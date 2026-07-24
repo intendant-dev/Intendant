@@ -452,12 +452,12 @@ function agendaInspGatesHtml(item) {
       ${target
     ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(target.id)}">waits on “${escapeHtml(title)}”</a>`
     : `<span class="ag2-insp-deplink">waits on ${escapeHtml(title)}</span>`}
-      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(d.target_id)}" title="Drop the edge (the log keeps history)">×</button>
+      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(d.target_id)}" title="Drop the link (the log keeps history)">×</button>
     </div>`;
   });
   const empty = !blockers.length && !deps.length
     ? '<div class="ag2-hint">Nothing gates this item.</div>' : '';
-  // Blockers and dependency edges describe OPEN work — the daemon refuses
+  // Blockers and dependency links describe OPEN work — the daemon refuses
   // them elsewhere, so the affordances only exist there.
   if (item.status !== 'open') {
     return `<section class="ag2-sec">
@@ -522,7 +522,7 @@ function agendaInspOrganizationHtml(item) {
     if (!target) return '';
     return `<span class="ag2-relchip">
       <a data-open-item="${escapeHtml(pid)}">${escapeHtml(target.title.slice(0, 34))}</a>
-      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the see-also edge (the log keeps history)">×</button>
+      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the see-also link (the log keeps history)">×</button>
     </span>`;
   }).join('');
   const relOptions = others
@@ -737,7 +737,7 @@ function agendaInspClick(e) {
   }
   const removeRel = e.target.closest('[data-remove-rel]');
   if (removeRel) {
-    // Either order works — the daemon resolves which side stores the edge.
+    // Either order works — the daemon resolves which side stores the link.
     agendaSendOp({ op: 'remove_relates_to', id: item.id, target_id: removeRel.dataset.removeRel }, removeRel);
     return;
   }

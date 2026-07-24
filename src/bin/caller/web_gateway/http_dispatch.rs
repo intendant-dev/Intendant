@@ -1177,6 +1177,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::CodexCloudWorkers => {
+                return handle_codex_cloud_workers(
+                    stream,
+                    request_line,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaList => {
                 return handle_agenda_list(
                     stream,

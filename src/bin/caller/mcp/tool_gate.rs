@@ -226,7 +226,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "get_restart_status"
         | "get_controller_loop_status"
         | "browser_workspace_providers"
-        | "list_browser_workspaces" => PeerOperation::StatsRead,
+        | "list_browser_workspaces"
+        | "list_codex_cloud_workers" => PeerOperation::StatsRead,
         // Session observation: logs, pending prompts, managed-context anchors.
         "get_logs"
         | "get_pending_approval"
@@ -252,8 +253,11 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "respond" | "post_session_note" | "ask_user" | "notify_user" | "request_user_display" => {
             PeerOperation::Message
         }
-        // Starting or delegating agent work.
-        "start_task" => PeerOperation::Task,
+        // Starting or delegating agent work. The Cloud follow-up rides
+        // here with submit: both mint provider-side agent turns.
+        "start_task" | "submit_codex_cloud_task" | "follow_up_codex_cloud_task" => {
+            PeerOperation::Task
+        }
         // Mutating the supervised session's context/lineage.
         "rewind_context"
         | "rewind_backout"
@@ -569,6 +573,30 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         ),
     );
     push(
+        "list_codex_cloud_workers",
+        manual_http_tool_definition!(
+            "list_codex_cloud_workers",
+            "Refresh Codex Cloud tasks into the local worker-lease store and list them, including tracked leases with live attachments outside the provider window. Contacts the provider through the daemon host's authenticated Codex CLI; never modifies a Cloud task.",
+            ListCodexCloudWorkersParams
+        ),
+    );
+    push(
+        "submit_codex_cloud_task",
+        manual_http_tool_definition!(
+            "submit_codex_cloud_task",
+            "Submit a new Codex Cloud task and track it as an ephemeral Intendant worker lease. This creates an external Cloud task and uses the daemon host's authenticated Codex CLI.",
+            SubmitCodexCloudTaskParams
+        ),
+    );
+    push(
+        "follow_up_codex_cloud_task",
+        manual_http_tool_definition!(
+            "follow_up_codex_cloud_task",
+            "Send a follow-up turn into an existing Codex Cloud task, reusing its worker and incremental build state while the worker is warm. Rides the provider's private web backend with the daemon host's Codex CLI login; refuses tasks with an active turn and fails closed on schema drift.",
+            FollowUpCodexCloudTaskParams
+        ),
+    );
+    push(
         "list_displays",
         manual_http_tool_definition!(
             "list_displays",
@@ -686,6 +714,97 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_cloud_tools_are_full_profile_only_with_explicit_iam_classes() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert!(tool_allowed_for_profile(
+            "list_codex_cloud_workers",
+            false,
+            None
+        ));
+        assert!(tool_allowed_for_profile(
+            "submit_codex_cloud_task",
+            false,
+            Some("full")
+        ));
+        assert!(tool_allowed_for_profile(
+            "follow_up_codex_cloud_task",
+            false,
+            Some("full")
+        ));
+        assert!(!tool_allowed_for_profile(
+            "list_codex_cloud_workers",
+            false,
+            Some("core")
+        ));
+        assert!(!tool_allowed_for_profile(
+            "submit_codex_cloud_task",
+            false,
+            Some("core")
+        ));
+        assert!(!tool_allowed_for_profile(
+            "follow_up_codex_cloud_task",
+            false,
+            Some("core")
+        ));
+        assert_eq!(
+            mcp_tool_operation("list_codex_cloud_workers"),
+            PeerOperation::StatsRead
+        );
+        assert_eq!(
+            mcp_tool_operation("submit_codex_cloud_task"),
+            PeerOperation::Task
+        );
+        assert_eq!(
+            mcp_tool_operation("follow_up_codex_cloud_task"),
+            PeerOperation::Task
+        );
+
+        let mut full = Vec::new();
+        append_manual_http_tool_definitions(&mut full, false, None);
+        for (name, attr) in [
+            (
+                "list_codex_cloud_workers",
+                IntendantServer::list_codex_cloud_workers_tool_attr(),
+            ),
+            (
+                "submit_codex_cloud_task",
+                IntendantServer::submit_codex_cloud_task_tool_attr(),
+            ),
+            (
+                "follow_up_codex_cloud_task",
+                IntendantServer::follow_up_codex_cloud_task_tool_attr(),
+            ),
+        ] {
+            let definition = full
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            assert_eq!(
+                definition["description"].as_str(),
+                attr.description.as_deref(),
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+
+        let mut core = Vec::new();
+        append_manual_http_tool_definitions(&mut core, false, Some("core"));
+        assert!(
+            core.iter().all(|tool| {
+                !matches!(
+                    tool["name"].as_str(),
+                    Some(
+                        "list_codex_cloud_workers"
+                            | "submit_codex_cloud_task"
+                            | "follow_up_codex_cloud_task"
+                    )
+                )
+            }),
+            "Codex Cloud provider tools must stay out of the compact profile"
+        );
+    }
 
     #[test]
     fn manual_http_rewind_tool_descriptions_match_tool_attributes() {

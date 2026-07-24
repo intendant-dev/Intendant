@@ -39,7 +39,7 @@ const AGENDA_GRAPH_SETTLE_ITERATIONS = 260;
 // level so re-renders (inspector open, event-lane merges) never reset
 // the orbit or re-scatter surviving nodes.
 let agendaGraphNodes = [];
-let agendaGraphEdges = [];
+let agendaGraphLinks = [];
 let agendaGraphKey = '';
 let agendaGraphSettleLeft = 0;
 let agendaGraphRaf = null;
@@ -272,7 +272,7 @@ function agendaGraphTeardown() {
 
 // ---- Layout (topology-keyed force relaxation) ----
 
-// Rebuild nodes/edges only when the topology key changes; surviving
+// Rebuild nodes/links only when the topology key changes; surviving
 // nodes keep their positions and the settle budget re-arms so the new
 // shape relaxes in over the following frames.
 function agendaGraphBuild() {
@@ -298,27 +298,27 @@ function agendaGraphBuild() {
     };
   });
   const idx = new Map(agendaGraphNodes.map((n, i) => [n.id, i]));
-  const edges = [];
+  const links = [];
   const seenRel = new Set();
   items.forEach((x) => {
     if (x.part_of && idx.has(x.part_of.parent_id)) {
-      edges.push({ a: idx.get(x.id), b: idx.get(x.part_of.parent_id), t: 'place' });
+      links.push({ a: idx.get(x.id), b: idx.get(x.part_of.parent_id), t: 'place' });
     }
-    (x.relies_on || []).forEach((edge) => {
-      if (idx.has(edge.target_id)) {
-        edges.push({ a: idx.get(x.id), b: idx.get(edge.target_id), t: 'dep' });
+    (x.relies_on || []).forEach((link) => {
+      if (idx.has(link.target_id)) {
+        links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'dep' });
       }
     });
     // relates_to renders undirected: dedupe the two stored directions.
-    (x.relates_to || []).forEach((edge) => {
-      if (!idx.has(edge.target_id)) return;
-      const pair = [x.id, edge.target_id].sort().join(':');
+    (x.relates_to || []).forEach((link) => {
+      if (!idx.has(link.target_id)) return;
+      const pair = [x.id, link.target_id].sort().join(':');
       if (seenRel.has(pair)) return;
       seenRel.add(pair);
-      edges.push({ a: idx.get(x.id), b: idx.get(edge.target_id), t: 'rel' });
+      links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'rel' });
     });
   });
-  agendaGraphEdges = edges;
+  agendaGraphLinks = links;
   agendaGraphSettleLeft = AGENDA_GRAPH_SETTLE_ITERATIONS;
   return items;
 }
@@ -333,7 +333,7 @@ function agendaGraphSettleBudget(count) {
 
 function agendaGraphRelax(iterations) {
   const nodes = agendaGraphNodes;
-  const edges = agendaGraphEdges;
+  const links = agendaGraphLinks;
   for (let it = 0; it < iterations; it++) {
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
@@ -350,11 +350,11 @@ function agendaGraphRelax(iterations) {
         B[0] -= dx * f; B[1] -= dy * f; B[2] -= dz * f;
       }
     }
-    edges.forEach((edge) => {
-      const A = nodes[edge.a].p;
-      const B = nodes[edge.b].p;
-      const rest = edge.t === 'place' ? 74 : edge.t === 'dep' ? 96 : 116;
-      const k = edge.t === 'place' ? 0.014 : 0.007;
+    links.forEach((link) => {
+      const A = nodes[link.a].p;
+      const B = nodes[link.b].p;
+      const rest = link.t === 'place' ? 74 : link.t === 'dep' ? 96 : 116;
+      const k = link.t === 'place' ? 0.014 : 0.007;
       const dx = B[0] - A[0];
       const dy = B[1] - A[1];
       const dz = B[2] - A[2];
@@ -470,21 +470,21 @@ function agendaGraphDraw(ts) {
       childCount.set(x.part_of.parent_id, (childCount.get(x.part_of.parent_id) || 0) + 1);
     }
   });
-  // Edges under nodes: placement solid iris, see-also dashed neutral,
+  // Links under nodes: placement solid iris, see-also dashed neutral,
   // waits-on rose with the animated dash (static under reduced motion).
-  agendaGraphEdges.forEach((edge) => {
-    const a = pts[edge.a];
-    const b = pts[edge.b];
+  agendaGraphLinks.forEach((link) => {
+    const a = pts[link.a];
+    const b = pts[link.b];
     const depth = Math.max(0.25, Math.min(1, ((a.s + b.s) / 2) * 1.1 - 0.18));
-    const hot = hover && (nodes[edge.a].id === hover || nodes[edge.b].id === hover);
+    const hot = hover && (nodes[link.a].id === hover || nodes[link.b].id === hover);
     g.beginPath();
     g.moveTo(a.x, a.y);
     g.lineTo(b.x, b.y);
-    if (edge.t === 'place') {
+    if (link.t === 'place') {
       g.setLineDash([]);
       g.strokeStyle = `rgba(${pal.iris},${depth * (hot ? 0.75 : 0.38)})`;
       g.lineWidth = hot ? 1.6 : 1.1;
-    } else if (edge.t === 'rel') {
+    } else if (link.t === 'rel') {
       g.setLineDash([3, 5]);
       g.lineDashOffset = 0;
       g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.5 : 0.16)})`;

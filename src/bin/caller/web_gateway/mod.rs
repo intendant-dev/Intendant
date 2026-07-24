@@ -47,6 +47,8 @@ pub(crate) use routes_transfers::*;
 
 mod routes_agenda;
 pub(crate) use routes_agenda::*;
+mod routes_codex_cloud;
+pub(crate) use routes_codex_cloud::*;
 mod routes_memory;
 pub(crate) use routes_memory::*;
 

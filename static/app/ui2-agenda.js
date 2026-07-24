@@ -276,10 +276,10 @@ function agendaFindItem(id) {
   return (agendaItems || []).find((item) => item.id === id) || null;
 }
 
-// One edge's render judgment: { satisfied, review } where review is
+// One link's render judgment: { satisfied, review } where review is
 // '' | 'target_retired' | 'target_missing'.
-function agendaEdgeState(edge) {
-  const target = agendaFindItem(edge.target_id);
+function agendaLinkState(link) {
+  const target = agendaFindItem(link.target_id);
   if (!target) return { satisfied: false, review: 'target_missing' };
   if (target.status === 'done') return { satisfied: true, review: '' };
   if (target.status === 'retired') return { satisfied: false, review: 'target_retired' };
@@ -289,7 +289,7 @@ function agendaEdgeState(edge) {
 function agendaItemIsBlocked(item) {
   if (item.status !== 'open') return false;
   if ((item.blockers || []).some((b) => !b.cleared)) return true;
-  return (item.relies_on || []).some((edge) => !agendaEdgeState(edge).satisfied);
+  return (item.relies_on || []).some((link) => !agendaLinkState(link).satisfied);
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
@@ -298,8 +298,8 @@ function agendaBlockedLine(item) {
   if (item.status !== 'open') return null;
   const blocker = (item.blockers || []).find((b) => !b.cleared);
   if (blocker) return `Blocked — waiting on: “${blocker.criterion}”`;
-  for (const edge of item.relies_on || []) {
-    const target = agendaFindItem(edge.target_id);
+  for (const link of item.relies_on || []) {
+    const target = agendaFindItem(link.target_id);
     if (!target) return 'Prerequisite missing from the fold — review';
     if (target.status === 'retired') return `Prerequisite “${target.title}” was retired — review`;
     if (target.status === 'open') return `Waits on “${target.title}” — still open`;
@@ -351,7 +351,7 @@ function agendaDescendantIds(id, seen) {
   return seen;
 }
 
-// The undirected adjacency union: edges stored on this item plus edges
+// The undirected adjacency union: links stored on this item plus links
 // other items store pointing here, deduped.
 function agendaRelationPartners(item) {
   const partners = new Set((item.relates_to || []).map((e) => e.target_id));
