@@ -48,7 +48,7 @@ share a project, park ONE hub note titled after the project, place them
 under it, and annotate the hub "triage: hub for <project>" so it leaves
 the frontier too; a singleton with no matching hub stays unplaced —
 annotate it "triage: no placement — standalone" so it leaves the
-frontier. Add relates_to edges only where reading the items shows a
+frontier. Add relates_to links only where reading the items shows a
 real working relation. Attach refs you can substantiate (the brief file
 an item's body names, the PR its title cites) — never guess a locator.
 
