@@ -5,6 +5,10 @@ install_root="${INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}"
 bin_dir="$install_root/bin"
 libexec_dir="$install_root/libexec/intendant-cloud"
 repo_root="${CODEX_CLOUD_REPO_ROOT:-$PWD}"
+# File scope, not function-local: the EXIT trap that cleans it expands
+# after install_downloaded_binary has returned, where a local would be
+# unbound under set -u (and the download would leak).
+downloaded=""
 
 mkdir -p "$bin_dir" "$libexec_dir"
 
@@ -14,11 +18,11 @@ install_downloaded_binary() {
     return 2
   fi
 
-  local downloaded actual
+  local actual
   downloaded="$(mktemp)"
   # EXIT, not RETURN: a set -e abort inside the function skips RETURN traps
   # and would leak the download.
-  trap 'rm -f "$downloaded"' EXIT
+  trap 'rm -f "${downloaded:-}"' EXIT
   curl --fail --silent --show-error --location \
     --proto '=https' --tlsv1.2 \
     "$INTENDANT_CLOUD_BINARY_URL" \

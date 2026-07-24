@@ -37,22 +37,36 @@ never be conflated:
 | Task workspace state | The repo diff and filesystem artifacts of one task and its follow-ups | A warm same-task follow-up kept a 336 MB ignored cargo `target/` and ran an identical build **68x faster** (189s → 2.8s) |
 | Live worker state | CPU, RAM, PIDs, sockets, tunnels | Warm continuity measured across ~8 minutes (same hostname, boot id, PID 1, inodes); allocation beyond a turn is *not* guaranteed |
 
+The first controlled **cold-resume checkpoint** (one run, 2026-07-24; not yet
+a measured boundary) sharpened the downside: after ~34 quiet minutes a
+same-task follow-up landed on a *replacement* worker — different hostname,
+boot id, and PID 1 — and every tested ignored/task-created path was gone
+(`target/`, `/root`, `/tmp` probes, heartbeat, the 336 MB cargo tree); only
+the selected repository revision survived (`selected_state_only`). One
+observation does not establish an eviction timeout, but it proves the loss
+mode is real: **an external build cache is a requirement for reuse that must
+survive replacement, not an optimization.**
+
 Consequences Intendant encodes:
 
 - **An environment is a template, not a machine.** New tasks — sequential or
   concurrent — get isolated workers; nothing crosses `/root`, `/tmp`, or
   process state between tasks. Cross-task build reuse needs a remote cache,
   not wishful thinking about a shared box.
-- **Same-task follow-ups are the warm lever.** Follow-ups (driven from the
-  task's page — the upstream CLI has no follow-up verb yet) can reuse the
-  same warm worker and its ignored build artifacts. Keep repeated work in
-  one task; the lease's task URL is the door.
+- **Same-task follow-ups are the warm lever.** `intendant codex-cloud
+  followup` (below) reuses the same warm worker and its ignored build
+  artifacts while the worker survives. Keep repeated work in one task — and
+  treat anything that must outlive a possible replacement as needing `pull`
+  or an external cache.
 - **Warmth is tracked honestly.** Every lease derives `warm` (actively
   running, or last activity within ~10 minutes — just past the measured
   window), `unknown` (through the 12-hour setup-cache horizon), or `cold`.
   Refreshes detect web-driven follow-ups as terminal → running → terminal
   flaps and count completed turns. The label is a heuristic from measured
-  behavior, never a guarantee.
+  behavior, never a guarantee — the observed ~34-minute eviction sits well
+  inside the `unknown` band, which is exactly why that band does not claim
+  warmth. (`probe --task` below is the cheap way to *measure* instead of
+  guessing; more checkpoints may later tighten these windows.)
 - **The 12-hour figure is the setup cache, not the worker.** Put expensive,
   stable toolchain work in `setup.sh` where the cache amortizes it across
   workers; keep task-specific mutable state out of it.
@@ -60,16 +74,21 @@ Consequences Intendant encodes:
 ### Worker fingerprints
 
 `intendant codex-cloud probe --env <ENV_ID>` submits a canned diagnostic
-task whose only output is one added file: a single-line JSON fingerprint
-(hostname, boot id, PID 1 start, toolchain, sizes). The fingerprint travels
-in the task diff — the one channel the CLI reliably exposes — and refresh
-collects it automatically once the probe finishes. `pull` also parses a
-fingerprint opportunistically from any diff that carries one.
+task whose only output is one file: a single-line JSON fingerprint
+(hostname, boot id, PID 1 start, toolchain, sizes), measured fresh on every
+probe turn. The fingerprint travels in the task diff — the one channel the
+CLI reliably exposes — and refresh collects it automatically whenever a
+probe task finishes a turn. `pull` also parses a fingerprint
+opportunistically from any diff that carries one.
 
-Matching `hostname` + `boot_id` + `pid1_start` identify one booted worker;
-a mismatch across turns of a single task is direct evidence of a cold
-replacement — the exact open question the runtime findings left. Probes are
-the reproducible instrument for it.
+`intendant codex-cloud probe --task <TASK_ID>` is the cross-turn instrument:
+it re-probes an *existing* task with a follow-up turn that rewrites the
+fingerprint file. Matching `hostname` + `boot_id` + `pid1_start` confirm the
+same booted worker; a mismatch against the recorded fingerprint is a
+**detected cold replacement** — the displaced fingerprint moves into the
+lease's `worker_history` and `cold_replacements_observed` increments (shown
+by `status` and the dashboard card). This turns the runtime findings'
+cold-resume methodology into a one-command check.
 
 ## Controller commands
 
@@ -99,8 +118,9 @@ intendant codex-cloud diff task_e_...
 # Bring a finished task home (see below).
 intendant codex-cloud pull task_e_...
 
-# Fingerprint a worker (see "Worker fingerprints" above).
+# Fingerprint a worker; re-probe a task to detect cold replacement.
 intendant codex-cloud probe --env <environment-id>
+intendant codex-cloud probe --task task_e_...
 
 # Continue a finished task with a new turn (see "Follow-ups" below).
 intendant codex-cloud followup task_e_... -m "Now also fix the tests"

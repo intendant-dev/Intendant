@@ -161,8 +161,11 @@ function cloudWorkerRow(lease) {
     const workerEl = document.createElement('span');
     workerEl.className = 'cloud-worker-id';
     const boot = lease.worker.boot_id ? ` · boot ${String(lease.worker.boot_id).slice(0, 8)}` : '';
-    workerEl.textContent = `worker ${lease.worker.hostname || '?'}${boot}`;
-    workerEl.title = 'Runtime fingerprint from a probe or pulled diff; identity change across turns = cold replacement';
+    const swaps = Number(lease.cold_replacements_observed) > 0
+      ? ` · replaced ×${lease.cold_replacements_observed}`
+      : '';
+    workerEl.textContent = `worker ${lease.worker.hostname || '?'}${boot}${swaps}`;
+    workerEl.title = 'Runtime fingerprint from a probe or pulled diff; re-probe with `codex-cloud probe --task` — a boot-identity mismatch is a detected cold replacement';
     meta.appendChild(workerEl);
   }
   if (lease.task_url) {
