@@ -37,6 +37,16 @@ newer record versions, and a torn final line are preserved but skipped so an
 older binary does not destroy history it cannot interpret. Multiple daemon
 processes sharing one home detect growth and refold before reads and writes.
 
+The raw log itself is also served, read-only, at `GET /api/agenda/ops`
+(`agenda.read`; tunnel twin `api_agenda_ops`) for per-item history and
+manifest-revision diffs. `since` is a 0-based line cursor into the append-only
+file, `item` filters server-side to one item's operations, and `limit` pages
+the scan (default 500, capped at 2000). The preserve-don't-destroy rule
+extends to this read: a line the serving build cannot fold is returned
+verbatim with `known: false`, and a line that is not JSON at all is returned
+string-escaped with `unparseable: true` — the endpoint never hides history it
+cannot parse.
+
 The item log writes and flushes one complete JSON line per operation, but does
 not `fsync` each item operation. It survives ordinary process and daemon
 restarts; the v1 contract is not a guarantee against sudden power loss. The
@@ -612,6 +622,7 @@ routes:
 | Route | Permission | Purpose |
 |---|---|---|
 | `GET /api/agenda` | `agenda.read` | Items, status counts, skipped-line count, and the session-resolution join map |
+| `GET /api/agenda/ops` | `agenda.read` | Raw op-log page: `since` line cursor, `item` filter, unfoldable lines served verbatim |
 | `POST /api/agenda/op` | `agenda.write` | Apply one validated Agenda command |
 | `POST /api/agenda/reminders/policy` | `settings.manage` | Change owner reminder policy |
 

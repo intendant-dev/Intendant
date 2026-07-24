@@ -514,6 +514,20 @@ impl AgendaHandle {
         (store.snapshot(), store.counts(), store.skipped_lines())
     }
 
+    /// One page of the raw op log (read-only; the `GET /api/agenda/ops`
+    /// surface). Holds the same store lock every append completes under,
+    /// so a page can never contain a torn in-process line — see
+    /// [`AgendaStore::read_ops`] for the cursor and forward-compat
+    /// contract.
+    pub(crate) fn read_ops(
+        &self,
+        since: u64,
+        item: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<super::store::AgendaOpsPage> {
+        self.lock().read_ops(since, item, limit)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AgendaStore> {
         // Poison recovery is sound here: disk is authoritative, and the
         // staleness check refolds from disk whenever lengths diverge.
@@ -1591,5 +1605,80 @@ mod tests {
         let run = recorded.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "completed");
         assert_eq!(run.session_id.as_deref(), Some("sess-run-1"));
+    }
+
+    /// The op-log read shares the append lock: pages taken WHILE another
+    /// thread appends through the same handle only ever hold complete
+    /// envelopes — never a torn or partial line, never an `unparseable`
+    /// artifact of an in-flight write.
+    #[test]
+    fn read_ops_under_concurrent_appends_never_serves_torn_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = std::sync::Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "torn-read canary".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        const APPENDS: u64 = 40;
+        let writer = {
+            let handle = handle.clone();
+            let id = item.id.clone();
+            std::thread::spawn(move || {
+                for round in 0..APPENDS {
+                    handle
+                        .apply(
+                            AgendaCommand::Annotate {
+                                id: id.clone(),
+                                text: format!("note {round} — {}", "x".repeat(200)),
+                                source: None,
+                            },
+                            None,
+                        )
+                        .unwrap();
+                }
+            })
+        };
+        let assert_complete = |page: &crate::agenda::AgendaOpsPage| {
+            for entry in &page.ops {
+                assert_eq!(
+                    entry["known"],
+                    serde_json::Value::Bool(true),
+                    "a concurrent read must never surface a torn line: {entry}"
+                );
+                assert!(
+                    serde_json::from_value::<super::super::types::AgendaOpRecord>(
+                        entry["op"].clone()
+                    )
+                    .is_ok(),
+                    "served line must be a complete envelope: {entry}"
+                );
+            }
+        };
+        while !writer.is_finished() {
+            let page = handle.read_ops(0, None, 2000).unwrap();
+            assert_complete(&page);
+        }
+        writer.join().unwrap();
+        let page = handle.read_ops(0, None, 2000).unwrap();
+        assert_complete(&page);
+        assert_eq!(page.log_len, APPENDS + 1);
+        assert_eq!(page.ops.len(), (APPENDS + 1) as usize);
+        assert_eq!(page.next_since, page.log_len);
     }
 }
