@@ -580,7 +580,8 @@ function agendaInspRefsHtml(item) {
         ? `<a class="ag2-ref-loc" data-jump-session="${escapeHtml(s.key)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`
         : `<span class="ag2-ref-loc" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</span>`;
     } else if (r.ref_type === 'memory') {
-      target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(label || 'claim ')}${escapeHtml(label ? '' : String(r.locator).slice(0, 12))}</a>`;
+      const text = label ? label + r.locator : `claim ${String(r.locator).slice(0, 12)}`;
+      target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`;
     } else {
       if (r.digest) hasFileDigest = true;
       target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest.slice(0, 16)}… recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
