@@ -16,7 +16,9 @@ install_downloaded_binary() {
 
   local downloaded actual
   downloaded="$(mktemp)"
-  trap 'rm -f "$downloaded"' RETURN
+  # EXIT, not RETURN: a set -e abort inside the function skips RETURN traps
+  # and would leak the download.
+  trap 'rm -f "$downloaded"' EXIT
   curl --fail --silent --show-error --location \
     --proto '=https' --tlsv1.2 \
     "$INTENDANT_CLOUD_BINARY_URL" \

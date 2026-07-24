@@ -573,7 +573,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "list_codex_cloud_workers",
         manual_http_tool_definition!(
             "list_codex_cloud_workers",
-            "Refresh and list Codex Cloud tasks as ephemeral Intendant worker leases. This is read-only and uses the daemon host's authenticated Codex CLI.",
+            "Refresh Codex Cloud tasks into the local worker-lease store and list them, including tracked leases with live attachments outside the provider window. Contacts the provider through the daemon host's authenticated Codex CLI; never modifies a Cloud task.",
             ListCodexCloudWorkersParams
         ),
     );

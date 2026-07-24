@@ -16,7 +16,9 @@ if [[ -r "$nonce_file" ]]; then
 else
   boot_nonce="uncached"
 fi
-if [[ ! "$boot_nonce" =~ ^[A-Za-z0-9._-]+$ ]]; then
+# Require at least one alphanumeric: the charset alone admits "." and "..",
+# and a dot-only nonce would walk the runtime parent out of its root.
+if [[ ! "$boot_nonce" =~ ^[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "invalid Intendant Cloud boot nonce" >&2
   exit 2
 fi

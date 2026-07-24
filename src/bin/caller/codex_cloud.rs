@@ -47,20 +47,15 @@ impl ProviderLeaseState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentState {
+    #[default]
     NotRequested,
     Awaiting,
     Connected,
     Disconnected,
     Expired,
-}
-
-impl Default for AttachmentState {
-    fn default() -> Self {
-        Self::NotRequested
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +69,11 @@ pub struct WorkerLease {
     pub provider_state: ProviderLeaseState,
     #[serde(default)]
     pub attachment_state: AttachmentState,
+    /// When the attachment last entered `Connected` (ms since epoch). Drives
+    /// the staleness TTL: a broker re-asserts liveness by recording
+    /// `connected` again, which restarts this clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_at_unix_ms: Option<u64>,
     pub provider_updated_at: Option<String>,
     pub last_observed_unix_ms: u64,
 }
@@ -93,6 +93,31 @@ pub struct SubmitTaskResult {
     pub stdout: String,
     pub stderr: String,
     pub lease: Option<WorkerLease>,
+}
+
+/// One provider-side lifecycle edge observed during a refresh: a tracked
+/// lease left the live states for a terminal one. A task first seen already
+/// terminal is history, not an edge, and is never reported.
+#[derive(Debug, Clone, Serialize)]
+pub struct TerminalTransition {
+    pub task_id: String,
+    pub title: String,
+    pub task_url: Option<String>,
+    pub provider_status: String,
+    pub provider_state: ProviderLeaseState,
+}
+
+/// What one provider refresh produced. `workers` mirrors the provider's
+/// current list window; `tracked_active` are store-only leases with a live
+/// attachment (awaiting/connected) that fell out of that window — the point
+/// of the attachment split is that liveness outlives the window, so they
+/// stay visible here until they expire or are pruned.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshOutcome {
+    pub workers: Vec<WorkerLease>,
+    pub tracked_active: Vec<WorkerLease>,
+    pub cursor: Option<String>,
+    pub transitions: Vec<TerminalTransition>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -120,7 +145,6 @@ fn store_version() -> u32 {
 struct CloudListResponse {
     #[serde(default)]
     tasks: Vec<CloudTask>,
-    #[allow(dead_code)]
     cursor: Option<String>,
 }
 
@@ -155,8 +179,10 @@ pub async fn run(args: Vec<String>) -> Result<(), String> {
         "list" | "refresh" => run_list(&args[1..]).await,
         "status" => run_status(&args[1..]).await,
         "diff" => run_passthrough("diff", &args[1..]).await,
+        "pull" => run_pull(&args[1..]).await,
         "bootstrap" => run_bootstrap(&args[1..]),
         "attachment" => run_attachment(&args[1..]),
+        "prune" => run_prune(&args[1..]),
         other => Err(format!(
             "unknown codex-cloud command '{other}'. Run `intendant codex-cloud --help`."
         )),
@@ -196,13 +222,16 @@ async fn run_exec(args: &[String]) -> Result<(), String> {
     }
 
     let parsed = parse_exec_args(args)?;
-    let result = submit_task(SubmitTaskRequest {
-        environment: parsed.environment,
-        branch: parsed.branch,
-        attempts: parsed.attempts,
-        title: parsed.title,
-        prompt: parsed.query,
-    })
+    let result = submit_task(
+        &state_path(),
+        SubmitTaskRequest {
+            environment: parsed.environment,
+            branch: parsed.branch,
+            attempts: parsed.attempts,
+            title: parsed.title,
+            prompt: parsed.query,
+        },
+    )
     .await?;
     if !result.stdout.is_empty() {
         print!("{}", result.stdout);
@@ -224,7 +253,18 @@ async fn run_exec(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn submit_task(request: SubmitTaskRequest) -> Result<SubmitTaskResult, String> {
+pub async fn submit_task(
+    store_path: &Path,
+    request: SubmitTaskRequest,
+) -> Result<SubmitTaskResult, String> {
+    submit_task_with(&codex_command(), store_path, request).await
+}
+
+async fn submit_task_with(
+    codex: &str,
+    store_path: &Path,
+    request: SubmitTaskRequest,
+) -> Result<SubmitTaskResult, String> {
     if request.environment.trim().is_empty() {
         return Err("Codex Cloud environment id cannot be empty".to_string());
     }
@@ -254,10 +294,11 @@ pub async fn submit_task(request: SubmitTaskRequest) -> Result<SubmitTaskResult,
     }
     cloud_args.push(request.prompt);
 
-    let output = run_codex(&codex_command(), &cloud_args).await?;
+    let output = run_codex(codex, &cloud_args).await?;
     let task_id = extract_task_id(&format!("{}\n{}", output.stdout, output.stderr));
     let lease = if let Some(task_id) = task_id.as_deref() {
-        let mut store = load_store()?;
+        let _lock = StoreLock::acquire(store_path)?;
+        let mut store = load_store(store_path)?;
         let lease = store
             .leases
             .entry(task_id.to_string())
@@ -272,11 +313,12 @@ pub async fn submit_task(request: SubmitTaskRequest) -> Result<SubmitTaskResult,
                 provider_status: "submitted".to_string(),
                 provider_state: ProviderLeaseState::Queued,
                 attachment_state: AttachmentState::NotRequested,
+                attached_at_unix_ms: None,
                 provider_updated_at: None,
                 last_observed_unix_ms: now_unix_ms(),
             })
             .clone();
-        save_store(&store)?;
+        save_store(store_path, &store)?;
         Some(lease)
     } else {
         None
@@ -299,43 +341,98 @@ async fn run_list(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let options = parse_list_args(args)?;
-    let observed = refresh_leases(
+    let outcome = refresh_leases(
+        &state_path(),
         options.environment.as_deref(),
         options.limit,
         options.cursor.as_deref(),
     )
     .await?;
+    for transition in &outcome.transitions {
+        eprintln!(
+            "[intendant] task {} is now {} — {}",
+            transition.task_id,
+            transition.provider_status,
+            transition_title(transition)
+        );
+    }
     if options.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&observed)
+            serde_json::to_string_pretty(&outcome)
                 .map_err(|e| format!("serialize worker leases: {e}"))?
         );
-    } else if observed.is_empty() {
+        return Ok(());
+    }
+    if outcome.workers.is_empty() && outcome.tracked_active.is_empty() {
         println!("No Codex Cloud tasks found.");
-    } else {
-        println!(
-            "{:<38}  {:<10}  {:<13}  {}",
-            "TASK", "PROVIDER", "ATTACHMENT", "TITLE"
-        );
-        for lease in &observed {
-            println!(
-                "{:<38}  {:<10}  {:<13}  {}",
-                lease.task_id,
-                lease.provider_status,
-                attachment_label(&lease.attachment_state),
-                lease.title
-            );
-        }
+        return Ok(());
+    }
+    if !outcome.workers.is_empty() {
+        print_lease_table(&outcome.workers);
+    }
+    if !outcome.tracked_active.is_empty() {
+        println!("\nTracked outside the provider window (live attachment):");
+        print_lease_table(&outcome.tracked_active);
+    }
+    if let Some(cursor) = outcome.cursor.as_deref() {
+        println!("\nNext page: intendant codex-cloud list --cursor {cursor}");
     }
     Ok(())
 }
 
+fn print_lease_table(leases: &[WorkerLease]) {
+    println!(
+        "{:<38}  {:<10}  {:<13}  {}",
+        "TASK", "PROVIDER", "ATTACHMENT", "TITLE"
+    );
+    for lease in leases {
+        println!(
+            "{:<38}  {:<10}  {:<13}  {}",
+            lease.task_id,
+            lease.provider_status,
+            attachment_label(&lease.attachment_state),
+            lease.title
+        );
+    }
+}
+
+fn transition_title(transition: &TerminalTransition) -> String {
+    if transition.title.trim().is_empty() {
+        "untitled Codex Cloud task".to_string()
+    } else {
+        transition.title.clone()
+    }
+}
+
+/// Refresh the provider's list window into the lease store and report what
+/// changed. Read-only toward the provider; the local store is updated (that
+/// is the point of a refresh).
 pub async fn refresh_leases(
+    store_path: &Path,
     environment: Option<&str>,
     limit: u8,
     cursor: Option<&str>,
-) -> Result<Vec<WorkerLease>, String> {
+) -> Result<RefreshOutcome, String> {
+    refresh_leases_with(
+        &codex_command(),
+        store_path,
+        environment,
+        limit,
+        cursor,
+        attach_ttl_ms(),
+    )
+    .await
+}
+
+async fn refresh_leases_with(
+    codex: &str,
+    store_path: &Path,
+    environment: Option<&str>,
+    limit: u8,
+    cursor: Option<&str>,
+    attach_ttl_ms: u64,
+) -> Result<RefreshOutcome, String> {
     if !(1..=20).contains(&limit) {
         return Err("Codex Cloud list limit must be from 1 to 20".to_string());
     }
@@ -355,16 +452,49 @@ pub async fn refresh_leases(
         cloud_args.push(cursor.to_string());
     }
 
-    let output = run_codex(&codex_command(), &cloud_args).await?;
+    // The provider call stays outside the lock; only the read-modify-write
+    // of the store is the critical section. Holding the lock across
+    // load → sync → save also makes each terminal transition observable by
+    // exactly one refresher (the loser reloads post-terminal state).
+    let output = run_codex(codex, &cloud_args).await?;
     let response = parse_cloud_list(&output.stdout)?;
-    let mut store = load_store()?;
-    sync_store(&mut store, &response.tasks);
-    save_store(&store)?;
-    Ok(response
+    let _lock = StoreLock::acquire(store_path)?;
+    let mut store = load_store(store_path)?;
+    let transitions = sync_store(&mut store, &response.tasks, now_unix_ms(), attach_ttl_ms);
+    save_store(store_path, &store)?;
+    let workers = response
         .tasks
         .iter()
         .filter_map(|task| store.leases.get(&task.id).cloned())
-        .collect())
+        .collect();
+    let mut tracked_active: Vec<WorkerLease> = store
+        .leases
+        .values()
+        .filter(|lease| !response.tasks.iter().any(|task| task.id == lease.task_id))
+        .filter(|lease| {
+            matches!(
+                lease.attachment_state,
+                AttachmentState::Awaiting | AttachmentState::Connected
+            )
+        })
+        .cloned()
+        .collect();
+    tracked_active.sort_by(|a, b| b.last_observed_unix_ms.cmp(&a.last_observed_unix_ms));
+    Ok(RefreshOutcome {
+        workers,
+        tracked_active,
+        cursor: response.cursor,
+        transitions,
+    })
+}
+
+/// Read the tracked leases without touching the provider (dashboard first
+/// paint, scripting). Newest-observed first.
+pub fn cached_leases(store_path: &Path) -> Result<Vec<WorkerLease>, String> {
+    let store = load_store(store_path)?;
+    let mut leases: Vec<WorkerLease> = store.leases.into_values().collect();
+    leases.sort_by(|a, b| b.last_observed_unix_ms.cmp(&a.last_observed_unix_ms));
+    Ok(leases)
 }
 
 async fn run_status(args: &[String]) -> Result<(), String> {
@@ -387,41 +517,42 @@ async fn run_status(args: &[String]) -> Result<(), String> {
     }
 
     // The current upstream `codex cloud status` has no JSON mode. Refresh the
-    // structured list first, then fall back to its human-readable status when
-    // a task is older than the list window.
-    let refresh = run_codex(
-        &codex_command(),
-        &[
-            "cloud".into(),
-            "list".into(),
-            "--json".into(),
-            "--limit".into(),
-            "20".into(),
-        ],
-    )
-    .await?;
-    let response = parse_cloud_list(&refresh.stdout)?;
-    let mut store = load_store()?;
-    sync_store(&mut store, &response.tasks);
-    save_store(&store)?;
-
-    if response.tasks.iter().any(|task| task.id == task_id) {
-        let lease = &store.leases[&task_id];
+    // structured list first; a tracked lease outside that window is served
+    // from the store (its attachment state is ours alone), and only an
+    // entirely unknown task falls back to the upstream human-readable status.
+    let store_path = state_path();
+    let outcome = refresh_leases(&store_path, None, 20, None).await?;
+    let lease = match outcome
+        .workers
+        .iter()
+        .find(|lease| lease.task_id == task_id)
+    {
+        Some(lease) => Some(lease.clone()),
+        None => cached_leases(&store_path)?
+            .into_iter()
+            .find(|lease| lease.task_id == task_id)
+            .inspect(|_| {
+                eprintln!(
+                    "[intendant] task is outside the newest provider window; provider fields may be stale"
+                );
+            }),
+    };
+    if let Some(lease) = lease {
         if json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(lease)
+                serde_json::to_string_pretty(&lease)
                     .map_err(|e| format!("serialize worker lease: {e}"))?
             );
         } else {
-            print_lease(lease);
+            print_lease(&lease);
         }
         return Ok(());
     }
 
     if json {
         return Err(
-            "task was not in the newest 20 Cloud tasks; the upstream `codex cloud status` command has no JSON mode"
+            "task is not tracked and was not in the newest 20 Cloud tasks; the upstream `codex cloud status` command has no JSON mode"
                 .to_string(),
         );
     }
@@ -461,6 +592,265 @@ async fn run_passthrough(command: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PullOutcome {
+    pub task_id: String,
+    pub branch: String,
+    pub worktree: PathBuf,
+    /// Paths left with conflict markers by the three-way apply. Empty means
+    /// the diff applied cleanly.
+    pub conflicts: Vec<String>,
+}
+
+async fn run_pull(args: &[String]) -> Result<(), String> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        println!(
+            "Usage:\n  intendant codex-cloud pull <TASK_ID> [--attempt N] [--branch NAME] [--dir PATH] [--repo PATH] [--json]"
+        );
+        println!(
+            "Fetches the task's diff through the Codex CLI (in a disposable directory) and applies it onto a fresh branch in a new git worktree — the upstream CLI never runs inside your repository."
+        );
+        return Ok(());
+    }
+    let task_id = args[0].clone();
+    let mut attempt: Option<u16> = None;
+    let mut branch: Option<String> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut repo: Option<PathBuf> = None;
+    let mut json = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--attempt" => {
+                i += 1;
+                attempt = Some(
+                    required_value(args, i, "--attempt")?
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| "--attempt must be a positive integer".to_string())?,
+                );
+            }
+            "--branch" => {
+                i += 1;
+                branch = Some(required_value(args, i, "--branch")?);
+            }
+            "--dir" => {
+                i += 1;
+                dir = Some(PathBuf::from(required_value(args, i, "--dir")?));
+            }
+            "--repo" => {
+                i += 1;
+                repo = Some(PathBuf::from(required_value(args, i, "--repo")?));
+            }
+            "--json" => json = true,
+            other => return Err(format!("unknown pull flag {other}")),
+        }
+        i += 1;
+    }
+    let outcome = pull_task(
+        &codex_command(),
+        repo.as_deref().unwrap_or_else(|| Path::new(".")),
+        &task_id,
+        attempt,
+        branch.as_deref(),
+        dir.as_deref(),
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome)
+                .map_err(|e| format!("serialize pull outcome: {e}"))?
+        );
+        return Ok(());
+    }
+    println!(
+        "Pulled {} onto branch {} in {}",
+        outcome.task_id,
+        outcome.branch,
+        outcome.worktree.display()
+    );
+    if outcome.conflicts.is_empty() {
+        println!("The diff applied cleanly (uncommitted). Next:");
+        println!("  cd {}", outcome.worktree.display());
+        println!("  git status && git diff   # review");
+        println!("  git add -A && git commit # land it your usual way");
+    } else {
+        println!("The three-way apply left conflicts to resolve:");
+        for path in &outcome.conflicts {
+            println!("  {path}");
+        }
+        println!("  cd {}", outcome.worktree.display());
+    }
+    Ok(())
+}
+
+/// Fetch a Cloud task's diff and apply it onto a fresh branch in a new git
+/// worktree. The Codex CLI runs in its disposable directory as always (its
+/// `error.log` habit is why it is never run inside a repository); only our
+/// own `git` touches the checkout. Nothing is committed — the result is a
+/// reviewable worktree.
+async fn pull_task(
+    codex: &str,
+    repo_hint: &Path,
+    task_id: &str,
+    attempt: Option<u16>,
+    branch_override: Option<&str>,
+    dir_override: Option<&Path>,
+) -> Result<PullOutcome, String> {
+    if task_id.trim().is_empty() || task_id.starts_with('-') {
+        return Err("pull requires a Codex Cloud task id".to_string());
+    }
+    let top = run_git(repo_hint, &["rev-parse", "--show-toplevel"]).await?;
+    let repo_root = PathBuf::from(top.stdout.trim());
+    if repo_root.as_os_str().is_empty() {
+        return Err(format!(
+            "{} is not inside a git repository",
+            repo_hint.display()
+        ));
+    }
+
+    let mut diff_args = vec!["cloud".to_string(), "diff".to_string(), task_id.to_string()];
+    if let Some(attempt) = attempt {
+        diff_args.push("--attempt".to_string());
+        diff_args.push(attempt.to_string());
+    }
+    let diff = run_codex(codex, &diff_args).await?;
+    if diff.stdout.trim().is_empty() {
+        return Err(format!(
+            "task {task_id} produced an empty diff (attempt {})",
+            attempt.unwrap_or(1)
+        ));
+    }
+
+    let branch = branch_override
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("codex-cloud/{task_id}"));
+    if run_git(
+        &repo_root,
+        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+    )
+    .await
+    .is_ok()
+    {
+        return Err(format!(
+            "branch {branch} already exists; pass --branch for a fresh name"
+        ));
+    }
+
+    let worktree_dir = dir_override.map(Path::to_path_buf).unwrap_or_else(|| {
+        repo_root
+            .join(".intendant")
+            .join("worktrees")
+            .join(&branch)
+    });
+    if worktree_dir.exists() {
+        return Err(format!(
+            "{} already exists; pass --dir for a fresh location",
+            worktree_dir.display()
+        ));
+    }
+    if let Some(parent) = worktree_dir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create worktree parent {}: {e}", parent.display()))?;
+    }
+    let worktree_str = worktree_dir
+        .to_str()
+        .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?
+        .to_string();
+    run_git(
+        &repo_root,
+        &["worktree", "add", "-b", &branch, &worktree_str, "HEAD"],
+    )
+    .await?;
+
+    let patch = tempfile::Builder::new()
+        .prefix("intendant-codex-cloud-pull-")
+        .suffix(".patch")
+        .tempfile()
+        .map_err(|e| format!("stage patch file: {e}"))?;
+    std::fs::write(patch.path(), diff.stdout.as_bytes())
+        .map_err(|e| format!("write patch file: {e}"))?;
+    let patch_str = patch
+        .path()
+        .to_str()
+        .ok_or_else(|| "patch path is not valid UTF-8".to_string())?
+        .to_string();
+
+    let applied = run_git(
+        &worktree_dir,
+        &["apply", "--3way", "--whitespace=nowarn", &patch_str],
+    )
+    .await;
+    let conflicts = match applied {
+        Ok(_) => Vec::new(),
+        Err(apply_error) => {
+            let unmerged = run_git(&worktree_dir, &["diff", "--name-only", "--diff-filter=U"])
+                .await
+                .map(|out| {
+                    out.stdout
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if unmerged.is_empty() {
+                // Nothing applied at all: remove the worktree and branch so a
+                // failed pull leaves no residue.
+                let _ = run_git(&repo_root, &["worktree", "remove", "--force", &worktree_str])
+                    .await;
+                let _ = run_git(&repo_root, &["branch", "-D", &branch]).await;
+                return Err(format!("apply the task diff: {apply_error}"));
+            }
+            unmerged
+        }
+    };
+
+    Ok(PullOutcome {
+        task_id: task_id.to_string(),
+        branch,
+        worktree: worktree_dir,
+        conflicts,
+    })
+}
+
+/// Run `git` with captured output. Unlike the provider CLI, git runs where
+/// the work is — in the repository or the new worktree.
+async fn run_git(cwd: &Path, args: &[&str]) -> Result<CommandOutput, String> {
+    let output = crate::platform::spawn_command("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("run git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
+        Ok(CommandOutput { stdout, stderr })
+    } else {
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(if detail.is_empty() {
+            format!("git {} exited with {}", args.join(" "), output.status)
+        } else {
+            format!("git {} exited with {}: {detail}", args.join(" "), output.status)
+        })
+    }
+}
+
 fn run_attachment(args: &[String]) -> Result<(), String> {
     if args.len() != 2
         || args
@@ -480,7 +870,9 @@ fn run_attachment(args: &[String]) -> Result<(), String> {
         "none" | "not-requested" => AttachmentState::NotRequested,
         other => return Err(format!("unknown attachment state {other:?}")),
     };
-    let mut store = load_store()?;
+    let store_path = state_path();
+    let _lock = StoreLock::acquire(&store_path)?;
+    let mut store = load_store(&store_path)?;
     let label = {
         let lease = store.leases.get_mut(&args[0]).ok_or_else(|| {
             format!(
@@ -489,12 +881,113 @@ fn run_attachment(args: &[String]) -> Result<(), String> {
             )
         })?;
         lease.attachment_state = state;
+        // `connected` (re-)starts the staleness clock; `none` resets the
+        // whole attachment record. Other states keep the history.
+        match lease.attachment_state {
+            AttachmentState::Connected => lease.attached_at_unix_ms = Some(now_unix_ms()),
+            AttachmentState::NotRequested => lease.attached_at_unix_ms = None,
+            _ => {}
+        }
         lease.last_observed_unix_ms = now_unix_ms();
         attachment_label(&lease.attachment_state)
     };
-    save_store(&store)?;
+    save_store(&store_path, &store)?;
     println!("{} attachment={label}", args[0]);
     Ok(())
+}
+
+fn run_prune(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        println!("Usage: intendant codex-cloud prune [--days N] [--all] [--json]");
+        println!("Drops terminal leases with no live attachment: older than N days (default 7), or every one with --all.");
+        return Ok(());
+    }
+    let mut days: Option<u64> = None;
+    let mut all = false;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--days" => {
+                i += 1;
+                days = Some(
+                    required_value(args, i, "--days")?
+                        .parse()
+                        .map_err(|_| "--days must be a non-negative integer".to_string())?,
+                );
+            }
+            "--all" => all = true,
+            "--json" => json = true,
+            other => return Err(format!("unknown prune flag {other}")),
+        }
+        i += 1;
+    }
+    if all && days.is_some() {
+        return Err("pass --days or --all, not both".to_string());
+    }
+    let older_than_ms = if all {
+        None
+    } else {
+        Some(days.unwrap_or(7).saturating_mul(24 * 60 * 60 * 1000))
+    };
+    let outcome = prune_leases(&state_path(), older_than_ms)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome)
+                .map_err(|e| format!("serialize prune outcome: {e}"))?
+        );
+    } else {
+        println!(
+            "Pruned {} lease(s); {} kept.",
+            outcome.removed.len(),
+            outcome.kept
+        );
+        for task_id in &outcome.removed {
+            println!("  removed {task_id}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PruneOutcome {
+    pub removed: Vec<String>,
+    pub kept: usize,
+}
+
+/// Drop terminal leases with no live attachment. `older_than_ms: None`
+/// removes them regardless of age. Non-terminal provider states and
+/// awaiting/connected attachments are never pruned — disconnect or expire
+/// them first.
+pub fn prune_leases(store_path: &Path, older_than_ms: Option<u64>) -> Result<PruneOutcome, String> {
+    let now = now_unix_ms();
+    let _lock = StoreLock::acquire(store_path)?;
+    let mut store = load_store(store_path)?;
+    let mut removed = Vec::new();
+    store.leases.retain(|task_id, lease| {
+        let prunable = lease.provider_state.is_terminal()
+            && !matches!(
+                lease.attachment_state,
+                AttachmentState::Awaiting | AttachmentState::Connected
+            )
+            && older_than_ms
+                .is_none_or(|cutoff| now.saturating_sub(lease.last_observed_unix_ms) > cutoff);
+        if prunable {
+            removed.push(task_id.clone());
+        }
+        !prunable
+    });
+    if !removed.is_empty() {
+        save_store(store_path, &store)?;
+    }
+    Ok(PruneOutcome {
+        removed,
+        kept: store.leases.len(),
+    })
 }
 
 fn run_bootstrap(args: &[String]) -> Result<(), String> {
@@ -711,43 +1204,176 @@ fn parse_cloud_list(stdout: &str) -> Result<CloudListResponse, String> {
     serde_json::from_str(stdout).map_err(|e| format!("parse `codex cloud list --json`: {e}"))
 }
 
-fn sync_store(store: &mut LeaseStore, tasks: &[CloudTask]) {
-    let observed = now_unix_ms();
+/// Fold one provider list window into the store and age every attachment.
+/// Returns the live → terminal edges this sync observed; callers hold the
+/// store lock across load → sync → save, so each edge is reported by
+/// exactly one refresher.
+fn sync_store(
+    store: &mut LeaseStore,
+    tasks: &[CloudTask],
+    now_ms: u64,
+    attach_ttl_ms: u64,
+) -> Vec<TerminalTransition> {
+    let mut transitions = Vec::new();
     for task in tasks {
         let provider_state = ProviderLeaseState::from_codex_status(&task.status);
-        let existing_attachment = store
-            .leases
-            .get(&task.id)
+        let existing = store.leases.get(&task.id).cloned();
+
+        if provider_state.is_terminal()
+            && existing
+                .as_ref()
+                .is_some_and(|lease| !lease.provider_state.is_terminal())
+        {
+            transitions.push(TerminalTransition {
+                task_id: task.id.clone(),
+                title: if task.title.trim().is_empty() {
+                    existing
+                        .as_ref()
+                        .map(|lease| lease.title.clone())
+                        .unwrap_or_default()
+                } else {
+                    task.title.clone()
+                },
+                task_url: task
+                    .url
+                    .clone()
+                    .or_else(|| existing.as_ref().and_then(|lease| lease.task_url.clone())),
+                provider_status: task.status.clone(),
+                provider_state: provider_state.clone(),
+            });
+        }
+
+        // Provider fields refresh wholesale, but an empty/null provider value
+        // never erases a locally-known one: the real list shape returns
+        // `environment_id: null`, and titles can arrive empty while the
+        // submit-time title is still the best label we have.
+        let keep = |incoming: Option<String>, current: fn(&WorkerLease) -> Option<String>| {
+            incoming.or_else(|| existing.as_ref().and_then(current))
+        };
+        let title = if task.title.trim().is_empty() {
+            existing
+                .as_ref()
+                .map(|lease| lease.title.clone())
+                .unwrap_or_default()
+        } else {
+            task.title.clone()
+        };
+
+        let existing_attachment = existing
+            .as_ref()
             .map(|lease| lease.attachment_state.clone())
             .unwrap_or_default();
-        let attachment_state = if provider_state.is_terminal()
-            && existing_attachment == AttachmentState::Disconnected
-        {
-            AttachmentState::Expired
-        } else {
-            existing_attachment
+        // A pre-TTL store can hold `connected` without a timestamp; its
+        // staleness clock starts at this sync instead of expiring it on
+        // sight.
+        let attached_at = match existing_attachment {
+            AttachmentState::Connected => existing
+                .as_ref()
+                .and_then(|lease| lease.attached_at_unix_ms)
+                .or(Some(now_ms)),
+            _ => existing.as_ref().and_then(|lease| lease.attached_at_unix_ms),
         };
+        let attachment_state = next_attachment_state(
+            existing_attachment,
+            attached_at,
+            provider_state.is_terminal(),
+            now_ms,
+            attach_ttl_ms,
+        );
+
         store.leases.insert(
             task.id.clone(),
             WorkerLease {
                 task_id: task.id.clone(),
-                task_url: task.url.clone(),
-                title: task.title.clone(),
-                environment_id: task.environment_id.clone(),
-                environment_label: task.environment_label.clone(),
+                task_url: keep(task.url.clone(), |lease| lease.task_url.clone()),
+                title,
+                environment_id: keep(task.environment_id.clone(), |lease| {
+                    lease.environment_id.clone()
+                }),
+                environment_label: keep(task.environment_label.clone(), |lease| {
+                    lease.environment_label.clone()
+                }),
                 provider_status: task.status.clone(),
                 provider_state,
                 attachment_state,
-                provider_updated_at: task.updated_at.clone(),
-                last_observed_unix_ms: observed,
+                attached_at_unix_ms: attached_at,
+                provider_updated_at: keep(task.updated_at.clone(), |lease| {
+                    lease.provider_updated_at.clone()
+                }),
+                last_observed_unix_ms: now_ms,
             },
         );
     }
+
+    // Store-only leases age too: a live attachment on a task that fell out
+    // of the provider window is exactly the state most at risk of rotting
+    // as `connected` forever.
+    for lease in store.leases.values_mut() {
+        if tasks.iter().any(|task| task.id == lease.task_id) {
+            continue;
+        }
+        if lease.attachment_state == AttachmentState::Connected
+            && lease.attached_at_unix_ms.is_none()
+        {
+            lease.attached_at_unix_ms = Some(now_ms);
+        }
+        lease.attachment_state = next_attachment_state(
+            lease.attachment_state.clone(),
+            lease.attached_at_unix_ms,
+            lease.provider_state.is_terminal(),
+            now_ms,
+            attach_ttl_ms,
+        );
+    }
+
+    transitions
 }
 
-fn load_store() -> Result<LeaseStore, String> {
-    let path = state_path();
-    match std::fs::read(&path) {
+/// The attachment lifecycle rules applied on every refresh:
+/// - `awaiting`/`disconnected` on a terminal task → `expired` (the broker is
+///   gone or will never arrive; nothing connects to a reclaimed container).
+/// - `connected` past the staleness TTL → `expired` unless re-asserted
+///   (`attachment <id> connected` restarts the clock).
+/// - `connected` within the TTL is kept even on a terminal task:
+///   reachability is checked independently of provider state.
+fn next_attachment_state(
+    current: AttachmentState,
+    attached_at_unix_ms: Option<u64>,
+    provider_terminal: bool,
+    now_ms: u64,
+    attach_ttl_ms: u64,
+) -> AttachmentState {
+    match current {
+        AttachmentState::Awaiting | AttachmentState::Disconnected if provider_terminal => {
+            AttachmentState::Expired
+        }
+        AttachmentState::Connected => {
+            let stale = attached_at_unix_ms
+                .is_none_or(|attached| now_ms.saturating_sub(attached) > attach_ttl_ms);
+            if stale {
+                AttachmentState::Expired
+            } else {
+                AttachmentState::Connected
+            }
+        }
+        other => other,
+    }
+}
+
+const DEFAULT_ATTACH_TTL_S: u64 = 3600;
+
+/// How long a `connected` attachment stays credible without re-assertion.
+fn attach_ttl_ms() -> u64 {
+    std::env::var("INTENDANT_CODEX_CLOUD_ATTACH_TTL_S")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ATTACH_TTL_S)
+        .saturating_mul(1000)
+}
+
+fn load_store(path: &Path) -> Result<LeaseStore, String> {
+    match std::fs::read(path) {
         Ok(bytes) => {
             let store: LeaseStore = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("parse worker lease store {}: {e}", path.display()))?;
@@ -768,15 +1394,62 @@ fn load_store() -> Result<LeaseStore, String> {
     }
 }
 
-fn save_store(store: &LeaseStore) -> Result<(), String> {
-    let path = state_path();
+fn save_store(path: &Path, store: &LeaseStore) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(store)
         .map_err(|e| format!("serialize worker lease store: {e}"))?;
-    crate::file_watcher::atomic_write(&path, &bytes)
+    crate::file_watcher::atomic_write(path, &bytes)
         .map_err(|e| format!("write worker lease store {}: {e}", path.display()))
 }
 
-fn state_path() -> PathBuf {
+/// Advisory cross-process lock over the store's read-modify-write windows:
+/// the daemon's MCP tools, the dashboard route, and any number of CLI
+/// invocations share one file, and `atomic_write` alone cannot stop a stale
+/// loader from clobbering a concurrent update. Locks a sidecar
+/// `<store>.lock` — never the store itself, whose inode `atomic_write`
+/// replaces (and whose reads Windows' LockFileEx would block). The OS
+/// releases the lock if the holder dies.
+struct StoreLock {
+    file: std::fs::File,
+}
+
+impl StoreLock {
+    fn acquire(store_path: &Path) -> Result<Self, String> {
+        let lock_path = store_lock_path(store_path);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create lease store directory {}: {e}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("open lease store lock {}: {e}", lock_path.display()))?;
+        file.lock()
+            .map_err(|e| format!("lock lease store {}: {e}", lock_path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn store_lock_path(store_path: &Path) -> PathBuf {
+    let mut name = store_path
+        .file_name()
+        .unwrap_or_default()
+        .to_os_string();
+    name.push(".lock");
+    store_path.with_file_name(name)
+}
+
+/// The edge resolver for the lease store location. Everything below the
+/// CLI/MCP/gateway edges takes the store path as a parameter; tests thread
+/// tempdirs and never touch this.
+pub(crate) fn state_path() -> PathBuf {
     if let Some(path) = std::env::var_os("INTENDANT_CODEX_CLOUD_STATE") {
         return PathBuf::from(path);
     }
@@ -829,16 +1502,14 @@ fn codex_working_dir() -> Result<tempfile::TempDir, String> {
         .map_err(|e| format!("create isolated Codex CLI working directory: {e}"))
 }
 
+/// First `task_…` token in the combined CLI output. A heuristic: the split
+/// already guarantees the token alphabet, and if the output ever mentions
+/// several task ids the first one wins — every observed submit format
+/// prints the new task's id first.
 fn extract_task_id(output: &str) -> Option<String> {
     output
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .find(|part| {
-            part.starts_with("task_")
-                && part.len() > "task_".len()
-                && part["task_".len()..]
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        })
+        .find(|part| part.len() > "task_".len() && part.starts_with("task_"))
         .map(ToOwned::to_owned)
 }
 
@@ -956,7 +1627,7 @@ internet allowlist must include every exact relay/download domain used by the wo
 
 fn print_help() {
     println!(
-        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  attachment   Record the independent live-attachment state\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
+        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
     );
 }
 
@@ -1026,79 +1697,281 @@ mod tests {
         );
     }
 
+    const TEST_TTL_MS: u64 = 60_000;
+
+    fn lease(task_id: &str) -> WorkerLease {
+        WorkerLease {
+            task_id: task_id.into(),
+            task_url: None,
+            title: "old".into(),
+            environment_id: None,
+            environment_label: None,
+            provider_status: "running".into(),
+            provider_state: ProviderLeaseState::Running,
+            attachment_state: AttachmentState::NotRequested,
+            attached_at_unix_ms: None,
+            provider_updated_at: None,
+            last_observed_unix_ms: 1,
+        }
+    }
+
+    fn store_with(leases: Vec<WorkerLease>) -> LeaseStore {
+        LeaseStore {
+            version: STORE_VERSION,
+            leases: leases
+                .into_iter()
+                .map(|lease| (lease.task_id.clone(), lease))
+                .collect(),
+        }
+    }
+
+    fn task(id: &str, status: &str) -> CloudTask {
+        CloudTask {
+            id: id.into(),
+            url: None,
+            title: String::new(),
+            status: status.into(),
+            updated_at: None,
+            environment_id: None,
+            environment_label: None,
+        }
+    }
+
     #[test]
     fn sync_preserves_independent_attachment_state() {
-        let mut store = LeaseStore {
-            version: STORE_VERSION,
-            leases: BTreeMap::from([(
-                "task_e_123".into(),
-                WorkerLease {
-                    task_id: "task_e_123".into(),
-                    task_url: None,
-                    title: "old".into(),
-                    environment_id: None,
-                    environment_label: None,
-                    provider_status: "running".into(),
-                    provider_state: ProviderLeaseState::Running,
-                    attachment_state: AttachmentState::Connected,
-                    provider_updated_at: None,
-                    last_observed_unix_ms: 1,
-                },
-            )]),
-        };
-        sync_store(
-            &mut store,
-            &[CloudTask {
-                id: "task_e_123".into(),
-                url: None,
-                title: "new".into(),
-                status: "ready".into(),
-                updated_at: None,
-                environment_id: None,
-                environment_label: None,
-            }],
-        );
+        let mut connected = lease("task_e_123");
+        connected.attachment_state = AttachmentState::Connected;
+        let mut store = store_with(vec![connected]);
+        let mut ready = task("task_e_123", "ready");
+        ready.title = "new".into();
+        sync_store(&mut store, &[ready], 1_000, TEST_TTL_MS);
         let lease = &store.leases["task_e_123"];
         assert_eq!(lease.provider_state, ProviderLeaseState::Finished);
         assert_eq!(lease.attachment_state, AttachmentState::Connected);
+        assert_eq!(lease.title, "new");
+        // A pre-TTL `connected` without a timestamp starts its clock at this
+        // sync instead of expiring on sight.
+        assert_eq!(lease.attached_at_unix_ms, Some(1_000));
     }
 
     #[test]
     fn disconnected_terminal_attachment_expires() {
-        let mut store = LeaseStore {
-            version: STORE_VERSION,
-            leases: BTreeMap::from([(
-                "task_e_123".into(),
-                WorkerLease {
-                    task_id: "task_e_123".into(),
-                    task_url: None,
-                    title: String::new(),
-                    environment_id: None,
-                    environment_label: None,
-                    provider_status: "running".into(),
-                    provider_state: ProviderLeaseState::Running,
-                    attachment_state: AttachmentState::Disconnected,
-                    provider_updated_at: None,
-                    last_observed_unix_ms: 1,
-                },
-            )]),
-        };
+        let mut disconnected = lease("task_e_123");
+        disconnected.attachment_state = AttachmentState::Disconnected;
+        let mut store = store_with(vec![disconnected]);
+        sync_store(&mut store, &[task("task_e_123", "error")], 1_000, TEST_TTL_MS);
+        assert_eq!(
+            store.leases["task_e_123"].attachment_state,
+            AttachmentState::Expired
+        );
+    }
+
+    #[test]
+    fn awaiting_on_terminal_task_expires() {
+        let mut awaiting = lease("task_e_123");
+        awaiting.attachment_state = AttachmentState::Awaiting;
+        let mut store = store_with(vec![awaiting]);
         sync_store(
             &mut store,
-            &[CloudTask {
-                id: "task_e_123".into(),
-                url: None,
-                title: String::new(),
-                status: "error".into(),
-                updated_at: None,
-                environment_id: None,
-                environment_label: None,
-            }],
+            &[task("task_e_123", "cancelled")],
+            1_000,
+            TEST_TTL_MS,
         );
         assert_eq!(
             store.leases["task_e_123"].attachment_state,
             AttachmentState::Expired
         );
+    }
+
+    #[test]
+    fn connected_attachment_expires_past_ttl_unless_reasserted() {
+        let mut connected = lease("task_e_123");
+        connected.attachment_state = AttachmentState::Connected;
+        connected.attached_at_unix_ms = Some(1_000);
+        let mut store = store_with(vec![connected]);
+
+        // Within the TTL: survives, even though the task is terminal.
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            1_000 + TEST_TTL_MS,
+            TEST_TTL_MS,
+        );
+        assert_eq!(
+            store.leases["task_e_123"].attachment_state,
+            AttachmentState::Connected
+        );
+
+        // Past the TTL without re-assertion: expired.
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            1_000 + TEST_TTL_MS + 1,
+            TEST_TTL_MS,
+        );
+        assert_eq!(
+            store.leases["task_e_123"].attachment_state,
+            AttachmentState::Expired
+        );
+    }
+
+    #[test]
+    fn store_only_connected_lease_ages_out_too() {
+        let mut connected = lease("task_e_old");
+        connected.attachment_state = AttachmentState::Connected;
+        connected.attached_at_unix_ms = Some(1_000);
+        let mut store = store_with(vec![connected]);
+        // The provider window no longer contains the task at all.
+        sync_store(
+            &mut store,
+            &[task("task_e_new", "running")],
+            1_000 + TEST_TTL_MS + 1,
+            TEST_TTL_MS,
+        );
+        assert_eq!(
+            store.leases["task_e_old"].attachment_state,
+            AttachmentState::Expired
+        );
+    }
+
+    #[test]
+    fn terminal_transition_reported_exactly_once() {
+        let mut store = store_with(vec![lease("task_e_123")]);
+        let first = sync_store(&mut store, &[task("task_e_123", "ready")], 1_000, TEST_TTL_MS);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].task_id, "task_e_123");
+        assert_eq!(first[0].provider_state, ProviderLeaseState::Finished);
+        // The stored lease title backfills the transition when the provider
+        // sends an empty one.
+        assert_eq!(first[0].title, "old");
+
+        let second = sync_store(&mut store, &[task("task_e_123", "ready")], 2_000, TEST_TTL_MS);
+        assert!(second.is_empty(), "terminal → terminal is not an edge");
+    }
+
+    #[test]
+    fn first_sight_terminal_is_history_not_a_transition() {
+        let mut store = store_with(vec![]);
+        let transitions =
+            sync_store(&mut store, &[task("task_e_done", "ready")], 1_000, TEST_TTL_MS);
+        assert!(transitions.is_empty());
+        assert_eq!(
+            store.leases["task_e_done"].provider_state,
+            ProviderLeaseState::Finished
+        );
+    }
+
+    #[test]
+    fn empty_provider_fields_never_erase_known_values() {
+        let mut known = lease("task_e_123");
+        known.title = "My submitted task".into();
+        known.environment_id = Some("env_42".into());
+        known.task_url = Some("https://chatgpt.com/codex/tasks/task_e_123".into());
+        let mut store = store_with(vec![known]);
+        // The real provider shape can return an empty title and null
+        // environment/url fields.
+        sync_store(&mut store, &[task("task_e_123", "running")], 1_000, TEST_TTL_MS);
+        let lease = &store.leases["task_e_123"];
+        assert_eq!(lease.title, "My submitted task");
+        assert_eq!(lease.environment_id.as_deref(), Some("env_42"));
+        assert_eq!(
+            lease.task_url.as_deref(),
+            Some("https://chatgpt.com/codex/tasks/task_e_123")
+        );
+    }
+
+    #[test]
+    fn prune_drops_only_inactive_terminal_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+
+        let mut done_old = lease("task_e_done_old");
+        done_old.provider_state = ProviderLeaseState::Finished;
+        done_old.last_observed_unix_ms = 1;
+        let mut done_connected = lease("task_e_done_connected");
+        done_connected.provider_state = ProviderLeaseState::Finished;
+        done_connected.attachment_state = AttachmentState::Connected;
+        let running = lease("task_e_running");
+        save_store(
+            &store_path,
+            &store_with(vec![done_old, done_connected, running]),
+        )
+        .unwrap();
+
+        let outcome = prune_leases(&store_path, None).unwrap();
+        assert_eq!(outcome.removed, vec!["task_e_done_old".to_string()]);
+        assert_eq!(outcome.kept, 2);
+        let remaining = load_store(&store_path).unwrap();
+        assert!(remaining.leases.contains_key("task_e_done_connected"));
+        assert!(remaining.leases.contains_key("task_e_running"));
+
+        // An age cutoff spares recently-observed terminal leases.
+        let mut done_fresh = lease("task_e_done_fresh");
+        done_fresh.provider_state = ProviderLeaseState::Finished;
+        done_fresh.last_observed_unix_ms = now_unix_ms();
+        save_store(&store_path, &store_with(vec![done_fresh])).unwrap();
+        let outcome = prune_leases(&store_path, Some(24 * 60 * 60 * 1000)).unwrap();
+        assert!(outcome.removed.is_empty());
+        assert_eq!(outcome.kept, 1);
+    }
+
+    #[test]
+    fn lease_store_round_trips_at_an_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("nested").join("leases.json");
+        let _lock = StoreLock::acquire(&store_path).unwrap();
+        let mut connected = lease("task_e_123");
+        connected.attachment_state = AttachmentState::Connected;
+        connected.attached_at_unix_ms = Some(42);
+        save_store(&store_path, &store_with(vec![connected])).unwrap();
+        let loaded = load_store(&store_path).unwrap();
+        assert_eq!(loaded.leases["task_e_123"].attached_at_unix_ms, Some(42));
+        assert!(store_lock_path(&store_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_outcome_carries_window_tracked_and_cursor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+        let mut tracked = lease("task_e_offwindow");
+        tracked.attachment_state = AttachmentState::Connected;
+        tracked.attached_at_unix_ms = Some(now_unix_ms());
+        save_store(&store_path, &store_with(vec![tracked])).unwrap();
+
+        let command = dir.path().join("fake-codex");
+        std::fs::write(
+            &command,
+            r#"#!/bin/sh
+cat <<'EOF'
+{"tasks": [{"id": "task_e_new", "url": null, "title": "Fresh", "status": "running",
+ "updated_at": null, "environment_id": null, "environment_label": null}],
+ "cursor": "next-page"}
+EOF
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = refresh_leases_with(
+            command.to_str().unwrap(),
+            &store_path,
+            None,
+            20,
+            None,
+            TEST_TTL_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.workers.len(), 1);
+        assert_eq!(outcome.workers[0].task_id, "task_e_new");
+        assert_eq!(outcome.tracked_active.len(), 1);
+        assert_eq!(outcome.tracked_active[0].task_id, "task_e_offwindow");
+        assert_eq!(outcome.cursor.as_deref(), Some("next-page"));
+        assert!(outcome.transitions.is_empty());
+        assert_eq!(load_store(&store_path).unwrap().leases.len(), 2);
     }
 
     #[test]
@@ -1201,5 +2074,145 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    async fn scrubbed_git(cwd: &Path, args: &[&str]) {
+        let status = crate::platform::spawn_command("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_emitting(dir: &Path, stdout: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let command = dir.join("fake-codex");
+        let mut script = String::from("#!/bin/sh\ncat <<'FAKE_EOF'\n");
+        script.push_str(stdout);
+        script.push_str("\nFAKE_EOF\n");
+        std::fs::write(&command, script).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        command
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_applies_task_diff_onto_fresh_worktree_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        scrubbed_git(&repo, &["init", "--quiet"]).await;
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        scrubbed_git(&repo, &["add", "README.md"]).await;
+        scrubbed_git(&repo, &["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "init"])
+            .await;
+
+        let diff = "diff --git a/greeting.txt b/greeting.txt\n\
+new file mode 100644\n\
+index 0000000..ce01362\n\
+--- /dev/null\n\
++++ b/greeting.txt\n\
+@@ -0,0 +1 @@\n\
++hello";
+        let codex = fake_codex_emitting(dir.path(), diff);
+
+        let outcome = pull_task(
+            codex.to_str().unwrap(),
+            &repo,
+            "task_e_pull",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.branch, "codex-cloud/task_e_pull");
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(outcome.worktree.join("greeting.txt")).unwrap(),
+            "hello\n"
+        );
+        // The main checkout is untouched; the branch exists.
+        assert!(!repo.join("greeting.txt").exists());
+        run_git(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/codex-cloud/task_e_pull",
+            ],
+        )
+        .await
+        .unwrap();
+
+        // A second pull of the same task refuses instead of clobbering.
+        let error = pull_task(
+            codex.to_str().unwrap(),
+            &repo,
+            "task_e_pull",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("already exists"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_cleans_up_when_nothing_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        scrubbed_git(&repo, &["init", "--quiet"]).await;
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        scrubbed_git(&repo, &["add", "README.md"]).await;
+        scrubbed_git(&repo, &["-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "init"])
+            .await;
+
+        let codex = fake_codex_emitting(dir.path(), "this is not a diff at all");
+        let error = pull_task(
+            codex.to_str().unwrap(),
+            &repo,
+            "task_e_bad",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("apply the task diff"), "{error}");
+        assert!(!repo
+            .join(".intendant")
+            .join("worktrees")
+            .join("codex-cloud")
+            .join("task_e_bad")
+            .exists());
+        assert!(run_git(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/codex-cloud/task_e_bad",
+            ],
+        )
+        .await
+        .is_err());
     }
 }

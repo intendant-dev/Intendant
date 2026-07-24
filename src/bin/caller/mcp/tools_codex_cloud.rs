@@ -6,22 +6,26 @@ use super::*;
 
 impl IntendantServer {
     #[tool(
-        description = "Refresh and list Codex Cloud tasks as ephemeral Intendant worker leases. This is read-only and uses the daemon host's authenticated Codex CLI."
+        description = "Refresh Codex Cloud tasks into the local worker-lease store and list them, including tracked leases with live attachments outside the provider window. Contacts the provider through the daemon host's authenticated Codex CLI; never modifies a Cloud task."
     )]
     pub(crate) async fn list_codex_cloud_workers(
         &self,
         Parameters(params): Parameters<ListCodexCloudWorkersParams>,
     ) -> String {
         match crate::codex_cloud::refresh_leases(
+            &crate::codex_cloud::state_path(),
             params.environment_id.as_deref(),
             params.limit.unwrap_or(20),
             None,
         )
         .await
         {
-            Ok(workers) => serde_json::json!({
+            Ok(outcome) => serde_json::json!({
                 "ok": true,
-                "workers": workers,
+                "workers": outcome.workers,
+                "tracked_active": outcome.tracked_active,
+                "cursor": outcome.cursor,
+                "transitions": outcome.transitions,
             })
             .to_string(),
             Err(error) => serde_json::json!({
@@ -46,7 +50,7 @@ impl IntendantServer {
             title: params.title,
             prompt: params.prompt,
         };
-        match crate::codex_cloud::submit_task(request).await {
+        match crate::codex_cloud::submit_task(&crate::codex_cloud::state_path(), request).await {
             Ok(result) => serde_json::json!({
                 "ok": true,
                 "result": result,
