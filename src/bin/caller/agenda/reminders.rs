@@ -33,7 +33,7 @@
 //! double-fire window between two live daemons sharing one home —
 //! at-least-once, honestly.
 
-use super::types::{AgendaItem, AgendaStatus};
+use super::types::{AgendaEffect, AgendaItem, AgendaStatus, RecurrenceSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -544,6 +544,59 @@ pub(crate) fn session_occurrence_id(
     hex
 }
 
+/// A standing series' planner-relevant instants at one moment, from
+/// [`series_instants`] — the single implementation of the recurrence
+/// k-index math (G3-pre), shared by [`plan`] and the display-only
+/// [`effect_next_fire_ms`] derivation so the two can never drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeriesInstants {
+    /// The latest due series instant — the one catch-up the planner
+    /// fires (a wake after downtime fires one instant, never a burst).
+    /// `None` while the series has not started.
+    pub(crate) due: Option<u64>,
+    /// The next strictly-future series instant, when the series
+    /// continues: the first instant before the series starts, else
+    /// `due`'s successor while it stays within the series bounds.
+    /// `None` when the series is exhausted (`until_ms` /
+    /// `max_occurrences`).
+    pub(crate) upcoming: Option<u64>,
+}
+
+/// The recurrence series math, pure and clock-injected: which instant of
+/// the series anchored at `fire` is currently due, and which future
+/// instant follows. Instants are time-defined — unspent ones consume
+/// their indices — and the series' last index is the tighter of the two
+/// bounds (`max_occurrences` in instants, `until_ms` in time).
+pub(crate) fn series_instants(fire: u64, rec: &RecurrenceSpec, now_ms: u64) -> SeriesInstants {
+    let every = rec.every_ms.max(1);
+    // The series' last index, when bounded.
+    let k_last: Option<u64> = {
+        let by_max = rec.max_occurrences.map(|m| u64::from(m).saturating_sub(1));
+        let by_until = rec.until_ms.map(|until| until.saturating_sub(fire) / every);
+        match (by_max, by_until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    };
+    if now_ms < fire {
+        return SeriesInstants {
+            due: None,
+            upcoming: Some(fire),
+        };
+    }
+    let k_now = (now_ms - fire) / every;
+    let k_due = k_last.map_or(k_now, |last| k_now.min(last));
+    let k_next = k_due + 1;
+    let upcoming =
+        (k_last.is_none_or(|last| k_next <= last) && k_due == k_now).then(|| fire + k_next * every);
+    SeriesInstants {
+        due: Some(fire + k_due * every),
+        upcoming,
+    }
+}
+
 /// What the scheduler should do right now, plus when to wake next.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -611,35 +664,18 @@ pub(crate) fn plan(
             // fires one catch-up, never a burst; skipped older instants
             // get no journal rows — downtime stays visible as journal
             // silence) plus any owner-requested instants; the next future
-            // series instant registers the wake.
+            // series instant registers the wake. The series math lives in
+            // [`series_instants`], shared with the display derivation.
             let mut candidates: Vec<(u64, bool)> = Vec::new();
             match &effect.manifest.recurrence {
                 None => candidates.push((effect.manifest.fire_at_ms, false)),
                 Some(rec) => {
-                    let fire = effect.manifest.fire_at_ms;
-                    let every = rec.every_ms.max(1);
-                    // The series' last index, when bounded (instants are
-                    // time-defined: unspent ones consume their indices).
-                    let k_last: Option<u64> = {
-                        let by_max = rec.max_occurrences.map(|m| u64::from(m).saturating_sub(1));
-                        let by_until = rec.until_ms.map(|until| until.saturating_sub(fire) / every);
-                        match (by_max, by_until) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b),
-                            (None, None) => None,
-                        }
-                    };
-                    if now_ms < fire {
-                        consider_wake(fire, &mut plan);
-                    } else {
-                        let k_now = (now_ms - fire) / every;
-                        let k_due = k_last.map_or(k_now, |last| k_now.min(last));
-                        candidates.push((fire + k_due * every, true));
-                        let k_next = k_due + 1;
-                        if k_last.is_none_or(|last| k_next <= last) && k_due == k_now {
-                            consider_wake(fire + k_next * every, &mut plan);
-                        }
+                    let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
+                    if let Some(due) = instants.due {
+                        candidates.push((due, true));
+                    }
+                    if let Some(upcoming) = instants.upcoming {
+                        consider_wake(upcoming, &mut plan);
                     }
                     for req in &effect.requested {
                         candidates.push((req.at_ms, true));
@@ -737,6 +773,145 @@ pub(crate) fn plan(
     plan
 }
 
+/// The next instant `effect` would actually fire, by [`plan`]'s own rules
+/// — the dashboard's display-only derivation (decorated onto the DTO at
+/// the serving seam, never stored, never folded from ops). `None` means
+/// nothing will fire: unapproved (an approval binds the current digest or
+/// does not exist), suspended, a spent or in-flight one-shot, an
+/// exhausted series.
+///
+/// Mirrors `plan` exactly, candidate for candidate: the same
+/// [`series_instants`] math, the same journal dedup (a `prepared`,
+/// `started`, or terminal occurrence never re-fires — `prepared` resolves
+/// through the crashed lane, fail-closed), the same staleness
+/// classification (a due instant past the window is `missed`, not a
+/// fire), and the same requested-instant handling (every pending request
+/// is a candidate; spent ones are journal-deduped). The one deliberate
+/// difference: transient execution state — the scheduler's private
+/// in-flight set, and the no-overlap hold while a run of this effect is
+/// still `started` — only DELAYS a fire, so a due instant held by either
+/// keeps showing here (it fires when the run settles; mid-dispatch, the
+/// write-back settles the display). The
+/// `next_fire_agrees_with_the_planner` differential test pins this mirror
+/// to `plan` itself.
+pub(crate) fn effect_next_fire_ms(
+    item_id: &str,
+    effect: &AgendaEffect,
+    journal: &OccurrenceJournal,
+    staleness_ms: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    let approval = effect.approval.as_ref()?;
+    if effect.suspended() {
+        return None;
+    }
+    // Candidate instants, exactly as `plan` assembles them.
+    let mut candidates: Vec<u64> = Vec::new();
+    let mut upcoming: Option<u64> = None;
+    fn consider_upcoming(instant: u64, upcoming: &mut Option<u64>) {
+        *upcoming = Some(upcoming.map_or(instant, |cur: u64| cur.min(instant)));
+    }
+    match &effect.manifest.recurrence {
+        None => candidates.push(effect.manifest.fire_at_ms),
+        Some(rec) => {
+            let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
+            if let Some(due) = instants.due {
+                candidates.push(due);
+            }
+            if let Some(next) = instants.upcoming {
+                consider_upcoming(next, &mut upcoming);
+            }
+            for req in &effect.requested {
+                candidates.push(req.at_ms);
+            }
+        }
+    }
+    let mut fires_next_pass: Option<u64> = None;
+    for instant in candidates {
+        let occurrence_id =
+            session_occurrence_id(item_id, &effect.effect_id, &approval.digest, instant);
+        let progress = journal.progress(&occurrence_id);
+        // Spent or already executing (`plan` skips these), or crash
+        // residue (`plan` resolves it through the crashed lane, never a
+        // fire).
+        if progress.terminal.is_some() || progress.started.is_some() || progress.prepared {
+            continue;
+        }
+        if instant > now_ms {
+            consider_upcoming(instant, &mut upcoming);
+        } else if now_ms.saturating_sub(instant) <= staleness_ms {
+            // Fires on the next pass (the missed lane takes the stale
+            // ones — a miss is not a fire).
+            fires_next_pass = Some(fires_next_pass.map_or(instant, |cur| cur.min(instant)));
+        }
+    }
+    fires_next_pass.or(upcoming)
+}
+
+/// When quiet hours would defer this item's pending reminder, the instant
+/// delivery would actually happen — the dashboard's display-only
+/// derivation (decorated onto the DTO at the serving seam, never stored).
+/// `None` when nothing defers: no due instant, item not open, the
+/// occurrence already spent, reminders disabled (nothing will deliver at
+/// all — absence claims nothing), no quiet hours, or the delivery
+/// instant falls outside the window.
+///
+/// `minute_of_day` is the driver-owned local-time conversion (epoch ms →
+/// minutes since local midnight), injected so this stays clock- and
+/// timezone-free like the rest of the planner. For a due instant
+/// (`due_ms <= now_ms`) this is exactly `plan`'s deferral — the window
+/// end measured from now; for a future instant it is the same pure
+/// window math evaluated at the due instant (windows spanning midnight
+/// included, via [`QuietHours::ms_until_end`]).
+pub(crate) fn reminder_deferred_until(
+    item: &AgendaItem,
+    journal: &OccurrenceJournal,
+    policy: &ReminderPolicy,
+    now_ms: u64,
+    minute_of_day: &dyn Fn(u64) -> u16,
+) -> Option<u64> {
+    if !policy.enabled || item.status != AgendaStatus::Open {
+        return None;
+    }
+    let due_ms = item.due_ms?;
+    let quiet = policy.quiet_hours.as_ref()?;
+    let progress = journal.progress(&occurrence_id(&item.id, due_ms));
+    if progress.terminal.is_some() {
+        return None; // spent — nothing pending to defer
+    }
+    // The instant delivery would be attempted: now for a due reminder
+    // (`plan` defers due deliveries from now), the due instant itself
+    // for a future one.
+    let deliver_at = due_ms.max(now_ms);
+    let remaining = quiet.ms_until_end(minute_of_day(deliver_at))?;
+    Some(deliver_at + remaining)
+}
+
+/// Stamp the DTO's display-only planner fields onto `items` in place:
+/// [`effect_next_fire_ms`] on every open item's effects and
+/// [`reminder_deferred_until`] on every item. The serving seam
+/// (`AgendaHandle`) calls this on freshly folded clones with the clock
+/// of the read — the fold product itself always carries `None`.
+pub(crate) fn decorate_planner_fields(
+    items: &mut [AgendaItem],
+    journal: &OccurrenceJournal,
+    policy: &ReminderPolicy,
+    now_ms: u64,
+    minute_of_day: &dyn Fn(u64) -> u16,
+) {
+    let staleness_ms = policy.staleness_ms();
+    for item in items.iter_mut() {
+        item.deferred_until = reminder_deferred_until(item, journal, policy, now_ms, minute_of_day);
+        if item.status != AgendaStatus::Open {
+            continue; // the planner considers open items only — nothing fires
+        }
+        for effect in &mut item.effects {
+            effect.next_fire_ms =
+                effect_next_fire_ms(&item.id, effect, journal, staleness_ms, now_ms);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::{AgendaKind, AgendaProvenance};
@@ -770,6 +945,7 @@ mod tests {
             refs: Vec::new(),
             part_of: None,
             relates_to: Vec::new(),
+            deferred_until: None,
         }
     }
 
@@ -1161,6 +1337,7 @@ mod tests {
             last_run: None,
             consecutive_failures: 0,
             requested: Vec::new(),
+            next_fire_ms: None,
         });
         base
     }
@@ -1471,6 +1648,7 @@ mod tests {
                 last_run: None,
                 consecutive_failures: 0,
                 requested: Vec::new(),
+                next_fire_ms: None,
             });
             base
         };
@@ -1486,5 +1664,440 @@ mod tests {
         assert_eq!(planned.spawn.len(), 1);
         assert!(!planned.spawn[0].recurring);
         assert_eq!(planned.next_wake_ms, None);
+    }
+
+    // ---- Display-only planner derivations (next_fire_ms / deferred_until) ----
+
+    /// An approved one-shot item (no recurrence), effect id `ef-1`.
+    fn one_shot_item(id: &str, fire_at: u64) -> AgendaItem {
+        let mut base = item(id, AgendaStatus::Open, None);
+        let manifest = SessionManifest {
+            goal: "one shot".into(),
+            fire_at_ms: fire_at,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+        };
+        let digest = super::super::types::manifest_digest(id, "ef-1", &manifest);
+        base.effects.push(AgendaEffect {
+            effect_id: "ef-1".into(),
+            digest: digest.clone(),
+            manifest,
+            proposed_ms: 1,
+            proposed_principal: None,
+            proposed_session_id: None,
+            proposed_kind: None,
+            approval: Some(AgendaApproval {
+                digest,
+                at_ms: 2,
+                principal: Some("owner".into()),
+                kind: Some("dashboard".into()),
+            }),
+            last_run: None,
+            consecutive_failures: 0,
+            requested: Vec::new(),
+            next_fire_ms: None,
+        });
+        base
+    }
+
+    /// Journal `prepared` + a terminal state for one occurrence id.
+    fn spend_occurrence(journal: &mut OccurrenceJournal, occurrence_id: &str, at_ms: u64) {
+        for state in [OccurrenceState::Prepared, OccurrenceState::Completed] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms,
+                    occurrence_id: occurrence_id.to_string(),
+                    item_id: "x".into(),
+                    due_ms: at_ms,
+                    state,
+                    urgency: None,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+    }
+
+    /// The differential pin: whatever `effect_next_fire_ms` claims must
+    /// be exactly what `plan` does with the same inputs — a due claim is
+    /// a spawn on the next pass, a future claim is the wake instant, and
+    /// `None` plans no spawn and no wake (single-effect, no-reminder
+    /// fixtures, so every plan output is attributable to the effect).
+    fn assert_agrees_with_planner(
+        item: &AgendaItem,
+        journal: &OccurrenceJournal,
+        policy: &ReminderPolicy,
+        now_ms: u64,
+    ) -> Option<u64> {
+        let effect = &item.effects[0];
+        let next = effect_next_fire_ms(&item.id, effect, journal, policy.staleness_ms(), now_ms);
+        let planned = plan(
+            std::slice::from_ref(item),
+            journal,
+            policy,
+            now_ms,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        match next {
+            Some(instant) if instant <= now_ms => {
+                assert!(
+                    planned
+                        .spawn
+                        .iter()
+                        .any(|s| s.effect_id == effect.effect_id && s.fire_at_ms == instant),
+                    "claimed due fire at {instant} must spawn: {planned:?}"
+                );
+            }
+            Some(instant) => {
+                assert_eq!(
+                    planned.next_wake_ms,
+                    Some(instant),
+                    "claimed future fire must be the planner's wake"
+                );
+            }
+            None => {
+                assert!(
+                    planned.spawn.is_empty(),
+                    "None must mean no spawn: {planned:?}"
+                );
+                assert_eq!(
+                    planned.next_wake_ms, None,
+                    "None must mean no series wake: {planned:?}"
+                );
+            }
+        }
+        next
+    }
+
+    /// The ratified next-fire matrix, each case pinned to the planner by
+    /// the differential assertion.
+    #[test]
+    fn next_fire_agrees_with_the_planner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let staleness = policy.staleness_ms();
+        // Far enough from epoch that a beyond-staleness instant exists.
+        let now = staleness + 10 * EVERY;
+
+        // One-shot, approved, upcoming → its instant.
+        let pending = one_shot_item("os-pending", now + 5_000);
+        assert_eq!(
+            assert_agrees_with_planner(&pending, &journal, &policy, now),
+            Some(now + 5_000)
+        );
+
+        // One-shot, approved, due within the window → still its instant.
+        let due = one_shot_item("os-due", now - 5_000);
+        assert_eq!(
+            assert_agrees_with_planner(&due, &journal, &policy, now),
+            Some(now - 5_000)
+        );
+
+        // One-shot finished (terminal run) → None.
+        let finished = one_shot_item("os-done", now - 5_000);
+        {
+            let effect = &finished.effects[0];
+            let occ = session_occurrence_id(
+                &finished.id,
+                &effect.effect_id,
+                &effect.approval.as_ref().unwrap().digest,
+                now - 5_000,
+            );
+            spend_occurrence(&mut journal, &occ, now - 4_000);
+        }
+        assert_eq!(
+            assert_agrees_with_planner(&finished, &journal, &policy, now),
+            None
+        );
+
+        // One-shot past the staleness window, never fired → the planner
+        // misses it (a miss is not a fire): no next fire, no spawn.
+        let stale = one_shot_item("os-stale", now.saturating_sub(staleness + 1_000));
+        assert_eq!(
+            assert_agrees_with_planner(&stale, &journal, &policy, now),
+            None
+        );
+
+        // Unapproved → None.
+        let mut unapproved = one_shot_item("os-unapproved", now + 5_000);
+        unapproved.effects[0].approval = None;
+        assert_eq!(
+            assert_agrees_with_planner(&unapproved, &journal, &policy, now),
+            None
+        );
+
+        // Standing series not yet started → the first instant.
+        let rec = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let ahead = standing_item("st-ahead", now + EVERY, rec);
+        assert_eq!(
+            assert_agrees_with_planner(&ahead, &journal, &policy, now),
+            Some(now + EVERY)
+        );
+
+        // Standing, catch-up due (latest due instant unspent) → that
+        // instant, not a burst of older ones.
+        let started = standing_item("st-due", now - (2 * EVERY + 1_000), rec);
+        assert_eq!(
+            assert_agrees_with_planner(&started, &journal, &policy, now),
+            Some(now - 1_000)
+        );
+
+        // Same series with the due instant spent → the next future one.
+        let caught_up = standing_item("st-caught-up", now - (2 * EVERY + 1_000), rec);
+        {
+            let effect = &caught_up.effects[0];
+            let occ = session_occurrence_id(
+                &caught_up.id,
+                &effect.effect_id,
+                &effect.approval.as_ref().unwrap().digest,
+                now - 1_000,
+            );
+            spend_occurrence(&mut journal, &occ, now - 900);
+        }
+        assert_eq!(
+            assert_agrees_with_planner(&caught_up, &journal, &policy, now),
+            Some(now + EVERY - 1_000)
+        );
+
+        // Suspended (failure streak at threshold) → None.
+        let mut suspended = standing_item("st-suspended", now - EVERY, rec);
+        suspended.effects[0].consecutive_failures =
+            super::super::types::DEFAULT_SUSPEND_AFTER_FAILURES;
+        assert_eq!(
+            assert_agrees_with_planner(&suspended, &journal, &policy, now),
+            None
+        );
+
+        // Series exhausted by max_occurrences (both instants spent) → None.
+        let bounded = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: None,
+            max_occurrences: Some(2),
+            suspend_after_failures: None,
+        };
+        let exhausted = standing_item("st-exhausted", now - 3 * EVERY, bounded);
+        {
+            let effect = &exhausted.effects[0];
+            let digest = &effect.approval.as_ref().unwrap().digest;
+            for instant in [now - 3 * EVERY, now - 2 * EVERY] {
+                let occ = session_occurrence_id(&exhausted.id, &effect.effect_id, digest, instant);
+                spend_occurrence(&mut journal, &occ, instant);
+            }
+        }
+        assert_eq!(
+            assert_agrees_with_planner(&exhausted, &journal, &policy, now),
+            None
+        );
+
+        // Series exhausted by until_ms (last in-bound instant spent) → None.
+        let until = RecurrenceSpec {
+            every_ms: EVERY,
+            until_ms: Some(now - 2 * EVERY),
+            max_occurrences: None,
+            suspend_after_failures: None,
+        };
+        let expired = standing_item("st-expired", now - 3 * EVERY, until);
+        {
+            let effect = &expired.effects[0];
+            let digest = &effect.approval.as_ref().unwrap().digest;
+            for instant in [now - 3 * EVERY, now - 2 * EVERY] {
+                let occ = session_occurrence_id(&expired.id, &effect.effect_id, digest, instant);
+                spend_occurrence(&mut journal, &occ, instant);
+            }
+        }
+        assert_eq!(
+            assert_agrees_with_planner(&expired, &journal, &policy, now),
+            None
+        );
+
+        // Owner-requested extra occurrence pending → it fires on the next
+        // pass, ahead of the series' future instant.
+        let mut requested = standing_item("st-requested", now + EVERY, rec);
+        requested.effects[0].requested.push(AgendaRequestedRun {
+            at_ms: now - 2_000,
+            principal: Some("owner".into()),
+            kind: Some("dashboard".into()),
+        });
+        assert_eq!(
+            assert_agrees_with_planner(&requested, &journal, &policy, now),
+            Some(now - 2_000)
+        );
+
+        // The same request journal-spent → back to the series' instant.
+        let mut request_spent = standing_item("st-request-spent", now + EVERY, rec);
+        request_spent.effects[0].requested.push(AgendaRequestedRun {
+            at_ms: now - 2_000,
+            principal: None,
+            kind: None,
+        });
+        {
+            let effect = &request_spent.effects[0];
+            let occ = session_occurrence_id(
+                &request_spent.id,
+                &effect.effect_id,
+                &effect.approval.as_ref().unwrap().digest,
+                now - 2_000,
+            );
+            spend_occurrence(&mut journal, &occ, now - 1_900);
+        }
+        assert_eq!(
+            assert_agrees_with_planner(&request_spent, &journal, &policy, now),
+            Some(now + EVERY)
+        );
+    }
+
+    /// Quiet-hours deferral display: window end for due and future
+    /// instants (midnight span included), and every `None` rule —
+    /// disabled policy, no window, outside the window, spent occurrence,
+    /// non-open item, no due.
+    #[test]
+    fn deferred_until_mirrors_the_quiet_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let mut policy = ReminderPolicy {
+            quiet_hours: Some(QuietHours {
+                start_min: 22 * 60,
+                end_min: 8 * 60,
+            }),
+            ..ReminderPolicy::default()
+        };
+        let now: u64 = 100_000_000;
+        let hour = 3_600_000u64;
+
+        // Due reminder, now inside the overnight window at 23:00 → the
+        // window ends 9h later, measured from now (plan's own deferral).
+        let due = item("q-due", AgendaStatus::Open, Some(now - 1_000));
+        let at_23 = |_: u64| 23 * 60;
+        assert_eq!(
+            reminder_deferred_until(&due, &journal, &policy, now, &at_23),
+            Some(now + 9 * hour)
+        );
+
+        // Midnight-spanning arithmetic on the other side: 03:00 → 5h left.
+        let at_3 = |_: u64| 3 * 60;
+        assert_eq!(
+            reminder_deferred_until(&due, &journal, &policy, now, &at_3),
+            Some(now + 5 * hour)
+        );
+
+        // Future reminder whose instant lands inside the window: the
+        // deferral is measured from the DUE instant, not from now.
+        let future_due = now + 10 * hour;
+        let future = item("q-future", AgendaStatus::Open, Some(future_due));
+        assert_eq!(
+            reminder_deferred_until(&future, &journal, &policy, now, &at_23),
+            Some(future_due + 9 * hour)
+        );
+
+        // Outside the window → no deferral.
+        let at_noon = |_: u64| 12 * 60;
+        assert_eq!(
+            reminder_deferred_until(&due, &journal, &policy, now, &at_noon),
+            None
+        );
+
+        // Reminders disabled → None (nothing will deliver at all; the
+        // field deliberately does not invent an enabled/disabled signal).
+        policy.enabled = false;
+        assert_eq!(
+            reminder_deferred_until(&due, &journal, &policy, now, &at_23),
+            None
+        );
+        policy.enabled = true;
+
+        // No quiet hours → None.
+        let open_policy = ReminderPolicy::default();
+        assert_eq!(
+            reminder_deferred_until(&due, &journal, &open_policy, now, &at_23),
+            None
+        );
+
+        // Spent occurrence → None (nothing pending to defer).
+        let spent = item("q-spent", AgendaStatus::Open, Some(now - 1_000));
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: now - 500,
+                occurrence_id: occurrence_id("q-spent", now - 1_000),
+                item_id: "q-spent".into(),
+                due_ms: now - 1_000,
+                state: OccurrenceState::Delivered,
+                urgency: None,
+                session_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            reminder_deferred_until(&spent, &journal, &policy, now, &at_23),
+            None
+        );
+
+        // Non-open and due-less items → None.
+        let done = item("q-done", AgendaStatus::Done, Some(now - 1_000));
+        assert_eq!(
+            reminder_deferred_until(&done, &journal, &policy, now, &at_23),
+            None
+        );
+        let no_due = item("q-no-due", AgendaStatus::Open, None);
+        assert_eq!(
+            reminder_deferred_until(&no_due, &journal, &policy, now, &at_23),
+            None
+        );
+    }
+
+    /// The decoration seam stamps both fields, and serde keeps them
+    /// additive: absent when `None`, plain numbers when set.
+    #[test]
+    fn decoration_serializes_additively() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy {
+            quiet_hours: Some(QuietHours {
+                start_min: 22 * 60,
+                end_min: 8 * 60,
+            }),
+            ..ReminderPolicy::default()
+        };
+        let now = 50 * EVERY;
+
+        // Undecorated fold product: neither key serializes.
+        let plain = one_shot_item("ser-plain", now + 5_000);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("deferred_until").is_none());
+        assert!(json["effects"][0].get("next_fire_ms").is_none());
+
+        // Decorated: an open item with a due reminder inside the window
+        // and an approved upcoming one-shot carries both fields.
+        let mut items = vec![plain];
+        items[0].due_ms = Some(now - 1_000);
+        let at_23 = |_: u64| 23 * 60;
+        decorate_planner_fields(&mut items, &journal, &policy, now, &at_23);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(
+            json["deferred_until"].as_u64(),
+            Some(now + 9 * 3_600_000u64)
+        );
+        assert_eq!(
+            json["effects"][0]["next_fire_ms"].as_u64(),
+            Some(now + 5_000)
+        );
+
+        // Non-open items keep every decoration at None.
+        let mut done = vec![one_shot_item("ser-done", now + 5_000)];
+        done[0].status = AgendaStatus::Done;
+        done[0].due_ms = Some(now - 1_000);
+        decorate_planner_fields(&mut done, &journal, &policy, now, &at_23);
+        assert_eq!(done[0].deferred_until, None);
+        assert_eq!(done[0].effects[0].next_fire_ms, None);
     }
 }

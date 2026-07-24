@@ -382,6 +382,15 @@ pub struct AgendaEffect {
     /// re-propose and revoke (a request exists only under an approval).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) requested: Vec<AgendaRequestedRun>,
+    /// Display-only planner derivation: the next instant this effect
+    /// would actually fire ([`super::reminders::effect_next_fire_ms`] —
+    /// the real planner math, so frontends never reimplement it), or
+    /// `None` when nothing will fire (unapproved, suspended, spent,
+    /// exhausted). Decorated at the serving seam
+    /// ([`super::AgendaHandle`]) with the clock of the read; always
+    /// `None` in the fold product, never folded from ops, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) next_fire_ms: Option<u64>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -522,6 +531,17 @@ pub struct AgendaItem {
     /// only — surfaces render the undirected union.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) relates_to: Vec<AgendaRelation>,
+    /// Display-only planner derivation: when the owner's quiet hours
+    /// would defer this item's pending reminder, the instant delivery
+    /// would actually happen
+    /// ([`super::reminders::reminder_deferred_until`] — the planner's
+    /// own quiet-window math). `None` when nothing defers — including
+    /// reminders disabled (nothing will deliver at all; absence claims
+    /// nothing). Decorated at the serving seam ([`super::AgendaHandle`])
+    /// with the clock of the read; always `None` in the fold product,
+    /// never folded from ops, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deferred_until: Option<u64>,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -1378,6 +1398,7 @@ pub(crate) fn apply_op(
                     refs: Vec::new(),
                     part_of: None,
                     relates_to: Vec::new(),
+                    deferred_until: None,
                 },
             );
             None
@@ -1716,6 +1737,7 @@ pub(crate) fn apply_op(
                 last_run: None,
                 consecutive_failures: 0,
                 requested: Vec::new(),
+                next_fire_ms: None,
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
                 Some(existing) => *existing = effect,
