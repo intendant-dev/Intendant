@@ -70,6 +70,7 @@ pub(crate) use tools_ask::{
 // clean the process-global registry through this.
 #[cfg(test)]
 pub(crate) use tools_ask::unregister_pending_ask;
+mod tools_codex_cloud;
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
@@ -720,6 +721,22 @@ impl IntendantServer {
             }
             "get_controller_loop_status" => {
                 Ok(text_tool_result(self.get_controller_loop_status().await))
+            }
+            "list_codex_cloud_workers" => {
+                let params = parse_params::<ListCodexCloudWorkersParams>(args)?;
+                Ok(text_tool_result(
+                    self.list_codex_cloud_workers(params).await,
+                ))
+            }
+            "submit_codex_cloud_task" => {
+                let params = parse_params::<SubmitCodexCloudTaskParams>(args)?;
+                Ok(text_tool_result(self.submit_codex_cloud_task(params).await))
+            }
+            "follow_up_codex_cloud_task" => {
+                let params = parse_params::<FollowUpCodexCloudTaskParams>(args)?;
+                Ok(text_tool_result(
+                    self.follow_up_codex_cloud_task(params).await,
+                ))
             }
             "browser_workspace_providers" => {
                 Ok(text_tool_result(self.browser_workspace_providers().await))

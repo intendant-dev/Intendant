@@ -99,6 +99,43 @@ pub struct StartTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListCodexCloudWorkersParams {
+    /// Optional Codex Cloud environment identifier.
+    #[serde(default, alias = "environmentId")]
+    pub environment_id: Option<String>,
+    /// Maximum tasks to refresh from the provider (1-20, default 20).
+    #[serde(default)]
+    pub limit: Option<u8>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubmitCodexCloudTaskParams {
+    /// Codex Cloud environment identifier.
+    #[serde(alias = "environmentId")]
+    pub environment_id: String,
+    /// Task prompt to execute in Codex Cloud.
+    pub prompt: String,
+    /// Optional Git branch. The Codex CLI uses its normal default when omitted.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Best-of-N assistant attempts (default 1).
+    #[serde(default)]
+    pub attempts: Option<u16>,
+    /// Optional local lease title used until provider refresh returns its title.
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FollowUpCodexCloudTaskParams {
+    /// Codex Cloud task id (task_…) to continue with a new turn.
+    #[serde(alias = "taskId")]
+    pub task_id: String,
+    /// Follow-up prompt appended as a new user turn on the task.
+    pub prompt: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionNoteImageParams {
     /// Image MIME type: image/png, image/jpeg, image/gif, image/webp, or image/bmp.
     pub media_type: String,

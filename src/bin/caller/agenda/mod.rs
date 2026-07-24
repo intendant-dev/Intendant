@@ -50,14 +50,14 @@ pub(crate) use store::{
     file_ref_drift, AgendaError, AgendaOpsPage, AgendaStore, AGENDA_OPS_DEFAULT_LIMIT,
 };
 pub(crate) use types::{
-    AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus,
+    AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaStatus,
 };
 // Test-support seam: cross-module tests (supervisor delivery, blocking
 // waiter) drive real handle-side resolutions with structured content.
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
 #[cfg(test)]
-pub(crate) use types::{AgendaAskResolution, AgendaKind};
+pub(crate) use types::AgendaAskResolution;
 
 use std::path::{Path, PathBuf};
 
