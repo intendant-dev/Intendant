@@ -793,9 +793,20 @@ fn now_ms() -> u64 {
 }
 
 fn local_minute_of_day() -> u16 {
+    local_minute_of_day_at(now_ms())
+}
+
+/// Minutes since local midnight at an arbitrary instant — the
+/// driver-owned timezone conversion the pure planner functions inject
+/// (`plan`'s quiet gate uses it at now; the display-only
+/// `reminder_deferred_until` derivation also evaluates it at a future
+/// due instant).
+pub(crate) fn local_minute_of_day_at(instant_ms: u64) -> u16 {
     use chrono::Timelike;
-    let now = chrono::Local::now();
-    (now.hour() * 60 + now.minute()) as u16
+    let local = chrono::DateTime::<chrono::Local>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(instant_ms),
+    );
+    (local.hour() * 60 + local.minute()) as u16
 }
 
 #[cfg(test)]

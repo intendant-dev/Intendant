@@ -347,6 +347,7 @@ mod tests {
             refs: Vec::new(),
             part_of: None,
             relates_to: Vec::new(),
+            deferred_until: None,
         }
     }
 

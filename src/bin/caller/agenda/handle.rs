@@ -8,7 +8,9 @@
 //! need synchronous results (the minted id, a 400/404), which the
 //! request/response surfaces already provide.
 
-use super::reminders::{ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore};
+use super::reminders::{
+    OccurrenceJournal, ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore,
+};
 use super::spawn_project::{resolve_spawn_project, SessionSpawnContext};
 use super::store::{AgendaError, AgendaStore, OccurrenceWriteBack};
 use super::types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem};
@@ -32,6 +34,12 @@ pub(crate) struct AgendaHandle {
     /// tests; the wiring edge installs the real one via
     /// [`Self::with_spawn_context`].
     spawn_ctx: SessionSpawnContext,
+    /// Read-only occurrence-journal reader for the display-only planner
+    /// decorations (`effects[].next_fire_ms`, `deferred_until`) — lazily
+    /// opened, staleness-refreshed per read. The scheduler owns its own
+    /// writer instance; both converge on the same file exactly like
+    /// co-homed daemons do.
+    decoration_journal: Mutex<Option<OccurrenceJournal>>,
 }
 
 impl AgendaHandle {
@@ -49,6 +57,7 @@ impl AgendaHandle {
                 home: dir.to_path_buf(),
                 default_project_root: None,
             },
+            decoration_journal: Mutex::new(None),
         }
     }
 
@@ -219,12 +228,16 @@ impl AgendaHandle {
         };
         let proposed = matches!(&cmd, AgendaCommand::ProposeEffect { .. });
         let actor_session = actor.as_ref().and_then(|actor| actor.session_id.clone());
-        let (item, counts) = {
+        let (mut item, counts) = {
             let mut store = self.lock();
             let item = store.apply_command(cmd, actor, now_ms())?;
             let counts = store.counts();
             (item, counts)
         };
+        // Decorate once, outside the store lock: the broadcast, the ask
+        // emissions below, and the returned command response all carry
+        // the same display-only planner fields.
+        self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
@@ -356,12 +369,13 @@ impl AgendaHandle {
         let target = self
             .open_ask_item(ask_id)
             .ok_or_else(|| AgendaError::NotFound(format!("no open ask {ask_id}")))?;
-        let (item, counts) = {
+        let (mut item, counts) = {
             let mut store = self.lock();
             let item = store.dismiss_question(&target.id, action, None, now_ms())?;
             let counts = store.counts();
             (item, counts)
         };
+        self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
@@ -404,7 +418,7 @@ impl AgendaHandle {
         questions: Vec<crate::mcp::AskUserQuestionParams>,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (item, counts) = {
+        let (mut item, counts) = {
             let mut store = self.lock();
             let item = store.apply_command(AgendaCommand::Ask { questions }, actor, now_ms())?;
             if let Some(ask) = &item.ask {
@@ -413,6 +427,7 @@ impl AgendaHandle {
             let counts = store.counts();
             (item, counts)
         };
+        self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
@@ -472,12 +487,13 @@ impl AgendaHandle {
         delivered: bool,
         session_id: Option<String>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (item, counts) = {
+        let (mut item, counts) = {
             let mut store = self.lock();
             let item = store.record_ask_delivery(item_id, delivered, session_id, now_ms())?;
             let counts = store.counts();
             (item, counts)
         };
+        self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
@@ -491,12 +507,13 @@ impl AgendaHandle {
         &self,
         write: OccurrenceWriteBack<'_>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (item, counts) = {
+        let (mut item, counts) = {
             let mut store = self.lock();
             let item = store.record_occurrence(write, now_ms())?;
             let counts = store.counts();
             (item, counts)
         };
+        self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
@@ -505,13 +522,18 @@ impl AgendaHandle {
     }
 
     /// Fresh snapshot: every item oldest-first, counts, and how many log
-    /// lines this build preserved but could not fold.
+    /// lines this build preserved but could not fold. Items carry the
+    /// display-only planner decorations, computed with this read's clock.
     pub(crate) fn snapshot(&self) -> (Vec<AgendaItem>, AgendaCounts, u64) {
-        let mut store = self.lock();
-        if let Err(err) = store.refresh_if_stale() {
-            eprintln!("[agenda] refresh before read failed: {err}");
-        }
-        (store.snapshot(), store.counts(), store.skipped_lines())
+        let (mut items, counts, skipped) = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before read failed: {err}");
+            }
+            (store.snapshot(), store.counts(), store.skipped_lines())
+        };
+        self.decorate_items(&mut items);
+        (items, counts, skipped)
     }
 
     /// One page of the raw op log (read-only; the `GET /api/agenda/ops`
@@ -535,6 +557,48 @@ impl AgendaHandle {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// Stamp the display-only planner derivations
+    /// (`effects[].next_fire_ms`, `deferred_until`) onto freshly folded
+    /// item clones, with the clock of this read — the serving seam for
+    /// every client-facing copy (list snapshots, command responses,
+    /// `agenda_changed` broadcasts). Computed by the REAL planner
+    /// functions ([`super::reminders::decorate_planner_fields`]), so
+    /// frontends never reimplement the math. Journal trouble degrades to
+    /// undecorated items (absence claims nothing). Never called under
+    /// the store lock — the journal reader has its own.
+    fn decorate_items(&self, items: &mut [AgendaItem]) {
+        let mut guard = match self.decoration_journal.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_none() {
+            match OccurrenceJournal::open(&self.dir) {
+                Ok(journal) => *guard = Some(journal),
+                Err(err) => {
+                    eprintln!("[agenda] opening journal for decoration failed: {err}");
+                    return;
+                }
+            }
+        }
+        let Some(journal) = guard.as_mut() else {
+            return;
+        };
+        if let Err(err) = journal.refresh_if_stale() {
+            eprintln!("[agenda] journal refresh for decoration failed: {err}");
+        }
+        super::reminders::decorate_planner_fields(
+            items,
+            journal,
+            &self.reminder_policy(),
+            now_ms(),
+            &super::scheduler::local_minute_of_day_at,
+        );
+    }
+
+    fn decorate_item(&self, item: &mut AgendaItem) {
+        self.decorate_items(std::slice::from_mut(item));
     }
 }
 
@@ -1680,5 +1744,82 @@ mod tests {
         assert_eq!(page.log_len, APPENDS + 1);
         assert_eq!(page.ops.len(), (APPENDS + 1) as usize);
         assert_eq!(page.next_since, page.log_len);
+    }
+
+    /// The serving seam stamps the display-only planner fields on every
+    /// client-facing copy: the command response, the `agenda_changed`
+    /// broadcast, and the snapshot all carry `next_fire_ms` for an
+    /// approved upcoming effect — while the fold product on disk never
+    /// does (the decoration is recomputed per read, never stored).
+    #[test]
+    fn serving_seam_decorates_next_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "weekly digest".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let fire_at = now_ms() + 60 * 60_000;
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    recurrence: None,
+                    id: item.id.clone(),
+                    goal: "summarize the week".into(),
+                    fire_at_ms: fire_at,
+                    orchestrate: false,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        // Proposed but unapproved: nothing fires, so no decoration.
+        assert_eq!(proposed.effects[0].next_fire_ms, None);
+
+        let approved = handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                actor("dashboard", None),
+            )
+            .unwrap();
+        // The command response carries the derivation…
+        assert_eq!(approved.effects[0].next_fire_ms, Some(fire_at));
+        // …the broadcast copy is the same decorated item…
+        let mut event_item = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::AgendaChanged { item: changed, .. } = event {
+                event_item = Some(changed);
+            }
+        }
+        assert_eq!(
+            event_item.expect("agenda_changed").effects[0].next_fire_ms,
+            Some(fire_at)
+        );
+        // …and so does every snapshot read.
+        let (items, _, _) = handle.snapshot();
+        assert_eq!(items[0].effects[0].next_fire_ms, Some(fire_at));
+        // No quiet hours configured: the reminder field stays absent.
+        assert_eq!(items[0].deferred_until, None);
+
+        // The fold product itself is undecorated: a fresh store sees the
+        // ops, not the derivation.
+        let store = AgendaStore::open(dir.path()).unwrap();
+        let raw = store.snapshot();
+        assert_eq!(raw[0].effects[0].next_fire_ms, None);
     }
 }

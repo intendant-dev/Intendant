@@ -430,6 +430,19 @@ window while the daemon is down, or is interrupted before launch
 confirmation, fails closed and is not automatically retried. The outcome is
 written back to `effects[].last_run`.
 
+Two display-only fields ride the served item DTO so frontends never
+reimplement planner math — both computed at read time by the planner's own
+functions, never stored, never folded from operations. `effects[].next_fire_ms`
+is the next instant the effect would actually fire (approval-gated,
+suspension-aware, journal-deduped, series bounds respected; absent when
+nothing will fire). `deferred_until` is the instant a quiet-hours-deferred
+reminder would actually deliver (window end, midnight-spanning windows
+included; absent when nothing defers — including reminders disabled, where
+inventing a value would claim a delivery that never comes). They are stamped
+at the serving seam — list snapshots, command responses, `agenda_changed`
+broadcasts, the MCP tool — with the clock of that read, and are absent from
+the wire when unset, so the payload stays additive for older clients.
+
 The scheduler observes dispatch receipts and completion events through the
 bounded broadcast EventBus. A lagged receiver is logged but not reconciled
 in-process; under extreme event pressure an occurrence can remain
@@ -464,8 +477,9 @@ seam at the authenticated edge — never parsed from the request. Coverage:
   no label.
 
 For display, the ledger snapshot response carries a `sessions` join map
-beside the items (never fields on them — the item DTO stays the pure fold
-product): each recorded session id resolves through the external wrapper
+beside the items (never fields on them — join data stays off the item DTO,
+which carries the fold product plus only the two display-only planner
+decorations above): each recorded session id resolves through the external wrapper
 index to its backend **conversation** (superseded wrapper incarnations
 included) or to the native session's log dir, with the session's human name
 and the Sessions-tab row key. The dashboard renders the resolved name as a
