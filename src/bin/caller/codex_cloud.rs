@@ -288,6 +288,7 @@ pub async fn run(args: Vec<String>) -> Result<(), String> {
         "diff" => run_passthrough("diff", &args[1..]).await,
         "pull" => run_pull(&args[1..]).await,
         "probe" => run_probe(&args[1..]).await,
+        "followup" | "follow-up" | "message" => run_followup(&args[1..]).await,
         "bootstrap" => run_bootstrap(&args[1..]),
         "attachment" => run_attachment(&args[1..]),
         "prune" => run_prune(&args[1..]),
@@ -926,6 +927,518 @@ fn record_worker_fingerprint(store_path: &Path, task_id: &str, fingerprint: Work
         lease.worker = Some(fingerprint);
         let _ = save_store(store_path, &store);
     }
+}
+
+// ── Follow-ups over the provider's private web backend ─────────────────
+//
+// The product supports follow-up turns on a Cloud task, but the public
+// Codex CLI has no verb for them (exec/status/list/apply/diff only;
+// upstream issue #24777 is an unimplemented proposal). The 2026-07-24
+// reverse-engineering validation proved the web UI's own backend accepts
+// a browser-free follow-up POST authenticated by the Codex CLI's stored
+// ChatGPT login. This lane rides that: deliberately narrow, serialized
+// per task, and fail-closed — the endpoint and schemas are private, so
+// 404/409/422 or any unrecognized shape is a compatibility break to
+// surface, never retry around. Prefer the official command the moment
+// upstream ships one. The two credential values (bearer token, account
+// id) never reach stdout, errors, logs, or receipts.
+
+const DEFAULT_WHAM_BACKEND: &str = "https://chatgpt.com/backend-api";
+
+fn wham_backend() -> String {
+    std::env::var("INTENDANT_CODEX_CLOUD_BACKEND")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_WHAM_BACKEND.to_string())
+}
+
+fn wham_user_agent() -> String {
+    format!("intendant/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The Codex CLI's stored ChatGPT login, read from its own `auth.json`.
+/// Both fields are credentials: deliberately not Serialize, and Debug is
+/// hand-written to redact them.
+pub(crate) struct CodexAuth {
+    access_token: String,
+    account_id: String,
+}
+
+impl std::fmt::Debug for CodexAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexAuth")
+            .field("access_token", &"<redacted>")
+            .field("account_id", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Upstream's own state-home convention (`CODEX_HOME`, default `~/.codex`).
+fn codex_home() -> PathBuf {
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        return PathBuf::from(path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".codex")
+}
+
+fn load_codex_auth(codex_home: &Path) -> Result<CodexAuth, String> {
+    let path = codex_home.join("auth.json");
+    let bytes = std::fs::read(&path).map_err(|e| {
+        format!(
+            "read Codex CLI login {}: {e}; follow-ups reuse the `codex login` ChatGPT session",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse Codex CLI login {}: {e}", path.display()))?;
+    let tokens = value
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "{} has no ChatGPT login tokens (API-key-only auth cannot drive Cloud follow-ups); run `codex login`",
+                path.display()
+            )
+        })?;
+    let access_token = tokens
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| format!("{} has no access token; run `codex login`", path.display()))?
+        .to_string();
+    let account_id = tokens
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            tokens
+                .get("id_token")
+                .and_then(serde_json::Value::as_str)
+                .and_then(chatgpt_account_id_from_id_token)
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} carries no ChatGPT account id; re-run `codex login` with a current Codex CLI",
+                path.display()
+            )
+        })?;
+    Ok(CodexAuth {
+        access_token,
+        account_id,
+    })
+}
+
+/// Older `auth.json` files carry the account id only inside the OpenID
+/// id_token's `https://api.openai.com/auth` claim. The JWT is our own
+/// local login file read for a header value — decoded, never verified.
+fn chatgpt_account_id_from_id_token(id_token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim())
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Observed wham id shapes: `task_e_…` tasks, `task_e_…~assttrn_e_…`
+/// assistant turns, `…~usrtrn_e_…` user turns. The follow-up POST demands
+/// the latest *assistant* turn id — the validation run got HTTP 404 for
+/// the predecessor user-turn id and HTTP 200 for the assistant turn.
+fn is_assistant_turn_id(turn_id: &str) -> bool {
+    turn_id.contains("~assttrn")
+}
+
+/// The exact recovered wire shape. `run_environment_in_qa_mode` is pinned
+/// to `false` — the only value the validation exercised.
+fn followup_body(task_id: &str, turn_id: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "follow_up": {
+            "task_id": task_id,
+            "turn_id": turn_id,
+            "run_environment_in_qa_mode": false,
+        },
+        "input_items": [{
+            "type": "message",
+            "role": "user",
+            "content": [{ "content_type": "text", "text": prompt }],
+        }],
+    })
+}
+
+/// Best-effort `current_turn_id` from the private task-detail response,
+/// checked at the two shapes observed (top level, nested `task`). Absence
+/// is a compatibility break the caller surfaces.
+fn current_turn_id(detail: &serde_json::Value) -> Option<String> {
+    [
+        detail.get("current_turn_id"),
+        detail
+            .get("task")
+            .and_then(|task| task.get("current_turn_id")),
+    ]
+    .into_iter()
+    .find_map(|candidate| {
+        candidate
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn collect_strings<'v>(value: &'v serde_json::Value, out: &mut Vec<&'v str>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// HTTP 200 alone is not success: the response must still reference the
+/// task (linkage), else the private schema changed under us. Fresh turn
+/// ids found in the response become the receipt (best-effort — their
+/// absence is tolerated, a broken linkage is not).
+fn validate_followup_response(
+    task_id: &str,
+    parent_turn_id: &str,
+    body: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let mut strings = Vec::new();
+    collect_strings(body, &mut strings);
+    if !strings.iter().any(|text| text.contains(task_id)) {
+        return Err(format!(
+            "the follow-up POST returned HTTP 200 but the response no longer references task {task_id} — treat this as a private-schema compatibility break and verify the task in the web UI"
+        ));
+    }
+    let mut new_turn_ids = Vec::new();
+    for text in strings {
+        let looks_like_turn =
+            text.starts_with("task_") && (text.contains("~assttrn") || text.contains("~usrtrn"));
+        if looks_like_turn && text != parent_turn_id && !new_turn_ids.iter().any(|id| id == text) {
+            new_turn_ids.push(text.to_string());
+        }
+    }
+    Ok(new_turn_ids)
+}
+
+/// Error framing for the private backend: 401/403 is login freshness with
+/// a local fix; 404/409/422 on known-good input is how a private schema
+/// announces a compatibility break — surfaced, never retried around.
+fn wham_error(status: u16, url: &str, body: &str) -> String {
+    let snippet: String = body.trim().chars().take(200).collect();
+    let detail = if snippet.is_empty() {
+        String::new()
+    } else {
+        format!(": {snippet}")
+    };
+    match status {
+        401 | 403 => format!(
+            "the Codex login was not accepted by {url} (HTTP {status}){detail}; refresh it with `codex login` (or any `codex cloud` command), then retry"
+        ),
+        404 | 409 | 422 => format!(
+            "{url} answered HTTP {status}{detail} — on a valid idle task this means the private follow-up endpoint changed shape (compatibility break); use the web UI and check whether upstream shipped an official follow-up command"
+        ),
+        _ => format!("{url} answered HTTP {status}{detail}"),
+    }
+}
+
+async fn wham_get_json(
+    client: &reqwest::Client,
+    url: &str,
+    auth: &CodexAuth,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .get(url)
+        .bearer_auth(&auth.access_token)
+        .header("chatgpt-account-id", &auth.account_id)
+        .header(reqwest::header::USER_AGENT, wham_user_agent())
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(wham_error(status.as_u16(), url, &text));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("parse {url} response: {e}"))
+}
+
+/// Receipt for an accepted follow-up. The credentials that obtained it are
+/// deliberately absent.
+#[derive(Debug, Serialize)]
+pub struct FollowupReceipt {
+    pub task_id: String,
+    /// The assistant turn the follow-up chained onto.
+    pub parent_turn_id: String,
+    /// Fresh turn ids referenced by the response (best-effort receipt).
+    pub new_turn_ids: Vec<String>,
+    pub task_url: String,
+    /// Terminal transitions observed by the pre-send idle refresh; callers
+    /// announce/park them like any refresh's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<TerminalTransition>,
+}
+
+/// A follow-up may only target an idle task: the provider runs one turn at
+/// a time and the posture is to reject rather than pile on. Provider truth
+/// comes from the public CLI — a fresh list refresh for window tasks, the
+/// upstream status verb's human line for a task outside the window.
+async fn ensure_task_idle(
+    codex: &str,
+    store_path: &Path,
+    task_id: &str,
+    attach_ttl_ms: u64,
+) -> Result<Vec<TerminalTransition>, String> {
+    let outcome = refresh_leases_with(codex, store_path, None, 20, None, attach_ttl_ms).await?;
+    if let Some(lease) = outcome
+        .workers
+        .iter()
+        .find(|lease| lease.task_id == task_id)
+    {
+        return if lease.provider_state.is_terminal() {
+            Ok(outcome.transitions)
+        } else {
+            Err(format!(
+                "task {task_id} still has an active turn (provider says {}); follow-ups are serialized per task — wait for it to finish, then retry",
+                lease.provider_status
+            ))
+        };
+    }
+    let status = run_codex(
+        codex,
+        &["cloud".into(), "status".into(), task_id.to_string()],
+    )
+    .await?;
+    let text = format!("{}\n{}", status.stdout, status.stderr).to_ascii_lowercase();
+    let mut tokens = text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+    if tokens.any(|token| {
+        matches!(
+            token,
+            "ready"
+                | "completed"
+                | "complete"
+                | "succeeded"
+                | "error"
+                | "failed"
+                | "cancelled"
+                | "canceled"
+        )
+    }) {
+        Ok(outcome.transitions)
+    } else {
+        Err(format!(
+            "could not establish that task {task_id} is idle from `codex cloud status` (it is outside the newest list window); retry once the task reports READY"
+        ))
+    }
+}
+
+fn followup_lock_path(store_path: &Path, task_id: &str) -> PathBuf {
+    let mut name = store_path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".followup-{task_id}.lock"));
+    store_path.with_file_name(name)
+}
+
+/// Edge resolver: Codex login, backend URL, codex command, and TTL come
+/// from the environment; everything below takes them as parameters.
+pub async fn follow_up_task(
+    store_path: &Path,
+    task_id: &str,
+    prompt: &str,
+) -> Result<FollowupReceipt, String> {
+    let auth = load_codex_auth(&codex_home())?;
+    follow_up_task_with(
+        &codex_command(),
+        &wham_backend(),
+        &auth,
+        store_path,
+        task_id,
+        prompt,
+        attach_ttl_ms(),
+    )
+    .await
+}
+
+async fn follow_up_task_with(
+    codex: &str,
+    backend: &str,
+    auth: &CodexAuth,
+    store_path: &Path,
+    task_id: &str,
+    prompt: &str,
+    attach_ttl_ms: u64,
+) -> Result<FollowupReceipt, String> {
+    let task_id = task_id.trim();
+    if !(task_id.starts_with("task_")
+        && task_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+    {
+        return Err(format!(
+            "'{task_id}' does not look like a Codex Cloud task id (task_…)"
+        ));
+    }
+    if prompt.trim().is_empty() {
+        return Err("follow-up prompt cannot be empty".to_string());
+    }
+
+    // One in-flight follow-up per task, machine-wide (blocking sidecar
+    // lock; the OS releases it if the holder dies). The task id is
+    // filename-safe — the alphabet was just validated.
+    let _followup_lock = StoreLock::acquire_path(&followup_lock_path(store_path, task_id))?;
+
+    let transitions = ensure_task_idle(codex, store_path, task_id, attach_ttl_ms).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+
+    // Resolve the latest assistant turn immediately before sending: stale
+    // turn ids and user-turn ids both 404 on the follow-up POST.
+    let detail_url = format!("{backend}/wham/tasks/{task_id}");
+    let detail = wham_get_json(&client, &detail_url, auth).await?;
+    let turn_id = current_turn_id(&detail).ok_or_else(|| {
+        format!(
+            "the task detail from {detail_url} carries no current_turn_id — the private follow-up schema changed (compatibility break); use the web UI"
+        )
+    })?;
+    if !is_assistant_turn_id(&turn_id) {
+        return Err(format!(
+            "the task's current turn ({turn_id}) is not an assistant turn; the task is likely still processing — wait for READY, then retry"
+        ));
+    }
+
+    let post_url = format!("{backend}/wham/tasks");
+    let response = client
+        .post(&post_url)
+        .bearer_auth(&auth.access_token)
+        .header("chatgpt-account-id", &auth.account_id)
+        .header(reqwest::header::USER_AGENT, wham_user_agent())
+        .json(&followup_body(task_id, &turn_id, prompt))
+        .send()
+        .await
+        .map_err(|e| format!("POST {post_url}: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(wham_error(status.as_u16(), &post_url, &text));
+    }
+    let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "the follow-up POST returned HTTP {status} with a non-JSON body ({e}) — compatibility break; verify the task in the web UI"
+        )
+    })?;
+    let new_turn_ids = validate_followup_response(task_id, &turn_id, &body)?;
+
+    // The provider accepted a new turn: record the running edge now so
+    // warmth stays honest and the next refresh's terminal edge counts the
+    // turn even if no refresh happens to catch it mid-run.
+    {
+        let _lock = StoreLock::acquire(store_path)?;
+        let mut store = load_store(store_path)?;
+        if let Some(lease) = store.leases.get_mut(task_id) {
+            lease.provider_status = "running".to_string();
+            lease.provider_state = ProviderLeaseState::Running;
+            lease.last_running_at_unix_ms = Some(now_unix_ms());
+            lease.last_observed_unix_ms = now_unix_ms();
+            save_store(store_path, &store)?;
+        }
+    }
+
+    Ok(FollowupReceipt {
+        task_id: task_id.to_string(),
+        parent_turn_id: turn_id,
+        new_turn_ids,
+        task_url: format!("https://chatgpt.com/codex/tasks/{task_id}"),
+        transitions,
+    })
+}
+
+async fn run_followup(args: &[String]) -> Result<(), String> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        print_followup_help();
+        return Ok(());
+    }
+    let mut task_id: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--message" => {
+                i += 1;
+                message = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or("--message requires a prompt argument")?,
+                );
+            }
+            "--json" => json = true,
+            other if task_id.is_none() && !other.starts_with('-') => {
+                task_id = Some(other.to_string());
+            }
+            other => return Err(format!("unknown followup argument {other}")),
+        }
+        i += 1;
+    }
+    let task_id = task_id.ok_or("followup requires a Codex Cloud task id")?;
+    let prompt = match message {
+        Some(message) => message,
+        None => {
+            use std::io::IsTerminal as _;
+            if std::io::stdin().is_terminal() {
+                eprintln!("[intendant] reading the follow-up prompt from stdin — end with Ctrl-D");
+            }
+            tokio::task::spawn_blocking(|| std::io::read_to_string(std::io::stdin()))
+                .await
+                .map_err(|e| format!("read stdin: {e}"))?
+                .map_err(|e| format!("read stdin: {e}"))?
+        }
+    };
+
+    let receipt = follow_up_task(&state_path(), &task_id, &prompt).await?;
+    announce_transitions(&receipt.transitions).await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt)
+                .map_err(|e| format!("serialize follow-up receipt: {e}"))?
+        );
+    } else {
+        println!("follow-up accepted: {}", receipt.task_id);
+        println!("  parent turn: {}", receipt.parent_turn_id);
+        if !receipt.new_turn_ids.is_empty() {
+            println!("  new turns: {}", receipt.new_turn_ids.join(", "));
+        }
+        println!("  url: {}", receipt.task_url);
+        println!("  watch: intendant codex-cloud status {}", receipt.task_id);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1786,7 +2299,12 @@ struct StoreLock {
 
 impl StoreLock {
     fn acquire(store_path: &Path) -> Result<Self, String> {
-        let lock_path = store_lock_path(store_path);
+        Self::acquire_path(&store_lock_path(store_path))
+    }
+
+    /// Lock an arbitrary sidecar path with the same semantics (the
+    /// per-task follow-up serialization lock rides here too).
+    fn acquire_path(lock_path: &Path) -> Result<Self, String> {
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create lease store directory {}: {e}", parent.display()))?;
@@ -1795,7 +2313,7 @@ impl StoreLock {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&lock_path)
+            .open(lock_path)
             .map_err(|e| format!("open lease store lock {}: {e}", lock_path.display()))?;
         file.lock()
             .map_err(|e| format!("lock lease store {}: {e}", lock_path.display()))?;
@@ -2014,7 +2532,7 @@ internet allowlist must include every exact relay/download domain used by the wo
 
 fn print_help() {
     println!(
-        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  probe        Submit a diagnostic task that fingerprints its worker\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
+        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  probe        Submit a diagnostic task that fingerprints its worker\n  followup     Send a follow-up turn into an existing task (private backend)\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
     );
 }
 
@@ -2027,6 +2545,12 @@ fn print_exec_help() {
 fn print_list_help() {
     println!(
         "Usage:\n  intendant codex-cloud list [--env ENV_ID] [--limit 1..20] [--cursor CURSOR] [--json]"
+    );
+}
+
+fn print_followup_help() {
+    println!(
+        "Usage:\n  intendant codex-cloud followup TASK_ID [-m PROMPT] [--json]\n\nSends a follow-up turn into an existing Codex Cloud task — the warm lever:\na follow-up reuses the task's worker and its incremental build state when\nit lands inside the warmth window (identical rebuild measured 68x faster).\nWithout -m the prompt is read from stdin, keeping sensitive instructions\nout of shell history.\n\nThis rides the provider's private web backend using the Codex CLI's own\nChatGPT login (never printed); the upstream CLI has no follow-up verb yet\n(issue #24777). Tasks with an active turn are refused, and any 404/409/422\nor schema change is reported as a compatibility break — prefer the\nofficial command once upstream ships one."
     );
 }
 
@@ -2811,5 +3335,292 @@ index 0000000..ce01362\n\
         )
         .await
         .is_err());
+    }
+
+    fn test_auth() -> CodexAuth {
+        CodexAuth {
+            access_token: "test-token".into(),
+            account_id: "acct-1".into(),
+        }
+    }
+
+    /// One observed request from the stub backend.
+    struct StubRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        account_id: Option<String>,
+        body: String,
+    }
+
+    /// Minimal scripted HTTP stub for the private-backend tests: answers
+    /// the given responses in order and reports each observed request back
+    /// over a channel (assertions happen on the test thread — a panic in
+    /// the server thread would not fail the test).
+    fn stub_backend(
+        responses: Vec<(u16, String)>,
+    ) -> (String, std::sync::mpsc::Receiver<StubRequest>) {
+        use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    return;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let mut authorization = None;
+                let mut account_id = None;
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    match name.to_ascii_lowercase().as_str() {
+                        "authorization" => authorization = Some(value.trim().to_string()),
+                        "chatgpt-account-id" => account_id = Some(value.trim().to_string()),
+                        "content-length" => content_length = value.trim().parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+                let mut body_bytes = vec![0u8; content_length];
+                if content_length > 0 && reader.read_exact(&mut body_bytes).is_err() {
+                    return;
+                }
+                let _ = tx.send(StubRequest {
+                    method,
+                    path,
+                    authorization,
+                    account_id,
+                    body: String::from_utf8_lossy(&body_bytes).into_owned(),
+                });
+                let response = format!(
+                    "HTTP/1.1 {status} Stub\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = reader.get_mut().write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[test]
+    fn codex_auth_reads_the_codex_cli_login() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"tokens":{"access_token":"bearer-secret-1","account_id":"acct-secret-1"}}"#,
+        )
+        .unwrap();
+        let auth = load_codex_auth(dir.path()).unwrap();
+        assert_eq!(auth.access_token, "bearer-secret-1");
+        assert_eq!(auth.account_id, "acct-secret-1");
+        let debug = format!("{auth:?}");
+        assert!(
+            !debug.contains("secret-1"),
+            "CodexAuth Debug must redact credentials: {debug}"
+        );
+
+        // Older auth.json: the account id lives only in the id_token claim.
+        use base64::Engine as _;
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acct-from-jwt" }
+        });
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap());
+        std::fs::write(
+            dir.path().join("auth.json"),
+            format!(r#"{{"tokens":{{"access_token":"tok","id_token":"h.{payload}.s"}}}}"#),
+        )
+        .unwrap();
+        let auth = load_codex_auth(dir.path()).unwrap();
+        assert_eq!(auth.account_id, "acct-from-jwt");
+
+        // API-key-only auth cannot drive Cloud follow-ups.
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-redacted"}"#,
+        )
+        .unwrap();
+        let error = load_codex_auth(dir.path()).unwrap_err();
+        assert!(error.contains("codex login"), "{error}");
+    }
+
+    #[test]
+    fn followup_wire_body_matches_the_recovered_shape() {
+        assert_eq!(
+            followup_body("task_e_1", "task_e_1~assttrn_e_2", "do it"),
+            serde_json::json!({
+                "follow_up": {
+                    "task_id": "task_e_1",
+                    "turn_id": "task_e_1~assttrn_e_2",
+                    "run_environment_in_qa_mode": false,
+                },
+                "input_items": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "content_type": "text", "text": "do it" }],
+                }],
+            })
+        );
+        assert!(is_assistant_turn_id("task_e_1~assttrn_e_2"));
+        assert!(!is_assistant_turn_id("task_e_1~usrtrn_e_2"));
+        assert!(!is_assistant_turn_id("task_e_1"));
+    }
+
+    #[test]
+    fn followup_response_validation_requires_task_linkage() {
+        let linked = serde_json::json!({
+            "task": { "id": "task_e_1", "current_turn_id": "task_e_1~usrtrn_e_9" }
+        });
+        assert_eq!(
+            validate_followup_response("task_e_1", "task_e_1~assttrn_e_2", &linked).unwrap(),
+            vec!["task_e_1~usrtrn_e_9".to_string()]
+        );
+
+        let unlinked = serde_json::json!({ "ok": true });
+        let error =
+            validate_followup_response("task_e_1", "task_e_1~assttrn_e_2", &unlinked).unwrap_err();
+        assert!(error.contains("compatibility break"), "{error}");
+    }
+
+    #[test]
+    fn wham_errors_frame_login_and_compatibility_breaks() {
+        assert!(wham_error(401, "https://x/wham/tasks", "").contains("codex login"));
+        let compat = wham_error(404, "https://x/wham/tasks", "not found");
+        assert!(compat.contains("compatibility break"), "{compat}");
+        assert!(compat.contains("not found"), "{compat}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followup_round_trip_against_a_stub_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+        let mut done = lease("task_e_fu");
+        done.provider_status = "ready".into();
+        done.provider_state = ProviderLeaseState::Finished;
+        save_store(&store_path, &store_with(vec![done])).unwrap();
+        let codex = fake_codex_emitting(
+            dir.path(),
+            r#"{"tasks": [{"id": "task_e_fu", "url": null, "title": "t", "status": "ready",
+ "updated_at": null, "environment_id": null, "environment_label": null}], "cursor": null}"#,
+        );
+        let (backend, requests) = stub_backend(vec![
+            (
+                200,
+                r#"{"id":"task_e_fu","current_turn_id":"task_e_fu~assttrn_e_1"}"#.to_string(),
+            ),
+            (
+                200,
+                r#"{"task":{"id":"task_e_fu","current_turn_id":"task_e_fu~usrtrn_e_2"}}"#
+                    .to_string(),
+            ),
+        ]);
+
+        let receipt = follow_up_task_with(
+            codex.to_str().unwrap(),
+            &backend,
+            &test_auth(),
+            &store_path,
+            "task_e_fu",
+            "continue please",
+            TEST_TTL_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.parent_turn_id, "task_e_fu~assttrn_e_1");
+        assert_eq!(
+            receipt.new_turn_ids,
+            vec!["task_e_fu~usrtrn_e_2".to_string()]
+        );
+        assert!(receipt.transitions.is_empty());
+
+        let detail = requests.recv().unwrap();
+        assert_eq!(detail.method, "GET");
+        assert_eq!(detail.path, "/wham/tasks/task_e_fu");
+        assert_eq!(detail.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(detail.account_id.as_deref(), Some("acct-1"));
+        let post = requests.recv().unwrap();
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.path, "/wham/tasks");
+        assert_eq!(post.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&post.body).unwrap(),
+            followup_body("task_e_fu", "task_e_fu~assttrn_e_1", "continue please")
+        );
+
+        // The accepted turn is recorded as a running edge, so warmth and
+        // the next refresh's terminal-edge turn counting stay honest.
+        let store = load_store(&store_path).unwrap();
+        let lease = store.leases.get("task_e_fu").unwrap();
+        assert_eq!(lease.provider_state, ProviderLeaseState::Running);
+        assert!(lease.last_running_at_unix_ms.is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followup_refuses_a_task_with_an_active_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+        let codex = fake_codex_emitting(
+            dir.path(),
+            r#"{"tasks": [{"id": "task_e_busy", "url": null, "title": "t", "status": "running",
+ "updated_at": null, "environment_id": null, "environment_label": null}], "cursor": null}"#,
+        );
+        // The unroutable backend proves the gate rejects before any HTTP.
+        let error = follow_up_task_with(
+            codex.to_str().unwrap(),
+            "http://127.0.0.1:9",
+            &test_auth(),
+            &store_path,
+            "task_e_busy",
+            "too eager",
+            TEST_TTL_MS,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("active turn"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followup_fails_closed_when_the_detail_schema_drifts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+        let codex = fake_codex_emitting(
+            dir.path(),
+            r#"{"tasks": [{"id": "task_e_drift", "url": null, "title": "t", "status": "ready",
+ "updated_at": null, "environment_id": null, "environment_label": null}], "cursor": null}"#,
+        );
+        let (backend, _requests) = stub_backend(vec![(200, "{}".to_string())]);
+        let error = follow_up_task_with(
+            codex.to_str().unwrap(),
+            &backend,
+            &test_auth(),
+            &store_path,
+            "task_e_drift",
+            "hello",
+            TEST_TTL_MS,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("current_turn_id"), "{error}");
     }
 }

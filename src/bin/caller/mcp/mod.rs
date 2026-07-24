@@ -732,6 +732,12 @@ impl IntendantServer {
                 let params = parse_params::<SubmitCodexCloudTaskParams>(args)?;
                 Ok(text_tool_result(self.submit_codex_cloud_task(params).await))
             }
+            "follow_up_codex_cloud_task" => {
+                let params = parse_params::<FollowUpCodexCloudTaskParams>(args)?;
+                Ok(text_tool_result(
+                    self.follow_up_codex_cloud_task(params).await,
+                ))
+            }
             "browser_workspace_providers" => {
                 Ok(text_tool_result(self.browser_workspace_providers().await))
             }

@@ -127,6 +127,15 @@ pub struct SubmitCodexCloudTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FollowUpCodexCloudTaskParams {
+    /// Codex Cloud task id (task_…) to continue with a new turn.
+    #[serde(alias = "taskId")]
+    pub task_id: String,
+    /// Follow-up prompt appended as a new user turn on the task.
+    pub prompt: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionNoteImageParams {
     /// Image MIME type: image/png, image/jpeg, image/gif, image/webp, or image/bmp.
     pub media_type: String,

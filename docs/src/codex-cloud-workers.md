@@ -102,6 +102,9 @@ intendant codex-cloud pull task_e_...
 # Fingerprint a worker (see "Worker fingerprints" above).
 intendant codex-cloud probe --env <environment-id>
 
+# Continue a finished task with a new turn (see "Follow-ups" below).
+intendant codex-cloud followup task_e_... -m "Now also fix the tests"
+
 # Drop terminal leases with no live attachment (default: older than 7 days).
 intendant codex-cloud prune
 intendant codex-cloud prune --all
@@ -144,6 +147,47 @@ upstream `codex cloud apply` command is deliberately not wrapped — it would
 either run in the disposable cwd (a no-op) or inside your repository (the
 `error.log` hazard); piping `diff` into our own `git` sidesteps both.
 
+## Follow-ups: continuing a task's warm worker
+
+A follow-up appends a new user turn to an existing task, and it is *the* warm
+lever: an active turn holds the task's worker, and a worker that kept its
+ignored build artifacts rebuilt an identical tree 68× faster in the 2026-07-24
+measurements. The product supports follow-ups, but the public Codex CLI has no
+verb for them (its Cloud surface is `exec`/`status`/`list`/`apply`/`diff`;
+upstream issue [#24777](https://github.com/openai/codex/issues/24777) is an
+unassigned proposal). `followup` therefore rides the same private backend the
+web UI uses — empirically validated end to end — under a deliberately
+conservative contract:
+
+```bash
+intendant codex-cloud followup task_e_... -m "Now also fix the tests"
+intendant codex-cloud followup task_e_... --json < prompt.txt   # stdin keeps prompts out of shell history
+```
+
+- **Auth is the Codex CLI's own ChatGPT login** (`auth.json` under
+  `$CODEX_HOME`, default `~/.codex`) — no browser, no cookies, no separate
+  credential. The bearer token and account id are read into process memory
+  for the two requests and are never printed, logged, or serialized into
+  receipts. API-key-only Codex auth cannot drive Cloud follow-ups.
+- **Idle tasks only, serialized per task.** A fresh provider refresh (or, for
+  tasks outside the list window, the upstream status verb) must show the task
+  terminal before anything is sent; a per-task sidecar lock serializes
+  concurrent invocations machine-wide.
+- **The parent turn is resolved immediately before sending** from the task
+  detail's `current_turn_id`, and must be an assistant turn — the validated
+  behavior is HTTP 404 for anything else.
+- **Fail closed on drift.** HTTP 404/409/422, a missing `current_turn_id`, or
+  a 200 response that no longer references the task are reported as
+  compatibility breaks of the private schema — never retried around. When
+  upstream ships an official follow-up command, prefer it and retire this
+  lane.
+- **The lease learns immediately:** an accepted follow-up records a running
+  edge (warmth stays warm, and the next refresh's terminal edge counts the
+  turn), and the receipt carries the new turn ids the response referenced.
+
+`INTENDANT_CODEX_CLOUD_BACKEND` overrides the backend base URL (tests point
+it at a local stub; the default is the production web backend).
+
 ## Attachment lifecycle
 
 An attachment broker or operator records the independent attachment state:
@@ -182,8 +226,8 @@ edge, and is never parked.
 
 The dashboard's **Sessions → Cloud** subtab renders the lease store: provider
 chip and attachment chip per lease (independent, like everything else here),
-the provider's task link, and the ready-made `pull` command for terminal
-tasks. The default paint is a cached read; **Sync with provider** hits
+the provider's task link, and the ready-made `pull` and `followup` commands
+for terminal tasks. The default paint is a cached read; **Sync with provider** hits
 `GET /api/codex-cloud/workers?refresh=1`, which re-syncs through the daemon
 host's Codex CLI and parks agenda notes for any transitions it observes. A
 failed sync degrades to the cached view with the error shown — the card never
@@ -191,14 +235,18 @@ goes blank because the provider CLI is missing.
 
 ## MCP tools
 
-The daemon's full MCP tool profile exposes `list_codex_cloud_workers` and
-`submit_codex_cloud_task`. This lets an Intendant agent refresh worker state
-or delegate a task using the daemon host's authenticated Codex CLI. These
-tools are intentionally omitted from the compact/core tool profile; agents
-can discover and invoke them through `intendant ctl tools list` and
+The daemon's full MCP tool profile exposes `list_codex_cloud_workers`,
+`submit_codex_cloud_task`, and `follow_up_codex_cloud_task`. This lets an
+Intendant agent refresh worker state, delegate a task, or continue one —
+the full warm-builder loop (submit → probe → follow up → pull) is drivable
+end to end by an agent using the daemon host's authenticated Codex CLI.
+These tools are intentionally omitted from the compact/core tool profile;
+agents can discover and invoke them through `intendant ctl tools list` and
 `intendant ctl tools call`. The list tool reports the same shape as
 `list --json` (window, tracked-active, cursor, transitions) plus how many
-agenda notes it parked.
+agenda notes it parked; the follow-up tool returns the acceptance receipt
+(parent turn, new turn ids) under the same fail-closed contract as the CLI
+verb.
 
 ## Environment bootstrap
 

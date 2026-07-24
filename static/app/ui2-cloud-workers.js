@@ -183,6 +183,11 @@ function cloudWorkerRow(lease) {
     pull.textContent = `intendant codex-cloud pull ${lease.task_id}`;
     pull.title = 'Bring this task’s diff home as a fresh branch in a new worktree';
     row.appendChild(pull);
+    const followup = document.createElement('div');
+    followup.className = 'cloud-worker-pull';
+    followup.textContent = `intendant codex-cloud followup ${lease.task_id}`;
+    followup.title = 'Send a follow-up turn into the same task — a warm worker reuses its incremental build state';
+    row.appendChild(followup);
   }
   return row;
 }

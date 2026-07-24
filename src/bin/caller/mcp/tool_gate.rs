@@ -253,8 +253,11 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "respond" | "post_session_note" | "ask_user" | "notify_user" | "request_user_display" => {
             PeerOperation::Message
         }
-        // Starting or delegating agent work.
-        "start_task" | "submit_codex_cloud_task" => PeerOperation::Task,
+        // Starting or delegating agent work. The Cloud follow-up rides
+        // here with submit: both mint provider-side agent turns.
+        "start_task" | "submit_codex_cloud_task" | "follow_up_codex_cloud_task" => {
+            PeerOperation::Task
+        }
         // Mutating the supervised session's context/lineage.
         "rewind_context"
         | "rewind_backout"
@@ -586,6 +589,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         ),
     );
     push(
+        "follow_up_codex_cloud_task",
+        manual_http_tool_definition!(
+            "follow_up_codex_cloud_task",
+            "Send a follow-up turn into an existing Codex Cloud task, reusing its worker and incremental build state while the worker is warm. Rides the provider's private web backend with the daemon host's Codex CLI login; refuses tasks with an active turn and fails closed on schema drift.",
+            FollowUpCodexCloudTaskParams
+        ),
+    );
+    push(
         "list_displays",
         manual_http_tool_definition!(
             "list_displays",
@@ -718,6 +729,11 @@ mod tests {
             false,
             Some("full")
         ));
+        assert!(tool_allowed_for_profile(
+            "follow_up_codex_cloud_task",
+            false,
+            Some("full")
+        ));
         assert!(!tool_allowed_for_profile(
             "list_codex_cloud_workers",
             false,
@@ -728,12 +744,21 @@ mod tests {
             false,
             Some("core")
         ));
+        assert!(!tool_allowed_for_profile(
+            "follow_up_codex_cloud_task",
+            false,
+            Some("core")
+        ));
         assert_eq!(
             mcp_tool_operation("list_codex_cloud_workers"),
             PeerOperation::StatsRead
         );
         assert_eq!(
             mcp_tool_operation("submit_codex_cloud_task"),
+            PeerOperation::Task
+        );
+        assert_eq!(
+            mcp_tool_operation("follow_up_codex_cloud_task"),
             PeerOperation::Task
         );
 
@@ -747,6 +772,10 @@ mod tests {
             (
                 "submit_codex_cloud_task",
                 IntendantServer::submit_codex_cloud_task_tool_attr(),
+            ),
+            (
+                "follow_up_codex_cloud_task",
+                IntendantServer::follow_up_codex_cloud_task_tool_attr(),
             ),
         ] {
             let definition = full
@@ -766,7 +795,11 @@ mod tests {
             core.iter().all(|tool| {
                 !matches!(
                     tool["name"].as_str(),
-                    Some("list_codex_cloud_workers" | "submit_codex_cloud_task")
+                    Some(
+                        "list_codex_cloud_workers"
+                            | "submit_codex_cloud_task"
+                            | "follow_up_codex_cloud_task"
+                    )
                 )
             }),
             "Codex Cloud provider tools must stay out of the compact profile"

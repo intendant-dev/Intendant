@@ -103,4 +103,37 @@ impl IntendantServer {
             .to_string(),
         }
     }
+
+    #[tool(
+        description = "Send a follow-up turn into an existing Codex Cloud task, reusing its worker and incremental build state while the worker is warm. Rides the provider's private web backend with the daemon host's Codex CLI login; refuses tasks with an active turn and fails closed on schema drift."
+    )]
+    pub(crate) async fn follow_up_codex_cloud_task(
+        &self,
+        Parameters(params): Parameters<FollowUpCodexCloudTaskParams>,
+    ) -> String {
+        match crate::codex_cloud::follow_up_task(
+            &crate::codex_cloud::state_path(),
+            &params.task_id,
+            &params.prompt,
+        )
+        .await
+        {
+            Ok(receipt) => {
+                let agenda_parked = self
+                    .park_codex_cloud_transitions(&receipt.transitions)
+                    .await;
+                serde_json::json!({
+                    "ok": true,
+                    "receipt": receipt,
+                    "agenda_parked": agenda_parked,
+                })
+                .to_string()
+            }
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": error,
+            })
+            .to_string(),
+        }
+    }
 }
