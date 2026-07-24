@@ -376,8 +376,8 @@ async fn run_list(args: &[String]) -> Result<(), String> {
 
 fn print_lease_table(leases: &[WorkerLease]) {
     println!(
-        "{:<38}  {:<10}  {:<13}  {}",
-        "TASK", "PROVIDER", "ATTACHMENT", "TITLE"
+        "{:<38}  {:<10}  {:<13}  TITLE",
+        "TASK", "PROVIDER", "ATTACHMENT"
     );
     for lease in leases {
         println!(
@@ -519,7 +519,7 @@ async fn refresh_leases_with(
         })
         .cloned()
         .collect();
-    tracked_active.sort_by(|a, b| b.last_observed_unix_ms.cmp(&a.last_observed_unix_ms));
+    tracked_active.sort_by_key(|lease| std::cmp::Reverse(lease.last_observed_unix_ms));
     Ok(RefreshOutcome {
         workers,
         tracked_active,
@@ -533,7 +533,7 @@ async fn refresh_leases_with(
 pub fn cached_leases(store_path: &Path) -> Result<Vec<WorkerLease>, String> {
     let store = load_store(store_path)?;
     let mut leases: Vec<WorkerLease> = store.leases.into_values().collect();
-    leases.sort_by(|a, b| b.last_observed_unix_ms.cmp(&a.last_observed_unix_ms));
+    leases.sort_by_key(|lease| std::cmp::Reverse(lease.last_observed_unix_ms));
     Ok(leases)
 }
 
