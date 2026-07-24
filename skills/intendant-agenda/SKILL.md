@@ -52,13 +52,13 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda schedule 01KX --goal "Weekly housekeeping pass" --at "+1d" --every 7d   # STANDING: one approval covers the series
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
-"$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the edge)
+"$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the link)
 "$INTENDANT" ctl agenda list --blocked         # open items with uncleared blockers / unmet deps
 "$INTENDANT" ctl agenda ref 01KX ~/brief.md --must-read --label "kickoff brief"   # typed pointer, never content
 "$INTENDANT" ctl agenda ref 01KX https://github.com/org/repo/pull/42              # url ref (type inferred)
 "$INTENDANT" ctl agenda add "Finish the soak review" --ref ~/soak-notes.md --must-read   # attach at park time
 "$INTENDANT" ctl agenda place 01KX --under 01KH   # file under a hub (re-parents atomically; --remove unplaces)
-"$INTENDANT" ctl agenda relates 01KX 01KY         # untyped see-also edge (--remove drops it)
+"$INTENDANT" ctl agenda relates 01KX 01KY         # untyped see-also link (--remove drops it)
 "$INTENDANT" ctl agenda list --under 01KH         # the hub's placed subtree
 ```
 
@@ -108,7 +108,7 @@ dashboard, attributed to your session.
   note to any item (the thread under it — progress, evidence, context for
   whoever picks it up). `block` states a human criterion on an open item;
   **nothing evaluates it** — it renders a blocked chip until cleared.
-  `relies-on` draws an edge to a prerequisite item; a completed
+  `relies-on` draws a link to a prerequisite item; a completed
   prerequisite satisfies it automatically at read time, a retired one
   flags the dependent for review. `list --blocked` filters the gated set.
 
@@ -122,7 +122,7 @@ dashboard, attributed to your session.
 
 - **The graph is navigation, never semantics**: `place` files an item
   under a hub (a hub is just an item with children — the program/project
-  item you'd naturally park anyway), `relates` draws a see-also edge.
+  item you'd naturally park anyway), `relates` draws a see-also link.
   One live parent; placement never hides an item from the flat list,
   never blocks a hub when a child is blocked, never completes anything.
   Filing your item under the program hub you're working helps the owner

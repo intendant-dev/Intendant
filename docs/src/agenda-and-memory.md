@@ -196,8 +196,8 @@ operations in the same append-only log:
   with the clearing actor. Setting and clearing are plain `agenda.write`
   acts; the housekeeping mandate governs agent *conduct* (agents without a
   mandate annotate with evidence instead of clearing), not capability.
-- **Dependencies** (`add_relies_on` / `remove_relies_on`) draw edges to
-  other items. A completed prerequisite satisfies the edge by pure
+- **Dependencies** (`add_relies_on` / `remove_relies_on`) draw links to
+  other items. A completed prerequisite satisfies the link by pure
   recomputation at read time; a **retired** prerequisite does not silently
   satisfy — the dependent renders "prerequisite retired — review"; a target
   missing from the fold renders "prerequisite missing"; cycles simply render
@@ -247,7 +247,7 @@ the preview blob store remains exclusively Ask-v2's (pinned in
 
 ### The graph: placement and adjacency (G2)
 
-Two more edge vocabularies make the agenda navigable, both ordinary
+Two more link vocabularies make the agenda navigable, both ordinary
 attributed ops, both **pure navigation**:
 
 - **`part_of`** (`add_part_of` / `remove_part_of`, plus the atomic `place`
@@ -261,9 +261,9 @@ attributed ops, both **pure navigation**:
   flags are all derived at render from the ordinary snapshot.
 - **`relates_to`** (`add_relates_to` / `remove_relates_to`) — untyped
   see-also adjacency: stored directed (the writer's item carries the
-  edge), rendered as the undirected union, deduped in both directions at
+  link), rendered as the undirected union, deduped in both directions at
   intake; removal names the pair in either order and the daemon resolves
-  the stored side. Capped at 32 stored edges per item.
+  the stored side. Capped at 32 stored links per item.
 
 **Two rules are pinned.** *Anti-hiding:* a `part_of` placement never
 removes an item from the flat recent lens — grouping is an opt-in reorder
@@ -587,7 +587,7 @@ share a project, park ONE hub note titled after the project, place them
 under it, and annotate the hub "triage: hub for <project>" so it leaves
 the frontier too; a singleton with no matching hub stays unplaced —
 annotate it "triage: no placement — standalone" so it leaves the
-frontier. Add relates_to edges only where reading the items shows a
+frontier. Add relates_to links only where reading the items shows a
 real working relation. Attach refs you can substantiate (the brief file
 an item's body names, the PR its title cites) — never guess a locator.
 
