@@ -1087,6 +1087,10 @@ function agendaOpenSchedSheet(itemId) {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const rec = m && m.recurrence;
+  // Executor prefill: the manifest's recorded pins, so the swap gesture
+  // (edit executor → approval voided → re-approve) starts from what the
+  // owner approved. Empty = inherit the daemon default at fire time.
+  const cfg = (m && m.agent_config) || {};
   agendaSheetState = {
     kind: 'sched',
     itemId,
@@ -1097,11 +1101,24 @@ function agendaOpenSchedSheet(itemId) {
     maxRuns: rec && rec.max_occurrences ? String(rec.max_occurrences) : '',
     suspend: rec && rec.suspend_after_failures ? String(rec.suspend_after_failures) : '3',
     orchestrate: !!(m && m.orchestrate),
+    execBackend: cfg.agent || '',
+    execModel: cfg.claude_model || cfg.codex_model || cfg.kimi_model || cfg.pi_model || '',
+    execEffort: cfg.claude_effort || cfg.codex_reasoning_effort || cfg.kimi_thinking || cfg.pi_thinking || '',
     approveNow: true,
     voids: !!(st && st.effect.approval),
     error: '',
   };
   agendaSheetRender();
+  // Model/effort option lists come from the served settings; fetch like
+  // the start sheet does and re-render when they land.
+  if (agendaStartSheetSettings === null && typeof fetchDashboardSettings === 'function') {
+    fetchDashboardSettings()
+      .then((d) => { if (d && !d.error) agendaStartSheetSettings = d; })
+      .catch(() => {})
+      .finally(() => {
+        if (agendaSheetState && agendaSheetState.kind === 'sched') agendaSheetRender();
+      });
+  }
 }
 
 function agendaSchedSheetHtml(item) {
@@ -1148,6 +1165,7 @@ function agendaSchedSheetHtml(item) {
       </select>
     </div>
     ${standingBlock}
+    ${agendaSchedExecutorRowsHtml()}
     <label class="ag2-check"><input type="checkbox" data-sheet="orchestrate"${s.orchestrate ? ' checked' : ''}>Orchestrated run (a conductor session fans out sub-agents)</label>
     <label class="ag2-check top"><input type="checkbox" data-sheet="approveNow"${s.approveNow ? ' checked' : ''}><span>Approve immediately<br><span class="ag2-hint">You’re on an owner surface. Any later edit mints a new digest and voids this approval.</span></span></label>
     ${s.voids ? '<div class="ag2-sheet-callout t-amber">This revises the manifest — the current approval becomes void until re-approved.</div>' : ''}
@@ -1156,6 +1174,47 @@ function agendaSchedSheetHtml(item) {
       <button type="button" class="ag2-btn ghost" data-sheet-act="close">Cancel</button>
       <button type="button" class="ag2-btn prim" data-sheet-act="sched-confirm">${s.approveNow ? 'Propose & approve' : 'Propose schedule'}</button>
     </div>`;
+}
+
+// The executor rows on the schedule sheet (Track AU): backend/model/
+// effort selects in the same settings-derived vocabulary the start-now
+// sheet uses. Digest-bound like the rest of the manifest — the amber
+// revision callout already names what an edit does to the approval, so
+// the swap gesture (edit executor → approval voided → re-approve) works
+// from the card. Untouched = inherit; a manifest pin the option list
+// doesn't know stays selectable (never silently dropped).
+function agendaSchedExecutorRowsHtml() {
+  const s = agendaSheetState;
+  const settings = agendaStartSheetSettings;
+  const withCurrent = (options, current) => {
+    const values = options.map(([v]) => v);
+    if (current && !values.includes(current)) options.push([current, `${current} (manifest pin)`]);
+    return options;
+  };
+  const select = (key, id, options, selected, label) => {
+    const rows = options.map(([value, text]) =>
+      `<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}>${escapeHtml(text)}</option>`);
+    return `<span class="ag2-sheet-k">${escapeHtml(label)}</span>
+      <select data-sheet="${key}" id="${id}" aria-label="${escapeHtml(label)}">${rows.join('')}</select>`;
+  };
+  const backendRow = select('execBackend', 'ag2-sched-backend', withCurrent([
+    ['', 'Daemon default'], ['internal', 'Internal agent'],
+    ['claude-code', 'Claude Code'], ['codex', 'Codex'], ['kimi', 'Kimi Code'],
+  ], s.execBackend), s.execBackend, 'Executor');
+  let modelRows = '';
+  if (s.execBackend && s.execBackend !== 'internal') {
+    const spec = agendaStartBackendConfig(settings || {}, s.execBackend);
+    const models = withCurrent(
+      [['', 'Daemon default']].concat((spec.models || []).map((m) => [m, m])), s.execModel);
+    const efforts = withCurrent(
+      [['', 'Daemon default']].concat((spec.efforts || []).map((e) => [e, e])), s.execEffort);
+    modelRows = select('execModel', 'ag2-sched-model', models, s.execModel, 'Model')
+      + select('execEffort', 'ag2-sched-effort', efforts, s.execEffort, spec.effortLabel || 'Effort');
+  }
+  return `<div class="ag2-sheet-grid">
+      ${backendRow}${modelRows}
+    </div>
+    <div class="ag2-hint">Digest-bound: the approval covers who runs this goal — changing the executor revises the manifest.</div>`;
 }
 
 async function agendaSchedConfirm(button) {
@@ -1188,6 +1247,19 @@ async function agendaSchedConfirm(button) {
     rec.suspend_after_failures = Math.max(1, Number(s.suspend) || 3);
     params.recurrence = rec;
   }
+  // Executor pins (Track AU): explicit picks only, assembled exactly as
+  // the start-now sheet does — untouched selects send nothing and the
+  // daemon's resolution chain fills them; a model/effort pick without an
+  // explicit backend pins the backend it belongs to, so the approved
+  // config can never silently re-target.
+  const execConfig = {};
+  if (s.execBackend) execConfig.agent = s.execBackend;
+  if (s.execBackend && s.execBackend !== 'internal') {
+    const spec = agendaStartBackendConfig(agendaStartSheetSettings || {}, s.execBackend);
+    if (s.execModel) execConfig[spec.modelKey] = s.execModel;
+    if (s.execEffort) execConfig[spec.effortKey] = s.execEffort;
+  }
+  if (Object.keys(execConfig).length) params.agent_config = execConfig;
   if (button) button.disabled = true;
   try {
     const resp = await daemonApi.request('api_agenda_op', params);
@@ -1301,9 +1373,15 @@ function agendaSheetInput(e) {
   const t = e.target.closest('[data-sheet]');
   if (!t) return;
   const key = t.dataset.sheet;
-  const structural = key === 'repeat' || key === 'approveNow';
+  const structural = key === 'repeat' || key === 'approveNow' || key === 'execBackend';
   if (t.type === 'checkbox') s[key] = !!t.checked;
   else s[key] = t.value;
+  if (key === 'execBackend') {
+    // A backend change swaps the model/effort vocabulary — stale picks
+    // from the previous backend must not ride along silently.
+    s.execModel = '';
+    s.execEffort = '';
+  }
   if (structural && e.type === 'change') agendaSheetRender();
 }
 
