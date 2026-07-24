@@ -451,6 +451,14 @@ impl AgendaStore {
             let digest = effect.digest.clone();
             return self.request_occurrence_of(id, &effect_id, &digest, actor, now_ms);
         }
+        // Launch pins validate at intake exactly like the scheduled lane
+        // (same authority, same wording) — the sheet's user sees the named
+        // rejection instead of a spawned-and-instantly-dead session.
+        let agent_config = agent_config.filter(|config| !config.is_empty());
+        if let Some(config) = agent_config.as_deref() {
+            crate::session_supervisor::validate_launch_config(config)
+                .map_err(AgendaError::Invalid)?;
+        }
         // Absent defaults to interactive (owner-ratified): the session
         // opens with the item and waits for the owner.
         let interactive = interactive.unwrap_or(true);
@@ -493,7 +501,7 @@ impl AgendaStore {
             orchestrate: false,
             interactive,
             project_root,
-            agent_config: agent_config.filter(|config| !config.is_empty()),
+            agent_config,
             recurrence: None,
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
@@ -1107,6 +1115,7 @@ impl AgendaStore {
                 fire_at_ms,
                 orchestrate,
                 recurrence,
+                agent_config,
                 source: _,
             } => {
                 let item = self.require(&id)?;
@@ -1117,6 +1126,18 @@ impl AgendaStore {
                 }
                 if fire_at_ms == 0 {
                     return Err(AgendaError::Invalid("fire_at_ms must be set".into()));
+                }
+                // Executor pins are validated NOW, not at fire time: a
+                // digest-bound manifest is reviewed and approved long
+                // before it spawns, so every contradiction the launch
+                // path would deterministically reject must be named here
+                // (same rules, same wording — one authority). All-inherit
+                // normalizes to the legacy absent shape so a config-less
+                // propose keeps byte-identical manifest bytes and digests.
+                let agent_config = agent_config.filter(|config| !config.is_empty());
+                if let Some(config) = agent_config.as_deref() {
+                    crate::session_supervisor::validate_launch_config(config)
+                        .map_err(AgendaError::Invalid)?;
                 }
                 if let Some(rec) = &recurrence {
                     if rec.every_ms < super::types::RECURRENCE_MIN_EVERY_MS {
@@ -1174,11 +1195,12 @@ impl AgendaStore {
                         orchestrate,
                         // Proposals keep the legacy autonomous shape; the
                         // project resolves at fire time (provenance →
-                        // daemon default → named refusal), and the launch
-                        // config inherits the daemon defaults.
+                        // daemon default → named refusal). The executor
+                        // pins (if any) ride the digest-bound manifest;
+                        // absent fields inherit the daemon defaults.
                         interactive: false,
                         project_root: None,
-                        agent_config: None,
+                        agent_config,
                         recurrence,
                     },
                 })
@@ -3665,6 +3687,7 @@ mod tests {
             fire_at_ms: 1_000_000,
             orchestrate: false,
             recurrence: Some(recurrence(every_ms)),
+            agent_config: None,
             source: None,
         }
     }
@@ -3704,6 +3727,7 @@ mod tests {
                         until_ms: Some(999_999),
                         ..recurrence(3_600_000)
                     }),
+                    agent_config: None,
                     source: None,
                 },
                 "until_ms must be after",
@@ -3718,6 +3742,7 @@ mod tests {
                         max_occurrences: Some(0),
                         ..recurrence(3_600_000)
                     }),
+                    agent_config: None,
                     source: None,
                 },
                 "at least 1",
@@ -3999,6 +4024,180 @@ mod tests {
         assert!(!serde_json::to_string(&legacy)
             .unwrap()
             .contains("recurrence"));
+    }
+
+    /// The executor twin of the cross-build rider (Track AU): a build
+    /// that predates the manifest's `agent_config` re-serializes without
+    /// it and derives a DIFFERENT digest — the approval reads as a
+    /// mismatch and the effect never fires, so an executor-bearing
+    /// standing manifest degrades fail-closed instead of firing the goal
+    /// on the wrong backend. An executor-less manifest never carries the
+    /// key, so legacy bytes, digests, and approvals are unchanged.
+    #[test]
+    fn executor_cross_build_digest_degrades_fail_closed() {
+        let with = super::super::types::SessionManifest {
+            goal: "standing".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
+                agent: Some("claude-code".into()),
+                claude_model: Some("fable-5".into()),
+                claude_effort: Some("max".into()),
+                ..Default::default()
+            })),
+            recurrence: Some(recurrence(3_600_000)),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert!(
+            json.get("agent_config").is_some(),
+            "the field reaches the wire"
+        );
+        let mut stripped_json = json.clone();
+        stripped_json
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_config");
+        let stripped: super::super::types::SessionManifest =
+            serde_json::from_value(stripped_json).unwrap();
+        assert_ne!(
+            super::super::types::manifest_digest("i", "e", &with),
+            super::super::types::manifest_digest("i", "e", &stripped),
+            "the executor must be digest-visible or old builds would fire the goal without it"
+        );
+        let legacy = super::super::types::SessionManifest {
+            agent_config: None,
+            ..stripped
+        };
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("agent_config"));
+    }
+
+    /// Track AU: the scheduled lane's executor intake — pins are recorded
+    /// verbatim on the digest-bound manifest, an all-inherit block
+    /// normalizes to the legacy absent shape (identical bytes, identical
+    /// digest), and every contradiction the launch path would
+    /// deterministically reject at spawn is refused NOW by name, on both
+    /// the propose and start-now commands, appending nothing.
+    #[test]
+    fn executor_propose_intake_records_validates_and_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("standing"), owner(), 1000)
+            .unwrap()
+            .id;
+        let propose =
+            |config: Option<crate::event::AgentLaunchConfig>| AgendaCommand::ProposeEffect {
+                id: id.clone(),
+                goal: "triage pass".into(),
+                fire_at_ms: 1_000_000,
+                orchestrate: false,
+                recurrence: Some(recurrence(3_600_000)),
+                agent_config: config.map(Box::new),
+                source: None,
+            };
+
+        let config = crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            claude_model: Some("fable-5".into()),
+            claude_effort: Some("max".into()),
+            ..Default::default()
+        };
+        let item = store
+            .apply_command(propose(Some(config.clone())), owner(), 1001)
+            .unwrap();
+        assert_eq!(
+            item.effects[0].manifest.agent_config.as_deref(),
+            Some(&config),
+            "the executor pins are recorded verbatim"
+        );
+        let executor_digest = item.effects[0].digest.clone();
+
+        let item = store.apply_command(propose(None), owner(), 1002).unwrap();
+        assert!(item.effects[0].manifest.agent_config.is_none());
+        let plain_digest = item.effects[0].digest.clone();
+        assert_ne!(
+            executor_digest, plain_digest,
+            "the executor is digest-visible — the owner approves WHO runs"
+        );
+
+        // All-inherit normalizes to ABSENT: identical manifest bytes,
+        // identical digest — a config-less gesture is unchanged by AU.
+        let item = store
+            .apply_command(
+                propose(Some(crate::event::AgentLaunchConfig::default())),
+                owner(),
+                1003,
+            )
+            .unwrap();
+        assert!(item.effects[0].manifest.agent_config.is_none());
+        assert_eq!(item.effects[0].digest, plain_digest);
+
+        // Named intake rejections — the launch path's own rules, at
+        // propose time instead of at 03:00.
+        let ops_before = store.ops();
+        for (config, needle) in [
+            (
+                crate::event::AgentLaunchConfig {
+                    agent: Some("warp-drive".into()),
+                    ..Default::default()
+                },
+                "unknown agent",
+            ),
+            (
+                crate::event::AgentLaunchConfig {
+                    agent: Some("internal".into()),
+                    claude_effort: Some("max".into()),
+                    ..Default::default()
+                },
+                "require Claude Code",
+            ),
+            (
+                crate::event::AgentLaunchConfig {
+                    agent: Some("codex".into()),
+                    claude_effort: Some("max".into()),
+                    ..Default::default()
+                },
+                "require Claude Code",
+            ),
+            (
+                crate::event::AgentLaunchConfig {
+                    agent: Some("codex".into()),
+                    codex_reasoning_effort: Some("warp".into()),
+                    ..Default::default()
+                },
+                "unsupported Codex reasoning effort",
+            ),
+        ] {
+            let err = store
+                .apply_command(propose(Some(config.clone())), owner(), 1004)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "unexpected rejection wording: {err}"
+            );
+            let err = store
+                .apply_command(
+                    AgendaCommand::StartNow {
+                        id: id.clone(),
+                        goal: None,
+                        project_root: None,
+                        interactive: Some(false),
+                        agent_config: Some(Box::new(config)),
+                    },
+                    owner(),
+                    1004,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "start_now must reject identically: {err}"
+            );
+        }
+        assert_eq!(store.ops(), ops_before, "rejected intakes append nothing");
     }
 
     /// A future ref type inside a known op name degrades exactly like an

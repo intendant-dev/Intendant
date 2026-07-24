@@ -663,6 +663,7 @@ pub fn session_log_entry_to_app_event(
                 session_id,
                 reason,
                 summary,
+                outcome: crate::event::TaskOutcome::Completed,
             })
         }
         "steer_requested" => {
@@ -2826,6 +2827,7 @@ mod tests {
                 session_id,
                 reason,
                 summary,
+                outcome: crate::event::TaskOutcome::Completed,
             } => {
                 assert_eq!(session_id.as_deref(), Some("session-1"));
                 assert_eq!(reason, "done");

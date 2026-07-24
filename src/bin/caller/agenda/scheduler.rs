@@ -466,11 +466,33 @@ fn observe_event(
             session_id: Some(session_id),
             reason,
             summary,
+            outcome,
         } => {
-            let note = summary.clone().unwrap_or_else(|| reason.clone());
+            // The emitter's typed class decides the journal terminal:
+            // `Failed` (external wrapper death, exhausted recovery) counts
+            // toward the suspend streak exactly like a native error end —
+            // never a string judgment over reason prose. A failure's
+            // write-back note is the stated `reason` (the cause); the
+            // summary is the agent's last words, honest only for
+            // completions.
+            let failed = matches!(outcome, crate::event::TaskOutcome::Failed);
             if state.running.contains_key(session_id) {
-                complete_running(handle, journal, state, session_id, note);
+                if failed {
+                    fail_running(handle, journal, state, session_id, reason);
+                } else {
+                    let note = summary.clone().unwrap_or_else(|| reason.clone());
+                    complete_running(handle, journal, state, session_id, note);
+                }
+            } else if failed {
+                state.remember_early_outcome(
+                    session_id,
+                    EarlyOutcome {
+                        failed: Some(reason.clone()),
+                        note: reason.clone(),
+                    },
+                );
             } else {
+                let note = summary.clone().unwrap_or_else(|| reason.clone());
                 state.remember_early_outcome(session_id, EarlyOutcome { failed: None, note });
             }
         }
@@ -1022,6 +1044,7 @@ mod tests {
                     fire_at_ms,
                     orchestrate: false,
                     source: None,
+                    agent_config: None,
                 },
                 None,
             )
@@ -1078,6 +1101,7 @@ mod tests {
                     fire_at_ms: now_ms() - 60_000,
                     orchestrate: false,
                     source: None,
+                    agent_config: None,
                 },
                 None,
             )
@@ -1187,6 +1211,7 @@ mod tests {
                     fire_at_ms: now_ms() - 30_000,
                     orchestrate: false,
                     source: None,
+                    agent_config: None,
                 },
                 None,
             )
@@ -1237,6 +1262,7 @@ mod tests {
                 session_id: Some("sess-run-2".into()),
                 reason: "Task complete".into(),
                 summary: Some("rev 2 done".into()),
+                outcome: crate::event::TaskOutcome::Completed,
             },
         );
         let (items, _, _) = handle.snapshot();
@@ -1669,6 +1695,235 @@ mod tests {
         assert_eq!(dispatched, 1, "exactly one configured occurrence fires");
     }
 
+    /// Track AU: a STANDING manifest with executor pins fires occurrences
+    /// whose StartTask carries the reviewed launch config; an
+    /// emitter-declared `Failed` terminal journals `failed` (the killed
+    /// external run must never journal `completed`); and three
+    /// consecutive failures suspend the standing effect with full native
+    /// parity — the planner plans nothing further and run-now is refused
+    /// by name. The third failure lands through the early-outcome
+    /// inversion (terminal beats the receipt) to pin that path too.
+    #[tokio::test]
+    async fn executor_failed_outcomes_journal_failed_and_suspend_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "standing triage".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let config = crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            claude_model: Some("fable-5".into()),
+            claude_effort: Some("max".into()),
+            ..Default::default()
+        };
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: "triage pass".into(),
+                    fire_at_ms: now_ms() - 30_000,
+                    orchestrate: false,
+                    recurrence: Some(super::super::types::RecurrenceSpec {
+                        every_ms: 3_600_000,
+                        until_ms: None,
+                        max_occurrences: None,
+                        suspend_after_failures: Some(3),
+                    }),
+                    agent_config: Some(Box::new(config.clone())),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            proposed.effects[0].manifest.agent_config.as_deref(),
+            Some(&config),
+            "the scheduled lane records the reviewed executor on the manifest"
+        );
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        // One pass with a fresh subscriber (the sibling tests' pattern):
+        // returns the dispatched delegation id, asserting the StartTask
+        // carried the approved executor config.
+        async fn fire(
+            handle: &AgendaHandle,
+            journal: &mut OccurrenceJournal,
+            state: &mut SchedulerState,
+            config: &crate::event::AgentLaunchConfig,
+        ) -> Option<String> {
+            let mut rx = handle.bus().subscribe();
+            run_pass(handle, journal, state).await;
+            let mut delegation = None;
+            while let Ok(event) = rx.try_recv() {
+                if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                    launch_config,
+                    delegation_id: Some(id),
+                    ..
+                }) = event
+                {
+                    assert_eq!(
+                        &launch_config, config,
+                        "every occurrence dispatches the approved executor"
+                    );
+                    delegation = Some(id);
+                }
+            }
+            delegation
+        }
+
+        // Occurrence 1: receipt, then a Failed-class TaskComplete (the
+        // external wrapper-death shape) — must journal `failed`.
+        let delegation = fire(&handle, &mut journal, &mut state, &config)
+            .await
+            .expect("the approved standing manifest fires");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: delegation,
+                session_id: "sess-x1".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskComplete {
+                session_id: Some("sess-x1".into()),
+                reason: "Claude Code process closed stdout".into(),
+                summary: None,
+                outcome: crate::event::TaskOutcome::Failed,
+            },
+        );
+        let effect_of = |handle: &AgendaHandle| {
+            let (items, _, _) = handle.snapshot();
+            items.iter().find(|i| i.id == item.id).unwrap().effects[0].clone()
+        };
+        let effect = effect_of(&handle);
+        assert_eq!(effect.last_run.as_ref().unwrap().state, "failed");
+        assert_eq!(effect.consecutive_failures, 1);
+
+        // Occurrence 2 (owner run-now): a SessionEnded while running —
+        // the shipped failure shape — keeps counting.
+        handle
+            .apply(
+                AgendaCommand::RequestOccurrence {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+        let delegation = fire(&handle, &mut journal, &mut state, &config)
+            .await
+            .expect("the requested occurrence fires");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: delegation,
+                session_id: "sess-x2".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "sess-x2".into(),
+                reason: "error: backend crashed".into(),
+                error_kind: None,
+            },
+        );
+        assert_eq!(effect_of(&handle).consecutive_failures, 2);
+
+        // Occurrence 3: the Failed terminal beats the receipt (the
+        // fast-spawn inversion) and still journals `failed`.
+        handle
+            .apply(
+                AgendaCommand::RequestOccurrence {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+        let delegation = fire(&handle, &mut journal, &mut state, &config)
+            .await
+            .expect("the second requested occurrence fires");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskComplete {
+                session_id: Some("sess-x3".into()),
+                reason: "recovery required".into(),
+                summary: None,
+                outcome: crate::event::TaskOutcome::Failed,
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: delegation,
+                session_id: "sess-x3".into(),
+            },
+        );
+        let effect = effect_of(&handle);
+        assert_eq!(effect.last_run.as_ref().unwrap().state, "failed");
+        assert_eq!(effect.consecutive_failures, 3);
+        assert!(effect.suspended(), "three failures suspend the series");
+        assert_eq!(
+            effect.next_fire_ms, None,
+            "a suspended effect plans no next instant"
+        );
+
+        // Native-parity surfacing: the planner plans nothing further and
+        // the run-now gesture is refused by name until re-approval.
+        assert!(
+            fire(&handle, &mut journal, &mut state, &config)
+                .await
+                .is_none(),
+            "a suspended standing effect dispatches nothing"
+        );
+        let err = handle
+            .apply(
+                AgendaCommand::RequestOccurrence {
+                    id: item.id.clone(),
+                },
+                owner(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("suspended after 3"),
+            "unexpected refusal: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn event_lag_resolves_awaiting_and_running_occurrences_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1874,6 +2129,7 @@ mod tests {
                     fire_at_ms: now_ms() - 30_000,
                     orchestrate: false,
                     source: None,
+                    agent_config: None,
                 },
                 None,
             )

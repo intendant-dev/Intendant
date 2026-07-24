@@ -332,6 +332,7 @@ fn handle_lifecycle_event(event: &AppEvent, state: &mut LifecycleWatcherState) {
             session_id,
             reason,
             summary,
+            outcome: _,
         } => {
             let summary = summary
                 .as_deref()
@@ -797,6 +798,7 @@ mod tests {
                 session_id: Some("lw-child-tc".to_string()),
                 reason: "done".to_string(),
                 summary: Some("ran the suite, all green".to_string()),
+                outcome: crate::event::TaskOutcome::Completed,
             },
             &mut state,
         );
@@ -990,6 +992,7 @@ mod tests {
                 session_id: Some("lw-child-fc".to_string()),
                 reason: "done".to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             },
             &mut state,
         );
@@ -1063,6 +1066,7 @@ mod tests {
                 session_id: Some("lw-child-batch-a".to_string()),
                 reason: "done".to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             },
             &mut state,
         );

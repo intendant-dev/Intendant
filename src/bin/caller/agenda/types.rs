@@ -870,7 +870,12 @@ pub enum AgendaCommand {
     /// without an owner-surface approval of the exact digest. `recurrence`
     /// (G3-pre) declares a standing cadence INSIDE the digest-bound body;
     /// an older daemon rejects the unknown field at strict intake rather
-    /// than silently parking a one-shot.
+    /// than silently parking a one-shot. `agent_config` (Track AU) pins
+    /// the executor the same way — the CreateSession launch vocabulary,
+    /// recorded on the digest-bound manifest so the owner approves WHO
+    /// runs the goal (backend/model/effort), validated at intake against
+    /// the launch path's own rules, and absent-normalized so a config-less
+    /// propose stays byte-identical to the legacy shape.
     ProposeEffect {
         id: String,
         goal: String,
@@ -879,6 +884,8 @@ pub enum AgendaCommand {
         orchestrate: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recurrence: Option<RecurrenceSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
@@ -3865,6 +3872,50 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
             propose
+        );
+
+        // Executor-bearing twin (Track AU): the launch-config block rides
+        // the digest-bound manifest between fire_at_ms and recurrence in
+        // declaration order, only its set fields on the wire. The
+        // executor-less line above doubles as the byte-identity pin — a
+        // config-less propose is unchanged bytes, unchanged digests.
+        let executor = AgendaOpRecord {
+            v: 1,
+            at_ms: 50,
+            actor: None,
+            source: None,
+            op: AgendaOp::ProposeEffect {
+                id: "01X".into(),
+                effect_id: "ef-1".into(),
+                manifest: SessionManifest {
+                    goal: "standing".into(),
+                    fire_at_ms: 1000,
+                    orchestrate: false,
+                    interactive: false,
+                    project_root: None,
+                    agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
+                        agent: Some("claude-code".into()),
+                        claude_model: Some("fable-5".into()),
+                        claude_effort: Some("max".into()),
+                        ..Default::default()
+                    })),
+                    recurrence: Some(RecurrenceSpec {
+                        every_ms: 3_600_000,
+                        until_ms: None,
+                        max_occurrences: Some(4),
+                        suspend_after_failures: None,
+                    }),
+                },
+            },
+        };
+        let line = serde_json::to_string(&executor).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":50,"op":{"type":"propose_effect","id":"01X","effect_id":"ef-1","manifest":{"goal":"standing","fire_at_ms":1000,"agent_config":{"agent":"claude-code","claude_model":"fable-5","claude_effort":"max"},"recurrence":{"every_ms":3600000,"max_occurrences":4}}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
+            executor
         );
 
         let request = AgendaOpRecord {
