@@ -52,6 +52,7 @@ const UI2_ICON_PATHS = {
   branch: '<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2"/><path d="M18 10.4c0 4.2-6 1.8-6 5.6"/>',
 
   // — production glyphs the prototype lacked (drawn to the same grid) —
+  bell: '<path d="M6 15.5V11a6 6 0 0 1 12 0v4.5l1.6 2.6H4.4z"/><path d="M10 20.6a2.2 2.2 0 0 0 4 0"/>',
   close: '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
   back: '<path d="M15 6l-6 6 6 6"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',

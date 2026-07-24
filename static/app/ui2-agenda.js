@@ -1,29 +1,51 @@
 // Agenda: the daemon's durable ledger of parked intent (tasks, notes,
-// deferred follow-ups). Two surfaces share one cache: the Agenda tab
-// (#tab-agenda — list, filters, composer) and a compact card on the
-// activity pane stacked under the vitals rail. Data flows through
-// daemonApi (tunnel `api_agenda_list` / `api_agenda_op`, HTTP twin
+// questions, scheduled-session effects). Two surfaces share one cache:
+// the Agenda tab (#tab-agenda — lenses, composer, cards, inspector) and a
+// compact card on the activity pane stacked under the vitals rail. Data
+// flows through daemonApi (tunnel `api_agenda_list` / `api_agenda_op` /
+// `api_agenda_ref_drift` / `api_agenda_reminder_policy`, HTTP twin
 // fallback) and refreshes live on the `agenda_changed` event lane.
 //
-// Item bodies are DATA, never instructions: everything renders through
-// escapeHtml as plain quoted text — no markdown execution, no HTML.
+// This fragment owns the DATA LAYER + shared derivations + the compact
+// card twin + the start-session confirm sheet; ui2-agenda-cards.js owns
+// the tab scaffold/lenses/cards; ui2-agenda-inspector.js owns the item
+// inspector, the schedule sheet, and the reminder-policy popover.
+//
+// Item-authored strings (titles, bodies, annotations, criteria, answers,
+// goals, notes) are DATA, never instructions: everything renders through
+// escapeHtml as plain quoted text — no markdown execution, no HTML. Ask
+// preview HTML renders ONLY inside sandboxed srcdoc iframes.
 
 let agendaItems = null; // null = never fetched (fetch on first need)
 let agendaCounts = { open: 0, done: 0, retired: 0 };
 let agendaSkippedLines = 0;
-let agendaFilter = 'open';
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
 let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 // Session-resolution join from the list response: recorded session id →
-// { source, conversation_id, key, name } for the Sessions-tab row. Ids the
-// daemon could not resolve have no entry — surfaces fall back to the raw
-// id. `attempted` remembers ids a fetch already tried, so an unresolvable
-// id never causes refetch loops on the event lane.
+// { source, conversation_id, key, name, project_root } for the
+// Sessions-tab row. Ids the daemon could not resolve have no entry —
+// surfaces fall back to the raw id. `attempted` remembers ids a fetch
+// already tried, so an unresolvable id never causes refetch loops on the
+// event lane.
 let agendaSessions = {};
 let agendaSessionLookupsAttempted = new Set();
 // Items whose full annotation thread is expanded (render caps at 3).
 const agendaExpandedThreads = new Set();
+
+// ---- Lens + inspector view state (the redesigned tab). Ephemeral
+// browser state — never persisted, never on the wire.
+let agendaLens = 'now';
+let agendaSearch = '';
+let agendaFilterBlocked = false;
+let agendaFilterFrontier = false;
+let agendaSelId = null; // inspector selection (item id) or null
+// Inline structured-answer state, shared by the card composer and the
+// inspector question section: picks per question index, one free-text
+// draft per item, anchored notes per `${itemId}:${qi}`.
+const agendaQaSel = {};
+const agendaQaDrafts = {};
+const agendaQaNotes = {};
 
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
@@ -61,9 +83,9 @@ async function agendaRefresh() {
 // this) harmless. Once per page load per ask id — and never for a
 // DISMISSED item (`item.dismissed`, still open): the owner cleared it
 // from the rails deliberately, so it stays cleared across loads; the
-// card's "Open question panel" button is the deliberate way back, and
-// answering or reopening clears the marker (the log keeps the dismissal
-// as history).
+// inspector's question section is the deliberate way back, and answering
+// or reopening clears the marker (the log keeps the dismissal as
+// history).
 const agendaAnnouncedAsks = new Set();
 function agendaAnnounceParkedAsks() {
   if (!Array.isArray(agendaItems)) return;
@@ -89,11 +111,10 @@ function agendaAnnounceParkedAsks() {
   }
 }
 
-// Explicit "open the question panel" from an agenda item card. Unlike the
-// once-per-load announce this is a user act: it re-surfaces even a tucked
-// or previously-dismissed panel, and it navigates to the Activity tab
-// where the panel lives (opening invisibly confused live QA 2026-07-20 —
-// the item card only offered the blind plain-text input).
+// Explicit "open the question panel" (the rail door in the inspector's
+// question section). Unlike the once-per-load announce this is a user
+// act: it re-surfaces even a tucked or previously-dismissed panel, and it
+// navigates to the Activity tab where the panel lives.
 function agendaOpenParkedAsk(itemId) {
   const item = (agendaItems || []).find((candidate) => candidate.id === itemId);
   if (!item || !item.ask || !Array.isArray(item.ask.questions) || !item.ask.questions.length) {
@@ -115,11 +136,11 @@ function agendaOpenParkedAsk(itemId) {
   if (typeof setQuestionMinimized === 'function') setQuestionMinimized(false);
 }
 
-// "View question" on a DONE ask-backed item: the same panel, rendered
-// READ-ONLY from the retained payload — the record stays fully viewable
-// (recorded picks selected, follow-ups and anchored notes as content,
-// preview cards from the retained blobs; blobs are deleted only on
-// retire, and a missing one degrades to a named placeholder). Close
+// "View the rail record" on a DONE ask-backed item: the same panel,
+// rendered READ-ONLY from the retained payload — the record stays fully
+// viewable (recorded picks selected, follow-ups and anchored notes as
+// content, preview cards from the retained blobs; blobs are deleted only
+// on retire, and a missing one degrades to a named placeholder). Close
 // returns here; "Reopen to change answer" rides the existing reopen op.
 function agendaViewAnsweredAsk(itemId) {
   const item = agendaFindItem(itemId);
@@ -153,15 +174,6 @@ async function agendaReopenAnsweredAsk(itemId) {
   if (!ok) return false;
   agendaOpenParkedAsk(itemId);
   return true;
-}
-
-// Head-click router for ask-backed items: an OPEN item's head opens the
-// live panel, a DONE item's head opens the read-only record.
-function agendaOpenAskPanel(itemId) {
-  const item = agendaFindItem(itemId);
-  if (!item) return;
-  if (item.status === 'open') agendaOpenParkedAsk(itemId);
-  else if (item.status === 'done') agendaViewAnsweredAsk(itemId);
 }
 
 // Live update from the event lane: merge the changed item, adopt counts.
@@ -230,42 +242,29 @@ async function agendaSendOp(params, button) {
   }
 }
 
+// Refused ops surface inline on the tab's notice line (and the ledger
+// keeps rendering under it). The daemon's named refusal is the message.
 function agendaFlashError(message) {
-  const note = document.getElementById('agenda-tab-skipped');
-  if (!note) return;
-  note.style.display = '';
+  const note = document.getElementById('ag2-notice');
+  if (!note) {
+    if (typeof showControlToast === 'function') showControlToast('error', message);
+    return;
+  }
+  note.hidden = false;
   note.textContent = message;
   setTimeout(() => {
     note.textContent = '';
-    agendaRenderAll(); // restores the skipped-lines note if one applies
+    note.hidden = true;
   }, 6000);
-}
-
-function agendaGlyph(status, kind) {
-  if (status === 'done') return '<span class="agenda-glyph done" aria-label="done">✓</span>';
-  if (status === 'retired') return '<span class="agenda-glyph retired" aria-label="retired">⊘</span>';
-  if (kind === 'question') return '<span class="agenda-glyph question" aria-label="open question">?</span>';
-  return '<span class="agenda-glyph open" aria-label="open">○</span>';
-}
-
-function agendaDueChip(item) {
-  if (!item.due_ms) return '';
-  const due = new Date(item.due_ms);
-  const overdue = item.status === 'open' && item.due_ms < Date.now();
-  const label = due.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-    + (due.getHours() || due.getMinutes()
-      ? ' ' + due.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-      : '');
-  return `<span class="agenda-chip due${overdue ? ' overdue' : ''}">due ${escapeHtml(label)}</span>`;
 }
 
 function agendaSessionInfo(id) {
   return (id && agendaSessions && agendaSessions[id]) || null;
 }
 
-// ---- F2 derived presentation (client twin of the daemon's is_blocked /
-// dependency_state — like the overdue chip, derived at render time from
-// facts the tab already holds; never stored, never on the wire).
+// ---- Derived presentation (client twin of the daemon's render-time
+// judgments — like the overdue chip, derived at render time from facts
+// the tab already holds; never stored, never on the wire).
 
 function agendaFindItem(id) {
   return (agendaItems || []).find((item) => item.id === id) || null;
@@ -285,6 +284,95 @@ function agendaItemIsBlocked(item) {
   if (item.status !== 'open') return false;
   if ((item.blockers || []).some((b) => !b.cleared)) return true;
   return (item.relies_on || []).some((edge) => !agendaEdgeState(edge).satisfied);
+}
+
+// The card's one-line blocked statement (first gate wins). Plain TEXT —
+// callers escape.
+function agendaBlockedLine(item) {
+  if (item.status !== 'open') return null;
+  const blocker = (item.blockers || []).find((b) => !b.cleared);
+  if (blocker) return `Blocked — waiting on: “${blocker.criterion}”`;
+  for (const edge of item.relies_on || []) {
+    const target = agendaFindItem(edge.target_id);
+    if (!target) return 'Prerequisite missing from the fold — review';
+    if (target.status === 'retired') return `Prerequisite “${target.title}” was retired — review`;
+    if (target.status === 'open') return `Waits on “${target.title}” — still open`;
+  }
+  return null;
+}
+
+// The item's scheduled-session effect, judged for render: kind is one of
+// running | suspended | pending | standing | armed | finished. Mirrors
+// the daemon's fold judgments (AgendaEffect::suspended, the scheduler's
+// next-instant derivation) — derived here every paint, never stored.
+function agendaEffectState(item) {
+  const effect = (item.effects || [])[0];
+  if (!effect || !effect.manifest) return null;
+  const manifest = effect.manifest;
+  const rec = manifest.recurrence || null;
+  const threshold = rec ? Math.max(1, rec.suspend_after_failures || 3) : 0;
+  const suspended = !!rec && (effect.consecutive_failures || 0) >= threshold;
+  const running = !!(effect.last_run && effect.last_run.state === 'started');
+  let next = manifest.fire_at_ms;
+  if (rec && rec.every_ms > 0) {
+    const behind = Math.max(0, Math.ceil((Date.now() - manifest.fire_at_ms) / rec.every_ms));
+    next = manifest.fire_at_ms + behind * rec.every_ms;
+  }
+  const kind = running ? 'running'
+    : suspended ? 'suspended'
+      : !effect.approval ? 'pending'
+        : rec ? 'standing'
+          : next > Date.now() ? 'armed' : 'finished';
+  return { effect, manifest, rec, threshold, suspended, running, next, kind };
+}
+
+function agendaChildrenOf(id) {
+  return (agendaItems || []).filter(
+    (it) => it.part_of && it.part_of.parent_id === id
+  );
+}
+
+// Transitive descendant set (cycle-safe) — the exclusion set for the
+// Filed-under and prerequisite pickers.
+function agendaDescendantIds(id, seen) {
+  seen = seen || new Set();
+  for (const child of agendaChildrenOf(id)) {
+    if (!seen.has(child.id)) {
+      seen.add(child.id);
+      agendaDescendantIds(child.id, seen);
+    }
+  }
+  return seen;
+}
+
+// The undirected adjacency union: edges stored on this item plus edges
+// other items store pointing here, deduped.
+function agendaRelationPartners(item) {
+  const partners = new Set((item.relates_to || []).map((e) => e.target_id));
+  (agendaItems || []).forEach((other) => {
+    if ((other.relates_to || []).some((e) => e.target_id === item.id)) {
+      partners.add(other.id);
+    }
+  });
+  partners.delete(item.id);
+  return partners;
+}
+
+// Triage-rank convention: the triage mandate writes ordinary annotations
+// with the self-described `triage` source, and a "rank N" phrase in the
+// text is its DECLARED ranking convention. The /rank (\d+)/ parse here is
+// a render-side bridge until a typed rank ships — it orders the Attend
+// group and labels the chip, and gates nothing (annotations are data).
+// The newest ranked triage note wins; an unranked one still marks the
+// item as triage-flagged.
+function agendaTriageInfo(item) {
+  const notes = (item.annotations || []).filter((a) => a.source === 'triage');
+  if (!notes.length) return null;
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const m = /rank (\d+)/.exec(notes[i].text || '');
+    if (m) return { rank: Number(m[1]), text: notes[i].text || '' };
+  }
+  return { rank: null, text: notes[notes.length - 1].text || '' };
 }
 
 function agendaActorLabel(p) {
@@ -343,21 +431,48 @@ function agendaActorHtml(p) {
   return bits.join(' ');
 }
 
-function agendaProvenanceLine(item) {
-  const p = item.provenance || {};
-  const created = p.created_ms
-    ? new Date(p.created_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-    : '';
-  const who = agendaActorHtml(p);
-  const parts = [];
-  if (created) parts.push(escapeHtml(`parked ${created}`));
-  if (who) parts.push(`by ${who}`);
-  return parts.join(' · ');
+// Relative instant ("in 3h" / "2d ago" / "just now"). Plain TEXT.
+function agendaRelTime(ms) {
+  if (!ms) return '';
+  const delta = ms - Date.now();
+  const abs = Math.abs(delta);
+  if (abs < 45e3) return 'just now';
+  const unit = abs < 36e5 ? `${Math.round(abs / 6e4)}m`
+    : abs < 864e5 ? `${Math.round(abs / 36e5)}h`
+      : `${Math.round(abs / 864e5)}d`;
+  return delta > 0 ? `in ${unit}` : `${unit} ago`;
+}
+
+// Absolute instant ("Tue Jul 21, 09:00", locale-aware). Plain TEXT.
+function agendaAbsTime(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  return `${d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}, `
+    + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+// Human cadence label for a recurrence interval (plain TEXT — callers
+// escape).
+function agendaCadenceLabel(everyMs) {
+  const minutes = Math.round((everyMs || 0) / 60000);
+  if (minutes % (7 * 24 * 60) === 0) return `${minutes / (7 * 24 * 60)}w`;
+  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${minutes}m`;
+}
+
+// The dismissal chip's tooltip (marker on a still-open question whose
+// rail card was skipped/denied). Plain TEXT — the caller escapes.
+function agendaDismissedTip(dismissed) {
+  const when = dismissed.at_ms ? agendaRelTime(dismissed.at_ms) : '';
+  const verb = dismissed.action ? `(${dismissed.action}) ` : '';
+  return `Rails cleared ${verb}${when ? `${when} ` : ''}— the question stays open `
+    + 'and answerable here; only an answer resolves it.';
 }
 
 // Jump to the conversation's row on the Sessions tab: switch tabs, then
 // focus/flash the card once the list renders it (rows are keyed by
-// sessionListRowKey = source<conversation id>). If the row is not in
+// sessionListRowKey = source<conversation id>). If the row is not in
 // the loaded window the jump degrades to just opening the tab.
 function agendaJumpToSession(key) {
   if (!key) return;
@@ -377,442 +492,9 @@ function agendaJumpToSession(key) {
   seek();
 }
 
-// Scheduled-session effect (A5): render the manifest under review, its
-// digest, and the approval state. Approval is an owner-surface act — the
-// dashboard is one, so the Approve button lives here; it carries the digest
-// of exactly the revision rendered, so what you approve is what you read
-// (a concurrent re-propose makes the click fail with "digest mismatch").
-function agendaEffectBlock(item) {
-  const effect = (item.effects || [])[0];
-  if (!effect || !effect.manifest) return '';
-  const manifest = effect.manifest;
-  const when = manifest.fire_at_ms ? new Date(manifest.fire_at_ms) : null;
-  const whenLabel = when
-    ? when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-      + ' ' + when.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-    : '';
-  // Standing cadence (G3-pre): the recurrence lives INSIDE the digest-
-  // bound manifest — one approval covers the series; any edit voids it.
-  const rec = manifest.recurrence || null;
-  const recLabel = rec ? agendaCadenceLabel(rec.every_ms) : '';
-  const suspendThreshold = rec ? (rec.suspend_after_failures || 3) : 0;
-  const suspended = !!rec && (effect.consecutive_failures || 0) >= suspendThreshold;
-  const chips =
-    (whenLabel ? `<span class="agenda-chip due">${rec ? 'from' : 'at'} ${escapeHtml(whenLabel)}</span>` : '')
-    + (rec ? `<span class="agenda-chip standing" title="Standing manifest: one approval covers every occurrence${rec.until_ms ? `; ends ${new Date(rec.until_ms).toLocaleDateString()}` : ''}${rec.max_occurrences ? `; at most ${rec.max_occurrences} runs` : ''}">every ${escapeHtml(recLabel)}</span>` : '')
-    + (suspended ? `<span class="agenda-chip blocked" title="${escapeHtml(`${effect.consecutive_failures} consecutive failed runs — re-approve the unchanged manifest to re-arm, or revoke`)}">suspended</span>` : '')
-    + (manifest.orchestrate ? '<span class="agenda-chip">orchestrate</span>' : '')
-    + (manifest.interactive ? '<span class="agenda-chip" title="Opens the session with the goal as its first message, then waits for you">interactive</span>' : '')
-    + (manifest.project_root
-      ? `<span class="agenda-chip" title="${escapeHtml(`project: ${manifest.project_root}`)}">${escapeHtml(agendaShortPath(manifest.project_root))}</span>`
-      : '');
-  const proposer = agendaActorLabel({
-    kind: effect.proposed_kind,
-    session_id: effect.proposed_session_id,
-    principal: effect.proposed_principal,
-  });
-  const digestShort = escapeHtml(String(effect.digest || '').slice(0, 12));
-  const run = effect.last_run;
-  let stateHtml = '';
-  let noteHtml = '';
-  let actions = '';
-  if (run) {
-    const glyphs = { completed: '✓', failed: '✗', missed: '⊘', unknown: '?', started: '▶' };
-    const classes = { completed: 'completed', failed: 'failed', started: 'armed' };
-    const bits = [`${glyphs[run.state] || '·'} ${run.state}`];
-    if (run.session_id) bits.push(agendaActorLabel({ session_id: run.session_id }));
-    stateHtml = `<span class="agenda-effect-state ${classes[run.state] || 'attention'}">${escapeHtml(bits.join(' · '))}</span>`;
-    if (run.note) {
-      // Session summaries / failure reasons are quoted data, like bodies.
-      noteHtml = `<div class="agenda-effect-note">${escapeHtml(run.note)}</div>`;
-    }
-  } else if (effect.approval) {
-    const who = agendaActorLabel(effect.approval);
-    stateHtml = `<span class="agenda-effect-state armed">approved${who ? ` by ${escapeHtml(who)}` : ''}</span>`;
-    if (item.status === 'open') {
-      actions = `<button type="button" class="agenda-btn" data-op="revoke_effect" data-id="${escapeHtml(item.id)}">Revoke</button>`;
-    }
-  } else {
-    stateHtml = '<span class="agenda-effect-state pending">awaiting your approval</span>';
-    if (item.status === 'open') {
-      actions = `<button type="button" class="agenda-btn approve" data-op="approve_effect" data-id="${escapeHtml(item.id)}" data-digest="${escapeHtml(effect.digest || '')}">Approve</button>`;
-    }
-  }
-  // Standing-effect actions (G3-pre). Suspended + still approved: the
-  // one-click re-arm re-approves the UNCHANGED digest. Approved + armed:
-  // "Run now" fires one extra occurrence of the approved bytes (bare
-  // start_now — the daemon routes it to request_occurrence, approval
-  // untouched).
-  if (rec && item.status === 'open' && effect.approval) {
-    if (suspended) {
-      actions = `<button type="button" class="agenda-btn approve" data-op="approve_effect" data-id="${escapeHtml(item.id)}" data-digest="${escapeHtml(effect.digest || '')}" title="Re-approve the unchanged manifest — resets the failure streak and re-arms the series">Re-arm</button>${actions}`;
-    } else if (!run || run.state !== 'started') {
-      actions = `<button type="button" class="agenda-btn agenda-run-now" data-id="${escapeHtml(item.id)}" title="Fire one extra occurrence of the approved manifest now — the standing approval is untouched">Run now</button>${actions}`;
-    }
-  }
-  return `<div class="agenda-effect">
-    <div class="agenda-effect-head">
-      <span class="agenda-effect-icon" aria-hidden="true">⏵</span>
-      <span class="agenda-effect-label">Scheduled session</span>
-      ${chips}${stateHtml}
-    </div>
-    <div class="agenda-effect-goal">${escapeHtml(manifest.goal || '')}</div>
-    ${noteHtml}
-    <div class="agenda-item-foot">
-      <span class="agenda-item-meta">digest ${digestShort}${proposer ? ` · proposed by ${escapeHtml(proposer)}` : ''}</span>
-      <span class="agenda-item-actions">${actions}</span>
-    </div>
-  </div>`;
-}
-
-// Human cadence label for a recurrence interval (plain TEXT — callers
-// escape).
-function agendaCadenceLabel(everyMs) {
-  const minutes = Math.round((everyMs || 0) / 60000);
-  if (minutes % (7 * 24 * 60) === 0) return `${minutes / (7 * 24 * 60)}w`;
-  if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)}d`;
-  if (minutes % 60 === 0) return `${minutes / 60}h`;
-  return `${minutes}m`;
-}
-
-// The dismissal chip's tooltip (marker on a still-open question whose
-// rail card was skipped/denied). Plain TEXT — the caller escapes.
-function agendaDismissedTip(dismissed) {
-  const when = dismissed.at_ms
-    ? new Date(dismissed.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-    : '';
-  const verb = dismissed.action ? `(${dismissed.action}) ` : '';
-  return `Dismissed ${verb}${when ? `on ${when} ` : ''}from the question rail — it stays open `
-    + 'and answerable here, but is not auto-announced again; Open question panel brings it back.';
-}
-
-// The recorded reply on a resolved question. Plain answers render the
-// joined text; rich (ask-backed) answers render the STRUCTURED breakdown
-// (`item.answer.structured` — maps keyed by question text), walked in the
-// ITEM's question order exactly like the daemon's text summary: a
-// "Header: answer" line per engaged question, the picked option labels,
-// follow-ups, and anchored preview notes. All of it is quoted data —
-// escaped, never executed, never instructions.
-function agendaAnswerBlock(item) {
-  const answer = item.answer;
-  const who = agendaActorLabel(answer);
-  const when = answer.at_ms
-    ? new Date(answer.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-    : '';
-  const meta = `<span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>`;
-  const questions = (item.ask && Array.isArray(item.ask.questions)) ? item.ask.questions : [];
-  const rows = answer.structured
-    ? agendaStructuredAnswerRows(questions, answer.structured)
-    : [];
-  if (!rows.length) {
-    return `<div class="agenda-item-answer">↳ ${escapeHtml(answer.text || '')}
-      ${meta}</div>`;
-  }
-  return `<div class="agenda-item-answer agenda-answer-structured">${rows.join('')}
-    <div>${meta}</div></div>`;
-}
-
-// One row per engaged question of a structured resolution. A question is
-// engaged when any of the maps mention it; a follow-up may stand in for
-// an answer, so the answer text is optional on the line.
-function agendaStructuredAnswerRows(questions, s) {
-  const answers = s.answers || {};
-  const selections = s.selections || {};
-  const followups = s.followups || {};
-  const annotations = s.annotations || {};
-  const engaged = questions.filter((q) =>
-    q.question in answers || q.question in selections
-    || q.question in followups || q.question in annotations);
-  return engaged.map((q) => {
-    const name = q.header || q.question;
-    const answerText = answers[q.question];
-    const head = answerText !== undefined
-      ? `<span class="agenda-answer-qname" title="${escapeHtml(q.question)}">${escapeHtml(name)}:</span> ${escapeHtml(answerText)}`
-      : `<span class="agenda-answer-qname" title="${escapeHtml(q.question)}">${escapeHtml(name)}</span>`;
-    const picks = (selections[q.question] || [])
-      .map((label) => `<span class="agenda-chip pick">✓ ${escapeHtml(label)}</span>`)
-      .join(' ');
-    const extras = [];
-    if (followups[q.question] !== undefined) {
-      extras.push(`<div class="agenda-answer-extra">follow-up: ${escapeHtml(followups[q.question])}</div>`);
-    }
-    for (const note of annotations[q.question] || []) {
-      extras.push(`<div class="agenda-answer-extra">note on ${escapeHtml(note.preview)}: ${escapeHtml(note.note)}</div>`);
-    }
-    return `<div class="agenda-answer-q">
-      <div class="agenda-answer-line">${head}</div>
-      ${picks ? `<div class="agenda-answer-picks">${picks}</div>` : ''}
-      ${extras.join('')}
-    </div>`;
-  });
-}
-
-// The item's thread + gates (F2): annotations (capped with an expander),
-// blockers with their clear affordance and cleared history, dependency
-// chips with satisfied/review markers, and the note/block composer.
-// Everything is data rendered escaped; nothing here executes or obeys.
-function agendaThreadBlock(item) {
-  const parts = [];
-  const notes = item.annotations || [];
-  if (notes.length) {
-    const cap = 3;
-    const shown = agendaExpandedThreads.has(item.id) ? notes : notes.slice(-cap);
-    const rows = shown.map((note) => {
-      const when = note.at_ms
-        ? new Date(note.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-        : '';
-      const who = agendaActorHtml(note);
-      const meta = [who, escapeHtml(when)].filter(Boolean).join(' · ');
-      return `<div class="agenda-note">↳ ${escapeHtml(note.text)}
-        <span class="agenda-item-meta">— ${meta}</span></div>`;
-    });
-    const more = notes.length > shown.length
-      ? `<button type="button" class="agenda-thread-more" data-id="${escapeHtml(item.id)}">show all ${notes.length} notes</button>`
-      : '';
-    parts.push(`<div class="agenda-thread">${rows.join('')}${more}</div>`);
-  }
-  const blockers = item.blockers || [];
-  if (blockers.length) {
-    const rows = blockers.map((blocker) => {
-      const who = agendaActorHtml(blocker);
-      if (blocker.cleared) {
-        const clearedBy = agendaActorHtml(blocker.cleared);
-        return `<div class="agenda-blocker cleared">✓ <s>${escapeHtml(blocker.criterion)}</s>
-          <span class="agenda-item-meta">— cleared${clearedBy ? ` by ${clearedBy}` : ''}</span></div>`;
-      }
-      const clear = item.status === 'open'
-        ? `<button type="button" class="agenda-btn agenda-clear-blocker" data-id="${escapeHtml(item.id)}" data-blocker="${escapeHtml(blocker.blocker_id)}">Clear</button>`
-        : '';
-      return `<div class="agenda-blocker">
-        <span class="agenda-blocker-text" title="${escapeHtml(blocker.blocker_id)}">⛔ ${escapeHtml(blocker.criterion)}</span>
-        <span class="agenda-item-meta">${who ? `— set by ${who}` : ''}</span>${clear}
-      </div>`;
-    });
-    parts.push(`<div class="agenda-blockers">${rows.join('')}</div>`);
-  }
-  const edges = item.relies_on || [];
-  if (edges.length) {
-    const chips = edges.map((edge) => {
-      const state = agendaEdgeState(edge);
-      const target = agendaFindItem(edge.target_id);
-      const label = target ? target.title : edge.target_id.slice(0, 10);
-      const marker = state.review === 'target_retired'
-        ? ' · prerequisite retired — review'
-        : state.review === 'target_missing'
-          ? ' · prerequisite missing'
-          : '';
-      const cls = state.satisfied ? 'satisfied' : state.review ? 'review' : 'waiting';
-      const remove = item.status === 'open'
-        ? `<button type="button" class="agenda-edge-remove" data-id="${escapeHtml(item.id)}" data-target="${escapeHtml(edge.target_id)}" aria-label="Remove dependency" title="Remove dependency">×</button>`
-        : '';
-      return `<span class="agenda-edge ${cls}" title="${escapeHtml(edge.target_id)}">
-        ${state.satisfied ? '✓' : '…'} needs ${escapeHtml(label)}${escapeHtml(marker)}${remove}</span>`;
-    });
-    parts.push(`<div class="agenda-edges">${chips.join('')}</div>`);
-  }
-  // Composer: annotate any non-retired item; block only open ones.
-  if (item.status !== 'retired') {
-    const blockBtn = item.status === 'open'
-      ? `<button type="button" class="agenda-btn agenda-thread-block" data-id="${escapeHtml(item.id)}">Block</button>`
-      : '';
-    parts.push(`<div class="agenda-thread-add">
-      <input type="text" class="agenda-thread-input" maxlength="4000"
-             placeholder="Add a note — or state a blocker…" aria-label="Note or blocker" data-id="${escapeHtml(item.id)}" />
-      <button type="button" class="agenda-btn agenda-thread-note" data-id="${escapeHtml(item.id)}">Note</button>
-      ${blockBtn}
-    </div>`);
-  }
-  return parts.length ? `<div class="agenda-item-thread">${parts.join('')}</div>` : '';
-}
-
-// ---- G2 graph presentation: hub roll-ups, placement, adjacency. ALL
-// derived at render from the ordinary snapshot — never stored, never on
-// the wire — and placement NEVER hides an item: the flat lens stays the
-// default, grouping is an opt-in reorder of the same cards (anti-hiding
-// rule). No transitive semantics: a hub completing over open children
-// wears a render-level flag only.
-
-let agendaGroupByHub = false;
-let agendaAttentionOrderOn = false;
-
-function agendaChildrenOf(id) {
-  return (agendaItems || []).filter(
-    (it) => it.part_of && it.part_of.parent_id === id
-  );
-}
-
-function agendaHubChip(item) {
-  const children = agendaChildrenOf(item.id);
-  if (!children.length) return '';
-  const open = children.filter((c) => c.status === 'open').length;
-  const doneOverOpen = item.status === 'done' && open > 0;
-  const flag = doneOverOpen
-    ? `<span class="agenda-hub-open-flag" title="This hub is done but ${open} of its children are still open — completion never cascades">· open children</span>`
-    : '';
-  return `<span class="agenda-chip hub" title="${children.length} item(s) placed under this one">⌂ ${open}/${children.length} open</span>${flag}`;
-}
-
-function agendaPlacementChip(item) {
-  if (!item.part_of) return '';
-  const parent = agendaFindItem(item.part_of.parent_id);
-  const label = parent ? parent.title : `${item.part_of.parent_id.slice(0, 10)}… (missing)`;
-  const short = label.length > 28 ? `${label.slice(0, 28)}…` : label;
-  return `<span class="agenda-chip placement">
-    <a href="#agenda" class="agenda-item-jump" data-jump="${escapeHtml(item.part_of.parent_id)}" title="Placed under: ${escapeHtml(label)}">in ${escapeHtml(short)}</a>
-    <button type="button" class="agenda-place-remove" data-id="${escapeHtml(item.id)}" data-parent="${escapeHtml(item.part_of.parent_id)}" aria-label="Remove placement" title="Un-place (history stays in the log)">×</button>
-  </span>`;
-}
-
-// The undirected adjacency union: edges stored on this item plus edges
-// other items store pointing here, deduped.
-function agendaRelationsBlock(item) {
-  const partners = new Set((item.relates_to || []).map((e) => e.target_id));
-  (agendaItems || []).forEach((other) => {
-    if ((other.relates_to || []).some((e) => e.target_id === item.id)) {
-      partners.add(other.id);
-    }
-  });
-  if (!partners.size) return '';
-  const chips = [...partners].map((pid) => {
-    const target = agendaFindItem(pid);
-    const label = target ? target.title : `${pid.slice(0, 10)}…`;
-    const short = label.length > 30 ? `${label.slice(0, 30)}…` : label;
-    return `<span class="agenda-relation">
-      <a href="#agenda" class="agenda-item-jump" data-jump="${escapeHtml(pid)}" title="${escapeHtml(label)}">↔ ${escapeHtml(short)}</a>
-      <button type="button" class="agenda-relation-remove" data-id="${escapeHtml(item.id)}" data-target="${escapeHtml(pid)}" aria-label="Remove relation" title="Remove relation (either side may — the daemon resolves the stored edge)">×</button>
-    </span>`;
-  });
-  return `<div class="agenda-relations">${chips.join('')}</div>`;
-}
-
-// Scroll-and-flash navigation to another item's card in this tab.
-function agendaJumpToItem(id) {
-  const selector = `.agenda-item[data-item-id="${window.CSS && CSS.escape ? CSS.escape(id) : id}"]`;
-  let card = document.querySelector(selector);
-  if (!card) {
-    // The target sits outside the current filter — widen to All.
-    agendaFilter = 'all';
-    document.querySelectorAll('#agenda-filters .agenda-filter').forEach((b) =>
-      b.classList.toggle('active', b.dataset.filter === 'all'));
-    agendaRenderTab();
-    card = document.querySelector(selector);
-  }
-  if (!card) return;
-  card.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  card.classList.add('agenda-jump-flash');
-  setTimeout(() => card.classList.remove('agenda-jump-flash'), 2400);
-}
-
-// The Attention lens (G3): the SAME open cards ordered by what needs the
-// owner — blocking questions, approval-pending manifests, suspended
-// standing effects, triage-recommended items, then recency. A pure
-// reorder over data the tab already holds (triage recommendations are
-// ordinary annotations with the self-described `triage` source — data,
-// gating nothing); the attention queue is a VIEW, never a second inbox.
-function agendaAttentionClass(item) {
-  if (item.kind === 'question' && item.status === 'open') return 0;
-  const effect = (item.effects || [])[0];
-  if (effect && !effect.approval && item.status === 'open') return 1;
-  if (effect && effect.manifest && effect.manifest.recurrence) {
-    const threshold = (effect.manifest.recurrence.suspend_after_failures || 3);
-    if ((effect.consecutive_failures || 0) >= threshold) return 2;
-  }
-  if ((item.annotations || []).some((n) => n.source === 'triage')) return 3;
-  return 4;
-}
-
-function agendaAttentionOrder(filtered) {
-  return filtered
-    .slice()
-    .sort((a, b) => {
-      const ca = agendaAttentionClass(a);
-      const cb = agendaAttentionClass(b);
-      if (ca !== cb) return ca - cb;
-      return (b.updated_ms || 0) - (a.updated_ms || 0);
-    })
-    .map((item) => ({ item, depth: 0 }));
-}
-
-// Grouped ordering (the by-hub lens): the SAME filtered cards, reordered
-// so children follow their parent (depth-indented). Roots keep the
-// newest-first order; an item whose parent is outside the filtered set
-// renders as a root — everything filtered stays visible, always.
-function agendaGroupedOrder(filtered) {
-  const inSet = new Map(filtered.map((item) => [item.id, item]));
-  const roots = filtered
-    .filter((item) => !(item.part_of && inSet.has(item.part_of.parent_id)))
-    .sort((a, b) => (a.id < b.id ? 1 : -1));
-  const out = [];
-  const emit = (item, depth) => {
-    out.push({ item, depth });
-    agendaChildrenOf(item.id)
-      .filter((child) => inSet.has(child.id))
-      .sort((a, b) => (a.id < b.id ? 1 : -1))
-      .forEach((child) => emit(child, Math.min(depth + 1, 6)));
-  };
-  roots.forEach((root) => emit(root, 0));
-  return out;
-}
-
-// ---- G1 typed references: chips + per-ref rows. Refs are POINTERS —
-// labels and locators are data, rendered escaped, never followed by
-// machinery. A must-read is rendered prominent for whoever picks the item
-// up (a pointer they weigh, not an order). File drift is fetched ON
-// DEMAND per item (the Verify button) — never on list render.
-
-function agendaRefsChip(item) {
-  const refs = item.refs || [];
-  if (!refs.length) return '';
-  const must = refs.filter((r) => r.must_read).length;
-  const label = refs.length === 1 ? '1 ref' : `${refs.length} refs`;
-  return `<span class="agenda-chip refs${must ? ' must' : ''}"${must ? ` title="${must} must-read"` : ''}>⛉ ${label}</span>`;
-}
-
-function agendaRefFileName(locator) {
-  const parts = String(locator).split(/[\\/]/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : locator;
-}
-
-function agendaRefsBlock(item) {
-  const refs = item.refs || [];
-  if (!refs.length) return '';
-  let hasFile = false;
-  const rows = refs.map((ref) => {
-    const label = ref.label || '';
-    let target = '';
-    if (ref.ref_type === 'url') {
-      target = `<a href="${escapeHtml(ref.locator)}" target="_blank" rel="noopener noreferrer nofollow">${escapeHtml(label || ref.locator)}</a>`;
-    } else if (ref.ref_type === 'session') {
-      const s = agendaSessionInfo(ref.locator);
-      const text = label || (s && s.name) || `session ${String(ref.locator).slice(0, 12)}`;
-      target = s && s.key
-        ? `<a href="#sessions" class="agenda-session-link" data-session-key="${escapeHtml(s.key)}" title="${escapeHtml(ref.locator)}">${escapeHtml(text)}</a>`
-        : `<span title="${escapeHtml(ref.locator)}">${escapeHtml(text)}</span>`;
-    } else if (ref.ref_type === 'memory') {
-      target = `<a href="#memory" class="agenda-ref-claim" data-claim="${escapeHtml(ref.locator)}" title="${escapeHtml(ref.locator)}">${escapeHtml(label || `claim ${String(ref.locator).slice(0, 12)}`)}</a>`;
-    } else {
-      hasFile = true;
-      const drift = ref.digest
-        ? `<span class="agenda-ref-drift" data-item="${escapeHtml(item.id)}" data-locator="${escapeHtml(ref.locator)}"></span>`
-        : '';
-      target = `<span title="${escapeHtml(ref.locator)}">${escapeHtml(label || agendaRefFileName(ref.locator))}</span>${drift}`;
-    }
-    const must = ref.must_read
-      ? '<span class="agenda-ref-must" title="Marked must-read by whoever attached it — weigh it before working the item">must-read</span>'
-      : '';
-    const remove = `<button type="button" class="agenda-ref-remove" data-id="${escapeHtml(item.id)}" data-type="${escapeHtml(ref.ref_type)}" data-locator="${escapeHtml(ref.locator)}" aria-label="Remove reference" title="Remove reference (history stays in the log)">×</button>`;
-    return `<span class="agenda-ref ${escapeHtml(ref.ref_type)}${ref.must_read ? ' must' : ''}">
-      <span class="agenda-ref-type">${escapeHtml(ref.ref_type)}</span>${must}${target}${remove}</span>`;
-  });
-  const verify = hasFile
-    ? `<button type="button" class="agenda-btn agenda-refs-verify" data-id="${escapeHtml(item.id)}" title="Re-hash the attached files against their attach-time digests">Verify files</button>`
-    : '';
-  return `<div class="agenda-refs">${rows.join('')}${verify}</div>`;
-}
-
 // On-demand drift check (G1): one fetch per gesture, per item — the
-// expand-time rehash lane. Badges land on the matching rows; a missing
-// file renders as missing, never an error.
+// expand-time rehash lane. Badges land on the matching inspector rows; a
+// missing file renders as missing, never an error.
 async function agendaVerifyRefs(itemId, button) {
   if (button) button.disabled = true;
   try {
@@ -826,7 +508,7 @@ async function agendaVerifyRefs(itemId, button) {
       el.dataset.status = row.status;
       el.textContent = row.status === 'unchanged' ? '✓ unchanged'
         : row.status === 'missing' ? 'missing'
-          : 'changed since attached';
+          : 'changed since attach';
     });
   } catch (err) {
     console.warn('agenda ref drift check failed', err);
@@ -918,6 +600,53 @@ function agendaShortPath(path) {
   }
   const raw = String(path || '');
   return raw.length > 28 ? `…${raw.slice(-27)}` : raw;
+}
+
+// ---- Reminder policy writes (Settings-gated: the owner's delivery
+// policy; an agenda.write grant can't raise its own item's loudness).
+
+function agendaItemUrgency(id) {
+  const overrides = (agendaReminderPolicy && agendaReminderPolicy.item_urgency) || {};
+  return overrides[id] || 'default';
+}
+
+async function agendaSetItemUrgency(id, value, control) {
+  const patch = { item_urgency: { [id]: value === 'default' ? null : value } };
+  await agendaSendPolicyPatch(patch, control);
+}
+
+async function agendaSendPolicyPatch(patch, control) {
+  if (control) control.disabled = true;
+  try {
+    const resp = await daemonApi.request('api_agenda_reminder_policy', patch);
+    if (resp.ok && resp.body && resp.body.reminder_policy) {
+      agendaReminderPolicy = resp.body.reminder_policy;
+      agendaRenderAll();
+      return true;
+    }
+    agendaFlashError((resp.body && resp.body.error) || `policy update failed (${resp.status})`);
+    agendaRenderAll(); // restore the controls to the effective policy
+    return false;
+  } catch (e) {
+    agendaFlashError(String(e && e.message || e));
+    return false;
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+
+// Whether the owner's quiet-hours window covers this instant (client twin
+// of QuietHours::contains — minutes since local midnight, may cross it).
+function agendaQuietNow() {
+  const quiet = agendaReminderPolicy && agendaReminderPolicy.quiet_hours;
+  if (!quiet) return false;
+  const now = new Date();
+  const minute = now.getHours() * 60 + now.getMinutes();
+  if (quiet.start_min === quiet.end_min) return false;
+  if (quiet.start_min < quiet.end_min) {
+    return minute >= quiet.start_min && minute < quiet.end_min;
+  }
+  return minute >= quiet.start_min || minute < quiet.end_min;
 }
 
 // ---- Start-now confirm sheet ----
@@ -1052,11 +781,14 @@ function agendaStartExecutionSummary(mode) {
 // settings (derive-don't-mirror: models and efforts come from the settings
 // payload where the daemon serves them; the static kimi/claude-alias lists
 // mirror the pinned settings-pane markup). `model`/`effort` are the daemon
-// DEFAULTS the selects inherit when left untouched.
-function agendaStartBackendConfig(settings) {
+// DEFAULTS the selects inherit when left untouched. `backend` may override
+// the daemon default (the sheet's Backend select) — the same
+// AgentLaunchConfig vocabulary CreateSession uses.
+function agendaStartBackendConfig(settings, backendOverride) {
   const d = settings || {};
-  const backend = (typeof normalizeAgentId === 'function')
+  const dflt = (typeof normalizeAgentId === 'function')
     ? normalizeAgentId(d.external_agent) : (d.external_agent || '');
+  const backend = backendOverride === undefined || backendOverride === '' ? dflt : backendOverride;
   if (backend === 'claude-code') {
     return {
       backend,
@@ -1064,9 +796,9 @@ function agendaStartBackendConfig(settings) {
       modelKey: 'claude_model',
       effortKey: 'claude_effort',
       effortLabel: 'Reasoning',
-      model: String(d.claude_model || ''),
+      model: backend === dflt ? String(d.claude_model || '') : '',
       models: ['fable', 'opus', 'sonnet', 'haiku'],
-      effort: String(d.claude_effort || ''),
+      effort: backend === dflt ? String(d.claude_effort || '') : '',
       efforts: Array.isArray(d.claude_efforts) ? d.claude_efforts : [],
     };
   }
@@ -1078,9 +810,9 @@ function agendaStartBackendConfig(settings) {
       modelKey: 'codex_model',
       effortKey: 'codex_reasoning_effort',
       effortLabel: 'Reasoning',
-      model: String(d.codex_model || ''),
+      model: backend === dflt ? String(d.codex_model || '') : '',
       models,
-      effort: String(d.codex_reasoning_effort || ''),
+      effort: backend === dflt ? String(d.codex_reasoning_effort || '') : '',
       efforts: Array.isArray(d.codex_reasoning_efforts) ? d.codex_reasoning_efforts : [],
     };
   }
@@ -1091,11 +823,14 @@ function agendaStartBackendConfig(settings) {
       modelKey: 'kimi_model',
       effortKey: 'kimi_thinking',
       effortLabel: 'Thinking',
-      model: String(d.kimi_model || ''),
+      model: backend === dflt ? String(d.kimi_model || '') : '',
       models: ['kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed', 'kimi-code/k3'],
-      effort: String(d.kimi_thinking || ''),
+      effort: backend === dflt ? String(d.kimi_thinking || '') : '',
       efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     };
+  }
+  if (backend === 'internal') {
+    return { backend: 'internal', label: 'Internal agent' };
   }
   return { backend: '', label: 'Internal agent' };
 }
@@ -1205,51 +940,43 @@ function agendaOpenStartSheet(itemId, anchor) {
   // DAEMON defaults (fetched fresh on open), with honest provenance —
   // an untouched select inherits ("daemon default (max)") and sends
   // nothing; an explicit pick is recorded on the manifest and applied.
+  // The Backend select uses the AgentLaunchConfig vocabulary the daemon
+  // documents ("internal", "codex", "claude-code", "kimi"); picking one
+  // explicitly pins the reviewed backend on the manifest. Pi is launchable
+  // as the daemon default but has no model catalog wired here yet.
   const config = agendaStartSheetEl('div', 'ags-config');
   panel.appendChild(config);
-  const configState = { spec: null, modelSel: null, effortSel: null };
+  const configState = { spec: null, backendSel: null, modelSel: null, effortSel: null, backendOverride: '' };
   const renderConfigControls = () => {
     config.textContent = '';
     configState.modelSel = null;
     configState.effortSel = null;
+    configState.backendSel = null;
     if (agendaStartSheetSettings === null) {
       config.appendChild(agendaStartSheetEl('div', 'ags-config-line',
         'Loading the daemon’s launch defaults…'));
       return;
     }
-    const spec = agendaStartBackendConfig(agendaStartSheetSettings);
+    const dfltSpec = agendaStartBackendConfig(agendaStartSheetSettings);
+    const spec = agendaStartBackendConfig(agendaStartSheetSettings, configState.backendOverride);
     configState.spec = spec;
-    const backendLine = agendaStartSheetEl('div', 'ags-config-line',
-      `${spec.label} · daemon default backend`);
-    config.appendChild(backendLine);
-    if (!spec.backend) {
-      config.appendChild(agendaStartSheetEl('div', 'ags-hint',
-        'Model and provider follow the daemon’s native configuration.'));
-      return;
-    }
-    const addSelect = (labelText, id, defaultValue, options) => {
+    const addSelect = (labelText, id, options, selected) => {
       const row = agendaStartSheetEl('div', 'ags-config-row');
       const label = agendaStartSheetEl('label', 'ags-label', labelText);
       label.setAttribute('for', id);
       row.appendChild(label);
       const select = document.createElement('select');
       select.id = id;
-      const inherit = document.createElement('option');
-      inherit.value = '';
-      inherit.textContent = defaultValue
-        ? `Daemon default (${defaultValue})`
-        : 'Daemon default (backend default)';
-      select.appendChild(inherit);
-      const values = [...options];
-      if (defaultValue && !values.includes(defaultValue)) values.push(defaultValue);
-      for (const value of values) {
+      for (const [value, text] of options) {
         const option = document.createElement('option');
         option.value = value;
-        option.textContent = value;
+        option.textContent = text;
+        if (value === selected) option.selected = true;
         select.appendChild(option);
       }
       row.appendChild(select);
-      const hint = agendaStartSheetEl('div', 'ags-hint', 'daemon default');
+      const hint = agendaStartSheetEl('div', 'ags-hint',
+        selected ? 'explicit — recorded on the manifest' : 'daemon default');
       row.appendChild(hint);
       select.addEventListener('change', () => {
         hint.textContent = select.value
@@ -1259,9 +986,35 @@ function agendaOpenStartSheet(itemId, anchor) {
       config.appendChild(row);
       return select;
     };
-    configState.modelSel = addSelect('Model', 'ags-config-model', spec.model, spec.models);
-    configState.effortSel = addSelect(
-      spec.effortLabel, 'ags-config-effort', spec.effort, spec.efforts);
+    const backendOptions = [['', `Daemon default (${dfltSpec.label})`]];
+    for (const [value, text] of [
+      ['internal', 'Internal agent'], ['codex', 'Codex'],
+      ['claude-code', 'Claude Code'], ['kimi', 'Kimi Code'],
+    ]) {
+      backendOptions.push([value, text]);
+    }
+    configState.backendSel = addSelect('Backend', 'ags-config-backend',
+      backendOptions, configState.backendOverride);
+    configState.backendSel.addEventListener('change', () => {
+      configState.backendOverride = configState.backendSel.value;
+      renderConfigControls();
+    });
+    if (!spec.backend || spec.backend === 'internal') {
+      config.appendChild(agendaStartSheetEl('div', 'ags-hint',
+        'Model and provider follow the daemon’s native configuration.'));
+      return;
+    }
+    if (!spec.modelKey) return;
+    const inheritLabel = (dflt) => dflt
+      ? `Daemon default (${dflt})` : 'Daemon default (backend default)';
+    const modelValues = [...spec.models];
+    if (spec.model && !modelValues.includes(spec.model)) modelValues.push(spec.model);
+    configState.modelSel = addSelect('Model', 'ags-config-model',
+      [['', inheritLabel(spec.model)], ...modelValues.map((v) => [v, v])], '');
+    const effortValues = [...spec.efforts];
+    if (spec.effort && !effortValues.includes(spec.effort)) effortValues.push(spec.effort);
+    configState.effortSel = addSelect(spec.effortLabel, 'ags-config-effort',
+      [['', inheritLabel(spec.effort)], ...effortValues.map((v) => [v, v])], '');
   };
   renderConfigControls();
   // Fetch fresh daemon defaults on every open (the settings snapshot ages
@@ -1363,17 +1116,18 @@ async function agendaStartSheetSubmit(item, goal, project, error, startBtn, conf
   // An explicit pick also pins the reviewed backend — the approved config
   // must not silently re-target if the daemon default changes.
   const spec = configState && configState.spec;
-  if (spec && spec.backend) {
-    const agentConfig = {};
+  const agentConfig = {};
+  if (configState && configState.backendOverride) {
+    agentConfig.agent = configState.backendOverride;
+  }
+  if (spec && spec.backend && spec.backend !== 'internal') {
     const model = configState.modelSel ? configState.modelSel.value : '';
     const effort = configState.effortSel ? configState.effortSel.value : '';
     if (model) agentConfig[spec.modelKey] = model;
     if (effort) agentConfig[spec.effortKey] = effort;
-    if (Object.keys(agentConfig).length) {
-      agentConfig.agent = spec.backend;
-      params.agent_config = agentConfig;
-    }
+    if ((model || effort) && !agentConfig.agent) agentConfig.agent = spec.backend;
   }
+  if (Object.keys(agentConfig).length) params.agent_config = agentConfig;
   startBtn.disabled = true;
   try {
     const resp = await daemonApi.request('api_agenda_op', params);
@@ -1395,444 +1149,10 @@ async function agendaStartSheetSubmit(item, goal, project, error, startBtn, conf
   }
 }
 
-function agendaActionButtons(item) {
-  const actions = [];
-  if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
-  else if (item.status === 'done') actions.push(['reopen', 'Reopen'], ['retire', 'Retire']);
-  else actions.push(['reopen', 'Reopen']);
-  let extra = '';
-  if (item.status === 'open') {
-    // Owner start-now: opens the CONFIRM SHEET (bottom sheet on coarse
-    // pointers, popover on desktop) — what will run (goal, project,
-    // config, Interactive/Goal-run) is reviewed there; the daemon mints
-    // + approves the manifest from the confirmed parameters and fires
-    // through the ordinary scheduled lane. The one-click instant fire is
-    // retired on dashboard surfaces (owner ruling, 2026-07-21). Owner
-    // surface = this dashboard; agents get NotPermitted.
-    // NOT on rich parked asks: those await the owner's ANSWER — spawning
-    // a follow-through session on one just re-reads the question at the
-    // owner (live-QA footgun 2026-07-20). Answering is the primary act;
-    // Open question panel is the affordance.
-    const richAsk = item.kind === 'question'
-      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
-    if (!richAsk) {
-      extra += `<button type="button" class="agenda-btn agenda-start-now" data-id="${escapeHtml(item.id)}" title="Review and start a supervised session from this item">Start now</button>`;
-    }
-    // Follow-up targets the ORIGIN conversation: live window → composer;
-    // ended but resumable → the existing resume path. Never a silent
-    // unrelated new session.
-    const sid = agendaFollowUpSid(item);
-    if (sid) {
-      extra += `<button type="button" class="agenda-btn agenda-follow-up" data-id="${escapeHtml(item.id)}" data-sid="${escapeHtml(sid)}" title="The recording conversation is live — open the composer targeted at it with this item quoted">Follow up</button>`;
-    } else if (agendaFollowUpResumable(item)) {
-      extra += `<button type="button" class="agenda-btn agenda-follow-up-resume" data-id="${escapeHtml(item.id)}" title="The recording conversation has ended — resume it (same conversation, its recorded project) and open the composer with this item quoted">Follow up (resumes session)</button>`;
-    }
-  }
-  const buttons = extra + actions
-    .map(([op, label]) =>
-      `<button type="button" class="agenda-btn" data-op="${op}" data-id="${escapeHtml(item.id)}">${label}</button>`)
-    .join('');
-  // The per-item reminder loudness control (owner policy) — only where a
-  // reminder can still fire.
-  if (item.status !== 'open' || !item.due_ms) return buttons;
-  const level = agendaItemUrgency(item.id);
-  const options = ['default', 'mute', 'info', 'attention', 'urgent']
-    .map((value) => {
-      const label = value === 'default'
-        ? `default (${(agendaReminderPolicy && agendaReminderPolicy.default_urgency) || 'attention'})`
-        : value;
-      return `<option value="${value}"${value === level ? ' selected' : ''}>${label}</option>`;
-    })
-    .join('');
-  return `<select class="agenda-bell" data-id="${escapeHtml(item.id)}" title="Reminder loudness for this item (owner policy)" aria-label="Reminder loudness">${options}</select>${buttons}`;
-}
-
-function agendaItemUrgency(id) {
-  const overrides = (agendaReminderPolicy && agendaReminderPolicy.item_urgency) || {};
-  return overrides[id] || 'default';
-}
-
-async function agendaSetItemUrgency(id, value, control) {
-  const patch = { item_urgency: { [id]: value === 'default' ? null : value } };
-  await agendaSendPolicyPatch(patch, control);
-}
-
-async function agendaSendPolicyPatch(patch, control) {
-  if (control) control.disabled = true;
-  try {
-    const resp = await daemonApi.request('api_agenda_reminder_policy', patch);
-    if (resp.ok && resp.body && resp.body.reminder_policy) {
-      agendaReminderPolicy = resp.body.reminder_policy;
-      agendaRenderAll();
-      return true;
-    }
-    agendaFlashError((resp.body && resp.body.error) || `policy update failed (${resp.status})`);
-    agendaRenderAll(); // restore the control to the effective policy
-    return false;
-  } catch (e) {
-    agendaFlashError(String(e && e.message || e));
-    return false;
-  } finally {
-    if (control) control.disabled = false;
-  }
-}
-
-function agendaRenderReminderBar() {
-  const bar = document.getElementById('agenda-reminders-bar');
-  if (!bar) return;
-  const policy = agendaReminderPolicy;
-  if (!policy) {
-    bar.innerHTML = '';
-    return;
-  }
-  const quiet = policy.quiet_hours;
-  const minToHhmm = (min) =>
-    `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
-  const quietLabel = quiet
-    ? `${minToHhmm(quiet.start_min)}–${minToHhmm(quiet.end_min)}`
-    : 'off';
-  bar.innerHTML = `
-    <span class="agenda-rem-label">Reminders</span>
-    <button type="button" class="agenda-btn" id="agenda-rem-toggle">${policy.enabled ? 'on' : 'off'}</button>
-    <span class="agenda-rem-label">quiet hours</span>
-    <button type="button" class="agenda-btn" id="agenda-rem-quiet" title="Deliveries inside the window wait for its end">${escapeHtml(quietLabel)}</button>
-    <span class="agenda-rem-label">default</span>
-    <select id="agenda-rem-default" aria-label="Default reminder urgency">
-      ${['info', 'attention', 'urgent'].map((value) =>
-        `<option value="${value}"${value === policy.default_urgency ? ' selected' : ''}>${value}</option>`).join('')}
-    </select>`;
-  const toggle = document.getElementById('agenda-rem-toggle');
-  if (toggle) toggle.addEventListener('click', () =>
-    agendaSendPolicyPatch({ enabled: !policy.enabled }, toggle));
-  const dflt = document.getElementById('agenda-rem-default');
-  if (dflt) dflt.addEventListener('change', () =>
-    agendaSendPolicyPatch({ default_urgency: dflt.value }, dflt));
-  const quietBtn = document.getElementById('agenda-rem-quiet');
-  if (quietBtn) quietBtn.addEventListener('click', () => {
-    const current = quiet ? `${minToHhmm(quiet.start_min)}-${minToHhmm(quiet.end_min)}` : '';
-    const raw = prompt('Quiet hours (HH:MM-HH:MM local; may cross midnight; empty = off)', current);
-    if (raw === null) return;
-    const trimmed = raw.trim();
-    if (!trimmed) {
-      agendaSendPolicyPatch({ quiet_hours: null }, quietBtn);
-      return;
-    }
-    const m = trimmed.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
-    if (!m) {
-      agendaFlashError('quiet hours must look like 22:00-08:00');
-      return;
-    }
-    const start = Number(m[1]) * 60 + Number(m[2]);
-    const end = Number(m[3]) * 60 + Number(m[4]);
-    if (start > 23 * 60 + 59 || end > 23 * 60 + 59) {
-      agendaFlashError('quiet hours must use 00:00–23:59');
-      return;
-    }
-    agendaSendPolicyPatch({ quiet_hours: { start_min: start, end_min: end } }, quietBtn);
-  });
-}
-
 function agendaRenderAll() {
   agendaRenderTab();
   agendaRenderCard();
-  agendaRenderReminderBar();
-}
-
-function agendaRenderTab() {
-  const list = document.getElementById('agenda-tab-list');
-  if (!list) return;
-  const counts = document.getElementById('agenda-tab-counts');
-  if (counts) {
-    counts.textContent =
-      `${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired`;
-  }
-  const note = document.getElementById('agenda-tab-skipped');
-  if (note && !note.textContent) {
-    if (agendaSkippedLines > 0) {
-      note.style.display = '';
-      note.textContent =
-        `${agendaSkippedLines} history line(s) from another build are preserved but not shown.`;
-    } else {
-      note.style.display = 'none';
-    }
-  }
-  if (agendaLoadError) {
-    list.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
-    return;
-  }
-  if (agendaItems === null) {
-    list.innerHTML = '<div class="ui-empty">Loading…</div>';
-    return;
-  }
-  // Questions is a KIND view, not a status: the open questions (rich
-  // parked asks lead with their panel button) plus the answered archive.
-  // Retired questions stay reachable under Retired / All.
-  const filtered = agendaItems.filter((item) =>
-    agendaFilter === 'all' ? true
-      : agendaFilter === 'blocked' ? agendaItemIsBlocked(item)
-        : agendaFilter === 'questions'
-          ? item.kind === 'question' && item.status !== 'retired'
-          : item.status === agendaFilter);
-  if (!filtered.length) {
-    list.innerHTML = agendaFilter === 'questions'
-      ? '<div class="ui-empty">No open or answered questions — park one with <code>intendant ctl ask --park</code>.</div>'
-      : `<div class="ui-empty">No ${agendaFilter === 'all' ? '' : `${agendaFilter} `}items — park one above, or run <code>intendant ctl agenda add</code>.</div>`;
-    return;
-  }
-  // Newest first reads best in a review list; ULIDs sort by creation.
-  // The by-hub lens reorders the SAME cards (children nested under
-  // parents) — the flat order stays the default and the guarantee.
-  const ordered = agendaAttentionOrderOn
-    ? agendaAttentionOrder(filtered)
-    : agendaGroupByHub
-    ? agendaGroupedOrder(filtered)
-    : filtered
-        .slice()
-        .sort((a, b) => (a.id < b.id ? 1 : -1))
-        .map((item) => ({ item, depth: 0 }));
-  const rows = ordered.map(({ item, depth }) => {
-    const tags = (item.tags || [])
-      .map((tag) => `<span class="agenda-chip">#${escapeHtml(tag)}</span>`)
-      .join('');
-    const body = item.body
-      ? `<div class="agenda-item-body">${escapeHtml(item.body)}</div>`
-      : '';
-    // The ask-seam reply affordance: open questions take a durable reply
-    // right here; answered ones show it (data, rendered escaped). Rich
-    // (ask-backed) questions lead with the panel — options and previews
-    // live there; the inline input stays as an explicit plain-text path,
-    // never the only door. Done rich asks keep a "View question" door to
-    // the same panel rendered read-only — the record stays fully viewable.
-    let answerBlock = '';
-    const openRichAsk = item.kind === 'question' && item.status === 'open'
-      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
-    const doneRichAsk = item.kind === 'question' && item.status === 'done'
-      && item.ask && Array.isArray(item.ask.questions) && item.ask.questions.length;
-    if (item.kind === 'question' && item.status === 'open') {
-      const richAsk = openRichAsk;
-      const openBtn = richAsk
-        ? `<div class="agenda-answer-row agenda-ask-open-row">
-            <button type="button" class="agenda-btn agenda-open-ask-btn" data-id="${escapeHtml(item.id)}">Open question panel</button>
-            <span class="agenda-ask-hint">${item.ask.questions.length > 1
-    ? `${item.ask.questions.length} structured questions`
-    : 'structured question'} with options${item.ask.questions.some((q) => (q.previews || []).length) ? ' + previews' : ''}</span>
-          </div>`
-        : '';
-      answerBlock = `${openBtn}<div class="agenda-answer-row">
-        <input type="text" class="agenda-answer-input" maxlength="4000"
-               placeholder="${richAsk ? 'Or type a plain-text answer…' : 'Answer this question…'}" aria-label="Answer" data-id="${escapeHtml(item.id)}" />
-        <button type="button" class="agenda-btn agenda-answer-btn" data-id="${escapeHtml(item.id)}">Answer</button>
-      </div>`;
-    } else if (item.answer && (item.answer.text || item.answer.structured)) {
-      // Answered: the archive keeps the full structured breakdown for
-      // rich asks, the joined text otherwise (agendaAnswerBlock).
-      answerBlock = agendaAnswerBlock(item);
-    }
-    if (doneRichAsk) {
-      answerBlock = `<div class="agenda-answer-row agenda-ask-open-row">
-          <button type="button" class="agenda-btn agenda-view-ask-btn" data-id="${escapeHtml(item.id)}">View question</button>
-          <span class="agenda-ask-hint">the full question as asked${item.ask.questions.some((q) => (q.previews || []).length) ? ' — previews included' : ''}, with the recorded answer</span>
-        </div>${answerBlock}`;
-    }
-    const blockedChip = agendaItemIsBlocked(item)
-      ? '<span class="agenda-chip blocked">blocked</span>'
-      : '';
-    // Dismissed-but-open questions wear a quiet marker: the rails were
-    // cleared deliberately and stay cleared (no auto re-announce); the
-    // item itself remains open and answerable right here.
-    const dismissedChip = item.status === 'open' && item.dismissed
-      ? `<span class="agenda-chip dismissed" title="${escapeHtml(agendaDismissedTip(item.dismissed))}">dismissed · still open</span>`
-      : '';
-    // Answered ask whose delivery reached no session (the daemon recorded
-    // `answer.delivered: false`): a quiet marker that the reply sits here
-    // unheard — the next session's agenda check is the pickup path.
-    // Pre-marker history (no `delivered` field) claims nothing.
-    const pickupChip = item.status === 'done' && item.ask && item.answer
-      && item.answer.delivered === false
-      ? '<span class="agenda-chip pickup" title="The answer was recorded, but the asking session was gone and no successor was live. The next session’s agenda check picks it up.">answered · awaiting pickup</span>'
-      : '';
-    // Rich asks: the whole head is the affordance — clicking the question
-    // opens its panel (live for open items, the read-only record for done
-    // ones; the explicit button below remains for discoverability).
-    // role/tabindex make it a real control for keyboard and assistive tech.
-    const headOpenAttrs = openRichAsk || doneRichAsk
-      ? ` agenda-item-head-openable" data-open-ask="${escapeHtml(item.id)}" role="button" tabindex="0" title="${openRichAsk ? 'Open the question panel' : 'View the answered question'}`
-      : '';
-    const indent = depth > 0 ? ` agenda-item-nested` : '';
-    const indentStyle = depth > 0 ? ` style="--agenda-nest-depth:${depth}"` : '';
-    return `<div class="agenda-item${indent}" data-status="${escapeHtml(item.status)}" data-item-id="${escapeHtml(item.id)}"${indentStyle}>
-      <div class="agenda-item-head${headOpenAttrs}">
-        ${agendaGlyph(item.status, item.kind)}
-        <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
-        <span class="agenda-item-title">${escapeHtml(item.title)}</span>
-        ${blockedChip}${dismissedChip}${pickupChip}${agendaDueChip(item)}${agendaHubChip(item)}${agendaPlacementChip(item)}${agendaRefsChip(item)}${tags}
-      </div>
-      ${body}${answerBlock}${agendaRefsBlock(item)}${agendaRelationsBlock(item)}${agendaThreadBlock(item)}${agendaEffectBlock(item)}
-      <div class="agenda-item-foot">
-        <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
-        <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
-      </div>
-    </div>`;
-  });
-  list.innerHTML = rows.join('');
-  list.querySelectorAll('a.agenda-session-link').forEach((link) => {
-    link.addEventListener('click', (e) => {
-      e.preventDefault();
-      agendaJumpToSession(link.dataset.sessionKey);
-    });
-  });
-  list.querySelectorAll('.agenda-open-ask-btn').forEach((btn) => {
-    btn.addEventListener('click', () => agendaOpenParkedAsk(btn.dataset.id));
-  });
-  list.querySelectorAll('.agenda-view-ask-btn').forEach((btn) => {
-    btn.addEventListener('click', () => agendaViewAnsweredAsk(btn.dataset.id));
-  });
-  list.querySelectorAll('.agenda-item-head-openable').forEach((head) => {
-    const open = (e) => {
-      // Chips/links inside the head keep their own behavior.
-      if (e.target.closest('button, a, input, select')) return;
-      e.preventDefault();
-      agendaOpenAskPanel(head.dataset.openAsk);
-    };
-    head.addEventListener('click', open);
-    head.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') open(e);
-    });
-  });
-  list.querySelectorAll('button[data-op]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const params = { op: btn.dataset.op, id: btn.dataset.id };
-      // Approve binds the digest of the revision this render showed.
-      if (btn.dataset.digest) params.digest = btn.dataset.digest;
-      agendaSendOp(params, btn);
-    });
-  });
-  list.querySelectorAll('select.agenda-bell').forEach((sel) => {
-    sel.addEventListener('change', () =>
-      agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
-  });
-  // F3 act-on-item wiring: Start now opens the confirm sheet (never an
-  // instant fire); follow-up routes to the origin conversation.
-  list.querySelectorAll('button.agenda-start-now').forEach((btn) => {
-    btn.addEventListener('click', () => agendaOpenStartSheet(btn.dataset.id, btn));
-  });
-  // G3-pre: Run now fires one extra occurrence of the APPROVED standing
-  // manifest (bare start_now — the daemon routes it to request_occurrence;
-  // the manifest shown in this block is exactly what runs, so no sheet).
-  list.querySelectorAll('button.agenda-run-now').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'start_now', id: btn.dataset.id }, btn));
-  });
-  list.querySelectorAll('button.agenda-follow-up').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const item = agendaFindItem(btn.dataset.id);
-      if (item) agendaFollowUpWithRecorder(item, btn.dataset.sid);
-    });
-  });
-  list.querySelectorAll('button.agenda-follow-up-resume').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const item = agendaFindItem(btn.dataset.id);
-      if (item) agendaFollowUpResume(item);
-    });
-  });
-  // F2 thread + gates wiring.
-  list.querySelectorAll('button.agenda-thread-more').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      agendaExpandedThreads.add(btn.dataset.id);
-      agendaRenderTab();
-    });
-  });
-  list.querySelectorAll('button.agenda-clear-blocker').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'clear_blocker', id: btn.dataset.id, blocker_id: btn.dataset.blocker }, btn));
-  });
-  list.querySelectorAll('button.agenda-edge-remove').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'remove_relies_on', id: btn.dataset.id, target_id: btn.dataset.target }, btn));
-  });
-  // G2 graph wiring: item jumps, un-place, relation removal.
-  list.querySelectorAll('a.agenda-item-jump').forEach((link) => {
-    link.addEventListener('click', (e) => {
-      e.preventDefault();
-      agendaJumpToItem(link.dataset.jump);
-    });
-  });
-  list.querySelectorAll('button.agenda-place-remove').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({
-        op: 'remove_part_of', id: btn.dataset.id, parent_id: btn.dataset.parent,
-      }, btn));
-  });
-  list.querySelectorAll('button.agenda-relation-remove').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({
-        op: 'remove_relates_to', id: btn.dataset.id, target_id: btn.dataset.target,
-      }, btn));
-  });
-  // G1 refs wiring: remove, on-demand drift verify, Memory claim jumps.
-  list.querySelectorAll('button.agenda-ref-remove').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({
-        op: 'remove_ref', id: btn.dataset.id,
-        ref_type: btn.dataset.type, locator: btn.dataset.locator,
-      }, btn));
-  });
-  list.querySelectorAll('button.agenda-refs-verify').forEach((btn) => {
-    btn.addEventListener('click', () => agendaVerifyRefs(btn.dataset.id, btn));
-  });
-  list.querySelectorAll('a.agenda-ref-claim').forEach((link) => {
-    link.addEventListener('click', (e) => {
-      e.preventDefault();
-      routeTo('memory');
-      if (typeof memoryGotoClaim === 'function') memoryGotoClaim(link.dataset.claim);
-    });
-  });
-  const submitThread = async (id, input, op, control) => {
-    const text = (input.value || '').trim();
-    if (!text) return;
-    input.disabled = true;
-    const params = op === 'set_blocker'
-      ? { op, id, criterion: text }
-      : { op, id, text };
-    const ok = await agendaSendOp(params, control);
-    input.disabled = false;
-    if (!ok) input.focus();
-  };
-  list.querySelectorAll('button.agenda-thread-note').forEach((btn) => {
-    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
-    if (!input) return;
-    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'annotate', btn));
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        submitThread(btn.dataset.id, input, 'annotate', btn);
-      }
-    });
-  });
-  list.querySelectorAll('button.agenda-thread-block').forEach((btn) => {
-    const input = list.querySelector(`input.agenda-thread-input[data-id="${btn.dataset.id}"]`);
-    if (!input) return;
-    btn.addEventListener('click', () => submitThread(btn.dataset.id, input, 'set_blocker', btn));
-  });
-  const submitAnswer = async (id, input, control) => {
-    const text = (input.value || '').trim();
-    if (!text) return;
-    input.disabled = true;
-    const ok = await agendaSendOp({ op: 'answer', id, text }, control);
-    input.disabled = false;
-    if (!ok) input.focus();
-  };
-  list.querySelectorAll('button.agenda-answer-btn').forEach((btn) => {
-    const input = list.querySelector(`input.agenda-answer-input[data-id="${btn.dataset.id}"]`);
-    if (!input) return;
-    btn.addEventListener('click', () => submitAnswer(btn.dataset.id, input, btn));
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        submitAnswer(btn.dataset.id, input, btn);
-      }
-    });
-  });
+  agendaInspectorRender();
 }
 
 // ---- Compact card on the activity pane (stacked under the vitals rail).
@@ -1943,73 +1263,14 @@ function agendaPositionCard() {
 
 {
   const wire = () => {
-    const filters = document.getElementById('agenda-filters');
-    if (filters) {
-      filters.querySelectorAll('.agenda-filter').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          agendaFilter = btn.dataset.filter || 'open';
-          filters.querySelectorAll('.agenda-filter').forEach((b) =>
-            b.classList.toggle('active', b === btn));
-          agendaRenderTab();
-        });
-      });
-      const group = document.getElementById('agenda-group-toggle');
-      const attention = document.getElementById('agenda-attention-toggle');
-      const syncLenses = () => {
-        if (group) {
-          group.classList.toggle('active', agendaGroupByHub);
-          group.setAttribute('aria-pressed', agendaGroupByHub ? 'true' : 'false');
-        }
-        if (attention) {
-          attention.classList.toggle('active', agendaAttentionOrderOn);
-          attention.setAttribute('aria-pressed', agendaAttentionOrderOn ? 'true' : 'false');
-        }
-        agendaRenderTab();
-      };
-      if (group) {
-        group.addEventListener('click', () => {
-          agendaGroupByHub = !agendaGroupByHub;
-          if (agendaGroupByHub) agendaAttentionOrderOn = false;
-          syncLenses();
-        });
-      }
-      if (attention) {
-        attention.addEventListener('click', () => {
-          agendaAttentionOrderOn = !agendaAttentionOrderOn;
-          if (agendaAttentionOrderOn) agendaGroupByHub = false;
-          syncLenses();
-        });
-      }
-    }
-    const addBtn = document.getElementById('agenda-add-btn');
-    const addTitle = document.getElementById('agenda-add-title');
-    const addKind = document.getElementById('agenda-add-kind');
-    const submitAdd = async () => {
-      const title = (addTitle && addTitle.value || '').trim();
-      if (!title) return;
-      const picked = (addKind && addKind.value) || 'task';
-      const kind = ['task', 'note', 'question'].includes(picked) ? picked : 'task';
-      const ok = await agendaSendOp({ op: 'add', kind, title }, addBtn);
-      if (ok && addTitle) {
-        addTitle.value = '';
-        addTitle.focus();
-      }
-    };
-    if (addBtn) addBtn.addEventListener('click', submitAdd);
-    if (addTitle) {
-      addTitle.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          submitAdd();
-        }
-      });
-    }
+    agendaEnsureScaffold();
     agendaBuildCard();
     agendaRefresh();
-    // Follow-up affordance liveness: the button is derived at render time
-    // from session-window state the agenda has no event lane for, so a
-    // visible tab re-renders when (and only when) the eligibility
-    // signature changes — the target-switch poll idiom, write-guarded.
+    // Follow-up affordance liveness: the inspector's follow-up action is
+    // derived at render time from session-window state the agenda has no
+    // event lane for, so a visible tab re-renders when (and only when) the
+    // eligibility signature changes — the target-switch poll idiom,
+    // write-guarded.
     let followUpSig = '';
     setInterval(() => {
       if (!agendaTabVisible() || !Array.isArray(agendaItems)) return;
@@ -2020,6 +1281,7 @@ function agendaPositionCard() {
       if (sig !== followUpSig) {
         followUpSig = sig;
         agendaRenderTab();
+        agendaInspectorRender();
       }
     }, 2000);
     // Pane-gated: the card lives in #activity-log-pane, so with the
