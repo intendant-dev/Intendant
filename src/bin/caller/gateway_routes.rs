@@ -368,6 +368,9 @@ pub(crate) enum RouteHandlerId {
     AgendaList,
     /// Raw op-log page (since/item/limit cursor; unknown ops verbatim).
     AgendaOps,
+    /// Raw occurrence-journal page (delivery/dispatch history; same
+    /// cursor semantics as the op log).
+    AgendaOccurrences,
     /// Apply one agenda command (add/ask/answer/patch/transitions/effects).
     AgendaOp,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
@@ -925,6 +928,20 @@ pub(crate) static ROUTES: &[Route] = &[
         "Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim)",
     )
     .with_tunnel(tunnel_method("api_agenda_ops")),
+    // The occurrence journal behind the scheduler, read-only: per-item
+    // delivery/dispatch history (prepared/delivered/suppressed/missed/
+    // started/completed/failed/unknown), with journal silence for
+    // downtime-skipped instants honestly visible. Same cursor and
+    // unknown-lines-verbatim posture as the op-log route.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/agenda/occurrences"),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaOccurrences,
+        "Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_occurrences")),
     // Capped above Default: the rich-ask park command (`op:"ask"`)
     // legitimately carries the ≤8 MB preview budget as base64 JSON.
     op_route(

@@ -1196,6 +1196,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaOccurrences => {
+                return handle_agenda_occurrences(
+                    stream,
+                    request_line,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaOp => {
                 // The authenticated edge: the pre-dispatch IAM gate bound
                 // this principal; no token names a session on this lane.

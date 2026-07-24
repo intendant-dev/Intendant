@@ -437,6 +437,131 @@ impl OccurrenceJournal {
         }
         Ok(())
     }
+
+    /// One page of the raw journal (read-only; `GET /api/agenda/occurrences`).
+    ///
+    /// `since` is a 0-based line cursor into `occurrences.jsonl`. The
+    /// journal is append-only — nothing in the daemon compacts, truncates,
+    /// or rewrites it (the writers are [`Self::append`]'s single
+    /// whole-line `write_all` and the torn-tail `\n` terminators in
+    /// [`Self::open`]/[`Self::refresh_if_stale`], which never add a line)
+    /// — so a line index is a stable sequence number, and external
+    /// tampering that shrinks the file surfaces as `log_len` dropping
+    /// below the cursor.
+    ///
+    /// The fold's skip-don't-brick rule extends to reads: a line
+    /// [`fold_journal`] cannot fold (a newer build's record shape) is
+    /// still served VERBATIM with `known:false` — this build never hides
+    /// delivery history it cannot parse; a line that is not JSON at all
+    /// is served as `{"seq":N,"known":false,"unparseable":true,"raw":…}`.
+    /// `item` filters on the raw line's `item_id` field (unknown shapes
+    /// included); lines without one are excluded under the filter.
+    /// Whitespace-only lines keep their seq slot but are never served.
+    ///
+    /// Torn reads: the in-process writer (the scheduler's own journal
+    /// instance) appends each record as ONE `write_all` of a complete
+    /// line on an `O_APPEND` handle, so a concurrent read observes whole
+    /// lines — the exact guarantee [`Self::refresh_if_stale`]'s own fold
+    /// (and the co-homed-daemons convergence it exists for) already
+    /// rests on; a crash-torn tail is permanently torn and served as
+    /// `unparseable` history. The caller's lock (`AgendaHandle`'s
+    /// journal mutex) additionally serializes this read against our own
+    /// terminator writes.
+    pub(crate) fn read_page(
+        &mut self,
+        since: u64,
+        item: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<AgendaOccurrencesPage> {
+        // Converge first (terminates a foreign torn tail), like every
+        // other read through this instance.
+        self.refresh_if_stale()?;
+        let limit = limit.clamp(1, AGENDA_OCCURRENCES_MAX_LIMIT);
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut occurrences: Vec<serde_json::Value> = Vec::new();
+        let mut log_len = 0u64;
+        // The first seq the scan did not consume; log_len unless the
+        // page filled mid-log.
+        let mut next_since: Option<u64> = None;
+        for (index, raw_line) in text.lines().enumerate() {
+            let seq = index as u64;
+            log_len = seq + 1;
+            if next_since.is_some() || seq < since {
+                continue;
+            }
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => {
+                    if let Some(want) = item {
+                        let referenced = value.get("item_id").and_then(serde_json::Value::as_str);
+                        if referenced != Some(want) {
+                            continue;
+                        }
+                    }
+                    // Known = this build's fold parses it — exactly the
+                    // predicate `fold_journal` folds with.
+                    let known = serde_json::from_str::<OccurrenceRecord>(line).is_ok();
+                    serde_json::json!({ "seq": seq, "known": known, "record": value })
+                }
+                Err(_) => {
+                    if item.is_some() {
+                        continue; // no item_id — excluded under the filter
+                    }
+                    serde_json::json!({
+                        "seq": seq,
+                        "known": false,
+                        "unparseable": true,
+                        "raw": line,
+                    })
+                }
+            };
+            occurrences.push(entry);
+            if occurrences.len() >= limit {
+                next_since = Some(seq + 1);
+            }
+        }
+        Ok(AgendaOccurrencesPage {
+            occurrences,
+            next_since: next_since.unwrap_or(log_len),
+            log_len,
+            filtered: item.is_some(),
+        })
+    }
+}
+
+/// Default page size for [`OccurrenceJournal::read_page`] when the caller
+/// names none; the clamp ceiling is [`AGENDA_OCCURRENCES_MAX_LIMIT`].
+pub(crate) const AGENDA_OCCURRENCES_DEFAULT_LIMIT: usize = 500;
+/// Hard page-size ceiling for [`OccurrenceJournal::read_page`].
+pub(crate) const AGENDA_OCCURRENCES_MAX_LIMIT: usize = 2000;
+
+/// One page of the raw occurrence journal, as
+/// `GET /api/agenda/occurrences` serves it. Serializes to exactly the
+/// response body:
+/// `{"occurrences":[…],"next_since":…,"log_len":…,"filtered":…}`.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct AgendaOccurrencesPage {
+    /// Served entries, in journal order. Each is
+    /// `{"seq":N,"known":bool,"record":<the line's JSON, verbatim>}`, or
+    /// `{"seq":N,"known":false,"unparseable":true,"raw":"<line>"}` for a
+    /// line that is not JSON at all.
+    pub(crate) occurrences: Vec<serde_json::Value>,
+    /// Resume cursor: the first seq this scan did not consume — last
+    /// returned seq + 1 when the page filled, otherwise `log_len`.
+    pub(crate) next_since: u64,
+    /// Total lines in the journal right now. A value below a client's
+    /// cursor means the append-only contract was broken externally.
+    pub(crate) log_len: u64,
+    /// True when an `item` filter was applied to this page.
+    pub(crate) filtered: bool,
 }
 
 fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
@@ -2099,5 +2224,226 @@ mod tests {
         decorate_planner_fields(&mut done, &journal, &policy, now, &at_23);
         assert_eq!(done[0].deferred_until, None);
         assert_eq!(done[0].effects[0].next_fire_ms, None);
+    }
+
+    // ---- The occurrence-journal read page (GET /api/agenda/occurrences) ----
+
+    /// Seed a journal through the REAL append path with the writer's own
+    /// record shapes: one reminder delivery (prepared → delivered, as
+    /// `deliver_one` writes) for item A and one scheduled-session run
+    /// (prepared → started → completed, as `dispatch_session` + the
+    /// write-back write) for item B — five lines, seqs 0..=4. Then three
+    /// foreign lines appended directly, as a newer build or hand edit
+    /// would: an unknown-shape record still carrying A's `item_id` (5),
+    /// an item-less unknown record (6), and a non-JSON line (7).
+    fn seeded_occurrences(dir: &Path) -> OccurrenceJournal {
+        let mut journal = OccurrenceJournal::open(dir).unwrap();
+        for (state, urgency) in [
+            (OccurrenceState::Prepared, None),
+            (OccurrenceState::Delivered, Some(ReminderUrgency::Attention)),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 1_000,
+                    occurrence_id: "occ-reminder-a".into(),
+                    item_id: "01ITEMA".into(),
+                    due_ms: 900,
+                    state,
+                    urgency,
+                    session_id: None,
+                })
+                .unwrap();
+        }
+        for (state, session) in [
+            (OccurrenceState::Prepared, None),
+            (OccurrenceState::Started, Some("sess-run-1".to_string())),
+            (OccurrenceState::Completed, Some("sess-run-1".to_string())),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 2_000,
+                    occurrence_id: "occ-session-b".into(),
+                    item_id: "01ITEMB".into(),
+                    due_ms: 1_900,
+                    state,
+                    urgency: None,
+                    session_id: session,
+                })
+                .unwrap();
+        }
+        let foreign = "{\"v\":1,\"at_ms\":3000,\"occurrence_id\":\"occ-future\",\"item_id\":\"01ITEMA\",\"due_ms\":2900,\"state\":\"rescheduled\"}\n\
+             {\"v\":2,\"kind\":\"journal_note\"}\n\
+             this line is not JSON at all\n";
+        let mut file = std::fs::File::options()
+            .append(true)
+            .open(&journal.path)
+            .unwrap();
+        file.write_all(foreign.as_bytes()).unwrap();
+        journal
+    }
+
+    fn page_seqs(page: &AgendaOccurrencesPage) -> Vec<u64> {
+        page.occurrences
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// Full-page service and window math: real-writer lines round-trip as
+    /// `known` records, a newer build's record is served verbatim with
+    /// `known:false`, a non-JSON line as `unparseable` — and
+    /// since/limit/next_since/log_len behave exactly like the op-log
+    /// cursor.
+    #[test]
+    fn occurrences_page_windows_and_serves_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = seeded_occurrences(dir.path());
+
+        let page = journal.read_page(0, None, 500).unwrap();
+        assert_eq!(page.log_len, 8);
+        assert_eq!(page.next_since, 8);
+        assert!(!page.filtered);
+        assert_eq!(page_seqs(&page), (0..8).collect::<Vec<u64>>());
+        // The five real-writer lines: known, and each round-trips through
+        // the typed record — nothing partial, nothing reshaped.
+        for entry in &page.occurrences[..5] {
+            assert_eq!(entry["known"], serde_json::Value::Bool(true));
+            let record: OccurrenceRecord = serde_json::from_value(entry["record"].clone()).unwrap();
+            assert!(record.at_ms > 0);
+        }
+        assert_eq!(page.occurrences[1]["record"]["state"], "delivered");
+        assert_eq!(page.occurrences[4]["record"]["state"], "completed");
+        assert_eq!(page.occurrences[4]["record"]["session_id"], "sess-run-1");
+        // A newer build's vocabulary: served verbatim, marked unknown.
+        assert_eq!(page.occurrences[5]["known"], serde_json::Value::Bool(false));
+        assert_eq!(page.occurrences[5]["record"]["state"], "rescheduled");
+        assert_eq!(page.occurrences[5]["record"]["item_id"], "01ITEMA");
+        assert_eq!(page.occurrences[6]["known"], serde_json::Value::Bool(false));
+        assert_eq!(page.occurrences[6]["record"]["kind"], "journal_note");
+        // Non-JSON: unparseable, raw preserved string-escaped.
+        assert_eq!(
+            page.occurrences[7]["unparseable"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(page.occurrences[7]["raw"], "this line is not JSON at all");
+
+        // Window math: a mid-log page fills and resumes exactly.
+        let page = journal.read_page(2, None, 3).unwrap();
+        assert_eq!(page_seqs(&page), vec![2, 3, 4]);
+        assert_eq!(page.next_since, 5);
+        assert_eq!(page.log_len, 8);
+        let page = journal.read_page(page.next_since, None, 500).unwrap();
+        assert_eq!(page_seqs(&page), vec![5, 6, 7]);
+        assert_eq!(page.next_since, 8);
+        // At (or past) the tail: empty page still pointing at the tail.
+        let page = journal.read_page(8, None, 500).unwrap();
+        assert!(page.occurrences.is_empty());
+        assert_eq!(page.next_since, 8);
+        let page = journal.read_page(100, None, 500).unwrap();
+        assert!(page.occurrences.is_empty());
+        assert_eq!(page.next_since, 8);
+        // The limit clamp floor: 0 is not "unbounded" and not "nothing".
+        let page = journal.read_page(0, None, 0).unwrap();
+        assert_eq!(page.occurrences.len(), 1);
+        assert_eq!(page.next_since, 1);
+    }
+
+    /// The `item` filter serves exactly the lines whose `item_id` is the
+    /// requested item — unknown-shape records included — and excludes
+    /// item-less and unparseable lines; a truncated filtered page resumes
+    /// without re-serving.
+    #[test]
+    fn occurrences_item_filter_includes_only_that_items_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = seeded_occurrences(dir.path());
+
+        let page = journal.read_page(0, Some("01ITEMA"), 500).unwrap();
+        assert!(page.filtered);
+        assert_eq!(page.log_len, 8);
+        assert_eq!(page.next_since, 8);
+        // A's reminder pair (0, 1) and the unknown-shape record on A (5);
+        // never B's lines, the item-less record (6), or non-JSON (7).
+        assert_eq!(page_seqs(&page), vec![0, 1, 5]);
+        for entry in &page.occurrences {
+            assert_eq!(entry["record"]["item_id"], "01ITEMA");
+        }
+        assert_eq!(page.occurrences[2]["known"], serde_json::Value::Bool(false));
+
+        let page = journal.read_page(0, Some("01ITEMB"), 500).unwrap();
+        assert_eq!(page_seqs(&page), vec![2, 3, 4]);
+
+        // Truncated filtered page: resume serves the rest exactly once.
+        let page = journal.read_page(0, Some("01ITEMA"), 2).unwrap();
+        assert_eq!(page_seqs(&page), vec![0, 1]);
+        assert_eq!(page.next_since, 2);
+        let page = journal
+            .read_page(page.next_since, Some("01ITEMA"), 500)
+            .unwrap();
+        assert_eq!(page_seqs(&page), vec![5]);
+        assert_eq!(page.next_since, 8);
+
+        // An id nothing references filters to an empty (honest) page.
+        let page = journal.read_page(0, Some("01NOSUCH"), 500).unwrap();
+        assert!(page.occurrences.is_empty());
+        assert!(page.filtered);
+        assert_eq!(page.next_since, 8);
+    }
+
+    /// The production topology's torn-read canary: the scheduler writes
+    /// through its OWN journal instance while a reader instance pages —
+    /// every served entry is a complete record (whole-line `O_APPEND`
+    /// visibility), never an `unparseable` artifact of an in-flight
+    /// append.
+    #[test]
+    fn occurrences_reads_never_split_writer_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        const APPENDS: u64 = 40;
+        let writer = {
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mut journal = OccurrenceJournal::open(&dir).unwrap();
+                for round in 0..APPENDS {
+                    journal
+                        .append(&OccurrenceRecord {
+                            v: 1,
+                            at_ms: round + 1,
+                            occurrence_id: format!("occ-{round}"),
+                            item_id: "01ITEMC".into(),
+                            due_ms: round,
+                            state: OccurrenceState::Delivered,
+                            urgency: Some(ReminderUrgency::Info),
+                            // Padding so a torn line would be visible.
+                            session_id: Some("x".repeat(200)),
+                        })
+                        .unwrap();
+                }
+            })
+        };
+        let mut reader = OccurrenceJournal::open(dir.path()).unwrap();
+        let assert_complete = |page: &AgendaOccurrencesPage| {
+            for entry in &page.occurrences {
+                assert_eq!(
+                    entry["known"],
+                    serde_json::Value::Bool(true),
+                    "a concurrent read must never surface a torn line: {entry}"
+                );
+                assert!(
+                    serde_json::from_value::<OccurrenceRecord>(entry["record"].clone()).is_ok(),
+                    "served line must be a complete record: {entry}"
+                );
+            }
+        };
+        while !writer.is_finished() {
+            let page = reader.read_page(0, None, 2000).unwrap();
+            assert_complete(&page);
+        }
+        writer.join().unwrap();
+        let page = reader.read_page(0, None, 2000).unwrap();
+        assert_complete(&page);
+        assert_eq!(page.log_len, APPENDS);
+        assert_eq!(page.occurrences.len(), APPENDS as usize);
+        assert_eq!(page.next_since, page.log_len);
     }
 }
