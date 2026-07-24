@@ -1422,6 +1422,7 @@
           <button class="subtab-btn active" data-sessions-tab="recent">Recent</button>
           <button class="subtab-btn" data-sessions-tab="deep">Deep Search</button>
           <button class="subtab-btn" data-sessions-tab="worktrees">Worktrees</button>
+          <button class="subtab-btn" data-sessions-tab="cloud">Cloud</button>
           <button class="subtab-btn" data-sessions-tab="new">New Session</button>
         </div>
         <div class="subtab-panes sessions-subtab-panes">
@@ -1665,6 +1666,19 @@
             <div class="sessions-aggregate" id="worktrees-aggregate"></div>
             <div class="worktrees-list" id="worktrees-list">
               <div class="empty-state">No worktree scan yet</div>
+            </div>
+          </div>
+          <div class="subtab-pane" id="sessions-pane-cloud">
+            <div class="sessions-header">
+              <div class="sessions-title-line">
+                <span class="sessions-title">Cloud Workers</span>
+                <button class="ui-btn sessions-refresh" id="cloud-workers-refresh" onclick="loadCloudWorkers(true)" title="Re-sync the lease store through the Codex CLI">Sync with provider</button>
+              </div>
+              <div class="cloud-workers-hint">Codex Cloud tasks tracked as ephemeral worker leases — provider state and live-attachment state are independent. Submit with <code>intendant codex-cloud exec</code>; bring results home with <code>intendant codex-cloud pull</code>.</div>
+            </div>
+            <div class="sessions-search-status" id="cloud-workers-status"></div>
+            <div class="cloud-workers-list" id="cloud-workers-list">
+              <div class="empty-state">No Codex Cloud tasks tracked yet</div>
             </div>
           </div>
           <div class="subtab-pane sessions-new-pane" id="sessions-pane-new">

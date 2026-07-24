@@ -84,7 +84,7 @@ const ACCESS_SUBTAB_ALIASES = {
 };
 const ACCESS_CANONICAL_SUBTABS = ['overview', 'daemons', 'people', 'peers', 'diagnostics', 'advanced'];
 const VALID_ACCESS_SUBTABS = ACCESS_CANONICAL_SUBTABS.concat(Object.keys(ACCESS_SUBTAB_ALIASES));
-const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'new'];
+const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'cloud', 'new'];
 
 function normalizeAccessSubtab(name) {
   const raw = String(name || 'overview').trim();
@@ -552,6 +552,8 @@ function switchSessionsSubtab(name) {
   if (next === 'new') {
     updateNewSessionProjectPrefills();
     requestAnimationFrame(focusNewSessionInput);
+  } else if (next === 'cloud') {
+    cloudWorkersOnShown();
   } else if (next === 'worktrees') {
     if (worktreeHasScannedData(_cachedWorktreeScan)) {
       renderWorktrees(_cachedWorktreeScan);

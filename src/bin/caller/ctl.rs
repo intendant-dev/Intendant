@@ -4182,6 +4182,41 @@ fn memory_propose_args(raw: &[String]) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
+/// Best-effort agenda `add` through the local daemon's lane, for CLI
+/// subsystems that observe something worth parking (codex-cloud terminal
+/// transitions). Same discovery as any other ctl invocation — loopback
+/// token, session lane when injected — and errs when no daemon answers;
+/// callers treat that as "not parked", never as fatal.
+pub(crate) async fn park_agenda_note(
+    title: &str,
+    body: &str,
+    tags: &[&str],
+    source: &str,
+) -> Result<(), String> {
+    let (config, _) = parse_global_args(Vec::new())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+    let mut map = Map::new();
+    map.insert("op".to_string(), Value::String("add".to_string()));
+    map.insert("kind".to_string(), Value::String("note".to_string()));
+    map.insert("title".to_string(), Value::String(title.to_string()));
+    map.insert("body".to_string(), Value::String(body.to_string()));
+    map.insert(
+        "tags".to_string(),
+        Value::Array(
+            tags.iter()
+                .map(|tag| Value::String((*tag).to_string()))
+                .collect(),
+        ),
+    );
+    map.insert("source".to_string(), Value::String(source.to_string()));
+    call_tool(&client, &config, "agenda_op", Value::Object(map))
+        .await
+        .map(|_| ())
+}
+
 async fn call_tool(
     client: &reqwest::Client,
     config: &Config,
