@@ -25,6 +25,7 @@ let agendaInspRefMust = false;
 function agendaOpenInspector(id) {
   if (!agendaFindItem(id)) return;
   agendaSelId = id;
+  agendaHoodReset(); // slice D: a fresh selection starts collapsed
   agendaInspEditingTitle = false;
   agendaInspEditingBody = false;
   agendaInspAdds = { blocker: false, dep: false, ref: false };
@@ -81,6 +82,7 @@ function agendaInspectorRender() {
         ${agendaInspOrganizationHtml(item)}
         ${agendaInspRefsHtml(item)}
         ${agendaInspThreadHtml(item)}
+        ${agendaHoodSectionHtml(item)}
       </div>
     </div>`;
   });
@@ -753,6 +755,12 @@ function agendaInspClick(e) {
     }, removeRef);
     return;
   }
+  const hoodAct = e.target.closest('[data-hood-act]');
+  if (hoodAct) {
+    // Under-the-hood section (slice D, ui2-agenda-hood.js).
+    agendaHoodClick(item, hoodAct);
+    return;
+  }
   const act = e.target.closest('[data-act]');
   if (!act) return;
   switch (act.dataset.act) {
@@ -1059,7 +1067,9 @@ function agendaSheetRender() {
   agendaRenderPreservingFocus(panel, () => {
     panel.innerHTML = agendaSheetState.kind === 'prev'
       ? agendaPrevSheetHtml(item)
-      : agendaSchedSheetHtml(item);
+      : agendaSheetState.kind === 'raw'
+        ? agendaRawSheetHtml(item) // slice D (ui2-agenda-hood.js)
+        : agendaSchedSheetHtml(item);
   });
   agendaHydratePreviewFrames(panel);
 }

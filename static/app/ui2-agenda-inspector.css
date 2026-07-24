@@ -1,7 +1,9 @@
-/* Agenda inspector + schedule/preview sheets + reminder-policy popover
-   (redesign slice A). Token palette only; scoped under html.ui-v2. The
-   inspector is an animated-width side panel ≥1180px and a fixed overlay
-   with a backdrop below that — same DOM, media-query switched. */
+/* Agenda inspector + schedule/preview/raw sheets + reminder-policy
+   popover (redesign slices A + D — slice D adds the under-the-hood
+   section and the raw-JSON sheet). Token palette only; scoped under
+   html.ui-v2. The inspector is an animated-width side panel ≥1180px and
+   a fixed overlay with a backdrop below that — same DOM, media-query
+   switched. */
 
 /* ---- Inspector shell ---- */
 
@@ -629,6 +631,267 @@ html.ui-v2 .ag2-insp-notetext {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin-top: 2px;
+}
+
+/* ---- Under the hood (slice D) ---- */
+
+html.ui-v2 .ag2-hood {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+html.ui-v2 .ag2-hood-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+html.ui-v2 .ag2-hood-title {
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-hood-sub,
+html.ui-v2 .ag2-hood-chev {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-hood-body {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+html.ui-v2 .ag2-hood-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+  padding: 10px 12px;
+}
+html.ui-v2 .ag2-hood-cardhead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+html.ui-v2 .ag2-hood-eyebrow {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-hood-effid {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-hood-idbtn {
+  display: inline-flex;
+  margin-top: 7px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-inset);
+  padding: 5px 10px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+html.ui-v2 .ag2-hood-idbtn:hover { border-color: var(--line-2); }
+html.ui-v2 .ag2-hood-idbtn .t-time { color: var(--iris-2); }
+html.ui-v2 .ag2-hood-idbtn .t-rand { color: var(--text-3); }
+html.ui-v2 .ag2-hood-idbtn.digest {
+  color: var(--text-2);
+  letter-spacing: 0.08em;
+}
+html.ui-v2 .ag2-hood-note {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 5px;
+}
+html.ui-v2 .ag2-hood-note.mono {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-hood-times {
+  display: flex;
+  gap: 16px;
+  margin-top: 9px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-hood-time-k {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-hood-time-v {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-2);
+  margin-top: 2px;
+}
+html.ui-v2 .ag2-hood-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+  align-items: center;
+}
+html.ui-v2 .ag2-hood-vchip {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-2);
+  background: var(--surface-3);
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-hood-source {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-style: italic;
+  color: var(--text-3);
+  border: 1px dashed var(--line-2);
+  border-radius: 6px;
+  padding: 2px 7px;
+}
+html.ui-v2 .ag2-hood-session { margin-top: 6px; }
+html.ui-v2 .ag2-hood-sess {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-hood-sess.plain { color: var(--text-3); }
+html.ui-v2 .ag2-hood-seal {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  font-size: 11px;
+  font-weight: 700;
+}
+html.ui-v2 .ag2-hood-seal.t-green { color: var(--green); }
+html.ui-v2 .ag2-hood-seal.t-amber { color: var(--amber); }
+html.ui-v2 .ag2-hood-sealdot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-hood-streak {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 8px;
+}
+html.ui-v2 .ag2-hood-streak .ag2-hood-note { margin: 0 0 0 4px; }
+html.ui-v2 .ag2-hood-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-2);
+  box-sizing: border-box;
+}
+html.ui-v2 .ag2-hood-dot.filled {
+  border: 0;
+  background: var(--rose);
+}
+html.ui-v2 .ag2-hood-occ {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 6px;
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-hood-rail {
+  margin: 9px 0 0 3px;
+  border-left: 1px solid var(--line);
+}
+html.ui-v2 .ag2-hood-tl-row {
+  position: relative;
+  padding: 0 0 9px 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+html.ui-v2 .ag2-hood-tl-dot {
+  position: absolute;
+  left: -4px;
+  top: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+html.ui-v2 .ag2-hood-tl-dot.t-iris { background: var(--iris); }
+html.ui-v2 .ag2-hood-tl-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-hood-tl-dot.t-amber { background: var(--amber); }
+html.ui-v2 .ag2-hood-tl-dot.t-rose { background: var(--rose); }
+html.ui-v2 .ag2-hood-tl-dot.t-sky { background: var(--sky); }
+html.ui-v2 .ag2-hood-tl-dot.t-neutral { background: var(--neutral-dot); }
+html.ui-v2 .ag2-hood-tl-verb {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-hood-tl-who {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-hood-tl-t {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-hood-more {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  margin-left: 17px;
+}
+html.ui-v2 .ag2-hood-foot {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+html.ui-v2 .ag2-hood-footnote {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-sheet-raw {
+  margin: 0;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  padding: 12px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+  overflow: auto;
+  max-height: 52vh;
 }
 
 /* ---- Modal sheets (schedule + preview) ---- */

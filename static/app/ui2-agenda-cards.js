@@ -940,7 +940,11 @@ function agendaRenderTab() {
   const skipped = agendaSkippedLines > 0
     ? ` · ${agendaSkippedLines} newer-build line${agendaSkippedLines === 1 ? '' : 's'} preserved unfolded (an older binary never destroys history it can’t read)`
     : '';
-  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${skipped}`;
+  // Real ops truth from GET /api/agenda/ops (slice D, ui2-agenda-hood.js):
+  // the segment renders once fetched; the sync fetches only while this
+  // tab is visible and the data signature moved.
+  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}`;
+  agendaLedgerOpsSync();
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
   agendaLensSurfacesDeactivate(lens.id);

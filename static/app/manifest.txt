@@ -87,19 +87,21 @@ ui2-activity.js
 46-recording-replay.js
 47-annotation-clips.js
 # Agenda must evaluate BEFORE the router (48): a #agenda deep link makes the
-# router's eval-time boot call agendaOnTabShown(), which reads these five
+# router's eval-time boot call agendaOnTabShown(), which reads these six
 # fragments' module-level lets/consts — they must be initialized by then
 # (deep-link TDZ rule). Their top levels declare only lets/consts/functions;
 # daemonApi (32), routeTo (48), escapeHtml (52) are reached from inside
-# functions at runtime. Order within the quintet: data layer, then the card
-# surface, then the inspector, then the lens surfaces (graph, plan) — each
-# consumes earlier state; the cards' lens registry reaches the lens
+# functions at runtime. Order within the sextet: data layer, then the card
+# surface, then the inspector, then the lens surfaces (graph, plan), then
+# the under-the-hood internals — each consumes earlier state; the cards'
+# lens registry, the inspector, and the chrome palette reach the later
 # fragments' hoisted functions at runtime only.
 ui2-agenda.js
 ui2-agenda-cards.js
 ui2-agenda-inspector.js
 ui2-agenda-graph.js
 ui2-agenda-plan.js
+ui2-agenda-hood.js
 # Memory: same deep-link TDZ rule as agenda — a #memory deep link makes the
 # router's eval-time boot call memoryOnTabShown(), which reads this fragment's
 # module-level lets. Top level declares only lets/functions.
