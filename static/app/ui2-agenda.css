@@ -1,8 +1,9 @@
-/* Agenda tab (redesign slice A: lenses, compose bar, cards) + the compact
-   activity-pane card + the start-now confirm sheet. Token palette only
-   (16-styles-v2-tokens); scoped under html.ui-v2 like every v2 sheet.
-   The inspector, schedule/preview sheets, and the reminder-policy popover
-   live in ui2-agenda-inspector.css. */
+/* Agenda tab (redesign slice A: lenses, compose bar, cards; slice B: the
+   Graph lens's constellation panel) + the compact activity-pane card +
+   the start-now confirm sheet. Token palette only (16-styles-v2-tokens);
+   scoped under html.ui-v2 like every v2 sheet. The inspector,
+   schedule/preview sheets, and the reminder-policy popover live in
+   ui2-agenda-inspector.css. */
 
 /* ---- Tab layout: main column + animated inspector ---- */
 
@@ -723,6 +724,105 @@ html.ui-v2 .ag2-prev-expand {
   flex-shrink: 0;
 }
 html.ui-v2 .ag2-prev-expand:hover { color: var(--iris-2); }
+
+/* ---- Graph lens (slice B): the constellation canvas panel. The canvas
+   draws everything item-authored (fillText only); this chrome is the
+   static frame — eyebrow, hint, legend chips — all pointer-transparent
+   so the orbit drag never fights them. ---- */
+
+html.ui-v2 .ag2-graph-panel {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--bg-1);
+  margin-bottom: 22px;
+}
+html.ui-v2 .ag2-graph-panel canvas {
+  display: block;
+  width: 100%;
+  height: 560px;
+  cursor: grab;
+}
+html.ui-v2 .ag2-graph-panel.empty {
+  min-height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+html.ui-v2 .ag2-graph-eyebrow {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  pointer-events: none;
+}
+html.ui-v2 .ag2-graph-eyebrow-title {
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-graph-eyebrow-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+html.ui-v2 .ag2-graph-hint {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+html.ui-v2 .ag2-graph-legend {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  pointer-events: none;
+}
+html.ui-v2 .ag2-graph-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 2px 9px;
+}
+html.ui-v2 .ag2-graph-swatch {
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-graph-swatch.s-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+html.ui-v2 .ag2-graph-swatch.s-dot.t-iris { background: var(--iris); }
+html.ui-v2 .ag2-graph-swatch.s-dot.t-amber { background: var(--amber); }
+html.ui-v2 .ag2-graph-swatch.s-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-graph-swatch.s-ring {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+html.ui-v2 .ag2-graph-swatch.s-ring.t-rose { border: 1.5px solid var(--rose); }
+html.ui-v2 .ag2-graph-swatch.s-ring.t-green { border: 1.5px solid var(--green); }
+html.ui-v2 .ag2-graph-swatch.s-line { width: 14px; }
+html.ui-v2 .ag2-graph-swatch.s-line.t-place { border-top: 2px solid rgba(var(--iris-rgb), 0.55); }
+html.ui-v2 .ag2-graph-swatch.s-line.t-rel { border-top: 2px dashed var(--text-3); }
+html.ui-v2 .ag2-graph-swatch.s-line.t-dep { border-top: 2px solid rgba(var(--rose-rgb), 0.6); }
 
 /* ---- Empty state + footer ledger ---- */
 

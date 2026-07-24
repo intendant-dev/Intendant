@@ -10,16 +10,35 @@
 // renders only inside sandboxed srcdoc iframes (agendaHydratePreviewFrames).
 
 // ---- Lens registry ----
-// The extensible seam for later slices: a lens is {id, label, groups()}.
-// The graph (constellation) and plan (Upcoming horizon) lenses land as
-// follow-up slices by ADDING entries here — nothing else changes.
+// The extensible seam for later slices: a lens is {id, label} plus either
+// groups() (the shared card-list surface) or render(host) (a custom
+// surface that owns #ag2-groups entirely — the graph lens's canvas,
+// slice B in ui2-agenda-graph.js), with an optional deactivate() the
+// render pass calls on every lens that is NOT about to paint (the graph
+// lens stops its rAF loop there). The plan (Upcoming horizon) lens lands
+// as a follow-up slice by ADDING an entry here — nothing else changes.
 const AGENDA_LENSES = [
   { id: 'now', label: 'Needs you', groups: () => agendaLensGroupsNow() },
   { id: 'open', label: 'Open', groups: () => agendaLensGroupsOpen() },
   { id: 'hubs', label: 'By hub', groups: () => agendaLensGroupsHubs() },
+  {
+    id: 'graph',
+    label: 'Graph',
+    render: (host) => agendaGraphRenderLens(host),
+    deactivate: () => agendaGraphTeardown(),
+  },
   { id: 'questions', label: 'Questions', groups: () => agendaLensGroupsQuestions() },
   { id: 'archive', label: 'Archive', groups: () => agendaLensGroupsArchive() },
 ];
+
+// Deactivate every lens surface except the one about to render — the
+// seam that stops the graph lens's animation the moment any other lens
+// (or an error/loading state, exceptId null) paints into #ag2-groups.
+function agendaLensSurfacesDeactivate(exceptId) {
+  AGENDA_LENSES.forEach((lens) => {
+    if (lens.deactivate && lens.id !== exceptId) lens.deactivate();
+  });
+}
 
 const AGENDA_COMPOSE_PLACEHOLDERS = {
   task: 'Park a task — one actionable line; details can follow in the item…',
@@ -900,11 +919,13 @@ function agendaRenderTab() {
   // Ledger + load/loading states.
   const ledger = document.getElementById('ag2-ledger');
   if (agendaLoadError) {
+    agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
     ledger.textContent = '';
     return;
   }
   if (agendaItems === null) {
+    agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = '<div class="ui-empty">Loading…</div>';
     ledger.textContent = '';
     return;
@@ -915,6 +936,13 @@ function agendaRenderTab() {
   ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${skipped}`;
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
+  agendaLensSurfacesDeactivate(lens.id);
+  if (lens.render) {
+    // Custom-surface lens (the graph): it owns #ag2-groups entirely and
+    // manages its own lifecycle from here.
+    lens.render(groupsHost);
+    return;
+  }
   const groups = lens.groups();
   if (!groups.length) {
     const filtered = agendaSearch.trim() || agendaFilterBlocked || agendaFilterFrontier;
