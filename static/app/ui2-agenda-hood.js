@@ -46,7 +46,14 @@ async function agendaHoodFetchPages(method, itemId, key) {
   const entries = [];
   let since = 0;
   for (let page = 0; page < 8; page++) {
-    const resp = await daemonApi.request(method, { item: itemId, limit: 500, since });
+    let resp;
+    try {
+      resp = await daemonApi.request(method, { item: itemId, limit: 500, since });
+    } catch (e) {
+      // Transport rejection must land as a rendered error, never a
+      // cache stuck in loading.
+      return { error: String((e && e.message) || e), entries, pageMore: false };
+    }
     if (!resp.ok || !resp.body || !Array.isArray(resp.body[key])) {
       const message = (resp.body && resp.body.error) || `unavailable (${resp.status})`;
       return { error: message, entries, pageMore: false };
