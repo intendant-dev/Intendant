@@ -1958,9 +1958,9 @@ pub(crate) fn apply_op(
 #[cfg(test)]
 pub(crate) fn dependency_state(
     items: &BTreeMap<String, AgendaItem>,
-    edge: &AgendaDependency,
+    link: &AgendaDependency,
 ) -> (bool, Option<&'static str>) {
-    match items.get(&edge.target_id) {
+    match items.get(&link.target_id) {
         None => (false, Some("target_missing")),
         Some(target) => match target.status {
             AgendaStatus::Done => (true, None),
@@ -1980,7 +1980,7 @@ pub(crate) fn is_blocked(items: &BTreeMap<String, AgendaItem>, item: &AgendaItem
             || item
                 .relies_on
                 .iter()
-                .any(|edge| !dependency_state(items, edge).0))
+                .any(|link| !dependency_state(items, link).0))
 }
 
 pub(crate) fn counts(items: &BTreeMap<String, AgendaItem>) -> AgendaCounts {
@@ -2621,7 +2621,7 @@ mod tests {
     /// clear-is-an-op history, links with add/remove, and full tolerance
     /// for out-of-order or foreign lines.
     #[test]
-    fn f2_fold_annotations_blockers_edges() {
+    fn f2_fold_annotations_blockers_links() {
         let mut items = BTreeMap::new();
         apply_op(&mut items, &rec(1, add("a", "dependent")));
         apply_op(&mut items, &rec(2, add("b", "prerequisite")));

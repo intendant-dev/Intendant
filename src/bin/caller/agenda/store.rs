@@ -1310,7 +1310,7 @@ impl AgendaStore {
                     return Err(AgendaError::Invalid("an item cannot rely on itself".into()));
                 }
                 // The target must exist NOW (intake strictness); the fold
-                // stays tolerant of dangling edges in foreign logs.
+                // stays tolerant of dangling links in foreign logs.
                 self.require(&target_id)?;
                 if item.relies_on.iter().any(|e| e.target_id == target_id) {
                     return Err(AgendaError::Transition(format!(
@@ -1417,7 +1417,7 @@ impl AgendaStore {
             } => {
                 let target_id = target_id.trim().to_string();
                 let item = self.require(&id)?;
-                // Resolve which side stores the edge — callers name the
+                // Resolve which side stores the link — callers name the
                 // pair in either order; the op names the storing item.
                 if item.relates_to.iter().any(|e| e.target_id == target_id) {
                     Ok(AgendaOp::RemoveRelatesTo { id, target_id })
@@ -2603,7 +2603,7 @@ mod tests {
 
     /// F2 intake strictness + persistence: the five thread/gate verbs
     /// validate at intake (empty/oversized text, non-open items for
-    /// set_blocker/add_relies_on, duplicates, self-edges, missing targets,
+    /// set_blocker/add_relies_on, duplicates, self-links, missing targets,
     /// caps), mint blocker ids server-side, and the folded state survives
     /// a store reopen. The forward-compat property (older builds
     /// skip-and-preserve unknown vocabulary) keeps holding for whatever
@@ -2700,7 +2700,7 @@ mod tests {
             Err(AgendaError::Invalid(_))
         ));
 
-        // AddReliesOn: self-edge, missing target, duplicate all refused.
+        // AddReliesOn: self-link, missing target, duplicate all refused.
         assert!(matches!(
             store.apply_command(
                 AgendaCommand::AddReliesOn {
@@ -2751,7 +2751,7 @@ mod tests {
 
         // ClearBlocker resolves a unique prefix to the full id at intake
         // (the durable op carries the exact id); RemoveReliesOn needs a
-        // live edge.
+        // live link.
         let cleared = store
             .apply_command(
                 AgendaCommand::ClearBlocker {
@@ -2838,7 +2838,7 @@ mod tests {
             .unwrap();
 
         // Reopen the store: thread, blocker history (cleared entry kept),
-        // and the removed edge all replay exactly.
+        // and the removed link all replay exactly.
         drop(store);
         let store = AgendaStore::open(dir.path()).unwrap();
         let a_re = store.get(&a.id).unwrap();
@@ -3607,7 +3607,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("already related"));
         // Removal named in the OPPOSITE order still resolves the stored
-        // side; the view edge disappears from the storing item.
+        // side; the view link disappears from the storing item.
         store
             .apply_command(
                 AgendaCommand::RemoveRelatesTo {
