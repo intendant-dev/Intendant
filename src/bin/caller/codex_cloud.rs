@@ -348,14 +348,7 @@ async fn run_list(args: &[String]) -> Result<(), String> {
         options.cursor.as_deref(),
     )
     .await?;
-    for transition in &outcome.transitions {
-        eprintln!(
-            "[intendant] task {} is now {} — {}",
-            transition.task_id,
-            transition.provider_status,
-            transition_title(transition)
-        );
-    }
+    announce_transitions(&outcome.transitions).await;
     if options.json {
         println!(
             "{}",
@@ -403,6 +396,53 @@ fn transition_title(transition: &TerminalTransition) -> String {
     } else {
         transition.title.clone()
     }
+}
+
+/// Human notice + best-effort agenda parking for observed terminal
+/// transitions. Parking rides the local daemon's lane when one is up;
+/// without a daemon the printed notice is the whole delivery. The store
+/// lock already guarantees each edge is observed once, so whoever observes
+/// it parks it.
+async fn announce_transitions(transitions: &[TerminalTransition]) {
+    for transition in transitions {
+        eprintln!(
+            "[intendant] task {} is now {} — {}",
+            transition.task_id,
+            transition.provider_status,
+            transition_title(transition)
+        );
+        let (title, body) = agenda_note_for(transition);
+        if crate::ctl::park_agenda_note(&title, &body, &["codex-cloud"], "codex-cloud")
+            .await
+            .is_ok()
+        {
+            eprintln!("[intendant]   parked on the daemon agenda");
+        }
+    }
+}
+
+/// The agenda note describing one terminal transition — shared between the
+/// CLI lane (via ctl) and the daemon lanes (MCP tool, dashboard route).
+pub(crate) fn agenda_note_for(transition: &TerminalTransition) -> (String, String) {
+    let title = format!(
+        "Codex Cloud task {}: {}",
+        transition.provider_status,
+        transition_title(transition)
+    );
+    let mut body = format!(
+        "Task `{}` reached provider state `{}`.\n",
+        transition.task_id, transition.provider_status
+    );
+    if let Some(url) = transition.task_url.as_deref() {
+        body.push('\n');
+        body.push_str(url);
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "\nPull the result locally:\n\n    intendant codex-cloud pull {}\n",
+        transition.task_id
+    ));
+    (title, body)
 }
 
 /// Refresh the provider's list window into the lease store and report what
@@ -522,6 +562,7 @@ async fn run_status(args: &[String]) -> Result<(), String> {
     // entirely unknown task falls back to the upstream human-readable status.
     let store_path = state_path();
     let outcome = refresh_leases(&store_path, None, 20, None).await?;
+    announce_transitions(&outcome.transitions).await;
     let lease = match outcome
         .workers
         .iter()
