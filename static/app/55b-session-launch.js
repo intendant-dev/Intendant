@@ -676,6 +676,17 @@ function newSessionAddKeysAction() {
   return { label: 'Add API keys', onClick: () => focusSettingsApiKeys() };
 }
 
+function newSessionSigninAction() {
+  return { label: 'Sign in an agent', onClick: () => focusVaultAgentSignin() };
+}
+
+// The unfueled remediations, as peers (the Activity empty state's pair):
+// add a provider API key, or sign an external agent into its subscription
+// account in the Vault tab.
+function newSessionUnfueledActions() {
+  return [newSessionAddKeysAction(), newSessionSigninAction()];
+}
+
 // Leads with the immediate fix (the paired newSessionAddKeysAction deep
 // link lands on that card); .env and vault leases stay as secondary paths.
 const NEW_SESSION_UNFUELED_MESSAGE =
@@ -872,20 +883,20 @@ function setNewSessionSpawnNotice(kind, text, action) {
   notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
   textEl.textContent = text || '';
   notice.title = text || '';
-  let actionBtn = document.getElementById('new-session-spawn-action');
-  if (action && hasText) {
-    if (!actionBtn) {
-      actionBtn = document.createElement('button');
-      actionBtn.id = 'new-session-spawn-action';
-      actionBtn.type = 'button';
-      actionBtn.className = 'sessions-spawn-action';
-      notice.appendChild(actionBtn);
-    }
-    actionBtn.textContent = action.label;
-    actionBtn.onclick = action.onClick;
-  } else if (actionBtn) {
-    actionBtn.remove();
-  }
+  // `action` is one {label, onClick} or an array of peers (the unfueled
+  // class pairs Add API keys with Sign in an agent). Buttons are rebuilt
+  // per notice — updates are event-driven, never per-frame.
+  const actions = hasText ? [action].flat().filter(Boolean) : [];
+  notice.querySelectorAll('.sessions-spawn-action').forEach(btn => btn.remove());
+  actions.forEach((entry, index) => {
+    const actionBtn = document.createElement('button');
+    actionBtn.id = index === 0 ? 'new-session-spawn-action' : `new-session-spawn-action-${index + 1}`;
+    actionBtn.type = 'button';
+    actionBtn.className = 'sessions-spawn-action';
+    actionBtn.textContent = entry.label;
+    actionBtn.onclick = entry.onClick;
+    notice.appendChild(actionBtn);
+  });
   stationScheduleUpdate();
 }
 
@@ -945,9 +956,9 @@ function maybeFailRecentNewSessionSpawn(sessionId, reason, errorKind) {
   newSessionSpawnTask = '';
   newSessionSpawnName = '';
   setNewSessionStartButtonPending(false);
-  // Structured failure classes carry an action instead of prose-parsing.
+  // Structured failure classes carry actions instead of prose-parsing.
   const action = errorKind === 'unfueled'
-    ? newSessionAddKeysAction()
+    ? newSessionUnfueledActions()
     : errorKind === 'no_project'
       ? newSessionPickProjectAction()
       : null;
@@ -1074,7 +1085,7 @@ async function startNewSession() {
     // Belt-and-braces behind the banner: the fueled flag may have flipped
     // since the last render.
     updateNewSessionFuelBanner();
-    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
+    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionUnfueledActions());
     return;
   }
 
