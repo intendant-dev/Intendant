@@ -529,7 +529,9 @@ The walkthrough: park the item once **with the mandate as its body** (the
 same text as the goal template's mandate) — start-now mints its goal from
 title + body, so both firing lanes carry identical marching orders; then
 `schedule` the first pass as a **standing weekly manifest**
-(`--at "next sunday 18:00" --every 7d --suspend-after 3`), review the
+(`--at '2026-08-02 18:00' --every 7d --suspend-after 3` — `--at` takes
+`+45m/+2h/+3d/+1w`, epoch ms, RFC3339, `YYYY-MM-DD`, or
+`'YYYY-MM-DD HH:MM'`), review the
 printed manifest, and `approve` its digest once (or click Approve on the
 card): one approval covers the weekly series until revoked — the ceremony
 matches the decision, and any edit to the manifest still voids it. (The
@@ -568,8 +570,9 @@ separate mandate, and the frontier is both the default and the ceiling):
    all happen where they always did.
 
 Template goal (paste into `ctl agenda schedule <id> --goal … --at
-"next monday 09:00" --every 7d --suspend-after 3`, and into the item body
-so Run now carries identical marching orders):
+'2026-07-27 09:00' --every 7d --suspend-after 3` — the date grammar is
+the same `+3d`/RFC3339/`'YYYY-MM-DD HH:MM'` family `--due` takes — and
+into the item body so Run now carries identical marching orders):
 
 ```text
 Agenda triage pass. Your scope is the UN-TRIAGED FRONTIER and only it:

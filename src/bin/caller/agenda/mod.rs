@@ -32,6 +32,7 @@
 mod ask;
 mod blobs;
 mod handle;
+mod mandate_templates;
 mod reminders;
 mod scheduler;
 mod spawn_project;

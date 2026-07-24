@@ -98,6 +98,8 @@ function agendaEnsureScaffold() {
                   title="Open items with an uncleared blocker or unmet prerequisite — derived at render, never stored"></button>
           <button type="button" class="ag2-fchip" id="ag2-f-frontier"
                   title="The un-triaged frontier: open items newer than the last triage summary, or unplaced with no triage note — the triage mandate’s scope">frontier</button>
+          <button type="button" class="ag2-fchip" id="ag2-automate"
+                  title="Park a standing mandate from a template — triage, housekeeping — and propose its schedule; you approve the digest on the card">automate…</button>
           <input id="ag2-search" class="ag2-search" type="text" autocomplete="off"
                  placeholder="Search the ledger — press /" aria-label="Search the agenda" />
         </div>
@@ -142,6 +144,11 @@ function agendaWireScaffold() {
   document.getElementById('ag2-f-frontier').addEventListener('click', () => {
     agendaFilterFrontier = !agendaFilterFrontier;
     agendaRenderTab();
+  });
+  const automate = document.getElementById('ag2-automate');
+  automate.addEventListener('click', (e) => {
+    e.stopPropagation();
+    agendaOpenAutomationSheet(automate);
   });
   document.getElementById('ag2-bell').addEventListener('click', (e) => {
     e.stopPropagation();
