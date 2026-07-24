@@ -17,6 +17,7 @@ mod build_info;
 mod builtin_skills;
 mod claude_auth_ceremony;
 mod codex_auth_ceremony;
+mod codex_cloud;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;
@@ -417,6 +418,7 @@ fn print_help() {
     println!("    service               Install, remove, inspect, or run the boot service");
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!("    auth                  Manage native provider authentication");
+    println!("    codex-cloud           Submit and track ephemeral Codex Cloud workers");
     println!();
     println!("SESSION LOGS:");
     println!("    Default: $INTENDANT_HOME/logs/<uuid>/ when INTENDANT_HOME is non-empty;");
@@ -3313,6 +3315,21 @@ async fn main() -> Result<(), CallerError> {
     if env::args().nth(1).as_deref() == Some("setup") {
         let argv: Vec<String> = env::args().skip(2).collect();
         return match setup::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // Intercept `intendant codex-cloud <action>` before project/provider
+    // initialization. Codex Cloud is a provider-owned task/lease surface, not
+    // a permanently configured peer, and only needs the authenticated local
+    // Codex CLI plus Intendant's own small state file.
+    if env::args().nth(1).as_deref() == Some("codex-cloud") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match codex_cloud::run(argv).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");

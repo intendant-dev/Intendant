@@ -226,7 +226,8 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         | "get_restart_status"
         | "get_controller_loop_status"
         | "browser_workspace_providers"
-        | "list_browser_workspaces" => PeerOperation::StatsRead,
+        | "list_browser_workspaces"
+        | "list_codex_cloud_workers" => PeerOperation::StatsRead,
         // Session observation: logs, pending prompts, managed-context anchors.
         "get_logs"
         | "get_pending_approval"
@@ -253,7 +254,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
             PeerOperation::Message
         }
         // Starting or delegating agent work.
-        "start_task" => PeerOperation::Task,
+        "start_task" | "submit_codex_cloud_task" => PeerOperation::Task,
         // Mutating the supervised session's context/lineage.
         "rewind_context"
         | "rewind_backout"
@@ -569,6 +570,22 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         ),
     );
     push(
+        "list_codex_cloud_workers",
+        manual_http_tool_definition!(
+            "list_codex_cloud_workers",
+            "Refresh and list Codex Cloud tasks as ephemeral Intendant worker leases. This is read-only and uses the daemon host's authenticated Codex CLI.",
+            ListCodexCloudWorkersParams
+        ),
+    );
+    push(
+        "submit_codex_cloud_task",
+        manual_http_tool_definition!(
+            "submit_codex_cloud_task",
+            "Submit a new Codex Cloud task and track it as an ephemeral Intendant worker lease. This creates an external Cloud task and uses the daemon host's authenticated Codex CLI.",
+            SubmitCodexCloudTaskParams
+        ),
+    );
+    push(
         "list_displays",
         manual_http_tool_definition!(
             "list_displays",
@@ -686,6 +703,75 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_cloud_tools_are_full_profile_only_with_explicit_iam_classes() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert!(tool_allowed_for_profile(
+            "list_codex_cloud_workers",
+            false,
+            None
+        ));
+        assert!(tool_allowed_for_profile(
+            "submit_codex_cloud_task",
+            false,
+            Some("full")
+        ));
+        assert!(!tool_allowed_for_profile(
+            "list_codex_cloud_workers",
+            false,
+            Some("core")
+        ));
+        assert!(!tool_allowed_for_profile(
+            "submit_codex_cloud_task",
+            false,
+            Some("core")
+        ));
+        assert_eq!(
+            mcp_tool_operation("list_codex_cloud_workers"),
+            PeerOperation::StatsRead
+        );
+        assert_eq!(
+            mcp_tool_operation("submit_codex_cloud_task"),
+            PeerOperation::Task
+        );
+
+        let mut full = Vec::new();
+        append_manual_http_tool_definitions(&mut full, false, None);
+        for (name, attr) in [
+            (
+                "list_codex_cloud_workers",
+                IntendantServer::list_codex_cloud_workers_tool_attr(),
+            ),
+            (
+                "submit_codex_cloud_task",
+                IntendantServer::submit_codex_cloud_task_tool_attr(),
+            ),
+        ] {
+            let definition = full
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            assert_eq!(
+                definition["description"].as_str(),
+                attr.description.as_deref(),
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
+
+        let mut core = Vec::new();
+        append_manual_http_tool_definitions(&mut core, false, Some("core"));
+        assert!(
+            core.iter().all(|tool| {
+                !matches!(
+                    tool["name"].as_str(),
+                    Some("list_codex_cloud_workers" | "submit_codex_cloud_task")
+                )
+            }),
+            "Codex Cloud provider tools must stay out of the compact profile"
+        );
+    }
 
     #[test]
     fn manual_http_rewind_tool_descriptions_match_tool_attributes() {

@@ -11,6 +11,7 @@
 - [Agenda and Memory](./agenda-and-memory.md)
 - [Display Pipeline](./display-pipeline.md)
 - [Peer Federation](./peer-federation.md)
+- [Codex Cloud Workers](./codex-cloud-workers.md)
 - [Self-Hosted Rendezvous](./self-hosted-rendezvous.md)
 - [Hosted Control](./hosted-control.md)
 - [Your Fleet, Your Name](./custom-domain.md)
