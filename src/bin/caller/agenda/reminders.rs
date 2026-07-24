@@ -787,9 +787,11 @@ pub(crate) fn plan(
 /// classification (a due instant past the window is `missed`, not a
 /// fire), and the same requested-instant handling (every pending request
 /// is a candidate; spent ones are journal-deduped). The one deliberate
-/// difference: the scheduler's transient in-flight set is private to its
-/// dispatch loop, so an occurrence mid-dispatch may briefly still show
-/// its instant here — the write-back settles it. The
+/// difference: transient execution state — the scheduler's private
+/// in-flight set, and the no-overlap hold while a run of this effect is
+/// still `started` — only DELAYS a fire, so a due instant held by either
+/// keeps showing here (it fires when the run settles; mid-dispatch, the
+/// write-back settles the display). The
 /// `next_fire_agrees_with_the_planner` differential test pins this mirror
 /// to `plan` itself.
 pub(crate) fn effect_next_fire_ms(
