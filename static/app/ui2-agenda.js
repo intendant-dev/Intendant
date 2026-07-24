@@ -319,8 +319,12 @@ function agendaEffectState(item) {
   const threshold = rec ? Math.max(1, rec.suspend_after_failures || 3) : 0;
   const suspended = !!rec && (effect.consecutive_failures || 0) >= threshold;
   const running = !!(effect.last_run && effect.last_run.state === 'started');
-  let next = manifest.fire_at_ms;
-  if (rec && rec.every_ms > 0) {
+  // The daemon decorates each effect with the planner's REAL next firing
+  // instant (`next_fire_ms`, absent when nothing will fire) — prefer it
+  // over reimplementing the planner here; the local arithmetic remains
+  // only as the fallback for undecorated data (stale caches, replays).
+  let next = effect.next_fire_ms || manifest.fire_at_ms;
+  if (!effect.next_fire_ms && rec && rec.every_ms > 0) {
     const behind = Math.max(0, Math.ceil((Date.now() - manifest.fire_at_ms) / rec.every_ms));
     next = manifest.fire_at_ms + behind * rec.every_ms;
   }
@@ -330,6 +334,23 @@ function agendaEffectState(item) {
         : rec ? 'standing'
           : next > Date.now() ? 'armed' : 'finished';
   return { effect, manifest, rec, threshold, suspended, running, next, kind };
+}
+
+// One-line executor description for a manifest's `agent_config` block:
+// backend · model · effort, or "native default" when the manifest
+// inherits everything. Pure render vocabulary — the daemon's launch
+// resolution chain is the authority on what actually applies at spawn.
+function agendaExecutorLabel(config) {
+  if (!config || typeof config !== 'object') return 'native default';
+  const backend = config.agent === 'internal' ? 'native' : (config.agent || '');
+  const model = config.claude_model || config.codex_model
+    || config.kimi_model || config.pi_model || '';
+  const effort = config.claude_effort || config.codex_reasoning_effort
+    || config.kimi_thinking || config.pi_thinking || '';
+  const bits = [backend, model, effort].filter(Boolean);
+  if (!bits.length) return 'native default';
+  if (!backend) bits.unshift('default backend');
+  return bits.join(' · ');
 }
 
 function agendaChildrenOf(id) {
