@@ -590,6 +590,19 @@ real file I/O and run under `spawn_blocking`. One sweep:
 - drains staged lease entries: deletes an entry once every transcript file
   inside it has been published.
 
+**The machine-global stores are swept by design**, even when `INTENDANT_HOME`
+points the state root elsewhere: a Codex or Claude Code conversation belongs
+to the machine, not to one daemon home, so every daemon indexes the shared
+external corpus. Hermetic rigs that must not see the box's real conversations
+set `INTENDANT_MESSAGE_SEARCH_DAEMON_HOME_ONLY=1` (also `true`/`yes`/`on`;
+any other value keeps the default), which confines source discovery to the
+daemon's own state root — its session logs, the leased-active registry and
+staging, and per-session backend homes persisted under the logs root all keep
+working. The switch gates root assembly (excluded stores are never
+enumerated), not query-time filtering; shards a state root published before
+flipping it stop refreshing and serve until the 14-day retention window
+expires them.
+
 **Leased homes and custody** (`lease_transcript_staging.rs`): OAuth leases
 materialize private `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME`/
 `PI_CODING_AGENT_DIR` roots that hold the

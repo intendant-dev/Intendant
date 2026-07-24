@@ -3,9 +3,13 @@
 //! intendant session logs, Codex rollouts (user home, leased-active
 //! homes, staged lease remnants), Claude Code transcripts (same three
 //! places), Kimi wires and Pi session trees — runs the per-source extractors, and publishes the resulting
-//! shards to the store. Everything below [`spawn_indexer`] takes its
-//! roots as parameters; only that production edge resolves the real
-//! environment.
+//! shards to the store. Machine-global external stores are swept by design
+//! even under a scratch `INTENDANT_HOME` (a Codex/Claude conversation
+//! belongs to the machine, not to one daemon home);
+//! [`DAEMON_HOME_ONLY_ENV`] is the explicit hermetic-rig off-switch, gating
+//! root assembly rather than query-time filtering. Everything below
+//! [`spawn_indexer`] takes its roots as parameters; only that production
+//! edge resolves the real environment.
 //!
 //! Freshness model: a 30-second cursor-driven sweep. Stored
 //! [`SourceCursor`]s make the steady state cheap (metadata + a 4 KiB
@@ -978,29 +982,88 @@ pub(crate) fn refresh_if_stale(max_age_ms: i64) {
     let _ = sweep_shared_production();
 }
 
+/// The hermetic-rig off-switch for machine-global sweeping. External-agent
+/// stores (`~/.codex`, `~/.claude/projects`, `~/.kimi-code`, `~/.pi/agent`
+/// and their `CODEX_HOME`-class env overrides) belong to the machine, not to
+/// one daemon state root, so a scratch-`INTENDANT_HOME` daemon still sweeps
+/// them BY DESIGN. A rig that must not see the box's real corpus sets this
+/// truthy (`1`/`true`/`yes`/`on`, case-insensitive) to confine source
+/// discovery to the daemon's own state root; every other value — unset,
+/// empty, typos — keeps the machine-global default, so misconfiguration
+/// degrades to current behavior, never to a silent exclusion.
+pub(crate) const DAEMON_HOME_ONLY_ENV: &str = "INTENDANT_MESSAGE_SEARCH_DAEMON_HOME_ONLY";
+
+/// Interpret a raw [`DAEMON_HOME_ONLY_ENV`] value. Split from
+/// [`resolve_production_roots`] so tests can pin the vocabulary without
+/// racing the parallel runner over process-global env (the
+/// `state_paths::intendant_home_override` convention).
+pub(crate) fn daemon_home_only(raw: Option<std::ffi::OsString>) -> bool {
+    raw.and_then(|value| value.into_string().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve the box's real message sources: the user's default homes, the
 /// lease-active registry (live materialized homes, indexed DURING the
 /// lease), and staged lease remnants awaiting drain. The one
 /// production-edge function here — everything else takes roots.
 pub(crate) fn resolve_production_roots() -> SweepRoots {
     let staging = crate::lease_transcript_staging::default_paths();
-    let user_home = crate::platform::home_dir();
-    let mut roots = SweepRoots {
-        store_root: Store::default_root(),
-        intendant_logs: crate::platform::intendant_home().join("logs"),
-        codex_roots: vec![
-            crate::web_gateway::session_catalog::backend_lists::codex_dir(&user_home),
-        ],
-        claude_project_roots: vec![user_home.join(".claude").join("projects")],
-        kimi_roots: vec![
-            crate::web_gateway::session_catalog::kimi_history::kimi_home_in(&user_home),
-        ],
-        pi_roots: vec![
-            crate::web_gateway::session_catalog::pi_history::pi_agent_dir_in(&user_home),
-        ],
-        staged_entries: Vec::new(),
+    let machine_home = if daemon_home_only(std::env::var_os(DAEMON_HOME_ONLY_ENV)) {
+        None
+    } else {
+        Some(crate::platform::home_dir())
     };
-    add_registry_and_staged_roots(&staging.active, &staging.staging, &mut roots);
+    assemble_sweep_roots(
+        Store::default_root(),
+        crate::platform::intendant_home().join("logs"),
+        machine_home.as_deref(),
+        &staging.active,
+        &staging.staging,
+    )
+}
+
+/// The assembly half of [`resolve_production_roots`], parameterized for
+/// tests. `machine_home: Some(home)` adds the machine-global external-agent
+/// stores resolved from that user home (the default); `None` is the
+/// [`DAEMON_HOME_ONLY_ENV`] posture — only sources discovered from the
+/// daemon's own state root are assembled (its session logs, the lease
+/// registry/staging under the store's parent, and per-session backend homes
+/// persisted under the logs root), so a hermetic rig never enumerates the
+/// box's real corpus. The knob gates assembly here, not query-time
+/// filtering: an excluded store is simply never swept.
+pub(crate) fn assemble_sweep_roots(
+    store_root: PathBuf,
+    intendant_logs: PathBuf,
+    machine_home: Option<&Path>,
+    active_root: &Path,
+    staging_root: &Path,
+) -> SweepRoots {
+    let mut roots = SweepRoots {
+        store_root,
+        intendant_logs,
+        ..SweepRoots::default()
+    };
+    if let Some(user_home) = machine_home {
+        roots
+            .codex_roots
+            .push(crate::web_gateway::session_catalog::backend_lists::codex_dir(user_home));
+        roots
+            .claude_project_roots
+            .push(user_home.join(".claude").join("projects"));
+        roots
+            .kimi_roots
+            .push(crate::web_gateway::session_catalog::kimi_history::kimi_home_in(user_home));
+        roots
+            .pi_roots
+            .push(crate::web_gateway::session_catalog::pi_history::pi_agent_dir_in(user_home));
+    }
+    add_registry_and_staged_roots(active_root, staging_root, &mut roots);
     let logs_root = roots.intendant_logs.clone();
     add_session_codex_home_roots(&logs_root, &mut roots);
     add_session_kimi_home_roots(&logs_root, &mut roots);
@@ -1548,6 +1611,142 @@ mod tests {
             .get("codex:codex-leased")
             .unwrap();
         assert!(!leased_entry.source_gone);
+    }
+
+    /// Default assembly (`machine_home: Some`): the four machine-global
+    /// external stores resolve from the injected user home. Hermetic — an
+    /// explicit non-process home never consults `CODEX_HOME`-class env.
+    #[test]
+    fn assemble_sweep_roots_default_includes_machine_global_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_home = tmp.path().join("fake-user-home");
+        let state = tmp.path().join("state");
+        let roots = assemble_sweep_roots(
+            state.join("store"),
+            state.join("logs"),
+            Some(&user_home),
+            &state.join("leased-active"),
+            &state.join("staging"),
+        );
+        assert_eq!(roots.store_root, state.join("store"));
+        assert_eq!(roots.intendant_logs, state.join("logs"));
+        assert_eq!(roots.codex_roots, vec![user_home.join(".codex")]);
+        assert_eq!(
+            roots.claude_project_roots,
+            vec![user_home.join(".claude").join("projects")]
+        );
+        assert_eq!(roots.kimi_roots, vec![user_home.join(".kimi-code")]);
+        assert_eq!(roots.pi_roots, vec![user_home.join(".pi").join("agent")]);
+        assert!(roots.staged_entries.is_empty());
+    }
+
+    /// Daemon-home-only assembly (`machine_home: None`): no machine-global
+    /// store is enumerated, while every source discovered from the daemon's
+    /// own state root keeps working — per-session persisted Codex/Kimi
+    /// homes recorded under the logs root, the leased-active registry, and
+    /// staged lease remnants.
+    #[test]
+    fn assemble_sweep_roots_daemon_home_only_keeps_state_root_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let logs_root = state.join("logs");
+
+        // Per-session Codex home override persisted under the logs root.
+        let session_codex_home = tmp.path().join("session-codex-home");
+        std::fs::create_dir_all(&session_codex_home).unwrap();
+        let session_dir = logs_root.join("cfg-session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session_agent_config.json"),
+            serde_json::json!({"codex_home": session_codex_home.to_string_lossy()}).to_string(),
+        )
+        .unwrap();
+        // Per-session Kimi bridge home persisted under the logs root.
+        let bridge_home = tmp.path().join("kimi-bridge-home");
+        std::fs::create_dir_all(&bridge_home).unwrap();
+        let config = crate::session_config::SessionAgentConfig {
+            source: Some("kimi".to_string()),
+            kimi_home: Some(bridge_home.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        crate::session_config::write_log_dir_config(&logs_root.join("kimi-wrapper"), &config)
+            .unwrap();
+        // A live leased home in the active registry + a staged remnant.
+        let active_root = state.join("leased-active");
+        let leased_home = tmp.path().join("leased-codex-home");
+        std::fs::create_dir_all(&active_root).unwrap();
+        std::fs::write(
+            active_root.join("codex.json"),
+            serde_json::json!({
+                "schema": 1, "dir_name": "codex", "source": "codex",
+                "home": leased_home.to_string_lossy(),
+                "materialized_at_ms": now_ms(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let staging_root = state.join("staging");
+        let staged_entry = staging_root.join("kimi-123-1");
+        std::fs::create_dir_all(&staged_entry).unwrap();
+        std::fs::write(
+            staged_entry.join("manifest.json"),
+            serde_json::json!({"source": "kimi"}).to_string(),
+        )
+        .unwrap();
+
+        let roots = assemble_sweep_roots(
+            state.join("store"),
+            logs_root.clone(),
+            None,
+            &active_root,
+            &staging_root,
+        );
+        assert_eq!(roots.intendant_logs, logs_root);
+        assert_eq!(
+            roots.codex_roots,
+            vec![leased_home, session_codex_home],
+            "state-root-discovered Codex homes survive; no machine-global root"
+        );
+        assert!(
+            roots.claude_project_roots.is_empty(),
+            "no machine-global Claude projects root: {:?}",
+            roots.claude_project_roots
+        );
+        assert_eq!(
+            roots.kimi_roots,
+            vec![staged_entry.clone(), bridge_home],
+            "staged remnant + persisted bridge home survive; no machine-global root"
+        );
+        assert!(
+            roots.pi_roots.is_empty(),
+            "no machine-global Pi root: {:?}",
+            roots.pi_roots
+        );
+        assert_eq!(roots.staged_entries, vec![staged_entry]);
+    }
+
+    /// The env vocabulary is pinned: only an explicit truthy value flips to
+    /// daemon-home-only; unset, empty, falsy, and garbage all keep the
+    /// machine-global default (misconfiguration degrades to CURRENT
+    /// behavior, never to a silent exclusion).
+    #[test]
+    fn daemon_home_only_vocabulary_is_pinned() {
+        for truthy in ["1", "true", "yes", "on", "TRUE", "On", " 1 "] {
+            assert!(daemon_home_only(Some(truthy.into())), "{truthy:?}");
+        }
+        for default in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("maybe"),
+        ] {
+            assert!(
+                !daemon_home_only(default.map(std::ffi::OsString::from)),
+                "{default:?}"
+            );
+        }
     }
 
     #[test]
