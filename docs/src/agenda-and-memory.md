@@ -663,6 +663,17 @@ effects, triage-recommended items (in summary order), then recency — a
 pure reorder of the flat list with the same actions and the same rail;
 nothing new to clear, nowhere new to look.
 
+The **Automations** lens (Track AU) answers "what automations do I have,
+are they healthy, when did they last run?" in one place: every item
+carrying a session-manifest effect, grouped needs-approval → suspended →
+running → armed → ended, each row showing the executor
+(backend · model · effort, or "native default"), cadence, last occurrence
+(state + write-back, with a jump to the run's session), the planner's
+served next instant, and the failure streak on suspended rows. It is a
+**view over the agenda snapshot the tab already holds** — no store, no
+new ops or routes — and its buttons are the existing acts: Approve,
+Run now (`request_occurrence`), Revoke, and re-approve-to-re-arm.
+
 ### Surfaces and permissions
 
 Agenda is available in the dashboard, through `intendant ctl agenda`, through

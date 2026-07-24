@@ -34,6 +34,11 @@ const AGENDA_LENSES = [
     render: (host) => agendaPlanRenderLens(host),
     deactivate: () => agendaPlanTeardown(),
   },
+  {
+    id: 'automations',
+    label: 'Automations',
+    groups: () => agendaLensGroupsAutomations(),
+  },
   { id: 'questions', label: 'Questions', groups: () => agendaLensGroupsQuestions() },
   { id: 'archive', label: 'Archive', groups: () => agendaLensGroupsArchive() },
 ];
@@ -387,6 +392,74 @@ function agendaLensGroupsHubs() {
   return groups;
 }
 
+// Automations (Track AU): every item carrying a session-manifest effect,
+// grouped by the effect's derived state. A VIEW over the agenda snapshot
+// the tab already holds — no store, no ops, no routes of its own (the G3
+// attention-queue ruling verbatim); every action on a row is an existing
+// op the cards/inspector already send. Row order inside a group is
+// newest-first; the group order is attention-shaped: what needs the owner
+// first, then what's suspended, live, armed, and spent.
+function agendaLensGroupsAutomations() {
+  const q = agendaSearch.trim().toLowerCase();
+  const pool = (agendaItems || [])
+    .filter((x) => (x.effects || []).length && agendaSearchMatch(x, q))
+    .filter((x) => !agendaFilterBlocked || agendaItemIsBlocked(x));
+  const staged = { pending: [], suspended: [], running: [], standing: [], ended: [] };
+  pool.forEach((item) => {
+    const st = agendaEffectState(item);
+    if (!st) return;
+    if (item.status !== 'open') { staged.ended.push(item); return; }
+    if (st.kind === 'pending') staged.pending.push(item);
+    else if (st.kind === 'suspended') staged.suspended.push(item);
+    else if (st.kind === 'running') staged.running.push(item);
+    else if (st.kind === 'standing') {
+      // A standing series with no next instant is spent (until/max
+      // reached) — the approval is inert, the history remains.
+      (st.effect.next_fire_ms ? staged.standing : staged.ended).push(item);
+    } else if (st.kind === 'armed') staged.standing.push(item);
+    else staged.ended.push(item);
+  });
+  Object.values(staged).forEach((arr) => arr.sort(agendaByNew));
+  const rows = (arr) => arr.map((x) => ({ item: x, automation: true, noHub: true }));
+  const groups = [];
+  if (staged.pending.length) {
+    groups.push({
+      label: 'Needs approval',
+      hint: 'nothing fires until you approve the digest — approval covers who runs, what, and when',
+      rows: rows(staged.pending),
+    });
+  }
+  if (staged.suspended.length) {
+    groups.push({
+      label: 'Suspended',
+      hint: 'failure streak hit the threshold — re-approving the unchanged digest re-arms the series',
+      rows: rows(staged.suspended),
+    });
+  }
+  if (staged.running.length) {
+    groups.push({
+      label: 'Running',
+      hint: 'one occurrence at a time — the outcome writes back to the item',
+      rows: rows(staged.running),
+    });
+  }
+  if (staged.standing.length) {
+    groups.push({
+      label: 'Armed',
+      hint: 'approved and scheduled — Run now fires one extra occurrence of the approved digest',
+      rows: rows(staged.standing),
+    });
+  }
+  if (staged.ended.length) {
+    groups.push({
+      label: 'Ended',
+      hint: 'spent series and finished one-shots — history stays on the item',
+      rows: rows(staged.ended),
+    });
+  }
+  return groups;
+}
+
 function agendaLensGroupsQuestions() {
   const pool = agendaFilteredPool();
   const open = pool
@@ -614,6 +687,59 @@ function agendaCardEffectStrip(item) {
   }
   return `<div class="ag2-eff t-${tone}">
     <span class="ag2-eff-line">${escapeHtml(line)}</span>
+    <span class="ag2-spacer"></span>${actions}
+  </div>`;
+}
+
+// The Automations lens's per-row strip: the full manifest-effect picture
+// regardless of state (the inline strip above surfaces only what needs
+// attention on ordinary lenses). Executor · cadence · last occurrence ·
+// next instant · streak, then the existing actions — every button is an
+// op the generic [data-op-btn] delegation already sends.
+function agendaAutomationStripHtml(item) {
+  const st = agendaEffectState(item);
+  if (!st) return '';
+  const e = st.effect;
+  const id = escapeHtml(item.id);
+  const meta = [];
+  meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
+  const last = e.last_run;
+  if (last) {
+    const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
+    const sess = last.session_id && agendaSessionInfo(last.session_id);
+    const jump = sess && sess.key
+      ? ` <a class="ag2-auto-run" data-jump-session="${escapeHtml(sess.key)}">open run</a>` : '';
+    meta.push(`<span class="ag2-auto-last st-${escapeHtml(last.state)}" title="${escapeHtml(tip)}">last: ${escapeHtml(last.state)} ${escapeHtml(agendaRelTime(last.at_ms))}${jump}</span>`);
+  }
+  if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
+    meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);
+  }
+  if (st.suspended) {
+    meta.push(`<span class="ag2-auto-streak" title="Suspended — never silently re-fired">suspended after ${e.consecutive_failures}</span>`);
+  } else if (e.next_fire_ms) {
+    meta.push(`<span title="The planner's real next instant, served with the item">next ${escapeHtml(agendaAbsTime(e.next_fire_ms))}</span>`);
+  } else if (st.kind === 'standing') {
+    meta.push('<span>series ended</span>');
+  }
+  let actions = '';
+  const digest = escapeHtml(e.digest || '');
+  if (st.kind === 'pending') {
+    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`;
+  } else if (st.kind === 'suspended') {
+    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`;
+  } else if (st.kind === 'running') {
+    const sess = e.last_run && e.last_run.session_id && agendaSessionInfo(e.last_run.session_id);
+    actions = sess && sess.key
+      ? `<button type="button" class="ag2-btn ghost" data-jump-session="${escapeHtml(sess.key)}">Watch</button>` : '';
+  } else if (st.kind === 'standing' && e.next_fire_ms) {
+    actions = `<button type="button" class="ag2-btn ghost" data-op-btn="request_occurrence" data-id="${id}" title="One extra occurrence of the approved digest — the standing approval is untouched">Run now</button>`
+      + `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
+  } else if (st.kind === 'armed') {
+    actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
+  }
+  return `<div class="ag2-eff ag2-auto t-${st.kind === 'pending' || st.kind === 'suspended' ? 'amber' : 'iris'}">
+    <span class="ag2-auto-meta">${meta.join('<span class="ag2-auto-dot">·</span>')}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
 }
@@ -881,7 +1007,7 @@ function agendaCardHtml(row) {
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
-      ${agendaCardEffectStrip(item)}
+      ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
     </div>
     <span class="ag2-card-chev" aria-hidden="true">›</span>
@@ -958,12 +1084,15 @@ function agendaRenderTab() {
   if (!groups.length) {
     const filtered = agendaSearch.trim() || agendaFilterBlocked || agendaFilterFrontier;
     const title = filtered ? 'Nothing matches'
-      : agendaLens === 'now' ? 'Nothing needs you' : 'Nothing here yet';
+      : agendaLens === 'now' ? 'Nothing needs you'
+        : agendaLens === 'automations' ? 'No automations yet' : 'Nothing here yet';
     const hint = filtered
       ? 'Loosen the search or filters — retire hides nothing from them.'
       : agendaLens === 'now'
         ? 'The agenda is quiet — everything parked is either moving or waiting politely.'
-        : 'Park something above, or let your sessions park as they work.';
+        : agendaLens === 'automations'
+          ? 'Schedule a standing session on any item (its Schedule section, or ctl agenda schedule) and it appears here with its approval, cadence, and run history.'
+          : 'Park something above, or let your sessions park as they work.';
     groupsHost.innerHTML = `<div class="ag2-empty">
       <div class="ag2-empty-glyph">◍</div>
       <div class="ag2-empty-title">${escapeHtml(title)}</div>
