@@ -1256,6 +1256,7 @@ pub(crate) async fn run_external_agent_mode(
                                                     session_id: live_session_id.clone(),
                                                     reason: reason.clone(),
                                                     summary: stats.last_response.clone(),
+                                                    outcome: crate::event::TaskOutcome::Failed,
                                                 });
                                                 stats.terminal_outcome = Some(reason);
                                                 break 'outer;
@@ -3487,6 +3488,7 @@ pub(crate) async fn run_external_agent_mode(
                     session_id: live_session_id.clone(),
                     reason: "recovery required".to_string(),
                     summary: recovery_hint.or(Some(message)),
+                    outcome: crate::event::TaskOutcome::Failed,
                 });
                 stats.terminal_outcome = Some("recovery required".to_string());
                 break;
@@ -3738,6 +3740,7 @@ pub(crate) async fn run_external_agent_mode(
                     session_id: live_session_id.clone(),
                     reason: reason.clone(),
                     summary: stats.last_response.clone(),
+                    outcome: crate::event::TaskOutcome::Failed,
                 });
                 stats.terminal_outcome = Some(reason);
                 break;

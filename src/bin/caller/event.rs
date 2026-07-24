@@ -150,6 +150,19 @@ pub type ContextInjectionQueue = Arc<Mutex<Vec<ContextInjection>>>;
 pub type ApprovalRegistry =
     Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ApprovalResponse>>>>;
 
+/// The emitter-declared class of a `TaskComplete` terminal. `Completed`
+/// covers every shipped emission (including the native policy exits —
+/// budget/safety-cap/denied — that the Track A occurrence ruling treats
+/// as completion shapes); `Failed` is the error class an occurrence
+/// journal records as `failed` (external wrapper death, exhausted
+/// recovery). Typed so downstream mapping never matches reason prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskOutcome {
+    #[default]
+    Completed,
+    Failed,
+}
+
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -231,6 +244,14 @@ pub enum AppEvent {
         session_id: Option<String>,
         reason: String,
         summary: Option<String>,
+        /// The emitter's typed classification of the terminal: `Completed`
+        /// is the shipped meaning (clean ends and the native policy exits
+        /// Track A ruled as completion shapes); `Failed` marks the
+        /// error-class externals (wrapper process death, exhausted
+        /// recovery) so consumers that must distinguish — the agenda's
+        /// occurrence journal — map a typed field instead of matching
+        /// reason prose. Every emitter states its class explicitly.
+        outcome: TaskOutcome,
     },
     /// User requested interruption; broadcast to agent loops so they can cancel.
     InterruptRequested {
@@ -2864,6 +2885,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             reason,
             summary,
+            outcome: _,
         } => Some(OutboundEvent::TaskComplete {
             session_id: session_id.clone(),
             reason: reason.clone(),
@@ -4041,6 +4063,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             session_id,
             reason,
             summary,
+            outcome: _,
         } => {
             log.task_complete_for_session(session_id.as_deref(), reason, summary.as_deref());
         }
@@ -4704,6 +4727,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             reason: "done".to_string(),
             summary: None,
+            outcome: crate::event::TaskOutcome::Completed,
         });
 
         assert!(matches!(

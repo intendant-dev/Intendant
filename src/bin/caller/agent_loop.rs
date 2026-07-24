@@ -1073,6 +1073,7 @@ fn controller_gate_stop_exit(
                 session_id: local_session_id.clone(),
                 reason: "Approval required in headless mode (tool_call)".to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             });
             LoopExitReason::Denied
         }
@@ -1082,6 +1083,7 @@ fn controller_gate_stop_exit(
                 session_id: local_session_id.clone(),
                 reason: "Denied by user".to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             });
             LoopExitReason::Denied
         }
@@ -2488,6 +2490,7 @@ pub(crate) async fn run_agent_loop(
                             session_id: local_session_id.clone(),
                             reason: format!("Denied by policy ({})", cat),
                             summary: None,
+                            outcome: crate::event::TaskOutcome::Completed,
                         });
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
@@ -2575,6 +2578,7 @@ pub(crate) async fn run_agent_loop(
                                     session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
+                                    outcome: crate::event::TaskOutcome::Completed,
                                 });
                                 return Ok((loop_stats, LoopExitReason::Denied));
                             }
@@ -2587,6 +2591,7 @@ pub(crate) async fn run_agent_loop(
                             session_id: local_session_id.clone(),
                             reason: format!("Approval required in headless mode ({})", cat),
                             summary: None,
+                            outcome: crate::event::TaskOutcome::Completed,
                         });
                         return Ok((loop_stats, LoopExitReason::Denied));
                     } else {
@@ -2663,6 +2668,7 @@ pub(crate) async fn run_agent_loop(
                                     session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
+                                    outcome: crate::event::TaskOutcome::Completed,
                                 });
                                 return Ok((loop_stats, LoopExitReason::Denied));
                             }
@@ -2842,6 +2848,7 @@ pub(crate) async fn run_agent_loop(
                         } else {
                             Some(brief.clone())
                         },
+                        outcome: crate::event::TaskOutcome::Completed,
                     });
                     exit_reason = LoopExitReason::TaskComplete;
                     break;
@@ -2915,6 +2922,7 @@ pub(crate) async fn run_agent_loop(
                             } else {
                                 Some(brief.clone())
                             },
+                            outcome: crate::event::TaskOutcome::Completed,
                         });
                         exit_reason = LoopExitReason::TaskComplete;
                         break;
@@ -3084,6 +3092,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             session_id: local_session_id.clone(),
                             reason: format!("Denied by policy ({})", cat),
                             summary: None,
+                            outcome: crate::event::TaskOutcome::Completed,
                         });
                         return Ok((loop_stats, LoopExitReason::Denied));
                     }
@@ -3171,6 +3180,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
+                                    outcome: crate::event::TaskOutcome::Completed,
                                 });
                                 return Ok((loop_stats, LoopExitReason::Denied));
                             }
@@ -3183,6 +3193,7 @@ Proceed with explicit assumptions and continue without additional questions."
                             session_id: local_session_id.clone(),
                             reason: format!("Approval required in headless mode ({})", cat),
                             summary: None,
+                            outcome: crate::event::TaskOutcome::Completed,
                         });
                         return Ok((loop_stats, LoopExitReason::Denied));
                     } else {
@@ -3259,6 +3270,7 @@ Proceed with explicit assumptions and continue without additional questions."
                                     session_id: local_session_id.clone(),
                                     reason: "Denied by user".to_string(),
                                     summary: None,
+                                    outcome: crate::event::TaskOutcome::Completed,
                                 });
                                 return Ok((loop_stats, LoopExitReason::Denied));
                             }

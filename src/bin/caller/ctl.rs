@@ -2159,19 +2159,17 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "schedule" => {
-            let args = parse_command_args(
-                &raw[1..],
-                &[
-                    "--goal",
-                    "--at",
-                    "--every",
-                    "--until",
-                    "--max-occurrences",
-                    "--suspend-after",
-                    "--source",
-                ],
-                &["--orchestrate"],
-            )?;
+            let mut value_flags = vec![
+                "--goal",
+                "--at",
+                "--every",
+                "--until",
+                "--max-occurrences",
+                "--suspend-after",
+                "--source",
+            ];
+            value_flags.extend(AGENDA_LAUNCH_FLAGS);
+            let args = parse_command_args(&raw[1..], &value_flags, &["--orchestrate"])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2233,6 +2231,10 @@ async fn run_agenda(
                 );
             }
             insert_string(&mut map, "source", args.one("--source"));
+            // Executor pins (Track AU): the same launch vocabulary the
+            // start-now sheet records, digest-bound on the standing
+            // manifest — the owner approves WHO runs the goal.
+            insert_agenda_launch_config(&mut map, &args);
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
             if args.one("--every").is_some() {
@@ -2303,17 +2305,11 @@ async fn run_agenda(
             // defaults through the standard resolution chain.
             let args = parse_command_args(
                 &raw[1..],
-                &[
-                    "--project",
-                    "--goal",
-                    "--agent",
-                    "--claude-model",
-                    "--claude-effort",
-                    "--codex-model",
-                    "--codex-reasoning-effort",
-                    "--kimi-model",
-                    "--kimi-thinking",
-                ],
+                &{
+                    let mut value_flags = vec!["--project", "--goal"];
+                    value_flags.extend(AGENDA_LAUNCH_FLAGS);
+                    value_flags
+                },
                 &["--goal-run"],
             )?;
             let id = agenda_resolve_id(
@@ -2336,33 +2332,7 @@ async fn run_agenda(
             if goal_run {
                 map.insert("interactive".to_string(), Value::Bool(false));
             }
-            let mut agent_config = Map::new();
-            insert_string(&mut agent_config, "agent", args.one("--agent"));
-            insert_string(
-                &mut agent_config,
-                "claude_model",
-                args.one("--claude-model"),
-            );
-            insert_string(
-                &mut agent_config,
-                "claude_effort",
-                args.one("--claude-effort"),
-            );
-            insert_string(&mut agent_config, "codex_model", args.one("--codex-model"));
-            insert_string(
-                &mut agent_config,
-                "codex_reasoning_effort",
-                args.one("--codex-reasoning-effort"),
-            );
-            insert_string(&mut agent_config, "kimi_model", args.one("--kimi-model"));
-            insert_string(
-                &mut agent_config,
-                "kimi_thinking",
-                args.one("--kimi-thinking"),
-            );
-            if !agent_config.is_empty() {
-                map.insert("agent_config".to_string(), Value::Object(agent_config));
-            }
+            insert_agenda_launch_config(&mut map, &args);
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
             if goal_run {
@@ -3070,6 +3040,55 @@ async fn agenda_transition(
     let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
     print_tool_response(response, config, None)?;
     Ok(())
+}
+
+/// The launch-pin flag family shared by `agenda start` and
+/// `agenda schedule` — the ctl mirror of the dashboard confirm sheet's
+/// executor fields, assembled into the wire `agent_config` by
+/// [`insert_agenda_launch_config`]. One list, two verbs: the standing
+/// lane must express the same executor vocabulary the start-now lane
+/// records (Track AU).
+const AGENDA_LAUNCH_FLAGS: [&str; 7] = [
+    "--agent",
+    "--claude-model",
+    "--claude-effort",
+    "--codex-model",
+    "--codex-reasoning-effort",
+    "--kimi-model",
+    "--kimi-thinking",
+];
+
+/// Assemble the [`AGENDA_LAUNCH_FLAGS`] values into the command's
+/// `agent_config` object (omitted entirely when no pin was passed, so a
+/// flag-less invocation stays byte-identical to the legacy wire shape).
+fn insert_agenda_launch_config(map: &mut Map<String, Value>, args: &CommandArgs) {
+    let mut agent_config = Map::new();
+    insert_string(&mut agent_config, "agent", args.one("--agent"));
+    insert_string(
+        &mut agent_config,
+        "claude_model",
+        args.one("--claude-model"),
+    );
+    insert_string(
+        &mut agent_config,
+        "claude_effort",
+        args.one("--claude-effort"),
+    );
+    insert_string(&mut agent_config, "codex_model", args.one("--codex-model"));
+    insert_string(
+        &mut agent_config,
+        "codex_reasoning_effort",
+        args.one("--codex-reasoning-effort"),
+    );
+    insert_string(&mut agent_config, "kimi_model", args.one("--kimi-model"));
+    insert_string(
+        &mut agent_config,
+        "kimi_thinking",
+        args.one("--kimi-thinking"),
+    );
+    if !agent_config.is_empty() {
+        map.insert("agent_config".to_string(), Value::Object(agent_config));
+    }
 }
 
 /// Resolve the first positional as an agenda item id, accepting any
@@ -5053,6 +5072,8 @@ fn help_agenda() {
   intendant ctl agenda patch ID_PREFIX [--title TEXT] [--body TEXT] [--tag TAG]... [--clear-tags] [--due WHEN|--clear-due] [--source LABEL]\n\
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
+      [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
+      [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
   intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
@@ -5120,7 +5141,13 @@ supervised session with that goal (never raw actions). --every INTERVAL\n\
 digest-bound manifest: ONE approval covers every occurrence until revoked,\n\
 --until/--max-occurrences end the series, and --suspend-after N (default 3)\n\
 suspends after N consecutive failed runs — surfaced, never silent; the\n\
-owner re-arms by re-approving the unchanged digest (one click). On a\n\
+owner re-arms by re-approving the unchanged digest (one click). The\n\
+launch flags (--agent, --claude-model/--claude-effort,\n\
+--codex-model/--codex-reasoning-effort, --kimi-model/--kimi-thinking)\n\
+pin the executor on the digest-bound manifest — the approval covers WHO\n\
+runs the goal (backend/model/effort), and editing the executor voids it\n\
+like any other revision; omitted fields inherit the daemon defaults\n\
+(explicit pin → daemon default → backend default). On a\n\
 standing approved item, `start` fires one extra occurrence of the approved\n\
 manifest immediately without touching the approval. Nothing fires until\n\
 the owner approves; approval is an owner-surface act (dashboard or an\n\

@@ -903,6 +903,7 @@ impl AppEventUpcaster {
                 session_id,
                 reason,
                 summary,
+                outcome: _,
             } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
@@ -3939,6 +3940,7 @@ mod tests {
                 session_id: None,
                 reason: (*reason).to_string(),
                 summary: None,
+                outcome: crate::event::TaskOutcome::Completed,
             });
             let completions: Vec<_> = out
                 .iter()
@@ -5105,6 +5107,7 @@ mod tests {
             session_id: Some("s1".into()),
             reason: "success".into(),
             summary: Some("all done".into()),
+            outcome: crate::event::TaskOutcome::Completed,
         });
     }
 
