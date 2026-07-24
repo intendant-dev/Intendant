@@ -217,8 +217,14 @@ function agendaTabVisible() {
 }
 
 function agendaOnTabShown() {
-  if (agendaItems === null) agendaRefresh();
-  else agendaRenderAll();
+  if (agendaItems === null) {
+    // Build the scaffold immediately (replacing the legacy static markup
+    // with the Loading state) — the fetch fills it in when it lands.
+    agendaRenderTab();
+    agendaRefresh();
+  } else {
+    agendaRenderAll();
+  }
 }
 
 async function agendaSendOp(params, button) {
@@ -1005,8 +1011,8 @@ function agendaOpenStartSheet(itemId, anchor) {
       return;
     }
     if (!spec.modelKey) return;
-    const inheritLabel = (dflt) => dflt
-      ? `Daemon default (${dflt})` : 'Daemon default (backend default)';
+    const inheritLabel = (defaultValue) => defaultValue
+      ? `Daemon default (${defaultValue})` : 'Daemon default (backend default)';
     const modelValues = [...spec.models];
     if (spec.model && !modelValues.includes(spec.model)) modelValues.push(spec.model);
     configState.modelSel = addSelect('Model', 'ags-config-model',

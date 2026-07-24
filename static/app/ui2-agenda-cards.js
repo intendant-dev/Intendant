@@ -461,7 +461,10 @@ function agendaCardChips(item) {
     chips.push(agendaChipHtml('dismissed · still open', 'neutral',
       agendaDismissedTip(item.dismissed), true));
   }
-  if (item.answer && item.answer.delivered === false) {
+  // Answered ask whose delivery reached no session (the daemon-recorded
+  // `delivered: false` marker; absent data claims nothing).
+  if (item.status === 'done' && item.ask && item.answer
+    && item.answer.delivered === false) {
     chips.push(agendaChipHtml('answered · awaiting pickup', 'sky',
       'No live session heard the answer — the asker’s successor reads it at session start', true));
   }
@@ -636,10 +639,11 @@ function agendaQaPillsHtml(item, qi) {
 
 // Preview thumbnails for one question — the "show, then ask" cards.
 // SECURITY INVARIANT (same as the question rail): agent-authored html
-// renders ONLY inside `<iframe sandbox="allow-scripts">` populated via
-// srcdoc from an authenticated fetch — opaque origin, never same-origin,
-// never blob:/createObjectURL. Bytes come from the agenda blob store
-// route the payload names.
+// renders ONLY inside a sandboxed srcdoc iframe with an opaque origin —
+// built exclusively by the shared createSandboxedPreviewFrame factory and
+// filled by the shared fetchSandboxedPreviewInto writer (fragment 41; the
+// pinned single-writer invariant). This renderer emits placeholder slots;
+// agendaHydratePreviewFrames swaps them for real frames.
 function agendaPreviewStripHtml(item, qi, ctx) {
   const q = item.ask && item.ask.questions[qi];
   const previews = (q && q.previews) || [];
@@ -654,8 +658,8 @@ function agendaPreviewStripHtml(item, qi, ctx) {
     const tone = answered ? 'green' : 'iris';
     let media;
     if (p.kind === 'html' && p.url) {
-      media = `<iframe class="ag2-prev-frame" sandbox="allow-scripts" referrerpolicy="no-referrer"
-        title="${escapeHtml(p.label || 'preview')}" data-preview-url="${escapeHtml(p.url)}" tabindex="-1"></iframe>`;
+      media = `<span class="ag2-prev-slot" data-preview-url="${escapeHtml(p.url)}"
+        data-preview-title="${escapeHtml(p.label || 'preview')}"></span>`;
     } else if (p.kind === 'image' && p.url) {
       media = `<img class="ag2-prev-img" loading="lazy" src="${escapeHtml(p.url)}" alt="${escapeHtml(p.label || 'preview')}" />`;
     } else if (p.kind === 'text' && p.content) {
@@ -682,32 +686,24 @@ function agendaPreviewStripHtml(item, qi, ctx) {
   return `<div class="ag2-prevs${ctx === 'insp' ? ' insp' : ''}">${cards.join('')}</div>`;
 }
 
-// Hydrate sandboxed preview frames after an innerHTML render: fetch the
-// blob once (cached per url) and hand it to srcdoc. A failed fetch
-// degrades to a named unavailable chip, never a broken card.
-const agendaPreviewHtmlCache = new Map();
+// Hydrate preview slots after an innerHTML render: each slot becomes a
+// sandboxed frame from the shared factory (fragment 41 — the pinned
+// single-factory/single-writer pattern), filled from the blob store. A
+// failed fetch degrades to a named unavailable chip, never a broken card.
 function agendaHydratePreviewFrames(root) {
-  root.querySelectorAll('iframe.ag2-prev-frame[data-preview-url]').forEach((frame) => {
-    const url = frame.dataset.previewUrl;
-    if (!url || frame.dataset.loaded) return;
-    frame.dataset.loaded = '1';
-    const cached = agendaPreviewHtmlCache.get(url);
-    if (cached !== undefined) {
-      frame.srcdoc = cached;
-      return;
-    }
-    fetch(url)
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((html) => {
-        agendaPreviewHtmlCache.set(url, html);
-        frame.srcdoc = html;
-      })
-      .catch(() => {
-        const chip = document.createElement('span');
-        chip.className = 'ag2-prev-missing';
-        chip.textContent = 'preview unavailable (blob deleted from the store)';
-        frame.replaceWith(chip);
-      });
+  root.querySelectorAll('.ag2-prev-slot[data-preview-url]').forEach((slot) => {
+    const url = slot.dataset.previewUrl;
+    if (!url) return;
+    const full = slot.dataset.previewFull === '1';
+    const frame = createSandboxedPreviewFrame(
+      full ? 'ag2-prev-frame full' : 'ag2-prev-frame', slot.dataset.previewTitle);
+    slot.replaceWith(frame);
+    fetchSandboxedPreviewInto(frame, url, () => {
+      const chip = document.createElement('span');
+      chip.className = 'ag2-prev-missing';
+      chip.textContent = 'preview unavailable (blob deleted from the store)';
+      frame.replaceWith(chip);
+    });
   });
 }
 

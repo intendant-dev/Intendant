@@ -455,6 +455,17 @@ function agendaInspGatesHtml(item) {
   });
   const empty = !blockers.length && !deps.length
     ? '<div class="ag2-hint">Nothing gates this item.</div>' : '';
+  // Blockers and dependency edges describe OPEN work — the daemon refuses
+  // them elsewhere, so the affordances only exist there.
+  if (item.status !== 'open') {
+    return `<section class="ag2-sec">
+      <div class="ag2-sec-head">
+        <span class="ag2-sec-label">Blocked on</span>
+        <span class="ag2-sec-hint">stated criteria &amp; prerequisites — nothing evaluates them; people do</span>
+      </div>
+      <div class="ag2-sec-body">${blockers.join('')}${deps.join('')}${empty}</div>
+    </section>`;
+  }
   const desc = agendaDescendantIds(item.id);
   const depOptions = (agendaItems || [])
     .filter((x) => x.id !== item.id && x.status === 'open' && !desc.has(x.id)
@@ -747,12 +758,11 @@ function agendaInspClick(e) {
     case 'close': agendaCloseInspector(); break;
     case 'copy-id': agendaCopyText(item.id, 'the full item id'); break;
     case 'title-edit':
-      if (item.status !== 'retired') {
-        agendaInspEditingTitle = true;
-        agendaInspTitleDraft = item.title;
-        agendaInspectorRender();
-        document.getElementById('ag2-insp-title-input')?.focus();
-      }
+      // Patch is presentation state and works on any status.
+      agendaInspEditingTitle = true;
+      agendaInspTitleDraft = item.title;
+      agendaInspectorRender();
+      document.getElementById('ag2-insp-title-input')?.focus();
       break;
     case 'title-save': agendaInspSaveTitle(item); break;
     case 'start': agendaOpenStartSheet(item.id, act); break;
@@ -1216,8 +1226,8 @@ function agendaPrevSheetHtml(item) {
     `<button type="button" class="ag2-seg-btn${i === s.pi ? ' active' : ''}" data-sheet-act="prev-view" data-view="${i}">${escapeHtml((pv.label || `#${i + 1}`).split(' — ')[0])}</button>`).join('');
   let media;
   if (p.kind === 'html' && p.url) {
-    media = `<iframe class="ag2-prev-frame full" sandbox="allow-scripts" referrerpolicy="no-referrer"
-      title="${escapeHtml(p.label || 'preview')}" data-preview-url="${escapeHtml(p.url)}"></iframe>`;
+    media = `<span class="ag2-prev-slot" data-preview-url="${escapeHtml(p.url)}"
+      data-preview-title="${escapeHtml(p.label || 'preview')}" data-preview-full="1"></span>`;
   } else if (p.kind === 'image' && p.url) {
     media = `<img class="ag2-prev-img full" src="${escapeHtml(p.url)}" alt="${escapeHtml(p.label || 'preview')}" />`;
   } else if (p.kind === 'text' && p.content) {
