@@ -6163,6 +6163,7 @@ mod tests {
             "api_session_current_changes",
             "api_session_current_history",
             "api_session_current_rollback",
+            "api_codex_cloud_workers",
             "api_agenda_list",
             "api_agenda_op",
             "api_agenda_ref_drift",
