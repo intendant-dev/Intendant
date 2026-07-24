@@ -45,24 +45,26 @@ function agendaHoodReset() {
 async function agendaHoodFetchPages(method, itemId, key) {
   const entries = [];
   let since = 0;
-  let pageMore = false;
   for (let page = 0; page < 8; page++) {
     const resp = await daemonApi.request(method, { item: itemId, limit: 500, since });
     if (!resp.ok || !resp.body || !Array.isArray(resp.body[key])) {
       const message = (resp.body && resp.body.error) || `unavailable (${resp.status})`;
-      return { error: message, entries, pageMore };
+      return { error: message, entries, pageMore: false };
     }
     entries.push(...resp.body[key]);
-    if (resp.body.next_since >= resp.body.log_len) return { error: '', entries, pageMore };
+    if (resp.body.next_since >= resp.body.log_len) return { error: '', entries, pageMore: false };
     since = resp.body.next_since;
-    pageMore = true; // provisional: cleared by a terminal page above
   }
+  // Page budget exhausted with the cursor still short of the log's end.
   return { error: '', entries, pageMore: true };
 }
 
 function agendaHoodEnsureData(item) {
+  // An errored cache counts as fresh: retry only when the item's
+  // updated_ms moves or the inspector reopens — a persistent failure
+  // must never become a render→fetch→render loop.
   const fresh = (cache) => cache && cache.itemId === item.id
-    && cache.updatedMs === (item.updated_ms || 0) && !cache.error;
+    && cache.updatedMs === (item.updated_ms || 0);
   if (!fresh(agendaHoodOps)) {
     const stamp = { itemId: item.id, updatedMs: item.updated_ms || 0 };
     agendaHoodOps = { ...stamp, loading: true, error: '', entries: [], pageMore: false };
@@ -200,11 +202,16 @@ function agendaHoodBornHtml(item) {
 // The latest journal record for this effect's last occurrence — journal
 // truth first; the fold's last_run fields are the fallback when the
 // journal page has nothing (absence claims nothing).
-function agendaHoodOccurrenceLine(effect) {
+function agendaHoodOccurrenceLine(item, effect) {
   const run = effect.last_run;
   if (!run) return '';
   let state = run.state;
   let source = 'journal synced before dispatch';
+  if (agendaHoodOcc && agendaHoodOcc.itemId !== item.id) {
+    // Cache from a previous selection (only reachable when this item's
+    // fetch is gated): claim nothing from it.
+    return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state} · fold view`)}</div>`;
+  }
   if (agendaHoodOcc && !agendaHoodOcc.loading && !agendaHoodOcc.error) {
     const records = agendaHoodOcc.entries
       .filter((entry) => entry && entry.record
@@ -266,7 +273,7 @@ function agendaHoodManifestHtml(item) {
     <div class="ag2-hood-seal t-${sealTone}"><span class="ag2-hood-sealdot"></span>${escapeHtml(sealLine)}</div>
     <div class="ag2-hood-note mono">${escapeHtml(attribution)}</div>
     ${streak}
-    ${agendaHoodOccurrenceLine(effect)}
+    ${agendaHoodOccurrenceLine(item, effect)}
   </div>`;
 }
 
@@ -314,7 +321,7 @@ function agendaHoodAskHtml(item) {
 
 // Presentation verb for one served envelope. Every interpolated field is
 // op-log DATA — the caller escapes the whole verb string.
-function agendaHoodOpVerb(op) {
+function agendaHoodOpVerb(op, envelope) {
   const type = String(op.type || '');
   const titleOf = (id, cap) => {
     const target = agendaFindItem(id);
@@ -329,7 +336,12 @@ function agendaHoodOpVerb(op) {
     case 'retire': return 'retired — hidden, never deleted';
     case 'answer': return 'answered';
     case 'dismiss': return `dismissed${op.action ? ` (${op.action})` : ''} — still open`;
-    case 'annotate': return 'annotated';
+    case 'annotate': {
+      // The self-described label rides the verb (the triage mandate's
+      // annotations read as "annotated · --source triage").
+      const source = envelope.source || op.source || '';
+      return source ? `annotated · --source ${source}` : 'annotated';
+    }
     case 'set_blocker': return 'blocker set';
     case 'clear_blocker': return 'blocker cleared';
     case 'add_ref': return `ref attached · ${op.ref_type || 'file'}`;
@@ -396,7 +408,7 @@ function agendaHoodHistoryHtml(item) {
       }
       const envelope = entry.op || {};
       const op = envelope.op || {};
-      const verb = entry.known ? agendaHoodOpVerb(op) : `op · ${String(op.type || '—')}`;
+      const verb = entry.known ? agendaHoodOpVerb(op, envelope) : `op · ${String(op.type || '—')}`;
       return {
         at: envelope.at_ms || 0,
         verb,
@@ -509,13 +521,20 @@ function agendaLedgerOpsSync() {
   agendaLedgerOpsInFlight = true;
   daemonApi.request('api_agenda_ops', { limit: 1 }).then((resp) => {
     agendaLedgerOpsInFlight = false;
-    if (!resp.ok || !resp.body || typeof resp.body.log_len !== 'number') return;
+    if (!resp.ok || !resp.body || typeof resp.body.log_len !== 'number') {
+      // Unsupported/unavailable: remember the signature so a failing
+      // daemon is not re-asked on every repaint — the next DATA change
+      // retries once. The segment simply stays absent.
+      agendaLedgerOpsSig = sig;
+      return;
+    }
     const changed = agendaLedgerOpsLen !== resp.body.log_len;
     agendaLedgerOpsLen = resp.body.log_len;
     agendaLedgerOpsSig = sig;
     if (changed) agendaRenderTab();
   }).catch(() => {
     agendaLedgerOpsInFlight = false;
+    agendaLedgerOpsSig = sig;
   });
 }
 
