@@ -119,6 +119,15 @@ function cloudWorkerRow(lease) {
   attachment.textContent = CLOUD_WORKER_ATTACHMENT_LABELS[attachState] || attachState;
   attachment.title = 'Live-attachment state (independent of provider state)';
   head.appendChild(attachment);
+  // Daemon-derived warm-worker heuristic: an active turn holds its worker;
+  // a warm worker keeps ignored build artifacts (measured 68x faster
+  // identical rebuild), so follow-ups in this task reuse them.
+  const warmth = lease.warmth || 'unknown';
+  const warmChip = document.createElement('span');
+  warmChip.className = `cloud-worker-chip cloud-worker-warmth is-${warmth}`;
+  warmChip.textContent = warmth === 'warm' ? 'likely warm' : warmth === 'cold' ? 'cold likely' : 'warmth unknown';
+  warmChip.title = 'Warm-worker heuristic: follow-ups in a warm task reuse its incremental build state';
+  head.appendChild(warmChip);
   row.appendChild(head);
 
   const meta = document.createElement('div');
@@ -140,6 +149,21 @@ function cloudWorkerRow(lease) {
     agoEl.className = 'cloud-worker-ago';
     agoEl.textContent = `observed ${ago}`;
     meta.appendChild(agoEl);
+  }
+  if (Number(lease.turns_observed) > 1) {
+    const turnsEl = document.createElement('span');
+    turnsEl.className = 'cloud-worker-ago';
+    turnsEl.textContent = `${lease.turns_observed} turns`;
+    turnsEl.title = 'Completed turns observed (follow-ups reuse the warm worker)';
+    meta.appendChild(turnsEl);
+  }
+  if (lease.worker && (lease.worker.hostname || lease.worker.boot_id)) {
+    const workerEl = document.createElement('span');
+    workerEl.className = 'cloud-worker-id';
+    const boot = lease.worker.boot_id ? ` · boot ${String(lease.worker.boot_id).slice(0, 8)}` : '';
+    workerEl.textContent = `worker ${lease.worker.hostname || '?'}${boot}`;
+    workerEl.title = 'Runtime fingerprint from a probe or pulled diff; identity change across turns = cold replacement';
+    meta.appendChild(workerEl);
   }
   if (lease.task_url) {
     const link = document.createElement('a');

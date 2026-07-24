@@ -1815,3 +1815,9 @@ html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
   width: fit-content;
   user-select: all;
 }
+
+/* Warm-worker heuristic chip: warm workers keep incremental build state
+   for same-task follow-ups; cold means past the setup-cache window. */
+.cloud-worker-warmth.is-warm { color: var(--peach, var(--yellow, #fab387)); border-color: currentColor; }
+.cloud-worker-warmth.is-unknown { color: var(--text-3); border-style: dashed; }
+.cloud-worker-warmth.is-cold { color: var(--text-3); }

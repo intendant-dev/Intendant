@@ -74,8 +74,112 @@ pub struct WorkerLease {
     /// `connected` again, which restarts this clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_at_unix_ms: Option<u64>,
+    /// Last refresh that saw the task actively running (ms since epoch).
+    /// With `last_terminal_at_unix_ms` this drives the warmth heuristic:
+    /// follow-up turns driven from the task's web UI surface here as
+    /// terminal → running → terminal flaps between refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_running_at_unix_ms: Option<u64>,
+    /// Last observed live → terminal edge — a completed turn (ms since
+    /// epoch). A task first seen already terminal has no known edge time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_terminal_at_unix_ms: Option<u64>,
+    /// Completed turns observed by refreshes (terminal edges). Follow-ups
+    /// in the same task increment this; first-sight-terminal history does
+    /// not.
+    #[serde(default)]
+    pub turns_observed: u32,
+    /// Submitted by `codex-cloud probe`: the task's diff carries a worker
+    /// fingerprint that refresh collects automatically once terminal.
+    #[serde(default)]
+    pub is_probe: bool,
+    /// Worker identity parsed from the newest collected fingerprint
+    /// (probe tasks, or any pulled diff that happened to carry one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerFingerprint>,
     pub provider_updated_at: Option<String>,
     pub last_observed_unix_ms: u64,
+}
+
+/// A worker identity fingerprint parsed from a task diff (see
+/// `codex-cloud probe`). Every field is best-effort — the in-container
+/// agent authored the file, so parsing is defensive and absence is normal.
+/// Two fingerprints with matching `hostname` + `boot_id` + `pid1_start`
+/// are the same booted worker; a mismatch across turns of one task is
+/// direct evidence of a cold replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerFingerprint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid1_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_kb: Option<u64>,
+    /// When this fingerprint was collected locally (ms since epoch).
+    #[serde(default)]
+    pub collected_at_unix_ms: u64,
+}
+
+/// The warm-worker heuristic distilled from the 2026-07-24 runtime
+/// findings: an actively running turn holds its worker; a warm same-task
+/// worker was measured surviving ~8 minutes between turns with its cargo
+/// target tree intact (an identical build ran 68x faster); nothing proves
+/// allocation beyond that, and the documented 12-hour window belongs to
+/// the *setup cache*, not the worker. These are conservative labels, not
+/// guarantees — `Unknown` is the honest default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warmth {
+    LikelyWarm,
+    Unknown,
+    ColdLikely,
+}
+
+/// Measured warm continuity was ~8 minutes; claim warmth just past it.
+const WARM_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// Beyond the documented setup-cache window nothing warm can remain.
+const SETUP_CACHE_WINDOW_MS: u64 = 12 * 60 * 60 * 1000;
+
+pub fn lease_warmth(lease: &WorkerLease, now_ms: u64) -> Warmth {
+    if matches!(lease.provider_state, ProviderLeaseState::Running) {
+        return Warmth::LikelyWarm;
+    }
+    // Queued tasks have no worker yet; fall through to history (none →
+    // Unknown).
+    let last_activity = lease
+        .last_terminal_at_unix_ms
+        .max(lease.last_running_at_unix_ms);
+    match last_activity {
+        None => Warmth::Unknown,
+        Some(at) => {
+            let age = now_ms.saturating_sub(at);
+            if age <= WARM_WINDOW_MS {
+                Warmth::LikelyWarm
+            } else if age <= SETUP_CACHE_WINDOW_MS {
+                Warmth::Unknown
+            } else {
+                Warmth::ColdLikely
+            }
+        }
+    }
+}
+
+pub fn warmth_label(warmth: Warmth) -> &'static str {
+    match warmth {
+        Warmth::LikelyWarm => "warm",
+        Warmth::Unknown => "unknown",
+        Warmth::ColdLikely => "cold",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +189,9 @@ pub struct SubmitTaskRequest {
     pub attempts: u16,
     pub title: Option<String>,
     pub prompt: String,
+    /// Marks the lease as a `codex-cloud probe` submission so refresh
+    /// collects the fingerprint from its diff once terminal.
+    pub probe: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +287,7 @@ pub async fn run(args: Vec<String>) -> Result<(), String> {
         "status" => run_status(&args[1..]).await,
         "diff" => run_passthrough("diff", &args[1..]).await,
         "pull" => run_pull(&args[1..]).await,
+        "probe" => run_probe(&args[1..]).await,
         "bootstrap" => run_bootstrap(&args[1..]),
         "attachment" => run_attachment(&args[1..]),
         "prune" => run_prune(&args[1..]),
@@ -230,6 +338,7 @@ async fn run_exec(args: &[String]) -> Result<(), String> {
             attempts: parsed.attempts,
             title: parsed.title,
             prompt: parsed.query,
+            probe: false,
         },
     )
     .await?;
@@ -314,6 +423,11 @@ async fn submit_task_with(
                 provider_state: ProviderLeaseState::Queued,
                 attachment_state: AttachmentState::NotRequested,
                 attached_at_unix_ms: None,
+                last_running_at_unix_ms: None,
+                last_terminal_at_unix_ms: None,
+                turns_observed: 0,
+                is_probe: request.probe,
+                worker: None,
                 provider_updated_at: None,
                 last_observed_unix_ms: now_unix_ms(),
             })
@@ -350,9 +464,15 @@ async fn run_list(args: &[String]) -> Result<(), String> {
     .await?;
     announce_transitions(&outcome.transitions).await;
     if options.json {
+        let payload = serde_json::json!({
+            "workers": leases_json(&outcome.workers),
+            "tracked_active": leases_json(&outcome.tracked_active),
+            "cursor": outcome.cursor,
+            "transitions": outcome.transitions,
+        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&outcome)
+            serde_json::to_string_pretty(&payload)
                 .map_err(|e| format!("serialize worker leases: {e}"))?
         );
         return Ok(());
@@ -375,19 +495,40 @@ async fn run_list(args: &[String]) -> Result<(), String> {
 }
 
 fn print_lease_table(leases: &[WorkerLease]) {
+    let now = now_unix_ms();
     println!(
-        "{:<38}  {:<10}  {:<13}  TITLE",
-        "TASK", "PROVIDER", "ATTACHMENT"
+        "{:<38}  {:<10}  {:<13}  {:<8}  TITLE",
+        "TASK", "PROVIDER", "ATTACHMENT", "WARMTH"
     );
     for lease in leases {
         println!(
-            "{:<38}  {:<10}  {:<13}  {}",
+            "{:<38}  {:<10}  {:<13}  {:<8}  {}",
             lease.task_id,
             lease.provider_status,
             attachment_label(&lease.attachment_state),
+            warmth_label(lease_warmth(lease, now)),
             lease.title
         );
     }
+}
+
+/// Serialize leases with the derived warmth attached — computed on the
+/// daemon side so no frontend re-implements the heuristic.
+pub fn leases_json(leases: &[WorkerLease]) -> Vec<serde_json::Value> {
+    let now = now_unix_ms();
+    leases
+        .iter()
+        .map(|lease| {
+            let mut value = serde_json::to_value(lease).unwrap_or(serde_json::Value::Null);
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "warmth".to_string(),
+                    serde_json::Value::String(warmth_label(lease_warmth(lease, now)).to_string()),
+                );
+            }
+            value
+        })
+        .collect()
 }
 
 fn transition_title(transition: &TerminalTransition) -> String {
@@ -498,10 +639,28 @@ async fn refresh_leases_with(
     // exactly one refresher (the loser reloads post-terminal state).
     let output = run_codex(codex, &cloud_args).await?;
     let response = parse_cloud_list(&output.stdout)?;
-    let _lock = StoreLock::acquire(store_path)?;
-    let mut store = load_store(store_path)?;
-    let transitions = sync_store(&mut store, &response.tasks, now_unix_ms(), attach_ttl_ms);
-    save_store(store_path, &store)?;
+    let (transitions, probe_pending) = {
+        let _lock = StoreLock::acquire(store_path)?;
+        let mut store = load_store(store_path)?;
+        let transitions = sync_store(&mut store, &response.tasks, now_unix_ms(), attach_ttl_ms);
+        save_store(store_path, &store)?;
+        // Probe fingerprints ride the diff; collect (outside the lock) for
+        // window tasks that reached terminal without one.
+        let probe_pending: Vec<String> = response
+            .tasks
+            .iter()
+            .filter_map(|task| store.leases.get(&task.id))
+            .filter(|lease| {
+                lease.is_probe && lease.provider_state.is_terminal() && lease.worker.is_none()
+            })
+            .map(|lease| lease.task_id.clone())
+            .collect();
+        (transitions, probe_pending)
+    };
+    for task_id in &probe_pending {
+        collect_probe_fingerprint(codex, store_path, task_id).await;
+    }
+    let store = load_store(store_path)?;
     let workers = response
         .tasks
         .iter()
@@ -633,6 +792,142 @@ async fn run_passthrough(command: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The canned probe prompt: the in-container agent reports the worker's
+/// runtime identity as one added file, so the fingerprint travels in the
+/// diff — the only channel the CLI surface reliably exposes. Systematizes
+/// the 2026-07-24 runtime-findings methodology (worker isolation, cache
+/// materialization, cold-replacement detection).
+const PROBE_PROMPT: &str = "Create exactly one new file at ._intendant-probe/fingerprint.json and change nothing else. Its content must be a single line of minified JSON with exactly these keys: \"intendant_probe\": 1, \"hostname\": the output of `hostname`, \"boot_id\": the contents of /proc/sys/kernel/random/boot_id, \"pid1_start\": field 22 of /proc/1/stat as a string, \"unix_ms\": the output of `date +%s%3N` as a number, \"git_rev\": the output of `git rev-parse HEAD`, \"rustc\": the output of `rustc --version` (or null if unavailable), \"cpus\": the output of `nproc` as a number, \"mem_kb\": the MemTotal number from /proc/meminfo. Do not run builds or tests, do not modify any other file, do not create branches, and finish immediately after writing the file.";
+
+async fn run_probe(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        println!("Usage: intendant codex-cloud probe --env ENV_ID [--title TITLE]");
+        println!(
+            "Submits a canned diagnostic task whose diff carries the worker's runtime fingerprint (hostname, boot id, PID 1 start, toolchain). Refresh collects it automatically once the task finishes; matching fingerprints identify one booted worker, mismatches across turns prove a cold replacement."
+        );
+        return Ok(());
+    }
+    let mut environment: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--env" => {
+                i += 1;
+                environment = Some(required_value(args, i, "--env")?);
+            }
+            "--title" => {
+                i += 1;
+                title = Some(required_value(args, i, "--title")?);
+            }
+            other => return Err(format!("unknown probe flag {other}")),
+        }
+        i += 1;
+    }
+    let environment = environment.ok_or_else(|| "probe requires --env <ENV_ID>".to_string())?;
+    let result = submit_task(
+        &state_path(),
+        SubmitTaskRequest {
+            environment,
+            branch: None,
+            attempts: 1,
+            title: Some(title.unwrap_or_else(|| "Intendant worker probe".to_string())),
+            prompt: PROBE_PROMPT.to_string(),
+            probe: true,
+        },
+    )
+    .await?;
+    match result.task_id {
+        Some(task_id) => {
+            println!("Probe submitted as {task_id}.");
+            println!(
+                "Run `intendant codex-cloud list` after it finishes; the worker fingerprint is collected from the diff automatically."
+            );
+        }
+        None => println!(
+            "Probe submitted, but no task id was visible in the CLI output; run `intendant codex-cloud list` to synchronize."
+        ),
+    }
+    Ok(())
+}
+
+/// Find the probe fingerprint in a unified diff: an added line whose JSON
+/// object carries `"intendant_probe"`. Defensive — the in-container agent
+/// authored the file, so any shape drift yields `None`, never an error.
+pub(crate) fn parse_probe_fingerprint(diff_text: &str) -> Option<WorkerFingerprint> {
+    for line in diff_text.lines() {
+        let Some(added) = line.strip_prefix('+') else {
+            continue;
+        };
+        let trimmed = added.trim();
+        if !trimmed.starts_with('{') || !trimmed.contains("\"intendant_probe\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("intendant_probe").is_none() {
+            continue;
+        }
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let num = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        return Some(WorkerFingerprint {
+            hostname: text("hostname"),
+            boot_id: text("boot_id"),
+            pid1_start: text("pid1_start").or_else(|| num("pid1_start").map(|n| n.to_string())),
+            unix_ms: num("unix_ms"),
+            git_rev: text("git_rev"),
+            rustc: text("rustc"),
+            cpus: num("cpus"),
+            mem_kb: num("mem_kb"),
+            collected_at_unix_ms: now_unix_ms(),
+        });
+    }
+    None
+}
+
+/// Best-effort: fetch a probe task's diff and record its fingerprint.
+/// Failures leave the lease unfingerprinted for the next refresh to retry
+/// (bounded: only tasks still in the provider window are attempted).
+async fn collect_probe_fingerprint(codex: &str, store_path: &Path, task_id: &str) {
+    let Ok(diff) = run_codex(
+        codex,
+        &["cloud".to_string(), "diff".to_string(), task_id.to_string()],
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(fingerprint) = parse_probe_fingerprint(&diff.stdout) else {
+        return;
+    };
+    record_worker_fingerprint(store_path, task_id, fingerprint);
+}
+
+/// Attach a fingerprint to a tracked lease (probe collection, or an
+/// opportunistic parse from a pulled diff). Silent best-effort.
+fn record_worker_fingerprint(store_path: &Path, task_id: &str, fingerprint: WorkerFingerprint) {
+    let Ok(_lock) = StoreLock::acquire(store_path) else {
+        return;
+    };
+    let Ok(mut store) = load_store(store_path) else {
+        return;
+    };
+    if let Some(lease) = store.leases.get_mut(task_id) {
+        lease.worker = Some(fingerprint);
+        let _ = save_store(store_path, &store);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PullOutcome {
     pub task_id: String,
@@ -641,6 +936,10 @@ pub struct PullOutcome {
     /// Paths left with conflict markers by the three-way apply. Empty means
     /// the diff applied cleanly.
     pub conflicts: Vec<String>,
+    /// Worker fingerprint opportunistically parsed from the pulled diff
+    /// (present when the task wrote one — probe tasks always do).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerFingerprint>,
 }
 
 async fn run_pull(args: &[String]) -> Result<(), String> {
@@ -702,6 +1001,9 @@ async fn run_pull(args: &[String]) -> Result<(), String> {
         dir.as_deref(),
     )
     .await?;
+    if let Some(worker) = outcome.worker.clone() {
+        record_worker_fingerprint(&state_path(), &outcome.task_id, worker);
+    }
     if json {
         println!(
             "{}",
@@ -768,6 +1070,7 @@ async fn pull_task(
             attempt.unwrap_or(1)
         ));
     }
+    let worker = parse_probe_fingerprint(&diff.stdout);
 
     let branch = branch_override
         .map(str::trim)
@@ -866,6 +1169,7 @@ async fn pull_task(
         branch,
         worktree: worktree_dir,
         conflicts,
+        worker,
     })
 }
 
@@ -1269,11 +1573,22 @@ fn sync_store(
         let provider_state = ProviderLeaseState::from_codex_status(&task.status);
         let existing = store.leases.get(&task.id).cloned();
 
-        if provider_state.is_terminal()
+        let terminal_edge = provider_state.is_terminal()
             && existing
                 .as_ref()
-                .is_some_and(|lease| !lease.provider_state.is_terminal())
-        {
+                .is_some_and(|lease| !lease.provider_state.is_terminal());
+        let mut last_running_at = existing.as_ref().and_then(|l| l.last_running_at_unix_ms);
+        let mut last_terminal_at = existing.as_ref().and_then(|l| l.last_terminal_at_unix_ms);
+        let mut turns_observed = existing.as_ref().map(|l| l.turns_observed).unwrap_or(0);
+        if matches!(provider_state, ProviderLeaseState::Running) {
+            last_running_at = Some(now_ms);
+        }
+        if terminal_edge {
+            last_terminal_at = Some(now_ms);
+            turns_observed += 1;
+        }
+
+        if terminal_edge {
             transitions.push(TerminalTransition {
                 task_id: task.id.clone(),
                 title: if task.title.trim().is_empty() {
@@ -1349,6 +1664,11 @@ fn sync_store(
                 provider_state,
                 attachment_state,
                 attached_at_unix_ms: attached_at,
+                last_running_at_unix_ms: last_running_at,
+                last_terminal_at_unix_ms: last_terminal_at,
+                turns_observed,
+                is_probe: existing.as_ref().is_some_and(|lease| lease.is_probe),
+                worker: existing.as_ref().and_then(|lease| lease.worker.clone()),
                 provider_updated_at: keep(task.updated_at.clone(), |lease| {
                     lease.provider_updated_at.clone()
                 }),
@@ -1572,6 +1892,24 @@ fn print_lease(lease: &WorkerLease) {
         "  attachment: {}",
         attachment_label(&lease.attachment_state)
     );
+    println!(
+        "  warmth: {}",
+        warmth_label(lease_warmth(lease, now_unix_ms()))
+    );
+    if lease.turns_observed > 0 {
+        println!("  turns observed: {}", lease.turns_observed);
+    }
+    if let Some(worker) = &lease.worker {
+        let boot = worker
+            .boot_id
+            .as_deref()
+            .map(|id| format!(" (boot {})", &id[..id.len().min(8)]))
+            .unwrap_or_default();
+        println!(
+            "  worker: {}{boot}",
+            worker.hostname.as_deref().unwrap_or("unknown-host")
+        );
+    }
     if let Some(environment) = lease
         .environment_label
         .as_deref()
@@ -1676,7 +2014,7 @@ internet allowlist must include every exact relay/download domain used by the wo
 
 fn print_help() {
     println!(
-        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
+        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  probe        Submit a diagnostic task that fingerprints its worker\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
     );
 }
 
@@ -1759,6 +2097,11 @@ mod tests {
             provider_state: ProviderLeaseState::Running,
             attachment_state: AttachmentState::NotRequested,
             attached_at_unix_ms: None,
+            last_running_at_unix_ms: None,
+            last_terminal_at_unix_ms: None,
+            turns_observed: 0,
+            is_probe: false,
+            worker: None,
             provider_updated_at: None,
             last_observed_unix_ms: 1,
         }
@@ -1911,6 +2254,167 @@ mod tests {
             TEST_TTL_MS,
         );
         assert!(second.is_empty(), "terminal → terminal is not an edge");
+    }
+
+    #[test]
+    fn turn_tracking_counts_terminal_edges_and_follow_up_flaps() {
+        let mut store = store_with(vec![lease("task_e_123")]);
+        // First completed turn.
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            1_000,
+            TEST_TTL_MS,
+        );
+        {
+            let lease = &store.leases["task_e_123"];
+            assert_eq!(lease.turns_observed, 1);
+            assert_eq!(lease.last_terminal_at_unix_ms, Some(1_000));
+        }
+        // A follow-up driven from the task's web UI: terminal → running →
+        // terminal shows up across refreshes as two more syncs.
+        sync_store(
+            &mut store,
+            &[task("task_e_123", "running")],
+            2_000,
+            TEST_TTL_MS,
+        );
+        {
+            let lease = &store.leases["task_e_123"];
+            assert_eq!(lease.last_running_at_unix_ms, Some(2_000));
+            assert_eq!(lease.turns_observed, 1, "running is not a completed turn");
+        }
+        let transitions = sync_store(
+            &mut store,
+            &[task("task_e_123", "ready")],
+            3_000,
+            TEST_TTL_MS,
+        );
+        assert_eq!(transitions.len(), 1, "each follow-up completion is an edge");
+        let lease = &store.leases["task_e_123"];
+        assert_eq!(lease.turns_observed, 2);
+        assert_eq!(lease.last_terminal_at_unix_ms, Some(3_000));
+    }
+
+    #[test]
+    fn warmth_follows_the_measured_windows() {
+        let mut running = lease("task_e_live");
+        running.provider_state = ProviderLeaseState::Running;
+        assert_eq!(lease_warmth(&running, 0), Warmth::LikelyWarm);
+
+        let mut queued = lease("task_e_queued");
+        queued.provider_state = ProviderLeaseState::Queued;
+        assert_eq!(
+            lease_warmth(&queued, 0),
+            Warmth::Unknown,
+            "queued tasks have no worker yet"
+        );
+
+        let mut done = lease("task_e_done");
+        done.provider_state = ProviderLeaseState::Finished;
+        done.provider_status = "ready".into();
+        done.last_terminal_at_unix_ms = Some(1_000);
+        assert_eq!(
+            lease_warmth(&done, 1_000 + WARM_WINDOW_MS),
+            Warmth::LikelyWarm
+        );
+        assert_eq!(
+            lease_warmth(&done, 1_000 + WARM_WINDOW_MS + 1),
+            Warmth::Unknown
+        );
+        assert_eq!(
+            lease_warmth(&done, 1_000 + SETUP_CACHE_WINDOW_MS + 1),
+            Warmth::ColdLikely
+        );
+
+        // First seen already terminal: no known edge time, honest Unknown.
+        let mut history = lease("task_e_hist");
+        history.provider_state = ProviderLeaseState::Finished;
+        assert_eq!(lease_warmth(&history, u64::MAX), Warmth::Unknown);
+    }
+
+    #[test]
+    fn parses_probe_fingerprint_from_a_diff() {
+        let diff = concat!(
+            "diff --git a/._intendant-probe/fingerprint.json b/._intendant-probe/fingerprint.json\n",
+            "new file mode 100644\n",
+            "index 0000000..1111111\n",
+            "--- /dev/null\n",
+            "+++ b/._intendant-probe/fingerprint.json\n",
+            "@@ -0,0 +1 @@\n",
+            "+{\"intendant_probe\":1,\"hostname\":\"44c6850d6d8a\",\"boot_id\":\"cbebf3bc-b510-4853-a484-fd08e8fa1c93\",\"pid1_start\":\"68\",\"unix_ms\":1753380000123,\"git_rev\":\"17309c10\",\"rustc\":\"rustc 1.96.1\",\"cpus\":8,\"mem_kb\":16000000}\n",
+        );
+        let fingerprint = parse_probe_fingerprint(diff).expect("fingerprint parses");
+        assert_eq!(fingerprint.hostname.as_deref(), Some("44c6850d6d8a"));
+        assert_eq!(
+            fingerprint.boot_id.as_deref(),
+            Some("cbebf3bc-b510-4853-a484-fd08e8fa1c93")
+        );
+        assert_eq!(fingerprint.pid1_start.as_deref(), Some("68"));
+        assert_eq!(fingerprint.cpus, Some(8));
+        assert!(parse_probe_fingerprint("+not json at all").is_none());
+        assert!(parse_probe_fingerprint("no added lines").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refresh_collects_probe_fingerprints_from_the_diff() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("leases.json");
+        let mut probe = lease("task_e_probe");
+        probe.is_probe = true;
+        save_store(&store_path, &store_with(vec![probe])).unwrap();
+
+        // The fake CLI answers `cloud list` with the probe task finished and
+        // `cloud diff` with the fingerprint file.
+        let command = dir.path().join("fake-codex");
+        std::fs::write(
+            &command,
+            r#"#!/bin/sh
+if [ "$2" = "list" ]; then
+cat <<'EOF'
+{"tasks": [{"id": "task_e_probe", "url": null, "title": "Intendant worker probe",
+ "status": "ready", "updated_at": null, "environment_id": null,
+ "environment_label": null}], "cursor": null}
+EOF
+elif [ "$2" = "diff" ]; then
+cat <<'EOF'
++++ b/._intendant-probe/fingerprint.json
++{"intendant_probe":1,"hostname":"2c827f9104b2","boot_id":"c8da9ec6-aaaa-bbbb-cccc-000000000000","pid1_start":"68","cpus":4}
+EOF
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = refresh_leases_with(
+            command.to_str().unwrap(),
+            &store_path,
+            None,
+            20,
+            None,
+            TEST_TTL_MS,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.transitions.len(), 1);
+        let worker = outcome.workers[0]
+            .worker
+            .as_ref()
+            .expect("fingerprint collected into the returned outcome");
+        assert_eq!(worker.hostname.as_deref(), Some("2c827f9104b2"));
+        let stored = load_store(&store_path).unwrap();
+        assert_eq!(
+            stored.leases["task_e_probe"]
+                .worker
+                .as_ref()
+                .and_then(|w| w.boot_id.as_deref()),
+            Some("c8da9ec6-aaaa-bbbb-cccc-000000000000")
+        );
+        assert_eq!(stored.leases["task_e_probe"].turns_observed, 1);
     }
 
     #[test]

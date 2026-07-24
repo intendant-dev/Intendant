@@ -38,7 +38,7 @@ pub(crate) async fn codex_cloud_workers_api_response(
         Ok(workers) => ApiResponse::json(
             200,
             JsonBody::Value(serde_json::json!({
-                "workers": workers,
+                "workers": crate::codex_cloud::leases_json(&workers),
                 "refreshed": refresh && refresh_error.is_none(),
                 "refresh_error": refresh_error,
                 "cursor": cursor,

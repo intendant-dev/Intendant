@@ -26,8 +26,8 @@ impl IntendantServer {
                     .await;
                 serde_json::json!({
                     "ok": true,
-                    "workers": outcome.workers,
-                    "tracked_active": outcome.tracked_active,
+                    "workers": crate::codex_cloud::leases_json(&outcome.workers),
+                    "tracked_active": crate::codex_cloud::leases_json(&outcome.tracked_active),
                     "cursor": outcome.cursor,
                     "transitions": outcome.transitions,
                     "agenda_parked": agenda_parked,
@@ -88,6 +88,7 @@ impl IntendantServer {
             attempts: params.attempts.unwrap_or(1),
             title: params.title,
             prompt: params.prompt,
+            probe: false,
         };
         match crate::codex_cloud::submit_task(&crate::codex_cloud::state_path(), request).await {
             Ok(result) => serde_json::json!({
