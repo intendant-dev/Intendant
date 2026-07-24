@@ -10,13 +10,14 @@
 // renders only inside sandboxed srcdoc iframes (agendaHydratePreviewFrames).
 
 // ---- Lens registry ----
-// The extensible seam for later slices: a lens is {id, label} plus either
-// groups() (the shared card-list surface) or render(host) (a custom
-// surface that owns #ag2-groups entirely — the graph lens's canvas,
-// slice B in ui2-agenda-graph.js), with an optional deactivate() the
-// render pass calls on every lens that is NOT about to paint (the graph
-// lens stops its rAF loop there). The plan (Upcoming horizon) lens lands
-// as a follow-up slice by ADDING an entry here — nothing else changes.
+// The extensible seam: a lens is {id, label} plus either groups() (the
+// shared card-list surface) or render(host) (a custom surface that owns
+// #ag2-groups entirely — the graph lens's canvas in ui2-agenda-graph.js,
+// the Upcoming timeline in ui2-agenda-plan.js), with an optional
+// deactivate() the render pass calls on every lens that is NOT about to
+// paint (the graph lens stops its rAF loop there; the plan lens its
+// refresh timer). Later lenses land by ADDING entries here — nothing
+// else changes.
 const AGENDA_LENSES = [
   { id: 'now', label: 'Needs you', groups: () => agendaLensGroupsNow() },
   { id: 'open', label: 'Open', groups: () => agendaLensGroupsOpen() },
@@ -26,6 +27,12 @@ const AGENDA_LENSES = [
     label: 'Graph',
     render: (host) => agendaGraphRenderLens(host),
     deactivate: () => agendaGraphTeardown(),
+  },
+  {
+    id: 'plan',
+    label: 'Upcoming',
+    render: (host) => agendaPlanRenderLens(host),
+    deactivate: () => agendaPlanTeardown(),
   },
   { id: 'questions', label: 'Questions', groups: () => agendaLensGroupsQuestions() },
   { id: 'archive', label: 'Archive', groups: () => agendaLensGroupsArchive() },
@@ -1094,6 +1101,14 @@ function agendaGroupsKeydown(e) {
     if (card && e.target === card) {
       e.preventDefault();
       agendaOpenInspector(card.dataset.itemId);
+      return;
+    }
+    // Focusable non-card openers (the Upcoming lens's timeline rows):
+    // Enter mirrors their click-delegation open.
+    const opener = e.target.closest('[data-open-item]');
+    if (opener && e.target === opener) {
+      e.preventDefault();
+      agendaOpenInspector(opener.dataset.openItem);
     }
   }
 }

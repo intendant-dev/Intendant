@@ -1,8 +1,9 @@
 /* Agenda tab (redesign slice A: lenses, compose bar, cards; slice B: the
-   Graph lens's constellation panel) + the compact activity-pane card +
-   the start-now confirm sheet. Token palette only (16-styles-v2-tokens);
-   scoped under html.ui-v2 like every v2 sheet. The inspector,
-   schedule/preview sheets, and the reminder-policy popover live in
+   Graph lens's constellation panel; slice C: the Upcoming lens's day
+   timeline) + the compact activity-pane card + the start-now confirm
+   sheet. Token palette only (16-styles-v2-tokens); scoped under
+   html.ui-v2 like every v2 sheet. The inspector, schedule/preview
+   sheets, and the reminder-policy popover live in
    ui2-agenda-inspector.css. */
 
 /* ---- Tab layout: main column + animated inspector ---- */
@@ -823,6 +824,94 @@ html.ui-v2 .ag2-graph-swatch.s-line { width: 14px; }
 html.ui-v2 .ag2-graph-swatch.s-line.t-place { border-top: 2px solid rgba(var(--iris-rgb), 0.55); }
 html.ui-v2 .ag2-graph-swatch.s-line.t-rel { border-top: 2px dashed var(--text-3); }
 html.ui-v2 .ag2-graph-swatch.s-line.t-dep { border-top: 2px solid rgba(var(--rose-rgb), 0.6); }
+
+/* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows
+   ride the shared .ag2-chip family; dots pulse via the shared ui2-pulse
+   keyframes, which the global reduced-motion rule collapses. ---- */
+
+html.ui-v2 .ag2-plan {
+  margin-bottom: 22px;
+}
+html.ui-v2 .ag2-plan-day {
+  margin-bottom: 18px;
+}
+html.ui-v2 .ag2-plan-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin: 0 0 8px 2px;
+}
+html.ui-v2 .ag2-plan-day-label {
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-plan-day-hint {
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-plan-rail {
+  margin-left: 3px;
+  border-left: 1px solid var(--line);
+}
+html.ui-v2 .ag2-plan-row {
+  position: relative;
+  padding: 0 0 13px 16px;
+  cursor: pointer;
+}
+html.ui-v2 .ag2-plan-dot {
+  position: absolute;
+  left: -4px;
+  top: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+html.ui-v2 .ag2-plan-dot.t-sky { background: var(--sky); }
+html.ui-v2 .ag2-plan-dot.t-iris { background: var(--iris); }
+html.ui-v2 .ag2-plan-dot.t-amber { background: var(--amber); }
+html.ui-v2 .ag2-plan-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-plan-dot.t-neutral { background: var(--neutral-dot); }
+html.ui-v2 .ag2-plan-dot.pulse.slow { animation: ui2-pulse 2s ease-in-out infinite; }
+html.ui-v2 .ag2-plan-dot.pulse.fast { animation: ui2-pulse 1.3s ease-in-out infinite; }
+html.ui-v2 .ag2-plan-line {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-plan-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  width: 44px;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-plan-title {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+html.ui-v2 .ag2-plan-row:hover .ag2-plan-title {
+  color: var(--iris-2);
+}
+html.ui-v2 .ag2-plan-what {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-plan-note {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin: 3px 0 0 53px;
+}
+html.ui-v2 .ag2-plan-foot {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
 
 /* ---- Empty state + footer ledger ---- */
 
