@@ -29,6 +29,12 @@ struct Config {
     /// scope-limited lane rather than escalating itself to owner by
     /// reading the file.
     loopback_token: Option<String>,
+    /// `base_url` came from `INTENDANT_MCP_URL` (no explicit `--url`):
+    /// this ctl runs inside a supervised session on its injected
+    /// session-MCP lane — a listener that serves only `/mcp` and no
+    /// owner `/api` surface. The owner-lane read verbs refuse with a
+    /// named error instead of a confusing wrong-listener failure.
+    from_session_env: bool,
 }
 
 #[derive(Debug)]
@@ -221,6 +227,7 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
             peer,
             bearer: None,
             loopback_token,
+            from_session_env,
         },
         command,
     ))
@@ -2387,6 +2394,10 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "list" | "ls" => run_agenda_list(client, config, &raw[1..]).await?,
+        "ops" => run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Ops).await?,
+        "occurrences" => {
+            run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Occurrences).await?
+        }
         "complete" | "done" => agenda_transition(client, config, "complete", &raw[1..]).await?,
         "reopen" => agenda_transition(client, config, "reopen", &raw[1..]).await?,
         "retire" => agenda_transition(client, config, "retire", &raw[1..]).await?,
@@ -3142,6 +3153,393 @@ async fn agenda_fetch(
         .unwrap_or_default();
     let counts = value.get("counts").cloned().unwrap_or(Value::Null);
     Ok((items, counts))
+}
+
+/// The two read-only log pages `ctl agenda` serves from the daemon's
+/// `/api` surface (the MCP tool surface for these pages stays deferred
+/// by owner ruling — see [`api_get`] for the lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgendaPageKind {
+    /// `GET /api/agenda/ops` — the append-only item op log.
+    Ops,
+    /// `GET /api/agenda/occurrences` — the delivery/dispatch journal.
+    Occurrences,
+}
+
+impl AgendaPageKind {
+    fn verb(self) -> &'static str {
+        match self {
+            AgendaPageKind::Ops => "ops",
+            AgendaPageKind::Occurrences => "occurrences",
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            AgendaPageKind::Ops => "/api/agenda/ops",
+            AgendaPageKind::Occurrences => "/api/agenda/occurrences",
+        }
+    }
+
+    /// The response's entries key (and the human tail's noun stem).
+    fn entries_key(self) -> &'static str {
+        match self {
+            AgendaPageKind::Ops => "ops",
+            AgendaPageKind::Occurrences => "occurrences",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            AgendaPageKind::Ops => "log lines",
+            AgendaPageKind::Occurrences => "journal lines",
+        }
+    }
+}
+
+/// The named `--peer` refusal for the read verbs: the loopback admission
+/// token must never leave the box, so these pages are local-daemon only
+/// for now — cross-daemon reads are a follow-up pending federation-auth
+/// design, not a missing flag.
+fn agenda_read_peer_refusal(kind: AgendaPageKind) -> String {
+    format!(
+        "agenda {verb} reads this daemon's local log over the loopback /api lane and \
+         does not support --peer (the loopback admission token never leaves the box). \
+         Read the peer's log on its own dashboard (Agenda tab) or its dashboard-control \
+         tunnel method api_agenda_{verb}; cross-daemon ctl reads are a named follow-up \
+         pending federation-auth design.",
+        verb = kind.verb(),
+    )
+}
+
+/// The named refusal for supervised-session ctl: the injected session-MCP
+/// lane serves only `/mcp` and deliberately carries no owner `/api`
+/// surface (a session never self-escalates to the owner token), so the
+/// read verbs name the working alternatives instead of failing against
+/// the wrong listener.
+fn agenda_read_session_lane_refusal(kind: AgendaPageKind) -> String {
+    format!(
+        "agenda {verb} rides the owner loopback /api lane, which a supervised \
+         session's injected MCP lane deliberately does not carry. Read items and \
+         their current state with `ctl agenda list` (the agenda_list lane); the raw \
+         log pages are for owner shells and the dashboard.",
+        verb = kind.verb(),
+    )
+}
+
+/// `{origin of base_url}{path}?{query}` — the same origin derivation
+/// [`peer_mcp_endpoint`] uses, applied to the local daemon's configured
+/// `/mcp` URL so the `/api` read lane targets exactly the daemon ctl is
+/// already talking to (session_id/managed_context query params never
+/// carry over — they scope `/mcp`, not `/api`).
+fn api_read_url(
+    base_url: &str,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<reqwest::Url, String> {
+    let base = reqwest::Url::parse(base_url)
+        .map_err(|e| format!("invalid daemon URL '{base_url}': {e}"))?;
+    if !matches!(base.scheme(), "http" | "https") {
+        return Err(format!(
+            "daemon URL '{base_url}' must be http(s) to derive the /api read lane"
+        ));
+    }
+    let mut url = reqwest::Url::parse(&format!("{}{path}", base.origin().ascii_serialization()))
+        .map_err(|e| format!("invalid /api URL for '{base_url}': {e}"))?;
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    Ok(url)
+}
+
+/// READ-ONLY GET against this daemon's `/api` surface — ctl's loopback
+/// read lane (current consumers: `agenda ops` / `agenda occurrences`).
+///
+/// This seam consumes — and mints nothing beyond — the gateway's
+/// EXISTING loopback authorization: the ratified transport ruling
+/// documented on `web_gateway/access_gates.rs::cleartext_loopback_admitted`
+/// (2026-07-20) names CLI-class owner clients ("`ctl`, rigs") as the
+/// cleartext-with-token class on exactly this lane, and
+/// `remote_dashboard_client_auth_missing` admits a direct-loopback
+/// `/api/*` request presenting the per-boot admission token without a
+/// TLS client certificate. The same token ctl already sends to `/mcp`
+/// rides here (header form), and per-route IAM classification stays the
+/// route row's — both current consumers are `agenda.read` GETs.
+///
+/// Deliberately GET-only by construction: mutations keep riding the MCP
+/// tool lane with its session-scoped attribution. Peer mode is refused
+/// with the named error ([`agenda_read_peer_refusal`]) — the token never
+/// leaves the box. Returns the raw response body text so `--json`
+/// callers can print the endpoint's bytes verbatim.
+async fn api_get(
+    client: &reqwest::Client,
+    config: &Config,
+    kind: AgendaPageKind,
+    query: &[(&str, String)],
+) -> Result<String, String> {
+    if config.peer.is_some() {
+        return Err(agenda_read_peer_refusal(kind));
+    }
+    if config.from_session_env {
+        return Err(agenda_read_session_lane_refusal(kind));
+    }
+    let url = api_read_url(&config.base_url, kind.path(), query)?;
+    let mut request = client.get(url);
+    if let Some(token) = &config.loopback_token {
+        request = request.header(crate::loopback_token::LOOPBACK_TOKEN_HEADER, token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read response body: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {text}"));
+    }
+    Ok(text)
+}
+
+/// `agenda ops` / `agenda occurrences`: one page of the raw log, the
+/// endpoint's honesty contract intact — `--json` prints the response
+/// body verbatim (unknown and unparseable entries included; nothing is
+/// hidden), human mode renders one terse line per entry plus the resume
+/// cursor.
+async fn run_agenda_read_page(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &[String],
+    kind: AgendaPageKind,
+) -> Result<(), String> {
+    // Refuse the wrong lanes before anything runs: the id resolution
+    // below rides the MCP lane, which WOULD reach a peer or the injected
+    // session listener — failing fast keeps the named refusal the only
+    // outcome.
+    if config.peer.is_some() {
+        return Err(agenda_read_peer_refusal(kind));
+    }
+    if config.from_session_env {
+        return Err(agenda_read_session_lane_refusal(kind));
+    }
+    let args = parse_command_args(raw, &["--since", "--limit"], &[])?;
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(prefix) = args.positional.first() {
+        let id = agenda_resolve_id_str(client, config, prefix).await?;
+        query.push(("item", id));
+    }
+    if let Some(since) = args.one("--since") {
+        let since: u64 = since
+            .parse()
+            .map_err(|_| format!("invalid --since '{since}' (a 0-based line number)"))?;
+        query.push(("since", since.to_string()));
+    }
+    if let Some(limit) = args.one("--limit") {
+        let limit: u64 = limit
+            .parse()
+            .map_err(|_| format!("invalid --limit '{limit}' (lines per page)"))?;
+        query.push(("limit", limit.to_string()));
+    }
+    let body = api_get(client, config, kind, &query).await?;
+    if config.json || config.raw {
+        println!("{}", body.trim_end());
+        return Ok(());
+    }
+    let page: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("unexpected agenda {} response: {e}", kind.verb()))?;
+    let entries = page
+        .get(kind.entries_key())
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let now_ms = now_epoch_ms();
+    for entry in &entries {
+        let row = match kind {
+            AgendaPageKind::Ops => agenda_ops_render_row(entry, now_ms),
+            AgendaPageKind::Occurrences => agenda_occurrences_render_row(entry),
+        };
+        println!("{row}");
+    }
+    let log_len = page.get("log_len").and_then(Value::as_u64).unwrap_or(0);
+    let next_since = page.get("next_since").and_then(Value::as_u64).unwrap_or(0);
+    if entries.is_empty() {
+        println!("no {} in range", kind.noun());
+    }
+    println!(
+        "{} of {log_len} {} · next --since {next_since}",
+        entries.len(),
+        kind.noun()
+    );
+    Ok(())
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// First `n` chars (id prefixes are ASCII ULIDs, but stay char-safe).
+fn agenda_short(text: &str, n: usize) -> String {
+    if text.chars().count() <= n {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(n).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Compact relative instant for op rows: "just now", "5m ago", "3h ago",
+/// "6d ago", "in 2h"; beyond ~30 days the absolute form reads better.
+fn agenda_relative_ms(now_ms: u64, at_ms: u64) -> String {
+    let (delta, future) = if at_ms > now_ms {
+        (at_ms - now_ms, true)
+    } else {
+        (now_ms - at_ms, false)
+    };
+    if delta < 60_000 {
+        return "just now".to_string();
+    }
+    let minutes = delta / 60_000;
+    if minutes >= 30 * 24 * 60 {
+        return agenda_format_ms(at_ms);
+    }
+    let compact = if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 48 * 60 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}d", minutes / (24 * 60))
+    };
+    if future {
+        format!("in {compact}")
+    } else {
+        format!("{compact} ago")
+    }
+}
+
+/// Compact actor label from an op-log envelope: the gate-resolved class
+/// first (dashboard / local / session <id>), the principal as a
+/// fallback, "—" when unattributed (daemon-authored write-backs land
+/// here too); a self-described `--source` label rides as `~label`,
+/// visibly second-class.
+fn agenda_actor_label(record: &Value) -> String {
+    let actor = record.get("actor").filter(|actor| !actor.is_null());
+    let field = |key: &str| {
+        actor
+            .and_then(|actor| actor.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let mut label = match field("kind") {
+        Some("dashboard") => "dashboard".to_string(),
+        Some("local_process") => "local".to_string(),
+        Some("agent_session") => match field("session_id") {
+            Some(session) => format!("session {}", agenda_short(session, 8)),
+            None => "session".to_string(),
+        },
+        Some(other) => other.to_string(),
+        None => match field("principal") {
+            Some(principal) => agenda_short(principal, 16),
+            None => "—".to_string(),
+        },
+    };
+    if let Some(source) = record
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|source| !source.is_empty())
+    {
+        label.push_str(&format!(" ~{source}"));
+    }
+    label
+}
+
+/// One `agenda ops` line: seq, op type, item id (short), actor, relative
+/// time — with the endpoint's honesty markers preserved (`[unknown to
+/// this build]` for unfolded vocabulary, "unreadable line" for non-JSON).
+fn agenda_ops_render_row(entry: &Value, now_ms: u64) -> String {
+    let seq = entry.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    if entry
+        .get("unparseable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let raw = entry.get("raw").and_then(Value::as_str).unwrap_or("");
+        return format!("{seq:>5}  unreadable line  {}", agenda_short(raw, 48));
+    }
+    let record = entry.get("op").cloned().unwrap_or(Value::Null);
+    let op_type = record
+        .pointer("/op/type")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let item = record
+        .pointer("/op/id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let when = record
+        .get("at_ms")
+        .and_then(Value::as_u64)
+        .map(|at_ms| agenda_relative_ms(now_ms, at_ms))
+        .unwrap_or_default();
+    let mut row = format!(
+        "{seq:>5}  {op_type:<18}  {:<9}  {}  {when}",
+        agenda_short(item, 8),
+        agenda_actor_label(&record),
+    );
+    if entry.get("known").and_then(Value::as_bool) != Some(true) {
+        row.push_str("  [unknown to this build]");
+    }
+    row
+}
+
+/// One `agenda occurrences` line: seq, occurrence id (short), state,
+/// absolute instant, item id (short), plus the run's session when one is
+/// recorded — same honesty markers as the ops rows.
+fn agenda_occurrences_render_row(entry: &Value) -> String {
+    let seq = entry.get("seq").and_then(Value::as_u64).unwrap_or(0);
+    if entry
+        .get("unparseable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let raw = entry.get("raw").and_then(Value::as_str).unwrap_or("");
+        return format!("{seq:>5}  unreadable line  {}", agenda_short(raw, 48));
+    }
+    let record = entry.get("record").cloned().unwrap_or(Value::Null);
+    let occurrence = record
+        .get("occurrence_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let state = record.get("state").and_then(Value::as_str).unwrap_or("?");
+    let instant = record
+        .get("at_ms")
+        .and_then(Value::as_u64)
+        .map(agenda_format_ms)
+        .unwrap_or_default();
+    let item = record.get("item_id").and_then(Value::as_str).unwrap_or("");
+    let mut row = format!(
+        "{seq:>5}  {:<13}  {state:<10}  {instant}  {:<9}",
+        agenda_short(occurrence, 12),
+        agenda_short(item, 8),
+    );
+    if let Some(session) = record
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty())
+    {
+        row.push_str(&format!("  session {}", agenda_short(session, 8)));
+    }
+    if entry.get("known").and_then(Value::as_bool) != Some(true) {
+        row.push_str("  [unknown to this build]");
+    }
+    row
 }
 
 /// Parse a human due-time into epoch ms: `+45m`/`+2h`/`+3d`/`+1w`
@@ -4612,6 +5010,8 @@ fn help_agenda() {
   intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
   intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
   intendant ctl agenda list --frontier           # the un-triaged frontier (triage mandate's scope)\n\
+  intendant ctl agenda ops [ID_PREFIX] [--since N] [--limit N]           # raw op-log page\n\
+  intendant ctl agenda occurrences [ID_PREFIX] [--since N] [--limit N]   # delivery/dispatch journal page\n\
   intendant ctl agenda complete ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
@@ -4649,6 +5049,17 @@ satisfies the edge by pure recomputation; a RETIRED one does not — the\n\
 dependent shows \"prerequisite retired — review\". `list --blocked` shows\n\
 open items with an uncleared blocker or unsatisfied dependency; blocked\n\
 is derived at read time, never stored, and never notifies.\n\
+\n\
+`ops` pages the raw append-only op log — every add, note, transition, and\n\
+schedule act with its actor and instant (per-item history); `occurrences`\n\
+pages the delivery/dispatch journal (reminder deliveries, scheduled-session\n\
+runs: prepared/delivered/suppressed/missed/started/completed/failed).\n\
+Read-only. ID_PREFIX filters to one item; resume with --since (the printed\n\
+cursor); --json prints the endpoint body verbatim. Lines a newer build\n\
+wrote are shown, never hidden (marked \"unknown to this build\"). Owner\n\
+shells on the local daemon only: the pages ride the loopback /api read\n\
+lane — no --peer, and a supervised session's injected lane deliberately\n\
+lacks them (use `agenda list` there).\n\
 \n\
 `ref` attaches a typed POINTER (never content): a file path (digested at\n\
 attach so the detail view can show drift honestly), a Memory claim id, a\n\
@@ -4782,6 +5193,194 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// The read verbs' `/api` URL assembly: origin derived from the
+    /// configured `/mcp` URL (scheme + host + port kept; `/mcp` path and
+    /// its session-scoping query dropped), query pairs appended in order.
+    #[test]
+    fn api_read_url_derives_origin_and_appends_query() {
+        let url = api_read_url(
+            "http://127.0.0.1:8765/mcp?session_id=s-1&managed_context=m-1",
+            "/api/agenda/ops",
+            &[
+                ("item", "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()),
+                ("since", "7".to_string()),
+                ("limit", "3".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:8765/api/agenda/ops?item=01ARZ3NDEKTSV4RRFFQ69G5FAV&since=7&limit=3"
+        );
+        // No params: no stray `?`.
+        let url =
+            api_read_url("https://box.local:9443/mcp", "/api/agenda/occurrences", &[]).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://box.local:9443/api/agenda/occurrences"
+        );
+        // Non-http(s) schemes are refused with a named error.
+        let err = api_read_url("unix:/tmp/sock", "/api/agenda/ops", &[]).unwrap_err();
+        assert!(err.contains("must be http(s)"), "{err}");
+    }
+
+    /// `--peer` refuses the read verbs before anything runs, with the
+    /// named error pointing at the peer's own surfaces — the loopback
+    /// admission token never leaves the box.
+    #[tokio::test]
+    async fn agenda_read_pages_refuse_peer_mode_with_named_error() {
+        let config = Config {
+            base_url: "https://peer.example:8765/mcp".to_string(),
+            session_id: None,
+            managed_context: None,
+            raw: false,
+            json: false,
+            peer: Some("box2".to_string()),
+            bearer: Some("secret".to_string()),
+            loopback_token: None,
+            from_session_env: false,
+        };
+        let client = reqwest::Client::new();
+        for (kind, tunnel) in [
+            (AgendaPageKind::Ops, "api_agenda_ops"),
+            (AgendaPageKind::Occurrences, "api_agenda_occurrences"),
+        ] {
+            let err = run_agenda_read_page(&client, &config, &[], kind)
+                .await
+                .unwrap_err();
+            assert!(err.contains("--peer"), "{err}");
+            assert!(err.contains(tunnel), "{err}");
+            assert!(err.contains("dashboard"), "{err}");
+            // The seam itself refuses too — defense in depth for any
+            // future caller that skips the verb driver.
+            let err = api_get(&client, &config, kind, &[]).await.unwrap_err();
+            assert!(err.contains("--peer"), "{err}");
+        }
+
+        // A supervised session's injected MCP lane (INTENDANT_MCP_URL)
+        // serves only /mcp and never the owner /api surface: the verbs
+        // refuse with the named alternative instead of failing against
+        // the wrong listener.
+        let session = Config {
+            base_url: "http://127.0.0.1:52345/mcp?session_token=abc".to_string(),
+            session_id: Some("sess-1".to_string()),
+            managed_context: None,
+            raw: false,
+            json: false,
+            peer: None,
+            bearer: None,
+            loopback_token: None,
+            from_session_env: true,
+        };
+        let err = run_agenda_read_page(&client, &session, &[], AgendaPageKind::Ops)
+            .await
+            .unwrap_err();
+        assert!(err.contains("supervised"), "{err}");
+        assert!(err.contains("agenda list"), "{err}");
+    }
+
+    #[test]
+    fn agenda_relative_ms_is_compact_in_both_directions() {
+        let now = 100 * 24 * 3_600_000u64; // day 100, well past every window
+        assert_eq!(agenda_relative_ms(now, now - 5_000), "just now");
+        assert_eq!(agenda_relative_ms(now, now - 5 * 60_000), "5m ago");
+        assert_eq!(agenda_relative_ms(now, now - 3 * 3_600_000), "3h ago");
+        assert_eq!(agenda_relative_ms(now, now - 6 * 24 * 3_600_000), "6d ago");
+        assert_eq!(agenda_relative_ms(now, now + 2 * 3_600_000), "in 2h");
+        // Beyond ~30 days the absolute form takes over (local time — just
+        // pin the shape, not the zone).
+        let old = agenda_relative_ms(now, now - 40 * 24 * 3_600_000);
+        assert!(old.contains('-') && old.contains(':'), "{old}");
+    }
+
+    /// Human ops rows preserve the endpoint's honesty contract: known
+    /// envelopes render type/item/actor/relative-time, unfolded
+    /// vocabulary is marked (never hidden), non-JSON lines render as
+    /// "unreadable line" with the raw text.
+    #[test]
+    fn agenda_ops_rows_render_known_unknown_and_unparseable() {
+        let now = 200 * 24 * 3_600_000u64;
+        let known = serde_json::json!({
+            "seq": 4,
+            "known": true,
+            "op": {
+                "v": 1,
+                "at_ms": now - 3 * 60_000,
+                "actor": {"kind": "agent_session", "session_id": "sess-abcdef123"},
+                "source": "cron",
+                "op": {"type": "annotate", "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "text": "note"}
+            }
+        });
+        let row = agenda_ops_render_row(&known, now);
+        assert!(row.contains("    4  "), "{row}");
+        assert!(row.contains("annotate"), "{row}");
+        assert!(row.contains("01ARZ3ND…"), "{row}");
+        assert!(row.contains("session sess-abc…"), "{row}");
+        assert!(row.contains("~cron"), "{row}");
+        assert!(row.contains("3m ago"), "{row}");
+        assert!(!row.contains("unknown to this build"), "{row}");
+
+        let unknown = serde_json::json!({
+            "seq": 9,
+            "known": false,
+            "op": {
+                "v": 1,
+                "at_ms": now - 60_000,
+                "op": {"type": "journal_curate", "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}
+            }
+        });
+        let row = agenda_ops_render_row(&unknown, now);
+        assert!(row.contains("journal_curate"), "{row}");
+        assert!(row.contains("[unknown to this build]"), "{row}");
+        // Unattributed envelope: the actor column degrades to "—".
+        assert!(row.contains('—'), "{row}");
+
+        let unparseable = serde_json::json!({
+            "seq": 12,
+            "known": false,
+            "unparseable": true,
+            "raw": "this line is not JSON at all",
+        });
+        let row = agenda_ops_render_row(&unparseable, now);
+        assert!(row.contains("unreadable line"), "{row}");
+        assert!(row.contains("this line is not JSON at all"), "{row}");
+    }
+
+    #[test]
+    fn agenda_occurrence_rows_render_state_instant_and_session() {
+        let entry = serde_json::json!({
+            "seq": 2,
+            "known": true,
+            "record": {
+                "v": 1,
+                "at_ms": 1_752_000_000_000u64,
+                "occurrence_id": "9f0e1d2c3b4a59687766554433221100",
+                "item_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "due_ms": 1_751_999_999_000u64,
+                "state": "completed",
+                "session_id": "sess-run-12345"
+            }
+        });
+        let row = agenda_occurrences_render_row(&entry);
+        assert!(row.contains("    2  "), "{row}");
+        assert!(row.contains("9f0e1d2c3b4a…"), "{row}");
+        assert!(row.contains("completed"), "{row}");
+        assert!(row.contains("01ARZ3ND…"), "{row}");
+        assert!(row.contains("session sess-run…"), "{row}");
+        // The instant is absolute local time; pin the shape only.
+        assert!(row.contains(':'), "{row}");
+
+        let foreign = serde_json::json!({
+            "seq": 7,
+            "known": false,
+            "record": {"v": 1, "at_ms": 1_752_000_000_000u64, "occurrence_id": "occ-x",
+                        "item_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "due_ms": 1, "state": "rescheduled"}
+        });
+        let row = agenda_occurrences_render_row(&foreign);
+        assert!(row.contains("rescheduled"), "{row}");
+        assert!(row.contains("[unknown to this build]"), "{row}");
     }
 
     #[test]
@@ -5480,6 +6079,7 @@ mod tests {
             peer: None,
             bearer: None,
             loopback_token: None,
+            from_session_env: false,
         }
     }
 
