@@ -2529,7 +2529,7 @@ mod tests {
             "item.status === 'done' && item.ask && item.answer",
             "item.answer.delivered === false",
             "answered · awaiting pickup",
-            "agenda-chip pickup",
+            "agendaChipHtml('answered · awaiting pickup', 'sky'",
         ] {
             assert!(
                 app.contains(marker),

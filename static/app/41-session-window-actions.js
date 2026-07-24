@@ -4119,6 +4119,41 @@ function updateQuestionProgress() {
 // Grid stays — zooming a preview is part of reading the record. A deleted
 // blob (retire prunes them) degrades to the same named "unavailable"
 // placeholder, never a broken card.
+
+// The ONE iframe factory and the ONE srcdoc writer for agent-authored
+// preview HTML, shared by every consumer (this question rail and the
+// Agenda tab's preview thumbnails/sheet). Centralizing them keeps the
+// pinned invariant checkable: the sandbox attribute is set in exactly one
+// place and the document is written in exactly one place, bundle-wide
+// (question_preview_iframe_sandbox_is_pinned counts both).
+function createSandboxedPreviewFrame(className, title) {
+  const frame = document.createElement('iframe');
+  frame.className = className;
+  frame.setAttribute('sandbox', 'allow-scripts');
+  frame.setAttribute('referrerpolicy', 'no-referrer');
+  frame.title = title || 'preview';
+  frame.tabIndex = -1;
+  return frame;
+}
+// Blob bytes are immutable per upload id, so fetched documents cache by
+// URL — re-renders re-hydrate without a round trip.
+const sandboxedPreviewHtmlCache = new Map();
+function fetchSandboxedPreviewInto(frame, url, onMissing) {
+  const cached = sandboxedPreviewHtmlCache.get(url);
+  const write = (html) => { frame.srcdoc = html; };
+  if (cached !== undefined) {
+    write(cached);
+    return;
+  }
+  fetch(url)
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((html) => {
+      sandboxedPreviewHtmlCache.set(url, html);
+      write(html);
+    })
+    .catch(() => { if (onMissing) onMissing(); });
+}
+
 function appendQuestionPreviews(block, q, qIndex, archive) {
   const previews = Array.isArray(q.previews) ? q.previews : [];
   if (!previews.length) return;
@@ -4250,16 +4285,9 @@ function appendQuestionPreviews(block, q, qIndex, archive) {
       });
 
     if (p.kind === 'html' && p.url) {
-      const frame = document.createElement('iframe');
-      frame.className = 'question-preview-frame';
-      frame.setAttribute('sandbox', 'allow-scripts');
-      frame.setAttribute('referrerpolicy', 'no-referrer');
-      frame.title = p.label || 'preview';
+      const frame = createSandboxedPreviewFrame('question-preview-frame', p.label || 'preview');
       card.appendChild(frame);
-      fetch(p.url)
-        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
-        .then((html) => { frame.srcdoc = html; })
-        .catch(() => { frame.replaceWith(missingChip(p)); });
+      fetchSandboxedPreviewInto(frame, p.url, () => { frame.replaceWith(missingChip(p)); });
     } else if (p.kind === 'image' && p.url) {
       const img = document.createElement('img');
       img.className = 'question-preview-image';
