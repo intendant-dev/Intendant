@@ -40,13 +40,10 @@ pub(crate) const STATE_REFUSED: &str =
 pub(crate) struct PendingManifest {
     /// SHA-256 of the state token, hex — the plaintext never rests.
     state_hash: String,
-    pub(crate) started_at_unix_ms: u64,
     pub(crate) expires_at_unix_ms: u64,
     /// The validated origin (`scheme://authority`) the ceremony started
     /// from; the redirect returns here and the callback page links back.
     pub(crate) origin: String,
-    /// Org handle for an org-owned App; `None` = personal account.
-    pub(crate) target_org: Option<String>,
     /// The principal whose CredentialsManage gesture opened the
     /// ceremony. The authority-free callback merely completes that
     /// authorized act, so this is the custody-audit actor at seal time
@@ -92,17 +89,14 @@ impl ManifestCeremonySlot {
     pub(crate) fn begin(
         &self,
         origin: String,
-        target_org: Option<String>,
         starter_principal: String,
         now_ms: u64,
     ) -> Result<String, String> {
         let token = random_state()?;
         let pending = PendingManifest {
             state_hash: token_hash(&token),
-            started_at_unix_ms: now_ms,
             expires_at_unix_ms: now_ms.saturating_add(MANIFEST_STATE_TTL_MS),
             origin,
-            target_org,
             starter_principal,
         };
         *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(pending);
@@ -137,8 +131,9 @@ impl ManifestCeremonySlot {
         Ok(pending)
     }
 
-    /// Whether a live (unexpired) ceremony is pending — status surface
-    /// only; never reveals the hash.
+    /// Whether a live (unexpired) ceremony is pending. Test-only today;
+    /// a status surface that wants it re-promotes it deliberately.
+    #[cfg(test)]
     pub(crate) fn active(&self, now_ms: u64) -> bool {
         self.pending
             .lock()
@@ -292,7 +287,6 @@ mod tests {
     fn begin(slot: &ManifestCeremonySlot) -> String {
         slot.begin(
             "http://127.0.0.1:8765".to_string(),
-            None,
             "principal:test".to_string(),
             NOW,
         )
@@ -340,16 +334,16 @@ mod tests {
         let _first = begin(&slot);
         let second = slot
             .begin(
-                "http://127.0.0.1:8765".to_string(),
-                Some("example-org".to_string()),
-                "principal:test".to_string(),
+                "https://box.example:8443".to_string(),
+                "principal:second".to_string(),
                 NOW,
             )
             .expect("second begin");
         // Replacement single-flight: only the live (second) token
         // redeems, and it carries the second ceremony's parameters.
         let pending = slot.consume(&second, NOW + 1).expect("live token redeems");
-        assert_eq!(pending.target_org.as_deref(), Some("example-org"));
+        assert_eq!(pending.origin, "https://box.example:8443");
+        assert_eq!(pending.starter_principal, "principal:second");
 
         // The voided first token: refused — and per burn-on-mismatch,
         // the attempt costs whatever ceremony is pending at the time

@@ -407,13 +407,13 @@ pub(crate) fn validated_request_origin(is_tls: bool, host_header: Option<&str>) 
 /// state (single-flight by replacement) and answers the form target +
 /// manifest for the fragment to POST. The custody precheck refuses up
 /// front: the owner must never create an App whose key this daemon
-/// cannot seal.
+/// cannot seal. `origin` is the edge-validated requesting origin
+/// ([`validated_request_origin`]); `None` = no usable Host header.
 pub(crate) fn github_manifest_start_api_response(
     body: &[u8],
     custody: &dyn GithubAppCustody,
     slot: &crate::github_pr::manifest_ceremony::ManifestCeremonySlot,
-    is_tls: bool,
-    host_header: Option<&str>,
+    origin: Option<String>,
     hostname_label: &str,
     starter_principal: &str,
     now_ms: u64,
@@ -444,18 +444,13 @@ pub(crate) fn github_manifest_start_api_response(
         },
         None => None,
     };
-    let Some(origin) = validated_request_origin(is_tls, host_header) else {
+    let Some(origin) = origin else {
         return ApiResponse::json_error(
             400,
             "the request carries no usable Host header to compose the redirect origin from",
         );
     };
-    let state = match slot.begin(
-        origin.clone(),
-        target_org.clone(),
-        starter_principal.to_string(),
-        now_ms,
-    ) {
+    let state = match slot.begin(origin.clone(), starter_principal.to_string(), now_ms) {
         Ok(state) => state,
         Err(error) => return ApiResponse::json_error(500, &error),
     };
@@ -669,8 +664,7 @@ pub(crate) async fn handle_github_manifest_start(
         body,
         &DaemonGithubAppCustody,
         crate::github_pr::manifest_ceremony::slot(),
-        is_tls,
-        host_header,
+        validated_request_origin(is_tls, host_header),
         &hostname_label,
         &starter_principal,
         now_unix_ms(),
@@ -972,7 +966,6 @@ mod tests {
         let state = slot
             .begin(
                 "http://127.0.0.1:8765".to_string(),
-                None,
                 "principal:test-starter".to_string(),
                 now_ms,
             )
@@ -1294,8 +1287,7 @@ mod tests {
             b"{}",
             &custody,
             &slot,
-            false,
-            Some("127.0.0.1:8765"),
+            validated_request_origin(false, Some("127.0.0.1:8765")),
             "example-host",
             "principal:test-starter",
             NOW,
@@ -1314,8 +1306,7 @@ mod tests {
             b"{}",
             &custody,
             &slot,
-            false,
-            Some("127.0.0.1:8765"),
+            validated_request_origin(false, Some("127.0.0.1:8765")),
             "example-host",
             "principal:test-starter",
             NOW,
@@ -1343,8 +1334,7 @@ mod tests {
             br#"{"organization": "example-org"}"#,
             &custody,
             &slot,
-            true,
-            Some("box.example:8443"),
+            validated_request_origin(true, Some("box.example:8443")),
             "example-host",
             "principal:test-starter",
             NOW,
@@ -1363,8 +1353,7 @@ mod tests {
             br#"{"organization": "-bad handle-"}"#,
             &custody,
             &slot,
-            false,
-            Some("127.0.0.1:8765"),
+            validated_request_origin(false, Some("127.0.0.1:8765")),
             "example-host",
             "principal:test-starter",
             NOW,
@@ -1375,8 +1364,7 @@ mod tests {
             b"{}",
             &custody,
             &slot,
-            false,
-            None,
+            validated_request_origin(false, None),
             "example-host",
             "principal:test-starter",
             NOW,
