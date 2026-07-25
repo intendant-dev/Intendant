@@ -263,6 +263,7 @@ pub(crate) async fn scan_once(
     client: &GithubAppClient,
     repos: &[String],
     state: &mut ScannerState,
+    tier1: &super::join::Tier1Cache,
 ) -> ScanSummary {
     let mut summary = ScanSummary::default();
     let mut hub_id: Option<String> = None;
@@ -280,8 +281,12 @@ pub(crate) async fn scan_once(
         let open = match listed {
             // 304: GitHub's open set is unchanged since the validator —
             // membership cannot have changed, so there is nothing to do
-            // and nothing to write.
-            Conditional::NotModified => continue,
+            // and nothing to write. The tier-1 join's states are hereby
+            // CONFIRMED current: refresh their stamps.
+            Conditional::NotModified => {
+                tier1.touch_repo(repo);
+                continue;
+            }
             Conditional::Fresh { value, etag } => {
                 match etag {
                     Some(etag) => {
@@ -294,6 +299,9 @@ pub(crate) async fn scan_once(
                 value
             }
         };
+        // Feed the tier-1 render join before planning: the list read
+        // already paid for this state; rendering must never re-fetch it.
+        tier1.update_repo(repo, &open);
         let (snapshot, _, _) = agenda.snapshot();
         let anchors = anchors_for_repo(&snapshot, repo);
         let actions = plan_repo(&anchors, &open);
@@ -499,7 +507,7 @@ pub(crate) fn spawn_scanner(
     tokio::spawn(async move {
         let runtime = super::status::global();
         let mut state = ScannerState::default();
-        let mut client: Option<(std::time::SystemTime, GithubAppClient)> = None;
+        let mut client: Option<(std::time::SystemTime, std::sync::Arc<GithubAppClient>)> = None;
         let mut consecutive_failures: u32 = 0;
         let mut last_line = String::new();
         let mut transition = |line: String| {
@@ -515,6 +523,7 @@ pub(crate) fn spawn_scanner(
             let blob_mtime = crate::key_custody::github_app_blob_mtime();
             if blob_mtime.is_none() || config.repos.is_empty() {
                 client = None;
+                super::join::publish_client(None);
                 tokio::time::sleep(std::time::Duration::from_secs(IDLE_RECHECK_S)).await;
                 continue;
             }
@@ -536,7 +545,11 @@ pub(crate) fn spawn_scanner(
                     })
                     .and_then(|creds| GithubAppClient::new(runtime.api_base(), creds).ok());
                 match built {
-                    Some(fresh) => client = Some((blob_mtime, fresh)),
+                    Some(fresh) => {
+                        let fresh = std::sync::Arc::new(fresh);
+                        super::join::publish_client(Some(fresh.clone()));
+                        client = Some((blob_mtime, fresh));
+                    }
                     None => {
                         // Deny/parse failure was audited by name inside
                         // the custody lane; the status surface says why.
@@ -546,6 +559,7 @@ pub(crate) fn spawn_scanner(
                         ));
                         transition("credentials unavailable; integration paused".to_string());
                         client = None;
+                        super::join::publish_client(None);
                         tokio::time::sleep(std::time::Duration::from_secs(IDLE_RECHECK_S)).await;
                         continue;
                     }
@@ -554,7 +568,14 @@ pub(crate) fn spawn_scanner(
             let Some((_, active)) = &client else {
                 continue;
             };
-            let summary = scan_once(&agenda, active, &config.repos, &mut state).await;
+            let summary = scan_once(
+                &agenda,
+                active,
+                &config.repos,
+                &mut state,
+                super::join::tier1(),
+            )
+            .await;
             let poll_s = config
                 .poll_minutes
                 .unwrap_or(DEFAULT_POLL_MINUTES)
@@ -696,7 +717,8 @@ mod tests {
         let fixture = spawn_fixture(routes).await;
         let client = GithubAppClient::new(&fixture.base, test_credentials()).unwrap();
         let mut state = ScannerState::default();
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let tier1 = crate::github_pr::join::Tier1Cache::default();
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary.parked, 2);
         assert!(summary.errors.is_empty());
 
@@ -748,12 +770,13 @@ mod tests {
         let fixture = spawn_fixture(routes).await;
         let client = GithubAppClient::new(&fixture.base, test_credentials()).unwrap();
         let mut state = ScannerState::default();
-        scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let tier1 = crate::github_pr::join::Tier1Cache::default();
+        scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         let converged = log_bytes(dir.path());
         assert!(!converged.is_empty());
 
         // Pass 2: 304 path (same validator).
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary, ScanSummary::default());
         assert_eq!(log_bytes(dir.path()), converged, "304 pass wrote ops");
 
@@ -771,7 +794,7 @@ mod tests {
                 "e2-after-ci-flip",
             ),
         );
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary, ScanSummary::default());
         assert_eq!(
             log_bytes(dir.path()),
@@ -782,7 +805,7 @@ mod tests {
         // Pass 4: a fresh scanner instance (restart — no ETags, no hub
         // cache) reconstructs everything from the fold and converges.
         let mut fresh = ScannerState::default();
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut fresh).await;
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut fresh, &tier1).await;
         assert_eq!(summary, ScanSummary::default());
         assert_eq!(log_bytes(dir.path()), converged, "restart re-parked");
     }
@@ -803,7 +826,8 @@ mod tests {
         let fixture = spawn_fixture(routes).await;
         let client = GithubAppClient::new(&fixture.base, test_credentials()).unwrap();
         let mut state = ScannerState::default();
-        scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let tier1 = crate::github_pr::join::Tier1Cache::default();
+        scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
 
         // PR 2 merges: it leaves the open list; the detail serves the
         // terminal state.
@@ -827,7 +851,7 @@ mod tests {
                 .to_string(),
             ),
         );
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary.completed, 1);
 
         let (snapshot, _, _) = agenda.snapshot();
@@ -858,7 +882,7 @@ mod tests {
                 "e3",
             ),
         );
-        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary.reopened, 1);
         assert_eq!(summary.parked, 0);
         let (snapshot, _, _) = agenda.snapshot();
@@ -881,7 +905,8 @@ mod tests {
         let fixture = spawn_fixture(routes).await;
         let client = GithubAppClient::new(&fixture.base, test_credentials()).unwrap();
         let mut state = ScannerState::default();
-        scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+        let tier1 = crate::github_pr::join::Tier1Cache::default();
+        scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         let anchor_id = agenda
             .snapshot()
             .0
@@ -915,7 +940,7 @@ mod tests {
                 "/repos/o/r/pulls",
                 pulls_route(serde_json::json!([pull(7, "contested", false)]), etag),
             );
-            scan_once(&agenda, &client, &["o/r".to_string()], &mut state).await;
+            scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         }
         let (snapshot, _, _) = agenda.snapshot();
         let anchor = snapshot.iter().find(|i| i.id == anchor_id).unwrap();

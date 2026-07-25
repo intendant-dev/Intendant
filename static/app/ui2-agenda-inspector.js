@@ -80,6 +80,7 @@ function agendaInspectorRender() {
         ${agendaInspReminderHtml(item)}
         ${agendaInspGatesHtml(item)}
         ${agendaInspOrganizationHtml(item)}
+        ${agendaInspPrStateHtml(item)}
         ${agendaInspRefsHtml(item)}
         ${agendaInspThreadHtml(item)}
         ${agendaHoodSectionHtml(item)}
@@ -88,6 +89,91 @@ function agendaInspectorRender() {
   });
   agendaHydratePreviewFrames(host);
 }
+
+// ---- PR render join (tier 2, Track PR) ----
+// Expand-time fetch-through of one anchor's live PR state: checks,
+// review, mergeability — auto-fetched when the inspector opens on an
+// item bearing a GitHub PR url ref (ambient context, unlike the
+// deliberate-gesture drift button: this is state ABOUT the pointed-at
+// thing, not a claim about a claim). Cached daemon-side behind a
+// single-flight + freshness floor; every rendered state carries its
+// age; unavailable renders as exactly that — the card never errors,
+// and nothing here ever writes an op.
+
+let agendaPrTier2 = {}; // item id → { status, state?, detail?, fetchedAt }
+let agendaPrTier2Inflight = new Set();
+
+function agendaPrStateEnsure(itemId) {
+  const cached = agendaPrTier2[itemId];
+  if (cached && Date.now() - cached.fetchedAt < 30_000) return;
+  if (agendaPrTier2Inflight.has(itemId)) return;
+  agendaPrTier2Inflight.add(itemId);
+  daemonApi.request('api_agenda_pr_state', { item_id: itemId }).then((resp) => {
+    agendaPrTier2[itemId] = {
+      status: (resp && resp.status) || 'unavailable',
+      state: (resp && resp.state) || null,
+      detail: (resp && resp.detail) || '',
+      fetchedAt: Date.now(),
+    };
+  }).catch((e) => {
+    agendaPrTier2[itemId] = {
+      status: 'unavailable',
+      state: null,
+      detail: String(e?.message || e),
+      fetchedAt: Date.now(),
+    };
+  }).finally(() => {
+    agendaPrTier2Inflight.delete(itemId);
+    if (agendaSelId === itemId) agendaInspectorRender();
+  });
+}
+
+function agendaInspPrStateHtml(item) {
+  if (!agendaPrLocator(item)) return '';
+  agendaPrStateEnsure(item.id);
+  const row = agendaPrTier2[item.id];
+  let body;
+  if (!row) {
+    body = '<div class="ag2-insp-sub">checking…</div>';
+  } else if (row.status !== 'live' || !row.state) {
+    body = `<div class="ag2-insp-sub">state unavailable${row.detail ? ` — ${escapeHtml(row.detail)}` : ''}</div>`;
+  } else {
+    const s = row.state;
+    const bits = [];
+    if (s.merged) bits.push('merged');
+    else if (s.pr_state) bits.push(escapeHtml(s.pr_state));
+    if (s.draft) bits.push('draft');
+    if (s.mergeable === false) bits.push('conflicts');
+    else if (s.mergeable === true) bits.push('mergeable');
+    const checks = s.checks || {};
+    if (checks.total) {
+      bits.push(`checks ${checks.succeeded || 0}/${checks.total}${checks.failed ? ` (${checks.failed} failed)` : ''}`);
+    }
+    const review = s.review || {};
+    if (review.approved) bits.push(`${review.approved} approval${review.approved === 1 ? '' : 's'}`);
+    if (review.changes_requested) bits.push(`${review.changes_requested} change request${review.changes_requested === 1 ? '' : 's'}`);
+    const renamed = s.title && item.title && !item.title.endsWith(s.title)
+      ? `<div class="ag2-insp-sub">now titled: ${escapeHtml(s.title)}</div>` : '';
+    body = `<div class="ag2-insp-sub">${bits.map(escapeHtml).join(' · ') || 'no state reported'}
+      <span class="ag2-dim"> · as of ${escapeHtml(agendaRelTime(s.fetched_at_ms))}</span></div>${renamed}`;
+  }
+  return `<div class="ag2-insp-section" data-pr-state>
+    <div class="ag2-insp-sechead">Pull request</div>
+    ${body}
+  </div>`;
+}
+
+window.qa = Object.assign(window.qa || {}, {
+  agendaPrJoin: () => ({
+    tier1Locators: Object.keys(agendaPullRequests || {}).length,
+    tier2Rows: Object.keys(agendaPrTier2 || {}).map((id) => ({
+      id,
+      status: agendaPrTier2[id].status,
+      ageMs: Date.now() - agendaPrTier2[id].fetchedAt,
+    })),
+    inflight: agendaPrTier2Inflight.size,
+  }),
+});
 
 // ---- Header ----
 

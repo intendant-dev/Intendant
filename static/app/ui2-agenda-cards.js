@@ -570,6 +570,20 @@ function agendaCardChips(item) {
     chips.push(agendaChipHtml('blocked', 'rose',
       'Derived at render — an uncleared blocker or unmet prerequisite'));
   }
+  // Tier-1 PR join chips (render-time only — never stored, never ops):
+  // draft state and rename divergence come from the scanner's last
+  // list poll; the anchor title stays as parked.
+  const pr = agendaPrTier1(item);
+  if (pr) {
+    if (pr.draft) {
+      chips.push(agendaChipHtml('draft', 'neutral',
+        `Draft on GitHub — as of ${agendaRelTime(pr.fetched_at_ms)}`));
+    }
+    if (pr.title && item.title && !item.title.endsWith(pr.title)) {
+      chips.push(agendaChipHtml('renamed', 'sky',
+        `Now titled on GitHub: ${pr.title}`));
+    }
+  }
   if (item.kind === 'question' && item.status === 'open' && item.dismissed) {
     chips.push(agendaChipHtml('dismissed · still open', 'neutral',
       agendaDismissedTip(item.dismissed), true));

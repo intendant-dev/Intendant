@@ -9,9 +9,10 @@ coordination radar's cheap `gh pr list` file-set read is a separate,
 unrelated lane and keeps working with or without this integration.)
 
 Configured, the daemon's **PR scanner** mirrors every watched pull
-request onto the agenda as a **thin intent anchor** under a "PRs" hub;
-the render-time state join (checks/review/mergeable on card expand)
-lands in the next slice.
+request onto the agenda as a **thin intent anchor** under a "PRs" hub,
+and the dashboard joins live PR state onto those anchors **at render
+time** — GitHub stays the sole store of PR state, and no state change
+is ever an agenda op.
 
 ## The scanner and its anchors
 
@@ -55,6 +56,43 @@ one re-admits it.
 The scanner keeps no durable state: the agenda is the durable truth,
 GitHub is the live truth, scanner state is a pure function of both — a
 daemon restart re-derives everything and converges without duplicates.
+
+## The render-time join
+
+Live PR state is served **beside** the agenda, never on it, in two
+tiers:
+
+- **Tier 1** — open state, draft flag, live title, branches, author —
+  is what the scanner's list poll already returned. It rides the agenda
+  snapshot response as a `pull_requests` sibling map keyed by the
+  anchors' url-ref locators (the sessions-join shape: the item DTO
+  stays the pure fold product; a locator with no entry claims nothing).
+  Cards chip from it — a `draft` badge, a `renamed` badge when the PR's
+  live title diverged from the parked one (the anchor is never
+  patched) — at zero per-render cost: the poll fetched it, not the
+  render.
+- **Tier 2** — checks rollup, review rollup, mergeability — is fetched
+  through a daemon-side cache when a card's inspector opens
+  (`GET /api/agenda/items/{item_id}/pr-state`, tunnel twin
+  `api_agenda_pr_state`): single-flight per PR so ten open dashboards
+  cost one GitHub exchange, a 60-second freshness floor so re-expands
+  are free, bounded retention. Every rendered state carries its age
+  ("as of 40s ago").
+
+Degrade is honest and boring: integration unconfigured or paused, key
+denied, GitHub unreachable, PR vanished — the card shows the anchor
+plus "state unavailable", never an error. The daemon holds the one
+GitHub client and the one rate budget; the browser never sees a GitHub
+credential and no CORS surface exists.
+
+Operator acceptance probe (headless, against a configured daemon or a
+fixture rig):
+
+```bash
+node scripts/validate-dashboard.cjs --port <port> \
+  --wait-for-selector '#tab-agenda' \
+  --probe-json "prjoin=window.qa.agendaPrJoin()"
+```
 
 **This does not replace the closed-loop landing watchers.** A session
 actively landing a PR watches the merge queue at seconds freshness

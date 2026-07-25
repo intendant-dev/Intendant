@@ -301,6 +301,8 @@ pub(crate) enum RouteHandlerId {
     SettingsGet,
     ApiKeysPost,
     ApiKeyStatus,
+    /// Tier-2 PR render join for one anchor (expand-time, cached).
+    AgendaPrState,
     /// GitHub App integration: seal credentials + set the watch list.
     GithubIntegrationSave,
     /// Integration presence + last-exchange state (never unseals).
@@ -1018,6 +1020,25 @@ pub(crate) static ROUTES: &[Route] = &[
         "Re-hash one item's file refs against their attach digests (expand-time drift check)",
     )
     .with_tunnel(tunnel_method("api_agenda_ref_drift")),
+    // Tier-2 render join for PR anchors (Track PR): checks/review/
+    // mergeability fetched through the daemon cache on card expand —
+    // never on list render, never stored, never an op. Degrades to
+    // "unavailable"; the card never errors.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/agenda/items",
+            &[
+                SegmentSpec::Capture("item_id"),
+                SegmentSpec::Literal("pr-state"),
+            ],
+        ),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaPrState,
+        "Live PR state for one anchor (expand-time render join; cached daemon-side)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_pr_state")),
     // Reminder delivery policy is owner policy, not agenda authorship:
     // it rides the Settings operation (quiet hours and urgency decide how
     // loudly the daemon speaks — the same class as its other knobs), so

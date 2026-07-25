@@ -29,6 +29,11 @@ let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 // already tried, so an unresolvable id never causes refetch loops on the
 // event lane.
 let agendaSessions = {};
+// Tier-1 PR render join (Track PR): the snapshot's `pull_requests`
+// sibling map — anchor url-ref locator → live open-PR state as the
+// scanner's last poll served it. Never fields on items; a locator with
+// no entry claims nothing.
+let agendaPullRequests = {};
 let agendaSessionLookupsAttempted = new Set();
 // Items whose full annotation thread is expanded (render caps at 3).
 const agendaExpandedThreads = new Set();
@@ -58,6 +63,7 @@ async function agendaRefresh() {
         agendaSkippedLines = resp.body.skipped_lines || 0;
         agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
         agendaSessions = resp.body.sessions || {};
+        agendaPullRequests = resp.body.pull_requests || {};
         agendaSessionLookupsAttempted = new Set(
           agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
@@ -421,6 +427,27 @@ function agendaActorLabel(p) {
   if (p.kind === 'daemon') return 'the daemon';
   if (p.kind === 'agent_session') return 'an agent session';
   return p.principal || '';
+}
+
+// The tier-1 join row for an item's PR url ref, if the snapshot served
+// one (open PRs of watched repos only — absent claims nothing).
+function agendaPrTier1(item) {
+  for (const r of (item.refs || [])) {
+    const t1 = agendaPullRequests[r.locator];
+    if (t1) return t1;
+  }
+  return null;
+}
+
+// The PR url ref itself (github.com pull link), joined or not — the
+// inspector's tier-2 fetch keys off its presence.
+function agendaPrLocator(item) {
+  for (const r of (item.refs || [])) {
+    if (r.ref_type === 'url' && /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(r.locator || '')) {
+      return r.locator;
+    }
+  }
+  return null;
 }
 
 // Full attribution HTML: the resolved session name as a jump link to its

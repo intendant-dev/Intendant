@@ -259,6 +259,7 @@ pub(crate) async fn control_request_frame(
         "api_agenda_ref_drift" => {
             api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await
         }
+        "api_agenda_pr_state" => api_agenda_pr_state_response(id, params.as_ref(), &runtime).await,
         "api_agenda_reminder_policy" => {
             api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
         }
@@ -1430,6 +1431,24 @@ pub(crate) async fn api_agenda_ref_drift_response(
         crate::web_gateway::agenda_ref_drift_api_response(&item_id, runtime.mcp_server.as_ref())
             .await,
         "agenda ref drift",
+    )
+}
+
+pub(crate) async fn api_agenda_pr_state_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let item_id = params
+        .and_then(|p| p.get("item_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_pr_state_api_response(&item_id, runtime.mcp_server.as_ref())
+            .await,
+        "agenda pr state",
     )
 }
 
