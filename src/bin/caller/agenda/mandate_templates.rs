@@ -44,6 +44,62 @@ pub(crate) struct WorkflowNode {
     pub(crate) claude_effort: Option<&'static str>,
 }
 
+/// One triggered standing-mandate template (Track T, T3): a single
+/// item + an `on_item_match`-triggered manifest — fire-on-event
+/// instead of cadence, the steward-gate consumer first. `mandate` is
+/// the parked body AND the goal; the canonical steward text is the T0
+/// ruling's amended block (rulings live at artifact tails —
+/// `~/triggers-workflows-intake.md`), byte-pinned to the docs and the
+/// dashboard copy below. Honesty note (verbatim contract, carried in
+/// the docs): a Fable-5 steward session RULES within delegated bounds
+/// and FLAGS owner-decisions to the rail — it inherits the human
+/// steward's delegation, not the owner's authority.
+pub(crate) struct TriggeredMandateTemplate {
+    pub(crate) id: &'static str,
+    pub(crate) title: &'static str,
+    pub(crate) mandate: &'static str,
+    /// The match predicate, tags ∧ kind (wire words).
+    pub(crate) item_kind: &'static str,
+    pub(crate) tags: &'static [&'static str],
+    /// Executor prefills (the owner's standing preference for judgment
+    /// mandates: supervised Claude / Fable 5 / max effort).
+    pub(crate) agent: Option<&'static str>,
+    pub(crate) claude_model: Option<&'static str>,
+    pub(crate) claude_effort: Option<&'static str>,
+}
+
+pub(crate) const TRIGGERED_MANDATE_TEMPLATES: &[TriggeredMandateTemplate] =
+    &[TriggeredMandateTemplate {
+        id: "steward-gate",
+        title: "Steward gate rulings",
+        mandate: r#"Steward-gate ruling pass. Gate questions tagged for the owner-plane
+steward seat have fired this session; your batch is the matched item
+ids in this goal's context. First read ~/steward-handoff-brief.md —
+it records the seat's delegation bounds and artifact map. For each
+item: read the question and EVERY must-read ref in full before
+ruling. Rule within the recorded delegation — conformance checklists,
+ruling standards, the price-tag rule. Append the ruling to the
+must-read artifact's RULING section (rulings live at artifact tails,
+additive-only), then answer the item with the decision summary and
+the pointer, shaped by ~/owner-briefing-standard.md: Situate, the
+decision, the depth, the recommendation. After answering, bus-message
+the asker's writer id that the answer landed (answer+wake, both
+directions). Anything that is an OWNER decision — scope changes, new
+authority, spending, anything outside recorded delegation — you park
+as an attention-flagged NOTE (never a question) and do not rule. You
+inherit the human steward's delegation, not the owner's authority.
+Never-list (binding): never approve, revoke, or start any manifest
+or effect; never judge memory claims; never complete, reopen, edit,
+or dispose of others' items — answers, annotations, and
+attention-flagged notes are your only agenda writes; park nothing
+beyond those; propose-don't-dispose governs every write."#,
+        item_kind: "question",
+        tags: &["gate"],
+        agent: Some("claude-code"),
+        claude_model: Some("fable-5"),
+        claude_effort: Some("max"),
+    }];
+
 /// A workflow template (Track T): a named protocol stamped as a small
 /// item-graph — an instance HUB whose body is the workflow's living
 /// orientation document (the briefing-standard mechanism; an ordinary
@@ -171,6 +227,14 @@ every placement you made and the ranked attention list. The summary
 item is your only new item besides hub notes, and it is EXCLUDED from
 every future frontier by definition — never place, rank, or annotate
 your own outputs.
+
+ORIENTATION MAINTENANCE: you are the orientation maintainer. Where a
+hub's body has drifted from what its children now show, propose the
+refreshed orientation paragraph as an annotation on the hub (repair by
+annotation — never a rewrite of another's item). When you rank a
+decision item whose body lacks orientation, your recommendation
+annotation supplies the missing Situate: one plain-language line a
+returning reader can act from correctly.
 
 NEVER (binding conduct, audited in the attributed op history): complete
 or retire anything; clear no blockers; answer no questions; never touch
@@ -402,6 +466,91 @@ mod tests {
             call > confirm,
             "the emitter is called from the owner-confirm handler"
         );
+    }
+
+    /// The steward-gate walkthrough (T3): the docs block byte-matches
+    /// the registry — whose text is the T0 ruling's amended canonical
+    /// block — and the honesty note appears verbatim in the docs prose.
+    #[test]
+    fn steward_walkthrough_block_and_honesty_note_byte_match() {
+        let steward = &TRIGGERED_MANDATE_TEMPLATES[0];
+        assert_eq!(
+            docs_block_after("### The steward-gate mandate"),
+            steward.mandate,
+            "the steward mandate block drifted from the ruling's canonical text"
+        );
+        assert!(
+            docs().contains(
+                "a Fable-5 steward session RULES within delegated bounds and\n\
+                 FLAGS owner-decisions to the rail — it inherits the human steward's\n\
+                 delegation, not the owner's authority."
+            ),
+            "the honesty note must appear verbatim in the docs"
+        );
+    }
+
+    /// The dashboard's triggered-mandate data is the second pinned copy.
+    #[test]
+    fn dashboard_triggered_mandate_data_carries_the_registry_verbatim() {
+        let fragment = include_str!("../../../../static/app/ui2-agenda-workflows.js");
+        for template in TRIGGERED_MANDATE_TEMPLATES {
+            assert!(
+                fragment.contains(&format!("id: '{}'", template.id)),
+                "fragment triggered-mandate table is missing id {}",
+                template.id
+            );
+            assert!(
+                fragment.contains(template.mandate),
+                "fragment copy of the {} mandate drifted",
+                template.id
+            );
+            assert!(
+                fragment.contains(&format!("itemKind: '{}'", template.item_kind)),
+                "fragment predicate kind drifted for {}",
+                template.id
+            );
+        }
+    }
+
+    /// Triggered-mandate registry invariants: ids unique across every
+    /// template table, a lawful predicate (kind word + 1..=8 non-empty
+    /// tags — the intake bounds), non-empty text.
+    #[test]
+    fn triggered_mandate_registry_invariants() {
+        let mut ids: std::collections::BTreeSet<&str> = MANDATE_TEMPLATES
+            .iter()
+            .map(|t| t.id)
+            .chain(WORKFLOW_TEMPLATES.iter().map(|t| t.id))
+            .collect();
+        for template in TRIGGERED_MANDATE_TEMPLATES {
+            assert!(!template.id.is_empty() && !template.title.is_empty());
+            assert!(!template.mandate.trim().is_empty());
+            assert!(ids.insert(template.id), "template id collides");
+            assert!(matches!(template.item_kind, "note" | "task" | "question"));
+            assert!(
+                (1..=super::super::types::TRIGGER_MATCH_TAGS_MAX).contains(&template.tags.len())
+            );
+            for tag in template.tags {
+                assert!(!tag.trim().is_empty());
+            }
+        }
+    }
+
+    /// The intendant-agenda skill's ask guidance carries the
+    /// briefing-standard lines (T3): decision items brief like the
+    /// standard, gates park with must-read refs + the gate tag, and the
+    /// answer+wake etiquette runs both directions.
+    #[test]
+    fn skill_ask_guidance_carries_the_briefing_standard_lines() {
+        let skill = include_str!("../../../../skills/intendant-agenda/SKILL.md");
+        for needle in [
+            "**Decision items brief like the owner briefing standard**",
+            "**Park gate questions with the artifact attached**",
+            "`gate` tag so standing mandates can match it",
+            "**Answer+wake etiquette, both directions**",
+        ] {
+            assert!(skill.contains(needle), "skill lost the line: {needle}");
+        }
     }
 
     /// Workflow registry invariants: ids unique and disjoint from the

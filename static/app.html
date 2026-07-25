@@ -36431,7 +36431,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '2367e9864d1df523';
+const INTENDANT_APP_BUILD = 'e07224a56bdb4f6d';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -90462,6 +90462,14 @@ item is your only new item besides hub notes, and it is EXCLUDED from
 every future frontier by definition — never place, rank, or annotate
 your own outputs.
 
+ORIENTATION MAINTENANCE: you are the orientation maintainer. Where a
+hub's body has drifted from what its children now show, propose the
+refreshed orientation paragraph as an annotation on the hub (repair by
+annotation — never a rewrite of another's item). When you rank a
+decision item whose body lacks orientation, your recommendation
+annotation supplies the missing Situate: one plain-language line a
+returning reader can act from correctly.
+
 NEVER (binding conduct, audited in the attributed op history): complete
 or retire anything; clear no blockers; answer no questions; never touch
 reminder or urgency policy; never place your own outputs; never judge,
@@ -95476,6 +95484,9 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
 // mandate templates. Stamping happens on click; the approval sheet
 // opens the moment the stamp lands.
 function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet) {
+  if (typeof agendaTriggeredMandateRenderButtons === 'function') {
+    agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet);
+  }
   for (const template of AGENDA_WORKFLOW_TEMPLATES) {
     const btn = agendaStartSheetEl('button', 'ags-seg-btn', `${template.title} →`);
     btn.type = 'button';
@@ -95491,6 +95502,96 @@ function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet) {
         if (typeof showControlToast === 'function') {
           showControlToast('error',
             `Workflow stamp failed: ${(e && e.message) || e} — items stamped so far remain parked.`);
+        }
+      }
+    });
+    seg.appendChild(btn);
+  }
+}
+
+// ---- Triggered standing mandates (Track T, T3) ----
+// Fire-on-event instead of cadence: one item + one on_item_match
+// manifest. The steward-gate consumer is the first entry. Pinned copy
+// of the registry (same parity discipline as the tables above); the
+// stamp path parks + proposes and lands the owner on the ordinary
+// Approve card — one digest, no sheet, and this lane emits no
+// approvals (the fragment's single-emitter pin counts them).
+
+const AGENDA_TRIGGERED_MANDATE_TEMPLATES = [
+  {
+    id: 'steward-gate',
+    title: 'Steward gate rulings',
+    itemKind: 'question',
+    tags: ['gate'],
+    agent: 'claude-code',
+    claudeModel: 'fable-5',
+    claudeEffort: 'max',
+    mandate: `Steward-gate ruling pass. Gate questions tagged for the owner-plane
+steward seat have fired this session; your batch is the matched item
+ids in this goal's context. First read ~/steward-handoff-brief.md —
+it records the seat's delegation bounds and artifact map. For each
+item: read the question and EVERY must-read ref in full before
+ruling. Rule within the recorded delegation — conformance checklists,
+ruling standards, the price-tag rule. Append the ruling to the
+must-read artifact's RULING section (rulings live at artifact tails,
+additive-only), then answer the item with the decision summary and
+the pointer, shaped by ~/owner-briefing-standard.md: Situate, the
+decision, the depth, the recommendation. After answering, bus-message
+the asker's writer id that the answer landed (answer+wake, both
+directions). Anything that is an OWNER decision — scope changes, new
+authority, spending, anything outside recorded delegation — you park
+as an attention-flagged NOTE (never a question) and do not rule. You
+inherit the human steward's delegation, not the owner's authority.
+Never-list (binding): never approve, revoke, or start any manifest
+or effect; never judge memory claims; never complete, reopen, edit,
+or dispose of others' items — answers, annotations, and
+attention-flagged notes are your only agenda writes; park nothing
+beyond those; propose-don't-dispose governs every write.`,
+  },
+];
+
+// Park + propose a triggered standing mandate; approval stays the
+// owner's ordinary card act.
+async function agendaTriggeredMandateStamp(template) {
+  const item = await agendaWorkflowOp({
+    op: 'add', kind: 'task', title: template.title, body: template.mandate,
+  });
+  const propose = {
+    op: 'propose_effect',
+    id: item.id,
+    goal: template.mandate,
+    fire_at_ms: Date.now(),
+    trigger: { kind: 'on_item_match', item_kind: template.itemKind, tags: template.tags },
+  };
+  const config = {};
+  if (template.agent) config.agent = template.agent;
+  if (template.claudeModel) config.claude_model = template.claudeModel;
+  if (template.claudeEffort) config.claude_effort = template.claudeEffort;
+  if (Object.keys(config).length) propose.agent_config = config;
+  await agendaWorkflowOp(propose);
+  if (typeof agendaOpenInspector === 'function') agendaOpenInspector(item.id);
+  if (typeof showControlToast === 'function') {
+    showControlToast('success',
+      'Parked and proposed — approve the digest on the card to arm the standing mandate.');
+  }
+}
+
+// Picker entries for the triggered mandates, rendered by the same hook.
+function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet) {
+  for (const template of AGENDA_TRIGGERED_MANDATE_TEMPLATES) {
+    const btn = agendaStartSheetEl('button', 'ags-seg-btn',
+      `${template.title} (${template.itemKind}:${template.tags.join(',')})`);
+    btn.type = 'button';
+    btn.dataset.triggeredMandate = template.id;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await agendaTriggeredMandateStamp(template);
+        closeAutomationSheet();
+      } catch (e) {
+        btn.disabled = false;
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', `Stamp failed: ${(e && e.message) || e}`);
         }
       }
     });
