@@ -1786,6 +1786,36 @@ mod tests {
         );
     }
 
+    /// The lane-parity regression pin (2026-07-25 live Safari finding):
+    /// the daemonApi facade yields an `{ok, status, body}` envelope on
+    /// EVERY lane — the local tunnel and the Safari/mTLS HTTP fallback
+    /// alike — and the github section must render the parsed BODY, never
+    /// the envelope (which renders HTTP codes as status labels and
+    /// undefined fields as "unconfigured"). Structural pin: the one
+    /// unwrap helper exists, checks `ok` and returns `body`, and no
+    /// direct github-method `daemonApi.request` call bypasses it.
+    #[test]
+    fn github_section_unwraps_the_daemon_api_envelope() {
+        let app = include_str!("../../../../static/app.html");
+        assert!(
+            app.contains("async function githubIntegrationApi("),
+            "the github section's envelope-unwrap helper is gone"
+        );
+        for marker in ["if (!resp.ok) {", "return resp.body ?? {};"] {
+            assert!(
+                app.contains(marker),
+                "the unwrap helper lost its envelope handling: {marker:?}"
+            );
+        }
+        assert_eq!(
+            app.matches("daemonApi.request('api_github_").count(),
+            0,
+            "a github-section call bypasses the envelope unwrap helper — \
+             it would render the envelope (HTTP status, undefined fields) \
+             on both transports"
+        );
+    }
+
     #[tokio::test]
     async fn remove_is_idempotent_and_clears_state() {
         let dir = tempfile::tempdir().unwrap();

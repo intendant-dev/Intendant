@@ -4304,12 +4304,29 @@ const githubIntegrationState = {
   repoPicker: { loading: false, repositories: null, error: null },
 };
 
+// Every github-section daemon call unwraps here. The daemonApi
+// contract is an {ok, status, body} envelope ON EVERY LANE — the local
+// tunnel and the Safari/mTLS HTTP fallback alike — and consuming the
+// envelope as the body renders HTTP codes as status labels and
+// undefined fields as "unconfigured" (the 2026-07-25 live Safari
+// finding). A non-ok envelope throws the body's named error. The
+// daemon-side pin `github_section_unwraps_the_daemon_api_envelope`
+// keeps direct request() calls out of this section.
+async function githubIntegrationApi(method, params) {
+  const resp = await daemonApi.request(method, params);
+  if (!resp.ok) {
+    const detail = resp.body && (resp.body.error || resp.body.detail);
+    throw new Error(String(detail || `${method} returned ${resp.status}`));
+  }
+  return resp.body ?? {};
+}
+
 async function githubIntegrationRefresh(force = false) {
   if (!force && Date.now() - githubIntegrationState.fetchedAt < 30_000) return;
   githubIntegrationState.fetchedAt = Date.now();
   try {
-    const data = await daemonApi.request('api_github_integration_status', {});
-    githubIntegrationState.data = data || null;
+    const body = await githubIntegrationApi('api_github_integration_status', {});
+    githubIntegrationState.data = body || null;
     githubIntegrationState.lastError = null;
   } catch (e) {
     githubIntegrationState.lastError = String(e?.message || e);
@@ -4355,8 +4372,8 @@ async function githubIntegrationDiscoveryTick() {
   }
   d.polling = true;
   try {
-    const data = await daemonApi.request('api_github_installations', {});
-    const rows = Array.isArray(data?.installations) ? data.installations : [];
+    const body = await githubIntegrationApi('api_github_installations', {});
+    const rows = Array.isArray(body?.installations) ? body.installations : [];
     d.installations = rows;
     d.error = null;
     if (rows.length === 1 && rows[0]?.installation_id) {
@@ -4380,8 +4397,8 @@ async function githubIntegrationCompleteInstall(row) {
   try {
     const payload = { installation_id: Number(row.installation_id) };
     if (row.app_id != null) payload.app_id = String(row.app_id);
-    const data = await daemonApi.request('api_github_integration_save', payload);
-    githubIntegrationState.data = data || githubIntegrationState.data;
+    const body = await githubIntegrationApi('api_github_integration_save', payload);
+    githubIntegrationState.data = body || githubIntegrationState.data;
     githubIntegrationState.fetchedAt = Date.now();
     githubIntegrationState.notice = {
       text: `Installed as ${row.account_login || 'the selected account'} — pick repositories below.`,
@@ -4402,14 +4419,14 @@ async function githubIntegrationSaveSelection(payload) {
   githubIntegrationState.busy = true;
   githubIntegrationState.notice = null;
   try {
-    const data = await daemonApi.request('api_github_integration_save', payload);
-    githubIntegrationState.data = data || githubIntegrationState.data;
+    const body = await githubIntegrationApi('api_github_integration_save', payload);
+    githubIntegrationState.data = body || githubIntegrationState.data;
     githubIntegrationState.fetchedAt = Date.now();
-    const status = String(data?.status || 'unknown');
+    const status = String(body?.status || 'unknown');
     githubIntegrationState.notice = {
       text: status === 'valid'
         ? 'Watch list saved — verified against GitHub.'
-        : `Saved. Status: ${status}${data?.detail ? ` — ${data.detail}` : ''}`,
+        : `Saved. Status: ${status}${body?.detail ? ` — ${body.detail}` : ''}`,
       cls: status === 'valid' ? 'ok' : 'warn',
     };
   } catch (e) {
@@ -4425,8 +4442,8 @@ async function githubIntegrationLoadRepositories() {
   p.loading = true;
   p.error = null;
   try {
-    const data = await daemonApi.request('api_github_repositories', {});
-    p.repositories = Array.isArray(data?.repositories) ? data.repositories : [];
+    const body = await githubIntegrationApi('api_github_repositories', {});
+    p.repositories = Array.isArray(body?.repositories) ? body.repositories : [];
   } catch (e) {
     p.error = String(e?.message || e);
   }
@@ -4469,11 +4486,15 @@ async function githubIntegrationConnect(orgInput) {
 }
 
 async function githubIntegrationSave(fields) {
+  // Ids ride only when present — the evolved save contract keeps the
+  // sealed values for absent ids, so an update needn't retype them.
   const payload = {
-    app_id: fields.appId.value.trim(),
-    installation_id: Number(fields.installationId.value || 0),
     repos: fields.repos.value.split('\n').map(s => s.trim()).filter(Boolean),
   };
+  const appId = fields.appId.value.trim();
+  if (appId) payload.app_id = appId;
+  const installationId = Number(fields.installationId.value || 0);
+  if (installationId >= 1) payload.installation_id = installationId;
   const pem = fields.pem.value.trim();
   if (pem) payload.private_key_pem = pem;
   const minutes = fields.pollMinutes.value.trim();
@@ -4482,14 +4503,14 @@ async function githubIntegrationSave(fields) {
   githubIntegrationState.notice = null;
   renderGithubIntegrationSection();
   try {
-    const data = await daemonApi.request('api_github_integration_save', payload);
-    githubIntegrationState.data = data || githubIntegrationState.data;
+    const body = await githubIntegrationApi('api_github_integration_save', payload);
+    githubIntegrationState.data = body || githubIntegrationState.data;
     githubIntegrationState.fetchedAt = Date.now();
-    const status = data?.status || 'saved';
+    const status = body?.status || 'saved';
     githubIntegrationState.notice = {
       text: status === 'valid'
-        ? `Saved — verified against GitHub${Number.isFinite(data?.verified_open_prs) ? ` (${data.verified_open_prs} open PRs)` : ''}.`
-        : `Saved. Status: ${status}${data?.detail ? ` — ${data.detail}` : ''}`,
+        ? `Saved — verified against GitHub${Number.isFinite(body?.verified_open_prs) ? ` (${body.verified_open_prs} open PRs)` : ''}.`
+        : `Saved. Status: ${status}${body?.detail ? ` — ${body.detail}` : ''}`,
       cls: status === 'valid' ? 'ok' : 'warn',
     };
     // The pasted key was sealed daemon-side; drop it from the DOM now.
@@ -4512,8 +4533,8 @@ async function githubIntegrationRemove() {
   githubIntegrationState.busy = true;
   renderGithubIntegrationSection();
   try {
-    const data = await daemonApi.request('api_github_integration_remove', {});
-    githubIntegrationState.data = data || githubIntegrationState.data;
+    const body = await githubIntegrationApi('api_github_integration_remove', {});
+    githubIntegrationState.data = body || githubIntegrationState.data;
     githubIntegrationState.fetchedAt = Date.now();
     githubIntegrationState.notice = { text: 'Credentials removed from custody.', cls: 'ok' };
   } catch (e) {
