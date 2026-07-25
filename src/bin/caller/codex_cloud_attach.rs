@@ -417,6 +417,7 @@ const WORKER_REPLY_KINDS: &[&str] = &[
     "display_tiles",
     "display_closed",
     "display_error",
+    "cu_result",
 ];
 
 /// Host-id prefix that routes a dashboard terminal frame to a connected
@@ -962,6 +963,67 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Home side of the CU inversion: send one `cu_execute` frame over the
+/// task's attachment and await its correlated `cu_result`. Correlation is
+/// by frame id; unrelated reply traffic (tiles, terminal output) is
+/// skipped. The caller was already gated on home — the worker executes
+/// with home's total authority over it.
+pub(crate) async fn cloud_cu_round_trip(
+    task_id: &str,
+    actions: serde_json::Value,
+    coordinate_space: Option<&str>,
+    observe: Option<serde_json::Value>,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let Some((to_worker, mut from_worker)) = attachment_channel(task_id) else {
+        return Err("cloud worker has no live attachment".to_string());
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut frame = serde_json::json!({
+        "t": "cu_execute",
+        "host_id": format!("{CLOUD_HOST_PREFIX}{task_id}"),
+        "id": id,
+        "actions": actions,
+    });
+    if let Some(space) = coordinate_space {
+        frame["coordinate_space"] = space.into();
+    }
+    if let Some(observe) = observe {
+        frame["observe"] = observe;
+    }
+    to_worker
+        .send(frame.to_string())
+        .await
+        .map_err(|_| "cloud worker detached".to_string())?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("cloud CU call timed out".to_string());
+        }
+        match tokio::time::timeout(remaining, from_worker.recv()).await {
+            Ok(Ok(text)) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value.get("t").and_then(serde_json::Value::as_str) == Some("cu_result")
+                    && value.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                {
+                    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+                        return Err(error.to_string());
+                    }
+                    return Ok(value);
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err("cloud worker detached".to_string());
+            }
+            Err(_) => return Err("cloud CU call timed out".to_string()),
+        }
+    }
+}
+
 /// Worker-side display state, hoisted to `run_agent` scope like the
 /// terminal registry: the display session (and any Xvfb it launched)
 /// survives socket reconnects; the per-viewer tile stream and pump die
@@ -975,6 +1037,13 @@ pub(crate) struct WorkerDisplayState {
     /// Kill-on-drop guard for a worker-launched Xvfb — held for RAII
     /// only, never read.
     _xvfb: Option<crate::vision::XvfbGuard>,
+    /// Session registry for the CU executor: `execute_actions` routes
+    /// screenshots and input through the session it finds here, never a
+    /// native platform API — load-bearing under the synthetic backend.
+    registry: Option<crate::display::SharedSessionRegistry>,
+    /// Screenshot scratch for CU batches (RAII-cleaned).
+    cu_screenshots: Option<tempfile::TempDir>,
+    cu_counter: u64,
 }
 
 impl WorkerDisplayState {
@@ -1058,7 +1127,119 @@ async fn start_worker_display_session(
         .start(15, None, None)
         .await
         .map_err(|e| format!("start worker display session: {e}"))?;
+    let registry: crate::display::SharedSessionRegistry = std::sync::Arc::new(
+        tokio::sync::RwLock::new(crate::display::SessionRegistry::new()),
+    );
+    registry
+        .write()
+        .await
+        .insert(display_id, Arc::clone(&session));
+    state.registry = Some(registry);
     Ok((display_id, session))
+}
+
+/// Ensure the worker display session exists, creating it on first use.
+async fn ensure_worker_display_session(
+    display: &mut WorkerDisplayState,
+) -> Result<(u32, std::sync::Arc<crate::display::DisplaySession>), String> {
+    if let Some((id, session)) = display.session.as_ref() {
+        return Ok((*id, std::sync::Arc::clone(session)));
+    }
+    let (id, session) = start_worker_display_session(display).await?;
+    display.session = Some((id, std::sync::Arc::clone(&session)));
+    Ok((id, session))
+}
+
+/// Run one CU batch against the worker's own display session and reduce
+/// the outcome to the wire summary `cu_result` carries: per-action status
+/// lines in the MCP formatter's vocabulary, the observation description,
+/// and the trailing screenshot. Home's authority over the worker is total,
+/// so no worker-side gating applies; the browser/MCP caller was gated on
+/// home before the frame ever rode the attachment.
+async fn execute_worker_cu_batch(
+    display: &mut WorkerDisplayState,
+    frame: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (display_id, _session) = ensure_worker_display_session(display).await?;
+    let mut actions: Vec<crate::computer_use::CuAction> = frame
+        .get("actions")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("parse cu actions: {e}"))?
+        .unwrap_or_default();
+    if actions.is_empty() {
+        return Err("no actions provided".to_string());
+    }
+    let registry = display.registry.clone();
+    let target = intendant_platform::DisplayTarget::Virtual { id: display_id };
+    let denorm_ref = if frame
+        .get("coordinate_space")
+        .and_then(serde_json::Value::as_str)
+        == Some("normalized_1000")
+    {
+        let size = crate::computer_use::target_pixel_size(target, &registry).await;
+        for action in &mut actions {
+            crate::mcp::denormalize_action(action, size.0, size.1);
+        }
+        Some(size)
+    } else {
+        None
+    };
+    if display.cu_screenshots.is_none() {
+        display.cu_screenshots =
+            Some(tempfile::tempdir().map_err(|e| format!("create cu screenshot dir: {e}"))?);
+    }
+    let screenshot_dir = display
+        .cu_screenshots
+        .as_ref()
+        .expect("just ensured")
+        .path()
+        .to_path_buf();
+    let observe = frame
+        .get("observe")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let outcome = crate::computer_use::execute_actions(
+        &actions,
+        target,
+        crate::computer_use::DisplayBackend::detect(),
+        &screenshot_dir,
+        &mut display.cu_counter,
+        &registry,
+        denorm_ref,
+        false,
+        None,
+        crate::computer_use::CuExecOptions {
+            observe,
+            annotate: false,
+            settle: None,
+        },
+    )
+    .await;
+    let mut results = Vec::with_capacity(outcome.results.len());
+    for (action, result) in actions.iter().zip(outcome.results.iter()) {
+        results.push(serde_json::json!({
+            "action": crate::mcp::format_cu_action_brief(action),
+            "status": crate::mcp::cu_result_status(result),
+            "detail": result.error.as_deref().or(result.detail.as_deref()).unwrap_or(""),
+        }));
+    }
+    let screenshot = outcome
+        .last_screenshot()
+        .map(|shot| (shot.base64_png.clone(), shot.width, shot.height));
+    let mut reply = serde_json::json!({
+        "results": results,
+        "observation": outcome.observation.describe(),
+        "display_id": display_id,
+    });
+    if let Some((b64, width, height)) = screenshot {
+        reply["screenshot_b64"] = serde_json::Value::String(b64);
+        reply["screenshot_width"] = width.into();
+        reply["screenshot_height"] = height.into();
+    }
+    Ok(reply)
 }
 
 /// Collect the boot-identity fields the probe prompt measures, in the same
@@ -1266,6 +1447,31 @@ async fn serve_worker_frame(
             let _ = out_tx
                 .send(reply(serde_json::json!({ "t": "display_closed" })))
                 .await;
+            return;
+        }
+        "cu_execute" => {
+            let id = field("id");
+            eprintln!(
+                "[cloud-agent] cu_execute ({} actions)",
+                frame
+                    .get("actions")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            );
+            let reply_value = match execute_worker_cu_batch(display, &frame).await {
+                Ok(mut value) => {
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert("t".into(), "cu_result".into());
+                        map.insert("id".into(), id.clone().into());
+                    }
+                    value
+                }
+                Err(error) => serde_json::json!({
+                    "t": "cu_result", "id": id, "error": error,
+                }),
+            };
+            let _ = out_tx.send(reply(reply_value)).await;
             return;
         }
         _ => {}
@@ -1647,6 +1853,115 @@ mod tests {
             }
         }
         assert!(saw_closed, "close is acked");
+        session.stop().await;
+    }
+
+    /// The CU inversion round-trips over an in-process attachment link:
+    /// home sends cu_execute, the fake worker answers the correlated
+    /// cu_result, unrelated broadcast traffic is skipped, and a dead
+    /// worker surfaces as a timeout.
+    #[tokio::test]
+    async fn cloud_cu_round_trip_correlates_and_times_out() {
+        let (to_worker_tx, mut to_worker_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (from_worker_tx, _) = tokio::sync::broadcast::channel::<String>(8);
+        attachment_links().lock().unwrap().insert(
+            "task_cu_rt".to_string(),
+            AttachmentLink {
+                to_worker: to_worker_tx,
+                from_worker: from_worker_tx.clone(),
+            },
+        );
+        let responder = tokio::spawn(async move {
+            let text = to_worker_rx.recv().await.expect("cu_execute arrives");
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["t"], "cu_execute");
+            assert_eq!(frame["host_id"], "cloud:task_cu_rt");
+            // Noise first: unrelated reply traffic must be skipped.
+            let _ = from_worker_tx.send(
+                r#"{"t":"display_tiles","host_id":"cloud:task_cu_rt","data":"aGk="}"#.to_string(),
+            );
+            let reply = serde_json::json!({
+                "t": "cu_result",
+                "id": frame["id"],
+                "results": [{"action": "screenshot", "status": "ok", "detail": ""}],
+                "observation": "pixels",
+            });
+            let _ = from_worker_tx.send(reply.to_string());
+        });
+        let value = cloud_cu_round_trip(
+            "task_cu_rt",
+            serde_json::json!([{"type": "screenshot"}]),
+            None,
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("round trip succeeds");
+        assert_eq!(value["results"][0]["status"], "ok");
+        responder.await.unwrap();
+
+        // Silent worker: the link is live (receiver held open) but nothing
+        // answers -> timeout, not a hang and not a detach.
+        let (silent_tx, _silent_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (silent_from_tx, _) = tokio::sync::broadcast::channel::<String>(8);
+        attachment_links().lock().unwrap().insert(
+            "task_cu_silent".to_string(),
+            AttachmentLink {
+                to_worker: silent_tx,
+                from_worker: silent_from_tx,
+            },
+        );
+        let error = cloud_cu_round_trip(
+            "task_cu_silent",
+            serde_json::json!([{"type": "screenshot"}]),
+            None,
+            None,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("times out");
+        assert!(error.contains("timed out"), "{error}");
+        let mut links = attachment_links().lock().unwrap();
+        links.remove("task_cu_rt");
+        links.remove("task_cu_silent");
+    }
+
+    /// The worker CU executor runs a real batch against a seeded synthetic
+    /// session: a screenshot action succeeds, the reply carries the
+    /// reduced results and the screenshot payload, and no native platform
+    /// API is involved (session-backed capture).
+    #[tokio::test]
+    async fn worker_cu_batch_screenshots_via_the_session() {
+        let backend = std::sync::Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let session = std::sync::Arc::new(crate::display::DisplaySession::new(0, backend));
+        session.disable_video_bank();
+        session.start(10, None, None).await.expect("session starts");
+        let registry: crate::display::SharedSessionRegistry = std::sync::Arc::new(
+            tokio::sync::RwLock::new(crate::display::SessionRegistry::new()),
+        );
+        registry
+            .write()
+            .await
+            .insert(0, std::sync::Arc::clone(&session));
+        let mut display = WorkerDisplayState {
+            session: Some((0, std::sync::Arc::clone(&session))),
+            registry: Some(registry),
+            ..Default::default()
+        };
+        let frame = serde_json::json!({
+            "t": "cu_execute",
+            "host_id": "cloud:t",
+            "id": "cu-1",
+            "actions": [{"type": "screenshot"}],
+        });
+        let value = execute_worker_cu_batch(&mut display, &frame)
+            .await
+            .expect("batch executes");
+        let status = value["results"][0]["status"].as_str().unwrap_or("?");
+        assert_ne!(status, "failed", "{value}");
+        assert!(value["screenshot_b64"]
+            .as_str()
+            .is_some_and(|b64| !b64.is_empty()));
         session.stop().await;
     }
 

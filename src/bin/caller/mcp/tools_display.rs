@@ -1140,6 +1140,107 @@ impl IntendantServer {
             return Ok(text_tool_error("No actions provided"));
         }
 
+        // Cloud-worker targets invert the whole call over the task's
+        // attachment: the worker executes against its own display session
+        // (its container is the sandbox) and replies with the reduced
+        // outcome. Everything below this point is local-display machinery.
+        if let Some(task_id) = params
+            .display_target
+            .as_deref()
+            .and_then(crate::codex_cloud_attach::cloud_host_task_id)
+        {
+            let task_id = task_id.to_string();
+            let actions_json = serde_json::to_value(&actions)
+                .map_err(|e| McpError::internal_error(format!("serialize actions: {e}"), None))?;
+            let observe_json = params
+                .observe
+                .as_ref()
+                .and_then(|observe| serde_json::to_value(observe).ok());
+            let result = crate::codex_cloud_attach::cloud_cu_round_trip(
+                &task_id,
+                actions_json,
+                params.coordinate_space.as_deref(),
+                observe_json,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+            let value = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(text_tool_error(format!(
+                        "cloud worker CU call failed: {error}"
+                    )))
+                }
+            };
+            let mut summaries = Vec::new();
+            if let Some(results) = value.get("results").and_then(serde_json::Value::as_array) {
+                for (i, entry) in results.iter().enumerate() {
+                    let action = entry
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let status = entry
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let detail = entry
+                        .get("detail")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if detail.is_empty() {
+                        summaries.push(format!("action[{i}] {action}: {status}"));
+                    } else {
+                        summaries.push(format!("action[{i}] {action}: {status}: {detail}"));
+                    }
+                }
+            }
+            let failed = value
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .map(|results| {
+                    results
+                        .iter()
+                        .filter(|entry| {
+                            entry.get("status").and_then(serde_json::Value::as_str)
+                                == Some("failed")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let total = value
+                .get("results")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let all_failed = total > 0 && failed == total;
+            if failed > 0 && !all_failed {
+                summaries.insert(0, format!("WARNING: {failed}/{total} actions failed"));
+            }
+            if let Some(observation) = value.get("observation").and_then(serde_json::Value::as_str)
+            {
+                summaries.push(format!("observation: {observation}"));
+            }
+            summaries.push(format!("executed on cloud worker {task_id}"));
+            if let Some(b64) = value
+                .get("screenshot_b64")
+                .and_then(serde_json::Value::as_str)
+            {
+                summaries.push("post-action screenshot captured".to_string());
+                let body = summaries.join("\n");
+                return Ok(if all_failed {
+                    image_tool_error(body, b64.to_string())
+                } else {
+                    image_tool_result(body, b64.to_string())
+                });
+            }
+            let body = summaries.join("\n");
+            return Ok(if all_failed {
+                text_tool_error(body)
+            } else {
+                text_tool_result(body)
+            });
+        }
+
         let state = self.state.read().await;
         let screenshot_dir = state
             .screenshot_dir

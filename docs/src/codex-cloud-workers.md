@@ -313,6 +313,24 @@ keepalive cadence when no viewer is subscribed. The same fail-closed
 rules as the terminal apply: only display reply kinds cross back from
 the worker, routed solely to the viewing connection.
 
+## Computer use on a live worker
+
+`execute_cu_actions` accepts `display_target: "cloud:<task_id>"`: the whole
+batch inverts over the task's attachment as one `cu_execute` frame, the
+worker runs the standard CU executor against its own display session
+(screenshots and input ride the session — the same virtual display the
+View button streams — with an unscoped actor, since the container is the
+sandbox), and the correlated `cu_result` carries the reduced outcome
+home: per-action status lines in the usual `ok`/`injected`/`failed`
+vocabulary, the observation description, and the trailing screenshot.
+Normalized `coordinate_space` batches are denormalized on the worker
+against its own display size. The MCP caller is gated on home exactly
+like a local CU call; the worker applies no further gates (home's
+authority over the worker is total), and `cu_result` joins the closed
+reply-kind allowlist like every other worker frame. A worker without a
+display capability answers with the named error from the display
+resolver rather than guessing.
+
 ## Attachment lifecycle
 
 The enrollment broker above records the attachment state for its workers;

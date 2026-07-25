@@ -2693,7 +2693,11 @@ pub async fn run_mcp_server(
 // ---------------------------------------------------------------------------
 
 /// Denormalize a CU action's coordinates from 0-1000 grid to pixel space.
-fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32, screen_h: u32) {
+pub(crate) fn denormalize_action(
+    action: &mut crate::computer_use::CuAction,
+    screen_w: u32,
+    screen_h: u32,
+) {
     use crate::computer_use::CuAction;
     let dn_x = |x: &mut i32| *x = (*x as f64 * screen_w as f64 / 1000.0) as i32;
     let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
@@ -2747,7 +2751,7 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
 }
 
 /// Format a CU action as a short description for logs.
-fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
+pub(crate) fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
     use crate::computer_use::CuAction;
     match action {
         CuAction::Click { x, y, button } => format!("(click {},{} {:?})", x, y, button),
@@ -2798,7 +2802,7 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
 /// The per-action status label shown to models: `ok` (effect verified),
 /// `injected` (dispatched to the OS, effect unverified — the honest ceiling
 /// for most input injection), or `failed`.
-fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
+pub(crate) fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
     result.status.label()
 }
 
