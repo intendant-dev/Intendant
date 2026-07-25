@@ -125,10 +125,73 @@ for every PR on the fleet, watched or not. Both exist on purpose.
   honored. Configuration state (which repos to watch, the poll cadence)
   is non-secret and lives in `[integrations.github]` in
   `intendant.toml`.
+- **The one-click ceremony's guard is a daemon-minted single-use
+  state.** GitHub's redirect lands on an authority-free callback route
+  (a browser navigation carries no daemon credential); without the
+  matching unexpired state — 32 random bytes, stored hashed, burned
+  atomically before any GitHub call — the callback is a uniform refusal
+  and the code is **never exchanged**, so a foreign code can never
+  substitute attacker-App credentials. The state travels only inside
+  the GitHub form action and its redirect; the per-boot dashboard
+  admission token never rides the redirect URL.
+- **Intendant stores only what the daemon uses.** The conversion
+  response's `client_secret` and `webhook_secret` are discarded at
+  parse (the daemon retains the App id, slug, and private key — nothing
+  else); the PEM travels GitHub → daemon → custody without ever
+  touching a file, a log, or the browser.
 
-## Setup: the five-minute ceremony
+## Setup: one click
 
-You (the owner) do this once; agents cannot and must not.
+You (the owner) do this once; agents cannot and must not. Dashboard →
+**Vault** → *GitHub App integration*:
+
+1. **Connect GitHub** — optionally type your org handle (blank = your
+   personal account) and press **Connect GitHub**. Your browser goes to
+   github.com with a pre-filled manifest: a **private** App named
+   `Intendant (<host>)` with exactly the three read-only permissions
+   and **no webhook**. One green button — *Create GitHub App* — and
+   GitHub sends the browser back to the daemon, which exchanges the
+   single-use code server-side and **seals the App's key straight into
+   custody**. You never see, download, or paste a PEM. (If the name is
+   taken, GitHub's own page lets you edit it before creating.)
+2. **Install on GitHub** — the section now shows the sealed App with an
+   *Install on GitHub* link. Pick the account and the repositories the
+   App may see. Back in the dashboard, the installation is discovered
+   automatically within a few seconds (several installations render a
+   picker; none after two minutes leaves the link plus the manual
+   fallback).
+3. **Pick repositories** — tick the repos to watch and *Save selection
+   & verify*. The daemon performs one real exchange (token mint plus a
+   pull list) so the status chip says `valid` — or tells you exactly
+   why not. Poll cadence lives under *Advanced* (default 5 minutes,
+   floor 1).
+
+Status states are honest and few: `unconfigured` (nothing runs),
+`configured` (sealed, no exchange yet), `valid`, `unreachable`
+(network/rate trouble, self-healing), `denied` (bad or revoked
+credentials — fix the configuration). A `pending install` chip rides
+beside them between Create and Install. One transient to know: after a
+daemon restart mid-pending, the chip reads plain `configured` until the
+section's first discovery call (or a scanner pass) re-establishes the
+pending phase — status polls never unseal the document, by design.
+Remove deletes the sealed entry (idempotent, audited as
+`key_custody_removed`) and returns the integration to `unconfigured`.
+
+The effective watch set is the intersection of your configured list and
+the installation's repositories — a repo listed but not installed (or
+vice versa) simply isn't watched, and the status surface shows the
+configured list so nothing skips silently.
+
+The ceremony needs the browser to reach the daemon's own origin
+(loopback or a directly-reached TLS dashboard) and a custody backend on
+the daemon (macOS today — the Connect button refuses by name
+otherwise). Where either is missing, the manual fallback below is the
+path.
+
+## Fallback: the manual five-field ceremony
+
+The form under *Enter credentials manually* accepts everything the
+one-click path automates — it remains fully supported:
 
 1. **Register the App** — GitHub → your org (or user) → Settings →
    Developer settings → GitHub Apps → *New GitHub App*. Name it
@@ -145,30 +208,24 @@ You (the owner) do this once; agents cannot and must not.
    the account → *Only select repositories* → pick the repos to watch.
    After installing, the browser URL ends in the **installation id**
    (`…/settings/installations/<number>`).
-4. **Enter it in the Vault tab** — dashboard → **Vault** → *GitHub App
-   integration*: paste the App ID, installation id, and the `.pem`
-   contents; list the repos to watch (`owner/repo`, one per line);
-   *Save & verify*. The key seals into custody and the daemon performs
-   one real exchange (token mint plus, when repos are listed, a pull
-   list) so the status chip says `valid` — or tells you exactly why
-   not. Delete the downloaded `.pem` afterwards; the sealed copy is now
-   the working one.
-5. **Done.** Status states are honest and few: `unconfigured` (nothing
-   runs), `configured` (sealed, no exchange yet), `valid`,
-   `unreachable` (network/rate trouble, self-healing), `denied` (bad or
-   revoked credentials — fix the configuration). Remove deletes the
-   sealed entry (idempotent, audited as `key_custody_removed`) and
-   returns the integration to `unconfigured`.
-
-The effective watch set is the intersection of your configured list and
-the installation's repositories — a repo listed but not installed (or
-vice versa) simply isn't watched, and the status surface shows the
-configured list so nothing skips silently.
+4. **Enter it in the Vault tab** — paste the App ID, installation id,
+   and the `.pem` contents; list the repos to watch (`owner/repo`, one
+   per line); *Save & verify*. Delete the downloaded `.pem` afterwards;
+   the sealed copy is now the working one.
 
 ## Endpoints
 
 `POST /api/integrations/github` (configure; `credentials.manage`),
 `GET /api/integrations/github/status` (`settings`),
-`DELETE /api/integrations/github` (`credentials.manage`) — declared on
-the gateway route table with dashboard-tunnel twins
-(`api_github_integration_save` / `_status` / `_remove`).
+`DELETE /api/integrations/github` (`credentials.manage`),
+`GET /api/integrations/github/installations` and
+`GET /api/integrations/github/repositories` (both `credentials.manage`
+— they unseal the key to mint tokens) — declared on the gateway route
+table with dashboard-tunnel twins (`api_github_integration_save` /
+`_status` / `_remove`, `api_github_installations` /
+`api_github_repositories`). The ceremony's two HTTP-only routes carry
+no tunnel twin by design: `POST
+/api/integrations/github/manifest-start` (`credentials.manage`; its
+payload is only meaningful to a browser on the daemon's own origin) and
+`GET /api/integrations/github/callback` (the authority-free redirect
+landing — the single-use state is the authorization).
