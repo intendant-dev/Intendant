@@ -764,6 +764,7 @@ mod tests {
     struct TempCustody {
         backend: intendant_custody::PlainFileBackend,
         stores: Mutex<usize>,
+        available: bool,
     }
 
     impl TempCustody {
@@ -771,6 +772,15 @@ mod tests {
             Self {
                 backend: intendant_custody::PlainFileBackend::new(root.join("custody")).unwrap(),
                 stores: Mutex::new(0),
+                available: true,
+            }
+        }
+
+        /// The non-macOS shape: no backend to seal with.
+        fn unavailable(root: &Path) -> Self {
+            Self {
+                available: false,
+                ..Self::new(root)
             }
         }
     }
@@ -783,7 +793,7 @@ mod tests {
                 .unwrap_or(false)
         }
         fn backend_available(&self) -> bool {
-            true
+            self.available
         }
         fn retrieve(&self) -> Option<Vec<u8>> {
             use intendant_custody::CustodyBackend as _;
@@ -906,6 +916,569 @@ mod tests {
         }
         assert_eq!(*custody.stores.lock().unwrap(), 0, "nothing may be sealed");
         assert!(!custody.present());
+    }
+
+    // ── The one-click ceremony (Track GC) ─────────────────────────────
+
+    use crate::github_pr::client::test_fixture::{spawn_fixture, token_route, FixtureResponse};
+    use crate::github_pr::manifest_ceremony::ManifestCeremonySlot;
+    use std::collections::HashMap;
+
+    const NOW: u64 = 1_700_000_000_000;
+    const CLIENT_SECRET_CANARY: &str = "canary-client-secret-3f1";
+    const WEBHOOK_SECRET_CANARY: &str = "canary-webhook-secret-9d4";
+
+    fn conversion_route(code: &str) -> ((String, String), FixtureResponse) {
+        let body = serde_json::json!({
+            "id": 4242,
+            "slug": "intendant-example",
+            "node_id": "A_node",
+            "name": "Intendant (example)",
+            "client_id": "Iv1.fixture",
+            "client_secret": CLIENT_SECRET_CANARY,
+            "webhook_secret": WEBHOOK_SECRET_CANARY,
+            "pem": crate::github_pr::client::test_rsa_pem(),
+            "html_url": "https://github.com/apps/intendant-example",
+            "owner": {"login": "example-org"},
+        })
+        .to_string();
+        (
+            (
+                "POST".to_string(),
+                format!("/app-manifests/{code}/conversions"),
+            ),
+            (201, Vec::new(), body),
+        )
+    }
+
+    fn begun_slot(now_ms: u64) -> (ManifestCeremonySlot, String) {
+        let slot = ManifestCeremonySlot::default();
+        let state = slot
+            .begin(
+                "http://127.0.0.1:8765".to_string(),
+                None,
+                "principal:test-starter".to_string(),
+                now_ms,
+            )
+            .expect("begin ceremony");
+        (slot, state)
+    }
+
+    fn callback_line(code: Option<&str>, state: Option<&str>) -> String {
+        let mut query = Vec::new();
+        if let Some(code) = code {
+            query.push(format!("code={code}"));
+        }
+        if let Some(state) = state {
+            query.push(format!("state={state}"));
+        }
+        format!(
+            "GET /api/integrations/github/callback?{} HTTP/1.1",
+            query.join("&")
+        )
+    }
+
+    fn page_status(response: &ApiResponse) -> (u16, String) {
+        match response {
+            ApiResponse::Bytes { status, bytes, .. } => {
+                let BytesPayload::InMemory(body) = bytes;
+                (*status, String::from_utf8_lossy(body).to_string())
+            }
+            _ => panic!("ceremony pages ride the bytes lane"),
+        }
+    }
+
+    /// The happy path: a valid state + code converts once, seals the
+    /// pending-install document, and the secrets GitHub returned are
+    /// discarded at parse — no sealed byte and no file under the test
+    /// root carries either canary.
+    #[tokio::test]
+    async fn one_click_callback_converts_seals_pending_and_discards_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([conversion_route("goodcode123")])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, state) = begun_slot(NOW);
+
+        let response = github_manifest_callback_api_response(
+            &callback_line(Some("goodcode123"), Some(&state)),
+            "test-src-happy",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 1,
+        )
+        .await;
+        let (status, page) = page_status(&response);
+        assert_eq!(status, 200, "page: {page}");
+        assert!(page.contains("intendant-example"), "page names the slug");
+        assert!(
+            page.contains("http://127.0.0.1:8765/"),
+            "page links the ceremony origin back"
+        );
+        assert_eq!(
+            fixture.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one conversion exchange"
+        );
+
+        let sealed = custody.retrieve().expect("sealed document exists");
+        let doc =
+            crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(&sealed)
+                .expect("parses in this build");
+        assert_eq!(doc.app_id, "4242");
+        assert_eq!(doc.installation_id, None, "sealed pending-install");
+        assert_eq!(doc.slug.as_deref(), Some("intendant-example"));
+        assert!(doc.private_key_pem.starts_with("-----BEGIN"));
+
+        // The named secrets-discard pin: the narrow parse never retained
+        // them, so no sealed byte sequence and no file under the test
+        // root contains either canary.
+        let sealed_text = String::from_utf8_lossy(&sealed);
+        assert!(!sealed_text.contains(CLIENT_SECRET_CANARY));
+        assert!(!sealed_text.contains(WEBHOOK_SECRET_CANARY));
+        let mut pending_dirs = vec![dir.path().to_path_buf()];
+        while let Some(scan) = pending_dirs.pop() {
+            for entry in std::fs::read_dir(&scan).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending_dirs.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).unwrap();
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        !text.contains(CLIENT_SECRET_CANARY)
+                            && !text.contains(WEBHOOK_SECRET_CANARY),
+                        "{path:?} must not carry a discarded secret"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            runtime.pending_install_slug().as_deref(),
+            Some("intendant-example")
+        );
+        let body = body_json(&github_integration_status_api_response(
+            Some(dir.path()),
+            &custody,
+            &runtime,
+        ));
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["pending_install"], true);
+        assert_eq!(body["app_slug"], "intendant-example");
+        assert_eq!(body["status"], "configured", "the label vocabulary is unchanged");
+    }
+
+    /// The named foreign-code pin: without a valid state — absent OR
+    /// wrong — the conversion endpoint is NEVER called (hit count zero),
+    /// nothing seals, and the refusal page is uniform.
+    #[tokio::test]
+    async fn callback_without_valid_state_never_reaches_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([conversion_route("foreigncode")])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, _state) = begun_slot(NOW);
+
+        let absent = github_manifest_callback_api_response(
+            &callback_line(Some("foreigncode"), None),
+            "test-src-foreign",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 1,
+        )
+        .await;
+        assert_eq!(page_status(&absent).0, 403);
+
+        let wrong = github_manifest_callback_api_response(
+            &callback_line(Some("foreigncode"), Some("not-the-state")),
+            "test-src-foreign",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 2,
+        )
+        .await;
+        let (status, page) = page_status(&wrong);
+        assert_eq!(status, 403);
+        assert_eq!(
+            page, page_status(&absent).1,
+            "refusals are uniform: absent and wrong states read identically"
+        );
+
+        assert_eq!(
+            fixture.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the conversion endpoint must never be reached without a valid state"
+        );
+        assert!(!custody.present(), "nothing seals on a refused callback");
+        assert_eq!(*custody.stores.lock().unwrap(), 0);
+    }
+
+    /// The named replay pin: the second identical callback refuses with
+    /// zero additional conversion exchanges and the store count stays 1.
+    #[tokio::test]
+    async fn replayed_callback_refuses_with_zero_new_conversions_and_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([conversion_route("replaycode")])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, state) = begun_slot(NOW);
+        let line = callback_line(Some("replaycode"), Some(&state));
+
+        let first = github_manifest_callback_api_response(
+            &line,
+            "test-src-replay",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 1,
+        )
+        .await;
+        assert_eq!(page_status(&first).0, 200);
+
+        let replay = github_manifest_callback_api_response(
+            &line,
+            "test-src-replay",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 2,
+        )
+        .await;
+        assert_eq!(page_status(&replay).0, 403);
+        assert_eq!(
+            fixture.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a replayed callback must not reach GitHub again"
+        );
+        assert_eq!(*custody.stores.lock().unwrap(), 1, "one seal, ever");
+    }
+
+    /// The named expired-state pin: past the TTL the refusal is uniform
+    /// and the conversion endpoint is never called.
+    #[tokio::test]
+    async fn expired_state_refuses_without_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([conversion_route("latecode")])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, state) = begun_slot(NOW);
+
+        let response = github_manifest_callback_api_response(
+            &callback_line(Some("latecode"), Some(&state)),
+            "test-src-expired",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + crate::github_pr::manifest_ceremony::MANIFEST_STATE_TTL_MS,
+        )
+        .await;
+        assert_eq!(page_status(&response).0, 403);
+        assert_eq!(fixture.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!custody.present());
+    }
+
+    /// A conversion failure after the burn ends the ceremony: the state
+    /// cannot be replayed into a second attempt (fail-closed ordering).
+    #[tokio::test]
+    async fn failed_conversion_ends_the_ceremony() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        // No conversion route: the fixture answers 404 (an invalid code).
+        let fixture = spawn_fixture(HashMap::new()).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, state) = begun_slot(NOW);
+        let line = callback_line(Some("deadcode"), Some(&state));
+
+        let first = github_manifest_callback_api_response(
+            &line,
+            "test-src-dead",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 1,
+        )
+        .await;
+        assert_eq!(page_status(&first).0, 502, "conversion failure is named");
+        assert_eq!(fixture.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!custody.present(), "no seal without a conversion");
+
+        let retry = github_manifest_callback_api_response(
+            &line,
+            "test-src-dead",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 2,
+        )
+        .await;
+        assert_eq!(
+            page_status(&retry).0,
+            403,
+            "the burn preceded the exchange; the ceremony is over"
+        );
+        assert_eq!(
+            fixture.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a burned state never converts again"
+        );
+    }
+
+    /// A malformed code is refused BEFORE the burn: a garbage probe must
+    /// not cost the owner their pending ceremony.
+    #[tokio::test]
+    async fn malformed_code_refuses_before_burning_the_ceremony() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([conversion_route("kept-code")])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let (slot, state) = begun_slot(NOW);
+
+        let garbage = github_manifest_callback_api_response(
+            &callback_line(Some("bad%2Fcode"), Some(&state)),
+            "test-src-shape",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 1,
+        )
+        .await;
+        assert_eq!(page_status(&garbage).0, 403);
+        assert_eq!(fixture.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // The pending ceremony survived the probe: the honest callback
+        // still completes.
+        let honest = github_manifest_callback_api_response(
+            &callback_line(Some("kept-code"), Some(&state)),
+            "test-src-shape",
+            &custody,
+            &slot,
+            &runtime,
+            NOW + 2,
+        )
+        .await;
+        assert_eq!(page_status(&honest).0, 200);
+    }
+
+    /// The custody precheck refuses manifest-start up front on a
+    /// backend-less platform — the owner must never create an App whose
+    /// key cannot seal — and no ceremony state is minted.
+    #[test]
+    fn manifest_start_refuses_without_custody_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::unavailable(dir.path());
+        let slot = ManifestCeremonySlot::default();
+        let response = github_manifest_start_api_response(
+            b"{}",
+            &custody,
+            &slot,
+            false,
+            Some("127.0.0.1:8765"),
+            "example-host",
+            "principal:test-starter",
+            NOW,
+        );
+        assert_eq!(status_of(&response), 400);
+        assert!(body_json(&response)
+            .to_string()
+            .contains("custody backend"));
+        assert!(!slot.active(NOW), "no state mints on a refused start");
+    }
+
+    #[test]
+    fn manifest_start_mints_state_and_composes_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let slot = ManifestCeremonySlot::default();
+        let response = github_manifest_start_api_response(
+            b"{}",
+            &custody,
+            &slot,
+            false,
+            Some("127.0.0.1:8765"),
+            "example-host",
+            "principal:test-starter",
+            NOW,
+        );
+        assert_eq!(status_of(&response), 200);
+        let body = body_json(&response);
+        let form_action = body["form_action"].as_str().unwrap();
+        assert!(
+            form_action.starts_with("https://github.com/settings/apps/new?state="),
+            "personal target: {form_action}"
+        );
+        assert_eq!(
+            body["manifest"]["redirect_url"],
+            "http://127.0.0.1:8765/api/integrations/github/callback"
+        );
+        assert_eq!(body["manifest"]["public"], false);
+        assert!(!body["manifest"]
+            .as_object()
+            .unwrap()
+            .contains_key("hook_attributes"));
+        assert!(slot.active(NOW + 1), "the ceremony is pending");
+
+        // Org target + validation.
+        let org = github_manifest_start_api_response(
+            br#"{"organization": "example-org"}"#,
+            &custody,
+            &slot,
+            true,
+            Some("box.example:8443"),
+            "example-host",
+            "principal:test-starter",
+            NOW,
+        );
+        let org_body = body_json(&org);
+        assert!(org_body["form_action"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://github.com/organizations/example-org/settings/apps/new?state="));
+        assert_eq!(
+            org_body["manifest"]["redirect_url"],
+            "https://box.example:8443/api/integrations/github/callback"
+        );
+
+        let bad_org = github_manifest_start_api_response(
+            br#"{"organization": "-bad handle-"}"#,
+            &custody,
+            &slot,
+            false,
+            Some("127.0.0.1:8765"),
+            "example-host",
+            "principal:test-starter",
+            NOW,
+        );
+        assert_eq!(status_of(&bad_org), 400);
+
+        let no_host = github_manifest_start_api_response(
+            b"{}",
+            &custody,
+            &slot,
+            false,
+            None,
+            "example-host",
+            "principal:test-starter",
+            NOW,
+        );
+        assert_eq!(status_of(&no_host), 400);
+    }
+
+    #[test]
+    fn validated_origin_refuses_authority_smuggling() {
+        assert_eq!(
+            validated_request_origin(false, Some("127.0.0.1:8765")).as_deref(),
+            Some("http://127.0.0.1:8765")
+        );
+        assert_eq!(
+            validated_request_origin(true, Some("Box.Example")).as_deref(),
+            Some("https://box.example")
+        );
+        for bad in [
+            "user@host",
+            "host/path",
+            "host?query=1",
+            "host#frag",
+            "",
+        ] {
+            assert_eq!(
+                validated_request_origin(false, Some(bad)),
+                None,
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The named manual-form regression pin: the five-field path still
+    /// configures end to end — a complete document seals, pending stays
+    /// false — and the one-click machinery is never consulted (no
+    /// conversion route exists on the fixture, and the hit count proves
+    /// only the verify exchange ran).
+    #[tokio::test]
+    async fn manual_form_regression_five_field_path_ignores_one_click_machinery() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([token_route()])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let payload = serde_json::json!({
+            "app_id": "123456",
+            "installation_id": 987,
+            "private_key_pem": crate::github_pr::client::test_rsa_pem(),
+        });
+        let response = github_integration_save_api_response(
+            payload.to_string().as_bytes(),
+            Some(dir.path()),
+            &custody,
+            &runtime,
+            "principal:test",
+            "local",
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_json(&response);
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["pending_install"], false);
+        assert_eq!(body["status"], "valid", "the real verify exchange ran");
+        let doc = crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(
+            &custody.retrieve().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.installation_id, Some(987), "complete, never pending");
+        assert_eq!(
+            fixture.token_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly the verify exchange — no ceremony machinery"
+        );
+    }
+
+    /// Completing a pending-install document through the save verb (the
+    /// GC2 auto-fill path) preserves the ceremony's key + slug and
+    /// clears the pending phase.
+    #[tokio::test]
+    async fn ids_only_save_completes_a_pending_document_and_clears_the_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        let fixture = spawn_fixture(HashMap::from([token_route()])).await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        let pending = crate::github_pr::credentials::GithubAppCredentials {
+            v: 1,
+            app_id: "123456".to_string(),
+            installation_id: None,
+            slug: Some("intendant-example".to_string()),
+            private_key_pem: crate::github_pr::client::test_rsa_pem().to_string(),
+        };
+        custody
+            .store(&pending.sealed_bytes().unwrap(), "principal:test", "test")
+            .unwrap();
+        runtime.set_pending_install("intendant-example".to_string());
+
+        let payload = serde_json::json!({"app_id": "123456", "installation_id": 987});
+        let response = github_integration_save_api_response(
+            payload.to_string().as_bytes(),
+            Some(dir.path()),
+            &custody,
+            &runtime,
+            "principal:test",
+            "local",
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_json(&response);
+        assert_eq!(body["pending_install"], false);
+        let doc = crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(
+            &custody.retrieve().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.installation_id, Some(987));
+        assert_eq!(
+            doc.slug.as_deref(),
+            Some("intendant-example"),
+            "the ceremony-recorded slug survives completion"
+        );
     }
 
     #[tokio::test]
