@@ -1354,6 +1354,19 @@ pub(crate) fn terminal_frame_dimension(frame: &serde_json::Value, key: &str, def
         .unwrap_or(default)
 }
 
+/// Push one dashboard frame onto a connected cloud worker's attachment.
+/// The per-frame IAM gate already cleared the same terminal operations
+/// the local registry would demand; past it, home spends its own (total)
+/// authority on the worker.
+fn forward_cloud_terminal_frame(frame: &serde_json::Value, task_id: &str) -> Result<(), String> {
+    let Some((to_worker, _)) = crate::codex_cloud_attach::attachment_channel(task_id) else {
+        return Err("cloud worker has no live attachment".to_string());
+    };
+    to_worker
+        .try_send(frame.to_string())
+        .map_err(|_| "cloud worker attachment is congested; frame dropped".to_string())
+}
+
 pub(crate) fn control_terminal_open_frame(
     frame: serde_json::Value,
     runtime: &ControlRuntime,
@@ -1366,6 +1379,75 @@ pub(crate) fn control_terminal_open_frame(
     let forwarder_key = (host_id.clone(), terminal_id.clone());
     if let Some(handle) = terminal_forwarders.remove(&forwarder_key) {
         handle.abort();
+    }
+    if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
+        // A cloud open always attaches-or-spawns ON THE WORKER, so it
+        // demands the same shell.spawn a local create would; view-only
+        // grants stop here.
+        let error_host = host_id.clone();
+        let error_term = terminal_id.clone();
+        let error_frame = move |error: String| {
+            serde_json::json!({
+                "t": "terminal_error",
+                "host_id": error_host.clone(),
+                "terminal_id": error_term.clone(),
+                "error": error,
+            })
+        };
+        let spawn_allowed = runtime_operation_decision(
+            runtime,
+            crate::peer::access_policy::PeerOperation::ShellSpawn,
+        )
+        .allowed;
+        let channel = if spawn_allowed {
+            crate::codex_cloud_attach::attachment_channel(task_id)
+                .ok_or_else(|| "cloud worker has no live attachment".to_string())
+        } else {
+            Err("shell.spawn is required to open a cloud worker terminal".to_string())
+        };
+        let terminal_output_tx = terminal_output_tx.clone();
+        let host = host_id.clone();
+        let term = terminal_id.clone();
+        let handle = tokio::spawn(async move {
+            let (to_worker, mut from_worker) = match channel {
+                Ok(channel) => channel,
+                Err(error) => {
+                    let _ = terminal_output_tx.send(error_frame(error)).await;
+                    return;
+                }
+            };
+            if to_worker.send(frame.to_string()).await.is_err() {
+                let _ = terminal_output_tx
+                    .send(error_frame("cloud worker detached".to_string()))
+                    .await;
+                return;
+            }
+            loop {
+                match from_worker.recv().await {
+                    Ok(text) => {
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        let (reply_host, reply_term) = terminal_frame_key(&value);
+                        if reply_host == host
+                            && reply_term == term
+                            && terminal_output_tx.send(value).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = terminal_output_tx
+                            .send(error_frame("cloud worker detached".to_string()))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+        terminal_forwarders.insert(forwarder_key, handle);
+        return None;
     }
     let registry = runtime.terminal_registry.clone();
     // Everything this task emits — the open ack/error and the output
@@ -1465,6 +1547,10 @@ pub(crate) fn control_terminal_input_frame(
     let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
         return None;
     };
+    if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
+        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        return None;
+    }
     let registry = runtime.terminal_registry.clone();
     let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
@@ -1486,6 +1572,10 @@ pub(crate) fn control_terminal_resize_frame(
     let (host_id, terminal_id) = terminal_frame_key(&frame);
     let cols = terminal_frame_dimension(&frame, "cols", 80);
     let rows = terminal_frame_dimension(&frame, "rows", 24);
+    if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
+        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        return None;
+    }
     let registry = runtime.terminal_registry.clone();
     let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
@@ -1509,6 +1599,10 @@ pub(crate) fn control_terminal_close_frame(
     if let Some(handle) = terminal_forwarders.remove(&(host_id.clone(), terminal_id.clone())) {
         handle.abort();
     }
+    if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
+        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        return None;
+    }
     let registry = runtime.terminal_registry.clone();
     let actor = runtime.grant.terminal_actor();
     tokio::spawn(async move {
@@ -1531,6 +1625,15 @@ pub(crate) fn control_terminal_share_frame(
         .get("shared")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
+    if crate::codex_cloud_attach::cloud_host_task_id(&host_id).is_some() {
+        let _ = terminal_events_tx.send(serde_json::json!({
+            "t": "terminal_error",
+            "host_id": host_id,
+            "terminal_id": terminal_id,
+            "error": "sharing is not available on a cloud worker terminal",
+        }));
+        return None;
+    }
     let registry = runtime.terminal_registry.clone();
     let actor = runtime.grant.terminal_actor();
     let terminal_events_tx = terminal_events_tx.clone();
