@@ -370,6 +370,10 @@ impl DisplayBackend for X11Backend {
     fn kind(&self) -> &'static str {
         "x11"
     }
+
+    fn x11_display_hint(&self) -> Option<String> {
+        Some(self.display.clone())
+    }
 }
 
 /// Browser mouse-button index (0=left, 1=middle, 2=right) to the X11
