@@ -217,23 +217,58 @@ pub(crate) fn binding_for_fingerprint(
 
 // ── Redemption (the public enroll route's core) ────────────────────────
 
-/// Light global limiter on the public doorbell. The single-use token is
-/// the real gate; this just keeps a scanner from grinding the store.
-static ENROLL_RATE: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
-const ENROLL_RATE_WINDOW_MS: u64 = 60_000;
-const ENROLL_RATE_MAX: u32 = 30;
+/// Doorbell limiter, per-source first (the pairing doorbell's design in
+/// `peer::access_request::enforce_create_rate_limits`): one cheap scanner
+/// must not be able to hold every legitimate worker at 429, so each
+/// source gets its own sliding window and the global window is only the
+/// wider backstop. The single-use token stays the real gate; this keeps
+/// the store from being ground. Emptied source queues are dropped so the
+/// map cannot grow without bound under rotating sources.
+struct EnrollRateLimiter {
+    global: std::collections::VecDeque<u64>,
+    per_source: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
+}
 
-pub(crate) fn enroll_rate_ok(now_ms: u64) -> bool {
-    let mut state = ENROLL_RATE
+static ENROLL_RATE: std::sync::OnceLock<std::sync::Mutex<EnrollRateLimiter>> =
+    std::sync::OnceLock::new();
+const ENROLL_RATE_WINDOW_MS: u64 = 60_000;
+const ENROLL_RATE_GLOBAL_MAX: usize = 60;
+const ENROLL_RATE_PER_SOURCE_MAX: usize = 10;
+
+fn prune_rate_window(queue: &mut std::collections::VecDeque<u64>, now_ms: u64) {
+    while let Some(at_ms) = queue.front().copied() {
+        if now_ms.saturating_sub(at_ms) < ENROLL_RATE_WINDOW_MS {
+            break;
+        }
+        queue.pop_front();
+    }
+}
+
+pub(crate) fn enroll_rate_ok(source: &str, now_ms: u64) -> bool {
+    let limiter = ENROLL_RATE.get_or_init(|| {
+        std::sync::Mutex::new(EnrollRateLimiter {
+            global: std::collections::VecDeque::new(),
+            per_source: std::collections::HashMap::new(),
+        })
+    });
+    let mut limiter = limiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if now_ms.saturating_sub(state.0) > ENROLL_RATE_WINDOW_MS {
-        *state = (now_ms, 0);
-    }
-    if state.1 >= ENROLL_RATE_MAX {
+    limiter.per_source.retain(|_, queue| {
+        prune_rate_window(queue, now_ms);
+        !queue.is_empty()
+    });
+    prune_rate_window(&mut limiter.global, now_ms);
+    if limiter.global.len() >= ENROLL_RATE_GLOBAL_MAX {
         return false;
     }
-    state.1 += 1;
+    let source_queue = limiter.per_source.entry(source.to_string()).or_default();
+    prune_rate_window(source_queue, now_ms);
+    if source_queue.len() >= ENROLL_RATE_PER_SOURCE_MAX {
+        return false;
+    }
+    source_queue.push_back(now_ms);
+    limiter.global.push_back(now_ms);
     true
 }
 
@@ -394,18 +429,47 @@ pub(crate) async fn serve_attachment_socket<S>(
         Ok(_) => eprintln!("[codex-cloud] worker attached for {task_id}"),
         Err(error) => eprintln!("[codex-cloud] attachment connect for {task_id}: {error}"),
     }
-    let (_write, mut read) = ws_stream.split();
-    while let Some(frame) = read.next().await {
-        match frame {
-            Ok(message) if message.is_close() => break,
-            Ok(_) => {}
-            Err(_) => break,
+    // The identity's hard expiry bounds the live socket too — admission
+    // checks the record, but a socket opened at minute 59 must not hold
+    // the attachment past the hour. Time-boxed means the clock wins.
+    let remaining_ms = attachment_remaining_ms(
+        binding.identity_expires_at_unix,
+        crate::codex_cloud::now_unix_ms(),
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
+    let (mut write, mut read) = ws_stream.split();
+    loop {
+        tokio::select! {
+            frame = read.next() => match frame {
+                None => break,
+                Some(Ok(message)) if message.is_close() => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                eprintln!(
+                    "[codex-cloud] cloud-worker identity for {task_id} expired; closing the attachment"
+                );
+                use futures_util::SinkExt as _;
+                let _ = write.close().await;
+                break;
+            }
         }
     }
     match record_attachment_state(&lease_store, &task_id, AttachmentState::Disconnected) {
         Ok(_) => eprintln!("[codex-cloud] worker detached for {task_id}"),
         Err(error) => eprintln!("[codex-cloud] attachment disconnect for {task_id}: {error}"),
     }
+}
+
+/// Milliseconds of socket lifetime left before the identity's record
+/// expiry — zero for an already-expired identity, so the caller's
+/// deadline fires immediately.
+fn attachment_remaining_ms(identity_expires_at_unix: i64, now_ms: u64) -> u64 {
+    u64::try_from(identity_expires_at_unix)
+        .unwrap_or(0)
+        .saturating_mul(1000)
+        .saturating_sub(now_ms)
 }
 
 // ── Attach verb (home side) ────────────────────────────────────────────
@@ -419,8 +483,13 @@ fn home_url_from(args_value: Option<String>) -> Result<String, String> {
             "attach needs the daemon's reachable WSS URL: pass --home-url wss://host:port or set INTENDANT_CODEX_CLOUD_HOME_URL"
                 .to_string()
         })?;
-    if !(url.starts_with("wss://") || url.starts_with("ws://")) {
-        return Err(format!("home URL must be ws(s)://…, got '{url}'"));
+    // wss:// only: the ceremony's token would ride plain HTTP on a ws://
+    // base, and a plaintext socket can present no client certificate, so
+    // the attachment could never form anyway.
+    if !url.starts_with("wss://") {
+        return Err(format!(
+            "home URL must be wss://… (the enrollment token and the mTLS attachment both require TLS), got '{url}'"
+        ));
     }
     Ok(url)
 }
@@ -474,7 +543,7 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
                 home_url_arg = Some(
                     args.get(i)
                         .cloned()
-                        .ok_or("--home-url requires a ws(s):// URL")?,
+                        .ok_or("--home-url requires a wss:// URL")?,
                 );
             }
             "--token-ttl-s" => {
@@ -599,11 +668,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         match args[i].as_str() {
             "--home" => {
                 i += 1;
-                home = Some(
-                    args.get(i)
-                        .cloned()
-                        .ok_or("--home requires a ws(s):// URL")?,
-                );
+                home = Some(args.get(i).cloned().ok_or("--home requires a wss:// URL")?);
             }
             "--home-fingerprint" => {
                 i += 1;
@@ -629,8 +694,10 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let home = home.ok_or("agent requires --home wss://host:port")?;
-    if !(home.starts_with("wss://") || home.starts_with("ws://")) {
-        return Err(format!("--home must be ws(s)://…, got '{home}'"));
+    if !home.starts_with("wss://") {
+        return Err(format!(
+            "--home must be wss://… (the enrollment token and the mTLS attachment both require TLS), got '{home}'"
+        ));
     }
     let home_fingerprint = home_fingerprint
         .ok_or("agent requires --home-fingerprint (pin the daemon's TLS identity)")?;
@@ -667,7 +734,10 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("generate keypair: {e}"))?;
     let key_path = state_dir.join("client.key");
     let cert_path = state_dir.join("client.crt");
-    write_private(&key_path, key_pair.serialize_pem().as_bytes())?;
+    // Owner-only from creation (0600 on Unix) — never write-then-chmod a
+    // private key.
+    intendant_core::state_paths::write_private_file(&key_path, key_pair.serialize_pem())
+        .map_err(|e| format!("write {}: {e}", key_path.display()))?;
 
     // 2. Redeem the token for a certificate at the public enroll route.
     let http_base = crate::peer::transport::ws_url_to_http_base(&home);
@@ -767,17 +837,6 @@ fn collect_worker_fingerprint(now_ms: u64) -> crate::codex_cloud::WorkerFingerpr
         mem_kb: None,
         collected_at_unix_ms: now_ms,
     }
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    }
-    Ok(())
 }
 
 async fn hold_attachment(
@@ -945,6 +1004,39 @@ mod tests {
         assert!(prompt.contains("tok-secret"));
         assert!(prompt.contains("run-worker.sh"));
         assert!(prompt.contains("foreground"));
+    }
+
+    #[test]
+    fn enroll_rate_limit_is_per_source_with_a_global_backstop() {
+        // Streaks use a far-future epoch so parallel tests sharing the
+        // process-wide limiter cannot interfere inside this window.
+        let base = 3_000_000_000_000u64;
+        for i in 0..ENROLL_RATE_PER_SOURCE_MAX {
+            assert!(enroll_rate_ok("198.51.100.7", base + i as u64), "{i}");
+        }
+        // The noisy source is throttled…
+        assert!(!enroll_rate_ok("198.51.100.7", base + 50));
+        // …while a different source is untouched.
+        assert!(enroll_rate_ok("198.51.100.8", base + 51));
+        // The noisy source recovers once its window slides.
+        assert!(enroll_rate_ok(
+            "198.51.100.7",
+            base + ENROLL_RATE_WINDOW_MS + 100
+        ));
+    }
+
+    #[test]
+    fn attachment_deadline_is_zero_once_the_identity_expired() {
+        assert_eq!(attachment_remaining_ms(100, 100_000), 0);
+        assert_eq!(attachment_remaining_ms(100, 99_000), 1_000);
+        assert_eq!(attachment_remaining_ms(-5, 0), 0);
+    }
+
+    #[test]
+    fn home_urls_must_be_wss() {
+        let err = home_url_from(Some("ws://127.0.0.1:8765/ws".into())).unwrap_err();
+        assert!(err.contains("wss://"), "{err}");
+        assert!(home_url_from(Some("wss://home.example:8443/ws".into())).is_ok());
     }
 
     #[test]
