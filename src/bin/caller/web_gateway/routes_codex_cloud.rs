@@ -89,23 +89,33 @@ pub(crate) async fn handle_codex_cloud_enroll(
     stream: DemuxStream,
     body: String,
     cert_dir: PathBuf,
+    peer_addr: std::net::SocketAddr,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = codex_cloud_enroll_response(body, cert_dir).await;
+    let response = codex_cloud_enroll_response(body, cert_dir, peer_addr).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-async fn codex_cloud_enroll_response(body: String, cert_dir: PathBuf) -> ApiResponse {
-    if !crate::codex_cloud_attach::enroll_rate_ok(crate::codex_cloud::now_unix_ms()) {
-        return ApiResponse::json_error(429, "enrollment is rate limited; retry shortly");
-    }
+async fn codex_cloud_enroll_response(
+    body: String,
+    cert_dir: PathBuf,
+    peer_addr: std::net::SocketAddr,
+) -> ApiResponse {
+    // Parse before counting: unparseable spray never consumes the
+    // allowance, so it cannot starve well-formed redemptions.
     let request: crate::codex_cloud_attach::EnrollRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(error) => {
             return ApiResponse::json_error(400, format!("invalid enrollment request: {error}"))
         }
     };
+    if !crate::codex_cloud_attach::enroll_rate_ok(
+        &peer_addr.ip().to_string(),
+        crate::codex_cloud::now_unix_ms(),
+    ) {
+        return ApiResponse::json_error(429, "enrollment is rate limited; retry shortly");
+    }
     let outcome = tokio::task::spawn_blocking(move || {
         crate::codex_cloud_attach::redeem_enrollment(
             &cert_dir,

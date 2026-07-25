@@ -1192,6 +1192,7 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     cert_dir,
+                    peer_addr,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
