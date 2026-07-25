@@ -572,12 +572,17 @@ pub(crate) async fn convert_manifest_code(
         .header("X-GitHub-Api-Version", API_VERSION)
         .send()
         .await
-        .map_err(|error| ApiError::Unreachable(error.to_string()))?;
+        // `without_url`: reqwest's Display embeds the request URL, and
+        // this one carries the still-live single-use code — it must
+        // never reach an error page or a log line.
+        .map_err(|error| ApiError::Unreachable(error.without_url().to_string()))?;
     let response = classify(response).await?;
     response
         .json::<ManifestConversion>()
         .await
-        .map_err(|error| ApiError::Unreachable(format!("conversion response: {error}")))
+        .map_err(|error| {
+            ApiError::Unreachable(format!("conversion response: {}", error.without_url()))
+        })
 }
 
 /// Map a non-2xx response onto the named failure classes. 304 never
