@@ -4,7 +4,7 @@
 //! wrapper, never a PAT. The App client, custody entry, and
 //! configuration/status surface landed first; the scanner mirrors
 //! watched PRs as thin agenda anchors (see `scanner`); the render-time
-//! state join arrives in the next slice.
+//! join serves live PR state beside those anchors (see `join`).
 //!
 //! The coordination radar's `gh` file-set read is a separate,
 //! deliberately cheap lane and stays untouched; unifying the two onto
@@ -12,5 +12,6 @@
 
 pub(crate) mod client;
 pub(crate) mod credentials;
+pub(crate) mod join;
 pub(crate) mod scanner;
 pub(crate) mod status;

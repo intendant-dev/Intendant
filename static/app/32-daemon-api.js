@@ -149,6 +149,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_fs_list: { verb: 'GET', path: '/api/fs/list', query: ['path'] },
   api_fs_read: { verb: 'GET', path: '/api/fs/read', query: ['path'], lane: 'bytes' },
   api_fs_mkdir: { verb: 'POST', path: '/api/fs/mkdir' },
+  api_agenda_pr_state: { verb: 'GET', path: '/api/agenda/items/{item_id}/pr-state' },
   api_github_integration_save: { verb: 'POST', path: '/api/integrations/github' },
   api_github_integration_status: { verb: 'GET', path: '/api/integrations/github/status' },
   api_github_integration_remove: { verb: 'DELETE', path: '/api/integrations/github' },

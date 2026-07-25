@@ -21,16 +21,97 @@ pub(crate) async fn agenda_list_api_response(
     };
     let (items, counts, skipped_lines) = agenda.snapshot();
     let sessions = agenda_sessions_join(&crate::platform::home_dir(), &items);
-    ApiResponse::json(
-        200,
-        JsonBody::Value(serde_json::json!({
-            "items": items,
-            "counts": counts,
-            "skipped_lines": skipped_lines,
-            "reminder_policy": agenda.reminder_policy(),
-            "sessions": sessions,
-        })),
-    )
+    // Tier-1 PR state for the anchors this snapshot serves — the same
+    // sibling discipline as `sessions`: keyed by the anchors' url-ref
+    // locators, memory-only (the scanner's poll fetched it, not this
+    // render), a locator with no entry claims nothing. Omitted entirely
+    // when nothing joins.
+    let pull_requests = crate::github_pr::join::tier1().for_locators(
+        items
+            .iter()
+            .flat_map(|item| item.refs.iter())
+            .map(|r| r.locator.as_str()),
+    );
+    let mut body = serde_json::json!({
+        "items": items,
+        "counts": counts,
+        "skipped_lines": skipped_lines,
+        "reminder_policy": agenda.reminder_policy(),
+        "sessions": sessions,
+    });
+    if !pull_requests.is_empty() {
+        body.as_object_mut()
+            .expect("object body")
+            .insert("pull_requests".to_string(), pull_requests.into());
+    }
+    ApiResponse::json(200, JsonBody::Value(body))
+}
+
+/// Transport-neutral core of `GET /api/agenda/items/{item_id}/pr-state`
+/// (tunnel twin `api_agenda_pr_state`): the tier-2 render join — checks,
+/// review, mergeability — fetched through the daemon cache on card
+/// expand, never on list render, never stored, never an op. Absent data
+/// claims nothing: no client (integration unconfigured/paused), no PR
+/// ref, or any GitHub failure all serve `status: "unavailable"` — the
+/// card degrades to the anchor, it never errors.
+pub(crate) async fn agenda_pr_state_api_response(
+    item_id: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let Some(item) = agenda.item_by_id(item_id) else {
+        return ApiResponse::json_error(404, "agenda item not found");
+    };
+    let Some((locator, repo, number)) = item.refs.iter().find_map(|r| {
+        crate::github_pr::scanner::parse_pr_locator(&r.locator)
+            .map(|(repo, number)| (r.locator.clone(), repo, number))
+    }) else {
+        return ApiResponse::json_error(404, "item has no pull-request reference");
+    };
+    let client = crate::github_pr::join::published_client()
+        .read()
+        .expect("client slot poisoned")
+        .clone();
+    let unavailable = |detail: &str| {
+        ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({
+                "item_id": item_id,
+                "status": "unavailable",
+                "detail": detail,
+            })),
+        )
+    };
+    let Some(client) = client else {
+        return unavailable("integration not running");
+    };
+    match crate::github_pr::join::tier2()
+        .fetch_through(&client, &repo, number, &locator)
+        .await
+    {
+        Some(state) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({
+                "item_id": item_id,
+                "status": "live",
+                "state": state,
+            })),
+        ),
+        None => unavailable("GitHub unreachable or the PR is gone"),
+    }
+}
+
+pub(crate) async fn handle_agenda_pr_state(
+    stream: DemuxStream,
+    item_id: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_pr_state_api_response(&item_id, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Display-resolution join for the sessions the served items reference:
@@ -287,6 +368,221 @@ pub(crate) async fn handle_agenda_occurrences(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_with_agenda(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<crate::mcp::IntendantServer>,
+        Arc<crate::agenda::AgendaHandle>,
+    ) {
+        let bus = crate::event::EventBus::new();
+        let mut state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            dir.join("logs"),
+        );
+        let agenda_dir = dir.join("agenda");
+        let handle = Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(&agenda_dir).unwrap(),
+            bus.clone(),
+            &agenda_dir,
+        ));
+        state.agenda = Some(handle.clone());
+        let server = Arc::new(crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus,
+        ));
+        (server, handle)
+    }
+
+    fn park_pr_anchor(agenda: &crate::agenda::AgendaHandle, locator: &str) -> String {
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Task,
+                    title: "r#5: fixture anchor".into(),
+                    body: String::new(),
+                    tags: vec!["pr".into()],
+                    due_ms: None,
+                    source: Some("github-pr-scanner".into()),
+                    refs: vec![crate::agenda::AgendaRefSpec {
+                        ref_type: crate::agenda::AgendaRefType::Url,
+                        locator: locator.to_string(),
+                        must_read: false,
+                        label: None,
+                    }],
+                },
+                Some(crate::agenda::AgendaActor::daemon()),
+            )
+            .unwrap()
+            .id
+    }
+
+    fn json_of(response: &ApiResponse) -> serde_json::Value {
+        match response {
+            ApiResponse::Json { body, .. } => {
+                serde_json::from_str(&body.as_text()).expect("json body")
+            }
+            _ => panic!("expected the JSON lane"),
+        }
+    }
+
+    /// Tier 1 rides the snapshot as a sibling map keyed by served
+    /// anchors' locators — items without joined refs produce no key at
+    /// all, and the item DTO itself never grows a state field.
+    #[tokio::test]
+    async fn snapshot_serves_tier1_sibling_for_served_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let locator = "https://github.com/o/r/pull/5";
+        park_pr_anchor(&agenda, locator);
+        let open: Vec<crate::github_pr::client::PrSummary> =
+            serde_json::from_value(serde_json::json!([
+                crate::github_pr::client::test_fixture::pull(5, "live", true)
+            ]))
+            .unwrap();
+        crate::github_pr::join::tier1().update_repo("o/r", &open);
+
+        let body = json_of(&agenda_list_api_response(Some(&server)).await);
+        let joined = &body["pull_requests"][locator];
+        assert_eq!(joined["draft"], true);
+        assert_eq!(joined["title"], "live");
+        assert!(joined["fetched_at_ms"].as_u64().unwrap() > 0);
+        let item = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| {
+                i["tags"]
+                    .as_array()
+                    .is_some_and(|t| t.iter().any(|x| x == "pr"))
+            })
+            .unwrap();
+        assert!(
+            item.get("pull_request").is_none() && item.get("pr_state").is_none(),
+            "join data must never become item fields"
+        );
+    }
+
+    /// The tier-2 expand lane: live state from the fixture while a
+    /// client is published; unavailable (never an error) without one;
+    /// and the op log stays byte-identical throughout — joined state is
+    /// served, never stored, never an op.
+    #[tokio::test]
+    async fn pr_state_serves_live_degrades_and_never_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let locator = "https://github.com/o/r/pull/5";
+        let item_id = park_pr_anchor(&agenda, locator);
+        let log_path = dir.path().join("agenda").join("agenda.jsonl");
+        let log_before = std::fs::read(&log_path).unwrap();
+
+        use crate::github_pr::client::test_fixture::{
+            spawn_fixture, test_credentials, token_route,
+        };
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(token_route().0, token_route().1);
+        routes.insert(
+            ("GET".to_string(), "/repos/o/r/pulls/5".to_string()),
+            (
+                200,
+                Vec::new(),
+                serde_json::json!({
+                    "state": "open", "merged": false, "draft": true,
+                    "title": "live title", "mergeable": true,
+                    "head": {"sha": "feedface00"},
+                })
+                .to_string(),
+            ),
+        );
+        routes.insert(
+            (
+                "GET".to_string(),
+                "/repos/o/r/commits/feedface00/check-runs".to_string(),
+            ),
+            (
+                200,
+                Vec::new(),
+                serde_json::json!({
+                    "total_count": 2,
+                    "check_runs": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": "completed", "conclusion": "failure"},
+                    ],
+                })
+                .to_string(),
+            ),
+        );
+        routes.insert(
+            ("GET".to_string(), "/repos/o/r/pulls/5/reviews".to_string()),
+            (
+                200,
+                Vec::new(),
+                serde_json::json!([
+                    {"user": {"login": "a"}, "state": "APPROVED"},
+                    {"user": {"login": "b"}, "state": "CHANGES_REQUESTED"},
+                ])
+                .to_string(),
+            ),
+        );
+        let fixture = spawn_fixture(routes).await;
+        let client =
+            crate::github_pr::client::GithubAppClient::new(&fixture.base, test_credentials())
+                .unwrap();
+        crate::github_pr::join::publish_client(Some(std::sync::Arc::new(client)));
+
+        let body = json_of(&agenda_pr_state_api_response(&item_id, Some(&server)).await);
+        assert_eq!(body["status"], "live");
+        assert_eq!(body["state"]["draft"], true);
+        assert_eq!(body["state"]["mergeable"], true);
+        assert_eq!(body["state"]["checks"]["total"], 2);
+        assert_eq!(body["state"]["checks"]["failed"], 1);
+        assert_eq!(body["state"]["review"]["approved"], 1);
+        assert_eq!(body["state"]["review"]["changes_requested"], 1);
+
+        // No client published: honest unavailability, never an error.
+        crate::github_pr::join::publish_client(None);
+        let body = json_of(&agenda_pr_state_api_response(&item_id, Some(&server)).await);
+        assert_eq!(body["status"], "unavailable");
+
+        // A non-PR item answers 404 by name.
+        let plain = agenda
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Note,
+                    title: "no pr here".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                    refs: Vec::new(),
+                },
+                None,
+            )
+            .unwrap();
+        let response = agenda_pr_state_api_response(&plain.id, Some(&server)).await;
+        match &response {
+            ApiResponse::Json { status, .. } => assert_eq!(*status, 404),
+            _ => panic!("expected JSON"),
+        }
+
+        // The whole lane wrote nothing but the plain item's park: strip
+        // that one line and the log is byte-identical — joined state
+        // never reaches the diary.
+        let log_after = std::fs::read(&log_path).unwrap();
+        let after_lines: Vec<&[u8]> = log_after.split(|b| *b == b'\n').collect();
+        let before_lines = log_before.split(|b| *b == b'\n').count();
+        assert_eq!(
+            after_lines.len(),
+            before_lines + 1,
+            "only the plain park landed"
+        );
+        assert!(
+            log_after.starts_with(&log_before),
+            "existing lines untouched"
+        );
+    }
 
     /// The F1 provenance resolver: a recorded wrapper id — even a
     /// superseded incarnation whose own log dir is gone — resolves to its

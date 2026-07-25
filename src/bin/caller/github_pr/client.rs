@@ -165,7 +165,8 @@ pub(crate) struct PrBranch {
 }
 
 /// One PR's detail view — the terminal-state fields the scanner records
-/// in its completion annotation. Unknown fields are ignored.
+/// in its completion annotation, plus what the render join serves on
+/// expand. Unknown fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PullDetail {
     #[serde(default)]
@@ -178,6 +179,38 @@ pub(crate) struct PullDetail {
     pub(crate) merged_at: Option<String>,
     #[serde(default)]
     pub(crate) closed_at: Option<String>,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) draft: bool,
+    /// `null` while GitHub computes it — absent data claims nothing.
+    #[serde(default)]
+    pub(crate) mergeable: Option<bool>,
+    #[serde(default)]
+    pub(crate) head: Option<PrHead>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PrHead {
+    #[serde(default)]
+    pub(crate) sha: Option<String>,
+}
+
+/// Check-runs rollup for one head sha — counts, never the run list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ChecksSummary {
+    pub(crate) total: usize,
+    pub(crate) completed: usize,
+    pub(crate) failed: usize,
+    pub(crate) succeeded: usize,
+}
+
+/// Latest-review-per-reviewer rollup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReviewSummary {
+    pub(crate) approved: usize,
+    pub(crate) changes_requested: usize,
+    pub(crate) commented: usize,
 }
 
 pub(crate) struct GithubAppClient {
@@ -319,6 +352,113 @@ impl GithubAppClient {
             Conditional::Fresh { value, .. } => serde_json::from_value(value)
                 .map_err(|error| ApiError::Unreachable(format!("pull detail shape: {error}"))),
         }
+    }
+
+    /// Check-runs rollup for a head sha (tier-2, expand-time only).
+    pub(crate) async fn check_runs_summary(
+        &self,
+        repo: &str,
+        sha: &str,
+    ) -> Result<ChecksSummary, ApiError> {
+        let url = format!(
+            "{}/repos/{repo}/commits/{sha}/check-runs?per_page=100",
+            self.api_base
+        );
+        let value = match self.get_value(&url, None).await? {
+            Conditional::NotModified => {
+                return Err(ApiError::Unreachable(
+                    "unconditional read answered 304".to_string(),
+                ))
+            }
+            Conditional::Fresh { value, .. } => value,
+        };
+        let runs = value
+            .get("check_runs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut summary = ChecksSummary {
+            total: value
+                .get("total_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(runs.len()),
+            ..Default::default()
+        };
+        for run in &runs {
+            let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "completed" {
+                summary.completed += 1;
+                match run.get("conclusion").and_then(|v| v.as_str()) {
+                    Some("success") | Some("neutral") | Some("skipped") => {
+                        summary.succeeded += 1;
+                    }
+                    Some(_) => summary.failed += 1,
+                    None => {}
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Latest-review-per-reviewer rollup (tier-2, expand-time only).
+    pub(crate) async fn reviews_summary(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<ReviewSummary, ApiError> {
+        let url = format!(
+            "{}/repos/{repo}/pulls/{number}/reviews?per_page=100",
+            self.api_base
+        );
+        let value = match self.get_value(&url, None).await? {
+            Conditional::NotModified => {
+                return Err(ApiError::Unreachable(
+                    "unconditional read answered 304".to_string(),
+                ))
+            }
+            Conditional::Fresh { value, .. } => value,
+        };
+        let reviews = value.as_array().cloned().unwrap_or_default();
+        // Latest state per reviewer wins; comment-only reviews never
+        // override an approval or a change request.
+        let mut latest: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for review in &reviews {
+            let login = review
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let state = review
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if login.is_empty() {
+                continue;
+            }
+            match state.as_str() {
+                "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" => {
+                    latest.insert(login, state);
+                }
+                "COMMENTED" => {
+                    latest.entry(login).or_insert(state);
+                }
+                _ => {}
+            }
+        }
+        let mut summary = ReviewSummary::default();
+        for state in latest.values() {
+            match state.as_str() {
+                "APPROVED" => summary.approved += 1,
+                "CHANGES_REQUESTED" => summary.changes_requested += 1,
+                "COMMENTED" => summary.commented += 1,
+                _ => {}
+            }
+        }
+        Ok(summary)
     }
 
     /// Every open PR of `owner/repo` (paginated, bounded), conditional

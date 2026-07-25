@@ -1300,6 +1300,21 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaPrState => {
+                // The row's `{item_id}` capture.
+                let item_id = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return handle_agenda_pr_state(
+                    stream,
+                    item_id,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaRefDrift => {
                 // The row's `{item_id}` capture.
                 let item_id = route_captures
