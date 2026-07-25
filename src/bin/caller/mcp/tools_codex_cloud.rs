@@ -68,7 +68,12 @@ impl IntendantServer {
                 source: Some("codex-cloud".to_string()),
                 refs: Vec::new(),
             };
-            if agenda.apply(cmd, None).is_ok() {
+            // Daemon-internal parker: attributed to the daemon actor
+            // kind (Track PR adopt-rider), lane named by `source`.
+            if agenda
+                .apply(cmd, Some(crate::agenda::AgendaActor::daemon()))
+                .is_ok()
+            {
                 parked += 1;
             }
         }

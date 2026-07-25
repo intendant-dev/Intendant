@@ -418,6 +418,7 @@ function agendaActorLabel(p) {
   if (p.kind === 'dashboard') return 'you';
   if (p.kind === 'local_process') return 'local ctl';
   if (p.kind === 'peer') return 'a peer daemon';
+  if (p.kind === 'daemon') return 'the daemon';
   if (p.kind === 'agent_session') return 'an agent session';
   return p.principal || '';
 }
@@ -1337,7 +1338,11 @@ const AGENDA_MANDATE_TEMPLATES = [
     suspendAfter: 3,
     mandate: `Agenda triage pass. Your scope is the UN-TRIAGED FRONTIER and only it:
 open items newer than the newest item tagged triage:summary, plus open
-items that lack both a part_of placement and a triage annotation. The
+items that lack both a part_of placement and a triage annotation —
+excluding items the daemon itself parked that are currently placed
+(provenance kind "daemon" with a live part_of: mirror anchors such as
+the PR scanner's arrive already placed and described; they are not
+untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each

@@ -33,7 +33,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LIST_PAGES: usize = 10;
 
 /// One named failure class per degrade lane the status surface knows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApiError {
     /// Network trouble, timeouts, 5xx — transient; try again later.
     Unreachable(String),
@@ -164,6 +164,22 @@ pub(crate) struct PrBranch {
     pub(crate) branch: String,
 }
 
+/// One PR's detail view — the terminal-state fields the scanner records
+/// in its completion annotation. Unknown fields are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PullDetail {
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) merged: bool,
+    #[serde(default)]
+    pub(crate) merge_commit_sha: Option<String>,
+    #[serde(default)]
+    pub(crate) merged_at: Option<String>,
+    #[serde(default)]
+    pub(crate) closed_at: Option<String>,
+}
+
 pub(crate) struct GithubAppClient {
     http: reqwest::Client,
     api_base: String,
@@ -290,6 +306,19 @@ impl GithubAppClient {
             value = serde_json::json!({ "__page": value, "__next": next });
         }
         Ok(Conditional::Fresh { value, etag })
+    }
+
+    /// One PR's detail — the scanner's terminal-state read for a PR
+    /// that left the open set (`merged`, timestamps, merge sha).
+    pub(crate) async fn get_pull(&self, repo: &str, number: u64) -> Result<PullDetail, ApiError> {
+        let url = format!("{}/repos/{repo}/pulls/{number}", self.api_base);
+        match self.get_value(&url, None).await? {
+            Conditional::NotModified => Err(ApiError::Unreachable(
+                "unconditional read answered 304".to_string(),
+            )),
+            Conditional::Fresh { value, .. } => serde_json::from_value(value)
+                .map_err(|error| ApiError::Unreachable(format!("pull detail shape: {error}"))),
+        }
     }
 
     /// Every open PR of `owner/repo` (paginated, bounded), conditional
@@ -467,15 +496,22 @@ wQzqW6CCPxt9AS8Om7oUZQ==
 -----END PRIVATE KEY-----
 ";
 
+/// Shared test support: a minimal HTTP/1.1 fixture standing in for
+/// api.github.com (never live GitHub in tests), with mutable routes so
+/// scenario tests can change the served world between polls, plus the
+/// throwaway credentials. Used by this module's tests and the
+/// scanner's.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_fixture {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn test_credentials() -> GithubAppCredentials {
+    pub(crate) type FixtureResponse = (u16, Vec<(String, String)>, String);
+
+    pub(crate) fn test_credentials() -> GithubAppCredentials {
         GithubAppCredentials {
             v: 1,
             app_id: "123456".to_string(),
@@ -483,6 +519,157 @@ mod tests {
             private_key_pem: TEST_RSA_PKCS1_PEM.to_string(),
         }
     }
+
+    pub(crate) struct Fixture {
+        pub(crate) base: String,
+        pub(crate) hits: Arc<AtomicUsize>,
+        pub(crate) token_hits: Arc<AtomicUsize>,
+        routes: Arc<Mutex<HashMap<(String, String), FixtureResponse>>>,
+    }
+
+    impl Fixture {
+        /// Replace one route's canned response (the world changed —
+        /// a PR merged, a page appeared). Takes effect on the next
+        /// request.
+        pub(crate) fn set_route(&self, method: &str, path: &str, response: FixtureResponse) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert((method.to_string(), path.to_string()), response);
+        }
+
+        pub(crate) fn remove_route(&self, method: &str, path: &str) {
+            self.routes
+                .lock()
+                .unwrap()
+                .remove(&(method.to_string(), path.to_string()));
+        }
+    }
+
+    pub(crate) fn token_route() -> ((String, String), FixtureResponse) {
+        (
+            (
+                "POST".to_string(),
+                "/app/installations/987/access_tokens".to_string(),
+            ),
+            (
+                201,
+                Vec::new(),
+                r#"{"token":"ghs_fixture","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+            ),
+        )
+    }
+
+    pub(crate) fn pull(number: u64, title: &str, draft: bool) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "title": title,
+            "draft": draft,
+            "html_url": format!("https://github.com/o/r/pull/{number}"),
+            "user": {"login": "octocat"},
+            "head": {"ref": "feature"},
+            "base": {"ref": "main"},
+            "updated_at": "2026-07-24T00:00:00Z",
+            "state": "open",
+        })
+    }
+
+    pub(crate) async fn spawn_fixture(
+        initial: HashMap<(String, String), FixtureResponse>,
+    ) -> Fixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let routes = Arc::new(Mutex::new(initial));
+        let fixture_base = base.clone();
+        let (hits_task, token_task, routes_task) =
+            (hits.clone(), token_hits.clone(), routes.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = routes_task.clone();
+                let hits = hits_task.clone();
+                let token_hits = token_task.clone();
+                let base = fixture_base.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&buf);
+                    let mut lines = text.lines();
+                    let request_line = lines.next().unwrap_or_default().to_string();
+                    let mut parts = request_line.split_whitespace();
+                    let method = parts.next().unwrap_or_default().to_string();
+                    let target = parts.next().unwrap_or_default().to_string();
+                    let path = target.split('?').next().unwrap_or_default().to_string();
+                    let headers: HashMap<String, String> = lines
+                        .take_while(|l| !l.is_empty())
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        .collect();
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if path.ends_with("/access_tokens") {
+                        token_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let auth = headers.get("authorization").cloned().unwrap_or_default();
+                        assert!(
+                            auth.starts_with("Bearer ey"),
+                            "token mint must carry the App JWT, got {auth:?}"
+                        );
+                    }
+                    let etag_match = headers.get("if-none-match").cloned();
+                    let looked_up = routes.lock().unwrap().get(&(method, path)).cloned();
+                    let (status, extra, body) = match looked_up {
+                        Some((status, extra, body)) => {
+                            let served_etag = extra
+                                .iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                                .map(|(_, v)| v.clone());
+                            if served_etag.is_some() && served_etag == etag_match {
+                                (304u16, extra.clone(), String::new())
+                            } else {
+                                (status, extra.clone(), body.clone())
+                            }
+                        }
+                        None => (404, Vec::new(), r#"{"message":"Not Found"}"#.to_string()),
+                    };
+                    let mut head = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in &extra {
+                        head.push_str(&format!("{name}: {}\r\n", value.replace("__BASE__", &base)));
+                    }
+                    head.push_str("\r\n");
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        Fixture {
+            base,
+            hits,
+            token_hits,
+            routes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_fixture::*;
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     fn b64url_decode(part: &str) -> Vec<u8> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -526,129 +713,6 @@ mod tests {
         public
             .verify(signing_input.as_bytes(), &b64url_decode(parts[2]))
             .expect("signature verifies against the key's public half");
-    }
-
-    /// One canned response per (method, path) — a minimal HTTP/1.1
-    /// fixture standing in for api.github.com. Never live GitHub in
-    /// tests.
-    struct Fixture {
-        base: String,
-        hits: Arc<AtomicUsize>,
-        token_hits: Arc<AtomicUsize>,
-    }
-
-    async fn spawn_fixture(
-        routes: HashMap<(String, String), (u16, Vec<(String, String)>, String)>,
-    ) -> Fixture {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(AtomicUsize::new(0));
-        let token_hits = Arc::new(AtomicUsize::new(0));
-        let routes = Arc::new(routes);
-        let fixture_base = base.clone();
-        let (hits_task, token_task) = (hits.clone(), token_hits.clone());
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let routes = routes.clone();
-                let hits = hits_task.clone();
-                let token_hits = token_task.clone();
-                let base = fixture_base.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) => break,
-                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            Err(_) => return,
-                        }
-                    }
-                    let text = String::from_utf8_lossy(&buf);
-                    let mut lines = text.lines();
-                    let request_line = lines.next().unwrap_or_default().to_string();
-                    let mut parts = request_line.split_whitespace();
-                    let method = parts.next().unwrap_or_default().to_string();
-                    let target = parts.next().unwrap_or_default().to_string();
-                    let path = target.split('?').next().unwrap_or_default().to_string();
-                    let headers: HashMap<String, String> = lines
-                        .take_while(|l| !l.is_empty())
-                        .filter_map(|l| l.split_once(':'))
-                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-                        .collect();
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    if path.ends_with("/access_tokens") {
-                        token_hits.fetch_add(1, Ordering::SeqCst);
-                        let auth = headers.get("authorization").cloned().unwrap_or_default();
-                        assert!(
-                            auth.starts_with("Bearer ey"),
-                            "token mint must carry the App JWT, got {auth:?}"
-                        );
-                    }
-                    let etag_match = headers.get("if-none-match").cloned();
-                    let (status, extra, body) = match routes.get(&(method, path)) {
-                        Some((status, extra, body)) => {
-                            let served_etag = extra
-                                .iter()
-                                .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
-                                .map(|(_, v)| v.clone());
-                            if served_etag.is_some() && served_etag == etag_match {
-                                (304u16, extra.clone(), String::new())
-                            } else {
-                                (*status, extra.clone(), body.clone())
-                            }
-                        }
-                        None => (404, Vec::new(), r#"{"message":"Not Found"}"#.to_string()),
-                    };
-                    let mut head = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        body.len()
-                    );
-                    for (name, value) in &extra {
-                        head.push_str(&format!("{name}: {}\r\n", value.replace("__BASE__", &base)));
-                    }
-                    head.push_str("\r\n");
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(body.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        Fixture {
-            base,
-            hits,
-            token_hits,
-        }
-    }
-
-    fn token_route() -> ((String, String), (u16, Vec<(String, String)>, String)) {
-        (
-            (
-                "POST".to_string(),
-                "/app/installations/987/access_tokens".to_string(),
-            ),
-            (
-                201,
-                Vec::new(),
-                r#"{"token":"ghs_fixture","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
-            ),
-        )
-    }
-
-    fn pull(number: u64, title: &str, draft: bool) -> serde_json::Value {
-        serde_json::json!({
-            "number": number,
-            "title": title,
-            "draft": draft,
-            "html_url": format!("https://github.com/o/r/pull/{number}"),
-            "user": {"login": "octocat"},
-            "head": {"ref": "feature"},
-            "base": {"ref": "main"},
-            "updated_at": "2026-07-24T00:00:00Z",
-            "state": "open",
-        })
     }
 
     #[tokio::test]

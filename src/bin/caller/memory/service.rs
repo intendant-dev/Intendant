@@ -329,10 +329,12 @@ impl MemoryService {
     /// of the seam type). Owner surfaces — the dashboard and the
     /// owner's own local processes — may reach every write verb the
     /// service exposes; supervised agent sessions, federated peers,
-    /// and unattributed callers are ring-2 writers: they AUTHOR
-    /// candidates (`propose`) and nothing else. Judgment, pin, and
-    /// curation verbs stay owner-side, and the denial is a named
-    /// outcome (§C.2 discipline), never a silent downgrade.
+    /// daemon-internal tasks (`ActorKind::Daemon`, Track PR ruling:
+    /// never owner-surface at any tenant edge), and unattributed
+    /// callers are ring-2 writers: they AUTHOR candidates (`propose`)
+    /// and nothing else. Judgment, pin, and curation verbs stay
+    /// owner-side, and the denial is a named outcome (§C.2
+    /// discipline), never a silent downgrade.
     fn authorize_write(actor: &ActorBinding, verb: Verb) -> Result<(), MemoryError> {
         let owner_surface = matches!(
             actor.kind,
@@ -361,9 +363,14 @@ impl MemoryService {
         match actor.kind {
             // The human at an authenticated dashboard surface.
             GateActorKind::Dashboard => (ActorKind::Human, None),
-            // The owner's box-local software, and internal dispatch
-            // that states no actor: the daemon device itself.
-            GateActorKind::LocalProcess | GateActorKind::Unattributed => (ActorKind::Daemon, None),
+            // The owner's box-local software, internal dispatch that
+            // states no actor, and the daemon's own scheduled tasks:
+            // the daemon device itself. (An unattested daemon actor has
+            // no §11.4 class — D-201 keeps any such judgment fold-inert,
+            // the kernel's own backstop.)
+            GateActorKind::LocalProcess | GateActorKind::Unattributed | GateActorKind::Daemon => {
+                (ActorKind::Daemon, None)
+            }
             GateActorKind::AgentSession => (
                 ActorKind::AgentSession,
                 actor.principal_id.clone().or_else(|| {
@@ -1041,6 +1048,9 @@ mod tests {
         for actor in [
             agent_actor(),
             ActorBinding::peer(Some("principal:peer:fingerprint".into())),
+            // Daemon-internal tasks join the propose-only class (Track
+            // PR ruling: never owner-surface at any tenant edge).
+            ActorBinding::daemon(),
             no_actor(),
         ] {
             assert!(MemoryService::authorize_write(&actor, Verb::Propose).is_ok());

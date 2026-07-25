@@ -51,7 +51,8 @@ pub(crate) use store::{
     file_ref_drift, AgendaError, AgendaOpsPage, AgendaStore, AGENDA_OPS_DEFAULT_LIMIT,
 };
 pub(crate) use types::{
-    AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaStatus,
+    AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaRefSpec,
+    AgendaRefType, AgendaStatus,
 };
 // Test-support seam: cross-module tests (supervisor delivery, blocking
 // waiter) drive real handle-side resolutions with structured content.

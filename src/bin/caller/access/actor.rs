@@ -62,6 +62,22 @@ pub enum ActorKind {
     Dashboard,
     /// A federated peer daemon acting under its granted profile.
     Peer,
+    /// The daemon itself, on schedule — a daemon-internal task (the
+    /// GitHub PR scanner, the agenda scheduler's write-backs, the ask
+    /// resolver) writing with no session, no gate, and no human at the
+    /// other end. **Unmintable from outside by construction** (Track PR
+    /// ruling 1, 2026-07-24, the first additive change under this
+    /// contract): no [`ActorBinding::from_principal`] arm maps to it —
+    /// every external surface classifies through the gate — and it is
+    /// constructed only in-process via [`ActorBinding::daemon`]. Both
+    /// identity fields stay `None` (no IAM principal names the daemon;
+    /// no session exists — absence is the honest record). Which daemon
+    /// lane wrote rides the ops' self-described `source` label, beside —
+    /// never inside — this attribution. Never an owner-surface class at
+    /// any tenant edge: where an edge has a propose-only class the
+    /// daemon joins it; where only owner verbs exist it is denied by
+    /// name; any elevation is a future ruling, never a match arm.
+    Daemon,
     /// No authenticated actor was stated. The explicit representation the
     /// contract requires — never substitute a defaulted principal.
     Unattributed,
@@ -76,6 +92,7 @@ impl ActorKind {
             ActorKind::LocalProcess => "local_process",
             ActorKind::Dashboard => "dashboard",
             ActorKind::Peer => "peer",
+            ActorKind::Daemon => "daemon",
             ActorKind::Unattributed => "unattributed",
         }
     }
@@ -145,6 +162,18 @@ impl ActorBinding {
         Self {
             kind: ActorKind::Peer,
             principal_id,
+            session_id: None,
+        }
+    }
+
+    /// The daemon itself, on schedule. In-process construction only —
+    /// see the [`ActorKind::Daemon`] docs; no gate can produce this and
+    /// [`ActorBinding::from_principal`] must never gain an arm for it
+    /// (pinned by `from_principal_never_mints_the_daemon_kind`).
+    pub fn daemon() -> Self {
+        Self {
+            kind: ActorKind::Daemon,
+            principal_id: None,
             session_id: None,
         }
     }
@@ -263,6 +292,59 @@ mod tests {
             crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https");
         let actor = ActorBinding::from_principal(&dashboard, None);
         assert_eq!(actor.kind, ActorKind::Dashboard);
+    }
+
+    /// MANDATORY PIN (Track PR ruling 1): the `daemon` kind is
+    /// unmintable from outside — no gate classification path may ever
+    /// produce it, whatever the principal class, authn statements, or
+    /// gate-bound session. The classifier's `_ =>` fallback silently
+    /// absorbs new principal kinds, so this test walks every
+    /// classification lane (gate-session-bound, authn-stated, each
+    /// named principal kind, the unknown-kind fallback) and asserts
+    /// none reaches [`ActorKind::Daemon`] — in-process construction via
+    /// [`ActorBinding::daemon`] is the only mint.
+    #[test]
+    fn from_principal_never_mints_the_daemon_kind() {
+        let loopback = crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http");
+        let session = crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+            "sess-x", "http", true,
+        );
+        let dashboard =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https");
+        // A principal that *claims* the daemon's name through every
+        // client-controllable surface: an unknown kind string and a
+        // forged authn statement. Neither may classify as Daemon.
+        let mut impostor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("imp", "https");
+        impostor.kind = "daemon".to_string();
+        impostor.authn.push(serde_json::json!({ "kind": "daemon" }));
+        for principal in [&loopback, &session, &dashboard, &impostor] {
+            for gate_session in [None, Some("sess-forged".to_string())] {
+                let actor = ActorBinding::from_principal(principal, gate_session);
+                assert_ne!(
+                    actor.kind,
+                    ActorKind::Daemon,
+                    "gate classification minted the daemon kind for principal \
+                     kind {:?} — the daemon kind is in-process-only",
+                    principal.kind
+                );
+            }
+        }
+        // The impostor lands visibly unclassified, principal named.
+        let actor = ActorBinding::from_principal(&impostor, None);
+        assert_eq!(actor.kind, ActorKind::Unattributed);
+        assert_eq!(actor.principal_id.as_deref(), Some(impostor.id.as_str()));
+    }
+
+    /// The in-process mint carries no identity fields — no IAM principal
+    /// names the daemon and no session exists; absence is the record.
+    #[test]
+    fn daemon_binding_is_bare_by_construction() {
+        let actor = ActorBinding::daemon();
+        assert_eq!(actor.kind, ActorKind::Daemon);
+        assert_eq!(actor.principal_id, None);
+        assert_eq!(actor.session_id, None);
+        assert_eq!(ActorKind::Daemon.as_str(), "daemon");
     }
 
     /// In-process plumbing serialization round-trips; the shape is NOT a

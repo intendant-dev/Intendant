@@ -35,7 +35,11 @@ pub(crate) const MANDATE_TEMPLATES: &[MandateTemplate] = &[
         title: "Agenda triage",
         mandate: r#"Agenda triage pass. Your scope is the UN-TRIAGED FRONTIER and only it:
 open items newer than the newest item tagged triage:summary, plus open
-items that lack both a part_of placement and a triage annotation. The
+items that lack both a part_of placement and a triage annotation —
+excluding items the daemon itself parked that are currently placed
+(provenance kind "daemon" with a live part_of: mirror anchors such as
+the PR scanner's arrive already placed and described; they are not
+untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each

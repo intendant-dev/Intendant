@@ -36431,7 +36431,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '64e58b7c79b7e98a';
+const INTENDANT_APP_BUILD = '34339005d819d9f3';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -89481,6 +89481,7 @@ function agendaActorLabel(p) {
   if (p.kind === 'dashboard') return 'you';
   if (p.kind === 'local_process') return 'local ctl';
   if (p.kind === 'peer') return 'a peer daemon';
+  if (p.kind === 'daemon') return 'the daemon';
   if (p.kind === 'agent_session') return 'an agent session';
   return p.principal || '';
 }
@@ -90400,7 +90401,11 @@ const AGENDA_MANDATE_TEMPLATES = [
     suspendAfter: 3,
     mandate: `Agenda triage pass. Your scope is the UN-TRIAGED FRONTIER and only it:
 open items newer than the newest item tagged triage:summary, plus open
-items that lack both a part_of placement and a triage annotation. The
+items that lack both a part_of placement and a triage annotation —
+excluding items the daemon itself parked that are currently placed
+(provenance kind "daemon" with a live part_of: mirror anchors such as
+the PR scanner's arrive already placed and described; they are not
+untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each
@@ -91030,14 +91035,21 @@ function agendaSearchMatch(item, q) {
 
 // The un-triaged frontier — the triage mandate's declared scope: open
 // items newer than the newest triage summary (`triage:summary` tag), or
-// unplaced with no triage annotation; summaries themselves excluded. A
-// render-side convention over ordinary data, like the rank parse.
+// unplaced with no triage annotation; summaries themselves excluded, and
+// so are daemon-parked items that are currently placed (Track PR ruling
+// 2, the mirror-writer exemption: a PR anchor the scanner parked and
+// filed arrives already placed and described — "untriaged" is false of
+// it; unfiling one re-admits it). A render-side convention over ordinary
+// data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
+// and the four expressions (ctl, this, docs, mandate template) move
+// together.
 function agendaFrontierPredicate() {
   const newestSummary = Math.max(0, ...(agendaItems || [])
     .filter((x) => (x.tags || []).includes('triage:summary'))
     .map((x) => (x.provenance && x.provenance.created_ms) || 0));
   return (x) => x.status === 'open'
     && !(x.tags || []).includes('triage:summary')
+    && !(x.part_of && x.provenance && x.provenance.kind === 'daemon')
     && (((x.provenance && x.provenance.created_ms) || 0) > newestSummary
       || (!x.part_of && !(x.annotations || []).some((a) => a.source === 'triage')));
 }
@@ -91411,9 +91423,10 @@ function agendaCardByline(item, opts) {
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(`session ${p.session_id.slice(0, 12)}…`)}</span>`;
   } else {
     const label = p.kind === 'dashboard' ? 'you'
-      : p.source ? p.source
-        : p.kind === 'local_process' ? 'local shell'
-          : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
+      : p.kind === 'daemon' ? 'the daemon'
+        : p.source ? p.source
+          : p.kind === 'local_process' ? 'local shell'
+            : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
   }
   const selfDesc = p.source
@@ -95180,6 +95193,7 @@ function memoryActorLabel(p) {
   if (p.actor === 'dashboard') return 'you';
   if (p.actor === 'local_process') return 'local ctl';
   if (p.actor === 'peer') return 'a peer daemon';
+  if (p.actor === 'daemon') return 'the daemon';
   if (p.actor === 'agent_session') return 'an agent session';
   if (p.actor === 'unattributed') return 'unattributed';
   return p.principal || '';

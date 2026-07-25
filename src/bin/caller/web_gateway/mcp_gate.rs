@@ -1600,6 +1600,118 @@ mod tests {
         );
     }
 
+    /// MANDATORY PIN (Track PR ruling 1, the external-lane negative):
+    /// no gate-classified write may ever record the `daemon` actor kind
+    /// — it is minted in-process only. Every lane class this gate
+    /// serves is driven end to end, including a principal that CLAIMS
+    /// the daemon's name through its `kind` string and authn statements
+    /// (which must land visibly unclassified, never as the daemon).
+    #[tokio::test]
+    async fn external_lanes_never_record_daemon_actor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            tmp.path().join("logs"),
+        );
+        let agenda_dir = tmp.path().join("agenda");
+        state.agenda = Some(std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(&agenda_dir).unwrap(),
+            bus.clone(),
+            &agenda_dir,
+        )));
+        let server = crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus.clone(),
+        );
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "agenda_op",
+                "arguments": { "op": "add", "kind": "task", "title": "lane probe" },
+            },
+        })
+        .to_string();
+
+        let mut impostor =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("imp", "https");
+        impostor.kind = "daemon".to_string();
+        impostor.authn.push(serde_json::json!({"kind": "daemon"}));
+
+        let lanes: Vec<(HttpAccessContext, Option<String>)> = vec![
+            (
+                HttpAccessContext {
+                    principal:
+                        crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                            "sess-neg", "http", true,
+                        ),
+                    iam_state: None,
+                },
+                Some("sess-neg".to_string()),
+            ),
+            (
+                HttpAccessContext {
+                    principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
+                        "test", "https",
+                    ),
+                    iam_state: None,
+                },
+                None,
+            ),
+            (
+                HttpAccessContext {
+                    principal: crate::access::iam::AccessPrincipal::local_loopback_mcp_default(
+                        "http",
+                    ),
+                    iam_state: None,
+                },
+                None,
+            ),
+            (
+                HttpAccessContext {
+                    principal: impostor,
+                    iam_state: None,
+                },
+                None,
+            ),
+        ];
+        for (access, gate_session) in lanes {
+            let principal_kind = access.principal.kind.clone();
+            let outcome = handle_mcp_http_request(
+                &call,
+                &server,
+                gate_session.as_deref(),
+                None,
+                None,
+                &access,
+                gate_session.clone(),
+                &bus,
+            )
+            .await;
+            // Either proof satisfies the pin: the lane is refused
+            // outright (nothing recorded — the impostor's unknown
+            // principal class fails IAM evaluation), or the write lands
+            // with any attribution BUT the daemon kind.
+            let McpHttpOutcome::Response(resp) = outcome else {
+                panic!("expected a response outcome for {principal_kind:?}");
+            };
+            let result = resp.result.expect("tool result");
+            if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+                continue;
+            }
+            let text = result["content"][0]["text"].as_str().expect("text content");
+            let item =
+                serde_json::from_str::<serde_json::Value>(text).expect("item json")["item"].clone();
+            assert_ne!(
+                item["provenance"]["kind"],
+                serde_json::json!("daemon"),
+                "a gate-classified {principal_kind:?} write recorded the daemon kind"
+            );
+        }
+    }
+
     fn memory_claim_from_outcome(outcome: McpHttpOutcome) -> serde_json::Value {
         let McpHttpOutcome::Response(resp) = outcome else {
             panic!("expected a response outcome");

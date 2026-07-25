@@ -1574,8 +1574,9 @@ impl AgendaStore {
     }
 
     /// Daemon-internal occurrence write-back (scheduler only — no command
-    /// twin exists, so no external surface reaches this). Appends the op
-    /// with no actor and folds it.
+    /// twin exists, so no external surface reaches this). Attributed to
+    /// the `daemon` actor kind (Track PR adopt-rider; older absent-actor
+    /// lines stay as legacy history).
     pub(crate) fn record_occurrence(
         &mut self,
         write: OccurrenceWriteBack<'_>,
@@ -1591,7 +1592,7 @@ impl AgendaStore {
             session_id: write.session_id,
             note: write.note.map(|n| n.chars().take(500).collect()),
         };
-        self.append_op(op, None, None, now_ms)
+        self.append_op(op, Some(AgendaActor::daemon()), None, now_ms)
     }
 
     /// Daemon-internal ask-delivery write-back (the session supervisor's
@@ -1618,7 +1619,7 @@ impl AgendaStore {
             delivered,
             session_id,
         };
-        self.append_op(op, None, None, now_ms)
+        self.append_op(op, Some(AgendaActor::daemon()), None, now_ms)
     }
 
     fn require(&self, id: &str) -> Result<&AgendaItem, AgendaError> {
