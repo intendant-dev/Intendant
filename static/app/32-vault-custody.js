@@ -4320,6 +4320,46 @@ function githubIntegrationChip(text, cls) {
   return chip;
 }
 
+// One-click connect (Track GC): manifest-start is an HTTP-only route
+// (no tunnel twin — the redirect must land back on THIS origin), so it
+// rides a plain same-origin fetch like the sibling-tokens lane, never
+// the daemonApi map. The response's form target + manifest are posted
+// as a real form navigation (target _self: works identically in
+// browsers and the macOS app's WKWebView, which drops _blank).
+async function githubIntegrationConnect(orgInput) {
+  if (githubIntegrationState.busy) return;
+  githubIntegrationState.busy = true;
+  githubIntegrationState.notice = null;
+  try {
+    const organization = String(orgInput?.value || '').trim();
+    const resp = await fetch('/api/integrations/github/manifest-start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(organization ? { organization } : {}),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      throw new Error(String(data?.error || `manifest-start failed (${resp.status})`));
+    }
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = String(data.form_action);
+    form.target = '_self';
+    const field = document.createElement('input');
+    field.type = 'hidden';
+    field.name = 'manifest';
+    field.value = JSON.stringify(data.manifest);
+    form.appendChild(field);
+    document.body.appendChild(form);
+    form.submit();
+    // The tab navigates to GitHub now; state past this point is moot.
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.busy = false;
+    renderGithubIntegrationSection();
+  }
+}
+
 async function githubIntegrationSave(fields) {
   const payload = {
     app_id: fields.appId.value.trim(),
@@ -4394,6 +4434,10 @@ function renderGithubIntegrationSection() {
   if (data?.configured) {
     chips.appendChild(githubIntegrationChip('credentials sealed', 'ok'));
   }
+  if (data?.pending_install) {
+    chips.appendChild(githubIntegrationChip('pending install', 'warn'));
+    if (data.app_slug) chips.appendChild(githubIntegrationChip(String(data.app_slug)));
+  }
   const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
   chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
   if (data && data.custody_backend_available === false) {
@@ -4408,10 +4452,60 @@ function renderGithubIntegrationSection() {
   }
   mount.appendChild(chips);
 
+  // The one-click lane (primary). Unconfigured: Connect + optional org
+  // handle. Sealed-pending-install: the install link (discovery + repo
+  // picker arrive with the next slice). The manual form below stays the
+  // universal fallback either way.
+  const custodyAvailable = !data || data.custody_backend_available !== false;
+  if (data && !data.configured) {
+    const connect = document.createElement('div');
+    connect.className = 'vault-connect-line';
+    const org = document.createElement('input');
+    org.type = 'text';
+    org.autocomplete = 'off';
+    org.placeholder = 'Organization (blank = personal account)';
+    org.className = 'vault-connect-org';
+    connect.appendChild(org);
+    const button = vaultButton('Connect GitHub', () => {
+      void githubIntegrationConnect(org);
+    }, { primary: true });
+    button.disabled = githubIntegrationState.busy || !custodyAvailable;
+    if (!custodyAvailable) {
+      button.title = 'No credential custody backend on this platform — use the manual form on a machine with custody support.';
+    }
+    connect.appendChild(button);
+    const hint = document.createElement('div');
+    hint.className = 'vault-connect-hint';
+    hint.textContent = custodyAvailable
+      ? 'One click on GitHub creates a private read-only App and seals its key here — nothing to copy.'
+      : 'The one-click ceremony needs a custody backend to seal the App key.';
+    connect.appendChild(hint);
+    mount.appendChild(connect);
+  } else if (data?.pending_install) {
+    const install = document.createElement('div');
+    install.className = 'vault-connect-line';
+    if (data.app_slug) {
+      // _self like the manifest form POST: the macOS app's WKWebView
+      // silently drops _blank, and the same-tab round trip works
+      // everywhere.
+      const link = document.createElement('a');
+      link.className = 'vault-install-link';
+      link.href = `https://github.com/apps/${encodeURIComponent(String(data.app_slug))}/installations/new`;
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Install on GitHub';
+      install.appendChild(link);
+    }
+    const hint = document.createElement('div');
+    hint.className = 'vault-connect-hint';
+    hint.textContent = 'The App is created and its key is sealed. Install it on your repositories on GitHub; installation discovery lands in the next update.';
+    install.appendChild(hint);
+    mount.appendChild(install);
+  }
+
   const fold = document.createElement('details');
   fold.className = 'acc-fold';
   const summary = document.createElement('summary');
-  summary.textContent = data?.configured ? 'Update the GitHub App' : 'Connect a GitHub App';
+  summary.textContent = data?.configured ? 'Update the GitHub App' : 'Enter credentials manually';
   const body = document.createElement('div');
   body.className = 'acc-fold-body';
   const grid = document.createElement('div');
