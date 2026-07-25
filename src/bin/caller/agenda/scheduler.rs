@@ -1297,6 +1297,7 @@ mod tests {
                     source: None,
                     agent_config: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -1355,6 +1356,7 @@ mod tests {
                     source: None,
                     agent_config: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -1466,6 +1468,7 @@ mod tests {
                     source: None,
                     agent_config: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -2095,6 +2098,7 @@ mod tests {
                     agent_config: Some(Box::new(config.clone())),
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -2723,6 +2727,7 @@ mod tests {
                     source: None,
                     agent_config: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )

@@ -1558,6 +1558,23 @@ function agendaOpenAutomationSheet(anchor) {
   fireRow.appendChild(fire);
   panel.appendChild(fireRow);
 
+  // Project pin (T3c): digest-bound on the manifest — where fired
+  // sessions run. Empty = the legacy resolution (parking session's
+  // root, else the daemon default), which a picker-stamped manifest on
+  // a projectless daemon does not have.
+  const projRow = agendaStartSheetEl('div', 'ags-config-row');
+  const projLabel = agendaStartSheetEl('label', 'ags-label', 'Project');
+  projLabel.setAttribute('for', 'agsx-project');
+  projRow.appendChild(projLabel);
+  const project = document.createElement('input');
+  project.type = 'text';
+  project.id = 'agsx-project';
+  project.placeholder = 'daemon default (absolute path to pin)';
+  projRow.appendChild(project);
+  projRow.appendChild(agendaStartSheetEl('div', 'ags-hint',
+    'where fired sessions run — required on a projectless daemon'));
+  panel.appendChild(projRow);
+
   const suspendRow = agendaStartSheetEl('div', 'ags-config-row');
   const suspendLabel = agendaStartSheetEl('label', 'ags-label', 'Suspend after');
   suspendLabel.setAttribute('for', 'agsx-suspend');
@@ -1654,7 +1671,7 @@ function agendaOpenAutomationSheet(anchor) {
   const park = agendaStartSheetEl('button', 'ags-btn ags-start', 'Park + propose');
   park.type = 'button';
   park.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { template: () => template, cadence, fire, suspend, configState, error, park }));
+    { template: () => template, cadence, fire, suspend, project, configState, error, park }));
   foot.appendChild(cancel);
   foot.appendChild(park);
   panel.appendChild(foot);
@@ -1677,7 +1694,8 @@ function agendaOpenAutomationSheet(anchor) {
   // their own approval sheet — rendered by the workflows fragment,
   // which owns that whole lane.
   if (typeof agendaWorkflowRenderPickerButtons === 'function') {
-    agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet);
+    agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet,
+      () => project.value.trim());
   }
   applyTemplate();
   agendaPresentStartSheet(host, panel, anchor);
@@ -1736,6 +1754,8 @@ async function agendaAutomationSheetSubmit(form) {
         suspend_after_failures: suspendAfter,
       },
     };
+    const projectRoot = form.project && form.project.value.trim();
+    if (projectRoot) propose.project_root = projectRoot;
     if (Object.keys(agentConfig).length) propose.agent_config = agentConfig;
     const proposed = await daemonApi.request('api_agenda_op', propose);
     if (!proposed.ok || !proposed.body || !proposed.body.item) {

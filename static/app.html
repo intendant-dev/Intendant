@@ -36550,7 +36550,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '8a827237b91e4cf9';
+const INTENDANT_APP_BUILD = '3c4d59cbae998bb1';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -91103,6 +91103,23 @@ function agendaOpenAutomationSheet(anchor) {
   fireRow.appendChild(fire);
   panel.appendChild(fireRow);
 
+  // Project pin (T3c): digest-bound on the manifest — where fired
+  // sessions run. Empty = the legacy resolution (parking session's
+  // root, else the daemon default), which a picker-stamped manifest on
+  // a projectless daemon does not have.
+  const projRow = agendaStartSheetEl('div', 'ags-config-row');
+  const projLabel = agendaStartSheetEl('label', 'ags-label', 'Project');
+  projLabel.setAttribute('for', 'agsx-project');
+  projRow.appendChild(projLabel);
+  const project = document.createElement('input');
+  project.type = 'text';
+  project.id = 'agsx-project';
+  project.placeholder = 'daemon default (absolute path to pin)';
+  projRow.appendChild(project);
+  projRow.appendChild(agendaStartSheetEl('div', 'ags-hint',
+    'where fired sessions run — required on a projectless daemon'));
+  panel.appendChild(projRow);
+
   const suspendRow = agendaStartSheetEl('div', 'ags-config-row');
   const suspendLabel = agendaStartSheetEl('label', 'ags-label', 'Suspend after');
   suspendLabel.setAttribute('for', 'agsx-suspend');
@@ -91199,7 +91216,7 @@ function agendaOpenAutomationSheet(anchor) {
   const park = agendaStartSheetEl('button', 'ags-btn ags-start', 'Park + propose');
   park.type = 'button';
   park.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { template: () => template, cadence, fire, suspend, configState, error, park }));
+    { template: () => template, cadence, fire, suspend, project, configState, error, park }));
   foot.appendChild(cancel);
   foot.appendChild(park);
   panel.appendChild(foot);
@@ -91222,7 +91239,8 @@ function agendaOpenAutomationSheet(anchor) {
   // their own approval sheet — rendered by the workflows fragment,
   // which owns that whole lane.
   if (typeof agendaWorkflowRenderPickerButtons === 'function') {
-    agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet);
+    agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet,
+      () => project.value.trim());
   }
   applyTemplate();
   agendaPresentStartSheet(host, panel, anchor);
@@ -91281,6 +91299,8 @@ async function agendaAutomationSheetSubmit(form) {
         suspend_after_failures: suspendAfter,
       },
     };
+    const projectRoot = form.project && form.project.value.trim();
+    if (projectRoot) propose.project_root = projectRoot;
     if (Object.keys(agentConfig).length) propose.agent_config = agentConfig;
     const proposed = await daemonApi.request('api_agenda_op', propose);
     if (!proposed.ok || !proposed.body || !proposed.body.item) {
@@ -95796,7 +95816,7 @@ async function agendaWorkflowOp(params) {
 // is the separate explicit act on the sheet this feeds. A mid-stamp
 // failure leaves ordinary parked items visible on the board
 // (append-only history; nothing rolls back silently).
-async function agendaWorkflowStamp(template) {
+async function agendaWorkflowStamp(template, projectRoot) {
   const hub = await agendaWorkflowOp({
     op: 'add', kind: 'note', title: template.title, body: template.orientation,
   });
@@ -95824,6 +95844,7 @@ async function agendaWorkflowStamp(template) {
       fire_at_ms: Date.now(),
       trigger: { kind: 'on_unblock' },
     };
+    if (projectRoot) propose.project_root = projectRoot;
     if (Object.keys(config).length) propose.agent_config = config;
     const item = await agendaWorkflowOp(propose);
     const effect = (item.effects || [])[0] || {};
@@ -95964,9 +95985,9 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
 // The automate sheet's picker hook: workflow entries beside the
 // mandate templates. Stamping happens on click; the approval sheet
 // opens the moment the stamp lands.
-function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet) {
+function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet, getProjectRoot) {
   if (typeof agendaTriggeredMandateRenderButtons === 'function') {
-    agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet);
+    agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot);
   }
   for (const template of AGENDA_WORKFLOW_TEMPLATES) {
     const btn = agendaStartSheetEl('button', 'ags-seg-btn', `${template.title} →`);
@@ -95975,7 +95996,8 @@ function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
-        const stamped = await agendaWorkflowStamp(template);
+        const stamped = await agendaWorkflowStamp(template,
+          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
         closeAutomationSheet();
         agendaWorkflowOpenApprovalSheet(stamped);
       } catch (e) {
@@ -96033,7 +96055,7 @@ beyond those; propose-don't-dispose governs every write.`,
 
 // Park + propose a triggered standing mandate; approval stays the
 // owner's ordinary card act.
-async function agendaTriggeredMandateStamp(template) {
+async function agendaTriggeredMandateStamp(template, projectRoot) {
   const item = await agendaWorkflowOp({
     op: 'add', kind: 'task', title: template.title, body: template.mandate,
   });
@@ -96044,6 +96066,7 @@ async function agendaTriggeredMandateStamp(template) {
     fire_at_ms: Date.now(),
     trigger: { kind: 'on_item_match', item_kind: template.itemKind, tags: template.tags },
   };
+  if (projectRoot) propose.project_root = projectRoot;
   const config = {};
   if (template.agent) config.agent = template.agent;
   if (template.claudeModel) config.claude_model = template.claudeModel;
@@ -96058,7 +96081,7 @@ async function agendaTriggeredMandateStamp(template) {
 }
 
 // Picker entries for the triggered mandates, rendered by the same hook.
-function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet) {
+function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot) {
   for (const template of AGENDA_TRIGGERED_MANDATE_TEMPLATES) {
     const btn = agendaStartSheetEl('button', 'ags-seg-btn',
       `${template.title} (${template.itemKind}:${template.tags.join(',')})`);
@@ -96067,7 +96090,8 @@ function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       try {
-        await agendaTriggeredMandateStamp(template);
+        await agendaTriggeredMandateStamp(template,
+          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
         closeAutomationSheet();
       } catch (e) {
         btn.disabled = false;

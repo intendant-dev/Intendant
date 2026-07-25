@@ -2167,6 +2167,7 @@ async fn run_agenda(
                 "--max-occurrences",
                 "--suspend-after",
                 "--on-item-match",
+                "--project",
                 "--source",
             ];
             value_flags.extend(AGENDA_LAUNCH_FLAGS);
@@ -2273,6 +2274,9 @@ async fn run_agenda(
             if let Some(trigger) = trigger {
                 map.insert("trigger".to_string(), trigger);
             }
+            // Explicit project pin (T3c): digest-bound on the manifest,
+            // so the approval covers WHERE the sessions run.
+            insert_string(&mut map, "project_root", args.one("--project"));
             insert_string(&mut map, "source", args.one("--source"));
             // Executor pins (Track AU): the same launch vocabulary the
             // start-now sheet records, digest-bound on the standing
@@ -5146,6 +5150,8 @@ fn help_agenda() {
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
       [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
       # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor)\n\
+      [--project DIR]   # digest-bound project pin: where fired sessions run (absolute, must\n\
+      # exist; omitted = the parking session's root, else the daemon default)\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
