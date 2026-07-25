@@ -1138,14 +1138,17 @@ fn present_org_grant_plan(
 /// subject must later authenticate over peer mTLS; a browser-key subject is
 /// record-only until a real browser-key ingress exists. A peer grant commits its inert IAM audit before the
 /// identity record, so a partial failure can leave audit history but never
-/// usable peer authority whose IAM commit failed.
+/// usable peer authority whose IAM commit failed. `source` is the caller's
+/// doorbell bucket for [`presentation_rate_ok`]; non-listener callers pass a
+/// fixed lane label such as `"local"`.
 pub fn present_org_grant_value(
     cert_dir: &std::path::Path,
+    source: &str,
     doc_value: &serde_json::Value,
     extra_daemon_ids: &[String],
     now_unix_ms: u64,
 ) -> Result<PresentedOrgGrant, String> {
-    if !presentation_rate_ok(now_unix_ms) {
+    if !presentation_rate_ok(source, now_unix_ms) {
         return Err("too many org grant presentations; retry shortly".to_string());
     }
     crate::access::iam::transact_state(cert_dir, |state, transaction| {
@@ -1807,23 +1810,64 @@ pub fn revoke_org(
     Ok(revoked)
 }
 
-/// Fixed-window limiter for the public presentation endpoint.
-pub fn presentation_rate_ok(now_unix_ms: u64) -> bool {
-    use std::sync::{Mutex, OnceLock};
-    const WINDOW_MS: u64 = 60_000;
-    const MAX_PER_WINDOW: u32 = 30;
-    static WINDOW: OnceLock<Mutex<(u64, u32)>> = OnceLock::new();
-    let mut window = WINDOW
-        .get_or_init(|| Mutex::new((0, 0)))
-        .lock()
-        .expect("org presentation limiter poisoned");
-    if now_unix_ms.saturating_sub(window.0) >= WINDOW_MS {
-        *window = (now_unix_ms, 0);
+/// Doorbell limiter for the public org presentation surface, per-source
+/// first (the enroll doorbell's design in
+/// `codex_cloud_attach::enroll_rate_ok`): one cheap scanner must not be
+/// able to hold the public presentation doorbell at its cap for everyone,
+/// so each source gets its own sliding window and the global window is
+/// only the wider backstop. The signed document stays the real
+/// authorization; this only keeps the store from being ground. Emptied
+/// source queues are dropped so the map cannot grow without bound under
+/// rotating sources.
+struct PresentationRateLimiter {
+    global: std::collections::VecDeque<u64>,
+    per_source: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
+}
+
+static PRESENTATION_RATE: std::sync::OnceLock<std::sync::Mutex<PresentationRateLimiter>> =
+    std::sync::OnceLock::new();
+const PRESENTATION_RATE_WINDOW_MS: u64 = 60_000;
+const PRESENTATION_RATE_GLOBAL_MAX: usize = 60;
+const PRESENTATION_RATE_PER_SOURCE_MAX: usize = 10;
+
+fn prune_presentation_window(queue: &mut std::collections::VecDeque<u64>, now_unix_ms: u64) {
+    while let Some(at_ms) = queue.front().copied() {
+        if now_unix_ms.saturating_sub(at_ms) < PRESENTATION_RATE_WINDOW_MS {
+            break;
+        }
+        queue.pop_front();
     }
-    if window.1 >= MAX_PER_WINDOW {
+}
+
+/// `source` is the listener's per-client bucket on the public HTTP door
+/// (the peer IP on direct ingress, the relay-preamble bucket on
+/// reachability-relay ingress) and a fixed lane label on authenticated or
+/// local callers.
+pub fn presentation_rate_ok(source: &str, now_unix_ms: u64) -> bool {
+    let limiter = PRESENTATION_RATE.get_or_init(|| {
+        std::sync::Mutex::new(PresentationRateLimiter {
+            global: std::collections::VecDeque::new(),
+            per_source: std::collections::HashMap::new(),
+        })
+    });
+    let mut limiter = limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    limiter.per_source.retain(|_, queue| {
+        prune_presentation_window(queue, now_unix_ms);
+        !queue.is_empty()
+    });
+    prune_presentation_window(&mut limiter.global, now_unix_ms);
+    if limiter.global.len() >= PRESENTATION_RATE_GLOBAL_MAX {
         return false;
     }
-    window.1 += 1;
+    let source_queue = limiter.per_source.entry(source.to_string()).or_default();
+    prune_presentation_window(source_queue, now_unix_ms);
+    if source_queue.len() >= PRESENTATION_RATE_PER_SOURCE_MAX {
+        return false;
+    }
+    source_queue.push_back(now_unix_ms);
+    limiter.global.push_back(now_unix_ms);
     true
 }
 
@@ -2894,7 +2938,7 @@ mod tests {
         let document_value = serde_json::to_value(&document).unwrap();
         let presentation_thread = std::thread::spawn(move || {
             presentation_started_tx.send(()).unwrap();
-            present_org_grant_value(&presentation_dir, &document_value, &[], test_now())
+            present_org_grant_value(&presentation_dir, "local", &document_value, &[], test_now())
         });
         presentation_started_rx.recv().unwrap();
         release_apply_tx.send(()).unwrap();
@@ -2952,7 +2996,8 @@ mod tests {
         .unwrap();
         crate::access::iam::save_state(directory.path(), &initial).unwrap();
         let document_value = serde_json::to_value(&document).unwrap();
-        present_org_grant_value(directory.path(), &document_value, &[], test_now()).unwrap();
+        present_org_grant_value(directory.path(), "local", &document_value, &[], test_now())
+            .unwrap();
 
         let (revoke_has_lock_tx, revoke_has_lock_rx) = mpsc::channel();
         let (release_revoke_tx, release_revoke_rx) = mpsc::channel();
@@ -2972,7 +3017,7 @@ mod tests {
         let presentation_dir = directory.path().to_path_buf();
         let presentation_thread = std::thread::spawn(move || {
             presentation_started_tx.send(()).unwrap();
-            present_org_grant_value(&presentation_dir, &document_value, &[], test_now())
+            present_org_grant_value(&presentation_dir, "local", &document_value, &[], test_now())
         });
         presentation_started_rx.recv().unwrap();
         release_revoke_tx.send(()).unwrap();
@@ -3031,6 +3076,7 @@ mod tests {
         std::fs::set_permissions(directory.path(), readonly).unwrap();
         let result = present_org_grant_value(
             directory.path(),
+            "local",
             &serde_json::to_value(&document).unwrap(),
             &[],
             test_now(),
@@ -3044,5 +3090,36 @@ mod tests {
                 .is_none(),
             "peer authority must not exist unless its IAM audit committed first"
         );
+    }
+
+    #[test]
+    fn presentation_rate_limit_is_per_source_with_a_global_backstop() {
+        // Far-future epoch in a distinctive range (the enroll limiter
+        // test's trick) so parallel tests sharing the process-wide
+        // limiter cannot interfere inside this window: real-clock
+        // callers use other buckets, and a real-clock prune vantage
+        // never counts future entries as stale.
+        let base = 3_600_000_000_000u64;
+        for i in 0..PRESENTATION_RATE_PER_SOURCE_MAX {
+            assert!(presentation_rate_ok("203.0.113.5", base + i as u64), "{i}");
+        }
+        // The noisy source is throttled…
+        assert!(!presentation_rate_ok("203.0.113.5", base + 50));
+        // …while a different source is untouched.
+        assert!(presentation_rate_ok("203.0.113.6", base + 51));
+        // The noisy source recovers once its window slides…
+        assert!(presentation_rate_ok(
+            "203.0.113.5",
+            base + PRESENTATION_RATE_WINDOW_MS + 100
+        ));
+        // …and that check also dropped every emptied aged-out queue from
+        // the map instead of retaining it forever.
+        let limiter = PRESENTATION_RATE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!limiter.per_source.contains_key("203.0.113.6"));
+        assert!(limiter.per_source.contains_key("203.0.113.5"));
     }
 }

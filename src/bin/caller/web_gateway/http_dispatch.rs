@@ -1901,11 +1901,15 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessOrgGrantPresent => {
+                // The listener's per-client doorbell bucket (peer IP on
+                // direct ingress, relay-preamble bucket on relay ingress)
+                // — an availability hint only, never authority.
                 return handle_access_org_grant_present(
                     stream,
                     route_body,
                     cert_dir,
                     agent_card_value_for_targets,
+                    source_hint,
                     route.cors,
                 )
                 .await;
@@ -1915,7 +1919,12 @@ pub(crate) async fn serve_http_request(
             }
             RouteHandlerId::AccessOrgApplyRenew => {
                 return handle_access_org_apply_renew(
-                    stream, route_body, req_path, cert_dir, route.cors,
+                    stream,
+                    route_body,
+                    req_path,
+                    cert_dir,
+                    source_hint,
+                    route.cors,
                 )
                 .await;
             }
