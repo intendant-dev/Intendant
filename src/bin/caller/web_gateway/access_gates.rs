@@ -349,6 +349,7 @@ pub(crate) fn allows_remote_certless_http(request_line: &str, method: &str, path
     is_public_peer_access_request_path(request_line)
         || is_public_org_grant_path(request_line)
         || is_public_connect_bootstrap_path(request_line)
+        || is_public_codex_cloud_enroll_path(request_line)
         || is_public_dashboard_shell_or_asset(method, path)
 }
 
@@ -1240,6 +1241,17 @@ mod tests {
                 "{method} {path} is authority-free discovery"
             );
         }
+        // The Codex Cloud enroll doorbell is certless by design (the
+        // single-use token in the body is the authorization) — and only
+        // as the exact POST.
+        {
+            let line = "POST /api/codex-cloud/enroll HTTP/1.1";
+            assert!(allows_remote_certless_http(
+                line,
+                "POST",
+                "/api/codex-cloud/enroll"
+            ));
+        }
         for (method, path) in [
             ("POST", "/connect/dashboard/offer"),
             ("POST", "/connect/dashboard/ice"),
@@ -1248,6 +1260,8 @@ mod tests {
             ("GET", "/frames/frame-1"),
             ("GET", "/recordings"),
             ("GET", "/recordings/run-1/segment"),
+            ("GET", "/api/codex-cloud/enroll"),
+            ("GET", "/api/codex-cloud/workers"),
             ("GET", "/debug"),
             ("GET", "/tmp/arbitrary-source.rs"),
             ("GET", "/ws"),

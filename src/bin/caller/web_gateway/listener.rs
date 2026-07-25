@@ -2278,6 +2278,29 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
+                    // Enrolled Codex Cloud workers never reach the dashboard
+                    // stream: their zero-authority `cloud-worker` profile
+                    // exists only to authenticate this socket, which becomes
+                    // the lease's attachment heartbeat and nothing else. The
+                    // profile is an authenticated fact from the identity
+                    // store (never a client header), so route on it before
+                    // the bearer gate — the mTLS identity is strictly
+                    // stronger auth than a federation bearer — and before
+                    // any dashboard grant is minted for it.
+                    if let Some(worker_identity) =
+                        peer_connection_identity.as_ref().filter(|identity| {
+                            identity.profile == crate::access::access_policy::CLOUD_WORKER_PROFILE
+                        })
+                    {
+                        let fingerprint = worker_identity.fingerprint.clone();
+                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        crate::codex_cloud_attach::serve_attachment_socket(ws_stream, &fingerprint)
+                            .await;
+                        return;
+                    }
                     // Bearer enforcement on /ws — dual-mode (Authorization
                     // header from daemons, ?token= query param from
                     // browsers). Reject with a plain HTTP 401 *before*

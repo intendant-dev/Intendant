@@ -367,6 +367,7 @@ pub(crate) enum RouteHandlerId {
     /// Codex Cloud worker leases (cached store; `?refresh=1` re-syncs via
     /// the daemon host's Codex CLI and parks transition notes).
     CodexCloudWorkers,
+    CodexCloudEnroll,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
     /// Raw op-log page (since/item/limit cursor; unknown ops verbatim).
@@ -921,6 +922,17 @@ pub(crate) static ROUTES: &[Route] = &[
         "Codex Cloud worker leases from the cached store (`?refresh=1` re-syncs via the Codex CLI)",
     )
     .with_tunnel(tunnel_method("api_codex_cloud_workers")),
+    // The attachment broker's redemption doorbell: an enrolling worker has
+    // no identity yet, so the route is public and the single-use minted
+    // token is the entire authorization (burned atomically; rate-limited;
+    // grants only the zero-authority cloud-worker profile).
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact(crate::codex_cloud_attach::ENROLL_PATH),
+        BodyPolicy::Capped(8 * 1024),
+        RouteHandlerId::CodexCloudEnroll,
+        "Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out)",
+    ),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),

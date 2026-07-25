@@ -316,6 +316,8 @@ pub async fn run(args: Vec<String>) -> Result<(), String> {
         "pull" => run_pull(&args[1..]).await,
         "probe" => run_probe(&args[1..]).await,
         "followup" | "follow-up" | "message" => run_followup(&args[1..]).await,
+        "attach" => crate::codex_cloud_attach::run_attach(&args[1..]).await,
+        "agent" => crate::codex_cloud_attach::run_agent(&args[1..]).await,
         "bootstrap" => run_bootstrap(&args[1..]),
         "attachment" => run_attachment(&args[1..]),
         "prune" => run_prune(&args[1..]),
@@ -996,7 +998,11 @@ fn mark_probe(store_path: &Path, task_id: &str) -> Result<(), String> {
 /// it into `worker_history` and counts a cold replacement — replacing
 /// silently would discard exactly the evidence the probe exists to
 /// gather.
-fn record_worker_fingerprint(store_path: &Path, task_id: &str, fingerprint: WorkerFingerprint) {
+pub(crate) fn record_worker_fingerprint(
+    store_path: &Path,
+    task_id: &str,
+    fingerprint: WorkerFingerprint,
+) {
     let Ok(_lock) = StoreLock::acquire(store_path) else {
         return;
     };
@@ -1855,15 +1861,24 @@ fn run_attachment(args: &[String]) -> Result<(), String> {
         "none" | "not-requested" => AttachmentState::NotRequested,
         other => return Err(format!("unknown attachment state {other:?}")),
     };
-    let store_path = state_path();
-    let _lock = StoreLock::acquire(&store_path)?;
-    let mut store = load_store(&store_path)?;
+    let label = record_attachment_state(&state_path(), &args[0], state)?;
+    println!("{} attachment={label}", args[0]);
+    Ok(())
+}
+
+/// Record an attachment-lane state on a tracked lease (the CLI verb, the
+/// enrollment broker, and the gateway's attachment socket all converge
+/// here — the store lock keeps them serialized).
+pub(crate) fn record_attachment_state(
+    store_path: &Path,
+    task_id: &str,
+    state: AttachmentState,
+) -> Result<&'static str, String> {
+    let _lock = StoreLock::acquire(store_path)?;
+    let mut store = load_store(store_path)?;
     let label = {
-        let lease = store.leases.get_mut(&args[0]).ok_or_else(|| {
-            format!(
-                "unknown worker lease {}; run `intendant codex-cloud list`",
-                args[0]
-            )
+        let lease = store.leases.get_mut(task_id).ok_or_else(|| {
+            format!("unknown worker lease {task_id}; run `intendant codex-cloud list`")
         })?;
         lease.attachment_state = state;
         // `connected` (re-)starts the staleness clock; `none` resets the
@@ -1876,9 +1891,8 @@ fn run_attachment(args: &[String]) -> Result<(), String> {
         lease.last_observed_unix_ms = now_unix_ms();
         attachment_label(&lease.attachment_state)
     };
-    save_store(&store_path, &store)?;
-    println!("{} attachment={label}", args[0]);
-    Ok(())
+    save_store(store_path, &store)?;
+    Ok(label)
 }
 
 fn run_prune(args: &[String]) -> Result<(), String> {
@@ -2419,7 +2433,7 @@ fn save_store(path: &Path, store: &LeaseStore) -> Result<(), String> {
 /// `<store>.lock` — never the store itself, whose inode `atomic_write`
 /// replaces (and whose reads Windows' LockFileEx would block). The OS
 /// releases the lock if the holder dies.
-struct StoreLock {
+pub(crate) struct StoreLock {
     file: std::fs::File,
 }
 
@@ -2430,7 +2444,7 @@ impl StoreLock {
 
     /// Lock an arbitrary sidecar path with the same semantics (the
     /// per-task follow-up serialization lock rides here too).
-    fn acquire_path(lock_path: &Path) -> Result<Self, String> {
+    pub(crate) fn acquire_path(lock_path: &Path) -> Result<Self, String> {
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create lease store directory {}: {e}", parent.display()))?;
@@ -2600,7 +2614,7 @@ fn reject_args(args: &[String], command: &str) -> Result<(), String> {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -2664,7 +2678,7 @@ internet allowlist must include every exact relay/download domain used by the wo
 
 fn print_help() {
     println!(
-        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  probe        Submit a diagnostic task that fingerprints its worker\n  followup     Send a follow-up turn into an existing task (private backend)\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
+        "Usage:\n  intendant codex-cloud <command> [options]\n\nCommands:\n  doctor       Verify the local Codex CLI and Cloud authentication\n  exec         Submit a task and create a provider-owned worker lease\n  list         Refresh and list Cloud tasks/leases (window + live tracked)\n  status       Show one tracked lease\n  diff         Show a task diff through the Codex CLI\n  pull         Apply a task's diff onto a fresh branch in a new worktree\n  probe        Submit a diagnostic task that fingerprints its worker\n  followup     Send a follow-up turn into an existing task (private backend)\n  attach       Mint a one-time enrollment token + attach prompt for a task's worker\n  agent        (runs inside the worker) redeem a token and hold the attachment socket\n  attachment   Record the independent live-attachment state\n  prune        Drop terminal leases with no live attachment\n  bootstrap    Generate setup, maintenance, and task-time worker scripts\n\nCodex Cloud containers are ephemeral worker leases, not permanent peers."
     );
 }
 
