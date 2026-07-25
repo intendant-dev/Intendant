@@ -752,6 +752,7 @@ mod tests {
                     orchestrate: false,
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -1636,6 +1637,7 @@ mod tests {
                     orchestrate: false,
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -1675,6 +1677,7 @@ mod tests {
                     orchestrate: false,
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -1824,6 +1827,7 @@ mod tests {
                     orchestrate: false,
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 None,
             )

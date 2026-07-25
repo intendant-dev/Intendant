@@ -10,7 +10,7 @@ use super::types::{
     MAX_PART_OF_DEPTH, MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS,
     MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS,
     MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS,
-    MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
+    MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM, TRIGGER_MATCH_TAGS_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -503,6 +503,10 @@ impl AgendaStore {
             project_root,
             agent_config,
             recurrence: None,
+            // start_now is the one-shot revise-and-run lane — a trigger
+            // never rides it (standing triggered manifests run-now via
+            // request_occurrence instead).
+            trigger: None,
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
         self.append_op(
@@ -547,12 +551,15 @@ impl AgendaStore {
                 "{id} has no scheduled session"
             )));
         };
-        let Some(rec) = &effect.manifest.recurrence else {
+        // Standing = recurring OR triggered (Track T): both are
+        // owner-approved standing decisions a run-now composes with; a
+        // one-shot's "run again" stays the start_now revise flow.
+        if effect.manifest.recurrence.is_none() && effect.manifest.trigger.is_none() {
             return Err(AgendaError::Transition(format!(
                 "{id}'s manifest is one-shot — run it again via start (which re-reviews \
                  and re-approves)"
             )));
-        };
+        }
         let Some(approval) = &effect.approval else {
             return Err(AgendaError::Transition(format!(
                 "{id}'s standing manifest is not approved — nothing may fire"
@@ -565,7 +572,7 @@ impl AgendaStore {
                 effect.digest
             )));
         }
-        if effect.consecutive_failures >= rec.suspend_threshold() {
+        if effect.suspended() {
             return Err(AgendaError::Transition(format!(
                 "{id}'s standing session is suspended after {} consecutive failures — \
                  re-approve the manifest to re-arm it, or revoke it",
@@ -1116,6 +1123,7 @@ impl AgendaStore {
                 orchestrate,
                 recurrence,
                 agent_config,
+                trigger,
                 source: _,
             } => {
                 let item = self.require(&id)?;
@@ -1162,6 +1170,19 @@ impl AgendaStore {
                         ));
                     }
                 }
+                if let Some(trig) = &trigger {
+                    // T0 ruling 2: a manifest is cadenced OR triggered in
+                    // v1 — composition returns only when a real consumer
+                    // asks for it.
+                    if recurrence.is_some() {
+                        return Err(AgendaError::Invalid(
+                            "manifest-cadence-and-trigger-exclusive: a manifest declares \
+                             recurrence OR a trigger, not both (v1)"
+                                .into(),
+                        ));
+                    }
+                    validate_trigger(trig)?;
+                }
                 let goal = {
                     let goal = goal.trim();
                     if goal.is_empty() {
@@ -1202,6 +1223,7 @@ impl AgendaStore {
                         project_root: None,
                         agent_config,
                         recurrence,
+                        trigger,
                     },
                 })
             }
@@ -1859,6 +1881,43 @@ fn validate_source(source: Option<String>) -> Result<Option<String>, AgendaError
         )));
     }
     Ok(Some(source.to_string()))
+}
+
+/// Trigger intake validation (Track T, T0 ruling 1): the match predicate
+/// is tags ∧ kind ONLY, with 1..=[`TRIGGER_MATCH_TAGS_MAX`] non-empty
+/// tags — a tag-less trigger would match every new item of its kind
+/// (kind-only matching is a future price-tagged ruling, not a default).
+fn validate_trigger(trigger: &super::types::TriggerSpec) -> Result<(), AgendaError> {
+    match trigger {
+        super::types::TriggerSpec::OnUnblock => Ok(()),
+        super::types::TriggerSpec::OnItemMatch { tags, .. } => {
+            if tags.is_empty() {
+                return Err(AgendaError::Invalid(
+                    "on_item_match requires at least one tag (kind-only matching is a \
+                     future ruling)"
+                        .into(),
+                ));
+            }
+            if tags.len() > TRIGGER_MATCH_TAGS_MAX {
+                return Err(AgendaError::Invalid(format!(
+                    "on_item_match accepts at most {TRIGGER_MATCH_TAGS_MAX} tags"
+                )));
+            }
+            for tag in tags {
+                if tag.trim().is_empty() {
+                    return Err(AgendaError::Invalid(
+                        "on_item_match tags must not be empty".into(),
+                    ));
+                }
+                if tag.chars().count() > MAX_TAG_CHARS {
+                    return Err(AgendaError::Invalid(format!(
+                        "on_item_match tag exceeds {MAX_TAG_CHARS} characters"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// One ref spec after intake validation: locator normalized, file digest
@@ -3690,6 +3749,7 @@ mod tests {
             recurrence: Some(recurrence(every_ms)),
             agent_config: None,
             source: None,
+            trigger: None,
         }
     }
 
@@ -3730,6 +3790,7 @@ mod tests {
                     }),
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 "until_ms must be after",
             ),
@@ -3745,6 +3806,7 @@ mod tests {
                     }),
                     agent_config: None,
                     source: None,
+                    trigger: None,
                 },
                 "at least 1",
             ),
@@ -4001,6 +4063,7 @@ mod tests {
             project_root: None,
             agent_config: None,
             recurrence: Some(recurrence(3_600_000)),
+            trigger: None,
         };
         let json = serde_json::to_value(&with).unwrap();
         assert!(
@@ -4049,6 +4112,7 @@ mod tests {
                 ..Default::default()
             })),
             recurrence: Some(recurrence(3_600_000)),
+            trigger: None,
         };
         let json = serde_json::to_value(&with).unwrap();
         assert!(
@@ -4076,6 +4140,126 @@ mod tests {
             .contains("agent_config"));
     }
 
+    /// Track T: a trigger-bearing manifest on an older build degrades
+    /// fail-closed — the re-serialization drops the unknown field, the
+    /// digest mismatches, the approval reads as void, nothing fires.
+    /// The exact recurrence/executor pin shape; the tail assertion is
+    /// the T1 byte-identity acceptance (trigger-less manifests never
+    /// emit the field).
+    #[test]
+    fn trigger_cross_build_digest_degrades_fail_closed() {
+        let with = super::super::types::SessionManifest {
+            goal: "gated run".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: Some(super::super::types::TriggerSpec::OnItemMatch {
+                item_kind: super::super::types::AgendaKind::Question,
+                tags: vec!["gate".into()],
+            }),
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert!(json.get("trigger").is_some(), "the field reaches the wire");
+        let mut stripped_json = json.clone();
+        stripped_json.as_object_mut().unwrap().remove("trigger");
+        let stripped: super::super::types::SessionManifest =
+            serde_json::from_value(stripped_json).unwrap();
+        assert_ne!(
+            super::super::types::manifest_digest("i", "e", &with),
+            super::super::types::manifest_digest("i", "e", &stripped),
+            "the trigger must be digest-visible or old builds would fire it as a one-shot"
+        );
+        let legacy = super::super::types::SessionManifest {
+            trigger: None,
+            ..stripped
+        };
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("\"trigger\""));
+    }
+
+    /// Track T intake: cadence ⊕ trigger are mutually exclusive with the
+    /// named refusal (T0 ruling 2), and the match predicate is bounded —
+    /// at least one tag, at most the cap, each non-empty (ruling 1).
+    /// Every refusal appends nothing.
+    #[test]
+    fn trigger_intake_enforces_exclusion_and_the_predicate_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("triggered"), owner(), 1000)
+            .unwrap()
+            .id;
+        let propose = |recurrence: Option<super::super::types::RecurrenceSpec>,
+                       trigger: Option<super::super::types::TriggerSpec>| {
+            AgendaCommand::ProposeEffect {
+                id: id.clone(),
+                goal: "g".into(),
+                fire_at_ms: 1_000_000,
+                orchestrate: false,
+                recurrence,
+                agent_config: None,
+                trigger,
+                source: None,
+            }
+        };
+        let gate = |tags: Vec<String>| super::super::types::TriggerSpec::OnItemMatch {
+            item_kind: super::super::types::AgendaKind::Question,
+            tags,
+        };
+        let ops_before = store.ops();
+        for (cmd, needle) in [
+            (
+                propose(Some(recurrence(3_600_000)), Some(gate(vec!["gate".into()]))),
+                "manifest-cadence-and-trigger-exclusive",
+            ),
+            (propose(None, Some(gate(Vec::new()))), "at least one tag"),
+            (
+                propose(None, Some(gate((0..9).map(|i| format!("t{i}")).collect()))),
+                "at most",
+            ),
+            (
+                propose(None, Some(gate(vec!["  ".into()]))),
+                "must not be empty",
+            ),
+        ] {
+            let err = store.apply_command(cmd, owner(), 2000).unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in {err}"
+            );
+        }
+        assert_eq!(store.ops(), ops_before, "refusals append nothing");
+
+        // The lawful shapes land: an on_unblock proposal and (after a
+        // revise) a bounded on_item_match proposal.
+        let parked = store
+            .apply_command(
+                propose(None, Some(super::super::types::TriggerSpec::OnUnblock)),
+                owner(),
+                3000,
+            )
+            .unwrap();
+        assert_eq!(
+            parked.effects[0].manifest.trigger,
+            Some(super::super::types::TriggerSpec::OnUnblock)
+        );
+        let revised = store
+            .apply_command(
+                propose(None, Some(gate(vec!["gate".into()]))),
+                owner(),
+                4000,
+            )
+            .unwrap();
+        assert_eq!(
+            revised.effects[0].manifest.trigger,
+            Some(gate(vec!["gate".into()]))
+        );
+    }
+
     /// Track AU: the scheduled lane's executor intake — pins are recorded
     /// verbatim on the digest-bound manifest, an all-inherit block
     /// normalizes to the legacy absent shape (identical bytes, identical
@@ -4099,6 +4283,7 @@ mod tests {
                 recurrence: Some(recurrence(3_600_000)),
                 agent_config: config.map(Box::new),
                 source: None,
+                trigger: None,
             };
 
         let config = crate::event::AgentLaunchConfig {
