@@ -1905,8 +1905,7 @@ impl DisplaySession {
         // flows), so the empty-baseline guard below — which protects real
         // displays from the silent-black-screen class — does not apply.
         let synthetic_source = self.backend.kind() == synthetic::KIND;
-        let bankless =
-            synthetic_source || self.video_bank_disabled.load(Ordering::Relaxed);
+        let bankless = synthetic_source || self.video_bank_disabled.load(Ordering::Relaxed);
         #[cfg(not(target_os = "windows"))]
         let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
         #[cfg(target_os = "windows")]

@@ -1443,10 +1443,7 @@ pub(crate) fn control_cloud_display_open_frame(
                         continue;
                     };
                     let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or("");
-                    let reply_host = value
-                        .get("host_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let reply_host = value.get("host_id").and_then(|v| v.as_str()).unwrap_or("");
                     if reply_host == host
                         && matches!(
                             kind,

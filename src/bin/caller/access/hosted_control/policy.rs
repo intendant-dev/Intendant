@@ -303,8 +303,8 @@ pub fn hosted_tunnel_frame_classification(preset: HostedPreset, frame_type: &str
     Some(match frame_type {
         "hello" | "ping" | "request" => true,
         "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close"
-        | "terminal_share" | "display_input" | "display_open" | "display_close" | "upload_start"
-        | "upload_chunk" | "upload_end" => preset == HostedPreset::Operate,
+        | "terminal_share" | "display_input" | "display_open" | "display_close"
+        | "upload_start" | "upload_chunk" | "upload_end" => preset == HostedPreset::Operate,
         "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
         | "egress_request_ack" => false,
         _ => return None,

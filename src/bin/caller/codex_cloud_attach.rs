@@ -928,9 +928,15 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     let mut display_state = WorkerDisplayState::default();
     let mut attempt: u32 = 0;
     loop {
-        let held =
-            hold_attachment(&home, &pinned, &identity, &task, &terminal_registry, &mut display_state)
-                .await;
+        let held = hold_attachment(
+            &home,
+            &pinned,
+            &identity,
+            &task,
+            &terminal_registry,
+            &mut display_state,
+        )
+        .await;
         // The per-viewer display half is socket-scoped: the pump and
         // stream unwind on their own when the socket's channels close,
         // and this reset clears the handles so the next open starts
@@ -1002,7 +1008,10 @@ async fn start_worker_display_session(
     let mock_synthetic = std::env::var("INTENDANT_MOCK_DISPLAY").as_deref() == Ok("synthetic")
         && std::env::var("PROVIDER").as_deref() == Ok("mock");
     let (display_id, backend): (u32, Arc<dyn crate::display::DisplayBackend>) = if mock_synthetic {
-        (0, Arc::new(crate::display::synthetic::SyntheticBackend::new()))
+        (
+            0,
+            Arc::new(crate::display::synthetic::SyntheticBackend::new()),
+        )
     } else if cfg!(target_os = "linux") {
         #[cfg(target_os = "linux")]
         {
@@ -1606,7 +1615,10 @@ mod tests {
             .expect("tiles within deadline")
             .expect("tile frame");
         let value: serde_json::Value = serde_json::from_str(&tiles).unwrap();
-        assert_eq!(value.get("t").and_then(|v| v.as_str()), Some("display_tiles"));
+        assert_eq!(
+            value.get("t").and_then(|v| v.as_str()),
+            Some("display_tiles")
+        );
         assert_eq!(
             value.get("host_id").and_then(|v| v.as_str()),
             Some("cloud:t")
