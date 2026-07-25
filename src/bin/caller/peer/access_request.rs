@@ -1091,12 +1091,28 @@ fn enforce_create_rate_limits(
     source_hint: Option<&str>,
     config: &PeerAccessRequestConfig,
 ) -> Result<(), CallerError> {
-    let now = unix_timestamp();
+    enforce_create_rate_limits_at(source_hint, config, unix_timestamp())
+}
+
+fn enforce_create_rate_limits_at(
+    source_hint: Option<&str>,
+    config: &PeerAccessRequestConfig,
+    now: i64,
+) -> Result<(), CallerError> {
     let limiter = CREATE_RATE_LIMITER.get_or_init(|| StdMutex::new(CreateRateLimiter::default()));
     let mut limiter = limiter
         .lock()
         .map_err(|_| CallerError::Config("peer access request rate limiter poisoned".into()))?;
     let window_secs = effective_rate_limit_window_secs(config);
+
+    // Prune every source queue and drop the emptied ones (the enroll
+    // doorbell's design in `codex_cloud_attach::enroll_rate_ok`): without
+    // the drop, rotating source hints would grow the map without bound
+    // over the daemon's lifetime.
+    limiter.per_source.retain(|_, queue| {
+        prune_rate_queue(queue, now, window_secs);
+        !queue.is_empty()
+    });
 
     prune_rate_queue(&mut limiter.global, now, window_secs);
     if limiter.global.len() >= config.max_creates_per_window {
@@ -1942,8 +1958,17 @@ mod tests {
         assert_eq!(project.config.peers[0].card_url, result.card_url);
     }
 
+    /// The create limiter is process-global, and the aging test below
+    /// prunes from a far-future vantage that would count every real-clock
+    /// entry as stale — interleaved with this real-clock streak it could
+    /// erase the streak mid-test. Serialize the two limiter tests.
+    static RATE_LIMIT_TEST_SERIALIZER: StdMutex<()> = StdMutex::new(());
+
     #[test]
     fn create_rate_limit_rejects_excess_per_source() {
+        let _serialized = RATE_LIMIT_TEST_SERIALIZER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let source = format!(
             "test-rate-{}-{:?}",
             unix_timestamp(),
@@ -1964,6 +1989,38 @@ mod tests {
                 .contains("peer access request rate limit exceeded"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn create_rate_limit_drops_emptied_source_entries() {
+        let _serialized = RATE_LIMIT_TEST_SERIALIZER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Far-future epoch in a distinctive range (same trick as the
+        // enroll limiter's test): parallel tests use the real clock, so
+        // nothing else can land entries inside this window — and a
+        // real-clock prune vantage never counts future entries as stale.
+        let base: i64 = 4_000_000_000;
+        let config = PeerAccessRequestConfig::default();
+        let window_secs = effective_rate_limit_window_secs(&config);
+        let source_a = "test-drop-source-a";
+        let source_b = "test-drop-source-b";
+
+        enforce_create_rate_limits_at(Some(source_a), &config, base).unwrap();
+        {
+            let limiter = CREATE_RATE_LIMITER.get().unwrap().lock().unwrap();
+            assert!(limiter.per_source.contains_key(source_a));
+        }
+
+        // Once its window ages out, any later check drops the emptied
+        // entry from the map instead of retaining it forever.
+        enforce_create_rate_limits_at(Some(source_b), &config, base + window_secs + 1).unwrap();
+        let limiter = CREATE_RATE_LIMITER.get().unwrap().lock().unwrap();
+        assert!(
+            !limiter.per_source.contains_key(source_a),
+            "aged-out source entry must be dropped, not kept as an empty queue"
+        );
+        assert!(limiter.per_source.contains_key(source_b));
     }
 
     #[test]
