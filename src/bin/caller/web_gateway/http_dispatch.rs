@@ -1187,6 +1187,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::CodexCloudEnroll => {
+                return handle_codex_cloud_enroll(
+                    stream,
+                    route_body,
+                    cert_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaList => {
                 return handle_agenda_list(
                     stream,

@@ -64,3 +64,68 @@ pub(crate) async fn handle_codex_cloud_workers(
     let response = codex_cloud_workers_api_response(refresh, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
+
+/// Method-exact membership test for the certless carve-out
+/// ([`super::access_gates::allows_remote_certless_http`]): a Codex Cloud
+/// worker redeeming its enrollment token has no client certificate yet —
+/// the single-use token in the body is the entire authorization, so this
+/// one POST sits in the doorbell class beside peer pairing and org
+/// grants.
+pub(crate) fn is_public_codex_cloud_enroll_path(request_line: &str) -> bool {
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    method == "POST" && path == crate::codex_cloud_attach::ENROLL_PATH
+}
+
+/// The attachment broker's public redemption doorbell
+/// (`POST /api/codex-cloud/enroll`): the single-use minted token is the
+/// entire authorization. Refusals are uniform (an unknown, used, or
+/// expired token reads identically) and the store I/O runs off the
+/// reactor thread.
+pub(crate) async fn handle_codex_cloud_enroll(
+    stream: DemuxStream,
+    body: String,
+    cert_dir: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = codex_cloud_enroll_response(body, cert_dir).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+async fn codex_cloud_enroll_response(body: String, cert_dir: PathBuf) -> ApiResponse {
+    if !crate::codex_cloud_attach::enroll_rate_ok(crate::codex_cloud::now_unix_ms()) {
+        return ApiResponse::json_error(429, "enrollment is rate limited; retry shortly");
+    }
+    let request: crate::codex_cloud_attach::EnrollRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiResponse::json_error(400, format!("invalid enrollment request: {error}"))
+        }
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::codex_cloud_attach::redeem_enrollment(
+            &cert_dir,
+            &crate::codex_cloud::state_path(),
+            &request,
+            crate::codex_cloud::now_unix_ms(),
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(enrolled)) => match serde_json::to_value(&enrolled) {
+            Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
+            Err(error) => ApiResponse::json_error(500, format!("serialize enrollment: {error}")),
+        },
+        Ok(Err(error)) => {
+            // Uniform refusal class: token problems and validation
+            // problems both land 403 without distinguishing detail beyond
+            // the message the broker chose to surface.
+            ApiResponse::json_error(403, &error)
+        }
+        Err(error) => ApiResponse::json_error(500, format!("enrollment task: {error}")),
+    }
+}

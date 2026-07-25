@@ -125,6 +125,9 @@ intendant codex-cloud probe --task task_e_...
 # Continue a finished task with a new turn (see "Follow-ups" below).
 intendant codex-cloud followup task_e_... -m "Now also fix the tests"
 
+# Attach the live worker to this daemon over mTLS (see "Attaching" below).
+intendant codex-cloud attach task_e_... --home-url wss://your-host:8765 --send
+
 # Drop terminal leases with no live attachment (default: older than 7 days).
 intendant codex-cloud prune
 intendant codex-cloud prune --all
@@ -208,9 +211,54 @@ intendant codex-cloud followup task_e_... --json < prompt.txt   # stdin keeps pr
 `INTENDANT_CODEX_CLOUD_BACKEND` overrides the backend base URL (tests point
 it at a local stub; the default is the production web backend).
 
+## Attaching a worker to home (mTLS enrollment ceremony)
+
+A worker has no inbound reachability and no durable identity, so attaching
+it inverts the usual peer pairing. Home runs the whole ceremony:
+
+```bash
+# Mint a single-use token bound to the task and deliver the attach prompt
+# as a follow-up turn into the warm worker:
+intendant codex-cloud attach task_e_... --home-url wss://your-host:8765 --send
+
+# Or print the prompt to deliver by hand (task page, initial submit):
+intendant codex-cloud attach task_e_... --home-url wss://your-host:8765
+```
+
+The composed prompt tells the worker to run `intendant codex-cloud agent`
+through `run-worker.sh` (task-local state), with the token on stdin — never
+argv. The agent then:
+
+1. generates a keypair in its task-local state root (the private key never
+   leaves the worker; the daemon signs a public key, never mints one);
+2. redeems `{token, public key}` at home's public
+   `POST /api/codex-cloud/enroll` route and receives a client certificate
+   whose identity record carries the system-issued **`cloud-worker`**
+   profile and a hard expiry (`--identity-ttl-s`, default 3600);
+3. dials home's gateway over mTLS, pinned to the fingerprint baked into
+   the prompt, and holds the socket in the foreground. The accepted socket
+   *is* the attachment: the lease flips `connected` while it lives and
+   `disconnected` when it dies.
+
+Security shape: the enrollment token is stored hashed, minutes-TTL
+(`--token-ttl-s`, default 900), bound to one task, and burned atomically on
+first redemption — an unknown, used, or expired token refuses identically,
+and the public doorbell is rate-limited. The `cloud-worker` profile is
+recognized by every enforcement path but grants **no** operation at all
+(strictly less than presence-only) and is never operator-assignable; the
+gateway routes an attaching cloud-worker socket to the attachment lane
+before any dashboard grant exists, so the certificate authenticates exactly
+one thing: this heartbeat. Authority over the worker flows home→worker in
+later slices; the worker's inbound authority on home stays nothing.
+
+The worker's egress must be able to reach `--home-url`: in a
+network-restricted Codex Cloud environment, add the home host to the
+environment's allowlist or the dial is refused before TLS.
+
 ## Attachment lifecycle
 
-An attachment broker or operator records the independent attachment state:
+The enrollment broker above records the attachment state for its workers;
+an external broker or operator can also record it manually:
 
 ```bash
 intendant codex-cloud attachment task_e_... awaiting
@@ -224,9 +272,8 @@ Refreshes age attachments by three rules:
   broker is gone or will never arrive.
 - `connected` carries `attached_at_unix_ms` and expires after a staleness TTL
   (`INTENDANT_CODEX_CLOUD_ATTACH_TTL_S`, default 3600) unless re-asserted:
-  recording `connected` again restarts the clock. This is the stopgap until a
-  broker owns liveness — a crashed broker cannot leave a lease `connected`
-  forever.
+  recording `connected` again restarts the clock — a crashed broker cannot
+  leave a lease `connected` forever.
 - `connected` within the TTL survives even a terminal provider task, because
   reachability must be checked independently of provider state.
 
@@ -365,9 +412,11 @@ attachment lane instead of pretending each Cloud task is a static `[[peer]]`.
 
 ## Current boundary
 
-This integration covers the reliable job/control plane and the safe
-setup/maintenance contract. The attachment state is ready for a broker to own,
-but Intendant does not yet mint one-time enrollment credentials or allocate
-multi-tenant relay routes. Until that broker exists, live attachment remains an
-explicit deployment-specific command rather than pretending each Cloud task is
-a static `[[peer]]`.
+This integration covers the reliable job/control plane, the safe
+setup/maintenance contract, and the enrollment ceremony that attaches a live
+worker to home over mTLS. The attachment is deliberately just a heartbeat so
+far: the socket carries a hello frame and liveness, nothing else — no
+terminal, no display, no home→worker command channel yet. Workers are
+ephemeral enrollments with zero-authority expiring identities, not static
+`[[peer]]` registry entries, and home must be reachable from the worker's
+egress allowlist (there is no relay tier).

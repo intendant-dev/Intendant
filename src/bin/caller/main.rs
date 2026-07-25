@@ -18,6 +18,7 @@ mod builtin_skills;
 mod claude_auth_ceremony;
 mod codex_auth_ceremony;
 mod codex_cloud;
+mod codex_cloud_attach;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;

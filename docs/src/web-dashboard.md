@@ -1884,6 +1884,7 @@ response omits the header.
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
 | GET | `/api/codex-cloud/workers` | StatsRead | own origin | none | Codex Cloud worker leases from the cached store (`?refresh=1` re-syncs via the Codex CLI) |
+| POST | `/api/codex-cloud/enroll` | public | public | ≤ 8 KiB | Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |

@@ -236,6 +236,12 @@ pub enum ProfileClass {
     TaskRunner,
     Operator,
     AdminPeer,
+    /// Authenticate-only ceiling for enrolled ephemeral cloud workers:
+    /// grants no operation at all — strictly less than `PresenceOnly`.
+    /// The identity exists so the gateway can recognize the connection
+    /// and route it to the attachment lane; authority over the worker
+    /// flows the other way (home drives the worker), never inbound.
+    CloudWorker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +376,18 @@ pub(crate) const PROFILES: &[(&str, ProfileClass)] = &[
     ("peer-root", ProfileClass::AdminPeer),
 ];
 
+/// The Codex Cloud attachment broker's system profile name — the single
+/// declaration every mint, enforcement, and routing site derives from.
+pub(crate) const CLOUD_WORKER_PROFILE: &str = "cloud-worker";
+
+/// System-issued profiles: recognized by every enforcement path but never
+/// operator-assignable — [`require_known_profile`] rejects them, and the
+/// dashboard picker (whose parity test mirrors [`PROFILES`] alone) never
+/// lists them. Minted only by dedicated ceremonies; today that is the
+/// Codex Cloud enrollment broker's `cloud-worker` identity.
+pub(crate) const SYSTEM_PROFILES: &[(&str, ProfileClass)] =
+    &[(CLOUD_WORKER_PROFILE, ProfileClass::CloudWorker)];
+
 /// Accepted alternate spellings, each canonicalizing to a [`PROFILES`] name.
 pub(crate) const PROFILE_ALIASES: &[(&str, &str)] = &[
     ("presence", "presence-only"),
@@ -411,6 +429,12 @@ pub fn profile_class(profile: &str) -> ProfileClass {
     let normalized = profile.trim().to_ascii_lowercase();
     canonical_profile_entry(&normalized)
         .map(|(_, class)| class)
+        .or_else(|| {
+            SYSTEM_PROFILES
+                .iter()
+                .find(|(name, _)| *name == normalized)
+                .map(|(_, class)| *class)
+        })
         // Unknown profiles degrade to the least-capable class. This is the
         // wire-side contract: a profile string this daemon does not know
         // (stored by an older build, minted by a newer one) fails closed
@@ -454,6 +478,10 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
     use ProfileClass::*;
 
     match profile_class(profile) {
+        // Authenticate-only: an enrolled cloud worker may hold its
+        // attachment socket and nothing else — strictly below
+        // PresenceOnly.
+        CloudWorker => false,
         PresenceOnly => matches!(op, PresenceRead),
         Stats => matches!(op, PresenceRead | StatsRead),
         SessionReader => matches!(op, PresenceRead | StatsRead | SessionInspect),
@@ -1204,6 +1232,31 @@ pub fn write_approved_identity(
     card_url: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<PeerIdentityRecord, CallerError> {
+    write_approved_identity_expiring(
+        cert_dir,
+        fingerprint,
+        label,
+        profile,
+        card_url,
+        request_id,
+        None,
+    )
+}
+
+/// [`write_approved_identity`] with an expiry: past `expires_at_unix` the
+/// record fails [`PeerIdentityRecord::is_active`] and the gateway refuses
+/// the certificate — the enforcement lane for short-lived identities
+/// (cloud-worker enrollments), independent of the certificate's own
+/// validity window.
+pub fn write_approved_identity_expiring(
+    cert_dir: &Path,
+    fingerprint: &str,
+    label: &str,
+    profile: &str,
+    card_url: Option<&str>,
+    request_id: Option<&str>,
+    expires_at_unix: Option<i64>,
+) -> Result<PeerIdentityRecord, CallerError> {
     with_identity_store_lock(cert_dir, || {
         let fingerprint = normalize_fingerprint(fingerprint)?;
         let profile = normalize_profile(profile)?;
@@ -1218,7 +1271,7 @@ pub fn write_approved_identity(
             filesystem: FilesystemAccessPolicy::default(),
             created_at_unix: unix_timestamp(),
             revoked_at_unix: None,
-            expires_at_unix: None,
+            expires_at_unix,
             source: None,
             org_grant_id: None,
             issued_via: None,
