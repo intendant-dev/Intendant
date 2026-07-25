@@ -101,6 +101,18 @@ impl AgendaActor {
         };
         (!actor.is_empty()).then_some(actor)
     }
+
+    /// The daemon-internal writer attribution (Track PR ruling 1 +
+    /// adopt-rider): the daemon itself, on schedule — scanner parks,
+    /// scheduler write-backs, the ask resolver's lane. Identity fields
+    /// stay empty by construction (no IAM principal, no session); which
+    /// daemon lane wrote rides the envelope `source`, beside — never
+    /// inside — this attribution. Pre-rider ops with an absent actor
+    /// stay as legacy history.
+    pub(crate) fn daemon() -> Self {
+        Self::from_binding(&crate::access::actor::ActorBinding::daemon())
+            .expect("the daemon binding always carries its kind")
+    }
 }
 
 /// The current reply on a question item (fold view of the latest `answer`

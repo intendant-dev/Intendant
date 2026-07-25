@@ -118,6 +118,7 @@ function memoryActorLabel(p) {
   if (p.actor === 'dashboard') return 'you';
   if (p.actor === 'local_process') return 'local ctl';
   if (p.actor === 'peer') return 'a peer daemon';
+  if (p.actor === 'daemon') return 'the daemon';
   if (p.actor === 'agent_session') return 'an agent session';
   if (p.actor === 'unattributed') return 'unattributed';
   return p.principal || '';

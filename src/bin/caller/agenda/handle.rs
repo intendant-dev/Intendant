@@ -330,8 +330,11 @@ impl AgendaHandle {
     /// holding `ask_id`, completing it. The joined text summary is built
     /// in item-question order; `ApprovalResolved` (emitted by
     /// [`AgendaHandle::apply`]'s closing path) clears every connected
-    /// rail. The write is unattributed: the uniform `ControlCommand` bus
-    /// lane carries no gate-resolved actor (see `agenda/ask.rs`).
+    /// rail. Attribution is the daemon's own resolver lane (Track PR
+    /// adopt-rider): the uniform `ControlCommand` bus lane carries no
+    /// gate-resolved human actor (see `agenda/ask.rs`), and the honest
+    /// record of who *wrote* is the daemon — never a fabricated
+    /// principal for the human whose identity the lane lost.
     pub(crate) fn answer_ask(
         &self,
         ask_id: u64,
@@ -356,7 +359,7 @@ impl AgendaHandle {
                 structured: Some(resolution),
                 source: None,
             },
-            None,
+            Some(super::types::AgendaActor::daemon()),
         )
     }
 
@@ -371,7 +374,12 @@ impl AgendaHandle {
             .ok_or_else(|| AgendaError::NotFound(format!("no open ask {ask_id}")))?;
         let (mut item, counts) = {
             let mut store = self.lock();
-            let item = store.dismiss_question(&target.id, action, None, now_ms())?;
+            let item = store.dismiss_question(
+                &target.id,
+                action,
+                Some(super::types::AgendaActor::daemon()),
+                now_ms(),
+            )?;
             let counts = store.counts();
             (item, counts)
         };
@@ -751,10 +759,14 @@ mod tests {
         let digest = proposed.effects[0].digest.clone();
         assert!(proposed.effects[0].approval.is_none());
 
-        // …and is refused approval of that same manifest, by name.
+        // …and is refused approval of that same manifest, by name. The
+        // daemon actor kind rides this same refusal list (Track PR
+        // ruling: never owner-surface at any tenant edge — the scanner
+        // parks and completes, it never approves).
         for (kind, session) in [
             ("agent_session", Some("sess-a5")),
             ("peer", None),
+            ("daemon", None),
             ("unattributed", None),
         ] {
             let denied = handle.apply(

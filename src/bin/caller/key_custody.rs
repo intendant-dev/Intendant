@@ -756,6 +756,15 @@ pub fn github_app_in_custody() -> bool {
     provider_estate_root().is_some_and(|root| github_app_in_custody_at(&root))
 }
 
+/// The sealed blob's mtime — pure path math, no keystore access. The
+/// scanner uses it to notice a re-configure without unsealing per poll
+/// (retrieval stays a JWT-mint-time-only event).
+pub fn github_app_blob_mtime() -> Option<std::time::SystemTime> {
+    let root = provider_estate_root()?;
+    let blob = github_app_blob_path(&root)?;
+    std::fs::metadata(blob).ok()?.modified().ok()
+}
+
 pub(crate) fn github_app_in_custody_at(root: &Path) -> bool {
     github_app_blob_path(root).is_some_and(|blob| blob.is_file())
 }

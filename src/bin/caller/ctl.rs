@@ -2788,51 +2788,8 @@ async fn run_agenda_list(
             Some(subtree)
         }
     };
-    // The un-triaged frontier (G3, render-time, never stored): open items
-    // newer than the newest `triage:summary` item, plus open items lacking
-    // both a placement and a triage annotation. Summary items are excluded
-    // BY DEFINITION (one of the two loop-prevention pins; the mandate's
-    // never-list is the other). Markers ride existing vocabulary — the tag
-    // and the self-described `--source triage` label — UNVERIFIED data
-    // gating nothing, same trust class as the overdue chip.
-    let summary_tagged = |item: &Value| {
-        item.get("tags")
-            .and_then(Value::as_array)
-            .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("triage:summary")))
-    };
-    let triage_watermark: u64 = all_items
-        .iter()
-        .filter(|item| summary_tagged(item))
-        .filter_map(|item| {
-            item.get("provenance")
-                .and_then(|p| p.get("created_ms"))
-                .and_then(Value::as_u64)
-        })
-        .max()
-        .unwrap_or(0);
-    let in_frontier = |item: &Value| {
-        if item.get("status").and_then(Value::as_str) != Some("open") || summary_tagged(item) {
-            return false;
-        }
-        let created = item
-            .get("provenance")
-            .and_then(|p| p.get("created_ms"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if created > triage_watermark {
-            return true;
-        }
-        let placed = item.get("part_of").is_some_and(|p| !p.is_null());
-        let triaged = item
-            .get("annotations")
-            .and_then(Value::as_array)
-            .is_some_and(|notes| {
-                notes
-                    .iter()
-                    .any(|n| n.get("source").and_then(Value::as_str) == Some("triage"))
-            });
-        !placed && !triaged
-    };
+    let triage_watermark = agenda_triage_watermark(&all_items);
+    let in_frontier = |item: &Value| agenda_item_in_frontier(item, triage_watermark);
     let items: Vec<&Value> = all_items
         .iter()
         .filter(|item| {
@@ -2878,6 +2835,77 @@ async fn run_agenda_list(
 /// dashboard derives the same way): open + (uncleared blocker OR any live
 /// edge whose target is not done — missing and retired targets both count
 /// as unsatisfied).
+fn agenda_summary_tagged(item: &Value) -> bool {
+    item.get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("triage:summary")))
+}
+
+/// The frontier watermark: the newest `triage:summary` item's park
+/// instant, `0` when no summary has ever been parked (every open item
+/// is then in the frontier).
+fn agenda_triage_watermark(all_items: &[Value]) -> u64 {
+    all_items
+        .iter()
+        .filter(|item| agenda_summary_tagged(item))
+        .filter_map(|item| {
+            item.get("provenance")
+                .and_then(|p| p.get("created_ms"))
+                .and_then(Value::as_u64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The un-triaged frontier (G3, render-time, never stored): open items
+/// newer than the newest `triage:summary` item, plus open items lacking
+/// both a placement and a triage annotation. Summary items are excluded
+/// BY DEFINITION (one of the two loop-prevention pins; the mandate's
+/// never-list is the other), and so are **daemon-parked items that are
+/// currently placed** (Track PR ruling 2, the mirror-writer exemption:
+/// an item the daemon parked and filed — a PR anchor under its hub —
+/// arrives already placed and fully described; "untriaged" is false of
+/// it. Keyed on the unforgeable `daemon` actor kind plus live
+/// placement, so unfiling one re-admits it). Markers ride existing
+/// vocabulary — the tag and the self-described `--source` labels —
+/// UNVERIFIED data gating nothing, same trust class as the overdue
+/// chip; the daemon kind is gate-derived and stronger.
+/// The dashboard twin is `agendaFrontierPredicate()` in
+/// `static/app/ui2-agenda-cards.js`; the definition also lives in
+/// `docs/src/agenda-and-memory.md` and the triage mandate template —
+/// the four expressions move together.
+fn agenda_item_in_frontier(item: &Value, triage_watermark: u64) -> bool {
+    if item.get("status").and_then(Value::as_str) != Some("open") || agenda_summary_tagged(item) {
+        return false;
+    }
+    let placed = item.get("part_of").is_some_and(|p| !p.is_null());
+    let daemon_parked = item
+        .get("provenance")
+        .and_then(|p| p.get("kind"))
+        .and_then(Value::as_str)
+        == Some("daemon");
+    if daemon_parked && placed {
+        return false;
+    }
+    let created = item
+        .get("provenance")
+        .and_then(|p| p.get("created_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if created > triage_watermark {
+        return true;
+    }
+    let triaged = item
+        .get("annotations")
+        .and_then(Value::as_array)
+        .is_some_and(|notes| {
+            notes
+                .iter()
+                .any(|n| n.get("source").and_then(Value::as_str) == Some("triage"))
+        });
+    !placed && !triaged
+}
+
 fn agenda_item_is_blocked(all_items: &[Value], item: &Value) -> bool {
     if item.get("status").and_then(Value::as_str) != Some("open") {
         return false;
@@ -3445,10 +3473,10 @@ fn agenda_relative_ms(now_ms: u64, at_ms: u64) -> String {
 }
 
 /// Compact actor label from an op-log envelope: the gate-resolved class
-/// first (dashboard / local / session <id>), the principal as a
-/// fallback, "—" when unattributed (daemon-authored write-backs land
-/// here too); a self-described `--source` label rides as `~label`,
-/// visibly second-class.
+/// first (dashboard / local / session <id> / the daemon), the principal
+/// as a fallback, "—" when unattributed (pre-adopt-rider daemon
+/// write-backs land here as legacy history); a self-described
+/// `--source` label rides as `~label`, visibly second-class.
 fn agenda_actor_label(record: &Value) -> String {
     let actor = record.get("actor").filter(|actor| !actor.is_null());
     let field = |key: &str| {
@@ -3460,6 +3488,7 @@ fn agenda_actor_label(record: &Value) -> String {
     let mut label = match field("kind") {
         Some("dashboard") => "dashboard".to_string(),
         Some("local_process") => "local".to_string(),
+        Some("daemon") => "the daemon".to_string(),
         Some("agent_session") => match field("session_id") {
             Some(session) => format!("session {}", agenda_short(session, 8)),
             None => "session".to_string(),
@@ -6471,5 +6500,71 @@ label = "twin"
         assert!(parse_global_args(args(&["--peer"])).is_err());
         assert!(parse_global_args(args(&["--peer=", "status"])).is_err());
         assert!(parse_global_args(args(&["--peer", "  ", "status"])).is_err());
+    }
+
+    /// The frontier definition with the Track PR ruling-2 amendment:
+    /// daemon-parked AND currently-placed items are not frontier
+    /// members (mirror anchors arrive placed and fully described);
+    /// unfiling one re-admits it, human items are untouched by the
+    /// clause, and the summary self-exclusion still holds. The
+    /// dashboard twin in `ui2-agenda-cards.js` encodes the same rule —
+    /// the four expressions (ctl, fragment, docs definition, mandate
+    /// template) move together.
+    #[test]
+    fn frontier_exempts_daemon_parked_placed_items_only() {
+        let item = |kind: Option<&str>, placed: bool, created: u64| {
+            serde_json::json!({
+                "status": "open",
+                "tags": [],
+                "provenance": {
+                    "created_ms": created,
+                    "kind": kind,
+                },
+                "part_of": if placed { serde_json::json!({"parent_id": "HUB"}) } else { serde_json::Value::Null },
+            })
+        };
+        let watermark = 100;
+        // A daemon-parked, placed anchor (newer than the watermark —
+        // the clause that catches placed items) is exempt…
+        assert!(!agenda_item_in_frontier(
+            &item(Some("daemon"), true, 200),
+            watermark
+        ));
+        // …but the same anchor unfiled re-enters the frontier.
+        assert!(agenda_item_in_frontier(
+            &item(Some("daemon"), false, 200),
+            watermark
+        ));
+        // A human-parked placed item newer than the watermark stays in
+        // the frontier (placement alone never exempts).
+        assert!(agenda_item_in_frontier(
+            &item(Some("dashboard"), true, 200),
+            watermark
+        ));
+        assert!(agenda_item_in_frontier(&item(None, true, 200), watermark));
+        // Old + placed drops out via the original clause regardless of
+        // actor; old + unplaced + untriaged stays in.
+        assert!(!agenda_item_in_frontier(
+            &item(Some("dashboard"), true, 50),
+            watermark
+        ));
+        assert!(agenda_item_in_frontier(
+            &item(Some("dashboard"), false, 50),
+            watermark
+        ));
+        // Summary items are excluded by definition, whoever parked them.
+        let summary = serde_json::json!({
+            "status": "open",
+            "tags": ["triage:summary"],
+            "provenance": {"created_ms": 300},
+        });
+        assert!(!agenda_item_in_frontier(&summary, watermark));
+        // Non-open items are never frontier members.
+        let done = serde_json::json!({
+            "status": "done",
+            "tags": [],
+            "provenance": {"created_ms": 300, "kind": "daemon"},
+        });
+        assert!(!agenda_item_in_frontier(&done, watermark));
     }
 }

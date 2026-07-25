@@ -254,14 +254,21 @@ function agendaSearchMatch(item, q) {
 
 // The un-triaged frontier — the triage mandate's declared scope: open
 // items newer than the newest triage summary (`triage:summary` tag), or
-// unplaced with no triage annotation; summaries themselves excluded. A
-// render-side convention over ordinary data, like the rank parse.
+// unplaced with no triage annotation; summaries themselves excluded, and
+// so are daemon-parked items that are currently placed (Track PR ruling
+// 2, the mirror-writer exemption: a PR anchor the scanner parked and
+// filed arrives already placed and described — "untriaged" is false of
+// it; unfiling one re-admits it). A render-side convention over ordinary
+// data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
+// and the four expressions (ctl, this, docs, mandate template) move
+// together.
 function agendaFrontierPredicate() {
   const newestSummary = Math.max(0, ...(agendaItems || [])
     .filter((x) => (x.tags || []).includes('triage:summary'))
     .map((x) => (x.provenance && x.provenance.created_ms) || 0));
   return (x) => x.status === 'open'
     && !(x.tags || []).includes('triage:summary')
+    && !(x.part_of && x.provenance && x.provenance.kind === 'daemon')
     && (((x.provenance && x.provenance.created_ms) || 0) > newestSummary
       || (!x.part_of && !(x.annotations || []).some((a) => a.source === 'triage')));
 }
@@ -635,9 +642,10 @@ function agendaCardByline(item, opts) {
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(`session ${p.session_id.slice(0, 12)}…`)}</span>`;
   } else {
     const label = p.kind === 'dashboard' ? 'you'
-      : p.source ? p.source
-        : p.kind === 'local_process' ? 'local shell'
-          : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
+      : p.kind === 'daemon' ? 'the daemon'
+        : p.source ? p.source
+          : p.kind === 'local_process' ? 'local shell'
+            : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
   }
   const selfDesc = p.source

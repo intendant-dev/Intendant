@@ -8,9 +8,58 @@ integration's trust shape and the five-minute setup ceremony. (The
 coordination radar's cheap `gh pr list` file-set read is a separate,
 unrelated lane and keeps working with or without this integration.)
 
-This slice ships the App client, the custody entry, and the
-configuration/status surface; the agenda PR scanner (thin anchors under
-a PRs hub) and the render-time state join land in the following slices.
+Configured, the daemon's **PR scanner** mirrors every watched pull
+request onto the agenda as a **thin intent anchor** under a "PRs" hub;
+the render-time state join (checks/review/mergeable on card expand)
+lands in the next slice.
+
+## The scanner and its anchors
+
+The scanner is a deterministic, zero-LLM daemon task (the coordination
+radar's sibling — that radar's cheap `gh` lane is separate and
+unchanged). Every poll (default 5 minutes, ETag-conditional,
+`[integrations.github] poll_minutes` overrides with floor 1) it diffs
+the watched repos' open-PR sets against its own anchors and writes
+**intent lifecycle ops only**:
+
+- **A new PR** parks one `task` anchor — title `Repo#N: <PR title>`,
+  a one-line body of immutable facts (author, `base ← head`), the tag
+  `pr`, and a single `url` ref to the PR (the join key) — and files it
+  under the **PRs hub** (an ordinary note titled "PRs", keyed by the
+  reserved `prs-hub` tag, created on the first scan that needs it).
+  On first enable this backfills every currently-open PR (drafts
+  included — draft-ness is mutable state and lives in the render join,
+  never in tags or titles); historical closed PRs are never parked.
+- **A merged or closed PR** gets a terminal annotation ("PR merged
+  (abc123def) at …" / "PR closed without merge at …"), is unfiled from
+  the hub, and completed. The hub is therefore the **open-PRs shelf** —
+  live children stay at dozens, and the log keeps the placement
+  history.
+- **A reopened PR** resurrects its own anchor (reopen + re-file) — no
+  duplicate is ever parked while an anchor of any status exists for
+  `repo#number`. **A retired anchor stays retired: an owner act
+  outranks the mirror; the scanner annotates instead** (once).
+
+PR *state* — checks, reviews, draft flips, title edits, mergeability —
+is **never an agenda op**: the diary stays byte-quiet while GitHub
+churns (pinned by test). Anchors point, never store: a `url` ref and a
+title suffice; GitHub remains the sole store of PR state.
+
+Every scanner write is attributed to the **`daemon` actor kind** (the
+daemon itself, on schedule — unmintable by any external surface) with
+the self-described source label `github-pr-scanner` beside it, and
+scanner anchors that are currently filed are **exempt from the triage
+frontier** by definition — they arrive placed and described; unfiling
+one re-admits it.
+
+The scanner keeps no durable state: the agenda is the durable truth,
+GitHub is the live truth, scanner state is a pure function of both — a
+daemon restart re-derives everything and converges without duplicates.
+
+**This does not replace the closed-loop landing watchers.** A session
+actively landing a PR watches the merge queue at seconds freshness
+with its own watcher; the scanner is minutes-fresh *ambient* awareness
+for every PR on the fleet, watched or not. Both exist on purpose.
 
 ## Trust shape
 

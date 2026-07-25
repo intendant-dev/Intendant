@@ -338,6 +338,15 @@ pub(crate) fn spawn_mode_web_gateway(
             // asks — nothing blocks on them, so the daemon records the
             // outcome. Detaches on drop like the scheduler.
             let _ask_resolver = crate::agenda::spawn_ask_resolver(handle.clone());
+            // The GitHub PR scanner (Track PR): mirrors watched repos'
+            // PRs as thin anchors under the PRs hub. Natural on/off —
+            // it idles keystore-free until credentials are sealed and a
+            // watch list exists. Detaches on drop like its siblings.
+            let scanner_settings_root = project_root
+                .clone()
+                .unwrap_or_else(crate::project::daemon_settings_config_root);
+            let _pr_scanner =
+                crate::github_pr::scanner::spawn_scanner(handle.clone(), scanner_settings_root);
             Some(handle)
         }
         Err(err) => {
