@@ -350,6 +350,7 @@ pub(crate) fn allows_remote_certless_http(request_line: &str, method: &str, path
         || is_public_org_grant_path(request_line)
         || is_public_connect_bootstrap_path(request_line)
         || is_public_codex_cloud_enroll_path(request_line)
+        || is_public_github_manifest_callback_path(request_line)
         || is_public_dashboard_shell_or_asset(method, path)
 }
 

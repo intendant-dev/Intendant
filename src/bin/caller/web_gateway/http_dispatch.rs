@@ -1662,6 +1662,36 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::GithubManifestStart => {
+                // The pre-dispatch IAM gate bound this principal
+                // (CredentialsManage); it becomes the ceremony's
+                // starter principal — the custody-audit actor when the
+                // authority-free callback later completes the act.
+                return handle_github_manifest_start(
+                    stream,
+                    route_body.as_bytes(),
+                    is_tls,
+                    http_header_value(header_text, "host"),
+                    http_access_context.principal.id.clone(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubManifestCallback => {
+                // Authority-free browser navigation (GitHub's redirect):
+                // the handler's state burn is the entire authorization.
+                // The rate-limit source is the peer IP, like the
+                // enrollment doorbell.
+                return handle_github_manifest_callback(
+                    stream,
+                    request_line,
+                    peer_addr.ip().to_string(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ClaudeAuthStart => {
                 return handle_claude_auth_start(
                     stream,

@@ -31,6 +31,14 @@ pub(crate) struct CheckOutcome {
 pub(crate) struct GithubIntegrationRuntime {
     api_base: String,
     last: Mutex<Option<CheckOutcome>>,
+    /// `Some(slug)` while the sealed document is pending install (the
+    /// manifest ceremony sealed a key with no installation yet). An
+    /// in-memory cache, not a second store: status never unseals, so
+    /// after a daemon restart this is unknown (reads `false`) until a
+    /// gated unsealing surface — GC2 discovery, a scanner pass — or the
+    /// completing save re-establishes it. The ceremony sets it; any
+    /// successful save or remove clears it.
+    pending_install_slug: Mutex<Option<String>>,
 }
 
 impl GithubIntegrationRuntime {
@@ -38,7 +46,29 @@ impl GithubIntegrationRuntime {
         Self {
             api_base: api_base.into(),
             last: Mutex::new(None),
+            pending_install_slug: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_pending_install(&self, slug: String) {
+        *self
+            .pending_install_slug
+            .lock()
+            .expect("github status poisoned") = Some(slug);
+    }
+
+    pub(crate) fn clear_pending_install(&self) {
+        *self
+            .pending_install_slug
+            .lock()
+            .expect("github status poisoned") = None;
+    }
+
+    pub(crate) fn pending_install_slug(&self) -> Option<String> {
+        self.pending_install_slug
+            .lock()
+            .expect("github status poisoned")
+            .clone()
     }
 
     pub(crate) fn api_base(&self) -> &str {
@@ -53,9 +83,11 @@ impl GithubIntegrationRuntime {
     }
 
     /// Forget cached outcomes (the Remove gesture): an unconfigured
-    /// integration has no last exchange to report.
+    /// integration has no last exchange to report — and no pending
+    /// ceremony phase either.
     pub(crate) fn clear(&self) {
         *self.last.lock().expect("github status poisoned") = None;
+        self.clear_pending_install();
     }
 
     pub(crate) fn last(&self) -> Option<CheckOutcome> {

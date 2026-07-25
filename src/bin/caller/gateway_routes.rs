@@ -208,6 +208,10 @@ pub(crate) const AGENDA_OP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// list. Anything near this cap is not a legitimate configure gesture.
 pub(crate) const GITHUB_INTEGRATION_BODY_CAP_BYTES: usize = 64 * 1024;
 
+/// The manifest-start payload: at most an org handle in a small JSON
+/// object. Anything bigger is not a legitimate connect gesture.
+pub(crate) const GITHUB_MANIFEST_START_BODY_CAP_BYTES: usize = 4 * 1024;
+
 /// Body cap for the visual-freshness diagnostics sink (NDJSON transcript
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -309,6 +313,13 @@ pub(crate) enum RouteHandlerId {
     GithubIntegrationStatus,
     /// Delete the sealed credentials (idempotent, audited).
     GithubIntegrationRemove,
+    /// Begin the one-click App Manifest ceremony: mint the single-use
+    /// state, compose the manifest + form target (custody precheck
+    /// refuses up front where no backend can seal).
+    GithubManifestStart,
+    /// GitHub's redirect landing (browser navigation): burn the state,
+    /// convert the code server-side, seal pending-install.
+    GithubManifestCallback,
     /// Claude sign-in ceremony: start `claude auth login` on a private PTY.
     ClaudeAuthStart,
     /// Ceremony state + validated sign-in URL + account info on success.
@@ -1639,13 +1650,17 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
-    // ── GitHub App integration (Track PR): credentials seal into
+    // ── GitHub App integration (Track PR + GC): credentials seal into
     //    OS-keystore custody (`github-app/credentials`, born in custody —
     //    no env/file lane), the watch list is non-secret config. Write
     //    and remove ride the provider-key gate (CredentialsManage);
     //    status is presence + last-exchange state and never unseals.
-    //    Capped tight: an App key PEM is ~3 KB; 64 KiB leaves room for
-    //    ids + a watch list, and nothing legitimate is bigger.
+    //    Family principle (Track GC ruling): any route that unseals the
+    //    key gates at CredentialsManage — "never unseals" is the
+    //    Settings tier's defining property, so credential *use* is
+    //    never a Settings-tier read. Capped tight: an App key PEM is
+    //    ~3 KB; 64 KiB leaves room for ids + a watch list, and nothing
+    //    legitimate is bigger.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/integrations/github"),
@@ -1673,6 +1688,40 @@ pub(crate) static ROUTES: &[Route] = &[
         "Remove the GitHub App integration credentials from custody",
     )
     .with_tunnel(tunnel_method("api_github_integration_remove")),
+    // ── One-click connect (Track GC), the App Manifest ceremony.
+    //    Manifest-start is HTTP-only like the loopback-token row below:
+    //    its payload (form target + state) is only meaningful to a
+    //    browser co-located with this origin — the redirect must land
+    //    back HERE — so a tunnel twin would mint states for ceremonies
+    //    that cannot complete (the peer-dashboard leg is deferred; the
+    //    manual form is its documented path).
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/integrations/github/manifest-start"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(GITHUB_MANIFEST_START_BODY_CAP_BYTES),
+        RouteHandlerId::GithubManifestStart,
+        "Begin the one-click GitHub App Manifest ceremony (mints the single-use state; refuses without a custody backend)",
+    ),
+    //    The callback is GitHub's redirect: a top-level browser
+    //    navigation carrying no daemon credential, so the row is
+    //    authority-free BY NAME and the daemon-minted single-use state
+    //    is the handler's entire authorization (the doorbell doctrine;
+    //    without a valid state the code is never exchanged). Own-origin
+    //    CORS like the passkey ceremonies: a navigation needs no ACAO,
+    //    and foreign pages get nothing to read from a drive-by fetch.
+    //    No tunnel twin: the only legitimate caller is GitHub's
+    //    redirect landing in a browser — a datachannel method can never
+    //    be that. The path must also sit in the certless carve-out
+    //    (`access_gates::allows_remote_certless_http`) or the origin
+    //    and client-auth gates refuse the navigation before dispatch.
+    public_own_origin_route(
+        RouteMethod::Get,
+        PathPattern::Exact(crate::github_pr::manifest_ceremony::CALLBACK_PATH),
+        BodyPolicy::None,
+        RouteHandlerId::GithubManifestCallback,
+        "GitHub App Manifest redirect landing (single-use state is the authorization; renders a return-to-dashboard page)",
+    ),
     // ── Same-home sibling loopback-token handoff (ratified 2026-07-20):
     //    the response contains per-boot loopback admission tokens, so
     //    the route rides the credential-custody operation like the
