@@ -180,6 +180,13 @@ function cloudWorkerRow(lease) {
   row.appendChild(meta);
 
   if (lease.attachment_state === 'connected' && lease.task_id) {
+    const view = document.createElement('button');
+    view.type = 'button';
+    view.className = 'ui-btn ui-btn-sm cloud-worker-view';
+    view.textContent = cloudDisplayTask === lease.task_id ? 'Viewing' : 'View';
+    view.title = 'Watch the worker’s virtual display live (tiles bridged over the attachment)';
+    view.addEventListener('click', () => openCloudWorkerDisplay(lease.task_id));
+    head.appendChild(view);
     const term = document.createElement('button');
     term.type = 'button';
     term.className = 'ui-btn ui-btn-sm cloud-worker-terminal';
@@ -217,6 +224,224 @@ function cloudConnectedShellHosts() {
     }));
 }
 
+// ── Live worker display viewer (attach slice 3a) ───────────────────────
+//
+// One viewer at a time, rendered in the #cloud-worker-display panel ABOVE
+// the card list (the list re-renders on refresh; the panel survives it).
+// Frames ride the local dashboard tunnel: display_open subscribes, the
+// worker's tile stream arrives as display_tiles (base64 tile wire
+// frames), and the shipped transport-agnostic TileCompositor paints them.
+// Input needs the same display.input floor a local display does — the
+// daemon gates per-frame; the viewer just sends.
+
+let cloudDisplayTask = null;
+let cloudDisplayId = 0;
+let cloudDisplayCompositor = null;
+let cloudDisplayListener = null;
+let cloudDisplayOpenTimer = null;
+let cloudDisplayStatusEl = null;
+
+function cloudDisplaySendFrame(frame) {
+  // terminalFrame is the tunnel's generic frame sender (canUseRpc +
+  // sendFrame); cloud terminal frames already ride it.
+  return typeof dashboardTransport !== 'undefined'
+    && dashboardTransport.terminalFrame
+    && dashboardTransport.terminalFrame(frame);
+}
+
+function cloudDisplayStatus(text, kind = '') {
+  if (!cloudDisplayStatusEl) return;
+  cloudDisplayStatusEl.textContent = text;
+  cloudDisplayStatusEl.className = `cloud-worker-display-status${kind ? ` ${kind}` : ''}`;
+}
+
+function closeCloudWorkerDisplay(sendClose = true) {
+  if (cloudDisplayOpenTimer) {
+    clearInterval(cloudDisplayOpenTimer);
+    cloudDisplayOpenTimer = null;
+  }
+  if (sendClose && cloudDisplayTask) {
+    cloudDisplaySendFrame({ t: 'display_close', host_id: `cloud:${cloudDisplayTask}` });
+  }
+  if (cloudDisplayListener) {
+    window.removeEventListener('intendant-cloud-display-frame', cloudDisplayListener);
+    cloudDisplayListener = null;
+  }
+  cloudDisplayCompositor = null;
+  cloudDisplayStatusEl = null;
+  cloudDisplayTask = null;
+  cloudDisplayId = 0;
+  const panel = document.getElementById('cloud-worker-display');
+  if (panel) {
+    panel.hidden = true;
+    panel.replaceChildren();
+  }
+  renderCloudWorkers();
+}
+
+function cloudDisplayNormalizedCoords(canvas, ev) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return { x: 0, y: 0 };
+  const x = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+  const y = Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height));
+  return { x, y };
+}
+
+function cloudDisplaySendInput(event) {
+  if (!cloudDisplayTask) return;
+  cloudDisplaySendFrame({
+    t: 'display_input',
+    host_id: `cloud:${cloudDisplayTask}`,
+    display_id: cloudDisplayId,
+    event,
+  });
+}
+
+function cloudDisplayWireInput(stage) {
+  stage.tabIndex = 0;
+  const mods = (ev) => ({ shift: ev.shiftKey, ctrl: ev.ctrlKey, alt: ev.altKey, meta: ev.metaKey });
+  const canvasOf = () => cloudDisplayCompositor && cloudDisplayCompositor.canvas;
+  stage.addEventListener('mousedown', (ev) => {
+    const canvas = canvasOf();
+    if (!canvas) return;
+    stage.focus();
+    ev.preventDefault();
+    const { x, y } = cloudDisplayNormalizedCoords(canvas, ev);
+    cloudDisplaySendInput({ t: 'md', x, y, b: ev.button });
+  });
+  stage.addEventListener('mouseup', (ev) => {
+    const canvas = canvasOf();
+    if (!canvas) return;
+    ev.preventDefault();
+    const { x, y } = cloudDisplayNormalizedCoords(canvas, ev);
+    cloudDisplaySendInput({ t: 'mu', x, y, b: ev.button });
+  });
+  stage.addEventListener('mousemove', (ev) => {
+    const canvas = canvasOf();
+    if (!canvas) return;
+    const { x, y } = cloudDisplayNormalizedCoords(canvas, ev);
+    cloudDisplaySendInput({ t: 'mm', x, y, buttons: ev.buttons });
+  });
+  stage.addEventListener('wheel', (ev) => {
+    const canvas = canvasOf();
+    if (!canvas) return;
+    ev.preventDefault();
+    const { x, y } = cloudDisplayNormalizedCoords(canvas, ev);
+    cloudDisplaySendInput({ t: 'sc', x, y, dx: ev.deltaX, dy: ev.deltaY });
+  }, { passive: false });
+  stage.addEventListener('keydown', (ev) => {
+    ev.preventDefault();
+    cloudDisplaySendInput({ t: 'kd', code: ev.code, key: ev.key, ...mods(ev) });
+  });
+  stage.addEventListener('keyup', (ev) => {
+    ev.preventDefault();
+    cloudDisplaySendInput({ t: 'ku', code: ev.code, key: ev.key, ...mods(ev) });
+  });
+}
+
+function openCloudWorkerDisplay(taskId) {
+  if (cloudDisplayTask === taskId) {
+    closeCloudWorkerDisplay();
+    return;
+  }
+  closeCloudWorkerDisplay();
+  const panel = document.getElementById('cloud-worker-display');
+  if (!panel) return;
+  if (typeof maybeStartDashboardControlTransport === 'function') {
+    maybeStartDashboardControlTransport({ onDemand: true });
+  }
+  cloudDisplayTask = taskId;
+  const host = `cloud:${taskId}`;
+  panel.hidden = false;
+
+  const head = document.createElement('div');
+  head.className = 'cloud-worker-display-head';
+  const title = document.createElement('span');
+  title.className = 'cloud-worker-display-title';
+  title.textContent = `Worker display · ${taskId}`;
+  head.appendChild(title);
+  cloudDisplayStatusEl = document.createElement('span');
+  head.appendChild(cloudDisplayStatusEl);
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'ui-btn ui-btn-sm';
+  close.textContent = 'Close';
+  close.addEventListener('click', () => closeCloudWorkerDisplay());
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  const stage = document.createElement('div');
+  stage.className = 'cloud-worker-display-stage';
+  panel.appendChild(stage);
+  cloudDisplayWireInput(stage);
+
+  cloudDisplayListener = (ev) => {
+    const msg = ev.detail || {};
+    if (msg.host_id !== host) return;
+    if (msg.t === 'display_opened') {
+      cloudDisplayId = Number(msg.display_id) || 0;
+      cloudDisplayStatus(`connected · display :${cloudDisplayId}`, 'ok');
+      return;
+    }
+    if (msg.t === 'display_error') {
+      cloudDisplayStatus(String(msg.error || 'display error'), 'error');
+      return;
+    }
+    if (msg.t === 'display_closed') {
+      cloudDisplayStatus('display closed', '');
+      return;
+    }
+    if (msg.t === 'display_tiles' && typeof msg.data === 'string') {
+      let bytes;
+      try {
+        bytes = Uint8Array.from(atob(msg.data), (c) => c.charCodeAt(0));
+      } catch (_) {
+        return;
+      }
+      try {
+        if (!cloudDisplayCompositor) {
+          // The stream opens with a Resize frame; construct the
+          // compositor from it (placeholder dims — onResize below
+          // reconfigures everything) and feed it the same frame.
+          const parsed = parseTileWireFrame(bytes);
+          if (parsed.type !== 'resize') return;
+          cloudDisplayCompositor = new TileCompositor(stage, {
+            tileSize: parsed.tile_size_px,
+            gridW: parsed.grid_w_tiles,
+            gridH: parsed.grid_h_tiles,
+          });
+        }
+        cloudDisplayCompositor.onWireFrame(bytes);
+      } catch (err) {
+        cloudDisplayStatus(`tile decode failed: ${(err && err.message) || err}`, 'error');
+      }
+    }
+  };
+  window.addEventListener('intendant-cloud-display-frame', cloudDisplayListener);
+
+  // The open frame needs the tunnel; retry until the on-demand start
+  // connects (terminalFrame returns false while it cannot send).
+  const tryOpen = () => {
+    if (cloudDisplaySendFrame({ t: 'display_open', host_id: host })) {
+      if (cloudDisplayOpenTimer) {
+        clearInterval(cloudDisplayOpenTimer);
+        cloudDisplayOpenTimer = null;
+      }
+      cloudDisplayStatus('opening worker display…', '');
+      return true;
+    }
+    cloudDisplayStatus('connecting the dashboard tunnel…', '');
+    return false;
+  };
+  if (!tryOpen()) {
+    cloudDisplayOpenTimer = setInterval(() => {
+      if (!cloudDisplayTask) return;
+      tryOpen();
+    }, 1000);
+  }
+  renderCloudWorkers();
+}
+
 function openCloudWorkerTerminal(taskId) {
   // Cloud terminal frames ride only the dashboard-control tunnel; start it
   // on demand so the affordance works even when the legacy /ws is the
@@ -232,3 +457,5 @@ function openCloudWorkerTerminal(taskId) {
 window.cloudConnectedShellHosts = cloudConnectedShellHosts;
 window.loadCloudWorkers = loadCloudWorkers;
 window.cloudWorkersOnShown = cloudWorkersOnShown;
+window.openCloudWorkerDisplay = openCloudWorkerDisplay;
+window.closeCloudWorkerDisplay = closeCloudWorkerDisplay;

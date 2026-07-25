@@ -303,9 +303,8 @@ pub fn hosted_tunnel_frame_classification(preset: HostedPreset, frame_type: &str
     Some(match frame_type {
         "hello" | "ping" | "request" => true,
         "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close"
-        | "terminal_share" | "display_input" | "upload_start" | "upload_chunk" | "upload_end" => {
-            preset == HostedPreset::Operate
-        }
+        | "terminal_share" | "display_input" | "display_open" | "display_close"
+        | "upload_start" | "upload_chunk" | "upload_end" => preset == HostedPreset::Operate,
         "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
         | "egress_request_ack" => false,
         _ => return None,
@@ -661,7 +660,8 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
             | "display_input_authority_state"
             | "event_gap" => true,
             "terminal_opened" | "terminal_output" | "terminal_exited" | "terminal_error"
-            | "terminal_shared" => preset == HostedPreset::Operate,
+            | "terminal_shared" | "display_opened" | "display_tiles" | "display_closed"
+            | "display_error" => preset == HostedPreset::Operate,
             _ => false,
         };
     }

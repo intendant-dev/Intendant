@@ -287,6 +287,32 @@ keeps exactly one output forwarder — a re-open (browser reload, host
 round-trip) replaces the listener on the surviving PTY rather than
 stacking a second one, which would double every output chunk.
 
+## Live view of a worker (display)
+
+A `connected` lease also renders a **View** button: the worker starts (or
+attaches) a virtual display — Xvfb on a Linux container (installed by
+`setup.sh`; the synthetic test card under the mock rig pair) — captures it
+with the standard X11 backend, and streams it through the real tile
+pipeline into a **single-subscriber socket stream** over the attachment
+(`DisplaySession::spawn_tile_socket_stream`: tile mode only, no video
+fallback, whole-snapshot delivery, 10 s re-anchor). Home bridges the
+frames onto the dashboard tunnel (`display_open`/`display_close` under
+`display.view`; tile frames arrive as `display_tiles`), and the Cloud
+card's viewer paints them with the same transport-agnostic tile
+compositor the peer display path ships. Pointer and keyboard input ride
+the existing `display_input` frame (`display.input`) with a
+`cloud:<task_id>` host, delivered to the worker's ordered input queue and
+injected via XTEST.
+
+WebRTC is deliberately absent from this path: a cloud worker can neither
+accept nor dial a peer connection (no inbound reachability; passive-only
+ICE-TCP; UDP-only TURN), so the attachment socket is the one lane —
+which also means the worker never runs video encoders at all
+(`disable_video_bank`): tiles are pure-Rust encodes, and capture idles to
+keepalive cadence when no viewer is subscribed. The same fail-closed
+rules as the terminal apply: only display reply kinds cross back from
+the worker, routed solely to the viewing connection.
+
 ## Attachment lifecycle
 
 The enrollment broker above records the attachment state for its workers;

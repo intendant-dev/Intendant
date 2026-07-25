@@ -63,6 +63,23 @@ else
   build_checked_out_binary
 fi
 
+# Display slice (attach slice 3): the worker serves its virtual display
+# over the attachment. Xvfb + xdpyinfo are what vision::launch_display
+# requires; best-effort — a worker without them still attaches, and
+# display_open answers with a clear "launch Xvfb" error naming the gap.
+if command -v Xvfb >/dev/null 2>&1 && command -v xdpyinfo >/dev/null 2>&1; then
+  echo "worker display prerequisites present (Xvfb, xdpyinfo)"
+elif command -v apt-get >/dev/null 2>&1; then
+  if apt-get install -y --no-install-recommends xvfb x11-utils 2>/dev/null \
+    || sudo -n apt-get install -y --no-install-recommends xvfb x11-utils 2>/dev/null; then
+    echo "installed worker display prerequisites (xvfb, x11-utils)"
+  else
+    echo "warning: could not install xvfb/x11-utils; worker display will be unavailable" >&2
+  fi
+else
+  echo "warning: Xvfb/xdpyinfo missing and no apt-get; worker display will be unavailable" >&2
+fi
+
 script_root="$repo_root/scripts/codex-cloud"
 if [[ ! -f "$script_root/run-worker.sh" ]]; then
   echo "missing $script_root/run-worker.sh" >&2

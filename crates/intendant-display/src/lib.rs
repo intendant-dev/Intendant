@@ -54,6 +54,7 @@ pub mod macos;
 pub mod macos_keymap;
 pub mod synthetic;
 pub mod tile;
+pub mod tile_socket;
 pub mod twcc_tap;
 pub mod visual_marker;
 #[cfg(target_os = "linux")]
@@ -1046,6 +1047,17 @@ pub trait DisplayBackend: Send + Sync + 'static {
 
     /// Human-readable backend name (e.g. "wayland", "x11").
     fn kind(&self) -> &'static str;
+
+    /// The X11 display string this backend actually captures (e.g.
+    /// `":99"`), for consumers that must open their own connection to
+    /// the same server — the XDamage tile-damage backend in particular.
+    /// `None` for non-X11 backends; the damage layer then falls back to
+    /// the process `DISPLAY`. Without this hint a session created via
+    /// `X11Backend::with_display` while `DISPLAY` points elsewhere would
+    /// attach XDamage to the wrong X server.
+    fn x11_display_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,6 +1256,10 @@ pub struct DisplaySession {
     /// for the intersection rule. `None` before `start()` / after
     /// `stop()`.
     layer_policy_handle: Mutex<Option<JoinHandle<()>>>,
+    /// See [`Self::disable_video_bank`]: treat this session like a
+    /// synthetic one for encoder-bank purposes (empty always-on set, no
+    /// small-source guard).
+    video_bank_disabled: AtomicBool,
 }
 
 /// Convert one BGRA frame to I420 for the pool-feed bridge.
@@ -1480,14 +1496,21 @@ fn make_damage_backend(
     width: u32,
     height: u32,
     backend_kind: &'static str,
+    x11_display_hint: Option<&str>,
 ) -> Box<dyn capture::damage::DamageBackend> {
     #[cfg(not(target_os = "linux"))]
-    let _ = backend_kind;
+    let _ = (backend_kind, x11_display_hint);
 
     #[cfg(target_os = "linux")]
     {
         if should_try_xdamage_for_tile_stream(backend_kind) {
-            let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+            // The capturing backend's own display string wins: a session
+            // on `:99` must not damage-track whatever the process-wide
+            // DISPLAY happens to name.
+            let display = x11_display_hint
+                .map(str::to_string)
+                .or_else(|| std::env::var("DISPLAY").ok())
+                .unwrap_or_else(|| ":0".to_string());
             match capture::x11_damage::X11DamageBackend::new(&display) {
                 Ok(backend) => {
                     eprintln!("[display/tile] XDamage backend enabled on DISPLAY={display}");
@@ -1772,7 +1795,18 @@ impl DisplaySession {
             agent_visible: Arc::new(AtomicBool::new(true)),
             session_epoch: Instant::now(),
             layer_policy_handle: Mutex::new(None),
+            video_bank_disabled: AtomicBool::new(false),
         }
+    }
+
+    /// Run this session without the always-on video encoder bank, exactly
+    /// like a synthetic session does: the empty pool is an explicitly
+    /// supported state, and on-demand encoder flows still work. For
+    /// sessions whose only viewers ride the tile-socket stream (Codex
+    /// Cloud workers), the bank would burn CPU encoding video nobody can
+    /// ever subscribe to. Must be called before [`Self::start`].
+    pub fn disable_video_bank(&self) {
+        self.video_bank_disabled.store(true, Ordering::Relaxed);
     }
 
     /// Set whether agents may see this display (see the `agent_visible`
@@ -1871,12 +1905,13 @@ impl DisplaySession {
         // flows), so the empty-baseline guard below — which protects real
         // displays from the silent-black-screen class — does not apply.
         let synthetic_source = self.backend.kind() == synthetic::KIND;
+        let bankless = synthetic_source || self.video_bank_disabled.load(Ordering::Relaxed);
         #[cfg(not(target_os = "windows"))]
         let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
         #[cfg(target_os = "windows")]
         let baseline_empty =
             width < encode::pool::MIN_LAYER_DIM || height < encode::pool::MIN_LAYER_DIM;
-        if baseline_empty && !synthetic_source {
+        if baseline_empty && !bankless {
             self.backend.stop_capture().await;
             return Err(CallerError::Display(format!(
                 "source too small for the always-on encoder baseline: \
@@ -1979,14 +2014,14 @@ impl DisplaySession {
         // `synthetic_source` rationale above the empty-baseline guard.)
         #[cfg(not(target_os = "windows"))]
         let layer_factory = move |w: u32, h: u32| {
-            if synthetic_source {
+            if bankless {
                 return Vec::new();
             }
             encode::pool::LayerSpec::vp8_simulcast(w, h, fps)
         };
         #[cfg(target_os = "windows")]
         let layer_factory = move |w: u32, h: u32| {
-            if synthetic_source {
+            if bankless {
                 return Vec::new();
             }
             vec![encode::pool::LayerSpec::single(
@@ -3111,6 +3146,7 @@ impl DisplaySession {
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
         let backend_kind = self.backend.kind();
+        let x11_display_hint = self.backend.x11_display_hint();
         // Tile-standby plumbing (per-peer RTP standby under tile mode):
         // the bridge owns every standby transition, mirrors the mode
         // into `tile_video_active` for the Subscribe handler, kicks the
@@ -3127,7 +3163,12 @@ impl DisplaySession {
         let pool_feed_kf_tx = self.pool_feed_keyframe_tx.lock().await.clone();
 
         let task = tokio::spawn(async move {
-            let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
+            let mut damage = make_damage_backend(
+                initial_w,
+                initial_h,
+                backend_kind,
+                x11_display_hint.as_deref(),
+            );
             // `Option` so the tracker can round-trip through the
             // spawn_blocking diff below (moved in, moved back out).
             let mut frame_diff: Option<capture::frame_diff::FrameDiffDamageTracker> = Some(

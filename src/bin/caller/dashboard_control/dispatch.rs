@@ -258,6 +258,17 @@ pub(crate) fn control_frame_response(
             "unix_ms": chrono::Utc::now().timestamp_millis(),
         })),
         "display_input" => {
+            // Cloud hosts: the event rides the attachment; ordering is
+            // preserved because the wire loop dispatches sequentially and
+            // the attachment sender is a single ordered channel.
+            if let Some(task_id) = parsed
+                .get("host_id")
+                .and_then(|value| value.as_str())
+                .and_then(crate::codex_cloud_attach::cloud_host_task_id)
+            {
+                let _ = forward_cloud_frame(&parsed, task_id);
+                return None;
+            }
             // Ordered handoff to the per-connection forwarder (see
             // `spawn_display_input_forwarder`): the wire loop dispatches
             // frames sequentially and this send preserves that order —
@@ -273,6 +284,10 @@ pub(crate) fn control_frame_response(
         "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
         "terminal_close" => control_terminal_close_frame(parsed, runtime, terminal_forwarders),
         "terminal_share" => control_terminal_share_frame(parsed, runtime, terminal_events_tx),
+        "display_open" => {
+            control_cloud_display_open_frame(parsed, terminal_output_tx, terminal_forwarders)
+        }
+        "display_close" => control_cloud_display_close_frame(parsed, terminal_forwarders),
         "presence_frame" => control_presence_frame(parsed, runtime.clone()),
         "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
         | "egress_request_ack" => {
@@ -1358,7 +1373,126 @@ pub(crate) fn terminal_frame_dimension(frame: &serde_json::Value, key: &str, def
 /// The per-frame IAM gate already cleared the same terminal operations
 /// the local registry would demand; past it, home spends its own (total)
 /// authority on the worker.
-fn forward_cloud_terminal_frame(frame: &serde_json::Value, task_id: &str) -> Result<(), String> {
+/// Reserved forwarder-map slot for a connection's cloud display
+/// subscription. Terminal forwarders key by (host_id, terminal_id); the
+/// display viewer is one-per-host, so it parks under a slot no browser
+/// terminal_id can collide with (control characters never survive the
+/// frame field extraction as meaningful ids).
+const CLOUD_DISPLAY_FORWARDER_SLOT: &str = "\u{1}cloud-display";
+
+/// `display_open` for `cloud:<task_id>` hosts: forward the open over the
+/// task's attachment and subscribe this connection to the worker's
+/// display reply frames (opened/tiles/closed/error), routed onto the same
+/// bounded outbound lane terminal output rides. Re-open replaces the
+/// forwarder (slice-2 dedup parity). The DisplayView floor was enforced
+/// by the frame table before dispatch.
+pub(crate) fn control_cloud_display_open_frame(
+    frame: serde_json::Value,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+) -> Option<serde_json::Value> {
+    let host_id = frame
+        .get("host_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let error_host = host_id.clone();
+    let error_frame = move |error: String| {
+        serde_json::json!({
+            "t": "display_error",
+            "host_id": error_host.clone(),
+            "error": error,
+        })
+    };
+    let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) else {
+        // Local displays bootstrap via api_display_bootstrap + WebRTC;
+        // this frame kind exists for cloud hosts alone.
+        let refusal = error_frame("display_open addresses cloud: hosts only".to_string());
+        let tx = terminal_output_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(refusal).await;
+        });
+        return None;
+    };
+    let forwarder_key = (host_id.clone(), CLOUD_DISPLAY_FORWARDER_SLOT.to_string());
+    if let Some(handle) = terminal_forwarders.remove(&forwarder_key) {
+        handle.abort();
+    }
+    let channel = crate::codex_cloud_attach::attachment_channel(task_id)
+        .ok_or_else(|| "cloud worker has no live attachment".to_string());
+    let terminal_output_tx = terminal_output_tx.clone();
+    let host = host_id.clone();
+    let handle = tokio::spawn(async move {
+        let (to_worker, mut from_worker) = match channel {
+            Ok(channel) => channel,
+            Err(error) => {
+                let _ = terminal_output_tx.send(error_frame(error)).await;
+                return;
+            }
+        };
+        if to_worker.send(frame.to_string()).await.is_err() {
+            let _ = terminal_output_tx
+                .send(error_frame("cloud worker detached".to_string()))
+                .await;
+            return;
+        }
+        loop {
+            match from_worker.recv().await {
+                Ok(text) => {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let kind = value.get("t").and_then(|v| v.as_str()).unwrap_or("");
+                    let reply_host = value.get("host_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if reply_host == host
+                        && matches!(
+                            kind,
+                            "display_opened" | "display_tiles" | "display_closed" | "display_error"
+                        )
+                        && terminal_output_tx.send(value).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = terminal_output_tx
+                        .send(error_frame("cloud worker detached".to_string()))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+    terminal_forwarders.insert(forwarder_key, handle);
+    None
+}
+
+/// `display_close` for cloud hosts: tell the worker to stop its stream,
+/// then drop this connection's subscription. The browser initiated the
+/// close and tears down its own viewer, so the forwarder need not
+/// survive to relay the worker's `display_closed` ack.
+pub(crate) fn control_cloud_display_close_frame(
+    frame: serde_json::Value,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+) -> Option<serde_json::Value> {
+    let host_id = frame
+        .get("host_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
+        let _ = forward_cloud_frame(&frame, task_id);
+    }
+    if let Some(handle) =
+        terminal_forwarders.remove(&(host_id, CLOUD_DISPLAY_FORWARDER_SLOT.to_string()))
+    {
+        handle.abort();
+    }
+    None
+}
+
+fn forward_cloud_frame(frame: &serde_json::Value, task_id: &str) -> Result<(), String> {
     let Some((to_worker, _)) = crate::codex_cloud_attach::attachment_channel(task_id) else {
         return Err("cloud worker has no live attachment".to_string());
     };
@@ -1548,7 +1682,7 @@ pub(crate) fn control_terminal_input_frame(
         return None;
     };
     if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
-        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        let _ = forward_cloud_frame(&frame, task_id);
         return None;
     }
     let registry = runtime.terminal_registry.clone();
@@ -1573,7 +1707,7 @@ pub(crate) fn control_terminal_resize_frame(
     let cols = terminal_frame_dimension(&frame, "cols", 80);
     let rows = terminal_frame_dimension(&frame, "rows", 24);
     if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
-        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        let _ = forward_cloud_frame(&frame, task_id);
         return None;
     }
     let registry = runtime.terminal_registry.clone();
@@ -1600,7 +1734,7 @@ pub(crate) fn control_terminal_close_frame(
         handle.abort();
     }
     if let Some(task_id) = crate::codex_cloud_attach::cloud_host_task_id(&host_id) {
-        let _ = forward_cloud_terminal_frame(&frame, task_id);
+        let _ = forward_cloud_frame(&frame, task_id);
         return None;
     }
     let registry = runtime.terminal_registry.clone();

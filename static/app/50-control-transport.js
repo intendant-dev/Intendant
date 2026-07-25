@@ -255,6 +255,15 @@ class DashboardControlTransport {
       vaultEgressHandleFrame(msg);
       return;
     }
+    if (msg.t === 'display_opened' || msg.t === 'display_tiles' || msg.t === 'display_closed' || msg.t === 'display_error') {
+      // Cloud-worker display frames (host_id = "cloud:<task>"): the Cloud
+      // card's viewer subscribes via this event; nothing else consumes
+      // the family, so an unhandled frame is simply dropped.
+      try {
+        window.dispatchEvent(new CustomEvent('intendant-cloud-display-frame', { detail: msg }));
+      } catch (_) {}
+      return;
+    }
     if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error' || msg.t === 'terminal_shared') {
       try {
         window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
