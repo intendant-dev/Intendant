@@ -924,3 +924,79 @@ html.ui-v2 #access-github-integration-section .vault-actions {
   gap: 8px;
   margin-top: 4px;
 }
+/* One-click connect lane (Track GC): the primary gesture above the
+   collapsed manual fallback. */
+html.ui-v2 #access-github-integration-section .vault-connect-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+html.ui-v2 #access-github-integration-section .vault-connect-org {
+  flex: 1 1 220px;
+  max-width: 320px;
+  box-sizing: border-box;
+  min-height: 36px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
+}
+html.ui-v2 #access-github-integration-section .vault-connect-org::placeholder {
+  color: var(--text-3);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-org:focus-visible {
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: var(--text-3);
+}
+html.ui-v2 #access-github-integration-section .vault-install-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 8px 14px;
+  border-radius: var(--r-ctl);
+  border: 1px solid rgba(var(--iris-rgb), .4);
+  background: rgba(var(--iris-rgb), .14);
+  color: var(--iris);
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+}
+html.ui-v2 #access-github-integration-section .vault-install-link:hover {
+  background: rgba(var(--iris-rgb), .22);
+}
+html.ui-v2 #access-github-integration-section .vault-repo-picker {
+  margin: 4px 0 12px;
+}
+html.ui-v2 #access-github-integration-section .vault-repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 4px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+}
+html.ui-v2 #access-github-integration-section .vault-repo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+html.ui-v2 #access-github-integration-section .vault-repo-item input {
+  accent-color: var(--iris);
+}

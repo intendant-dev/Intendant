@@ -4298,6 +4298,10 @@ const githubIntegrationState = {
   notice: null, // { text, cls } — the last action's outcome, transient
   lastError: null,
   removeArmedAt: 0,
+  // Bounded install discovery (pending state only).
+  discovery: { polling: false, until: 0, installations: null, error: null },
+  // Repo picker cache (installed state only).
+  repoPicker: { loading: false, repositories: null, error: null },
 };
 
 async function githubIntegrationRefresh(force = false) {
@@ -4318,6 +4322,150 @@ function githubIntegrationChip(text, cls) {
   chip.className = 'vault-chip' + (cls ? ` ${cls}` : '');
   chip.textContent = text;
   return chip;
+}
+
+// One-click connect (Track GC): manifest-start is an HTTP-only route
+// (no tunnel twin — the redirect must land back on THIS origin), so it
+// rides a plain same-origin fetch like the sibling-tokens lane, never
+// the daemonApi map. The response's form target + manifest are posted
+// as a real form navigation (target _self: works identically in
+// browsers and the macOS app's WKWebView, which drops _blank).
+// Bounded installation discovery (Track GC slice GC2): after the
+// Install click (or on opening a pending section) poll the discovery
+// route every 5 s for up to 2 minutes. Exactly one installation
+// auto-fills through the EXISTING save verb; several render a picker;
+// zero leaves the install link + the manual fallback. The route is a
+// plain request — the daemon runs no loop.
+const GITHUB_DISCOVERY_TICK_MS = 5000;
+const GITHUB_DISCOVERY_WINDOW_MS = 120000;
+
+function githubIntegrationDiscoveryStart() {
+  const d = githubIntegrationState.discovery;
+  d.until = Date.now() + GITHUB_DISCOVERY_WINDOW_MS;
+  d.error = null;
+  if (!d.polling) void githubIntegrationDiscoveryTick();
+}
+
+async function githubIntegrationDiscoveryTick() {
+  const d = githubIntegrationState.discovery;
+  if (!githubIntegrationState.data?.pending_install || Date.now() > d.until) {
+    d.polling = false;
+    renderGithubIntegrationSection();
+    return;
+  }
+  d.polling = true;
+  try {
+    const data = await daemonApi.request('api_github_installations', {});
+    const rows = Array.isArray(data?.installations) ? data.installations : [];
+    d.installations = rows;
+    d.error = null;
+    if (rows.length === 1 && rows[0]?.installation_id) {
+      d.polling = false;
+      await githubIntegrationCompleteInstall(rows[0]);
+      return;
+    }
+  } catch (e) {
+    d.error = String(e?.message || e);
+  }
+  setTimeout(() => { void githubIntegrationDiscoveryTick(); }, GITHUB_DISCOVERY_TICK_MS);
+  renderGithubIntegrationSection();
+}
+
+// The auto-fill: complete the pending document through the existing
+// save verb (ids-only update — the sealed key and slug survive, and
+// save's real verification runs).
+async function githubIntegrationCompleteInstall(row) {
+  if (githubIntegrationState.busy) return;
+  githubIntegrationState.busy = true;
+  try {
+    const payload = { installation_id: Number(row.installation_id) };
+    if (row.app_id != null) payload.app_id = String(row.app_id);
+    const data = await daemonApi.request('api_github_integration_save', payload);
+    githubIntegrationState.data = data || githubIntegrationState.data;
+    githubIntegrationState.fetchedAt = Date.now();
+    githubIntegrationState.notice = {
+      text: `Installed as ${row.account_login || 'the selected account'} — pick repositories below.`,
+      cls: 'ok',
+    };
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+  }
+  githubIntegrationState.busy = false;
+  githubIntegrationState.repoPicker = { loading: false, repositories: null, error: null };
+  renderGithubIntegrationSection();
+}
+
+// The repo picker's write: config only (no ids, no key) — the daemon
+// verifies against the sealed document without re-sealing it.
+async function githubIntegrationSaveSelection(payload) {
+  if (githubIntegrationState.busy) return;
+  githubIntegrationState.busy = true;
+  githubIntegrationState.notice = null;
+  try {
+    const data = await daemonApi.request('api_github_integration_save', payload);
+    githubIntegrationState.data = data || githubIntegrationState.data;
+    githubIntegrationState.fetchedAt = Date.now();
+    const status = String(data?.status || 'unknown');
+    githubIntegrationState.notice = {
+      text: status === 'valid'
+        ? 'Watch list saved — verified against GitHub.'
+        : `Saved. Status: ${status}${data?.detail ? ` — ${data.detail}` : ''}`,
+      cls: status === 'valid' ? 'ok' : 'warn',
+    };
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+  }
+  githubIntegrationState.busy = false;
+  renderGithubIntegrationSection();
+}
+
+async function githubIntegrationLoadRepositories() {
+  const p = githubIntegrationState.repoPicker;
+  if (p.loading || p.repositories) return;
+  p.loading = true;
+  p.error = null;
+  try {
+    const data = await daemonApi.request('api_github_repositories', {});
+    p.repositories = Array.isArray(data?.repositories) ? data.repositories : [];
+  } catch (e) {
+    p.error = String(e?.message || e);
+  }
+  p.loading = false;
+  renderGithubIntegrationSection();
+}
+
+async function githubIntegrationConnect(orgInput) {
+  if (githubIntegrationState.busy) return;
+  githubIntegrationState.busy = true;
+  githubIntegrationState.notice = null;
+  try {
+    const organization = String(orgInput?.value || '').trim();
+    const resp = await fetch('/api/integrations/github/manifest-start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(organization ? { organization } : {}),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      throw new Error(String(data?.error || `manifest-start failed (${resp.status})`));
+    }
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = String(data.form_action);
+    form.target = '_self';
+    const field = document.createElement('input');
+    field.type = 'hidden';
+    field.name = 'manifest';
+    field.value = JSON.stringify(data.manifest);
+    form.appendChild(field);
+    document.body.appendChild(form);
+    form.submit();
+    // The tab navigates to GitHub now; state past this point is moot.
+  } catch (e) {
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.busy = false;
+    renderGithubIntegrationSection();
+  }
 }
 
 async function githubIntegrationSave(fields) {
@@ -4394,6 +4542,10 @@ function renderGithubIntegrationSection() {
   if (data?.configured) {
     chips.appendChild(githubIntegrationChip('credentials sealed', 'ok'));
   }
+  if (data?.pending_install) {
+    chips.appendChild(githubIntegrationChip('pending install', 'warn'));
+    if (data.app_slug) chips.appendChild(githubIntegrationChip(String(data.app_slug)));
+  }
   const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
   chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
   if (data && data.custody_backend_available === false) {
@@ -4408,10 +4560,172 @@ function renderGithubIntegrationSection() {
   }
   mount.appendChild(chips);
 
+  // The one-click lane (primary). Unconfigured: Connect + optional org
+  // handle. Sealed-pending-install: the install link (discovery + repo
+  // picker arrive with the next slice). The manual form below stays the
+  // universal fallback either way.
+  const custodyAvailable = !data || data.custody_backend_available !== false;
+  if (data && !data.configured) {
+    const connect = document.createElement('div');
+    connect.className = 'vault-connect-line';
+    const org = document.createElement('input');
+    org.type = 'text';
+    org.autocomplete = 'off';
+    org.placeholder = 'Organization (blank = personal account)';
+    org.className = 'vault-connect-org';
+    connect.appendChild(org);
+    const button = vaultButton('Connect GitHub', () => {
+      void githubIntegrationConnect(org);
+    }, { primary: true });
+    button.disabled = githubIntegrationState.busy || !custodyAvailable;
+    if (!custodyAvailable) {
+      button.title = 'No credential custody backend on this platform — use the manual form on a machine with custody support.';
+    }
+    connect.appendChild(button);
+    const hint = document.createElement('div');
+    hint.className = 'vault-connect-hint';
+    hint.textContent = custodyAvailable
+      ? 'One click on GitHub creates a private read-only App and seals its key here — nothing to copy.'
+      : 'The one-click ceremony needs a custody backend to seal the App key.';
+    connect.appendChild(hint);
+    mount.appendChild(connect);
+  } else if (data?.pending_install) {
+    const install = document.createElement('div');
+    install.className = 'vault-connect-line';
+    if (data.app_slug) {
+      // _self like the manifest form POST: the macOS app's WKWebView
+      // silently drops _blank, and the same-tab round trip works
+      // everywhere. Clicking arms the bounded discovery loop so the
+      // installation is picked up when the owner returns.
+      const link = document.createElement('a');
+      link.className = 'vault-install-link';
+      link.href = `https://github.com/apps/${encodeURIComponent(String(data.app_slug))}/installations/new`;
+      link.rel = 'noopener noreferrer';
+      link.textContent = 'Install on GitHub';
+      link.addEventListener('click', () => { githubIntegrationDiscoveryStart(); });
+      install.appendChild(link);
+    }
+    const d = githubIntegrationState.discovery;
+    const found = Array.isArray(d.installations) ? d.installations : [];
+    const hint = document.createElement('div');
+    hint.className = 'vault-connect-hint';
+    if (d.polling && found.length === 0) {
+      hint.textContent = 'The App is created and its key is sealed. Waiting for the installation to appear on GitHub…';
+    } else if (found.length > 1) {
+      hint.textContent = 'Several installations found — pick the one to watch:';
+    } else if (d.error) {
+      hint.textContent = `Discovery hit a problem (${d.error}); it keeps retrying while this window is open.`;
+    } else if (d.until > 0 && Date.now() > d.until) {
+      hint.textContent = 'No installation appeared yet. Install the App on GitHub, then reopen this section — or finish with the manual form below.';
+    } else {
+      hint.textContent = 'The App is created and its key is sealed. Install it on your repositories on GitHub and the installation is picked up automatically.';
+      githubIntegrationDiscoveryStart();
+    }
+    install.appendChild(hint);
+    if (found.length > 1) {
+      const picker = document.createElement('div');
+      picker.className = 'vault-actions';
+      for (const row of found) {
+        const pick = vaultButton(
+          `${row.account_login || 'account'} (#${row.installation_id})`,
+          () => { void githubIntegrationCompleteInstall(row); },
+        );
+        pick.disabled = githubIntegrationState.busy;
+        picker.appendChild(pick);
+      }
+      install.appendChild(picker);
+    }
+    mount.appendChild(install);
+  } else if (data?.configured) {
+    // Installed: the repo picker (installed ∩ configured semantics —
+    // checked = watched; writes ride the existing save verb and never
+    // touch custody). Poll minutes live under Advanced.
+    void githubIntegrationLoadRepositories();
+    const p = githubIntegrationState.repoPicker;
+    const picker = document.createElement('div');
+    picker.className = 'vault-repo-picker';
+    const configured = new Set(Array.isArray(data.repos) ? data.repos : []);
+    if (p.error) {
+      const err = document.createElement('div');
+      err.className = 'vault-connect-hint';
+      err.textContent = `Repository listing failed: ${p.error}`;
+      picker.appendChild(err);
+    } else if (!p.repositories) {
+      const loading = document.createElement('div');
+      loading.className = 'vault-connect-hint';
+      loading.textContent = 'Listing the installation’s repositories…';
+      picker.appendChild(loading);
+    } else {
+      const list = document.createElement('div');
+      list.className = 'vault-repo-list';
+      const known = new Set();
+      for (const name of [...p.repositories, ...configured]) {
+        if (known.has(name)) continue;
+        known.add(name);
+        const label = document.createElement('label');
+        label.className = 'vault-repo-item';
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.value = name;
+        box.checked = configured.has(name);
+        label.appendChild(box);
+        const text = document.createElement('span');
+        // A configured repo the installation can no longer see still
+        // renders (checked) so unticking it stays possible.
+        text.textContent = p.repositories.includes(name) ? name : `${name} (not visible to the installation)`;
+        label.appendChild(text);
+        list.appendChild(label);
+      }
+      if (known.size === 0) {
+        const none = document.createElement('div');
+        none.className = 'vault-connect-hint';
+        none.textContent = 'The installation can see no repositories — grant it some on GitHub.';
+        list.appendChild(none);
+      }
+      picker.appendChild(list);
+
+      const advanced = document.createElement('details');
+      advanced.className = 'acc-fold';
+      const advSummary = document.createElement('summary');
+      advSummary.textContent = 'Advanced';
+      advanced.appendChild(advSummary);
+      const advBody = document.createElement('div');
+      advBody.className = 'acc-fold-body vault-connect-line';
+      const pollLabel = document.createElement('span');
+      pollLabel.className = 'vault-connect-hint';
+      pollLabel.textContent = 'Poll minutes (default 5):';
+      advBody.appendChild(pollLabel);
+      const poll = document.createElement('input');
+      poll.type = 'number';
+      poll.min = '1';
+      poll.className = 'vault-connect-org';
+      poll.placeholder = data?.poll_minutes ? String(data.poll_minutes) : '5';
+      advBody.appendChild(poll);
+      advanced.appendChild(advBody);
+      picker.appendChild(advanced);
+
+      const actions = document.createElement('div');
+      actions.className = 'vault-actions';
+      const saveSelection = vaultButton('Save selection & verify', () => {
+        const repos = Array.from(list.querySelectorAll('input[type=checkbox]'))
+          .filter((box) => box.checked)
+          .map((box) => box.value);
+        const payload = { repos };
+        const minutes = Number.parseInt(poll.value, 10);
+        if (Number.isFinite(minutes) && minutes >= 1) payload.poll_minutes = minutes;
+        void githubIntegrationSaveSelection(payload);
+      }, { primary: true });
+      saveSelection.disabled = githubIntegrationState.busy;
+      actions.appendChild(saveSelection);
+      picker.appendChild(actions);
+    }
+    mount.appendChild(picker);
+  }
+
   const fold = document.createElement('details');
   fold.className = 'acc-fold';
   const summary = document.createElement('summary');
-  summary.textContent = data?.configured ? 'Update the GitHub App' : 'Connect a GitHub App';
+  summary.textContent = data?.configured ? 'Update the GitHub App' : 'Enter credentials manually';
   const body = document.createElement('div');
   body.className = 'acc-fold-body';
   const grid = document.createElement('div');

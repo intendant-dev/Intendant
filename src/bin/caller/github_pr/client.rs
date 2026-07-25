@@ -213,6 +213,16 @@ pub(crate) struct ReviewSummary {
     pub(crate) commented: usize,
 }
 
+/// One installation of the App, as the discovery surface renders it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct InstallationSummary {
+    pub(crate) installation_id: u64,
+    pub(crate) account_login: String,
+    /// GitHub also echoes the App id per row; the auto-fill save wants
+    /// it, and the sealed document is never unsealed for a status read.
+    pub(crate) app_id: Option<u64>,
+}
+
 pub(crate) struct GithubAppClient {
     http: reqwest::Client,
     api_base: String,
@@ -256,10 +266,18 @@ impl GithubAppClient {
                 return Ok(cached.token.clone());
             }
         }
+        // A pending-install document has no installation to mint against;
+        // the named refusal keeps the ceremony phase honest (Denied stays
+        // until the install completes the document).
+        let Some(installation_id) = self.credentials.installation_id else {
+            return Err(ApiError::Denied(
+                "installation pending — install the App on GitHub and finish discovery".to_string(),
+            ));
+        };
         let jwt = mint_app_jwt(&self.credentials, now).map_err(ApiError::Denied)?;
         let url = format!(
             "{}/app/installations/{}/access_tokens",
-            self.api_base, self.credentials.installation_id
+            self.api_base, installation_id
         );
         let response = self
             .http
@@ -291,6 +309,82 @@ impl GithubAppClient {
             expires_unix_s,
         });
         Ok(token)
+    }
+
+    /// The App's installations, under the App JWT alone — the discovery
+    /// read of the connect ceremony, so it works on a pending-install
+    /// document (no installation token exists yet). One page of 100:
+    /// a private per-daemon App has one installation in practice; a
+    /// hundred is not a shape this integration mirrors.
+    pub(crate) async fn list_installations(&self) -> Result<Vec<InstallationSummary>, ApiError> {
+        let jwt = mint_app_jwt(&self.credentials, unix_now_s()).map_err(ApiError::Denied)?;
+        let url = format!("{}/app/installations?per_page=100", self.api_base);
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|error| ApiError::Unreachable(error.to_string()))?;
+        let response = classify(response).await?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| ApiError::Unreachable(format!("installations body: {error}")))?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| ApiError::Unreachable("installations shape: not a list".to_string()))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(InstallationSummary {
+                    installation_id: row.get("id")?.as_u64()?,
+                    account_login: row
+                        .get("account")
+                        .and_then(|a| a.get("login"))
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    app_id: row.get("app_id").and_then(|v| v.as_u64()),
+                })
+            })
+            .collect())
+    }
+
+    /// Repositories the installation can see (the repo picker's read):
+    /// installation token, `full_name`s only, bounded pagination like
+    /// the PR list.
+    pub(crate) async fn list_installation_repositories(&self) -> Result<Vec<String>, ApiError> {
+        let mut names = Vec::new();
+        let mut url = format!("{}/installation/repositories?per_page=100", self.api_base);
+        for _ in 0..MAX_LIST_PAGES {
+            let value = match self.get_value(&url, None).await? {
+                Conditional::NotModified => {
+                    return Err(ApiError::Unreachable(
+                        "unconditional read answered 304".to_string(),
+                    ))
+                }
+                Conditional::Fresh { value, .. } => value,
+            };
+            let (page, next) = match (value.get("__page"), value.get("__next")) {
+                (Some(page), Some(next)) => (page.clone(), next.as_str().map(str::to_string)),
+                _ => (value, None),
+            };
+            if let Some(rows) = page.get("repositories").and_then(|r| r.as_array()) {
+                names.extend(rows.iter().filter_map(|row| {
+                    row.get("full_name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                }));
+            }
+            match next {
+                Some(next_url) => url = next_url,
+                None => break,
+            }
+        }
+        Ok(names)
     }
 
     /// Conditional GET of an absolute API URL. `etag` rides
@@ -525,6 +619,58 @@ fn next_page_url(response: &reqwest::Response) -> Option<String> {
     None
 }
 
+/// What the manifest ceremony keeps from GitHub's conversion response.
+/// Deliberately three fields: `client_secret` and `webhook_secret` are
+/// in the response but **never materialize as retained values** — the
+/// narrow parse is the discard (serde ignores the rest of the body).
+#[derive(serde::Deserialize)]
+pub(crate) struct ManifestConversion {
+    pub(crate) id: u64,
+    pub(crate) slug: String,
+    pub(crate) pem: String,
+}
+
+/// Exchange a manifest-flow `code` for the created App's identity:
+/// `POST {api_base}/app-manifests/{code}/conversions`. Credential-less
+/// by design — the single-use code GitHub minted at the owner's Create
+/// click is the entire authorization, so this is a free function, not a
+/// `GithubAppClient` method (no key exists until this call returns).
+/// GitHub answers 201 with the full App object; 404 for an
+/// invalid/expired/used code lands in the `Denied` class via
+/// [`classify`].
+pub(crate) async fn convert_manifest_code(
+    api_base: &str,
+    code: &str,
+) -> Result<ManifestConversion, ApiError> {
+    let http = reqwest::Client::builder()
+        .user_agent("intendant")
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| ApiError::Unreachable(format!("http client: {error}")))?;
+    let url = format!(
+        "{}/app-manifests/{}/conversions",
+        api_base.trim_end_matches('/'),
+        code
+    );
+    let response = http
+        .post(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", API_VERSION)
+        .send()
+        .await
+        // `without_url`: reqwest's Display embeds the request URL, and
+        // this one carries the still-live single-use code — it must
+        // never reach an error page or a log line.
+        .map_err(|error| ApiError::Unreachable(error.without_url().to_string()))?;
+    let response = classify(response).await?;
+    response
+        .json::<ManifestConversion>()
+        .await
+        .map_err(|error| {
+            ApiError::Unreachable(format!("conversion response: {}", error.without_url()))
+        })
+}
+
 /// Map a non-2xx response onto the named failure classes. 304 never
 /// reaches here (handled at the call site).
 async fn classify(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
@@ -655,7 +801,8 @@ pub(crate) mod test_fixture {
         GithubAppCredentials {
             v: 1,
             app_id: "123456".to_string(),
-            installation_id: 987,
+            installation_id: Some(987),
+            slug: None,
             private_key_pem: TEST_RSA_PKCS1_PEM.to_string(),
         }
     }

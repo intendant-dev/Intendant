@@ -67,7 +67,20 @@ dashboard, attributed to your session.
   title/body question, `ctl ask --park` (or the `ask_user` tool with
   `park: true`) when options, pick bounds, or preview cards help the owner
   answer at a glance — the full question renders on the dashboard question
-  rail, returns `{status:"parked", item_id, ask_id}` immediately, and the
+  rail. **Decision items brief like the owner briefing standard**
+  (`~/owner-briefing-standard.md`): Situate first — re-teach what this
+  is and why from the map, for a reader who genuinely paged it out —
+  then the decision with what silence does (nothing; silence is never
+  consent), depth clearly bounded so skipping is safe, and a committed
+  recommendation. **Park gate questions with the artifact attached**:
+  the ruling target rides as a `--must-read` ref (a pointer, never
+  pasted content) and a `gate` tag so standing mandates can match it.
+  **Answer+wake etiquette, both directions**: when you park a gate,
+  name your coordination-bus writer id in the body and watch your
+  messages; when you answer another session's question, bus-message the
+  asker's writer id that the answer landed — an answered item nobody
+  wakes for is a relay the owner ends up doing by hand.
+  A parked ask returns `{status:"parked", item_id, ask_id}` immediately, and the
   reply lands on the item (`answer` in `list --json`; rich asks also carry
   `answer.structured`). While your session still lives, the owner's answer
   is delivered back to you as a user message — otherwise read it from the

@@ -387,6 +387,7 @@ pub(crate) async fn handle_access_org_grant_present(
     body_text: String,
     cert_dir: std::path::PathBuf,
     agent_card_value_for_targets: std::sync::Arc<serde_json::Value>,
+    source_hint: String,
     cors: crate::gateway_routes::CorsPosture,
 ) {
     // Transport-owned body decode; the doorbell's parse-error 400 rides
@@ -395,7 +396,12 @@ pub(crate) async fn handle_access_org_grant_present(
         Ok(params) => {
             // Materializes grants — an authority transaction.
             blocking_access_response(move || {
-                access_org_present_api_response(&cert_dir, params, &agent_card_value_for_targets)
+                access_org_present_api_response_from_source(
+                    &cert_dir,
+                    &source_hint,
+                    params,
+                    &agent_card_value_for_targets,
+                )
             })
             .await
         }
@@ -423,6 +429,7 @@ pub(crate) async fn handle_access_org_apply_renew(
     body_text: String,
     req_path: &str,
     cert_dir: std::path::PathBuf,
+    source_hint: String,
     cors: crate::gateway_routes::CorsPosture,
 ) {
     // The per-path caps (ORL vs grant-doc) live on the two table rows;
@@ -433,9 +440,9 @@ pub(crate) async fn handle_access_org_apply_renew(
             // Both leaves run authority transactions.
             blocking_access_response(move || {
                 if is_orl_apply {
-                    access_org_orl_apply_api_response(&cert_dir, params)
+                    access_org_orl_apply_api_response_from_source(&cert_dir, &source_hint, params)
                 } else {
-                    access_org_renew_api_response(&cert_dir, params)
+                    access_org_renew_api_response_from_source(&cert_dir, &source_hint, params)
                 }
             })
             .await
@@ -1095,16 +1102,41 @@ pub(crate) fn access_org_manage_api_response(
     access_result_api_response(result, 400)
 }
 
-/// POST /api/access/org-grants + the tunnel's `api_access_org_present`
-/// (the doorbell class: the signed document is the authorization).
+/// Doorbell bucket for the dashboard-control tunnel twins of the org
+/// doorbell quartet: tunnel callers are authenticated, IAM-gated
+/// dashboard sessions rather than listener sources, so the whole lane
+/// shares one fixed bucket (distinct from any peer address, which keeps
+/// public-door scanners from starving it past the global backstop).
+const ORG_DOORBELL_TUNNEL_SOURCE: &str = "dashboard-control";
+
+/// POST /api/access/org-grants (the doorbell class: the signed document
+/// is the authorization). `source` is the listener's per-client bucket —
+/// the peer IP on direct ingress, the relay-preamble bucket on
+/// reachability-relay ingress.
+pub(crate) fn access_org_present_api_response_from_source(
+    cert_dir: &std::path::Path,
+    source: &str,
+    params: serde_json::Value,
+    agent_card: &serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(
+        access_org_present_response_value(cert_dir, source, params, agent_card),
+        400,
+    )
+}
+
+/// The tunnel's `api_access_org_present`, on the fixed tunnel-lane
+/// doorbell bucket.
 pub(crate) fn access_org_present_api_response(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> ApiResponse {
-    access_result_api_response(
-        access_org_present_response_value(cert_dir, params, agent_card),
-        400,
+    access_org_present_api_response_from_source(
+        cert_dir,
+        ORG_DOORBELL_TUNNEL_SOURCE,
+        params,
+        agent_card,
     )
 }
 
@@ -1115,22 +1147,48 @@ pub(crate) fn access_org_orl_api_response(cert_dir: &std::path::Path, handle: &s
     access_result_api_response(access_org_orl_response_value(cert_dir, handle), 404)
 }
 
-/// POST /api/access/orgs/revocations/apply + the tunnel's
-/// `api_access_org_orl_apply`.
+/// POST /api/access/orgs/revocations/apply, with the listener's
+/// per-client doorbell bucket as `source`.
+pub(crate) fn access_org_orl_apply_api_response_from_source(
+    cert_dir: &std::path::Path,
+    source: &str,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(
+        access_org_orl_apply_response_value(cert_dir, source, params),
+        400,
+    )
+}
+
+/// The tunnel's `api_access_org_orl_apply`, on the fixed tunnel-lane
+/// doorbell bucket.
 pub(crate) fn access_org_orl_apply_api_response(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> ApiResponse {
-    access_result_api_response(access_org_orl_apply_response_value(cert_dir, params), 400)
+    access_org_orl_apply_api_response_from_source(cert_dir, ORG_DOORBELL_TUNNEL_SOURCE, params)
 }
 
-/// POST /api/access/org-grants/renew + the tunnel's
-/// `api_access_org_renew`.
+/// POST /api/access/org-grants/renew, with the listener's per-client
+/// doorbell bucket as `source`.
+pub(crate) fn access_org_renew_api_response_from_source(
+    cert_dir: &std::path::Path,
+    source: &str,
+    params: serde_json::Value,
+) -> ApiResponse {
+    access_result_api_response(
+        access_org_renew_response_value(cert_dir, source, params),
+        400,
+    )
+}
+
+/// The tunnel's `api_access_org_renew`, on the fixed tunnel-lane
+/// doorbell bucket.
 pub(crate) fn access_org_renew_api_response(
     cert_dir: &std::path::Path,
     params: serde_json::Value,
 ) -> ApiResponse {
-    access_result_api_response(access_org_renew_response_value(cert_dir, params), 400)
+    access_org_renew_api_response_from_source(cert_dir, ORG_DOORBELL_TUNNEL_SOURCE, params)
 }
 
 /// POST /api/access/fleet-cert/request + the tunnel's
@@ -2208,11 +2266,13 @@ pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
 /// — as on the other doorbell fns below.
 pub(crate) fn access_org_present_response_value(
     cert_dir: &std::path::Path,
+    source: &str,
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let outcome = crate::access::org::present_org_grant_value(
         cert_dir,
+        source,
         &params,
         &org_target_agent_card_ids(agent_card),
         crate::access::client_key::now_unix_ms() as u64,
@@ -2496,10 +2556,11 @@ pub(crate) fn access_org_orl_response_value(
 /// a partial failure is therefore fail-closed and remains retryable.
 pub(crate) fn access_org_orl_apply_response_value(
     cert_dir: &std::path::Path,
+    source: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let now = crate::access::client_key::now_unix_ms() as u64;
-    if !crate::access::org::presentation_rate_ok(now) {
+    if !crate::access::org::presentation_rate_ok(source, now) {
         return Err("too many org grant presentations; retry shortly".to_string());
     }
     if serde_json::to_string(&params)
@@ -2637,10 +2698,11 @@ pub(crate) fn access_org_revoke_member_response_value(
 /// revocation list gates it.
 pub(crate) fn access_org_renew_response_value(
     cert_dir: &std::path::Path,
+    source: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let now = crate::access::client_key::now_unix_ms() as u64;
-    if !crate::access::org::presentation_rate_ok(now) {
+    if !crate::access::org::presentation_rate_ok(source, now) {
         return Err("too many org grant presentations; retry shortly".to_string());
     }
     if serde_json::to_string(&params)
@@ -5669,9 +5731,13 @@ mod tests {
         // the shared present core (derived through it over the same
         // tempdir store); 400 under the public tail.
         let card = serde_json::json!({});
-        let expected_error =
-            access_org_present_response_value(&cert_dir, serde_json::json!({}), &card)
-                .expect_err("empty org grant document must not verify");
+        let expected_error = access_org_present_response_value(
+            &cert_dir,
+            "golden-transcript",
+            serde_json::json!({}),
+            &card,
+        )
+        .expect_err("empty org grant document must not verify");
         let expected_body = serde_json::json!({"error": expected_error}).to_string();
         let response = collect_access_handler_response(|stream| {
             handle_access_org_grant_present(
@@ -5679,6 +5745,7 @@ mod tests {
                 "{}".to_string(),
                 cert_dir.clone(),
                 std::sync::Arc::new(card.clone()),
+                "golden-transcript".to_string(),
                 public_cors("POST", "/api/access/org-grants"),
             )
         })
@@ -5699,6 +5766,7 @@ mod tests {
                 invalid.to_string(),
                 cert_dir.clone(),
                 std::sync::Arc::new(card.clone()),
+                "golden-transcript".to_string(),
                 public_cors("POST", "/api/access/org-grants"),
             )
         })
@@ -5742,6 +5810,7 @@ mod tests {
                 "{}".to_string(),
                 "/api/access/orgs/revocations/apply",
                 cert_dir.clone(),
+                "golden-transcript".to_string(),
                 public_cors("POST", "/api/access/orgs/revocations/apply"),
             )
         })
@@ -5764,6 +5833,7 @@ mod tests {
                 "{}".to_string(),
                 "/api/access/org-grants/renew",
                 cert_dir.clone(),
+                "golden-transcript".to_string(),
                 public_cors("POST", "/api/access/org-grants/renew"),
             )
         })

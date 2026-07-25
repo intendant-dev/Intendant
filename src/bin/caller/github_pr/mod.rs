@@ -13,5 +13,6 @@
 pub(crate) mod client;
 pub(crate) mod credentials;
 pub(crate) mod join;
+pub(crate) mod manifest_ceremony;
 pub(crate) mod scanner;
 pub(crate) mod status;

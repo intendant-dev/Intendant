@@ -1662,6 +1662,52 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::GithubManifestStart => {
+                // The pre-dispatch IAM gate bound this principal
+                // (CredentialsManage); it becomes the ceremony's
+                // starter principal — the custody-audit actor when the
+                // authority-free callback later completes the act.
+                return handle_github_manifest_start(
+                    stream,
+                    route_body.as_bytes(),
+                    is_tls,
+                    http_header_value(header_text, "host"),
+                    http_access_context.principal.id.clone(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubManifestCallback => {
+                // Authority-free browser navigation (GitHub's redirect):
+                // the handler's state burn is the entire authorization.
+                // The rate-limit source is the peer IP, like the
+                // enrollment doorbell.
+                return handle_github_manifest_callback(
+                    stream,
+                    request_line,
+                    peer_addr.ip().to_string(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubInstallations => {
+                return handle_github_installations(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubRepositories => {
+                return handle_github_repositories(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ClaudeAuthStart => {
                 return handle_claude_auth_start(
                     stream,
@@ -1901,11 +1947,15 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::AccessOrgGrantPresent => {
+                // The listener's per-client doorbell bucket (peer IP on
+                // direct ingress, relay-preamble bucket on relay ingress)
+                // — an availability hint only, never authority.
                 return handle_access_org_grant_present(
                     stream,
                     route_body,
                     cert_dir,
                     agent_card_value_for_targets,
+                    source_hint,
                     route.cors,
                 )
                 .await;
@@ -1915,7 +1965,12 @@ pub(crate) async fn serve_http_request(
             }
             RouteHandlerId::AccessOrgApplyRenew => {
                 return handle_access_org_apply_renew(
-                    stream, route_body, req_path, cert_dir, route.cors,
+                    stream,
+                    route_body,
+                    req_path,
+                    cert_dir,
+                    source_hint,
+                    route.cors,
                 )
                 .await;
             }

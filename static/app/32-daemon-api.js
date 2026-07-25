@@ -153,6 +153,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_github_integration_save: { verb: 'POST', path: '/api/integrations/github' },
   api_github_integration_status: { verb: 'GET', path: '/api/integrations/github/status' },
   api_github_integration_remove: { verb: 'DELETE', path: '/api/integrations/github' },
+  api_github_installations: { verb: 'GET', path: '/api/integrations/github/installations' },
+  api_github_repositories: { verb: 'GET', path: '/api/integrations/github/repositories' },
   api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
   api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
   api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
