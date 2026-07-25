@@ -971,6 +971,16 @@ pub enum AgendaCommand {
         agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<TriggerSpec>,
+        /// The project root the fired session runs under, recorded on
+        /// the digest-bound manifest so the approval covers WHERE.
+        /// Validated at intake (absolute, existing directory — the same
+        /// contradiction the launch path would refuse at fire time,
+        /// named now). Absent = the legacy resolution: the parking
+        /// session's recorded root, else the daemon default — which a
+        /// picker-stamped manifest on a projectless daemon does not
+        /// have, the live gap this field closes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },

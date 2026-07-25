@@ -753,6 +753,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 actor("agent_session", Some("sess-a5")),
             )
@@ -1638,6 +1639,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -1678,6 +1680,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )
@@ -1828,6 +1831,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 None,
             )

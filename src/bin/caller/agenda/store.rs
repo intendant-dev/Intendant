@@ -1124,6 +1124,7 @@ impl AgendaStore {
                 recurrence,
                 agent_config,
                 trigger,
+                project_root,
                 source: _,
             } => {
                 let item = self.require(&id)?;
@@ -1183,6 +1184,31 @@ impl AgendaStore {
                     }
                     validate_trigger(trig)?;
                 }
+                // Explicit project pin (T3c): the same contradiction the
+                // launch path would deterministically refuse at fire time
+                // is named NOW, at review time — a picker-stamped
+                // standing manifest on a projectless daemon otherwise
+                // fires straight into the named refusal.
+                let project_root = match project_root.map(|p| p.trim().to_string()) {
+                    None => None,
+                    Some(p) if p.is_empty() => None,
+                    Some(p) => {
+                        let path = std::path::Path::new(&p);
+                        if !path.is_absolute() {
+                            return Err(AgendaError::Invalid(format!(
+                                "project_root must be an absolute path, got {p:?}"
+                            )));
+                        }
+                        if !path.is_dir() {
+                            return Err(AgendaError::Invalid(format!(
+                                "project_root {p:?} is not an existing directory — the spawn \
+                                 would be refused at fire time; fix the path or omit it for \
+                                 the daemon default"
+                            )));
+                        }
+                        Some(p)
+                    }
+                };
                 let goal = {
                     let goal = goal.trim();
                     if goal.is_empty() {
@@ -1214,13 +1240,14 @@ impl AgendaStore {
                         goal,
                         fire_at_ms,
                         orchestrate,
-                        // Proposals keep the legacy autonomous shape; the
-                        // project resolves at fire time (provenance →
-                        // daemon default → named refusal). The executor
-                        // pins (if any) ride the digest-bound manifest;
-                        // absent fields inherit the daemon defaults.
+                        // Proposals keep the legacy autonomous shape;
+                        // without an explicit pin the project resolves at
+                        // fire time (provenance → daemon default → named
+                        // refusal). The executor pins (if any) ride the
+                        // digest-bound manifest; absent fields inherit
+                        // the daemon defaults.
                         interactive: false,
-                        project_root: None,
+                        project_root,
                         agent_config,
                         recurrence,
                         trigger,
@@ -3750,6 +3777,7 @@ mod tests {
             agent_config: None,
             source: None,
             trigger: None,
+            project_root: None,
         }
     }
 
@@ -3791,6 +3819,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 "until_ms must be after",
             ),
@@ -3807,6 +3836,7 @@ mod tests {
                     agent_config: None,
                     source: None,
                     trigger: None,
+                    project_root: None,
                 },
                 "at least 1",
             ),
@@ -4204,6 +4234,7 @@ mod tests {
                 agent_config: None,
                 trigger,
                 source: None,
+                project_root: None,
             }
         };
         let gate = |tags: Vec<String>| super::super::types::TriggerSpec::OnItemMatch {
@@ -4284,6 +4315,7 @@ mod tests {
                 agent_config: config.map(Box::new),
                 source: None,
                 trigger: None,
+                project_root: None,
             };
 
         let config = crate::event::AgentLaunchConfig {
@@ -4624,5 +4656,72 @@ mod tests {
             }
             last_len = page.log_len;
         }
+    }
+
+    /// T3c: an explicit project pin is validated at review time — the
+    /// same contradiction the launch path would refuse at fire time,
+    /// named NOW — and binds the digest (the approval covers WHERE);
+    /// blank normalizes to the legacy absent shape.
+    #[test]
+    fn propose_project_root_validates_and_binds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let id = store
+            .apply_command(add_cmd("pinned"), owner(), 1000)
+            .unwrap()
+            .id;
+        let propose = |project_root: Option<String>| AgendaCommand::ProposeEffect {
+            id: id.clone(),
+            goal: "g".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            recurrence: None,
+            agent_config: None,
+            trigger: None,
+            project_root,
+            source: None,
+        };
+        for (bad, needle) in [
+            (
+                Some("relative/path".to_string()),
+                "must be an absolute path",
+            ),
+            (
+                Some(format!("{}/definitely-missing-child", dir.path().display())),
+                "not an existing directory",
+            ),
+        ] {
+            let err = store
+                .apply_command(propose(bad), owner(), 2000)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?} in {err}"
+            );
+        }
+        let parked = store
+            .apply_command(propose(Some("   ".into())), owner(), 3000)
+            .unwrap();
+        assert_eq!(
+            parked.effects[0].manifest.project_root, None,
+            "blank normalizes absent"
+        );
+        let unpinned_digest = parked.effects[0].digest.clone();
+        let proj = tempfile::tempdir().unwrap();
+        let pinned = store
+            .apply_command(
+                propose(Some(proj.path().display().to_string())),
+                owner(),
+                4000,
+            )
+            .unwrap();
+        assert_eq!(
+            pinned.effects[0].manifest.project_root,
+            Some(proj.path().display().to_string())
+        );
+        assert_ne!(
+            pinned.effects[0].digest, unpinned_digest,
+            "the pin revises the digest"
+        );
     }
 }
