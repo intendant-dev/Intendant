@@ -663,6 +663,25 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
         tunnel: true,
         note: "pointer/keyboard injection into a display",
     },
+    // ---- tunnel only: cloud-worker display viewer ----
+    FrameLaneSpec {
+        frame: "display_open",
+        op: Some(PeerOperation::DisplayView),
+        ws: false,
+        tunnel: true,
+        note: "opens a cloud worker's virtual display over the task's attachment and \
+               subscribes this connection to its tile stream; local displays bootstrap \
+               via api_display_bootstrap + WebRTC instead, and cloud frames ride the \
+               tunnel only (slice-2 precedent: /ws stays local-only)",
+    },
+    FrameLaneSpec {
+        frame: "display_close",
+        op: Some(PeerOperation::DisplayView),
+        ws: false,
+        tunnel: true,
+        note: "tears down this connection's cloud-worker tile subscription — closing a \
+               viewer is view-scoped, not a display mutation",
+    },
     // ---- /ws only: display signaling + diagnostics marker ----
     FrameLaneSpec {
         frame: "set_diagnostics_visual_marker",
@@ -1624,6 +1643,9 @@ mod tests {
             ("terminal_close",                 Some(TerminalWrite),  Some(TerminalWrite)),
             ("terminal_share",                 Some(TerminalWrite),  Some(TerminalWrite)),
             ("display_input",                  Some(DisplayInput),   Some(DisplayInput)),
+            // -- tunnel only: cloud-worker display viewer --
+            ("display_open",                   None,                 Some(DisplayView)),
+            ("display_close",                  None,                 Some(DisplayView)),
             // -- /ws only: display signaling + diagnostics marker --
             ("set_diagnostics_visual_marker",  Some(DisplayInput),   None),
             ("display_offer",                  Some(DisplayView),    None),

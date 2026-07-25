@@ -413,6 +413,10 @@ const WORKER_REPLY_KINDS: &[&str] = &[
     "terminal_exited",
     "terminal_error",
     "terminal_shared",
+    "display_opened",
+    "display_tiles",
+    "display_closed",
+    "display_error",
 ];
 
 /// Host-id prefix that routes a dashboard terminal frame to a connected
@@ -918,9 +922,21 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     let terminal_registry = crate::terminal::TerminalRegistry::new(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
+    // Same lifetime rule as the registry: the display session (and any
+    // worker-launched Xvfb) survives reconnects; per-viewer stream state
+    // dies with each socket.
+    let mut display_state = WorkerDisplayState::default();
     let mut attempt: u32 = 0;
     loop {
-        match hold_attachment(&home, &pinned, &identity, &task, &terminal_registry).await {
+        let held =
+            hold_attachment(&home, &pinned, &identity, &task, &terminal_registry, &mut display_state)
+                .await;
+        // The per-viewer display half is socket-scoped: the pump and
+        // stream unwind on their own when the socket's channels close,
+        // and this reset clears the handles so the next open starts
+        // clean.
+        display_state.stop_viewer();
+        match held {
             Ok(()) => {
                 attempt = 0;
                 eprintln!("[cloud-agent] attachment closed by home; reconnecting");
@@ -938,6 +954,102 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         let backoff = std::time::Duration::from_secs(2u64.saturating_pow(attempt.min(4)));
         tokio::time::sleep(backoff).await;
     }
+}
+
+/// Worker-side display state, hoisted to `run_agent` scope like the
+/// terminal registry: the display session (and any Xvfb it launched)
+/// survives socket reconnects; the per-viewer tile stream and pump die
+/// with each socket and are recreated by the next `display_open`.
+#[derive(Default)]
+pub(crate) struct WorkerDisplayState {
+    session: Option<(u32, std::sync::Arc<crate::display::DisplaySession>)>,
+    stream: Option<crate::display::tile_socket::TileSocketStream>,
+    pump: Option<tokio::task::JoinHandle<()>>,
+    input: Option<std::sync::Arc<crate::display::BrowserInputSource>>,
+    /// Kill-on-drop guard for a worker-launched Xvfb — held for RAII
+    /// only, never read.
+    _xvfb: Option<crate::vision::XvfbGuard>,
+}
+
+impl WorkerDisplayState {
+    /// Tear down the per-viewer half (stream + pump + input source),
+    /// keeping the session/Xvfb for the next open. The capture demand
+    /// probe idles a paced backend once the stream's subscription drops.
+    fn stop_viewer(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            stream.stop_nowait();
+        }
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+        self.input = None;
+    }
+}
+
+/// Resolve and start the worker's display session: the synthetic backend
+/// under the mock rig pair (same fail-closed gate as the daemon), an
+/// existing X display, or a fresh Xvfb on Linux. Errors are the operator's
+/// actionable message — name what is missing.
+async fn start_worker_display_session(
+    state: &mut WorkerDisplayState,
+) -> Result<(u32, std::sync::Arc<crate::display::DisplaySession>), String> {
+    use std::sync::Arc;
+
+    // `state` only receives the Xvfb guard, which exists on Linux alone.
+    #[cfg(not(target_os = "linux"))]
+    let _ = &mut *state;
+
+    let mock_synthetic = std::env::var("INTENDANT_MOCK_DISPLAY").as_deref() == Ok("synthetic")
+        && std::env::var("PROVIDER").as_deref() == Ok("mock");
+    let (display_id, backend): (u32, Arc<dyn crate::display::DisplayBackend>) = if mock_synthetic {
+        (0, Arc::new(crate::display::synthetic::SyntheticBackend::new()))
+    } else if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        {
+            let env_display = std::env::var("DISPLAY").ok();
+            let existing = env_display
+                .as_deref()
+                .and_then(|display| display.strip_prefix(':'))
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|number| number.parse::<u32>().ok())
+                .filter(|id| crate::vision::virtual_display_socket_exists(*id));
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    let id = crate::vision::conventional_virtual_display().unwrap_or(99);
+                    let config = crate::vision::DisplayConfig {
+                        target: intendant_platform::DisplayTarget::Virtual { id },
+                        width: 1280,
+                        height: 800,
+                    };
+                    let guard = crate::vision::launch_display(&config)
+                        .await
+                        .map_err(|e| format!("launch Xvfb for the worker display: {e}"))?;
+                    state._xvfb = Some(guard);
+                    id
+                }
+            };
+            let backend = crate::display::x11::X11Backend::with_display(&format!(":{id}"))
+                .map_err(|e| format!("connect to worker X display :{id}: {e}"))?;
+            (id, Arc::new(backend))
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!()
+    } else {
+        return Err(
+            "worker display needs a Linux virtual display (Xvfb) or the synthetic mock backend"
+                .to_string(),
+        );
+    };
+    let session = Arc::new(crate::display::DisplaySession::new(display_id, backend));
+    // The only possible viewer rides the tile-socket stream; never spin
+    // the always-on video encoder bank in the container.
+    session.disable_video_bank();
+    session
+        .start(15, None, None)
+        .await
+        .map_err(|e| format!("start worker display session: {e}"))?;
+    Ok((display_id, session))
 }
 
 /// Collect the boot-identity fields the probe prompt measures, in the same
@@ -975,6 +1087,7 @@ async fn hold_attachment(
     identity: &crate::peer::transport::tls_client::ClientIdentityPaths,
     task: &str,
     registry: &crate::terminal::TerminalRegistry,
+    display: &mut WorkerDisplayState,
 ) -> Result<(), String> {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -1021,7 +1134,7 @@ async fn hold_attachment(
                 Some(Ok(message)) if message.is_close() => break,
                 Some(Ok(message)) => {
                     if let Ok(text) = message.into_text() {
-                        serve_worker_frame(registry, text.as_str(), &out_tx, &mut forwarders).await;
+                        serve_worker_frame(registry, text.as_str(), &out_tx, &mut forwarders, display).await;
                     }
                 }
                 Some(Err(error)) => return Err(format!("attachment socket: {error}")),
@@ -1053,6 +1166,7 @@ async fn serve_worker_frame(
         crate::terminal::TerminalKey,
         tokio::task::JoinHandle<()>,
     >,
+    display: &mut WorkerDisplayState,
 ) {
     use base64::Engine as _;
 
@@ -1069,6 +1183,85 @@ async fn serve_worker_frame(
     let kind = field("t");
     let host_id = field("host_id");
     let terminal_id = field("terminal_id");
+    let reply = |mut value: serde_json::Value| {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("host_id".into(), host_id.clone().into());
+            if !terminal_id.is_empty() {
+                map.insert("terminal_id".into(), terminal_id.clone().into());
+            }
+        }
+        value.to_string()
+    };
+
+    // Display frames carry no terminal_id and no registry key.
+    match kind.as_str() {
+        "display_open" => {
+            display.stop_viewer();
+            let (display_id, session) = match display.session.as_ref() {
+                Some((id, session)) => (*id, std::sync::Arc::clone(session)),
+                None => match start_worker_display_session(display).await {
+                    Ok((id, session)) => {
+                        display.session = Some((id, std::sync::Arc::clone(&session)));
+                        (id, session)
+                    }
+                    Err(error) => {
+                        eprintln!("[cloud-agent] display_open failed: {error}");
+                        let _ = out_tx
+                            .send(reply(serde_json::json!({
+                                "t": "display_error", "error": error,
+                            })))
+                            .await;
+                        return;
+                    }
+                },
+            };
+            eprintln!("[cloud-agent] display_open (:{display_id})");
+            let _ = out_tx
+                .send(reply(serde_json::json!({
+                    "t": "display_opened", "display_id": display_id,
+                })))
+                .await;
+            display.input = Some(session.browser_input_source(
+                crate::display::BrowserInputAuthorization::new(std::sync::Arc::new(|| true)),
+            ));
+            let (tile_tx, mut tile_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
+            display.stream = Some(session.spawn_tile_socket_stream(tile_tx));
+            let pump_out = out_tx.clone();
+            let pump_host = host_id.clone();
+            display.pump = Some(tokio::spawn(async move {
+                while let Some(bytes) = tile_rx.recv().await {
+                    let frame = serde_json::json!({
+                        "t": "display_tiles",
+                        "host_id": pump_host,
+                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    });
+                    if pump_out.send(frame.to_string()).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+            return;
+        }
+        "display_input" => {
+            if let (Some(input), Some(event)) =
+                (display.input.as_ref(), frame.get("event").cloned())
+            {
+                if let Ok(event) = serde_json::from_value::<crate::display::InputEvent>(event) {
+                    input.enqueue(event);
+                }
+            }
+            return;
+        }
+        "display_close" => {
+            display.stop_viewer();
+            let _ = out_tx
+                .send(reply(serde_json::json!({ "t": "display_closed" })))
+                .await;
+            return;
+        }
+        _ => {}
+    }
+
     if terminal_id.is_empty() {
         return;
     }
@@ -1077,13 +1270,6 @@ async fn serve_worker_frame(
         terminal_id: terminal_id.clone(),
     };
     let actor = crate::terminal::TerminalActor::Root;
-    let reply = |mut value: serde_json::Value| {
-        if let Some(map) = value.as_object_mut() {
-            map.insert("host_id".into(), host_id.clone().into());
-            map.insert("terminal_id".into(), terminal_id.clone().into());
-        }
-        value.to_string()
-    };
     match kind.as_str() {
         "terminal_open" => {
             let cols = frame
@@ -1368,10 +1554,17 @@ mod tests {
             r#"{"t":"terminal_output","host_id":"cloud:x","terminal_id":"shell-0","data":"aGk="}"#,
         );
         assert!(rx.try_recv().is_ok());
+        route_worker_frame(
+            &tx,
+            r#"{"t":"display_tiles","host_id":"cloud:x","data":"aGk="}"#,
+        );
+        assert!(rx.try_recv().is_ok());
         // The worker cannot inject request kinds, hellos, or junk into
         // home — its inbound authority stays nothing.
         for dropped in [
             r#"{"t":"terminal_open","host_id":"cloud:x","terminal_id":"shell-0"}"#,
+            r#"{"t":"display_open","host_id":"cloud:x"}"#,
+            r#"{"t":"display_input","host_id":"cloud:x","event":{"t":"mm","x":0.1,"y":0.1}}"#,
             r#"{"v":2,"kind":"cloud-worker-hello","task_id":"x"}"#,
             r#"{"t":"api_sessions"}"#,
             "not json",
@@ -1381,6 +1574,70 @@ mod tests {
         }
     }
 
+    /// The worker's display arms end to end over a seeded synthetic
+    /// session (no env, no X server): open replies `display_opened` and
+    /// starts the tile stream (base64 wire frames stamped with the cloud
+    /// host), input enqueues, close stops the viewer and acks.
+    #[tokio::test]
+    async fn worker_display_open_streams_tiles_and_close_stops() {
+        let backend = std::sync::Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let session = std::sync::Arc::new(crate::display::DisplaySession::new(0, backend));
+        session.disable_video_bank();
+        session.start(10, None, None).await.expect("session starts");
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::terminal::TerminalRegistry::new(dir.path().to_path_buf());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(1024);
+        let mut forwarders = std::collections::HashMap::new();
+        let mut display = WorkerDisplayState {
+            session: Some((0, std::sync::Arc::clone(&session))),
+            ..Default::default()
+        };
+
+        let open = r#"{"t":"display_open","host_id":"cloud:t"}"#;
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("opened within deadline")
+            .expect("open reply");
+        assert!(opened.contains("display_opened"), "{opened}");
+
+        let tiles = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("tiles within deadline")
+            .expect("tile frame");
+        let value: serde_json::Value = serde_json::from_str(&tiles).unwrap();
+        assert_eq!(value.get("t").and_then(|v| v.as_str()), Some("display_tiles"));
+        assert_eq!(
+            value.get("host_id").and_then(|v| v.as_str()),
+            Some("cloud:t")
+        );
+        assert!(value
+            .get("data")
+            .and_then(|v| v.as_str())
+            .is_some_and(|data| !data.is_empty()));
+
+        let input = r#"{"t":"display_input","host_id":"cloud:t","display_id":0,"event":{"t":"mm","x":0.5,"y":0.5}}"#;
+        serve_worker_frame(&registry, input, &out_tx, &mut forwarders, &mut display).await;
+
+        let close = r#"{"t":"display_close","host_id":"cloud:t"}"#;
+        serve_worker_frame(&registry, close, &out_tx, &mut forwarders, &mut display).await;
+        assert!(display.stream.is_none() && display.pump.is_none());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_closed = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv()).await {
+                Ok(Some(text)) if text.contains("display_closed") => {
+                    saw_closed = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_closed, "close is acked");
+        session.stop().await;
+    }
+
     #[tokio::test]
     async fn reopening_a_worker_terminal_replaces_its_forwarder() {
         let dir = tempfile::tempdir().unwrap();
@@ -1388,7 +1645,8 @@ mod tests {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
         let mut forwarders = std::collections::HashMap::new();
         let open = r#"{"t":"terminal_open","host_id":"cloud:t","terminal_id":"shell-0","cols":80,"rows":24}"#;
-        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        let mut display = WorkerDisplayState::default();
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
         assert_eq!(forwarders.len(), 1);
         let first = out_rx.recv().await.expect("first opened reply");
         assert!(first.contains("terminal_opened"), "{first}");
@@ -1400,7 +1658,7 @@ mod tests {
         // A second open for the same key attaches the surviving PTY and
         // must replace the listener, never stack a second one (stacked
         // listeners double every output chunk on the dashboard).
-        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
         assert_eq!(forwarders.len(), 1);
         let second = out_rx.recv().await.expect("second opened reply");
         assert!(second.contains("terminal_opened"), "{second}");
