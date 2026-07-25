@@ -357,12 +357,34 @@ per-occurrence write-backs are the review surface). Mechanics:
   sees the approval as a mismatch — a standing mandate never fires as a
   mangled one-shot on a build that cannot understand it (pinned by test).
 
-**Event-triggered firing is deferred by decision (G4).** Firing on item
-arrival would add event-triggered effects to a deliberately time-only
-scheduler; the open questions — batching windows so a burst is one run,
-per-effect rate caps, loop prevention beyond conduct text — are named
-here so commissioning is a future owner decision, not scope drift. An
-event trigger would never widen who approves manifests.
+**Event-triggered firing (Track T — the commissioned G4).** A manifest
+may declare `trigger` INSIDE the digest-bound body instead of a cadence
+(cadence ⊕ trigger, refused by name): **on_unblock** fires when the
+item's `relies_on` prerequisites are all done — a retired or missing
+prerequisite never satisfies, and an empty `relies_on` fires on
+approval, the workflow-start gesture; **on_item_match** fires when a
+NEW open item of the declared kind carrying ALL the declared tags
+appears (the predicate is tags ∧ kind only; arrivals before approval
+never match). Approval binds WHO + WHAT + WHEN + ON WHAT, and on an
+older build a trigger-bearing manifest degrades fail-closed exactly
+like recurrence — digest mismatch, never a mangled one-shot.
+`fire_at_ms` on a triggered manifest is the **arm floor**, a feature:
+causes before max(fire_at_ms, approval instant) never fire, and a
+future floor is a scheduled arming — do not "fix" it. G4's guardrail
+questions are answered in machinery, not conduct text: a burst of
+matches coalesces for 60 s into ONE occurrence carrying the whole
+batch, and each matched item gets a daemon-attributed
+consumed-annotation (source `trigger-evaluator`) so consumption folds
+from the log; refires are floored at the last terminal outcome plus
+the 15-minute cadence floor for BOTH trigger kinds; the standing
+no-overlap rule holds one occurrence in flight; failure streaks
+suspend at the default threshold; and items parked by sessions a
+trigger itself started are excluded from re-matching by verified
+attribution — the journal's gate-resolved session ids, never
+`--source` or body text. Known residual until transitive exclusion
+lands: a mandate whose SUB-agents park matching items can cycle at the
+cooldown rate — visible in the journal, bounded by suspension. An
+event trigger never widens who approves manifests.
 
 **Start now** (`start_now`, `ctl agenda start`, the item's button) is the
 owner's act-on-item. On dashboard surfaces the button opens a **confirm

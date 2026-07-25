@@ -2166,10 +2166,12 @@ async fn run_agenda(
                 "--until",
                 "--max-occurrences",
                 "--suspend-after",
+                "--on-item-match",
                 "--source",
             ];
             value_flags.extend(AGENDA_LAUNCH_FLAGS);
-            let args = parse_command_args(&raw[1..], &value_flags, &["--orchestrate"])?;
+            let args =
+                parse_command_args(&raw[1..], &value_flags, &["--orchestrate", "--on-unblock"])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2182,9 +2184,47 @@ async fn run_agenda(
                 .map(str::trim)
                 .filter(|g| !g.is_empty())
                 .ok_or_else(|| "agenda schedule requires --goal TEXT".to_string())?;
-            let at = args
-                .one("--at")
-                .ok_or_else(|| "agenda schedule requires --at WHEN".to_string())?;
+            // Event triggers (Track T): fire on state, not at an instant.
+            let trigger = match (args.has("--on-unblock"), args.one("--on-item-match")) {
+                (true, Some(_)) => {
+                    return Err("pass --on-unblock OR --on-item-match, not both".to_string())
+                }
+                (true, None) => Some(serde_json::json!({ "kind": "on_unblock" })),
+                (false, Some(spec)) => {
+                    let (kind, tags) = spec.split_once(':').ok_or_else(|| {
+                        "--on-item-match takes KIND:TAG[,TAG...] (e.g. question:gate)".to_string()
+                    })?;
+                    let tags: Vec<Value> = tags
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|tag| !tag.is_empty())
+                        .map(|tag| Value::String(tag.to_string()))
+                        .collect();
+                    Some(serde_json::json!({
+                        "kind": "on_item_match",
+                        "item_kind": kind.trim(),
+                        "tags": tags,
+                    }))
+                }
+                (false, None) => None,
+            };
+            if trigger.is_some() && args.one("--every").is_some() {
+                return Err(
+                    "a manifest is cadenced OR triggered: pass --every or a trigger flag, \
+                     not both"
+                        .to_string(),
+                );
+            }
+            let fire_at_ms = match args.one("--at") {
+                Some(at) => parse_due_ms(at)?,
+                // A triggered manifest's fire_at_ms is the ARM FLOOR —
+                // omitted means armed on approval.
+                None if trigger.is_some() => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|err| err.to_string())?
+                    .as_millis() as u64,
+                None => return Err("agenda schedule requires --at WHEN".to_string()),
+            };
             let mut map = Map::new();
             map.insert(
                 "op".to_string(),
@@ -2192,7 +2232,7 @@ async fn run_agenda(
             );
             map.insert("id".to_string(), Value::String(id));
             map.insert("goal".to_string(), Value::String(goal.to_string()));
-            map.insert("fire_at_ms".to_string(), Value::from(parse_due_ms(at)?));
+            map.insert("fire_at_ms".to_string(), Value::from(fire_at_ms));
             if args.has("--orchestrate") {
                 map.insert("orchestrate".to_string(), Value::Bool(true));
             }
@@ -2229,6 +2269,9 @@ async fn run_agenda(
                      pass --every too"
                         .to_string(),
                 );
+            }
+            if let Some(trigger) = trigger {
+                map.insert("trigger".to_string(), trigger);
             }
             insert_string(&mut map, "source", args.one("--source"));
             // Executor pins (Track AU): the same launch vocabulary the
@@ -5101,6 +5144,8 @@ fn help_agenda() {
   intendant ctl agenda patch ID_PREFIX [--title TEXT] [--body TEXT] [--tag TAG]... [--clear-tags] [--due WHEN|--clear-due] [--source LABEL]\n\
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
+      [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
+      # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor)\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\

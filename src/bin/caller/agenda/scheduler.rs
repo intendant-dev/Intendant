@@ -14,6 +14,7 @@ use super::reminders::{
     SpawnOccurrence,
 };
 use super::store::OccurrenceWriteBack;
+use super::types::{AgendaActor, AgendaCommand};
 use crate::event::{AppEvent, ControlMsg};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -492,7 +493,7 @@ fn dispatch_session(
     state: &mut SchedulerState,
     spawn: SpawnOccurrence,
     now: u64,
-) {
+) -> bool {
     let project_root = match super::spawn_project::resolve_spawn_project(
         spawn.project_root.as_deref(),
         spawn.provenance_session_id.as_deref(),
@@ -501,11 +502,34 @@ fn dispatch_session(
         Ok((root, _source)) => root,
         Err(why) => {
             resolve_spawnless(handle, journal, &spawn, OccurrenceState::Failed, now, &why);
-            return;
+            return false;
         }
     };
     if !session_record(journal, &spawn, now, OccurrenceState::Prepared, None) {
-        return; // cannot journal ⇒ do not spawn what we cannot dedup
+        return false; // cannot journal ⇒ do not spawn what we cannot dedup
+    }
+    // Dispatch-time consumed-marking (Track T, T0 ruling 6): a
+    // daemon-attributed annotation on each matched item — the scanner's
+    // attribution shape, source label beside the actor — makes match
+    // consumption fold-derivable, which is what keeps the trigger
+    // evaluator stateless. Ordered after the fsync'd `prepared` row and
+    // before the send: a failed annotate is logged, never fatal — the
+    // occurrence proceeds, the unconsumed item re-batches after the
+    // cooldown floor, and the journal keeps the truth visible.
+    for matched_id in &spawn.matched_item_ids {
+        let note = AgendaCommand::Annotate {
+            id: matched_id.clone(),
+            text: format!(
+                "{}effect={} occurrence={}",
+                super::types::TRIGGER_CONSUMED_PREFIX,
+                spawn.effect_id,
+                spawn.occurrence_id
+            ),
+            source: Some(super::types::TRIGGER_CONSUMED_SOURCE.to_string()),
+        };
+        if let Err(err) = handle.apply(note, Some(AgendaActor::daemon())) {
+            eprintln!("[agenda] trigger consumed-annotation on {matched_id} failed: {err}");
+        }
     }
     // Interactive spawns mirror the composer's launch shape (Auto — the
     // daemon's own execution heuristics, presence included): the goal is
@@ -526,6 +550,7 @@ fn dispatch_session(
             last_attempt_ms: now,
         },
     );
+    true
 }
 
 /// The occurrence's `StartTask`, identical on first send and every
@@ -540,11 +565,23 @@ fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root:
     } else {
         (Some(spawn.orchestrate), Some(!spawn.orchestrate))
     };
+    // An on_item_match batch rides the goal as a data prologue (Track T):
+    // the matched item ids, for the session to read via ctl — data to
+    // act on under the approved goal, never instructions themselves.
+    let task = if spawn.matched_item_ids.is_empty() {
+        spawn.goal.clone()
+    } else {
+        format!(
+            "{}\n\nMatched agenda items (this firing's batch): {}",
+            spawn.goal,
+            spawn.matched_item_ids.join(" ")
+        )
+    };
     handle
         .bus()
         .send(AppEvent::ControlCommand(ControlMsg::StartTask {
             session_id: None,
-            task: spawn.goal.clone(),
+            task,
             orchestrate,
             direct,
             project_root: Some(project_root.to_string()),
@@ -1259,6 +1296,7 @@ mod tests {
                     orchestrate: false,
                     source: None,
                     agent_config: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -1316,6 +1354,7 @@ mod tests {
                     orchestrate: false,
                     source: None,
                     agent_config: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -1426,6 +1465,7 @@ mod tests {
                     orchestrate: false,
                     source: None,
                     agent_config: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -1909,6 +1949,101 @@ mod tests {
         assert_eq!(dispatched, 1, "exactly one configured occurrence fires");
     }
 
+    /// Track T: dispatching an on_item_match batch journals `prepared`,
+    /// writes the daemon's consumed-annotation on every matched item
+    /// (source `trigger-evaluator` beside the daemon actor — the
+    /// fold-derivable consumption the stateless evaluator reads), and
+    /// the StartTask goal carries the batch as a data prologue with the
+    /// occurrence-id delegation.
+    #[tokio::test]
+    async fn trigger_batch_dispatch_annotates_matches_and_carries_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let park_question = |title: &str| {
+            handle
+                .apply(
+                    AgendaCommand::Add {
+                        refs: Vec::new(),
+                        kind: AgendaKind::Question,
+                        title: title.into(),
+                        body: String::new(),
+                        tags: vec!["gate".into()],
+                        due_ms: None,
+                        source: None,
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        let q1 = park_question("gate one");
+        let q2 = park_question("gate two");
+
+        let mut rx = handle.bus().subscribe();
+        let spawn = SpawnOccurrence {
+            occurrence_id: "occ-batch".into(),
+            item_id: "standing-item".into(),
+            effect_id: "ef-1".into(),
+            goal: "rule the parked gates".into(),
+            orchestrate: false,
+            fire_at_ms: 1_000,
+            recurring: true,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            provenance_session_id: None,
+            matched_item_ids: vec![q1.id.clone(), q2.id.clone()],
+        };
+        assert!(dispatch_session(
+            &handle,
+            &mut journal,
+            &mut state,
+            spawn,
+            1_000
+        ));
+        assert!(journal.progress("occ-batch").prepared);
+
+        let (items, _, _) = handle.snapshot();
+        for id in [&q1.id, &q2.id] {
+            let item = items.iter().find(|i| &i.id == id).unwrap();
+            let note = item
+                .annotations
+                .iter()
+                .find(|note| {
+                    note.text
+                        .starts_with("trigger-consumed effect=ef-1 occurrence=occ-batch")
+                })
+                .expect("every matched item carries the consumed-annotation");
+            assert_eq!(note.kind.as_deref(), Some("daemon"));
+            assert_eq!(note.source.as_deref(), Some("trigger-evaluator"));
+            assert_eq!(note.session_id, None, "daemon attribution is bare");
+        }
+
+        let mut seen_task = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                task,
+                delegation_id,
+                ..
+            }) = event
+            {
+                assert_eq!(delegation_id.as_deref(), Some("agenda-occ-occ-batch"));
+                seen_task = Some(task);
+            }
+        }
+        let task = seen_task.expect("the batch occurrence dispatches one StartTask");
+        assert!(task.starts_with("rule the parked gates"));
+        assert!(
+            task.contains(&format!(
+                "Matched agenda items (this firing's batch): {} {}",
+                q1.id, q2.id
+            )),
+            "the batch rides the goal as a data prologue: {task}"
+        );
+    }
+
     /// Track AU: a STANDING manifest with executor pins fires occurrences
     /// whose StartTask carries the reviewed launch config; an
     /// emitter-declared `Failed` terminal journals `failed` (the killed
@@ -1959,6 +2094,7 @@ mod tests {
                     }),
                     agent_config: Some(Box::new(config.clone())),
                     source: None,
+                    trigger: None,
                 },
                 None,
             )
@@ -2586,6 +2722,7 @@ mod tests {
                     orchestrate: false,
                     source: None,
                     agent_config: None,
+                    trigger: None,
                 },
                 None,
             )

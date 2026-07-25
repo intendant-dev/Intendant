@@ -377,6 +377,24 @@ impl OccurrenceJournal {
         self.state.get(occurrence_id).cloned().unwrap_or_default()
     }
 
+    /// Session ids this item's occurrences have STARTED with, from the
+    /// journal fold — the verified-attribution loop-exclusion key
+    /// (Track T, T0 ruling 7 direct branch): an item parked by one of
+    /// these sessions never re-fires this item's effect. Durable across
+    /// restarts because the journal is; keyed on the gate-resolved
+    /// session id the write-back recorded, never on `--source` or any
+    /// text a mandate controls.
+    pub(crate) fn started_sessions_for_item(
+        &self,
+        item_id: &str,
+    ) -> std::collections::BTreeSet<String> {
+        self.state
+            .values()
+            .filter(|progress| progress.item_id.as_deref() == Some(item_id))
+            .filter_map(|progress| progress.started.clone())
+            .collect()
+    }
+
     /// Occurrences with a `prepared` record but no terminal one — a crash
     /// interrupted delivery; at-least-once means they retry. (The planner
     /// derives retries from item state; this is the test/diagnostic view.)
@@ -660,6 +678,12 @@ pub(crate) struct SpawnOccurrence {
     /// The parking session (item provenance) — the fallback the dispatcher
     /// resolves a project from when the manifest carries none.
     pub(crate) provenance_session_id: Option<String>,
+    /// The `on_item_match` batch this firing carries (Track T): the
+    /// matched item ids, empty for time-lane and `on_unblock`
+    /// occurrences. Rides the fired session's goal prologue and the
+    /// dispatch-time consumed-annotations — NEVER journal fields (rows
+    /// stay shape-identical to cadence occurrences).
+    pub(crate) matched_item_ids: Vec<String>,
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
@@ -689,6 +713,133 @@ pub(crate) fn session_occurrence_id(
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// One trigger-bearing effect's current due state (Track T): the due
+/// instant — CAUSE-derived, so the same cause yields the same occurrence
+/// id across restarts and re-plans — and, for `on_item_match`, the
+/// batch it would carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TriggerDue {
+    pub(crate) due_ms: u64,
+    pub(crate) matched_item_ids: Vec<String>,
+}
+
+/// The trigger derivation, pure over the fold + journal-derived
+/// exclusion set. ONE implementation shared by [`plan`] and
+/// [`effect_next_fire_ms`] (the differential pin covers the trigger
+/// cases), mirroring the [`series_instants`] discipline.
+///
+/// Floors, in force for BOTH kinds: the ARM floor
+/// `max(fire_at_ms, approval instant)` (T0 ruling 3 — causes before it
+/// never fire, no retro-matching) and the COOLDOWN floor `last terminal
+/// outcome + TRIGGER_COOLDOWN_MS` (T0 ruling 4 — the universal
+/// per-effect refire rate cap; first fires have no prior terminal and
+/// are unaffected).
+pub(crate) fn trigger_due(
+    items: &[AgendaItem],
+    item: &AgendaItem,
+    effect: &AgendaEffect,
+    trigger: &super::types::TriggerSpec,
+    approval_at_ms: u64,
+    started_sessions: &std::collections::BTreeSet<String>,
+) -> Option<TriggerDue> {
+    let arm = effect.manifest.fire_at_ms.max(approval_at_ms);
+    let cooldown_floor = effect.last_run.as_ref().and_then(|run| {
+        matches!(
+            run.state.as_str(),
+            "completed" | "failed" | "missed" | "unknown"
+        )
+        .then(|| run.at_ms.saturating_add(super::types::TRIGGER_COOLDOWN_MS))
+    });
+    let floored = |cause: u64| cooldown_floor.map_or(cause.max(arm), |cd| cause.max(arm).max(cd));
+    match trigger {
+        super::types::TriggerSpec::OnUnblock => {
+            // Every prerequisite Done. A retired or MISSING target does
+            // NOT satisfy — the render rule, applied to firing
+            // fail-closed. Empty relies_on is vacuously satisfied (the
+            // workflow-start gesture): due = the arm floor.
+            let mut cause = 0u64;
+            for dep in &item.relies_on {
+                let target = items.iter().find(|t| t.id == dep.target_id)?;
+                if target.status != AgendaStatus::Done {
+                    return None;
+                }
+                cause = cause.max(target.completed_ms.unwrap_or(target.updated_ms));
+            }
+            Some(TriggerDue {
+                due_ms: floored(cause),
+                matched_item_ids: Vec::new(),
+            })
+        }
+        super::types::TriggerSpec::OnItemMatch { item_kind, tags } => {
+            let mut latest_arrival = 0u64;
+            let mut matched: Vec<String> = Vec::new();
+            for candidate in items {
+                if candidate.id == item.id
+                    || candidate.status != AgendaStatus::Open
+                    || candidate.kind != *item_kind
+                {
+                    continue;
+                }
+                // New = arrival after the arm floor (no retro-matching
+                // the backlog, T0 ruling 1).
+                if candidate.provenance.created_ms <= arm {
+                    continue;
+                }
+                if !tags.iter().all(|tag| candidate.tags.contains(tag)) {
+                    continue;
+                }
+                // Verified-attribution self-exclusion (T0 ruling 7,
+                // direct branch): an item parked by a session this
+                // effect's occurrences STARTED never re-fires it. Keyed
+                // on the gate-resolved provenance session id against the
+                // journal's started set — never on `--source` or text.
+                if candidate
+                    .provenance
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|sid| started_sessions.contains(sid))
+                {
+                    continue;
+                }
+                if trigger_consumed(candidate, &effect.effect_id) {
+                    continue;
+                }
+                latest_arrival = latest_arrival.max(candidate.provenance.created_ms);
+                matched.push(candidate.id.clone());
+            }
+            if matched.is_empty() {
+                return None;
+            }
+            // The batching window (T0 ruling 5): due W after the LATEST
+            // unconsumed arrival, so a burst coalesces into one firing
+            // carrying the whole batch.
+            Some(TriggerDue {
+                due_ms: floored(
+                    latest_arrival.saturating_add(super::types::TRIGGER_BATCH_WINDOW_MS),
+                ),
+                matched_item_ids: matched,
+            })
+        }
+    }
+}
+
+/// Fold-derived match consumption: a dispatch-time consumed-annotation
+/// from the daemon marks the item spent for this effect. Attribution-
+/// checked — the text prefix alone gates nothing (a non-daemon writer
+/// echoing the marker changes nothing, per the unverified-label
+/// doctrine).
+fn trigger_consumed(item: &AgendaItem, effect_id: &str) -> bool {
+    let marker = format!(
+        "{}effect={effect_id} ",
+        super::types::TRIGGER_CONSUMED_PREFIX
+    );
+    item.annotations.iter().any(|note| {
+        note.kind.as_deref() == Some("daemon")
+            && note.source.as_deref() == Some(super::types::TRIGGER_CONSUMED_SOURCE)
+            && note.text.starts_with(&marker)
+    })
 }
 
 /// A standing series' planner-relevant instants at one moment, from
@@ -813,19 +964,38 @@ pub(crate) fn plan(
             // silence) plus any owner-requested instants; the next future
             // series instant registers the wake. The series math lives in
             // [`series_instants`], shared with the display derivation.
+            // Triggered manifests (Track T) are the third candidate
+            // producer: `fire_at_ms` is the ARM FLOOR, never a fire
+            // instant, and the one candidate comes from the shared
+            // [`trigger_due`] cause derivation; owner-requested instants
+            // (run-now) still compose.
             let mut candidates: Vec<(u64, bool)> = Vec::new();
-            match &effect.manifest.recurrence {
-                None => candidates.push((effect.manifest.fire_at_ms, false)),
-                Some(rec) => {
-                    let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
-                    if let Some(due) = instants.due {
-                        candidates.push((due, true));
-                    }
-                    if let Some(upcoming) = instants.upcoming {
-                        consider_wake(upcoming, &mut plan);
-                    }
-                    for req in &effect.requested {
-                        candidates.push((req.at_ms, true));
+            let mut trigger_batch: Vec<String> = Vec::new();
+            let triggered = effect.manifest.trigger.is_some();
+            if let Some(trig) = &effect.manifest.trigger {
+                let started = journal.started_sessions_for_item(&item.id);
+                if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started)
+                {
+                    candidates.push((due.due_ms, true));
+                    trigger_batch = due.matched_item_ids;
+                }
+                for req in &effect.requested {
+                    candidates.push((req.at_ms, true));
+                }
+            } else {
+                match &effect.manifest.recurrence {
+                    None => candidates.push((effect.manifest.fire_at_ms, false)),
+                    Some(rec) => {
+                        let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
+                        if let Some(due) = instants.due {
+                            candidates.push((due, true));
+                        }
+                        if let Some(upcoming) = instants.upcoming {
+                            consider_wake(upcoming, &mut plan);
+                        }
+                        for req in &effect.requested {
+                            candidates.push((req.at_ms, true));
+                        }
                     }
                 }
             }
@@ -859,6 +1029,7 @@ pub(crate) fn plan(
                     project_root: effect.manifest.project_root.clone(),
                     agent_config: effect.manifest.agent_config.clone(),
                     provenance_session_id: item.provenance.session_id.clone(),
+                    matched_item_ids: trigger_batch.clone(),
                 };
                 if progress.prepared {
                     // Crash between prepare and launch confirmation: fail
@@ -868,7 +1039,13 @@ pub(crate) fn plan(
                 }
                 if instant > now_ms {
                     consider_wake(instant, &mut plan);
-                } else if now_ms.saturating_sub(instant) > staleness_ms {
+                } else if !triggered && now_ms.saturating_sub(instant) > staleness_ms {
+                    // Trigger occurrences never stale-miss: a workflow
+                    // chain must survive downtime (a missed node would
+                    // wedge every dependent forever — the cause-derived
+                    // instant is the occurrence's identity and cannot
+                    // advance), and a gate batch parked during downtime
+                    // should fire on wake, not apologize.
                     plan.missed_sessions.push(spawn);
                 } else if !overlap {
                     plan.spawn.push(spawn);
@@ -942,7 +1119,8 @@ pub(crate) fn plan(
 /// `next_fire_agrees_with_the_planner` differential test pins this mirror
 /// to `plan` itself.
 pub(crate) fn effect_next_fire_ms(
-    item_id: &str,
+    items: &[AgendaItem],
+    item: &AgendaItem,
     effect: &AgendaEffect,
     journal: &OccurrenceJournal,
     staleness_ms: u64,
@@ -952,31 +1130,44 @@ pub(crate) fn effect_next_fire_ms(
     if effect.suspended() {
         return None;
     }
-    // Candidate instants, exactly as `plan` assembles them.
+    // Candidate instants, exactly as `plan` assembles them — including
+    // the trigger lane (Track T), which shares [`trigger_due`] with the
+    // planner so the two cannot drift.
     let mut candidates: Vec<u64> = Vec::new();
     let mut upcoming: Option<u64> = None;
     fn consider_upcoming(instant: u64, upcoming: &mut Option<u64>) {
         *upcoming = Some(upcoming.map_or(instant, |cur: u64| cur.min(instant)));
     }
-    match &effect.manifest.recurrence {
-        None => candidates.push(effect.manifest.fire_at_ms),
-        Some(rec) => {
-            let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
-            if let Some(due) = instants.due {
-                candidates.push(due);
-            }
-            if let Some(next) = instants.upcoming {
-                consider_upcoming(next, &mut upcoming);
-            }
-            for req in &effect.requested {
-                candidates.push(req.at_ms);
+    let triggered = effect.manifest.trigger.is_some();
+    if let Some(trig) = &effect.manifest.trigger {
+        let started = journal.started_sessions_for_item(&item.id);
+        if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started) {
+            candidates.push(due.due_ms);
+        }
+        for req in &effect.requested {
+            candidates.push(req.at_ms);
+        }
+    } else {
+        match &effect.manifest.recurrence {
+            None => candidates.push(effect.manifest.fire_at_ms),
+            Some(rec) => {
+                let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
+                if let Some(due) = instants.due {
+                    candidates.push(due);
+                }
+                if let Some(next) = instants.upcoming {
+                    consider_upcoming(next, &mut upcoming);
+                }
+                for req in &effect.requested {
+                    candidates.push(req.at_ms);
+                }
             }
         }
     }
     let mut fires_next_pass: Option<u64> = None;
     for instant in candidates {
         let occurrence_id =
-            session_occurrence_id(item_id, &effect.effect_id, &approval.digest, instant);
+            session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, instant);
         let progress = journal.progress(&occurrence_id);
         // Spent or already executing (`plan` skips these), or crash
         // residue (`plan` resolves it through the crashed lane, never a
@@ -986,9 +1177,10 @@ pub(crate) fn effect_next_fire_ms(
         }
         if instant > now_ms {
             consider_upcoming(instant, &mut upcoming);
-        } else if now_ms.saturating_sub(instant) <= staleness_ms {
+        } else if triggered || now_ms.saturating_sub(instant) <= staleness_ms {
             // Fires on the next pass (the missed lane takes the stale
-            // ones — a miss is not a fire).
+            // ones — a miss is not a fire; trigger occurrences never
+            // stale-miss, mirroring `plan`).
             fires_next_pass = Some(fires_next_pass.map_or(instant, |cur| cur.min(instant)));
         }
     }
@@ -1047,14 +1239,30 @@ pub(crate) fn decorate_planner_fields(
     minute_of_day: &dyn Fn(u64) -> u16,
 ) {
     let staleness_ms = policy.staleness_ms();
-    for item in items.iter_mut() {
+    // The trigger lane (Track T) reads ACROSS items — dependency
+    // statuses, match candidates — so next-fire values are computed in
+    // an immutable pass and stamped in a second. Same values, no
+    // aliasing; non-open items keep the fold's `None` (the planner
+    // considers open items only — nothing fires).
+    let next_fires: Vec<Vec<Option<u64>>> = items
+        .iter()
+        .map(|item| {
+            item.effects
+                .iter()
+                .map(|effect| {
+                    (item.status == AgendaStatus::Open)
+                        .then(|| {
+                            effect_next_fire_ms(items, item, effect, journal, staleness_ms, now_ms)
+                        })
+                        .flatten()
+                })
+                .collect()
+        })
+        .collect();
+    for (item, fires) in items.iter_mut().zip(next_fires) {
         item.deferred_until = reminder_deferred_until(item, journal, policy, now_ms, minute_of_day);
-        if item.status != AgendaStatus::Open {
-            continue; // the planner considers open items only — nothing fires
-        }
-        for effect in &mut item.effects {
-            effect.next_fire_ms =
-                effect_next_fire_ms(&item.id, effect, journal, staleness_ms, now_ms);
+        for (effect, fire) in item.effects.iter_mut().zip(fires) {
+            effect.next_fire_ms = fire;
         }
     }
 }
@@ -1465,6 +1673,7 @@ mod tests {
             project_root: None,
             agent_config: None,
             recurrence: Some(rec),
+            trigger: None,
         };
         let digest = super::super::types::manifest_digest(id, "ef-1", &manifest);
         base.effects.push(AgendaEffect {
@@ -1776,6 +1985,7 @@ mod tests {
                 project_root: None,
                 agent_config: None,
                 recurrence: None,
+                trigger: None,
             };
             let digest = super::super::types::manifest_digest("os", "ef-os", &manifest);
             base.effects.push(AgendaEffect {
@@ -1826,6 +2036,7 @@ mod tests {
             project_root: None,
             agent_config: None,
             recurrence: None,
+            trigger: None,
         };
         let digest = super::super::types::manifest_digest(id, "ef-1", &manifest);
         base.effects.push(AgendaEffect {
@@ -1879,10 +2090,23 @@ mod tests {
         policy: &ReminderPolicy,
         now_ms: u64,
     ) -> Option<u64> {
+        assert_agreement(std::slice::from_ref(item), item, journal, policy, now_ms)
+    }
+
+    /// The multi-item form (Track T): trigger derivations read across
+    /// items, so trigger cases feed the whole fixture slice to both
+    /// sides of the differential.
+    fn assert_agreement(
+        items: &[AgendaItem],
+        item: &AgendaItem,
+        journal: &OccurrenceJournal,
+        policy: &ReminderPolicy,
+        now_ms: u64,
+    ) -> Option<u64> {
         let effect = &item.effects[0];
-        let next = effect_next_fire_ms(&item.id, effect, journal, policy.staleness_ms(), now_ms);
+        let next = effect_next_fire_ms(items, item, effect, journal, policy.staleness_ms(), now_ms);
         let planned = plan(
-            std::slice::from_ref(item),
+            items,
             journal,
             policy,
             now_ms,
@@ -2467,5 +2691,391 @@ mod tests {
         assert_eq!(page.log_len, APPENDS);
         assert_eq!(page.occurrences.len(), APPENDS as usize);
         assert_eq!(page.next_since, page.log_len);
+    }
+
+    // ---- Track T: event triggers ----
+
+    use super::super::types::{
+        AgendaAnnotation, AgendaDependency, TriggerSpec, TRIGGER_BATCH_WINDOW_MS,
+        TRIGGER_COOLDOWN_MS,
+    };
+
+    fn triggered_item(
+        id: &str,
+        trigger: TriggerSpec,
+        fire_at: u64,
+        approved_at: u64,
+    ) -> AgendaItem {
+        let mut base = item(id, AgendaStatus::Open, None);
+        let manifest = SessionManifest {
+            goal: "triggered run".into(),
+            fire_at_ms: fire_at,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: Some(trigger),
+        };
+        let digest = super::super::types::manifest_digest(id, "ef-1", &manifest);
+        base.effects.push(AgendaEffect {
+            effect_id: "ef-1".into(),
+            digest: digest.clone(),
+            manifest,
+            proposed_ms: 1,
+            proposed_principal: None,
+            proposed_session_id: None,
+            proposed_kind: None,
+            approval: Some(AgendaApproval {
+                digest,
+                at_ms: approved_at,
+                principal: Some("owner".into()),
+                kind: Some("dashboard".into()),
+            }),
+            last_run: None,
+            consecutive_failures: 0,
+            requested: Vec::new(),
+            next_fire_ms: None,
+        });
+        base
+    }
+
+    fn done_at(id: &str, completed: u64) -> AgendaItem {
+        let mut it = item(id, AgendaStatus::Done, None);
+        it.completed_ms = Some(completed);
+        it
+    }
+
+    fn depends_on(node: &mut AgendaItem, target: &str) {
+        node.relies_on.push(AgendaDependency {
+            target_id: target.into(),
+            added_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+        });
+    }
+
+    fn gate_trigger() -> TriggerSpec {
+        TriggerSpec::OnItemMatch {
+            item_kind: AgendaKind::Question,
+            tags: vec!["gate".into()],
+        }
+    }
+
+    fn matching_question(id: &str, created: u64, session: Option<&str>) -> AgendaItem {
+        let mut it = item(id, AgendaStatus::Open, None);
+        it.kind = AgendaKind::Question;
+        it.tags = vec!["gate".into(), "extra".into()];
+        it.provenance.created_ms = created;
+        it.provenance.session_id = session.map(Into::into);
+        it
+    }
+
+    fn empty_sets() -> std::collections::HashSet<String> {
+        Default::default()
+    }
+
+    /// on_unblock fires exactly when every prerequisite is Done — a
+    /// retired or missing target never satisfies (the render rule,
+    /// applied to firing fail-closed) — with the cause-derived instant,
+    /// stable across re-plans.
+    #[test]
+    fn trigger_unblock_fires_when_the_chain_completes_and_only_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let now = 500_000;
+
+        let items = vec![item("node-a", AgendaStatus::Open, None), node.clone()];
+        assert_eq!(
+            assert_agreement(&items, &items[1], &journal, &policy, now),
+            None
+        );
+
+        let mut retired = item("node-a", AgendaStatus::Retired, None);
+        retired.completed_ms = Some(100_000);
+        let items = vec![retired, node.clone()];
+        assert_eq!(
+            assert_agreement(&items, &items[1], &journal, &policy, now),
+            None
+        );
+
+        let items = vec![node.clone()];
+        assert_eq!(
+            assert_agreement(&items, &items[0], &journal, &policy, now),
+            None
+        );
+
+        let items = vec![done_at("node-a", 100_000), node.clone()];
+        let due = assert_agreement(&items, &items[1], &journal, &policy, now);
+        assert_eq!(
+            due,
+            Some(100_000),
+            "due = the dependency's completion instant"
+        );
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        let spawn = &planned.spawn[0];
+        assert!(spawn.matched_item_ids.is_empty());
+        // Cause-derived identity: a later re-plan mints the same occurrence.
+        let again = plan(
+            &items,
+            &journal,
+            &policy,
+            now + 60_000,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(again.spawn[0].occurrence_id, spawn.occurrence_id);
+    }
+
+    /// Empty relies_on is vacuously satisfied — the workflow-start
+    /// gesture: the first node fires at the arm floor
+    /// (max(fire_at_ms, approval instant)), never before it.
+    #[test]
+    fn trigger_unblock_vacuous_fires_at_the_arm_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let node = triggered_item("first", TriggerSpec::OnUnblock, 5_000, 8_000);
+        let next = assert_agreement(
+            std::slice::from_ref(&node),
+            &node,
+            &journal,
+            &policy,
+            100_000,
+        );
+        assert_eq!(next, Some(8_000), "due = max(fire_at, approval)");
+    }
+
+    /// A spent trigger occurrence never refires; a RE-completed
+    /// dependency is a new cause and refires — floored by the effect's
+    /// last terminal outcome + the cooldown (T0 ruling 4, the universal
+    /// per-effect rate cap).
+    #[test]
+    fn trigger_refire_needs_a_new_cause_and_respects_the_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let now = 1_000_000;
+
+        let items = vec![done_at("node-a", 100_000), node];
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        let occurrence = planned.spawn[0].occurrence_id.clone();
+        spend_occurrence(&mut journal, &occurrence, 150_000);
+        assert_eq!(
+            assert_agreement(&items, &items[1], &journal, &policy, now),
+            None,
+            "spent cause never refires"
+        );
+
+        // Reopen-and-redo: the dependency re-completes later — a new
+        // cause instant — but the last terminal run floors the due.
+        let mut node2 = items[1].clone();
+        node2.effects[0].last_run = Some(AgendaRun {
+            occurrence_id: occurrence,
+            state: "completed".into(),
+            session_id: None,
+            at_ms: 150_000,
+            note: None,
+        });
+        let items2 = vec![done_at("node-a", 200_000), node2];
+        let due = assert_agreement(&items2, &items2[1], &journal, &policy, now);
+        assert_eq!(
+            due,
+            Some(150_000 + TRIGGER_COOLDOWN_MS),
+            "the cooldown floors the refire for on_unblock too"
+        );
+    }
+
+    /// A burst of matching arrivals coalesces into ONE occurrence whose
+    /// batch is every unconsumed match; before the window closes the due
+    /// instant is the planner's wake, not a spawn. Non-matching kinds,
+    /// missing tags, and pre-arm arrivals never join.
+    #[test]
+    fn trigger_match_batches_a_burst_into_one_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let standing = triggered_item("steward", gate_trigger(), approved, approved);
+        let mut wrong_kind = item("t1", AgendaStatus::Open, None);
+        wrong_kind.tags = vec!["gate".into()];
+        wrong_kind.provenance.created_ms = 22_000;
+        let mut wrong_tags = matching_question("q-untagged", 23_000, None);
+        wrong_tags.tags = vec!["other".into()];
+        let items = vec![
+            standing,
+            matching_question("q1", 20_000, None),
+            matching_question("q2", 25_000, None),
+            matching_question("q3", 30_000, None),
+            wrong_kind,
+            wrong_tags,
+            matching_question("q0-pre-arm", 5_000, None),
+        ];
+        let close = 30_000 + TRIGGER_BATCH_WINDOW_MS;
+
+        // Mid-window: the close instant is a wake, never a spawn.
+        let early = plan(
+            &items,
+            &journal,
+            &policy,
+            close - 1,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(early.spawn.is_empty());
+        assert_eq!(early.next_wake_ms, Some(close));
+
+        let next = assert_agreement(&items, &items[0], &journal, &policy, close);
+        assert_eq!(next, Some(close), "due = latest unconsumed arrival + W");
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            close,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        assert_eq!(
+            planned.spawn[0].matched_item_ids,
+            vec!["q1".to_string(), "q2".into(), "q3".into()]
+        );
+    }
+
+    /// The loop rails: a daemon-attributed consumed-annotation excludes
+    /// a match; the same text WITHOUT daemon attribution excludes
+    /// nothing (unverified-label doctrine); and an item parked by a
+    /// session this effect's occurrences started is excluded by
+    /// verified attribution (T0 ruling 7, direct branch).
+    #[test]
+    fn trigger_match_consumed_and_fired_session_items_never_refire() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let standing = triggered_item("steward", gate_trigger(), approved, approved);
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: 15_000,
+                occurrence_id: "occ-prior".into(),
+                item_id: "steward".into(),
+                due_ms: 15_000,
+                state: OccurrenceState::Started,
+                urgency: None,
+                session_id: Some("sess-fired".into()),
+            })
+            .unwrap();
+
+        let mut consumed = matching_question("q-consumed", 20_000, None);
+        consumed.annotations.push(AgendaAnnotation {
+            text: "trigger-consumed effect=ef-1 occurrence=x".into(),
+            at_ms: 21_000,
+            principal: None,
+            session_id: None,
+            kind: Some("daemon".into()),
+            source: Some("trigger-evaluator".into()),
+        });
+        let mut impostor = matching_question("q-impostor", 21_000, None);
+        impostor.annotations.push(AgendaAnnotation {
+            text: "trigger-consumed effect=ef-1 occurrence=x".into(),
+            at_ms: 21_500,
+            principal: None,
+            session_id: Some("whoever".into()),
+            kind: Some("agent_session".into()),
+            source: Some("trigger-evaluator".into()),
+        });
+        let looped = matching_question("q-loop", 22_000, Some("sess-fired"));
+
+        let items = vec![standing, consumed, impostor, looped];
+        let now = 22_000 + TRIGGER_BATCH_WINDOW_MS + TRIGGER_COOLDOWN_MS;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        assert_eq!(
+            planned.spawn[0].matched_item_ids,
+            vec!["q-impostor".to_string()],
+            "consumed and fired-session items are excluded; an impostor \
+             annotation without daemon attribution consumes nothing"
+        );
+    }
+
+    /// A suspended triggered effect plans nothing — the streak semantics
+    /// inherit at the default threshold (no per-manifest knob in v1).
+    #[test]
+    fn trigger_suspended_effect_plans_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let mut standing = triggered_item("steward", gate_trigger(), 10_000, 10_000);
+        standing.effects[0].consecutive_failures = 3;
+        assert!(standing.effects[0].suspended());
+        let items = vec![standing, matching_question("q1", 20_000, None)];
+        assert_eq!(
+            assert_agreement(&items, &items[0], &journal, &policy, 10_000_000),
+            None
+        );
+    }
+
+    /// Trigger occurrences never stale-miss: a workflow node whose due
+    /// instant passed far beyond the staleness window still fires on
+    /// wake — a missed node would wedge every dependent forever, since
+    /// the cause-derived instant is the occurrence's identity.
+    #[test]
+    fn triggered_occurrences_never_stale_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let items = vec![done_at("node-a", 100_000), node];
+        let now = 100_000 + policy.staleness_ms() + 10 * EVERY;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(planned.missed_sessions.is_empty(), "never missed");
+        assert_eq!(planned.spawn.len(), 1, "fires on wake regardless of gap");
     }
 }

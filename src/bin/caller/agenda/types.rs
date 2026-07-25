@@ -260,6 +260,56 @@ impl RecurrenceSpec {
     }
 }
 
+/// Trigger match-predicate tag cap (Track T, T0 ruling 1 — the price-tag
+/// rule: richer predicates are future rulings, not knobs).
+pub(crate) const TRIGGER_MATCH_TAGS_MAX: usize = 8;
+/// Batching window for `on_item_match` (T0 ruling 5, fixed in v1): a
+/// match becomes due this long after the LATEST unconsumed arrival, so a
+/// burst coalesces into ONE occurrence carrying the whole batch.
+pub(crate) const TRIGGER_BATCH_WINDOW_MS: u64 = 60 * 1000;
+/// Per-effect refire floor for BOTH trigger kinds (T0 ruling 4): a
+/// trigger occurrence is never due before the effect's last terminal
+/// outcome + this floor. Reuses the shipped cadence floor — one rate
+/// vocabulary, no new knob. First fires have no prior terminal, so a
+/// workflow chain still advances within one evaluator tick.
+pub(crate) const TRIGGER_COOLDOWN_MS: u64 = RECURRENCE_MIN_EVERY_MS;
+/// The self-described `source` label on the daemon's dispatch-time
+/// consumed-annotations (beside — never inside — the daemon actor
+/// attribution, the scanner's exact shape).
+pub(crate) const TRIGGER_CONSUMED_SOURCE: &str = "trigger-evaluator";
+/// Machine-readable consumed-annotation text prefix. The planner derives
+/// match consumption from annotations bearing this prefix ONLY when they
+/// also carry daemon-kind attribution — text alone gates nothing
+/// (unverified-label doctrine).
+pub(crate) const TRIGGER_CONSUMED_PREFIX: &str = "trigger-consumed ";
+
+/// Event trigger on a manifest (Track T): fire the effect when something
+/// HAPPENS instead of at an instant. Lives INSIDE the digest-bound
+/// manifest, so approval binds WHO + WHAT + WHEN + ON-WHAT and any edit
+/// voids it. Mutually exclusive with `recurrence` in v1 (intake-enforced,
+/// T0 ruling 2): a manifest is cadenced OR triggered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerSpec {
+    /// The workflow-node trigger: fire when this item's `relies_on`
+    /// prerequisites are all satisfied (Done — a retired or missing
+    /// target does NOT satisfy, matching the render rule) while the item
+    /// is open and the effect approved. Empty `relies_on` is vacuously
+    /// satisfied: a workflow's first node fires on approval, gated by
+    /// the arm floor.
+    OnUnblock,
+    /// The standing-gate trigger: fire when a NEW open item of
+    /// `item_kind` carrying ALL of `tags` appears (arrival after the arm
+    /// floor — no retro-matching the backlog). The predicate vocabulary
+    /// is tags ∧ kind ONLY (T0 ruling 1); every widening — OR,
+    /// multi-kind, bodies, regex, status, retro-match — is a future
+    /// price-tagged ruling.
+    OnItemMatch {
+        item_kind: AgendaKind,
+        tags: Vec<String>,
+    },
+}
+
 /// A scheduled-session manifest (slice A5): the complete statement of
 /// what firing does — reviewed by the owner at approval time. Immutable
 /// per revision: [`manifest_digest`] binds the approval, and any edit
@@ -314,6 +364,18 @@ pub struct SessionManifest {
     /// one-shot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recurrence: Option<RecurrenceSpec>,
+    /// Event trigger (Track T). Additive: absent-on-the-wire when
+    /// `None`, so legacy manifest bytes — and the digests their
+    /// approvals bind — are unchanged. On an older build a
+    /// trigger-bearing manifest degrades fail-closed exactly like
+    /// recurrence: the re-serialization drops the field, the digest
+    /// mismatches, the approval reads as void — never a mangled
+    /// one-shot. `fire_at_ms` on a triggered manifest is the ARM FLOOR,
+    /// a feature (T0 ruling 3): causes before
+    /// max(fire_at_ms, approval instant) never fire, and a future floor
+    /// is a scheduled arming — do not "fix" it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trigger: Option<TriggerSpec>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -410,15 +472,20 @@ fn is_zero_u32(n: &u32) -> bool {
 }
 
 impl AgendaEffect {
-    /// Suspended = recurring ∧ the failure streak reached the manifest's
-    /// threshold. Render/planner judgment over fold products — the
-    /// planner plans nothing for a suspended effect, and the owner
-    /// re-arms with one re-approval of the unchanged digest.
+    /// Suspended = standing (recurring OR triggered) ∧ the failure
+    /// streak reached the threshold. Render/planner judgment over fold
+    /// products — the planner plans nothing for a suspended effect, and
+    /// the owner re-arms with one re-approval of the unchanged digest.
+    /// Triggered manifests carry no per-manifest threshold in v1 (no
+    /// knob — price-tag rule) and suspend at the default; one-shots have
+    /// no streak semantics at all.
     pub(crate) fn suspended(&self) -> bool {
-        self.manifest
-            .recurrence
-            .as_ref()
-            .is_some_and(|rec| self.consecutive_failures >= rec.suspend_threshold())
+        let threshold = match (&self.manifest.recurrence, &self.manifest.trigger) {
+            (Some(rec), _) => rec.suspend_threshold(),
+            (None, Some(_)) => DEFAULT_SUSPEND_AFTER_FAILURES,
+            (None, None) => return false,
+        };
+        self.consecutive_failures >= threshold
     }
 }
 
@@ -887,7 +954,11 @@ pub enum AgendaCommand {
     /// recorded on the digest-bound manifest so the owner approves WHO
     /// runs the goal (backend/model/effort), validated at intake against
     /// the launch path's own rules, and absent-normalized so a config-less
-    /// propose stays byte-identical to the legacy shape.
+    /// propose stays byte-identical to the legacy shape. `trigger`
+    /// (Track T) declares event-fired semantics the same way — inside
+    /// the digest-bound body, mutually exclusive with `recurrence` in v1
+    /// (named refusal at intake), rejected as an unknown field by older
+    /// daemons rather than silently parked as a one-shot.
     ProposeEffect {
         id: String,
         goal: String,
@@ -898,6 +969,8 @@ pub enum AgendaCommand {
         recurrence: Option<RecurrenceSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger: Option<TriggerSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
@@ -2101,6 +2174,7 @@ mod tests {
                 claude_effort: Some("xhigh".into()),
                 ..Default::default()
             })),
+            trigger: None,
         };
         let round: SessionManifest =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
@@ -2109,6 +2183,52 @@ mod tests {
         // manifest fields and config fields must not collide).
         let value = serde_json::to_value(&full).unwrap();
         assert_eq!(value["agent_config"]["claude_effort"], "xhigh");
+    }
+
+    /// Track T: the trigger's wire shapes pinned byte-for-byte
+    /// (internally tagged, snake_case), the round-trip, and the digest
+    /// revision — declaring a trigger revises the manifest like any
+    /// other edit, and the field is a nested object, never flattened.
+    #[test]
+    fn trigger_wire_shapes_and_digest_revision_are_pinned() {
+        assert_eq!(
+            serde_json::to_string(&TriggerSpec::OnUnblock).unwrap(),
+            r#"{"kind":"on_unblock"}"#
+        );
+        let matcher = TriggerSpec::OnItemMatch {
+            item_kind: AgendaKind::Question,
+            tags: vec!["gate".into()],
+        };
+        let matcher_json = r#"{"kind":"on_item_match","item_kind":"question","tags":["gate"]}"#;
+        assert_eq!(serde_json::to_string(&matcher).unwrap(), matcher_json);
+        let back: TriggerSpec = serde_json::from_str(matcher_json).unwrap();
+        assert_eq!(back, matcher);
+
+        let base = SessionManifest {
+            goal: "g".into(),
+            fire_at_ms: 9,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: None,
+        };
+        let with = SessionManifest {
+            trigger: Some(matcher),
+            ..base.clone()
+        };
+        assert_ne!(
+            manifest_digest("item-1", "ef-1", &base),
+            manifest_digest("item-1", "ef-1", &with),
+            "a trigger revises the digest"
+        );
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["trigger"]["kind"], "on_item_match");
+        // Trigger-less manifests keep the legacy bytes exactly.
+        assert!(!serde_json::to_string(&base)
+            .unwrap()
+            .contains("\"trigger\""));
     }
 
     #[test]
@@ -3864,6 +3984,7 @@ mod tests {
                 max_occurrences: Some(4),
                 suspend_after_failures: None,
             }),
+            trigger: None,
         };
         let propose = AgendaOpRecord {
             v: 1,
@@ -3917,6 +4038,7 @@ mod tests {
                         max_occurrences: Some(4),
                         suspend_after_failures: None,
                     }),
+                    trigger: None,
                 },
             },
         };
@@ -3974,6 +4096,7 @@ mod tests {
                         project_root: None,
                         agent_config: None,
                         recurrence: None,
+                        trigger: None,
                     },
                 },
             ),
