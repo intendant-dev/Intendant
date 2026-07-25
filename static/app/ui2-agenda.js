@@ -1665,6 +1665,12 @@ function agendaOpenAutomationSheet(anchor) {
     btn.addEventListener('click', () => { template = t; applyTemplate(); });
     seg.appendChild(btn);
   }
+  // Workflow templates (Track T) stamp an item-graph and hand off to
+  // their own approval sheet — rendered by the workflows fragment,
+  // which owns that whole lane.
+  if (typeof agendaWorkflowRenderPickerButtons === 'function') {
+    agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet);
+  }
   applyTemplate();
   agendaPresentStartSheet(host, panel, anchor);
 }
