@@ -256,10 +256,18 @@ impl GithubAppClient {
                 return Ok(cached.token.clone());
             }
         }
+        // A pending-install document has no installation to mint against;
+        // the named refusal keeps the ceremony phase honest (Denied stays
+        // until the install completes the document).
+        let Some(installation_id) = self.credentials.installation_id else {
+            return Err(ApiError::Denied(
+                "installation pending — install the App on GitHub and finish discovery".to_string(),
+            ));
+        };
         let jwt = mint_app_jwt(&self.credentials, now).map_err(ApiError::Denied)?;
         let url = format!(
             "{}/app/installations/{}/access_tokens",
-            self.api_base, self.credentials.installation_id
+            self.api_base, installation_id
         );
         let response = self
             .http
@@ -525,6 +533,58 @@ fn next_page_url(response: &reqwest::Response) -> Option<String> {
     None
 }
 
+/// What the manifest ceremony keeps from GitHub's conversion response.
+/// Deliberately three fields: `client_secret` and `webhook_secret` are
+/// in the response but **never materialize as retained values** — the
+/// narrow parse is the discard (serde ignores the rest of the body).
+#[derive(serde::Deserialize)]
+pub(crate) struct ManifestConversion {
+    pub(crate) id: u64,
+    pub(crate) slug: String,
+    pub(crate) pem: String,
+}
+
+/// Exchange a manifest-flow `code` for the created App's identity:
+/// `POST {api_base}/app-manifests/{code}/conversions`. Credential-less
+/// by design — the single-use code GitHub minted at the owner's Create
+/// click is the entire authorization, so this is a free function, not a
+/// `GithubAppClient` method (no key exists until this call returns).
+/// GitHub answers 201 with the full App object; 404 for an
+/// invalid/expired/used code lands in the `Denied` class via
+/// [`classify`].
+pub(crate) async fn convert_manifest_code(
+    api_base: &str,
+    code: &str,
+) -> Result<ManifestConversion, ApiError> {
+    let http = reqwest::Client::builder()
+        .user_agent("intendant")
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|error| ApiError::Unreachable(format!("http client: {error}")))?;
+    let url = format!(
+        "{}/app-manifests/{}/conversions",
+        api_base.trim_end_matches('/'),
+        code
+    );
+    let response = http
+        .post(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", API_VERSION)
+        .send()
+        .await
+        // `without_url`: reqwest's Display embeds the request URL, and
+        // this one carries the still-live single-use code — it must
+        // never reach an error page or a log line.
+        .map_err(|error| ApiError::Unreachable(error.without_url().to_string()))?;
+    let response = classify(response).await?;
+    response
+        .json::<ManifestConversion>()
+        .await
+        .map_err(|error| {
+            ApiError::Unreachable(format!("conversion response: {}", error.without_url()))
+        })
+}
+
 /// Map a non-2xx response onto the named failure classes. 304 never
 /// reaches here (handled at the call site).
 async fn classify(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
@@ -655,7 +715,8 @@ pub(crate) mod test_fixture {
         GithubAppCredentials {
             v: 1,
             app_id: "123456".to_string(),
-            installation_id: 987,
+            installation_id: Some(987),
+            slug: None,
             private_key_pem: TEST_RSA_PKCS1_PEM.to_string(),
         }
     }

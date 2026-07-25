@@ -536,14 +536,29 @@ pub(crate) fn spawn_scanner(
                 // The one unseal site outside a configure gesture: the
                 // client holds the parsed key for its lifetime; a
                 // re-configure (new blob mtime) rebuilds it.
-                let built = crate::key_custody::github_app_from_custody()
-                    .and_then(|secret| {
-                        super::credentials::GithubAppCredentials::from_sealed_bytes(
-                            secret.as_bytes(),
-                        )
+                let parsed = crate::key_custody::github_app_from_custody().and_then(|secret| {
+                    super::credentials::GithubAppCredentials::from_sealed_bytes(secret.as_bytes())
                         .ok()
-                    })
-                    .and_then(|creds| GithubAppClient::new(runtime.api_base(), creds).ok());
+                });
+                // A pending-install document (manifest ceremony sealed,
+                // App not installed yet) is a named pause, not a
+                // failure — and this unseal re-establishes the runtime's
+                // pending cache after a daemon restart.
+                if let Some(creds) = parsed.as_ref() {
+                    if creds.installation_id.is_none() {
+                        runtime.set_pending_install(creds.slug.clone().unwrap_or_default());
+                        transition(
+                            "installation pending — install the App on GitHub; integration paused"
+                                .to_string(),
+                        );
+                        client = None;
+                        super::join::publish_client(None);
+                        tokio::time::sleep(std::time::Duration::from_secs(IDLE_RECHECK_S)).await;
+                        continue;
+                    }
+                }
+                let built =
+                    parsed.and_then(|creds| GithubAppClient::new(runtime.api_base(), creds).ok());
                 match built {
                     Some(fresh) => {
                         let fresh = std::sync::Arc::new(fresh);
