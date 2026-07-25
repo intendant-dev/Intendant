@@ -1948,6 +1948,22 @@ mod tests {
             registry: Some(registry),
             ..Default::default()
         };
+        // Wait for the capture's first frame: without one the session
+        // screenshot path errs and the executor falls through to the
+        // native capture path, which a CI runner has no display for
+        // (production behavior — a real Xvfb worker's fallback hits the
+        // same display via DISPLAY; the test pins the session path).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if session.screenshot().await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "synthetic session produced no frame within the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
         let frame = serde_json::json!({
             "t": "cu_execute",
             "host_id": "cloud:t",
