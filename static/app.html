@@ -36431,7 +36431,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'd60e141ef387d3e3';
+const INTENDANT_APP_BUILD = 'aafb89a83aab54ee';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -79037,6 +79037,12 @@ function refreshShellHostOptions() {
       connected: peer.connected !== false,
     });
   }
+  const cloudHosts = typeof window.cloudConnectedShellHosts === 'function'
+    ? window.cloudConnectedShellHosts()
+    : [];
+  for (const host of cloudHosts) {
+    options.push({ id: host.id, label: host.label, connected: true });
+  }
   select.innerHTML = '';
   for (const option of options) {
     const el = document.createElement('option');
@@ -79553,6 +79559,17 @@ function sendLegacyMediaEditorMessage(obj) {
 
 function sendShellMessage(obj) {
   const hostId = String(obj?.host_id || currentShellHostId()).trim() || SHELL_HOST_ID;
+  if (hostId.startsWith('cloud:')) {
+    // Cloud worker terminals are bridged by THIS daemon over the task's
+    // attachment socket — frames ride the local transport, never a peer
+    // connection.
+    if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame({ ...obj, host_id: hostId })) {
+      return true;
+    }
+    setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    if (obj?.t === 'terminal_open') showShellWaitingNotice();
+    return false;
+  }
   if (hostId !== SHELL_HOST_ID && hostId !== selfPeerId) {
     if (!peerDashboardControlSignalAvailable(hostId)) {
       setShellHostStatus('Shell access is unavailable for the selected peer', 'error');
@@ -95874,6 +95891,16 @@ function cloudWorkerRow(lease) {
   }
   row.appendChild(meta);
 
+  if (lease.attachment_state === 'connected' && lease.task_id) {
+    const term = document.createElement('button');
+    term.type = 'button';
+    term.className = 'ui-btn ui-btn-sm cloud-worker-terminal';
+    term.textContent = 'Terminal';
+    term.title = 'Open a shell inside the live worker (bridged over the attachment)';
+    term.addEventListener('click', () => openCloudWorkerTerminal(lease.task_id));
+    head.appendChild(term);
+  }
+
   const isTerminal = ['finished', 'failed', 'cancelled'].includes(lease.provider_state);
   if (isTerminal && lease.task_id) {
     const pull = document.createElement('div');
@@ -95890,6 +95917,25 @@ function cloudWorkerRow(lease) {
   return row;
 }
 
+// Connected leases double as shell hosts: the picker lists them beside
+// peers, and frames for `cloud:<task_id>` ride the LOCAL tunnel (the
+// bridge lives on this daemon).
+function cloudConnectedShellHosts() {
+  return cloudWorkersRows
+    .filter(lease => lease.attachment_state === 'connected' && lease.task_id)
+    .map(lease => ({
+      id: `cloud:${lease.task_id}`,
+      label: `Cloud: ${lease.title || lease.task_id}`,
+    }));
+}
+
+function openCloudWorkerTerminal(taskId) {
+  if (typeof refreshShellHostOptions === 'function') refreshShellHostOptions();
+  if (typeof setShellHost === 'function') setShellHost(`cloud:${taskId}`);
+  if (typeof switchTab === 'function') switchTab('terminal');
+}
+
+window.cloudConnectedShellHosts = cloudConnectedShellHosts;
 window.loadCloudWorkers = loadCloudWorkers;
 window.cloudWorkersOnShown = cloudWorkersOnShown;
 /* ── static/app/48-router-settings.js ── */

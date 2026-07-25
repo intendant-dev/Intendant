@@ -255,6 +255,30 @@ The worker's egress must be able to reach `--home-url`: in a
 network-restricted Codex Cloud environment, add the home host to the
 environment's allowlist or the dial is refused before TLS.
 
+## Terminal on a live worker
+
+A `connected` lease renders a **Terminal** button on its Cloud-card row (and
+appears in the Terminal tab's host picker as `cloud:<task_id>`). The shell
+runs **inside the worker**: the dashboard's ordinary terminal frames, after
+clearing the same per-frame IAM gate a local shell demands (opening also
+requires `shell.spawn`), are bridged by this daemon over the task's
+attachment socket; the worker serves them from its own PTY registry and
+streams output frames back. The browser only ever talks to home — a worker
+behind a cloud egress allowlist can never terminate a direct browser
+connection, so the peer-terminal WebRTC path deliberately does not apply.
+
+Fail-closed rules: the bridge forwards only terminal *request* kinds to the
+worker, accepts only terminal *reply* kinds back (anything else off the
+socket is dropped — the worker's inbound authority on home stays nothing),
+and routes replies solely to dashboard subscribers of that `cloud:` host.
+Worker shells are unscoped (`ShellSpawnPolicy.scope = None`): the container
+is the sandbox and home's principal owns the worker, so the Landlock/
+Seatbelt scoped-shell machinery never engages. Sessions survive a socket
+reconnect (the worker keeps its registry across redials) and die with the
+task turn or the identity expiry. Sharing is refused on cloud hosts, and
+the bridge rides the dashboard tunnel only — the legacy `/ws` fallback
+serves local terminals exclusively.
+
 ## Attachment lifecycle
 
 The enrollment broker above records the attachment state for its workers;
@@ -414,9 +438,10 @@ attachment lane instead of pretending each Cloud task is a static `[[peer]]`.
 
 This integration covers the reliable job/control plane, the safe
 setup/maintenance contract, and the enrollment ceremony that attaches a live
-worker to home over mTLS. The attachment is deliberately just a heartbeat so
-far: the socket carries a hello frame and liveness, nothing else — no
-terminal, no display, no home→worker command channel yet. Workers are
+worker to home over mTLS. The attachment now carries the terminal frame channel besides
+liveness: home→worker terminal requests and worker→home terminal replies,
+with everything else dropped at both edges — but no display or computer-use
+lane yet. Workers are
 ephemeral enrollments with zero-authority expiring identities, not static
 `[[peer]]` registry entries, and home must be reachable from the worker's
 egress allowlist (there is no relay tier).

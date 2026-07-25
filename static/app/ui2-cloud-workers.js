@@ -179,6 +179,16 @@ function cloudWorkerRow(lease) {
   }
   row.appendChild(meta);
 
+  if (lease.attachment_state === 'connected' && lease.task_id) {
+    const term = document.createElement('button');
+    term.type = 'button';
+    term.className = 'ui-btn ui-btn-sm cloud-worker-terminal';
+    term.textContent = 'Terminal';
+    term.title = 'Open a shell inside the live worker (bridged over the attachment)';
+    term.addEventListener('click', () => openCloudWorkerTerminal(lease.task_id));
+    head.appendChild(term);
+  }
+
   const isTerminal = ['finished', 'failed', 'cancelled'].includes(lease.provider_state);
   if (isTerminal && lease.task_id) {
     const pull = document.createElement('div');
@@ -195,5 +205,24 @@ function cloudWorkerRow(lease) {
   return row;
 }
 
+// Connected leases double as shell hosts: the picker lists them beside
+// peers, and frames for `cloud:<task_id>` ride the LOCAL tunnel (the
+// bridge lives on this daemon).
+function cloudConnectedShellHosts() {
+  return cloudWorkersRows
+    .filter(lease => lease.attachment_state === 'connected' && lease.task_id)
+    .map(lease => ({
+      id: `cloud:${lease.task_id}`,
+      label: `Cloud: ${lease.title || lease.task_id}`,
+    }));
+}
+
+function openCloudWorkerTerminal(taskId) {
+  if (typeof refreshShellHostOptions === 'function') refreshShellHostOptions();
+  if (typeof setShellHost === 'function') setShellHost(`cloud:${taskId}`);
+  if (typeof switchTab === 'function') switchTab('terminal');
+}
+
+window.cloudConnectedShellHosts = cloudConnectedShellHosts;
 window.loadCloudWorkers = loadCloudWorkers;
 window.cloudWorkersOnShown = cloudWorkersOnShown;

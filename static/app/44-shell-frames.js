@@ -474,6 +474,17 @@ function sendLegacyMediaEditorMessage(obj) {
 
 function sendShellMessage(obj) {
   const hostId = String(obj?.host_id || currentShellHostId()).trim() || SHELL_HOST_ID;
+  if (hostId.startsWith('cloud:')) {
+    // Cloud worker terminals are bridged by THIS daemon over the task's
+    // attachment socket — frames ride the local transport, never a peer
+    // connection.
+    if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame({ ...obj, host_id: hostId })) {
+      return true;
+    }
+    setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    if (obj?.t === 'terminal_open') showShellWaitingNotice();
+    return false;
+  }
   if (hostId !== SHELL_HOST_ID && hostId !== selfPeerId) {
     if (!peerDashboardControlSignalAvailable(hostId)) {
       setShellHostStatus('Shell access is unavailable for the selected peer', 'error');
