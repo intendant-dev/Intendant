@@ -78,4 +78,9 @@ pub(crate) fn is_injected_external_user_text(text: &str) -> bool {
         || trimmed.starts_with("<bash-stdout>")
         || trimmed.starts_with("<bash-stderr>")
         || trimmed.starts_with("<user_shell_command>")
+        // Harness context reminders ride user text blocks in Claude Code
+        // transcripts; they are operator plumbing, never human speech
+        // (Track NS R8 — without this they leak into the prose-only
+        // export as "user" prose).
+        || trimmed.starts_with("<system-reminder")
 }
