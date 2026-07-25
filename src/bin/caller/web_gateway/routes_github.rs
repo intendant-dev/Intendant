@@ -52,8 +52,13 @@ impl GithubAppCustody for DaemonGithubAppCustody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubSavePayload {
-    app_id: String,
-    installation_id: u64,
+    /// Required with a fresh key; optional on an update of an existing
+    /// entry (absent = keep the sealed value). The repo picker's
+    /// config-only writes send neither id.
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    installation_id: Option<u64>,
     /// Absent on an ids/watch-list-only update of an existing entry.
     #[serde(default)]
     private_key_pem: Option<String>,
@@ -194,18 +199,34 @@ pub(crate) async fn github_integration_save_api_response(
         return ApiResponse::json_error(400, "poll_minutes floor is 1");
     }
 
-    // Resolve the credentials document: a fresh key, or an ids-only
-    // update re-sealing the existing document. Updates need the current
-    // key, so this is the one configure-time unseal — an owner gesture
-    // under CredentialsManage, not a poll.
-    let mut document = match payload.private_key_pem.as_deref() {
-        Some(pem) => crate::github_pr::credentials::GithubAppCredentials {
-            v: 1,
-            app_id: payload.app_id.clone(),
-            installation_id: Some(payload.installation_id),
-            slug: None,
-            private_key_pem: pem.to_string(),
-        },
+    // Resolve the credentials document: a fresh key, an ids update
+    // re-sealing the existing document, or a config-only write (repo
+    // picker, poll minutes) that verifies against the sealed document
+    // without re-sealing it. Updates need the current key, so this is
+    // the one configure-time unseal — an owner gesture under
+    // CredentialsManage, not a poll.
+    let ids_supplied = payload.app_id.is_some() || payload.installation_id.is_some();
+    let (mut document, reseal) = match payload.private_key_pem.as_deref() {
+        Some(pem) => {
+            let (Some(app_id), Some(installation_id)) =
+                (payload.app_id.clone(), payload.installation_id)
+            else {
+                return ApiResponse::json_error(
+                    400,
+                    "app_id and installation_id are required with a new private key",
+                );
+            };
+            (
+                crate::github_pr::credentials::GithubAppCredentials {
+                    v: 1,
+                    app_id,
+                    installation_id: Some(installation_id),
+                    slug: None,
+                    private_key_pem: pem.to_string(),
+                },
+                true,
+            )
+        }
         None => {
             if !custody.present() {
                 return ApiResponse::json_error(
@@ -222,12 +243,16 @@ pub(crate) async fn github_integration_save_api_response(
             match crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(&existing)
             {
                 Ok(mut existing) => {
-                    existing.app_id = payload.app_id.clone();
-                    // Completing a pending-install document keeps its
-                    // ceremony-recorded slug; a plain ids update keeps
-                    // whatever was there.
-                    existing.installation_id = Some(payload.installation_id);
-                    existing
+                    // Present ids overwrite; absent ids keep the sealed
+                    // values. Completing a pending-install document
+                    // keeps its ceremony-recorded slug either way.
+                    if let Some(app_id) = payload.app_id.clone() {
+                        existing.app_id = app_id;
+                    }
+                    if let Some(installation_id) = payload.installation_id {
+                        existing.installation_id = Some(installation_id);
+                    }
+                    (existing, ids_supplied)
                 }
                 Err(error) => return ApiResponse::json_error(500, &error),
             }
@@ -236,17 +261,21 @@ pub(crate) async fn github_integration_save_api_response(
     if let Err(error) = document.validate() {
         return ApiResponse::json_error(400, &error);
     }
-    let sealed = match document.sealed_bytes() {
-        Ok(bytes) => bytes,
-        Err(error) => return ApiResponse::json_error(500, &error),
-    };
-    if let Err(error) = custody.store(&sealed, actor_principal, audit_origin) {
-        return ApiResponse::json_error(500, &error);
+    if reseal {
+        let sealed = match document.sealed_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => return ApiResponse::json_error(500, &error),
+        };
+        if let Err(error) = custody.store(&sealed, actor_principal, audit_origin) {
+            return ApiResponse::json_error(500, &error);
+        }
+        // A re-sealed complete document ends the ceremony pending
+        // phase — including the auto-fill that completes it. A pending
+        // document (app_id-only update) stays pending.
+        if document.installation_id.is_some() {
+            runtime.clear_pending_install();
+        }
     }
-    // Every save writes a complete document (installation_id present),
-    // so any ceremony pending-phase is over — including the GC2
-    // auto-fill that completes a pending-install document.
-    runtime.clear_pending_install();
 
     // Persist the non-secret watch config beside the sealed entry.
     let mut config_persisted = true;
@@ -646,6 +675,118 @@ pub(crate) async fn github_manifest_callback_api_response(
         ),
         Some(&pending.origin),
     )
+}
+
+/// Unseal + parse the sealed document for a ceremony read. `None` =
+/// absent or custody-denied (the custody lane audited it by name).
+fn unsealed_document(
+    custody: &dyn GithubAppCustody,
+) -> Option<crate::github_pr::credentials::GithubAppCredentials> {
+    let bytes = custody.retrieve()?;
+    crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(&bytes).ok()
+}
+
+/// Transport-neutral core of `GET /api/integrations/github/installations`
+/// (tunnel twin `api_github_installations`). App-JWT discovery: works on
+/// a pending-install document — and re-establishes the runtime's
+/// pending cache from the sealed doc (the restart-transient self-heal).
+pub(crate) async fn github_installations_api_response(
+    custody: &dyn GithubAppCustody,
+    runtime: &crate::github_pr::status::GithubIntegrationRuntime,
+) -> ApiResponse {
+    if !custody.present() {
+        return ApiResponse::json_error(400, "no GitHub App is configured");
+    }
+    let Some(document) = unsealed_document(custody) else {
+        return ApiResponse::json_error(
+            500,
+            "custody refused the sealed credentials (the custody trail carries the deny)",
+        );
+    };
+    if document.installation_id.is_none() {
+        runtime.set_pending_install(document.slug.clone().unwrap_or_default());
+    }
+    let client = match crate::github_pr::client::GithubAppClient::new(runtime.api_base(), document)
+    {
+        Ok(client) => client,
+        Err(error) => return ApiResponse::json_error(500, &error),
+    };
+    match client.list_installations().await {
+        Ok(installations) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "installations": installations })),
+        ),
+        Err(error) => {
+            runtime.record_error(&error);
+            ApiResponse::json_error(502, format!("installation discovery failed: {error}"))
+        }
+    }
+}
+
+/// Transport-neutral core of `GET /api/integrations/github/repositories`
+/// (tunnel twin `api_github_repositories`). Installation-token read —
+/// a pending-install document is a named refusal, not an error class.
+pub(crate) async fn github_repositories_api_response(
+    custody: &dyn GithubAppCustody,
+    runtime: &crate::github_pr::status::GithubIntegrationRuntime,
+) -> ApiResponse {
+    if !custody.present() {
+        return ApiResponse::json_error(400, "no GitHub App is configured");
+    }
+    let Some(document) = unsealed_document(custody) else {
+        return ApiResponse::json_error(
+            500,
+            "custody refused the sealed credentials (the custody trail carries the deny)",
+        );
+    };
+    if document.installation_id.is_none() {
+        runtime.set_pending_install(document.slug.clone().unwrap_or_default());
+        return ApiResponse::json_error(
+            400,
+            "installation pending — install the App on GitHub and finish discovery first",
+        );
+    }
+    let client = match crate::github_pr::client::GithubAppClient::new(runtime.api_base(), document)
+    {
+        Ok(client) => client,
+        Err(error) => return ApiResponse::json_error(500, &error),
+    };
+    match client.list_installation_repositories().await {
+        Ok(repositories) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "repositories": repositories })),
+        ),
+        Err(error) => {
+            runtime.record_error(&error);
+            ApiResponse::json_error(502, format!("repository listing failed: {error}"))
+        }
+    }
+}
+
+pub(crate) async fn handle_github_installations(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = github_installations_api_response(
+        &DaemonGithubAppCustody,
+        crate::github_pr::status::global(),
+    )
+    .await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_github_repositories(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = github_repositories_api_response(
+        &DaemonGithubAppCustody,
+        crate::github_pr::status::global(),
+    )
+    .await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_github_manifest_start(
@@ -1477,6 +1618,171 @@ mod tests {
             doc.slug.as_deref(),
             Some("intendant-example"),
             "the ceremony-recorded slug survives completion"
+        );
+    }
+
+    fn seal_direct(
+        custody: &TempCustody,
+        doc: &crate::github_pr::credentials::GithubAppCredentials,
+    ) {
+        custody
+            .store(&doc.sealed_bytes().unwrap(), "principal:test", "test")
+            .unwrap();
+    }
+
+    fn complete_doc() -> crate::github_pr::credentials::GithubAppCredentials {
+        crate::github_pr::credentials::GithubAppCredentials {
+            v: 1,
+            app_id: "123456".to_string(),
+            installation_id: Some(987),
+            slug: Some("intendant-example".to_string()),
+            private_key_pem: crate::github_pr::client::test_rsa_pem().to_string(),
+        }
+    }
+
+    fn pending_doc() -> crate::github_pr::credentials::GithubAppCredentials {
+        crate::github_pr::credentials::GithubAppCredentials {
+            installation_id: None,
+            ..complete_doc()
+        }
+    }
+
+    /// Discovery answers under the App JWT on a PENDING document — and
+    /// the unseal re-establishes the runtime's pending cache (the
+    /// restart-transient self-heal).
+    #[tokio::test]
+    async fn installations_discovery_works_on_pending_docs_and_reheals_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        seal_direct(&custody, &pending_doc());
+        let fixture = spawn_fixture(HashMap::from([(
+            ("GET".to_string(), "/app/installations".to_string()),
+            (
+                200,
+                Vec::new(),
+                serde_json::json!([{
+                    "id": 987,
+                    "account": {"login": "example-org"},
+                    "app_id": 123456,
+                    "app_slug": "intendant-example",
+                }])
+                .to_string(),
+            ),
+        )]))
+        .await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+        assert!(runtime.pending_install_slug().is_none(), "fresh runtime");
+
+        let response = github_installations_api_response(&custody, &runtime).await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_json(&response);
+        assert_eq!(body["installations"][0]["installation_id"], 987);
+        assert_eq!(body["installations"][0]["account_login"], "example-org");
+        assert_eq!(body["installations"][0]["app_id"], 123456);
+        assert_eq!(
+            runtime.pending_install_slug().as_deref(),
+            Some("intendant-example"),
+            "the gated unseal re-established the pending cache"
+        );
+    }
+
+    /// The repo listing refuses a pending document by name and lists
+    /// under the installation token once the document is complete.
+    #[tokio::test]
+    async fn repositories_refuse_on_pending_and_list_on_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        seal_direct(&custody, &pending_doc());
+        let fixture = spawn_fixture(HashMap::from([
+            token_route(),
+            (
+                ("GET".to_string(), "/installation/repositories".to_string()),
+                (
+                    200,
+                    Vec::new(),
+                    serde_json::json!({
+                        "total_count": 2,
+                        "repositories": [
+                            {"full_name": "example-org/repo-a"},
+                            {"full_name": "example-org/repo-b"},
+                        ],
+                    })
+                    .to_string(),
+                ),
+            ),
+        ]))
+        .await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+
+        let refused = github_repositories_api_response(&custody, &runtime).await;
+        assert_eq!(status_of(&refused), 400);
+        assert!(body_json(&refused)
+            .to_string()
+            .contains("installation pending"));
+        assert_eq!(
+            fixture.hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a pending document never mints a token"
+        );
+
+        seal_direct(&custody, &complete_doc());
+        let listed = github_repositories_api_response(&custody, &runtime).await;
+        assert_eq!(status_of(&listed), 200);
+        assert_eq!(
+            body_json(&listed)["repositories"],
+            serde_json::json!(["example-org/repo-a", "example-org/repo-b"])
+        );
+    }
+
+    /// A config-only save (the repo picker's write) never touches
+    /// custody: the store count stays where seeding left it, the sealed
+    /// document is byte-identical, and the verify exchange still runs
+    /// against the sealed key.
+    #[tokio::test]
+    async fn repos_only_save_never_touches_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        let custody = TempCustody::new(dir.path());
+        seal_direct(&custody, &complete_doc());
+        let sealed_before = custody.retrieve().unwrap();
+        assert_eq!(*custody.stores.lock().unwrap(), 1, "seeding store only");
+        let fixture = spawn_fixture(HashMap::from([
+            token_route(),
+            (
+                (
+                    "GET".to_string(),
+                    "/repos/example-org/repo-a/pulls".to_string(),
+                ),
+                (200, Vec::new(), "[]".to_string()),
+            ),
+        ]))
+        .await;
+        let runtime = GithubIntegrationRuntime::new(&fixture.base);
+
+        let payload = serde_json::json!({"repos": ["example-org/repo-a"], "poll_minutes": 7});
+        let response = github_integration_save_api_response(
+            payload.to_string().as_bytes(),
+            Some(dir.path()),
+            &custody,
+            &runtime,
+            "principal:test",
+            "local",
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_json(&response);
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["status"], "valid", "the verify exchange ran");
+        assert_eq!(body["repos"], serde_json::json!(["example-org/repo-a"]));
+        assert_eq!(body["poll_minutes"], 7);
+        assert_eq!(
+            *custody.stores.lock().unwrap(),
+            1,
+            "a config-only save must never re-seal"
+        );
+        assert_eq!(
+            custody.retrieve().unwrap(),
+            sealed_before,
+            "the sealed document is byte-identical"
         );
     }
 

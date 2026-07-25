@@ -213,6 +213,16 @@ pub(crate) struct ReviewSummary {
     pub(crate) commented: usize,
 }
 
+/// One installation of the App, as the discovery surface renders it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct InstallationSummary {
+    pub(crate) installation_id: u64,
+    pub(crate) account_login: String,
+    /// GitHub also echoes the App id per row; the auto-fill save wants
+    /// it, and the sealed document is never unsealed for a status read.
+    pub(crate) app_id: Option<u64>,
+}
+
 pub(crate) struct GithubAppClient {
     http: reqwest::Client,
     api_base: String,
@@ -299,6 +309,82 @@ impl GithubAppClient {
             expires_unix_s,
         });
         Ok(token)
+    }
+
+    /// The App's installations, under the App JWT alone — the discovery
+    /// read of the connect ceremony, so it works on a pending-install
+    /// document (no installation token exists yet). One page of 100:
+    /// a private per-daemon App has one installation in practice; a
+    /// hundred is not a shape this integration mirrors.
+    pub(crate) async fn list_installations(&self) -> Result<Vec<InstallationSummary>, ApiError> {
+        let jwt = mint_app_jwt(&self.credentials, unix_now_s()).map_err(ApiError::Denied)?;
+        let url = format!("{}/app/installations?per_page=100", self.api_base);
+        let response = self
+            .http
+            .get(&url)
+            .bearer_auth(&jwt)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|error| ApiError::Unreachable(error.to_string()))?;
+        let response = classify(response).await?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| ApiError::Unreachable(format!("installations body: {error}")))?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| ApiError::Unreachable("installations shape: not a list".to_string()))?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(InstallationSummary {
+                    installation_id: row.get("id")?.as_u64()?,
+                    account_login: row
+                        .get("account")
+                        .and_then(|a| a.get("login"))
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    app_id: row.get("app_id").and_then(|v| v.as_u64()),
+                })
+            })
+            .collect())
+    }
+
+    /// Repositories the installation can see (the repo picker's read):
+    /// installation token, `full_name`s only, bounded pagination like
+    /// the PR list.
+    pub(crate) async fn list_installation_repositories(&self) -> Result<Vec<String>, ApiError> {
+        let mut names = Vec::new();
+        let mut url = format!("{}/installation/repositories?per_page=100", self.api_base);
+        for _ in 0..MAX_LIST_PAGES {
+            let value = match self.get_value(&url, None).await? {
+                Conditional::NotModified => {
+                    return Err(ApiError::Unreachable(
+                        "unconditional read answered 304".to_string(),
+                    ))
+                }
+                Conditional::Fresh { value, .. } => value,
+            };
+            let (page, next) = match (value.get("__page"), value.get("__next")) {
+                (Some(page), Some(next)) => (page.clone(), next.as_str().map(str::to_string)),
+                _ => (value, None),
+            };
+            if let Some(rows) = page.get("repositories").and_then(|r| r.as_array()) {
+                names.extend(rows.iter().filter_map(|row| {
+                    row.get("full_name")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                }));
+            }
+            match next {
+                Some(next_url) => url = next_url,
+                None => break,
+            }
+        }
+        Ok(names)
     }
 
     /// Conditional GET of an absolute API URL. `etag` rides

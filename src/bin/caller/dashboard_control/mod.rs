@@ -5935,6 +5935,13 @@ mod tests {
                 Row,
                 Some(Op::CredentialsManage),
             ),
+            // One-click connect (Track GC): both reads UNSEAL the key
+            // (App JWT / installation token) — the family principle
+            // gates credential use at CredentialsManage, never
+            // Settings. Manifest-start and the callback are HTTP-only
+            // by design and deliberately absent here.
+            ("api_github_installations", Row, Some(Op::CredentialsManage)),
+            ("api_github_repositories", Row, Some(Op::CredentialsManage)),
             ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (
@@ -6209,6 +6216,8 @@ mod tests {
             "api_github_integration_save",
             "api_github_integration_status",
             "api_github_integration_remove",
+            "api_github_installations",
+            "api_github_repositories",
             "api_claude_auth_start",
             "api_claude_auth_status",
             "api_claude_auth_code",

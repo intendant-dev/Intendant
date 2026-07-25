@@ -320,6 +320,10 @@ pub(crate) enum RouteHandlerId {
     /// GitHub's redirect landing (browser navigation): burn the state,
     /// convert the code server-side, seal pending-install.
     GithubManifestCallback,
+    /// Installation discovery under the App JWT (unseals; pending OK).
+    GithubInstallations,
+    /// The installation's visible repositories (unseals; complete only).
+    GithubRepositories,
     /// Claude sign-in ceremony: start `claude auth login` on a private PTY.
     ClaudeAuthStart,
     /// Ceremony state + validated sign-in URL + account info on success.
@@ -1722,6 +1726,27 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::GithubManifestCallback,
         "GitHub App Manifest redirect landing (single-use state is the authorization; renders a return-to-dashboard page)",
     ),
+    //    Discovery + repo listing are reads that UNSEAL the key (App
+    //    JWT / installation token), so per the family principle above
+    //    they gate at CredentialsManage, never Settings.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/integrations/github/installations"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::GithubInstallations,
+        "The App's installations (App-JWT discovery; works while the install is pending)",
+    )
+    .with_tunnel(tunnel_method("api_github_installations")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/integrations/github/repositories"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::GithubRepositories,
+        "Repositories the installation can see (installation token; feeds the repo picker)",
+    )
+    .with_tunnel(tunnel_method("api_github_repositories")),
     // ── Same-home sibling loopback-token handoff (ratified 2026-07-20):
     //    the response contains per-boot loopback admission tokens, so
     //    the route rides the credential-custody operation like the

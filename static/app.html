@@ -36481,7 +36481,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '7c9794c4b8006794';
+const INTENDANT_APP_BUILD = '0fb23b1551d9ee43';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39059,6 +39059,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_github_integration_save: { verb: 'POST', path: '/api/integrations/github' },
   api_github_integration_status: { verb: 'GET', path: '/api/integrations/github/status' },
   api_github_integration_remove: { verb: 'DELETE', path: '/api/integrations/github' },
+  api_github_installations: { verb: 'GET', path: '/api/integrations/github/installations' },
+  api_github_repositories: { verb: 'GET', path: '/api/integrations/github/repositories' },
   api_fs_write: { verb: 'POST', path: '/api/fs/write', lane: 'upload', encode: 'json-b64' },
   api_fs_rename: { verb: 'POST', path: '/api/fs/rename' },
   api_fs_delete: { verb: 'POST', path: '/api/fs/delete' },
