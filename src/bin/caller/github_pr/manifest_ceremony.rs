@@ -116,7 +116,11 @@ impl ManifestCeremonySlot {
     /// ceremony, never a second try at it — and costs the owner one
     /// restart). Unknown, replayed, expired, and absent states are
     /// indistinguishable ([`STATE_REFUSED`]).
-    pub(crate) fn consume(&self, presented_state: &str, now_ms: u64) -> Result<PendingManifest, String> {
+    pub(crate) fn consume(
+        &self,
+        presented_state: &str,
+        now_ms: u64,
+    ) -> Result<PendingManifest, String> {
         let pending = self
             .pending
             .lock()
@@ -173,7 +177,8 @@ pub(crate) fn manifest_form_action(target_org: Option<&str>, state: &str) -> Str
     let encoded_state: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
     match target_org {
         Some(org) => {
-            let encoded_org: String = url::form_urlencoded::byte_serialize(org.as_bytes()).collect();
+            let encoded_org: String =
+                url::form_urlencoded::byte_serialize(org.as_bytes()).collect();
             format!(
                 "https://github.com/organizations/{encoded_org}/settings/apps/new?state={encoded_state}"
             )
@@ -327,7 +332,8 @@ mod tests {
         let slot = ManifestCeremonySlot::default();
         let token = begin(&slot);
         assert_eq!(
-            slot.consume(&token, NOW + MANIFEST_STATE_TTL_MS).unwrap_err(),
+            slot.consume(&token, NOW + MANIFEST_STATE_TTL_MS)
+                .unwrap_err(),
             STATE_REFUSED,
             "an expired state must refuse uniformly"
         );
@@ -350,7 +356,8 @@ mod tests {
         // (here: none), never a retry.
         let first_again = begin(&slot);
         assert_eq!(
-            slot.consume(&first_again[..first_again.len() - 1], NOW + 1).unwrap_err(),
+            slot.consume(&first_again[..first_again.len() - 1], NOW + 1)
+                .unwrap_err(),
             STATE_REFUSED,
             "a near-miss token is refused"
         );

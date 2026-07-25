@@ -133,7 +133,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let map = json.as_object().unwrap();
         assert!(!map.contains_key("slug"), "absent slug must not serialize");
-        assert_eq!(map["installation_id"], 987, "completed id stays a plain number");
+        assert_eq!(
+            map["installation_id"], 987,
+            "completed id stays a plain number"
+        );
 
         let legacy = serde_json::json!({
             "v": 1,

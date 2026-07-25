@@ -372,7 +372,9 @@ fn validate_org_handle(handle: &str) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err(format!("organization {handle:?} is not a GitHub org handle"))
+        Err(format!(
+            "organization {handle:?} is not a GitHub org handle"
+        ))
     }
 }
 
@@ -457,8 +459,7 @@ pub(crate) fn github_manifest_start_api_response(
         Ok(state) => state,
         Err(error) => return ApiResponse::json_error(500, &error),
     };
-    let manifest =
-        crate::github_pr::manifest_ceremony::manifest_document(&origin, hostname_label);
+    let manifest = crate::github_pr::manifest_ceremony::manifest_document(&origin, hostname_label);
     let form_action =
         crate::github_pr::manifest_ceremony::manifest_form_action(target_org.as_deref(), &state);
     ApiResponse::json(
@@ -485,7 +486,12 @@ fn html_escape(text: &str) -> String {
 /// A self-contained ceremony page (no SPA assets, no secrets). The
 /// return link is the validated ceremony origin; success pages also
 /// meta-refresh there after a beat.
-fn ceremony_page(status: u16, title: &str, detail: &str, return_origin: Option<&str>) -> ApiResponse {
+fn ceremony_page(
+    status: u16,
+    title: &str,
+    detail: &str,
+    return_origin: Option<&str>,
+) -> ApiResponse {
     let (link, refresh) = match return_origin {
         Some(origin) => {
             let escaped = html_escape(origin);
@@ -515,7 +521,10 @@ fn ceremony_page(status: u16, title: &str, detail: &str, return_origin: Option<&
         headers: vec![
             ("Cache-Control", "no-cache".to_string()),
             ("X-Content-Type-Options", "nosniff".to_string()),
-            ("Content-Security-Policy", "frame-ancestors 'none'".to_string()),
+            (
+                "Content-Security-Policy",
+                "frame-ancestors 'none'".to_string(),
+            ),
             ("Connection", "close".to_string()),
         ],
         bytes: BytesPayload::InMemory(html.into_bytes()),
@@ -602,7 +611,9 @@ pub(crate) async fn github_manifest_callback_api_response(
         return ceremony_page(
             500,
             "GitHub's response could not be sealed",
-            &format!("The created App's key did not validate ({error}). Start again from the dashboard."),
+            &format!(
+                "The created App's key did not validate ({error}). Start again from the dashboard."
+            ),
             Some(&pending.origin),
         );
     }
@@ -622,7 +633,12 @@ pub(crate) async fn github_manifest_callback_api_response(
         &pending.starter_principal,
         "github-manifest-callback",
     ) {
-        return ceremony_page(500, "Custody refused the seal", &error, Some(&pending.origin));
+        return ceremony_page(
+            500,
+            "Custody refused the seal",
+            &error,
+            Some(&pending.origin),
+        );
     }
     runtime.set_pending_install(conversion.slug.clone());
     ceremony_page(
@@ -1023,9 +1039,8 @@ mod tests {
         );
 
         let sealed = custody.retrieve().expect("sealed document exists");
-        let doc =
-            crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(&sealed)
-                .expect("parses in this build");
+        let doc = crate::github_pr::credentials::GithubAppCredentials::from_sealed_bytes(&sealed)
+            .expect("parses in this build");
         assert_eq!(doc.app_id, "4242");
         assert_eq!(doc.installation_id, None, "sealed pending-install");
         assert_eq!(doc.slug.as_deref(), Some("intendant-example"));
@@ -1067,7 +1082,10 @@ mod tests {
         assert_eq!(body["configured"], true);
         assert_eq!(body["pending_install"], true);
         assert_eq!(body["app_slug"], "intendant-example");
-        assert_eq!(body["status"], "configured", "the label vocabulary is unchanged");
+        assert_eq!(
+            body["status"], "configured",
+            "the label vocabulary is unchanged"
+        );
     }
 
     /// The named foreign-code pin: without a valid state — absent OR
@@ -1104,7 +1122,8 @@ mod tests {
         let (status, page) = page_status(&wrong);
         assert_eq!(status, 403);
         assert_eq!(
-            page, page_status(&absent).1,
+            page,
+            page_status(&absent).1,
             "refusals are uniform: absent and wrong states read identically"
         );
 
@@ -1282,9 +1301,7 @@ mod tests {
             NOW,
         );
         assert_eq!(status_of(&response), 400);
-        assert!(body_json(&response)
-            .to_string()
-            .contains("custody backend"));
+        assert!(body_json(&response).to_string().contains("custody backend"));
         assert!(!slot.active(NOW), "no state mints on a refused start");
     }
 
@@ -1377,13 +1394,7 @@ mod tests {
             validated_request_origin(true, Some("Box.Example")).as_deref(),
             Some("https://box.example")
         );
-        for bad in [
-            "user@host",
-            "host/path",
-            "host?query=1",
-            "host#frag",
-            "",
-        ] {
+        for bad in ["user@host", "host/path", "host?query=1", "host#frag", ""] {
             assert_eq!(
                 validated_request_origin(false, Some(bad)),
                 None,

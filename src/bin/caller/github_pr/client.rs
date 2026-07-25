@@ -261,8 +261,7 @@ impl GithubAppClient {
         // until the install completes the document).
         let Some(installation_id) = self.credentials.installation_id else {
             return Err(ApiError::Denied(
-                "installation pending — install the App on GitHub and finish discovery"
-                    .to_string(),
+                "installation pending — install the App on GitHub and finish discovery".to_string(),
             ));
         };
         let jwt = mint_app_jwt(&self.credentials, now).map_err(ApiError::Denied)?;
