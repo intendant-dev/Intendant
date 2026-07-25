@@ -2674,6 +2674,12 @@ function refreshShellHostOptions() {
       connected: peer.connected !== false,
     });
   }
+  const cloudHosts = typeof window.cloudConnectedShellHosts === 'function'
+    ? window.cloudConnectedShellHosts()
+    : [];
+  for (const host of cloudHosts) {
+    options.push({ id: host.id, label: host.label, connected: true });
+  }
   select.innerHTML = '';
   for (const option of options) {
     const el = document.createElement('option');

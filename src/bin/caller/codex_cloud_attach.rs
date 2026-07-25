@@ -401,19 +401,81 @@ fn record_worker_json(lease_store_path: &Path, task_id: &str, value: &serde_json
     crate::codex_cloud::record_worker_fingerprint(lease_store_path, task_id, fingerprint);
 }
 
+// ── Attachment frames + link registry (slice 2) ────────────────────────
+
+/// Worker→home reply kinds. The worker's inbound authority on home is
+/// nothing: frames off the socket are routed only to dashboard
+/// subscribers of this task's cloud host, never into home's own frame
+/// dispatch, and any kind outside this list is dropped on the floor.
+const WORKER_REPLY_KINDS: &[&str] = &[
+    "terminal_opened",
+    "terminal_output",
+    "terminal_exited",
+    "terminal_error",
+    "terminal_shared",
+];
+
+/// Host-id prefix that routes a dashboard terminal frame to a connected
+/// cloud worker's attachment instead of the local terminal registry.
+pub(crate) const CLOUD_HOST_PREFIX: &str = "cloud:";
+
+/// `Some(task_id)` when a dashboard `host_id` addresses a cloud worker.
+pub(crate) fn cloud_host_task_id(host_id: &str) -> Option<&str> {
+    host_id
+        .strip_prefix(CLOUD_HOST_PREFIX)
+        .filter(|task| !task.is_empty())
+}
+
+const LINK_TO_WORKER_CAP: usize = 64;
+const LINK_FROM_WORKER_CAP: usize = 256;
+
+/// One connected worker's live frame channels: bounded home→worker sender
+/// plus a broadcast of the worker's (filtered) reply frames.
+struct AttachmentLink {
+    to_worker: tokio::sync::mpsc::Sender<String>,
+    from_worker: tokio::sync::broadcast::Sender<String>,
+}
+
+static ATTACHMENT_LINKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, AttachmentLink>>,
+> = std::sync::OnceLock::new();
+
+fn attachment_links() -> &'static std::sync::Mutex<std::collections::HashMap<String, AttachmentLink>>
+{
+    ATTACHMENT_LINKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The bridge's handle on a connected worker: a sender for home→worker
+/// frames and a fresh subscription to its reply frames. `None` when the
+/// task has no live attachment.
+pub(crate) fn attachment_channel(
+    task_id: &str,
+) -> Option<(
+    tokio::sync::mpsc::Sender<String>,
+    tokio::sync::broadcast::Receiver<String>,
+)> {
+    let links = attachment_links()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    links
+        .get(task_id)
+        .map(|link| (link.to_worker.clone(), link.from_worker.subscribe()))
+}
+
 // ── The attachment socket (listener lane) ──────────────────────────────
 
 /// Serve one accepted cloud-worker WebSocket: resolve its task binding,
-/// flip the lease `connected`, hold until the socket ends, flip
-/// `disconnected`. The socket is the heartbeat — no frames are required
-/// beyond the hello, and tungstenite answers pings during the read loop.
+/// flip the lease `connected`, register the frame link, and pump frames
+/// until the socket ends or the identity expires — then flip
+/// `disconnected`. The socket doubles as the heartbeat; tungstenite
+/// answers pings during the read loop.
 pub(crate) async fn serve_attachment_socket<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     fingerprint: &str,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use futures_util::StreamExt as _;
+    use futures_util::{SinkExt as _, StreamExt as _};
 
     let lease_store = state_path();
     let broker = broker_path(&lease_store);
@@ -429,6 +491,20 @@ pub(crate) async fn serve_attachment_socket<S>(
         Ok(_) => eprintln!("[codex-cloud] worker attached for {task_id}"),
         Err(error) => eprintln!("[codex-cloud] attachment connect for {task_id}: {error}"),
     }
+    let (to_worker_tx, mut to_worker_rx) = tokio::sync::mpsc::channel::<String>(LINK_TO_WORKER_CAP);
+    let (from_worker_tx, _) = tokio::sync::broadcast::channel::<String>(LINK_FROM_WORKER_CAP);
+    {
+        let mut links = attachment_links()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        links.insert(
+            task_id.clone(),
+            AttachmentLink {
+                to_worker: to_worker_tx.clone(),
+                from_worker: from_worker_tx.clone(),
+            },
+        );
+    }
     // The identity's hard expiry bounds the live socket too — admission
     // checks the record, but a socket opened at minute 59 must not hold
     // the attachment past the hour. Time-boxed means the clock wins.
@@ -443,22 +519,71 @@ pub(crate) async fn serve_attachment_socket<S>(
             frame = read.next() => match frame {
                 None => break,
                 Some(Ok(message)) if message.is_close() => break,
-                Some(Ok(_)) => {}
+                Some(Ok(message)) => {
+                    if let Ok(text) = message.into_text() {
+                        route_worker_frame(&from_worker_tx, text.as_str());
+                    }
+                }
                 Some(Err(_)) => break,
+            },
+            outbound = to_worker_rx.recv() => match outbound {
+                Some(text) => {
+                    if write
+                        .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                None => break,
             },
             _ = tokio::time::sleep_until(deadline) => {
                 eprintln!(
                     "[codex-cloud] cloud-worker identity for {task_id} expired; closing the attachment"
                 );
-                use futures_util::SinkExt as _;
                 let _ = write.close().await;
                 break;
             }
         }
     }
+    {
+        // Remove only our own link: a reconnect may already have replaced
+        // it, and the replacement must survive this socket's teardown.
+        let mut links = attachment_links()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if links
+            .get(&task_id)
+            .is_some_and(|link| link.to_worker.same_channel(&to_worker_tx))
+        {
+            links.remove(&task_id);
+        }
+    }
     match record_attachment_state(&lease_store, &task_id, AttachmentState::Disconnected) {
         Ok(_) => eprintln!("[codex-cloud] worker detached for {task_id}"),
         Err(error) => eprintln!("[codex-cloud] attachment disconnect for {task_id}: {error}"),
+    }
+}
+
+/// Route one worker frame: reply kinds fan out to dashboard subscribers,
+/// everything else (hello included) is dropped without dispatch.
+fn route_worker_frame(from_worker_tx: &tokio::sync::broadcast::Sender<String>, text: &str) {
+    let kind = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("t")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    if kind
+        .as_deref()
+        .is_some_and(|kind| WORKER_REPLY_KINDS.contains(&kind))
+    {
+        // No subscribers is fine — output before any dashboard attaches
+        // simply has no audience.
+        let _ = from_worker_tx.send(text.to_string());
     }
 }
 
@@ -788,9 +913,14 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         cert_path,
         key_path,
     };
+    // Outlives individual sockets so shell sessions survive a reconnect;
+    // the task turn's end (or the identity expiry) tears everything down.
+    let terminal_registry = crate::terminal::TerminalRegistry::new(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
     let mut attempt: u32 = 0;
     loop {
-        match hold_attachment(&home, &pinned, &identity, &task).await {
+        match hold_attachment(&home, &pinned, &identity, &task, &terminal_registry).await {
             Ok(()) => {
                 attempt = 0;
                 eprintln!("[cloud-agent] attachment closed by home; reconnecting");
@@ -844,6 +974,7 @@ async fn hold_attachment(
     pinned: &[crate::access::pinning::Fingerprint],
     identity: &crate::peer::transport::tls_client::ClientIdentityPaths,
     task: &str,
+    registry: &crate::terminal::TerminalRegistry,
 ) -> Result<(), String> {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -864,21 +995,202 @@ async fn hold_attachment(
             .await
             .map_err(|e| format!("dial {home}: {e}"))?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({ "v": 1, "kind": HELLO_KIND, "task_id": task })
+        serde_json::json!({ "v": 2, "kind": HELLO_KIND, "task_id": task, "terminal": true })
             .to_string()
             .into(),
     ))
     .await
     .map_err(|e| format!("send hello: {e}"))?;
     eprintln!("[cloud-agent] attached; holding the socket");
-    while let Some(frame) = ws.next().await {
-        match frame {
-            Ok(message) if message.is_close() => break,
-            Ok(_) => {}
-            Err(error) => return Err(format!("attachment socket: {error}")),
+    // Replies and PTY output share one bounded outbound lane so forwarder
+    // tasks never interleave partial writes on the sink.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(LINK_FROM_WORKER_CAP);
+    // One PTY-output forwarder per terminal key: a re-open (browser
+    // reload, shell-pane host round-trip) attaches the surviving PTY, and
+    // without the abort each open would stack another listener and every
+    // output chunk would reach home once per stacked open.
+    let mut forwarders: std::collections::HashMap<
+        crate::terminal::TerminalKey,
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
+    let (mut sink, mut stream) = ws.split();
+    loop {
+        tokio::select! {
+            frame = stream.next() => match frame {
+                None => break,
+                Some(Ok(message)) if message.is_close() => break,
+                Some(Ok(message)) => {
+                    if let Ok(text) = message.into_text() {
+                        serve_worker_frame(registry, text.as_str(), &out_tx, &mut forwarders).await;
+                    }
+                }
+                Some(Err(error)) => return Err(format!("attachment socket: {error}")),
+            },
+            outbound = out_rx.recv() => match outbound {
+                Some(text) => {
+                    sink.send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                        .await
+                        .map_err(|e| format!("send frame: {e}"))?;
+                }
+                None => break,
+            },
         }
     }
     Ok(())
+}
+
+/// The worker's terminal server: home's authority over this worker is
+/// total (the container is the sandbox), so frames arriving on the
+/// authenticated attachment act as root with an unscoped spawn policy —
+/// the scoped/Landlock machinery never engages. Sessions live in the
+/// caller's registry so they survive a reconnect; the task turn's end
+/// (or the identity expiry) tears the whole process down.
+async fn serve_worker_frame(
+    registry: &crate::terminal::TerminalRegistry,
+    text: &str,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    forwarders: &mut std::collections::HashMap<
+        crate::terminal::TerminalKey,
+        tokio::task::JoinHandle<()>,
+    >,
+) {
+    use base64::Engine as _;
+
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let field = |name: &str| {
+        frame
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let kind = field("t");
+    let host_id = field("host_id");
+    let terminal_id = field("terminal_id");
+    if terminal_id.is_empty() {
+        return;
+    }
+    let key = crate::terminal::TerminalKey {
+        host_id: host_id.clone(),
+        terminal_id: terminal_id.clone(),
+    };
+    let actor = crate::terminal::TerminalActor::Root;
+    let reply = |mut value: serde_json::Value| {
+        if let Some(map) = value.as_object_mut() {
+            map.insert("host_id".into(), host_id.clone().into());
+            map.insert("terminal_id".into(), terminal_id.clone().into());
+        }
+        value.to_string()
+    };
+    match kind.as_str() {
+        "terminal_open" => {
+            let cols = frame
+                .get("cols")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(80) as u16;
+            let rows = frame
+                .get("rows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(24) as u16;
+            let policy = crate::terminal::ShellSpawnPolicy {
+                may_spawn: true,
+                shared: false,
+                scope: None,
+            };
+            match registry
+                .open_or_attach(key.clone(), cols, rows, &actor, policy)
+                .await
+            {
+                Ok((session, spawned)) => {
+                    eprintln!(
+                        "[cloud-agent] terminal_open {terminal_id} ({})",
+                        if spawned { "spawned" } else { "attached" }
+                    );
+                    if let Some(previous) = forwarders.remove(&key) {
+                        previous.abort();
+                    }
+                    let mut listener = session.attach();
+                    let _ = out_tx
+                        .send(reply(serde_json::json!({
+                            "t": "terminal_opened", "shared": false, "can_share": false,
+                        })))
+                        .await;
+                    let forward_tx = out_tx.clone();
+                    let forward_reply_host = host_id.clone();
+                    let forward_reply_terminal = terminal_id.clone();
+                    let handle = tokio::spawn(async move {
+                        while let Some(event) = listener.recv().await {
+                            let frame = match event {
+                                crate::terminal::TerminalEvent::Output(bytes) => {
+                                    serde_json::json!({
+                                        "t": "terminal_output",
+                                        "host_id": forward_reply_host,
+                                        "terminal_id": forward_reply_terminal,
+                                        "data": base64::engine::general_purpose::STANDARD
+                                            .encode(&bytes),
+                                    })
+                                }
+                                crate::terminal::TerminalEvent::Exited { status } => {
+                                    let exited = serde_json::json!({
+                                        "t": "terminal_exited",
+                                        "host_id": forward_reply_host,
+                                        "terminal_id": forward_reply_terminal,
+                                        "status": status,
+                                    });
+                                    let _ = forward_tx.send(exited.to_string()).await;
+                                    break;
+                                }
+                            };
+                            if forward_tx.send(frame.to_string()).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    forwarders.insert(key, handle);
+                }
+                Err(error) => {
+                    let _ = out_tx
+                        .send(reply(serde_json::json!({
+                            "t": "terminal_error", "error": error.to_string(),
+                        })))
+                        .await;
+                }
+            }
+        }
+        "terminal_input" => {
+            let data = frame
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+                .unwrap_or_default();
+            if let Some(session) = registry.get_visible(&key, &actor).await {
+                session.write_input(&data);
+            }
+        }
+        "terminal_resize" => {
+            let cols = frame
+                .get("cols")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(80) as u16;
+            let rows = frame
+                .get("rows")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(24) as u16;
+            if let Some(session) = registry.get_visible(&key, &actor).await {
+                session.resize(cols, rows);
+            }
+        }
+        "terminal_close" => {
+            // Drop the handle without aborting: the close kills the PTY,
+            // the listener sees Exited, and the forwarder flushes that
+            // final frame home before exiting on its own.
+            forwarders.remove(&key);
+            registry.close_visible(&key, &actor).await;
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1037,6 +1349,61 @@ mod tests {
         let err = home_url_from(Some("ws://127.0.0.1:8765/ws".into())).unwrap_err();
         assert!(err.contains("wss://"), "{err}");
         assert!(home_url_from(Some("wss://home.example:8443/ws".into())).is_ok());
+    }
+
+    #[test]
+    fn cloud_host_ids_parse_and_refuse_empties() {
+        assert_eq!(cloud_host_task_id("cloud:task_e_1"), Some("task_e_1"));
+        assert_eq!(cloud_host_task_id("cloud:"), None);
+        assert_eq!(cloud_host_task_id("local"), None);
+        assert_eq!(cloud_host_task_id("intendant:peer"), None);
+    }
+
+    #[test]
+    fn worker_frames_fan_out_replies_and_drop_everything_else() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(8);
+        // A reply kind reaches subscribers.
+        route_worker_frame(
+            &tx,
+            r#"{"t":"terminal_output","host_id":"cloud:x","terminal_id":"shell-0","data":"aGk="}"#,
+        );
+        assert!(rx.try_recv().is_ok());
+        // The worker cannot inject request kinds, hellos, or junk into
+        // home — its inbound authority stays nothing.
+        for dropped in [
+            r#"{"t":"terminal_open","host_id":"cloud:x","terminal_id":"shell-0"}"#,
+            r#"{"v":2,"kind":"cloud-worker-hello","task_id":"x"}"#,
+            r#"{"t":"api_sessions"}"#,
+            "not json",
+        ] {
+            route_worker_frame(&tx, dropped);
+            assert!(rx.try_recv().is_err(), "{dropped}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reopening_a_worker_terminal_replaces_its_forwarder() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::terminal::TerminalRegistry::new(dir.path().to_path_buf());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut forwarders = std::collections::HashMap::new();
+        let open = r#"{"t":"terminal_open","host_id":"cloud:t","terminal_id":"shell-0","cols":80,"rows":24}"#;
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        assert_eq!(forwarders.len(), 1);
+        let first = out_rx.recv().await.expect("first opened reply");
+        assert!(first.contains("terminal_opened"), "{first}");
+        let previous = forwarders
+            .values()
+            .next()
+            .map(tokio::task::JoinHandle::is_finished);
+        assert_eq!(previous, Some(false));
+        // A second open for the same key attaches the surviving PTY and
+        // must replace the listener, never stack a second one (stacked
+        // listeners double every output chunk on the dashboard).
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        assert_eq!(forwarders.len(), 1);
+        let second = out_rx.recv().await.expect("second opened reply");
+        assert!(second.contains("terminal_opened"), "{second}");
     }
 
     #[test]

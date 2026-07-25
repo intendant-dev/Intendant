@@ -970,8 +970,13 @@ class DashboardTransport {
     return dashboardControlTransportEnabled();
   }
 
-  startControl() {
-    if (!this.enabled()) return Promise.resolve(false);
+  startControl(options = {}) {
+    // `onDemand` starts the transport as a data lane for a feature that has
+    // no other path (cloud worker terminals ride only the tunnel bridge),
+    // without flipping the event-lane preference: with the legacy /ws
+    // healthy the tunnel simply coexists, exactly like the localStorage
+    // opt-in lane.
+    if (!this.enabled() && !options.onDemand) return Promise.resolve(false);
     if (!window.RTCPeerConnection) return Promise.reject(new Error('RTCPeerConnection is unavailable'));
     if (dashboardControlTransport) return this.controlStartPromise || Promise.resolve(true);
     dashboardControlTransport = new DashboardControlTransport();
@@ -1290,8 +1295,8 @@ dashboardTransport = new DashboardTransport();
 dashboardUpdateTransportStatus();
 refreshVirtualDisplayAvailability();
 
-function maybeStartDashboardControlTransport() {
-  return dashboardTransport.startControl();
+function maybeStartDashboardControlTransport(options = {}) {
+  return dashboardTransport.startControl(options);
 }
 
 async function waitForDashboardControlReady(timeoutMs = 30000) {
