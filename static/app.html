@@ -36431,7 +36431,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'aafb89a83aab54ee';
+const INTENDANT_APP_BUILD = 'e484bb986ee16278';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -79566,7 +79566,15 @@ function sendShellMessage(obj) {
     if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame({ ...obj, host_id: hostId })) {
       return true;
     }
-    setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    // The tunnel is the only lane for cloud terminals: kick an on-demand
+    // start (dedup'd inside startControl) — the transport-status update on
+    // connect re-opens the shell via maybeOpenShellAfterTransportReady.
+    if (typeof maybeStartDashboardControlTransport === 'function') {
+      maybeStartDashboardControlTransport({ onDemand: true });
+      setShellHostStatus('Connecting the dashboard tunnel for the cloud worker terminal…', '');
+    } else {
+      setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    }
     if (obj?.t === 'terminal_open') showShellWaitingNotice();
     return false;
   }
@@ -95930,6 +95938,12 @@ function cloudConnectedShellHosts() {
 }
 
 function openCloudWorkerTerminal(taskId) {
+  // Cloud terminal frames ride only the dashboard-control tunnel; start it
+  // on demand so the affordance works even when the legacy /ws is the
+  // event lane (the default browser posture) and the tunnel is idle.
+  if (typeof maybeStartDashboardControlTransport === 'function') {
+    maybeStartDashboardControlTransport({ onDemand: true });
+  }
   if (typeof refreshShellHostOptions === 'function') refreshShellHostOptions();
   if (typeof setShellHost === 'function') setShellHost(`cloud:${taskId}`);
   if (typeof switchTab === 'function') switchTab('terminal');
@@ -99214,8 +99228,13 @@ class DashboardTransport {
     return dashboardControlTransportEnabled();
   }
 
-  startControl() {
-    if (!this.enabled()) return Promise.resolve(false);
+  startControl(options = {}) {
+    // `onDemand` starts the transport as a data lane for a feature that has
+    // no other path (cloud worker terminals ride only the tunnel bridge),
+    // without flipping the event-lane preference: with the legacy /ws
+    // healthy the tunnel simply coexists, exactly like the localStorage
+    // opt-in lane.
+    if (!this.enabled() && !options.onDemand) return Promise.resolve(false);
     if (!window.RTCPeerConnection) return Promise.reject(new Error('RTCPeerConnection is unavailable'));
     if (dashboardControlTransport) return this.controlStartPromise || Promise.resolve(true);
     dashboardControlTransport = new DashboardControlTransport();
@@ -99534,8 +99553,8 @@ dashboardTransport = new DashboardTransport();
 dashboardUpdateTransportStatus();
 refreshVirtualDisplayAvailability();
 
-function maybeStartDashboardControlTransport() {
-  return dashboardTransport.startControl();
+function maybeStartDashboardControlTransport(options = {}) {
+  return dashboardTransport.startControl(options);
 }
 
 async function waitForDashboardControlReady(timeoutMs = 30000) {

@@ -481,7 +481,15 @@ function sendShellMessage(obj) {
     if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame({ ...obj, host_id: hostId })) {
       return true;
     }
-    setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    // The tunnel is the only lane for cloud terminals: kick an on-demand
+    // start (dedup'd inside startControl) — the transport-status update on
+    // connect re-opens the shell via maybeOpenShellAfterTransportReady.
+    if (typeof maybeStartDashboardControlTransport === 'function') {
+      maybeStartDashboardControlTransport({ onDemand: true });
+      setShellHostStatus('Connecting the dashboard tunnel for the cloud worker terminal…', '');
+    } else {
+      setShellHostStatus('Cloud worker terminals need the dashboard tunnel', 'error');
+    }
     if (obj?.t === 'terminal_open') showShellWaitingNotice();
     return false;
   }

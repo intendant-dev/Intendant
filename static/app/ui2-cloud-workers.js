@@ -218,6 +218,12 @@ function cloudConnectedShellHosts() {
 }
 
 function openCloudWorkerTerminal(taskId) {
+  // Cloud terminal frames ride only the dashboard-control tunnel; start it
+  // on demand so the affordance works even when the legacy /ws is the
+  // event lane (the default browser posture) and the tunnel is idle.
+  if (typeof maybeStartDashboardControlTransport === 'function') {
+    maybeStartDashboardControlTransport({ onDemand: true });
+  }
   if (typeof refreshShellHostOptions === 'function') refreshShellHostOptions();
   if (typeof setShellHost === 'function') setShellHost(`cloud:${taskId}`);
   if (typeof switchTab === 'function') switchTab('terminal');

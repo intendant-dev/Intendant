@@ -277,7 +277,15 @@ Seatbelt scoped-shell machinery never engages. Sessions survive a socket
 reconnect (the worker keeps its registry across redials) and die with the
 task turn or the identity expiry. Sharing is refused on cloud hosts, and
 the bridge rides the dashboard tunnel only — the legacy `/ws` fallback
-serves local terminals exclusively.
+serves local terminals exclusively. Because the tunnel is the only lane,
+opening a cloud terminal starts the dashboard-control transport **on
+demand** when it is not already up (the default browser posture keeps the
+legacy `/ws` as the event lane and no tunnel): the transport comes up as a
+data lane, the event-lane preference is untouched, and the queued open
+replays automatically once it connects. On the worker, each terminal key
+keeps exactly one output forwarder — a re-open (browser reload, host
+round-trip) replaces the listener on the surviving PTY rather than
+stacking a second one, which would double every output chunk.
 
 ## Attachment lifecycle
 

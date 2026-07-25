@@ -1005,6 +1005,14 @@ async fn hold_attachment(
     // Replies and PTY output share one bounded outbound lane so forwarder
     // tasks never interleave partial writes on the sink.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(LINK_FROM_WORKER_CAP);
+    // One PTY-output forwarder per terminal key: a re-open (browser
+    // reload, shell-pane host round-trip) attaches the surviving PTY, and
+    // without the abort each open would stack another listener and every
+    // output chunk would reach home once per stacked open.
+    let mut forwarders: std::collections::HashMap<
+        crate::terminal::TerminalKey,
+        tokio::task::JoinHandle<()>,
+    > = std::collections::HashMap::new();
     let (mut sink, mut stream) = ws.split();
     loop {
         tokio::select! {
@@ -1013,7 +1021,7 @@ async fn hold_attachment(
                 Some(Ok(message)) if message.is_close() => break,
                 Some(Ok(message)) => {
                     if let Ok(text) = message.into_text() {
-                        serve_worker_frame(registry, text.as_str(), &out_tx).await;
+                        serve_worker_frame(registry, text.as_str(), &out_tx, &mut forwarders).await;
                     }
                 }
                 Some(Err(error)) => return Err(format!("attachment socket: {error}")),
@@ -1041,6 +1049,10 @@ async fn serve_worker_frame(
     registry: &crate::terminal::TerminalRegistry,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
+    forwarders: &mut std::collections::HashMap<
+        crate::terminal::TerminalKey,
+        tokio::task::JoinHandle<()>,
+    >,
 ) {
     use base64::Engine as _;
 
@@ -1088,10 +1100,17 @@ async fn serve_worker_frame(
                 scope: None,
             };
             match registry
-                .open_or_attach(key, cols, rows, &actor, policy)
+                .open_or_attach(key.clone(), cols, rows, &actor, policy)
                 .await
             {
-                Ok((session, _spawned)) => {
+                Ok((session, spawned)) => {
+                    eprintln!(
+                        "[cloud-agent] terminal_open {terminal_id} ({})",
+                        if spawned { "spawned" } else { "attached" }
+                    );
+                    if let Some(previous) = forwarders.remove(&key) {
+                        previous.abort();
+                    }
                     let mut listener = session.attach();
                     let _ = out_tx
                         .send(reply(serde_json::json!({
@@ -1101,7 +1120,7 @@ async fn serve_worker_frame(
                     let forward_tx = out_tx.clone();
                     let forward_reply_host = host_id.clone();
                     let forward_reply_terminal = terminal_id.clone();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         while let Some(event) = listener.recv().await {
                             let frame = match event {
                                 crate::terminal::TerminalEvent::Output(bytes) => {
@@ -1129,6 +1148,7 @@ async fn serve_worker_frame(
                             }
                         }
                     });
+                    forwarders.insert(key, handle);
                 }
                 Err(error) => {
                     let _ = out_tx
@@ -1163,6 +1183,10 @@ async fn serve_worker_frame(
             }
         }
         "terminal_close" => {
+            // Drop the handle without aborting: the close kills the PTY,
+            // the listener sees Exited, and the forwarder flushes that
+            // final frame home before exiting on its own.
+            forwarders.remove(&key);
             registry.close_visible(&key, &actor).await;
         }
         _ => {}
@@ -1355,6 +1379,31 @@ mod tests {
             route_worker_frame(&tx, dropped);
             assert!(rx.try_recv().is_err(), "{dropped}");
         }
+    }
+
+    #[tokio::test]
+    async fn reopening_a_worker_terminal_replaces_its_forwarder() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::terminal::TerminalRegistry::new(dir.path().to_path_buf());
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let mut forwarders = std::collections::HashMap::new();
+        let open = r#"{"t":"terminal_open","host_id":"cloud:t","terminal_id":"shell-0","cols":80,"rows":24}"#;
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        assert_eq!(forwarders.len(), 1);
+        let first = out_rx.recv().await.expect("first opened reply");
+        assert!(first.contains("terminal_opened"), "{first}");
+        let previous = forwarders
+            .values()
+            .next()
+            .map(tokio::task::JoinHandle::is_finished);
+        assert_eq!(previous, Some(false));
+        // A second open for the same key attaches the surviving PTY and
+        // must replace the listener, never stack a second one (stacked
+        // listeners double every output chunk on the dashboard).
+        serve_worker_frame(&registry, open, &out_tx, &mut forwarders).await;
+        assert_eq!(forwarders.len(), 1);
+        let second = out_rx.recv().await.expect("second opened reply");
+        assert!(second.contains("terminal_opened"), "{second}");
     }
 
     #[test]
