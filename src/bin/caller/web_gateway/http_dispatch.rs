@@ -1692,6 +1692,22 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::GithubInstallations => {
+                return handle_github_installations(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::GithubRepositories => {
+                return handle_github_repositories(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ClaudeAuthStart => {
                 return handle_claude_auth_start(
                     stream,

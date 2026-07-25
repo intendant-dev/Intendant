@@ -974,3 +974,29 @@ html.ui-v2 #access-github-integration-section .vault-install-link {
 html.ui-v2 #access-github-integration-section .vault-install-link:hover {
   background: rgba(var(--iris-rgb), .22);
 }
+html.ui-v2 #access-github-integration-section .vault-repo-picker {
+  margin: 4px 0 12px;
+}
+html.ui-v2 #access-github-integration-section .vault-repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 4px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+}
+html.ui-v2 #access-github-integration-section .vault-repo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+html.ui-v2 #access-github-integration-section .vault-repo-item input {
+  accent-color: var(--iris);
+}

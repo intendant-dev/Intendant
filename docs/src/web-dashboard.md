@@ -1947,6 +1947,8 @@ response omits the header.
 | DELETE | `/api/integrations/github` | CredentialsManage | own origin | none | Remove the GitHub App integration credentials from custody |
 | POST | `/api/integrations/github/manifest-start` | CredentialsManage | own origin | ≤ 4 KiB | Begin the one-click GitHub App Manifest ceremony (mints the single-use state; refuses without a custody backend) |
 | GET | `/api/integrations/github/callback` | public | own origin | none | GitHub App Manifest redirect landing (single-use state is the authorization; renders a return-to-dashboard page) |
+| GET | `/api/integrations/github/installations` | CredentialsManage | own origin | none | The App's installations (App-JWT discovery; works while the install is pending) |
+| GET | `/api/integrations/github/repositories` | CredentialsManage | own origin | none | Repositories the installation can see (installation token; feeds the repo picker) |
 | GET | `/api/local-daemons/tokens` | CredentialsManage | own origin | none | Loopback admission tokens for same-home daemon instances (owner handoff) |
 | POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
 | GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
