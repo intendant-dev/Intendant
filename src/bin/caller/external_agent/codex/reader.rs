@@ -439,6 +439,7 @@ pub(crate) async fn reader_task(
             &mut notification_state,
             thread_id.as_deref(),
             turn_id.as_deref(),
+            protocol_watch.as_ref(),
         );
     }
 }
@@ -989,6 +990,102 @@ pub(crate) fn codex_collab_agent_tool_call(params: &serde_json::Value) -> Option
         model,
         reasoning_effort,
         agents,
+    })
+}
+
+/// The command-ish label for a wire `dynamicToolCall` item, derived through
+/// the catalog lane's rollout mapping (`rollout::codex_function_call_command`)
+/// so live rows and hydrated rows agree: `exec_command`-style calls surface
+/// their command argument, every other dynamic tool surfaces its tool name.
+/// Freeform custom tools deliver their raw string input as `arguments` — for
+/// the exec-shaped ones (codex 0.145's `exec` custom tool) that string IS the
+/// command.
+pub(crate) fn codex_dynamic_tool_command(item: &serde_json::Value) -> Option<String> {
+    let tool = item
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let arguments = item
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if matches!(tool, "exec" | "exec_command" | "shell" | "bash" | "sh") {
+        // Exec-shaped dynamic tools: prefer the command argument whatever
+        // the envelope — object arguments ({cmd}/{command}/{script}, via the
+        // rollout mapping's exec_command path), else a freeform string input
+        // that IS the command.
+        let payload = serde_json::json!({ "name": "exec_command", "arguments": arguments.clone() });
+        if let Some(command) = rollout::codex_function_call_command(&payload)
+            .filter(|command| command != "exec_command")
+        {
+            return Some(command);
+        }
+        if let Some(raw) = arguments.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(raw.to_string());
+        }
+        return Some(tool.to_string());
+    }
+    let payload = serde_json::json!({ "name": tool, "arguments": arguments });
+    rollout::codex_function_call_command(&payload).or_else(|| Some(tool.to_string()))
+}
+
+/// Text output of a completed `dynamicToolCall` item: the concatenated
+/// `inputText` content items (image/audio entries surface nothing textual).
+pub(crate) fn codex_dynamic_tool_output_text(item: &serde_json::Value) -> String {
+    let Some(items) = item
+        .get("contentItems")
+        .or_else(|| item.get("content_items"))
+        .and_then(|v| v.as_array())
+    else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for entry in items {
+        if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+/// A wire `subAgentActivity` item names a collab child thread. codex 0.145
+/// multi-agent-v2 spawns announce receivers ONLY here — the accompanying
+/// `collabAgentToolCall` items carry empty `receiverThreadIds` (captured
+/// live 2026-07-26) — so this is the reader's registration signal for
+/// child-thread event routing. Surfaced as a `SubAgentToolCall` whose
+/// `receiver_thread_ids` carries the child; the status stays the activity
+/// kind verbatim (never "inProgress"), so the drain registers and announces
+/// the child without minting a synthetic tool-call activity row.
+pub(crate) fn codex_sub_agent_activity_event(
+    params: &serde_json::Value,
+    thread_id: Option<&str>,
+) -> Option<AgentEvent> {
+    let item = params.get("item").unwrap_or(params);
+    if item.get("type").and_then(|v| v.as_str()) != Some("subAgentActivity") {
+        return None;
+    }
+    let child_thread_id = non_empty_string_at(item, &["/agentThreadId", "/agent_thread_id"])?;
+    let item_id = non_empty_string_at(item, &["/id"]).unwrap_or_default();
+    let kind = non_empty_string_at(item, &["/kind"]).unwrap_or_else(|| "started".to_string());
+    let sender_thread_id = non_empty_string_at(params, &["/threadId", "/thread_id"])
+        .or_else(|| thread_id.map(str::to_string))
+        .unwrap_or_default();
+    Some(AgentEvent::SubAgentToolCall {
+        item_id,
+        tool: "subAgentActivity".to_string(),
+        status: kind,
+        sender_thread_id,
+        receiver_thread_ids: vec![child_thread_id],
+        prompt: None,
+        model: None,
+        reasoning_effort: None,
+        agents: Vec::new(),
     })
 }
 
@@ -2361,7 +2458,7 @@ pub(crate) fn translate_notification_with_state(
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
     state: &mut CodexNotificationState,
 ) {
-    translate_notification_with_scope(method, params, event_tx, state, None, None);
+    translate_notification_with_scope(method, params, event_tx, state, None, None, None);
 }
 
 pub(crate) fn codex_item_event_id<'a>(
@@ -2389,6 +2486,7 @@ pub(crate) fn translate_notification_with_scope(
     state: &mut CodexNotificationState,
     thread_id: Option<&str>,
     turn_id: Option<&str>,
+    protocol_watch: Option<&crate::external_agent::protocol_watch::ProtocolWatchHandle>,
 ) {
     match method {
         "error" => {
@@ -2550,8 +2648,52 @@ pub(crate) fn translate_notification_with_scope(
                         send_scoped_agent_event(event_tx, thread_id, turn_id, event);
                     }
                 }
+                // Dynamic tool calls carry codex 0.145's custom/freeform tools
+                // (the unified-exec `exec` custom tool among them). Mirror the
+                // catalog lane's function-call mapping so live rows and
+                // hydrated rows agree: exec-style calls surface their command
+                // argument, every other dynamic tool surfaces its tool name.
+                // Observing the command keys the output echo filter to the
+                // same call_* id its output events ride.
+                "dynamicToolCall" => {
+                    if let Some(command) = codex_dynamic_tool_command(item) {
+                        observe_codex_command_output_command(state, &item_id, &command);
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolStarted {
+                                item_id,
+                                tool_name: "command".to_string(),
+                                preview: compact_codex_command_preview(&command),
+                                message_uuid: None,
+                            },
+                        );
+                    }
+                }
+                "subAgentActivity" => {
+                    if let Some(event) = codex_sub_agent_activity_event(params, thread_id) {
+                        send_scoped_agent_event(event_tx, thread_id, turn_id, event);
+                    }
+                }
                 other => {
-                    let _ = other;
+                    if let Some(watch) = protocol_watch {
+                        if let Some(message) = watch.observe(
+                            crate::external_agent::protocol_watch::codex_unhandled_item_type_finding(
+                                other,
+                            ),
+                        ) {
+                            send_scoped_agent_event(
+                                event_tx,
+                                thread_id,
+                                turn_id,
+                                AgentEvent::Log {
+                                    level: "warn".to_string(),
+                                    message,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2571,6 +2713,44 @@ pub(crate) fn translate_notification_with_scope(
                     AgentEvent::ToolOutputDelta {
                         item_id,
                         text,
+                        message_uuid: None,
+                    },
+                );
+            }
+        }
+
+        // codex 0.145 unified exec: `write_stdin` calls announce no item pair
+        // — this notification's typed stdin IS the command announcement,
+        // keyed to the owning exec session's call_* id (the same id its
+        // outputDelta stream rides). Without a begin here, live Activity
+        // shows the session's streamed output with no command lines (the
+        // rollout records the paired `write_stdin` function_call, so reload
+        // showed them — the live/hydration drift of 2026-07-26). Observing
+        // the typed line also keys the echo filter so the PTY's own echo of
+        // it is stripped from the output stream. Empty stdin is an output
+        // poll, not a command — stays silent.
+        "item/commandExecution/terminalInteraction" => {
+            let item_id = params
+                .get("itemId")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let command = params
+                .get("stdin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if !item_id.is_empty() && !command.is_empty() {
+                observe_codex_command_output_command(state, &item_id, command);
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::ToolStarted {
+                        item_id,
+                        tool_name: "command".to_string(),
+                        preview: compact_codex_command_preview(command),
                         message_uuid: None,
                     },
                 );
@@ -2666,6 +2846,16 @@ pub(crate) fn translate_notification_with_scope(
                 return;
             }
 
+            // A completed subAgentActivity still names its child thread —
+            // forward it for routing registration, and skip the generic
+            // ToolCompleted tail (the announcement is not a tool row).
+            if item_type == "subAgentActivity" {
+                if let Some(event) = codex_sub_agent_activity_event(params, thread_id) {
+                    send_scoped_agent_event(event_tx, thread_id, turn_id, event);
+                }
+                return;
+            }
+
             // The remaining types are Codex UI/bookkeeping records, not tools.
             if matches!(item_type, "contextCompaction" | "imageView") {
                 return;
@@ -2724,6 +2914,32 @@ pub(crate) fn translate_notification_with_scope(
                         .command_output_hygiene
                         .remove(&codex_command_output_hygiene_key(&item_id));
                 }
+            }
+
+            // Dynamic tool results carry their output as content items.
+            if item_type == "dynamicToolCall" {
+                if let Some(command) = codex_dynamic_tool_command(item) {
+                    observe_codex_command_output_command(state, &item_id, &command);
+                }
+                let output = codex_dynamic_tool_output_text(item);
+                if !output.is_empty() {
+                    if let Some(text) = filter_codex_command_output(state, &item_id, &output, true)
+                    {
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolOutputDelta {
+                                item_id: item_id.clone(),
+                                text,
+                                message_uuid: None,
+                            },
+                        );
+                    }
+                }
+                state
+                    .command_output_hygiene
+                    .remove(&codex_command_output_hygiene_key(&item_id));
             }
 
             // Extract MCP tool call results
@@ -2969,7 +3185,6 @@ pub(crate) fn translate_notification_with_scope(
         | "thread/closed"
         | "thread/tokenUsage/updated"
         | "account/rateLimits/updated"
-        | "item/commandExecution/terminalInteraction"
         | "configWarning"
         | "serverRequest/resolved"
         | "remoteControl/status/changed" => {}
@@ -3042,7 +3257,28 @@ pub(crate) fn translate_notification_with_scope(
         "skills/changed" => {}
 
         other => {
-            let _ = other;
+            // Methods that reach here were dropped without a translation.
+            // `codex_findings` only flags tokens missing from the pinned
+            // vocabulary, so a pinned-but-unhandled method (the class the
+            // 0.145 unified-exec begins fell into) needs its own finding to
+            // become visible drift instead of a silent Activity gap.
+            if let Some(watch) = protocol_watch {
+                if let Some(message) = watch.observe(
+                    crate::external_agent::protocol_watch::codex_unhandled_notification_finding(
+                        other,
+                    ),
+                ) {
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::Log {
+                            level: "warn".to_string(),
+                            message,
+                        },
+                    );
+                }
+            }
         }
     }
 }
@@ -4627,21 +4863,409 @@ error: build failed
         output
     }
 
+    // ── codex 0.145 unified-exec live begins ──
+    //
+    // Fixture shapes below are verbatim from raw app-server captures taken
+    // on codex-cli 0.145.0 (2026-07-26): `write_stdin` interactions announce
+    // no item pair — only `item/commandExecution/terminalInteraction` keyed
+    // to the owning exec session's call_* id — which the reader used to
+    // swallow in its informational-ignore arm, so live Activity streamed
+    // command output with no command lines (the 2026-07-26 owner-evidenced
+    // regression; supersedes the 2026-05-18 `is_silent` pin).
+
     #[test]
-    fn translate_terminal_interaction_is_silent() {
+    fn translate_terminal_interaction_emits_command_begin() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let params = serde_json::json!({
+            "threadId": "019fa026-a704-7293-b9ee-99b53cdbd4be",
+            "turnId": "019fa026-a7e1-74f3-a20d-91d2b0354c6a",
+            "itemId": "call_HiA1fm9F4JbgDytJXQ4bPpLT",
+            "processId": "82438",
+            "stdin": "print('lane1b-interaction')\n"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/terminalInteraction",
+            &params,
+            &tx,
+            &mut state,
+        );
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted {
+                item_id,
+                tool_name,
+                preview,
+                ..
+            } => {
+                assert_eq!(item_id, "call_HiA1fm9F4JbgDytJXQ4bPpLT");
+                assert_eq!(tool_name, "command");
+                assert_eq!(preview, "print('lane1b-interaction')");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one event per interaction");
+        // Echo-filter alignment: the typed line is observed under the SAME
+        // call_* key the session's outputDelta stream rides.
+        assert!(
+            state
+                .command_output_hygiene
+                .contains_key("call_HiA1fm9F4JbgDytJXQ4bPpLT"),
+            "interaction must observe its command under the session's output key"
+        );
+    }
+
+    #[test]
+    fn translate_terminal_interaction_empty_stdin_is_silent_poll() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for stdin in ["", "   ", "\n"] {
+            let params = serde_json::json!({
+                "itemId": "call_123",
+                "processId": "62701",
+                "stdin": stdin,
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            });
+            translate_notification("item/commandExecution/terminalInteraction", &params, &tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "an output poll (stdin {stdin:?}) is not a command"
+            );
+        }
+        // Without the owning session's item id there is no row to key.
+        let params = serde_json::json!({ "stdin": "echo hi\n" });
+        translate_notification("item/commandExecution/terminalInteraction", &params, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn translate_terminal_interaction_scopes_to_notification_thread() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let params = serde_json::json!({
+            "threadId": "child-thread",
+            "turnId": "child-turn",
+            "itemId": "call_side",
+            "stdin": "echo side\n"
+        });
+        translate_notification_with_scope(
+            "item/commandExecution/terminalInteraction",
+            &params,
+            &tx,
+            &mut state,
+            Some("child-thread"),
+            Some("child-turn"),
+            None,
+        );
+        match rx.try_recv().unwrap() {
+            AgentEvent::Scoped {
+                thread_id, event, ..
+            } => {
+                assert_eq!(thread_id.as_deref(), Some("child-thread"));
+                match *event {
+                    AgentEvent::ToolStarted { ref item_id, .. } => {
+                        assert_eq!(item_id, "call_side")
+                    }
+                    ref other => panic!("expected ToolStarted, got {:?}", other),
+                }
+            }
+            other => panic!("expected Scoped ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_dynamic_tool_call_started_emits_command_begin() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        // exec_command-style JSON arguments extract the command argument.
+        let params = serde_json::json!({
+            "item": {
+                "type": "dynamicToolCall",
+                "id": "call_dyn1",
+                "namespace": null,
+                "tool": "exec_command",
+                "arguments": {"cmd": "jq . data.json"},
+                "status": "inProgress"
+            }
+        });
+        translate_notification_with_state("item/started", &params, &tx, &mut state);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted {
+                item_id,
+                tool_name,
+                preview,
+                ..
+            } => {
+                assert_eq!(item_id, "call_dyn1");
+                assert_eq!(tool_name, "command");
+                assert_eq!(preview, "jq . data.json");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+        assert!(
+            state.command_output_hygiene.contains_key("call_dyn1"),
+            "dynamic exec begin must observe its command under the call id"
+        );
+
+        // The 0.145 freeform `exec` custom tool delivers its raw string
+        // input as the arguments — that string IS the command.
+        let params = serde_json::json!({
+            "item": {
+                "type": "dynamicToolCall",
+                "id": "call_dyn2",
+                "tool": "exec",
+                "arguments": "rg -n 'pattern' src/",
+                "status": "inProgress"
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted {
+                item_id, preview, ..
+            } => {
+                assert_eq!(item_id, "call_dyn2");
+                assert_eq!(preview, "rg -n 'pattern' src/");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+
+        // Non-exec dynamic tools surface their tool name (the catalog
+        // lane's mapping for non-exec function calls).
+        let params = serde_json::json!({
+            "item": {
+                "type": "dynamicToolCall",
+                "id": "call_dyn3",
+                "tool": "browser.search",
+                "arguments": {"query": "docs"},
+                "status": "inProgress"
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted {
+                item_id, preview, ..
+            } => {
+                assert_eq!(item_id, "call_dyn3");
+                assert_eq!(preview, "browser.search");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_dynamic_tool_call_completed_emits_output_and_completion() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
-            "itemId": "call_123",
-            "processId": "62701",
-            "stdin": "secret input\n",
-            "threadId": "thread-1",
-            "turnId": "turn-1"
+            "item": {
+                "type": "dynamicToolCall",
+                "id": "call_dyn4",
+                "tool": "exec",
+                "arguments": "echo done",
+                "status": "completed",
+                "success": true,
+                "contentItems": [
+                    {"type": "inputText", "text": "done"},
+                    {"type": "inputImage", "imageUrl": "data:image/png;base64,xxxx"}
+                ]
+            }
         });
-        translate_notification("item/commandExecution/terminalInteraction", &params, &tx);
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolOutputDelta { item_id, text, .. } => {
+                assert_eq!(item_id, "call_dyn4");
+                assert_eq!(text, "done");
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted {
+                item_id, status, ..
+            } => {
+                assert_eq!(item_id, "call_dyn4");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_sub_agent_activity_registers_child_thread() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Verbatim capture shape: multi_agent_v2 spawns announce the child
+        // thread ONLY here (collabAgentToolCall receiverThreadIds arrive
+        // empty), and the item surfaces at item/completed.
+        let params = serde_json::json!({
+            "item": {
+                "type": "subAgentActivity",
+                "id": "call_hmKrhNulgzAcITeZrL1T3xbj",
+                "kind": "started",
+                "agentThreadId": "019fa02d-0072-7071-bf56-ef1a7833aadb",
+                "agentPath": "/root/lane2_capture"
+            },
+            "threadId": "019fa02c-e8b5-7b23-8feb-ff7fa3246ffa"
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::SubAgentToolCall {
+                item_id,
+                tool,
+                status,
+                sender_thread_id,
+                receiver_thread_ids,
+                ..
+            } => {
+                assert_eq!(item_id, "call_hmKrhNulgzAcITeZrL1T3xbj");
+                assert_eq!(tool, "subAgentActivity");
+                assert_eq!(status, "started");
+                assert_eq!(sender_thread_id, "019fa02c-e8b5-7b23-8feb-ff7fa3246ffa");
+                assert_eq!(
+                    receiver_thread_ids,
+                    vec!["019fa02d-0072-7071-bf56-ef1a7833aadb".to_string()]
+                );
+            }
+            other => panic!("expected SubAgentToolCall, got {:?}", other),
+        }
         assert!(
             rx.try_recv().is_err(),
-            "terminal stdin interactions should not emit activity events"
+            "a subagent announcement is not a tool row — no ToolCompleted tail"
         );
+
+        // item/started carries the same registration signal.
+        let params = serde_json::json!({
+            "item": {
+                "type": "subAgentActivity",
+                "id": "call_x",
+                "kind": "interacted",
+                "agentThreadId": "child-2",
+                "agentPath": "/root/x"
+            },
+            "threadId": "parent-1"
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::SubAgentToolCall {
+                status,
+                receiver_thread_ids,
+                ..
+            } => {
+                assert_eq!(status, "interacted");
+                assert_eq!(receiver_thread_ids, vec!["child-2".to_string()]);
+            }
+            other => panic!("expected SubAgentToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_unified_exec_startup_matrix_stays_mapped() {
+        // Verbatim lane-1 capture shape: exec_command startups DO arrive as
+        // commandExecution items (id = call_*, source unifiedExecStartup) —
+        // pin that the begin arm keeps mapping them so the terminal-
+        // interaction lane above is additive, not a replacement.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "type": "commandExecution",
+                "id": "call_nfk4YmDCwzCRd4HNQE4GbiZL",
+                "command": "/bin/zsh -lc 'echo lane1-capture-ok'",
+                "cwd": "/tmp/scratch1",
+                "processId": "72022",
+                "source": "unifiedExecStartup",
+                "status": "inProgress",
+                "aggregatedOutput": null
+            },
+            "threadId": "019fa023-40b6-7070-b491-c0d39a742d60",
+            "turnId": "019fa023-418b-7c81-a81b-4b3d39668bd1"
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted {
+                item_id, tool_name, ..
+            } => {
+                assert_eq!(item_id, "call_nfk4YmDCwzCRd4HNQE4GbiZL");
+                assert_eq!(tool_name, "command");
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_unhandled_item_type_and_method_report_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let command = tmp.path().join("codex-fixture.exe");
+        #[cfg(not(windows))]
+        let command = tmp.path().join("codex-fixture");
+        std::fs::write(&command, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let watch = crate::external_agent::protocol_watch::ProtocolWatchHandle::new_in(
+            tmp.path().join("state"),
+            crate::external_agent::AgentBackend::Codex,
+            "vanilla",
+            command.to_str().unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+
+        // A pinned-known item type with no translation arm becomes a named
+        // finding (this is the class the unified-exec begins fell into).
+        let params = serde_json::json!({ "item": { "type": "sleep", "id": "item-s" } });
+        translate_notification_with_scope(
+            "item/started",
+            &params,
+            &tx,
+            &mut state,
+            None,
+            None,
+            Some(&watch),
+        );
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "warn");
+                assert!(message.contains("codex_unhandled_item_type"), "{message}");
+                assert!(message.contains("'sleep'"), "{message}");
+            }
+            other => panic!("expected Log finding, got {:?}", other),
+        }
+        // Deduped per process: the second occurrence stays silent.
+        translate_notification_with_scope(
+            "item/started",
+            &params,
+            &tx,
+            &mut state,
+            None,
+            None,
+            Some(&watch),
+        );
+        assert!(rx.try_recv().is_err());
+
+        // A method dropped by the final arm reports on its own surface.
+        translate_notification_with_scope(
+            "some/unknown/method",
+            &serde_json::json!({}),
+            &tx,
+            &mut state,
+            None,
+            None,
+            Some(&watch),
+        );
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "warn");
+                assert!(
+                    message.contains("codex_unhandled_notification"),
+                    "{message}"
+                );
+                assert!(
+                    !message.contains("some/unknown/method"),
+                    "novel identifiers stay redacted: {message}"
+                );
+            }
+            other => panic!("expected Log finding, got {:?}", other),
+        }
     }
 
     #[test]
@@ -5371,6 +5995,7 @@ error: build failed
             &mut state,
             Some("thread-abc"),
             Some("turn-xyz"),
+            None,
         );
 
         match rx.try_recv().unwrap() {
@@ -6008,7 +6633,6 @@ error: build failed
             "thread/started",
             "thread/tokenUsage/updated",
             "account/rateLimits/updated",
-            "item/commandExecution/terminalInteraction",
             "mcpServer/startupStatus/updated",
             "configWarning",
         ];
