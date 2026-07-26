@@ -516,16 +516,30 @@ fn ceremony_page(
     detail: &str,
     return_origin: Option<&str>,
 ) -> ApiResponse {
+    // Return-to-context (UX0 ruling): the ceremony landed the user on an
+    // external hop, so both the link and the auto-refresh carry them back
+    // AT THE VAULT SECTION with fresh state — `?ceremony=github` tells the
+    // section to bypass its status cache and scroll itself into view
+    // (32-vault-custody.js reads and strips it); `#vault` is the router's
+    // tab anchor. A bare origin root-drop was the owner's finding 3.
     let (link, refresh) = match return_origin {
         Some(origin) => {
             let escaped = html_escape(origin);
             (
-                format!("<p><a href=\"{escaped}/\">Return to the dashboard</a></p>"),
-                format!("<meta http-equiv=\"refresh\" content=\"6;url={escaped}/\">"),
+                format!(
+                    "<p><a href=\"{escaped}/?ceremony=github#vault\">\
+                     Return to the dashboard's Vault section</a></p>"
+                ),
+                format!(
+                    "<meta http-equiv=\"refresh\" \
+                     content=\"6;url={escaped}/?ceremony=github#vault\">"
+                ),
             )
         }
         None => (
-            "<p>Return to the dashboard tab you started from.</p>".to_string(),
+            "<p>Return to the dashboard tab you started from — the Vault section \
+             shows the integration's live state.</p>"
+                .to_string(),
             String::new(),
         ),
     };
@@ -1850,5 +1864,57 @@ mod tests {
         );
         assert_eq!(status_of(&response), 200);
         assert_eq!(body_json(&response)["configured"], false);
+    }
+
+    /// UX0 ruling pin (binding addition 1): the ceremony feedback
+    /// grammar. The four presentation classes exist in the GitHub
+    /// section's fragment and stylesheet, and the legacy warning class
+    /// never co-occurs with the PROGRESS presentation on any line —
+    /// "progress dressed as a warning" was the owner's finding 3, and a
+    /// regression fails this test, not a review.
+    #[test]
+    fn ceremony_feedback_grammar_is_pinned() {
+        let fragment = include_str!("../../../../static/app/32-vault-custody.js");
+        let styles = include_str!("../../../../static/app/ui2-vault.css");
+        for class in ["is-progress", "is-attention", "is-success", "is-refusal"] {
+            assert!(
+                fragment.contains(class),
+                "32-vault-custody.js lost grammar class {class}"
+            );
+            assert!(
+                styles.contains(&format!(".vault-chip.{class}")),
+                "ui2-vault.css lost the chip rule for {class}"
+            );
+        }
+        for (name, content) in [("32-vault-custody.js", fragment), ("ui2-vault.css", styles)] {
+            for line in content.lines() {
+                if line.contains("is-progress") {
+                    assert!(
+                        !line.contains("warn"),
+                        "{name}: the warning class co-occurs with is-progress: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// UX0 ruling pin (return-to-context): every ceremony page with a
+    /// known origin sends the owner back AT THE VAULT SECTION with the
+    /// cache-bypass marker — both the link and the auto-refresh. A bare
+    /// origin root-drop was finding 3's first cause.
+    #[test]
+    fn ceremony_page_returns_to_the_vault_section() {
+        let response = ceremony_page(200, "t", "d", Some("https://box.example:8765"));
+        let (status, body) = page_status(&response);
+        assert_eq!(status, 200);
+        let target = "https://box.example:8765/?ceremony=github#vault";
+        assert!(
+            body.contains(&format!("href=\"{target}\"")),
+            "the return link lost the section anchor: {body}"
+        );
+        assert!(
+            body.contains(&format!("content=\"6;url={target}\"")),
+            "the auto-refresh lost the section anchor: {body}"
+        );
     }
 }

@@ -17980,6 +17980,60 @@ html.ui-v2 #access-github-integration-section .vault-chip.warn {
   border-color: rgba(var(--amber-rgb), .26);
   color: var(--amber);
 }
+
+/* The ceremony feedback grammar (UX0 ruling, pinned vocabulary):
+   is-progress — in flight, no user action (sky, pulse);
+   is-attention — waits on a user decision (amber, correctly);
+   is-success — explicit success with the next action (green);
+   is-refusal — named reason + what to do (rose).
+   The legacy warning class may never co-occur with the progress
+   presentation — the pin in routes_github.rs enforces it per line. */
+html.ui-v2 #access-github-integration-section .vault-chip.is-progress {
+  background: rgba(var(--sky-rgb), .12);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+  animation: ui2-pulse 2s ease-in-out infinite;
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-attention {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-success {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-refusal {
+  background: rgba(var(--rose-rgb), .12);
+  border-color: rgba(var(--rose-rgb), .28);
+  color: var(--rose);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-progress {
+  color: var(--sky);
+  animation: ui2-pulse 2.4s ease-in-out infinite;
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-attention {
+  color: var(--amber);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-refusal {
+  color: var(--rose);
+}
+html.ui-v2 #access-github-integration-section .vault-install-link.primary {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 16px;
+  border-radius: 9px;
+  background: var(--iris);
+  color: var(--on-accent, #fff);
+  font-size: 12.5px;
+  font-weight: 800;
+  text-decoration: none;
+}
+html.ui-v2 #access-github-integration-section .vault-install-link.primary:hover {
+  filter: brightness(1.08);
+  text-decoration: none;
+}
 html.ui-v2 #access-github-integration-section .vault-form-grid {
   display: grid;
   grid-template-columns: minmax(120px, 170px) 1fr;
@@ -36791,7 +36845,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '0aaf6fcab8f52c48';
+const INTENDANT_APP_BUILD = '2c25e7d18d32e116';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -44792,10 +44846,54 @@ async function githubIntegrationRefresh(force = false) {
     const body = await githubIntegrationApi('api_github_integration_status', {});
     githubIntegrationState.data = body || null;
     githubIntegrationState.lastError = null;
+    if (githubCeremonyReturn && body && body.status === 'valid') {
+      // The chip reads valid on ceremony return: the explicit success
+      // moment, with what happens next — never a silent state flip.
+      githubCeremonyReturn = false;
+      githubIntegrationState.notice = {
+        text: `Connected — PR cards appear on the agenda within ~${body.poll_minutes || 5} minutes.`,
+        cls: 'is-success',
+      };
+    }
   } catch (e) {
     githubIntegrationState.lastError = String(e?.message || e);
   }
   renderGithubIntegrationSection();
+}
+
+// Return-to-context (UX0 ruling): the callback page sends the owner
+// back to `/?ceremony=github#vault`. On arrival: bypass the 30 s status
+// cache (finding 3's stale paint), scroll this section into view once
+// the deferred vault pane mounts it, and strip the marker from the URL
+// so a reload doesn't replay the gesture.
+let githubCeremonyReturn = false;
+function githubIntegrationCeremonyReturnBoot() {
+  let params;
+  try { params = new URLSearchParams(window.location.search); } catch { return; }
+  if (params.get('ceremony') !== 'github') return;
+  githubCeremonyReturn = true;
+  params.delete('ceremony');
+  const rest = params.toString();
+  try {
+    history.replaceState(null, '',
+      `${window.location.pathname}${rest ? `?${rest}` : ''}${window.location.hash || '#vault'}`);
+  } catch { /* history unavailable — cosmetic only */ }
+  githubIntegrationRefresh(true);
+  let tries = 0;
+  const scroll = () => {
+    const mount = document.getElementById('access-github-integration-section');
+    if (mount && mount.childElementCount) {
+      mount.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      return;
+    }
+    if (tries++ < 40) setTimeout(scroll, 250);
+  };
+  scroll();
+}
+{
+  const bootCeremonyReturn = () => githubIntegrationCeremonyReturnBoot();
+  if (document.readyState !== 'loading') bootCeremonyReturn();
+  else document.addEventListener('DOMContentLoaded', bootCeremonyReturn, { once: true });
 }
 
 function githubIntegrationChip(text, cls) {
@@ -44866,10 +44964,10 @@ async function githubIntegrationCompleteInstall(row) {
     githubIntegrationState.fetchedAt = Date.now();
     githubIntegrationState.notice = {
       text: `Installed as ${row.account_login || 'the selected account'} — pick repositories below.`,
-      cls: 'ok',
+      cls: 'is-success',
     };
   } catch (e) {
-    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'is-refusal' };
   }
   githubIntegrationState.busy = false;
   githubIntegrationState.repoPicker = { loading: false, repositories: null, error: null };
@@ -44889,12 +44987,12 @@ async function githubIntegrationSaveSelection(payload) {
     const status = String(body?.status || 'unknown');
     githubIntegrationState.notice = {
       text: status === 'valid'
-        ? 'Watch list saved — verified against GitHub.'
+        ? `Watch list saved — verified against GitHub. PR cards appear on the agenda within ~${body?.poll_minutes || 5} minutes.`
         : `Saved. Status: ${status}${body?.detail ? ` — ${body.detail}` : ''}`,
-      cls: status === 'valid' ? 'ok' : 'warn',
+      cls: status === 'valid' ? 'is-success' : 'is-refusal',
     };
   } catch (e) {
-    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'is-refusal' };
   }
   githubIntegrationState.busy = false;
   renderGithubIntegrationSection();
@@ -44943,7 +45041,7 @@ async function githubIntegrationConnect(orgInput) {
     form.submit();
     // The tab navigates to GitHub now; state past this point is moot.
   } catch (e) {
-    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'is-refusal' };
     githubIntegrationState.busy = false;
     renderGithubIntegrationSection();
   }
@@ -44975,12 +45073,12 @@ async function githubIntegrationSave(fields) {
       text: status === 'valid'
         ? `Saved — verified against GitHub${Number.isFinite(body?.verified_open_prs) ? ` (${body.verified_open_prs} open PRs)` : ''}.`
         : `Saved. Status: ${status}${body?.detail ? ` — ${body.detail}` : ''}`,
-      cls: status === 'valid' ? 'ok' : 'warn',
+      cls: status === 'valid' ? 'is-success' : 'is-refusal',
     };
     // The pasted key was sealed daemon-side; drop it from the DOM now.
     fields.pem.value = '';
   } catch (e) {
-    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'is-refusal' };
   }
   githubIntegrationState.busy = false;
   renderGithubIntegrationSection();
@@ -45000,9 +45098,9 @@ async function githubIntegrationRemove() {
     const body = await githubIntegrationApi('api_github_integration_remove', {});
     githubIntegrationState.data = body || githubIntegrationState.data;
     githubIntegrationState.fetchedAt = Date.now();
-    githubIntegrationState.notice = { text: 'Credentials removed from custody.', cls: 'ok' };
+    githubIntegrationState.notice = { text: 'Credentials removed from custody.', cls: 'is-success' };
   } catch (e) {
-    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'warn' };
+    githubIntegrationState.notice = { text: String(e?.message || e), cls: 'is-refusal' };
   }
   githubIntegrationState.busy = false;
   renderGithubIntegrationSection();
@@ -45017,28 +45115,40 @@ function renderGithubIntegrationSection() {
   const data = githubIntegrationState.data;
   mount.innerHTML = '';
 
+  // The ceremony feedback grammar (UX0 ruling, pinned): is-progress =
+  // in flight, no user action; is-attention = waits on a user decision
+  // (amber is CORRECT here — never on progress); is-success = explicit,
+  // with the next action; is-refusal = named reason + what to do. The
+  // legacy ok/warn chip classes remain for the rest of the Vault; this
+  // section speaks the grammar.
   const chips = document.createElement('div');
   chips.className = 'vault-status-line';
   const status = data?.status || (githubIntegrationState.lastError ? 'unknown' : 'loading');
-  const statusCls = status === 'valid' ? 'ok'
-    : (status === 'denied' || status === 'unreachable') ? 'warn'
+  const statusCls = status === 'valid' ? 'is-success'
+    : (status === 'denied' || status === 'unreachable') ? 'is-refusal'
+    : status === 'loading' ? 'is-progress'
     : '';
   chips.appendChild(githubIntegrationChip(`status: ${status}`, statusCls));
   if (data?.configured) {
-    chips.appendChild(githubIntegrationChip('credentials sealed', 'ok'));
+    chips.appendChild(githubIntegrationChip('credentials sealed', 'is-success'));
   }
   if (data?.pending_install) {
-    chips.appendChild(githubIntegrationChip('pending install', 'warn'));
+    // Success so far (App created, key sealed) awaiting the user's next
+    // move — attention, never a warning dressed over progress.
+    chips.appendChild(githubIntegrationChip('pending install — one step left', 'is-attention'));
     if (data.app_slug) chips.appendChild(githubIntegrationChip(String(data.app_slug)));
   }
   const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
   chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
   if (data && data.custody_backend_available === false) {
-    chips.appendChild(githubIntegrationChip('no custody backend on this platform', 'warn'));
+    chips.appendChild(githubIntegrationChip('no custody backend on this platform', 'is-refusal'));
   }
-  if (data?.detail) chips.appendChild(githubIntegrationChip(String(data.detail), 'warn'));
+  if (data?.detail) {
+    chips.appendChild(githubIntegrationChip(String(data.detail),
+      statusCls === 'is-refusal' ? 'is-refusal' : 'is-attention'));
+  }
   if (githubIntegrationState.lastError) {
-    chips.appendChild(githubIntegrationChip(githubIntegrationState.lastError, 'warn'));
+    chips.appendChild(githubIntegrationChip(githubIntegrationState.lastError, 'is-refusal'));
   }
   if (githubIntegrationState.notice) {
     chips.appendChild(githubIntegrationChip(githubIntegrationState.notice.text, githubIntegrationState.notice.cls));
@@ -45082,8 +45192,10 @@ function renderGithubIntegrationSection() {
       // silently drops _blank, and the same-tab round trip works
       // everywhere. Clicking arms the bounded discovery loop so the
       // installation is picked up when the owner returns.
+      // The single next action, presented as the primary button (the
+      // NEEDS-YOU grammar): the ceremony waits on exactly this click.
       const link = document.createElement('a');
-      link.className = 'vault-install-link';
+      link.className = 'vault-install-link primary';
       link.href = `https://github.com/apps/${encodeURIComponent(String(data.app_slug))}/installations/new`;
       link.rel = 'noopener noreferrer';
       link.textContent = 'Install on GitHub';
@@ -45095,12 +45207,18 @@ function renderGithubIntegrationSection() {
     const hint = document.createElement('div');
     hint.className = 'vault-connect-hint';
     if (d.polling && found.length === 0) {
+      // Ceremony in flight, nothing for the user to do: PROGRESS, with
+      // its pulse — never the warning class.
+      hint.className = 'vault-connect-hint is-progress';
       hint.textContent = 'The App is created and its key is sealed. Waiting for the installation to appear on GitHub…';
     } else if (found.length > 1) {
+      hint.className = 'vault-connect-hint is-attention';
       hint.textContent = 'Several installations found — pick the one to watch:';
     } else if (d.error) {
+      hint.className = 'vault-connect-hint is-refusal';
       hint.textContent = `Discovery hit a problem (${d.error}); it keeps retrying while this window is open.`;
     } else if (d.until > 0 && Date.now() > d.until) {
+      hint.className = 'vault-connect-hint is-attention';
       hint.textContent = 'No installation appeared yet. Install the App on GitHub, then reopen this section — or finish with the manual form below.';
     } else {
       hint.textContent = 'The App is created and its key is sealed. Install it on your repositories on GitHub and the installation is picked up automatically.';
