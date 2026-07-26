@@ -4321,11 +4321,27 @@ async function githubIntegrationApi(method, params) {
   return resp.body ?? {};
 }
 
+// Bounded waits for daemon answers: keychain custody can park the
+// daemon-side call behind a macOS SecurityAgent authorization (routine
+// after every rebuild — the binary stops matching the keychain item's
+// ACL), and an unanswered request must become a NAMED refusal with the
+// remedy — never an eternal progress line.
+const GITHUB_INTEGRATION_TIMEOUT_MS = 20_000;
+const GITHUB_KEYCHAIN_HINT = 'No answer from the daemon in 20 s. On a Mac this usually means a Keychain authorization dialog is waiting for you — it can hide behind windows or on another desktop. Find it, click “Always Allow”, then Retry. (Restarting the daemon re-prompts fresh.)';
+function githubIntegrationDeadline() {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => reject(new Error(GITHUB_KEYCHAIN_HINT)), GITHUB_INTEGRATION_TIMEOUT_MS);
+  });
+}
+
 async function githubIntegrationRefresh(force = false) {
   if (!force && Date.now() - githubIntegrationState.fetchedAt < 30_000) return;
   githubIntegrationState.fetchedAt = Date.now();
   try {
-    const body = await githubIntegrationApi('api_github_integration_status', {});
+    const body = await Promise.race([
+      githubIntegrationApi('api_github_integration_status', {}),
+      githubIntegrationDeadline(),
+    ]);
     githubIntegrationState.data = body || null;
     githubIntegrationState.lastError = null;
     if (githubCeremonyReturn && body && body.status === 'valid') {
@@ -4486,11 +4502,15 @@ async function githubIntegrationSaveSelection(payload) {
 
 async function githubIntegrationLoadRepositories() {
   const p = githubIntegrationState.repoPicker;
-  if (p.loading || p.repositories) return;
+  // An errored listing does NOT auto-retry on every render (that loops);
+  // the rendered Retry button clears the error explicitly.
+  if (p.loading || p.repositories || p.error) return;
   p.loading = true;
-  p.error = null;
   try {
-    const body = await githubIntegrationApi('api_github_repositories', {});
+    const body = await Promise.race([
+      githubIntegrationApi('api_github_repositories', {}),
+      githubIntegrationDeadline(),
+    ]);
     p.repositories = Array.isArray(body?.repositories) ? body.repositories : [];
   } catch (e) {
     p.error = String(e?.message || e);
@@ -4604,37 +4624,53 @@ function renderGithubIntegrationSection() {
   // The ceremony feedback grammar (UX0 ruling, pinned): is-progress =
   // in flight, no user action; is-attention = waits on a user decision
   // (amber is CORRECT here — never on progress); is-success = explicit,
-  // with the next action; is-refusal = named reason + what to do. The
-  // legacy ok/warn chip classes remain for the rest of the Vault; this
-  // section speaks the grammar.
+  // with the next action; is-refusal = named reason + what to do.
+  //
+  // ORIENTATION FIRST: one human sentence says what is true and what
+  // happens next; the chips below it are secondary facts. Nobody should
+  // have to decode a `status: configured` telemetry wall (the owner's
+  // 2026-07-26 finding, verbatim).
+  const status = data?.status || (githubIntegrationState.lastError ? 'unknown' : 'loading');
+  const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
+  const poll = data?.poll_minutes || 5;
+  const orientation = document.createElement('div');
+  let orient = { cls: '', text: '' };
+  if (githubIntegrationState.lastError) {
+    orient = { cls: 'is-refusal', text: githubIntegrationState.lastError };
+  } else if (status === 'loading') {
+    orient = { cls: 'is-progress', text: 'Checking the integration’s state…' };
+  } else if (data && !data.configured && !data.pending_install) {
+    orient = { cls: '', text: 'Not connected. One click below creates a private read-only GitHub App for your account and seals its key on this machine.' };
+  } else if (data?.pending_install) {
+    orient = { cls: 'is-attention', text: 'The App is created and its key is sealed — one step left: install it on your repositories on GitHub. The installation is picked up automatically when you return.' };
+  } else if (status === 'valid') {
+    orient = repoCount
+      ? { cls: 'is-success', text: `Connected and verified — watching ${repoCount} repositor${repoCount === 1 ? 'y' : 'ies'}. Open PR cards land on the Agenda within ~${poll} minutes.` }
+      : { cls: 'is-attention', text: 'Connected and verified — but no repositories are watched yet. Tick some below and “Save selection & verify”; PR cards then land on the Agenda.' };
+  } else if (status === 'denied') {
+    orient = { cls: 'is-refusal', text: `GitHub refused the credentials${data?.detail ? ` — ${data.detail}` : ''}. Reconnect below, or check the App’s installation on GitHub.` };
+  } else if (status === 'unreachable') {
+    orient = { cls: 'is-refusal', text: `GitHub is unreachable${data?.detail ? ` — ${data.detail}` : ''}. The daemon retries on its next poll.` };
+  } else if (status === 'configured') {
+    orient = { cls: 'is-attention', text: `Connected — credentials are sealed; nothing has been verified against GitHub since the daemon started. ${repoCount ? 'The next poll verifies the watch list.' : 'Pick repositories below and “Save selection & verify” — PR cards then land on the Agenda.'}` };
+  } else {
+    orient = { cls: '', text: `Integration state: ${status}.` };
+  }
+  orientation.className = `vault-orientation${orient.cls ? ` ${orient.cls}` : ''}`;
+  orientation.textContent = orient.text;
+  mount.appendChild(orientation);
+
   const chips = document.createElement('div');
   chips.className = 'vault-status-line';
-  const status = data?.status || (githubIntegrationState.lastError ? 'unknown' : 'loading');
-  const statusCls = status === 'valid' ? 'is-success'
-    : (status === 'denied' || status === 'unreachable') ? 'is-refusal'
-    : status === 'loading' ? 'is-progress'
-    : '';
-  chips.appendChild(githubIntegrationChip(`status: ${status}`, statusCls));
+  if (data?.configured || data?.pending_install) {
+    chips.appendChild(githubIntegrationChip('key sealed in custody', 'is-success'));
+  }
+  if (data?.app_slug) chips.appendChild(githubIntegrationChip(String(data.app_slug)));
   if (data?.configured) {
-    chips.appendChild(githubIntegrationChip('credentials sealed', 'is-success'));
+    chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
   }
-  if (data?.pending_install) {
-    // Success so far (App created, key sealed) awaiting the user's next
-    // move — attention, never a warning dressed over progress.
-    chips.appendChild(githubIntegrationChip('pending install — one step left', 'is-attention'));
-    if (data.app_slug) chips.appendChild(githubIntegrationChip(String(data.app_slug)));
-  }
-  const repoCount = Array.isArray(data?.repos) ? data.repos.length : 0;
-  chips.appendChild(githubIntegrationChip(`${repoCount} repo${repoCount === 1 ? '' : 's'} watched`));
   if (data && data.custody_backend_available === false) {
     chips.appendChild(githubIntegrationChip('no custody backend on this platform', 'is-refusal'));
-  }
-  if (data?.detail) {
-    chips.appendChild(githubIntegrationChip(String(data.detail),
-      statusCls === 'is-refusal' ? 'is-refusal' : 'is-attention'));
-  }
-  if (githubIntegrationState.lastError) {
-    chips.appendChild(githubIntegrationChip(githubIntegrationState.lastError, 'is-refusal'));
   }
   if (githubIntegrationState.notice) {
     chips.appendChild(githubIntegrationChip(githubIntegrationState.notice.text, githubIntegrationState.notice.cls));
@@ -4736,13 +4772,18 @@ function renderGithubIntegrationSection() {
     const configured = new Set(Array.isArray(data.repos) ? data.repos : []);
     if (p.error) {
       const err = document.createElement('div');
-      err.className = 'vault-connect-hint';
+      err.className = 'vault-connect-hint is-refusal';
       err.textContent = `Repository listing failed: ${p.error}`;
       picker.appendChild(err);
+      const retry = vaultButton('Retry', () => {
+        githubIntegrationState.repoPicker = { loading: false, repositories: null, error: null };
+        renderGithubIntegrationSection();
+      });
+      picker.appendChild(retry);
     } else if (!p.repositories) {
       const loading = document.createElement('div');
-      loading.className = 'vault-connect-hint';
-      loading.textContent = 'Listing the installation’s repositories…';
+      loading.className = 'vault-connect-hint is-progress';
+      loading.textContent = 'Listing the installation’s repositories… (answers within 20 s or says why not)';
       picker.appendChild(loading);
     } else {
       const list = document.createElement('div');

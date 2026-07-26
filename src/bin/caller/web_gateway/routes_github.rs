@@ -31,21 +31,40 @@ pub(crate) trait GithubAppCustody: Send + Sync {
 /// Production custody: the daemon-global estate in `key_custody`.
 pub(crate) struct DaemonGithubAppCustody;
 
+/// Keychain custody can PARK the calling thread: macOS Security waits on
+/// a SecurityAgent authorization when the binary no longer matches the
+/// item's ACL — routine after every rebuild. Observed live 2026-07-26:
+/// four runtime workers stuck in `retrieve`, the whole daemon
+/// unresponsive at 0% CPU. Every production custody touch therefore runs
+/// via `block_in_place`, so a parked call surrenders its runtime slot
+/// instead of wedging the serve path; outside a multi-thread runtime the
+/// closure runs inline (startup paths, tests).
+fn custody_blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 impl GithubAppCustody for DaemonGithubAppCustody {
     fn present(&self) -> bool {
-        crate::key_custody::github_app_in_custody()
+        custody_blocking(crate::key_custody::github_app_in_custody)
     }
     fn backend_available(&self) -> bool {
-        crate::key_custody::custody_backend_available()
+        custody_blocking(crate::key_custody::custody_backend_available)
     }
     fn retrieve(&self) -> Option<Vec<u8>> {
-        crate::key_custody::github_app_from_custody().map(|secret| secret.as_bytes().to_vec())
+        custody_blocking(|| {
+            crate::key_custody::github_app_from_custody().map(|secret| secret.as_bytes().to_vec())
+        })
     }
     fn store(&self, material: &[u8], actor: &str, origin: &str) -> Result<(), String> {
-        crate::key_custody::store_github_app(material, actor, origin)
+        custody_blocking(|| crate::key_custody::store_github_app(material, actor, origin))
     }
     fn remove(&self, actor: &str, origin: &str) -> Result<(), String> {
-        crate::key_custody::remove_github_app(actor, origin)
+        custody_blocking(|| crate::key_custody::remove_github_app(actor, origin))
     }
 }
 
