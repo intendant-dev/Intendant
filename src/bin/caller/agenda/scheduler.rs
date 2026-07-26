@@ -565,18 +565,22 @@ fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root:
     } else {
         (Some(spawn.orchestrate), Some(!spawn.orchestrate))
     };
-    // An on_item_match batch rides the goal as a data prologue (Track T):
-    // the matched item ids, for the session to read via ctl — data to
-    // act on under the approved goal, never instructions themselves.
-    let task = if spawn.matched_item_ids.is_empty() {
-        spawn.goal.clone()
-    } else {
-        format!(
-            "{}\n\nMatched agenda items (this firing's batch): {}",
-            spawn.goal,
+    // Every fired session's task carries a data rider naming its source:
+    // the agenda item + occurrence that fired it, so goal self-references
+    // ("THIS item", "your prerequisite item") resolve mechanically through
+    // the session's own attributed ctl; an on_item_match batch adds its
+    // matched ids (Track T). Both lines are data to act on under the
+    // approved goal, never instructions themselves.
+    let mut task = format!(
+        "{}\n\nFired from agenda item {} (occurrence {})",
+        spawn.goal, spawn.item_id, spawn.occurrence_id
+    );
+    if !spawn.matched_item_ids.is_empty() {
+        task.push_str(&format!(
+            "\nMatched agenda items (this firing's batch): {}",
             spawn.matched_item_ids.join(" ")
-        )
-    };
+        ));
+    }
     handle
         .bus()
         .send(AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -1392,12 +1396,18 @@ mod tests {
             1,
             "exactly the approved manifest dispatches"
         );
-        assert_eq!(dispatched[0].0, "run the nightly sweep");
         let occurrence_id = dispatched[0]
             .1
             .strip_prefix(DELEGATION_PREFIX)
             .unwrap()
             .to_string();
+        assert_eq!(
+            dispatched[0].0,
+            format!(
+                "run the nightly sweep\n\nFired from agenda item {item_id} (occurrence {occurrence_id})"
+            ),
+            "every fired task names its source item + occurrence as one data line"
+        );
         assert!(state.awaiting.contains_key(&occurrence_id));
 
         // Receipt → started, on the journal and the item.
@@ -2038,12 +2048,14 @@ mod tests {
         }
         let task = seen_task.expect("the batch occurrence dispatches one StartTask");
         assert!(task.starts_with("rule the parked gates"));
-        assert!(
-            task.contains(&format!(
-                "Matched agenda items (this firing's batch): {} {}",
+        assert_eq!(
+            task,
+            format!(
+                "rule the parked gates\n\nFired from agenda item standing-item \
+                 (occurrence occ-batch)\nMatched agenda items (this firing's batch): {} {}",
                 q1.id, q2.id
-            )),
-            "the batch rides the goal as a data prologue: {task}"
+            ),
+            "the source line + batch ride the goal as a data prologue: {task}"
         );
     }
 
