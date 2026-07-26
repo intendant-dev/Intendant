@@ -855,7 +855,8 @@ function agendaCardEffectStrip(item) {
       ? `<button type="button" class="ag2-btn ghost" data-jump-session="${escapeHtml(s.key)}">Watch</button>`
       : '';
   }
-  return `<div class="ag2-eff t-${tone}">
+  const semantic = st.kind === 'running' ? 'is-progress' : 'is-attention';
+  return `<div class="ag2-eff t-${tone} ${semantic}">
     <span class="ag2-eff-line">${escapeHtml(line)}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
@@ -912,10 +913,42 @@ function agendaAutomationStripHtml(item) {
   } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
-  return `<div class="ag2-eff ag2-auto t-${st.kind === 'pending' || st.kind === 'suspended' ? 'amber' : 'iris'}">
+  const autoTone = st.kind === 'pending' || st.kind === 'suspended' ? 'amber'
+    : st.kind === 'standing' ? 'green'
+      : ['armed', 'watching', 'waiting'].includes(st.kind) ? 'sky' : 'iris';
+  const autoSemantic = st.kind === 'pending' || st.kind === 'suspended' ? 'is-attention'
+    : ['running', 'ready'].includes(st.kind) ? 'is-progress' : '';
+  return `<div class="ag2-eff ag2-auto t-${autoTone}${autoSemantic ? ` ${autoSemantic}` : ''}">
     <span class="ag2-auto-meta">${meta.join('<span class="ag2-auto-dot">·</span>')}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
+}
+
+// The explicit "now armed" moment (UX0 ruling; UX2): approving is never
+// a silent state flip — one toast says what is now true and what
+// happens next, mirroring the workflow sheet's proven pattern. Derives
+// from the RESPONSE item, so the line states the daemon's post-approve
+// truth, not a prediction.
+function agendaApprovalMoment(item) {
+  if (typeof showControlToast !== 'function') return;
+  const st = agendaEffectState(item);
+  let line = 'Approved — the manifest is armed. Revoke anytime on the card.';
+  if (st) {
+    if (st.kind === 'standing') {
+      line = `Approved — standing series armed: every ${agendaCadenceLabel(st.rec.every_ms)}, next ${agendaAbsTime(st.next)}. Revoke anytime on the card.`;
+    } else if (st.kind === 'armed') {
+      line = `Approved — armed; fires ${agendaAbsTime(st.next)}. Watch it on the Automations lens; revoke anytime.`;
+    } else if (st.kind === 'watching') {
+      line = 'Approved — watching; fires when a new matching item arrives (arrivals batch for a minute). Revoke anytime.';
+    } else if (st.kind === 'waiting') {
+      line = 'Approved — armed; fires the moment every prerequisite completes. Revoke anytime.';
+    } else if (st.kind === 'ready') {
+      line = 'Approved — prerequisites already complete; the session fires within the minute.';
+    } else if (st.kind === 'running') {
+      line = 'Approved — an occurrence is already in flight.';
+    }
+  }
+  showControlToast('success', line);
 }
 
 // ---- Workflow pipeline strip (hub cards + the hubs lens) ----
@@ -1389,7 +1422,9 @@ function agendaGroupsClick(e) {
     const params = { op: opBtn.dataset.opBtn, id: opBtn.dataset.id };
     // Approve binds the digest of the revision this render showed.
     if (opBtn.dataset.digest) params.digest = opBtn.dataset.digest;
-    agendaSendOp(params, opBtn);
+    agendaSendOp(params, opBtn).then((item) => {
+      if (item && params.op === 'approve_effect') agendaApprovalMoment(item);
+    });
     return;
   }
   const jump = e.target.closest('[data-jump-session]');

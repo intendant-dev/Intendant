@@ -1886,7 +1886,27 @@ mod tests {
                 "ui2-vault.css lost the chip rule for {class}"
             );
         }
-        for (name, content) in [("32-vault-custody.js", fragment), ("ui2-vault.css", styles)] {
+        // UX2 extends the grammar to the agenda's ceremony surfaces: the
+        // approval strips speak is-attention/is-progress and refusals
+        // paint is-refusal at the card. Same vocabulary, same pin.
+        let agenda_cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        let agenda_shared = include_str!("../../../../static/app/ui2-agenda.js");
+        for (class, holder) in [
+            ("is-attention", agenda_cards),
+            ("is-progress", agenda_cards),
+            ("is-refusal", agenda_shared),
+        ] {
+            assert!(
+                holder.contains(class),
+                "agenda ceremony surfaces lost grammar class {class}"
+            );
+        }
+        for (name, content) in [
+            ("32-vault-custody.js", fragment),
+            ("ui2-vault.css", styles),
+            ("ui2-agenda-cards.js", agenda_cards),
+            ("ui2-agenda.js", agenda_shared),
+        ] {
             for line in content.lines() {
                 if line.contains("is-progress") {
                     assert!(

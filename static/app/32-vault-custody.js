@@ -4361,16 +4361,20 @@ function githubIntegrationCeremonyReturnBoot() {
       `${window.location.pathname}${rest ? `?${rest}` : ''}${window.location.hash || '#vault'}`);
   } catch { /* history unavailable — cosmetic only */ }
   githubIntegrationRefresh(true);
+  // The vault pane renders deferred and may re-render (resetting scroll)
+  // when the fresh status lands — so scroll on mount AND re-assert once
+  // after the render settles.
   let tries = 0;
-  const scroll = () => {
+  const scroll = (reassert) => {
     const mount = document.getElementById('access-github-integration-section');
     if (mount && mount.childElementCount) {
-      mount.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      mount.scrollIntoView({ block: 'start' });
+      if (reassert) setTimeout(() => scroll(false), 1500);
       return;
     }
-    if (tries++ < 40) setTimeout(scroll, 250);
+    if (tries++ < 80) setTimeout(() => scroll(reassert), 250);
   };
-  scroll();
+  scroll(true);
 }
 {
   const bootCeremonyReturn = () => githubIntegrationCeremonyReturnBoot();
