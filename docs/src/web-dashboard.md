@@ -281,7 +281,7 @@ Codex primary/secondary, native Anthropic per-minute headers), dim below
 the tooltip lists every window. Session-facts chips (the vitals `config`
 section, wire-first from each backend's own echoes with the launch config
 as the honestly-marked fallback) show the model + configured reasoning
-effort (`⬡ fable-5 · max`) and the permission mode in plain words
+effort (`⬡ claude-fable-5 · max`) and the permission mode in plain words
 (`🛡 Acts without asking`) — bypass/ungated modes get a quiet warning
 tint (cosmetic, never the health dot), the raw backend vocabulary
 (`bypassPermissions`, `workspace-write · on-request`, the autonomy level)
