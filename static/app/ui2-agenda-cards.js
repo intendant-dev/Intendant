@@ -40,6 +40,12 @@ const AGENDA_LENSES = [
     groups: () => agendaLensGroupsAutomations(),
   },
   { id: 'questions', label: 'Questions', groups: () => agendaLensGroupsQuestions() },
+  {
+    id: 'diary',
+    label: 'Diary',
+    render: (host) => agendaDiaryRenderLens(host),
+    deactivate: () => agendaDiaryTeardown(),
+  },
   { id: 'archive', label: 'Archive', groups: () => agendaLensGroupsArchive() },
 ];
 

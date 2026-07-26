@@ -101,6 +101,7 @@ ui2-agenda-cards.js
 ui2-agenda-inspector.js
 ui2-agenda-graph.js
 ui2-agenda-plan.js
+ui2-agenda-diary.js
 ui2-agenda-hood.js
 ui2-agenda-workflows.js
 # Memory: same deep-link TDZ rule as agenda — a #memory deep link makes the
