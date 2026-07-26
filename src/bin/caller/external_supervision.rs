@@ -1377,6 +1377,21 @@ pub(crate) enum DrainOutcome {
         message: Option<String>,
         turns_in_round: usize,
     },
+    /// A fatal (non-retryable, non-recoverable) backend error ended the
+    /// round before any turn completed — the launch-refusal class: an
+    /// invalid `--model` pin, an auth refusal at spawn. The backend
+    /// process may still be running, but the round did no work and the
+    /// error is its honest outcome. The caller must end with a FAILED
+    /// terminal ([`crate::event::TaskOutcome::Failed`]), never a
+    /// DoneSignal: a scheduled occurrence resolved by this shape journals
+    /// `failed` (suspend streaks, owner visibility), not `completed`
+    /// (2026-07-26: a fable-5 launch refusal rode a DoneSignal into a
+    /// COMPLETED occurrence and the failure was invisible — specimen
+    /// occurrence 21fe746a, session 6993c73f).
+    TurnFailed {
+        reason: String,
+        turns_in_round: usize,
+    },
     /// The agent process terminated.
     Terminated {
         reason: String,

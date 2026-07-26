@@ -3490,6 +3490,21 @@ pub(crate) async fn drain_external_child_turn(
         DrainOutcome::TurnCompleted { message, .. } => {
             emit_child_turn_complete(&child_config, conversation_kind, message);
         }
+        DrainOutcome::TurnFailed { reason, .. } => {
+            // A zero-turn fatal error inside a child conversation: report
+            // the cause; no child completion is emitted for a turn that
+            // never ran.
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "error".to_string(),
+                source: backend_label.clone(),
+                content: format!(
+                    "{} conversation turn failed before any work: {}",
+                    conversation_kind, reason
+                ),
+                turn: None,
+            });
+        }
         DrainOutcome::LimitRejected {
             resets_at_epoch,
             message,

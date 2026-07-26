@@ -943,6 +943,31 @@ pub(crate) async fn run_with_presence(
                                             project_root: round_session_root.clone(),
                                         });
                                     }
+                                    Ok(DrainOutcome::TurnFailed {
+                                        reason,
+                                        turns_in_round,
+                                    }) => {
+                                        // The resumed turn died on a fatal
+                                        // error before running anything —
+                                        // report the failure, never a done
+                                        // signal for a turn that never ran.
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                            project_root: round_session_root.clone(),
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "External agent turn failed before any work: {}",
+                                                reason
+                                            ),
+                                            level: Some(types::LogLevel::Error),
+                                            turn: None,
+                                        });
+                                    }
                                     Ok(DrainOutcome::ContextRewindRequested {
                                         request, ..
                                     }) => {
@@ -970,6 +995,27 @@ pub(crate) async fn run_with_presence(
                                                     turns_in_round,
                                                     native_message_count: None,
                                                     project_root: round_session_root.clone(),
+                                                });
+                                            }
+                                            Ok(Some(DrainOutcome::TurnFailed {
+                                                reason,
+                                                turns_in_round,
+                                            })) => {
+                                                cumulative_stats.rounds += 1;
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: session_log_id(&session_log),
+                                                    round: cumulative_stats.rounds,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                    project_root: round_session_root.clone(),
+                                                });
+                                                bus.send(AppEvent::PresenceLog {
+                                                    message: format!(
+                                                        "External agent turn failed before any work during resumed context-rewind turn: {}",
+                                                        reason
+                                                    ),
+                                                    level: Some(types::LogLevel::Error),
+                                                    turn: None,
                                                 });
                                             }
                                             Ok(Some(DrainOutcome::LimitRejected {
@@ -2066,6 +2112,27 @@ pub(crate) async fn run_with_presence(
                                         project_root: round_session_root.clone(),
                                     });
                                 }
+                                DrainOutcome::TurnFailed {
+                                    reason,
+                                    turns_in_round,
+                                } => {
+                                    // A spontaneous round died on a fatal
+                                    // error before running anything: close
+                                    // the round without a done signal.
+                                    cumulative_stats.rounds = round;
+                                    slog(&session_log, |l| {
+                                        l.error(&format!(
+                                            "Spontaneous external round failed before any turn completed: {reason}"
+                                        ))
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                        project_root: round_session_root.clone(),
+                                    });
+                                }
                                 DrainOutcome::Interrupted { .. } => {
                                     cumulative_stats.rounds = round;
                                 }
@@ -2935,6 +3002,35 @@ pub(crate) async fn run_with_presence(
                 }
 
                 match outcome {
+                    DrainOutcome::TurnFailed {
+                        reason,
+                        turns_in_round,
+                    } => {
+                        // The turn died on a fatal error before running
+                        // anything (the launch-refusal class): close the
+                        // round as a failure — no done signal for a turn
+                        // that never ran.
+                        cumulative_stats.rounds += 1;
+                        slog(&session_log, |l| {
+                            l.error(&format!(
+                                "External agent turn failed before any work: {reason}"
+                            ))
+                        });
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: session_log_id(&session_log),
+                            round: cumulative_stats.rounds,
+                            turns_in_round,
+                            native_message_count: None,
+                            project_root: round_session_root.clone(),
+                        });
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!(
+                                "External agent turn failed before any work: {reason}"
+                            ),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                    }
                     DrainOutcome::TurnCompleted {
                         message,
                         turns_in_round,

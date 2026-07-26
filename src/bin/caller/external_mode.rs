@@ -1109,6 +1109,43 @@ pub(crate) async fn run_external_agent_mode(
                                             }
                                         }
                                         match drain_outcome {
+                                            DrainOutcome::TurnFailed {
+                                                reason,
+                                                turns_in_round,
+                                            } => {
+                                                // A backend-started round
+                                                // observed from idle died on
+                                                // a fatal error before any
+                                                // turn ran: fail honestly,
+                                                // like the primary loop.
+                                                stats.rounds = round;
+                                                slog(&session_log, |l| {
+                                                    l.error(&format!(
+                                                        "External agent round failed before any turn completed while observed from idle: {reason}"
+                                                    ))
+                                                });
+                                                record_external_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                    project_root: round_session_root.clone(),
+                                                });
+                                                bus.send(AppEvent::TaskComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    reason: reason.clone(),
+                                                    summary: None,
+                                                    outcome: crate::event::TaskOutcome::Failed,
+                                                });
+                                                stats.terminal_outcome = Some(reason);
+                                                break 'outer;
+                                            }
                                             DrainOutcome::TurnCompleted {
                                                 message,
                                                 turns_in_round,
@@ -2573,6 +2610,20 @@ pub(crate) async fn run_external_agent_mode(
                                 project_root: round_session_root.clone(),
                             });
                         }
+                        DrainOutcome::TurnFailed { reason, .. } => {
+                            // The in-flight turn died on a fatal error
+                            // before running anything; the edit cannot be
+                            // applied to a failed round — report and skip
+                            // the rollback, like recovery/termination.
+                            let message = format!(
+                                "{} turn failed before edit rollback: {}",
+                                agent.name(),
+                                reason
+                            );
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
                         DrainOutcome::RecoveryRequired {
                             message,
                             recovery_hint,
@@ -2816,6 +2867,49 @@ pub(crate) async fn run_external_agent_mode(
             }
         }
         match drain_outcome {
+            DrainOutcome::TurnFailed {
+                reason,
+                turns_in_round,
+            } => {
+                // The launch-refusal class: a fatal backend error ended the
+                // round before any turn ran (an invalid model pin, an auth
+                // refusal at spawn). The honest terminal is FAILED — the
+                // typed outcome is what the agenda scheduler journals
+                // (streaks, suspension, owner visibility); a DoneSignal
+                // here journaled a fable-5 refusal COMPLETED on 2026-07-26
+                // (occurrence 21fe746a). Follow-ups would re-fire into the
+                // same refusal (the pin rides the launch config), so the
+                // supervised span ends like a termination.
+                stats.rounds = round;
+                slog(&session_log, |l| {
+                    l.error(&format!(
+                        "External agent round failed before any turn completed: {reason}"
+                    ))
+                });
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    turns_in_round,
+                );
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                    project_root: round_session_root.clone(),
+                });
+                bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
+                    reason: reason.clone(),
+                    // Never the "agent's last words": for a round that ran
+                    // nothing, the cause is the whole story.
+                    summary: None,
+                    outcome: crate::event::TaskOutcome::Failed,
+                });
+                stats.terminal_outcome = Some(reason);
+                break;
+            }
             DrainOutcome::TurnCompleted {
                 message,
                 turns_in_round,

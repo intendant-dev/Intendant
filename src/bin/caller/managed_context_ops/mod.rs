@@ -425,6 +425,7 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
     request: Option<ExternalContextRewindRequest>,
     turn_stop_status: ManagedContextRewindTurnStopStatus,
     recovery: Option<ExternalBackendRecovery>,
+    fatal_round_error: Option<String>,
     message: Option<String>,
     turns_in_round: usize,
 ) -> DrainOutcome {
@@ -442,6 +443,19 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
             recovery_hint: recovery.recovery_hint,
             turns_in_round,
         };
+    }
+    // A fatal backend error that ended a ZERO-turn round is the
+    // launch-refusal class: nothing ran, so completing the round would
+    // journal a lie. A round with completed turns keeps its completion
+    // shape even when a fatal error ends it — real work happened and the
+    // error is already logged; only the did-nothing round fails.
+    if turns_in_round == 0 {
+        if let Some(reason) = fatal_round_error {
+            return DrainOutcome::TurnFailed {
+                reason,
+                turns_in_round,
+            };
+        }
     }
     DrainOutcome::TurnCompleted {
         message,
@@ -800,6 +814,61 @@ pub(crate) fn find_context_rewind_anchor_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drain-exit precedence: a pending rewind and a pending recovery both
+    /// outrank a fatal round error, and the fatal error fails ONLY a
+    /// zero-turn round — a round with real turns keeps its completion
+    /// shape (the 2026-07-26 launch-refusal rider's deliberate scope).
+    #[test]
+    fn drain_exit_fails_only_zero_turn_rounds_with_a_fatal_error() {
+        let outcome = backend_recovery_outcome_or_context_rewind(
+            None,
+            ManagedContextRewindTurnStopStatus::NotRequested,
+            None,
+            Some("claude-code backend error (success): bad model".to_string()),
+            None,
+            0,
+        );
+        match outcome {
+            DrainOutcome::TurnFailed {
+                reason,
+                turns_in_round,
+            } => {
+                assert_eq!(turns_in_round, 0);
+                assert!(reason.contains("bad model"));
+            }
+            _ => panic!("zero-turn fatal error must resolve TurnFailed"),
+        }
+
+        // Real turns: the fatal error never downgrades a round with work.
+        assert!(matches!(
+            backend_recovery_outcome_or_context_rewind(
+                None,
+                ManagedContextRewindTurnStopStatus::NotRequested,
+                None,
+                Some("late fatal error".to_string()),
+                Some("did things".to_string()),
+                2,
+            ),
+            DrainOutcome::TurnCompleted { .. }
+        ));
+
+        // Recovery outranks the fatal cause even at zero turns.
+        assert!(matches!(
+            backend_recovery_outcome_or_context_rewind(
+                None,
+                ManagedContextRewindTurnStopStatus::NotRequested,
+                Some(ExternalBackendRecovery {
+                    message: "starved".to_string(),
+                    recovery_hint: None,
+                }),
+                Some("fatal cause".to_string()),
+                None,
+                0,
+            ),
+            DrainOutcome::RecoveryRequired { .. }
+        ));
+    }
 
     #[test]
     fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
