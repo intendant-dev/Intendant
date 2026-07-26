@@ -310,6 +310,39 @@ pub enum TriggerSpec {
     },
 }
 
+/// One hash-pinned binding reference on a manifest (sealed refs,
+/// owner-ruled 2026-07-26): content the approved goal DEPENDS ON, sealed
+/// under the approval digest. The pin names the bytes (`sha256` of the
+/// locator's content at propose time); intake verifies it against the
+/// daemon's own read, and the scheduler re-verifies at fire time,
+/// refusing to spawn on drift — so the approval covers what the goal
+/// references, not just the goal text (item bodies and plain G1 refs
+/// stay editable under an armed approval; binding refs do not).
+/// Doctrine: sealed binding-ref content MAY carry instructions for the
+/// fired session — it is exactly what the owner reviewed; everything
+/// else a fired session reads (bodies, annotations, unhashed refs)
+/// stays data. v1 locator scheme is `file:<absolute path>` only —
+/// `body:` and `git:<path>@<commit>` are future vocabulary, refused by
+/// name at intake until priced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindingRef {
+    /// `file:<absolute path>` (v1). Stored verbatim as intake validated
+    /// it.
+    pub locator: String,
+    /// Full sha256 of the referenced bytes as lowercase hex — stated by
+    /// the proposer (the pin says what THEY read), verified by the
+    /// daemon at intake and again at fire.
+    pub sha256: String,
+}
+
+/// Binding-ref count rail per manifest (a pathology bound, not a
+/// budget — a manifest sealing more artifacts than this is a design
+/// smell, split the work).
+pub(crate) const MAX_BINDING_REFS_PER_MANIFEST: usize = 16;
+/// The `file:` locator scheme prefix (v1's only binding-ref scheme).
+pub(crate) const BINDING_REF_FILE_SCHEME: &str = "file:";
+
 /// A scheduled-session manifest (slice A5): the complete statement of
 /// what firing does — reviewed by the owner at approval time. Immutable
 /// per revision: [`manifest_digest`] binds the approval, and any edit
@@ -376,6 +409,16 @@ pub struct SessionManifest {
     /// is a scheduled arming — do not "fix" it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) trigger: Option<TriggerSpec>,
+    /// Hash-pinned binding refs (sealed refs). Additive: absent-on-the-
+    /// wire when empty, so legacy manifest bytes — and the digests their
+    /// approvals bind — are unchanged, and the approval digest COVERS
+    /// the pins by construction (they are manifest bytes): swapping a
+    /// ref or its hash revises the manifest and voids the approval like
+    /// any other edit. An older build re-serializes without the field,
+    /// derives a different digest, and degrades fail-closed exactly like
+    /// recurrence/trigger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) binding_refs: Vec<BindingRef>,
 }
 
 /// An owner's approval of one manifest revision. `digest` is the bound
@@ -981,6 +1024,14 @@ pub enum AgendaCommand {
         /// have, the live gap this field closes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_root: Option<String>,
+        /// Hash-pinned binding refs (sealed refs): `{locator, sha256}`
+        /// pairs the PROPOSER hashed. Intake verifies each pin against
+        /// the daemon's own read of the locator and refuses a mismatch
+        /// by name — what gets sealed is what both sides read. Older
+        /// daemons reject the unknown field at strict intake rather
+        /// than silently parking an unsealed manifest.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        binding_refs: Vec<BindingRef>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
@@ -2172,6 +2223,7 @@ mod tests {
 
         // Full round-trip with the additive fields set preserves them.
         let full = SessionManifest {
+            binding_refs: Vec::new(),
             recurrence: None,
             goal: "g".into(),
             fire_at_ms: 9,
@@ -2215,6 +2267,7 @@ mod tests {
         assert_eq!(back, matcher);
 
         let base = SessionManifest {
+            binding_refs: Vec::new(),
             goal: "g".into(),
             fire_at_ms: 9,
             orchestrate: false,
@@ -2239,6 +2292,82 @@ mod tests {
         assert!(!serde_json::to_string(&base)
             .unwrap()
             .contains("\"trigger\""));
+    }
+
+    /// Sealed refs, pin (a): the binding-ref wire shape is pinned, the
+    /// field is absent-on-the-wire when empty (legacy manifest bytes —
+    /// and the digests their approvals bind — unchanged by
+    /// construction), and the approval digest COVERS the pins: adding a
+    /// ref, swapping its hash, or re-pointing its locator each mints a
+    /// new digest that voids any standing approval.
+    #[test]
+    fn binding_refs_are_digest_covered_and_additive() {
+        let base = SessionManifest {
+            goal: "g".into(),
+            fire_at_ms: 9,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: None,
+            binding_refs: Vec::new(),
+        };
+        assert!(
+            !serde_json::to_string(&base)
+                .unwrap()
+                .contains("binding_refs"),
+            "ref-less manifests keep the legacy bytes exactly"
+        );
+
+        let sealed = SessionManifest {
+            binding_refs: vec![BindingRef {
+                locator: "file:/work/brief.md".into(),
+                sha256: "aa".repeat(32),
+            }],
+            ..base.clone()
+        };
+        let json = serde_json::to_string(&sealed).unwrap();
+        assert!(
+            json.contains(&format!(
+                r#""binding_refs":[{{"locator":"file:/work/brief.md","sha256":"{}"}}]"#,
+                "aa".repeat(32)
+            )),
+            "the wire shape is pinned: {json}"
+        );
+        let round: SessionManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(round, sealed);
+
+        let base_digest = manifest_digest("item-1", "ef-1", &base);
+        let sealed_digest = manifest_digest("item-1", "ef-1", &sealed);
+        assert_ne!(
+            base_digest, sealed_digest,
+            "sealing a ref revises the digest"
+        );
+        let swapped_hash = SessionManifest {
+            binding_refs: vec![BindingRef {
+                locator: "file:/work/brief.md".into(),
+                sha256: "bb".repeat(32),
+            }],
+            ..base.clone()
+        };
+        assert_ne!(
+            manifest_digest("item-1", "ef-1", &swapped_hash),
+            sealed_digest,
+            "swapping the pinned hash revises the digest — the owner re-approves what changed"
+        );
+        let repointed = SessionManifest {
+            binding_refs: vec![BindingRef {
+                locator: "file:/work/other.md".into(),
+                sha256: "aa".repeat(32),
+            }],
+            ..base.clone()
+        };
+        assert_ne!(
+            manifest_digest("item-1", "ef-1", &repointed),
+            sealed_digest,
+            "re-pointing the locator revises the digest"
+        );
     }
 
     #[test]
@@ -3982,6 +4111,7 @@ mod tests {
     #[test]
     fn g3pre_op_line_formats_are_pinned() {
         let manifest = SessionManifest {
+            binding_refs: Vec::new(),
             goal: "standing".into(),
             fire_at_ms: 1000,
             orchestrate: false,
@@ -4031,6 +4161,7 @@ mod tests {
                 id: "01X".into(),
                 effect_id: "ef-1".into(),
                 manifest: SessionManifest {
+                    binding_refs: Vec::new(),
                     goal: "standing".into(),
                     fire_at_ms: 1000,
                     orchestrate: false,
@@ -4099,6 +4230,7 @@ mod tests {
                     id: "01X".into(),
                     effect_id: "ef-1".into(),
                     manifest: SessionManifest {
+                        binding_refs: Vec::new(),
                         goal: "v2".into(),
                         fire_at_ms: 2000,
                         orchestrate: false,

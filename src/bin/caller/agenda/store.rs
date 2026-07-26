@@ -5,9 +5,10 @@
 
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
-    AgendaOpRecord, AgendaPatch, AgendaRefType, AgendaStatus, AGENDA_LOG_VERSION,
-    MAX_ANNOTATIONS_PER_ITEM, MAX_BODY_BYTES, MAX_CHILDREN_PER_HUB, MAX_CRITERION_CHARS,
-    MAX_PART_OF_DEPTH, MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS,
+    AgendaOpRecord, AgendaPatch, AgendaRefType, AgendaStatus, BindingRef, AGENDA_LOG_VERSION,
+    BINDING_REF_FILE_SCHEME, MAX_ANNOTATIONS_PER_ITEM, MAX_BINDING_REFS_PER_MANIFEST,
+    MAX_BODY_BYTES, MAX_CHILDREN_PER_HUB, MAX_CRITERION_CHARS, MAX_PART_OF_DEPTH,
+    MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS,
     MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS,
     MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS,
     MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM, TRIGGER_MATCH_TAGS_MAX,
@@ -510,8 +511,12 @@ impl AgendaStore {
             recurrence: None,
             // start_now is the one-shot revise-and-run lane — a trigger
             // never rides it (standing triggered manifests run-now via
-            // request_occurrence instead).
+            // request_occurrence instead). Its minted manifest seals
+            // nothing: the gesture runs the ITEM, and a re-mint over a
+            // ref-bearing proposal is an owner-attributed revision that
+            // voids that approval like any other.
             trigger: None,
+            binding_refs: Vec::new(),
         };
         let digest = super::types::manifest_digest(id, &effect_id, &manifest);
         self.append_op(
@@ -1130,6 +1135,7 @@ impl AgendaStore {
                 agent_config,
                 trigger,
                 project_root,
+                binding_refs,
                 source: _,
             } => {
                 let item = self.require(&id)?;
@@ -1231,6 +1237,13 @@ impl AgendaStore {
                     }
                     goal.to_string()
                 };
+                // Binding refs (sealed refs) verify NOW, not just at fire
+                // time: the proposer stated a hash, and a pin the daemon's
+                // own read already contradicts would only park a manifest
+                // whose every firing refuses — the project_root precedent
+                // (name the deterministic fire-time refusal at review
+                // time).
+                let binding_refs = validate_binding_refs(binding_refs)?;
                 // v1: one session effect per item — a re-propose revises it
                 // (stable effect_id lineage, fresh digest, approval void).
                 let effect_id = item
@@ -1261,6 +1274,7 @@ impl AgendaStore {
                         agent_config,
                         recurrence,
                         trigger,
+                        binding_refs,
                     },
                 })
             }
@@ -2109,6 +2123,129 @@ pub(crate) fn digest_file(path: &Path) -> std::io::Result<String> {
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+/// Parse a binding-ref locator (sealed refs). v1 grammar: `file:` + an
+/// absolute path, bounded like G1 file refs. Every other scheme is
+/// future vocabulary — refused by name so a `body:`/`git:` propose fails
+/// loudly today instead of sealing garbage.
+pub(crate) fn binding_ref_path(locator: &str) -> Result<&Path, String> {
+    let Some(raw) = locator.strip_prefix(BINDING_REF_FILE_SCHEME) else {
+        return Err(format!(
+            "binding ref locator {locator:?} must use the \
+             {BINDING_REF_FILE_SCHEME}<absolute path> scheme — v1 seals files only \
+             (body:/git: forms are future vocabulary)"
+        ));
+    };
+    if locator.chars().count() > MAX_REF_FILE_LOCATOR_CHARS {
+        return Err(format!(
+            "binding ref path exceeds {MAX_REF_FILE_LOCATOR_CHARS} characters"
+        ));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!(
+            "binding ref {locator:?} must carry an absolute path"
+        ));
+    }
+    Ok(path)
+}
+
+/// Intake validation of proposed binding refs (sealed refs): locator
+/// grammar, pin shape, and the caller-stated sha256 verified against the
+/// daemon's OWN read of the live bytes — a pin this read already
+/// contradicts would only park a manifest whose every firing refuses,
+/// so the contradiction is named at review time (the project_root
+/// precedent). Pins normalize to lowercase hex; the returned refs are
+/// what the digest-bound manifest records.
+fn validate_binding_refs(refs: Vec<BindingRef>) -> Result<Vec<BindingRef>, AgendaError> {
+    if refs.len() > MAX_BINDING_REFS_PER_MANIFEST {
+        return Err(AgendaError::Invalid(format!(
+            "a manifest seals at most {MAX_BINDING_REFS_PER_MANIFEST} binding refs"
+        )));
+    }
+    let mut validated: Vec<BindingRef> = Vec::with_capacity(refs.len());
+    for BindingRef { locator, sha256 } in refs {
+        let path = binding_ref_path(&locator).map_err(AgendaError::Invalid)?;
+        let sha256 = sha256.to_ascii_lowercase();
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(AgendaError::Invalid(format!(
+                "binding ref {locator}: sha256 must be 64 hex characters"
+            )));
+        }
+        if validated.iter().any(|seen| seen.locator == locator) {
+            return Err(AgendaError::Invalid(format!(
+                "binding ref {locator} is listed twice"
+            )));
+        }
+        let meta = std::fs::metadata(path).map_err(|err| {
+            AgendaError::Invalid(format!("binding ref {locator} is not readable ({err})"))
+        })?;
+        if !meta.is_file() {
+            return Err(AgendaError::Invalid(format!(
+                "binding ref {locator} is not a regular file"
+            )));
+        }
+        if meta.len() > MAX_REF_FILE_HASH_BYTES {
+            return Err(AgendaError::Invalid(format!(
+                "binding ref {locator} exceeds {MAX_REF_FILE_HASH_BYTES} bytes — \
+                 binding refs seal working artifacts, not archives"
+            )));
+        }
+        let live = digest_file(path).map_err(|err| {
+            AgendaError::Invalid(format!("cannot hash binding ref {locator}: {err}"))
+        })?;
+        if live != sha256 {
+            return Err(AgendaError::Invalid(format!(
+                "binding ref {locator}: the proposed pin {sha256} does not match the \
+                 live content ({live}) — re-read the file and re-propose"
+            )));
+        }
+        validated.push(BindingRef { locator, sha256 });
+    }
+    Ok(validated)
+}
+
+/// Fire-time seal check of one binding ref (sealed refs): the live file
+/// must still hash to the approved pin exactly. `Err` carries the named
+/// occurrence-failure reason — the scheduler journals it and refuses to
+/// spawn, so an approved goal never runs against silently drifted or
+/// unreadable referenced content.
+pub(crate) fn verify_binding_ref(binding_ref: &BindingRef) -> Result<(), String> {
+    let path = binding_ref_path(&binding_ref.locator)?;
+    let live = match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(format!(
+                "binding ref unreadable: {} (not a regular file)",
+                binding_ref.locator
+            ))
+        }
+        Ok(meta) if meta.len() > MAX_REF_FILE_HASH_BYTES => {
+            // Grown past the hash bound = changed by size alone; attach
+            // only ever pinned content within the bound (G1's rule).
+            return Err(format!(
+                "binding ref drifted: {} — the live file outgrew the \
+                 {MAX_REF_FILE_HASH_BYTES}-byte seal bound",
+                binding_ref.locator
+            ));
+        }
+        Ok(_) => digest_file(path)
+            .map_err(|err| format!("binding ref unreadable: {} ({err})", binding_ref.locator))?,
+        Err(err) => {
+            return Err(format!(
+                "binding ref unreadable: {} ({err})",
+                binding_ref.locator
+            ))
+        }
+    };
+    if live != binding_ref.sha256 {
+        return Err(format!(
+            "binding ref drifted: {} — approved sha256 {}, live file {live}; \
+             re-propose and re-approve to reseal",
+            binding_ref.locator, binding_ref.sha256
+        ));
+    }
+    Ok(())
 }
 
 fn validate_title(title: &str) -> Result<String, AgendaError> {
@@ -3779,6 +3916,7 @@ mod tests {
 
     fn propose_recurring(id: &str, every_ms: u64) -> AgendaCommand {
         AgendaCommand::ProposeEffect {
+            binding_refs: Vec::new(),
             id: id.to_string(),
             goal: "standing sweep".into(),
             fire_at_ms: 1_000_000,
@@ -3818,6 +3956,7 @@ mod tests {
             (propose_recurring(&id, 60_000), "floors at 15 minutes"),
             (
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     id: id.clone(),
                     goal: "g".into(),
                     fire_at_ms: 1_000_000,
@@ -3835,6 +3974,7 @@ mod tests {
             ),
             (
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     id: id.clone(),
                     goal: "g".into(),
                     fire_at_ms: 1_000_000,
@@ -4096,6 +4236,7 @@ mod tests {
     #[test]
     fn g3pre_cross_build_digest_degrades_fail_closed() {
         let with = super::super::types::SessionManifest {
+            binding_refs: Vec::new(),
             goal: "standing".into(),
             fire_at_ms: 1_000_000,
             orchestrate: false,
@@ -4130,6 +4271,238 @@ mod tests {
             .contains("recurrence"));
     }
 
+    /// Sealed-refs intake: the proposer's stated pin is verified against
+    /// the daemon's OWN read at propose time — a matching pin lands on
+    /// the digest-bound manifest (normalized to lowercase hex) and
+    /// survives replay, and every deterministic fire-time refusal is
+    /// named NOW instead: hash mismatch, unreadable path, non-`file:`
+    /// scheme, relative path, malformed pin, duplicate locator, and the
+    /// count rail.
+    #[test]
+    fn propose_binding_refs_verify_at_intake() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let brief = content.path().join("brief.md");
+        std::fs::write(&brief, b"the sealed brief\n").unwrap();
+        let pin = digest_file(&brief).unwrap();
+        let locator = format!("file:{}", brief.display());
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let item = store
+            .apply_command(add_cmd("sealed"), owner(), 1000)
+            .unwrap();
+        let propose = |refs: Vec<BindingRef>| AgendaCommand::ProposeEffect {
+            id: item.id.clone(),
+            goal: "read the sealed brief and act".into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            recurrence: None,
+            agent_config: None,
+            trigger: None,
+            project_root: None,
+            binding_refs: refs,
+            source: None,
+        };
+
+        // An UPPERCASE pin normalizes to canonical lowercase hex.
+        let sealed = store
+            .apply_command(
+                propose(vec![BindingRef {
+                    locator: locator.clone(),
+                    sha256: pin.to_ascii_uppercase(),
+                }]),
+                owner(),
+                1001,
+            )
+            .unwrap();
+        assert_eq!(
+            sealed.effects[0].manifest.binding_refs,
+            vec![BindingRef {
+                locator: locator.clone(),
+                sha256: pin.clone(),
+            }],
+            "the verified pin rides the digest-bound manifest"
+        );
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.item(&item.id).unwrap().effects[0]
+                .manifest
+                .binding_refs,
+            sealed.effects[0].manifest.binding_refs,
+            "replay converges — the op carries the sealed manifest verbatim"
+        );
+
+        // A pin the daemon's read contradicts refuses by name.
+        let err = store
+            .apply_command(
+                propose(vec![BindingRef {
+                    locator: locator.clone(),
+                    sha256: "cc".repeat(32),
+                }]),
+                owner(),
+                1002,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the live content"),
+            "{err}"
+        );
+        // Unreadable path.
+        let err = store
+            .apply_command(
+                propose(vec![BindingRef {
+                    locator: format!("file:{}", content.path().join("gone.md").display()),
+                    sha256: pin.clone(),
+                }]),
+                owner(),
+                1003,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("is not readable"), "{err}");
+        // Non-file: schemes are future vocabulary, refused by name.
+        for bad in ["body:", "git:brief.md@HEAD", "/etc/hosts", "https://x/y"] {
+            let err = store
+                .apply_command(
+                    propose(vec![BindingRef {
+                        locator: bad.to_string(),
+                        sha256: pin.clone(),
+                    }]),
+                    owner(),
+                    1004,
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("file:<absolute path>"),
+                "{bad}: {err}"
+            );
+        }
+        // Relative path under the scheme.
+        let err = store
+            .apply_command(
+                propose(vec![BindingRef {
+                    locator: "file:relative/brief.md".into(),
+                    sha256: pin.clone(),
+                }]),
+                owner(),
+                1005,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("absolute path"), "{err}");
+        // Malformed pins.
+        for bad_pin in ["abc", &"zz".repeat(32)] {
+            let err = store
+                .apply_command(
+                    propose(vec![BindingRef {
+                        locator: locator.clone(),
+                        sha256: bad_pin.to_string(),
+                    }]),
+                    owner(),
+                    1006,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("64 hex characters"), "{err}");
+        }
+        // Duplicate locators.
+        let dup = BindingRef {
+            locator: locator.clone(),
+            sha256: pin.clone(),
+        };
+        let err = store
+            .apply_command(propose(vec![dup.clone(), dup.clone()]), owner(), 1007)
+            .unwrap_err();
+        assert!(err.to_string().contains("listed twice"), "{err}");
+        // Count rail (checked before any filesystem read).
+        let err = store
+            .apply_command(
+                propose(vec![dup; MAX_BINDING_REFS_PER_MANIFEST + 1]),
+                owner(),
+                1008,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&MAX_BINDING_REFS_PER_MANIFEST.to_string()),
+            "{err}"
+        );
+    }
+
+    /// Fire-time seal check: unchanged content passes; drifted content,
+    /// missing files, and non-`file:` locators refuse with exactly the
+    /// named reasons the scheduler journals against the occurrence.
+    #[test]
+    fn verify_binding_ref_names_drift_and_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sealed.md");
+        std::fs::write(&path, b"v1").unwrap();
+        let pin = digest_file(&path).unwrap();
+        let bref = BindingRef {
+            locator: format!("file:{}", path.display()),
+            sha256: pin,
+        };
+        assert_eq!(verify_binding_ref(&bref), Ok(()));
+
+        std::fs::write(&path, "v2 — amended under an armed approval").unwrap();
+        let err = verify_binding_ref(&bref).unwrap_err();
+        assert!(
+            err.starts_with(&format!("binding ref drifted: file:{}", path.display())),
+            "{err}"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let err = verify_binding_ref(&bref).unwrap_err();
+        assert!(
+            err.starts_with(&format!("binding ref unreadable: file:{}", path.display())),
+            "{err}"
+        );
+
+        let err = verify_binding_ref(&BindingRef {
+            locator: "/no-scheme".into(),
+            sha256: "aa".repeat(32),
+        })
+        .unwrap_err();
+        assert!(err.contains("file:<absolute path>"), "{err}");
+    }
+
+    /// The sealed-refs twin of the cross-build rider: a build that
+    /// predates `binding_refs` re-serializes the manifest without it and
+    /// derives a DIFFERENT digest — the approval reads as a mismatch and
+    /// the effect never fires, so a sealed manifest degrades fail-closed
+    /// on older builds instead of firing UNSEALED (exactly the class of
+    /// silent unsealing the pin exists to catch).
+    #[test]
+    fn binding_refs_cross_build_digest_degrades_fail_closed() {
+        let with = super::super::types::SessionManifest {
+            goal: "sealed".into(),
+            fire_at_ms: 1_000_000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: None,
+            binding_refs: vec![BindingRef {
+                locator: "file:/work/brief.md".into(),
+                sha256: "aa".repeat(32),
+            }],
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert!(
+            json.get("binding_refs").is_some(),
+            "the field reaches the wire"
+        );
+        let mut stripped_json = json.clone();
+        stripped_json
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_refs");
+        let stripped: super::super::types::SessionManifest =
+            serde_json::from_value(stripped_json).unwrap();
+        assert_ne!(
+            super::super::types::manifest_digest("i", "e", &with),
+            super::super::types::manifest_digest("i", "e", &stripped),
+            "binding refs must be digest-visible or old builds would fire the goal unsealed"
+        );
+    }
+
     /// The executor twin of the cross-build rider (Track AU): a build
     /// that predates the manifest's `agent_config` re-serializes without
     /// it and derives a DIFFERENT digest — the approval reads as a
@@ -4140,6 +4513,7 @@ mod tests {
     #[test]
     fn executor_cross_build_digest_degrades_fail_closed() {
         let with = super::super::types::SessionManifest {
+            binding_refs: Vec::new(),
             goal: "standing".into(),
             fire_at_ms: 1_000_000,
             orchestrate: false,
@@ -4189,6 +4563,7 @@ mod tests {
     #[test]
     fn trigger_cross_build_digest_degrades_fail_closed() {
         let with = super::super::types::SessionManifest {
+            binding_refs: Vec::new(),
             goal: "gated run".into(),
             fire_at_ms: 1_000_000,
             orchestrate: false,
@@ -4236,6 +4611,7 @@ mod tests {
         let propose = |recurrence: Option<super::super::types::RecurrenceSpec>,
                        trigger: Option<super::super::types::TriggerSpec>| {
             AgendaCommand::ProposeEffect {
+                binding_refs: Vec::new(),
                 id: id.clone(),
                 goal: "g".into(),
                 fire_at_ms: 1_000_000,
@@ -4317,6 +4693,7 @@ mod tests {
             .id;
         let propose =
             |config: Option<crate::event::AgentLaunchConfig>| AgendaCommand::ProposeEffect {
+                binding_refs: Vec::new(),
                 id: id.clone(),
                 goal: "triage pass".into(),
                 fire_at_ms: 1_000_000,
@@ -4681,6 +5058,7 @@ mod tests {
             .unwrap()
             .id;
         let propose = |project_root: Option<String>| AgendaCommand::ProposeEffect {
+            binding_refs: Vec::new(),
             id: id.clone(),
             goal: "g".into(),
             fire_at_ms: 1_000_000,

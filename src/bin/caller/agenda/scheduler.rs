@@ -505,6 +505,19 @@ fn dispatch_session(
             return false;
         }
     };
+    // Fire-time seal check (sealed refs): every binding ref must still
+    // hash to its approved pin — an approved goal never spawns against
+    // silently drifted or unreadable referenced content. The refusal is
+    // this occurrence's terminal `failed` outcome with the named reason,
+    // written back to the item and counted by the standing failure
+    // streak, so a stale standing manifest suspends and surfaces to the
+    // owner instead of firing over its own drift again and again.
+    for binding_ref in &spawn.binding_refs {
+        if let Err(why) = super::store::verify_binding_ref(binding_ref) {
+            resolve_spawnless(handle, journal, &spawn, OccurrenceState::Failed, now, &why);
+            return false;
+        }
+    }
     if !session_record(journal, &spawn, now, OccurrenceState::Prepared, None) {
         return false; // cannot journal ⇒ do not spawn what we cannot dedup
     }
@@ -568,13 +581,22 @@ fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root:
     // Every fired session's task carries a data rider naming its source:
     // the agenda item + occurrence that fired it, so goal self-references
     // ("THIS item", "your prerequisite item") resolve mechanically through
-    // the session's own attributed ctl; an on_item_match batch adds its
-    // matched ids (Track T). Both lines are data to act on under the
-    // approved goal, never instructions themselves.
+    // the session's own attributed ctl; each binding ref adds one line —
+    // locator + approved sha256, verified at fire (sealed refs: the
+    // CONTENT behind a verified pin is what the owner reviewed and may
+    // carry instructions; the line itself is a pointer); an on_item_match
+    // batch adds its matched ids (Track T). All rider lines are data to
+    // act on under the approved goal, never instructions themselves.
     let mut task = format!(
         "{}\n\nFired from agenda item {} (occurrence {})",
         spawn.goal, spawn.item_id, spawn.occurrence_id
     );
+    for binding_ref in &spawn.binding_refs {
+        task.push_str(&format!(
+            "\nBinding ref {} sha256 {} — verified at fire",
+            binding_ref.locator, binding_ref.sha256
+        ));
+    }
     if !spawn.matched_item_ids.is_empty() {
         task.push_str(&format!(
             "\nMatched agenda items (this firing's batch): {}",
@@ -1089,7 +1111,7 @@ pub(crate) fn local_minute_of_day_at(instant_ms: u64) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::super::store::AgendaStore;
-    use super::super::types::{AgendaCommand, AgendaKind};
+    use super::super::types::{AgendaCommand, AgendaKind, BindingRef, RecurrenceSpec};
     use super::*;
     use crate::event::EventBus;
 
@@ -1293,6 +1315,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "run the nightly sweep".into(),
@@ -1318,6 +1341,223 @@ mod tests {
             )
             .unwrap();
         (item.id, effect_id, proposed.effects[0].digest.clone())
+    }
+
+    /// Parks one item and proposes+approves a sealed manifest on it —
+    /// binding refs riding the digest the owner approves (intake verifies
+    /// the pins, so the referenced files must exist with exactly the
+    /// pinned bytes at propose time).
+    fn approved_sealed_item(
+        handle: &AgendaHandle,
+        fire_at_ms: u64,
+        goal: &str,
+        binding_refs: Vec<BindingRef>,
+        recurrence: Option<RecurrenceSpec>,
+    ) -> String {
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "sealed work".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: goal.into(),
+                    fire_at_ms,
+                    orchestrate: false,
+                    recurrence,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+        item.id
+    }
+
+    /// Sealed refs, pin (c): the fired task's exact bytes extend with one
+    /// data line per binding ref — locator + approved sha256, verified at
+    /// fire — under the source line, before any batch line.
+    #[tokio::test]
+    async fn sealed_manifest_task_carries_binding_ref_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let brief = content.path().join("brief.md");
+        std::fs::write(&brief, b"sealed instructions v1\n").unwrap();
+        let pin = super::super::store::digest_file(&brief).unwrap();
+        let locator = format!("file:{}", brief.display());
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let item_id = approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "act on the sealed brief",
+            vec![BindingRef {
+                locator: locator.clone(),
+                sha256: pin.clone(),
+            }],
+            None,
+        );
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut dispatched = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                task,
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                dispatched.push((task, delegation_id));
+            }
+        }
+        assert_eq!(dispatched.len(), 1, "the sealed manifest dispatches");
+        let occurrence_id = dispatched[0].1.strip_prefix(DELEGATION_PREFIX).unwrap();
+        assert_eq!(
+            dispatched[0].0,
+            format!(
+                "act on the sealed brief\n\nFired from agenda item {item_id} \
+                 (occurrence {occurrence_id})\nBinding ref {locator} sha256 {pin} \
+                 — verified at fire"
+            ),
+            "each binding ref rides the fired task as one data line"
+        );
+    }
+
+    /// Sealed refs, pin (b): the live-failure shape. An approved STANDING
+    /// manifest whose referenced file changes after approval refuses to
+    /// spawn at fire time — no StartTask, the occurrence journals
+    /// terminal `failed` with the named drift reason, the write-back
+    /// lands on the item, and the failure counts on the standing streak
+    /// (the suspension counter) so a stale manifest suspends and
+    /// surfaces instead of firing over its own drift. A deleted ref
+    /// refuses the same way under the `unreadable` name.
+    #[tokio::test]
+    async fn binding_ref_drift_refuses_spawn_and_journals_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let drifting = content.path().join("drifting.md");
+        let vanishing = content.path().join("vanishing.md");
+        std::fs::write(&drifting, b"approved bytes\n").unwrap();
+        std::fs::write(&vanishing, b"soon gone\n").unwrap();
+        let drifting_locator = format!("file:{}", drifting.display());
+        let vanishing_locator = format!("file:{}", vanishing.display());
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let recurrence = || {
+            Some(RecurrenceSpec {
+                every_ms: super::super::types::RECURRENCE_MIN_EVERY_MS,
+                until_ms: None,
+                max_occurrences: None,
+                suspend_after_failures: None,
+            })
+        };
+        let drift_item = approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "sweep with the approved brief",
+            vec![BindingRef {
+                locator: drifting_locator.clone(),
+                sha256: super::super::store::digest_file(&drifting).unwrap(),
+            }],
+            recurrence(),
+        );
+        let vanish_item = approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "sweep with the vanishing brief",
+            vec![BindingRef {
+                locator: vanishing_locator.clone(),
+                sha256: super::super::store::digest_file(&vanishing).unwrap(),
+            }],
+            recurrence(),
+        );
+
+        // The live specimen: the referenced file is amended (and the
+        // other deleted) UNDER the armed approval.
+        std::fs::write(&drifting, b"amended after approval\n").unwrap();
+        std::fs::remove_file(&vanishing).unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "a drifted seal must not spawn"
+            );
+        }
+        let (items, _, _) = handle.snapshot();
+        let drifted = items.iter().find(|i| i.id == drift_item).unwrap();
+        let run = drifted.effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "failed");
+        let note = run.note.as_deref().unwrap_or_default();
+        assert!(
+            note.starts_with(&format!("binding ref drifted: {drifting_locator}")),
+            "the named reason reaches the item: {note}"
+        );
+        assert_eq!(
+            journal.progress(&run.occurrence_id).terminal,
+            Some(OccurrenceState::Failed),
+            "the journal records the terminal refusal"
+        );
+        assert_eq!(
+            drifted.effects[0].consecutive_failures, 1,
+            "the refusal counts on the standing streak — suspension machinery sees it"
+        );
+        let vanished = items.iter().find(|i| i.id == vanish_item).unwrap();
+        let run = vanished.effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "failed");
+        let note = run.note.as_deref().unwrap_or_default();
+        assert!(
+            note.starts_with(&format!("binding ref unreadable: {vanishing_locator}")),
+            "the unreadable case refuses under its own name: {note}"
+        );
+        assert_eq!(vanished.effects[0].consecutive_failures, 1);
+
+        // Restoring the approved bytes does not resurrect the SPENT
+        // occurrence — the next series instant fires normally instead.
+        std::fs::write(&drifting, b"approved bytes\n").unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "a spent refused occurrence must not re-dispatch inside its instant"
+            );
+        }
     }
 
     /// The A5 lifecycle at unit level: an approved due manifest dispatches
@@ -1352,6 +1592,7 @@ mod tests {
         handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: bystander.id.clone(),
                     goal: "must not run".into(),
@@ -1470,6 +1711,7 @@ mod tests {
         handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item_id.clone(),
                     goal: "run the nightly sweep, rev 2".into(),
@@ -1996,6 +2238,7 @@ mod tests {
 
         let mut rx = handle.bus().subscribe();
         let spawn = SpawnOccurrence {
+            binding_refs: Vec::new(),
             occurrence_id: "occ-batch".into(),
             item_id: "standing-item".into(),
             effect_id: "ef-1".into(),
@@ -2097,6 +2340,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     id: item.id.clone(),
                     goal: "triage pass".into(),
                     fire_at_ms: now_ms() - 30_000,
@@ -2731,6 +2975,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "sweep it".into(),

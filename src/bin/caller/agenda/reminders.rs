@@ -33,7 +33,7 @@
 //! double-fire window between two live daemons sharing one home —
 //! at-least-once, honestly.
 
-use super::types::{AgendaEffect, AgendaItem, AgendaStatus, RecurrenceSpec};
+use super::types::{AgendaEffect, AgendaItem, AgendaStatus, BindingRef, RecurrenceSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -684,6 +684,10 @@ pub(crate) struct SpawnOccurrence {
     /// dispatch-time consumed-annotations — NEVER journal fields (rows
     /// stay shape-identical to cadence occurrences).
     pub(crate) matched_item_ids: Vec<String>,
+    /// The manifest's hash-pinned binding refs (sealed refs), carried to
+    /// the dispatcher for the fire-time seal check and the fired task's
+    /// per-ref data lines.
+    pub(crate) binding_refs: Vec<BindingRef>,
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
@@ -1062,6 +1066,7 @@ pub(crate) fn plan(
                     agent_config: effect.manifest.agent_config.clone(),
                     provenance_session_id: item.provenance.session_id.clone(),
                     matched_item_ids: trigger_batch.clone(),
+                    binding_refs: effect.manifest.binding_refs.clone(),
                 };
                 if progress.prepared {
                     // Crash between prepare and launch confirmation: fail
@@ -1700,6 +1705,7 @@ mod tests {
     fn standing_item(id: &str, fire_at: u64, rec: RecurrenceSpec) -> AgendaItem {
         let mut base = item(id, AgendaStatus::Open, None);
         let manifest = SessionManifest {
+            binding_refs: Vec::new(),
             goal: "standing run".into(),
             fire_at_ms: fire_at,
             orchestrate: false,
@@ -2012,6 +2018,7 @@ mod tests {
         let one_shot = {
             let mut base = item("os", AgendaStatus::Open, None);
             let manifest = SessionManifest {
+                binding_refs: Vec::new(),
                 goal: "one shot".into(),
                 fire_at_ms: 50_000,
                 orchestrate: false,
@@ -2063,6 +2070,7 @@ mod tests {
     fn one_shot_item(id: &str, fire_at: u64) -> AgendaItem {
         let mut base = item(id, AgendaStatus::Open, None);
         let manifest = SessionManifest {
+            binding_refs: Vec::new(),
             goal: "one shot".into(),
             fire_at_ms: fire_at,
             orchestrate: false,
@@ -2742,6 +2750,7 @@ mod tests {
     ) -> AgendaItem {
         let mut base = item(id, AgendaStatus::Open, None);
         let manifest = SessionManifest {
+            binding_refs: Vec::new(),
             goal: "triggered run".into(),
             fire_at_ms: fire_at,
             orchestrate: false,

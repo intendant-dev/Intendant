@@ -2168,6 +2168,7 @@ async fn run_agenda(
                 "--suspend-after",
                 "--on-item-match",
                 "--project",
+                "--binding-ref",
                 "--source",
             ];
             value_flags.extend(AGENDA_LAUNCH_FLAGS);
@@ -2277,6 +2278,18 @@ async fn run_agenda(
             // Explicit project pin (T3c): digest-bound on the manifest,
             // so the approval covers WHERE the sessions run.
             insert_string(&mut map, "project_root", args.one("--project"));
+            // Sealed refs: hash each --binding-ref at propose time — the
+            // pin states what THIS process read; the daemon verifies its
+            // own view at intake and re-verifies at every fire, so the
+            // approval digest covers the referenced content, not just
+            // the goal text.
+            let binding_refs = args
+                .all("--binding-ref")
+                .map(binding_ref_propose_value)
+                .collect::<Result<Vec<Value>, String>>()?;
+            if !binding_refs.is_empty() {
+                map.insert("binding_refs".to_string(), Value::Array(binding_refs));
+            }
             insert_string(&mut map, "source", args.one("--source"));
             // Executor pins (Track AU): the same launch vocabulary the
             // start-now sheet records, digest-bound on the standing
@@ -2708,6 +2721,43 @@ fn agenda_ref_spec(raw: &str, explicit: Option<&str>) -> Result<(String, String)
         locator.to_string()
     };
     Ok((ref_type, locator))
+}
+
+/// `--binding-ref file:PATH` propose-time hashing (sealed refs): resolve
+/// PATH, sha256 its bytes NOW, and embed `{locator, sha256}` — the
+/// manifest pin the approval digest covers. The daemon verifies the pin
+/// against its own read at intake (a remote `--url` daemon reading
+/// different bytes refuses by name) and re-verifies at every fire. v1
+/// accepts `file:` locators only; other schemes refuse by name.
+fn binding_ref_propose_value(spec: &str) -> Result<Value, String> {
+    let Some(raw) = spec.strip_prefix("file:") else {
+        return Err(format!(
+            "--binding-ref {spec:?}: v1 seals file:PATH locators only \
+             (body:/git: forms are future vocabulary)"
+        ));
+    };
+    if raw.is_empty() {
+        return Err("--binding-ref file: needs a path".to_string());
+    }
+    let path = std::path::Path::new(raw);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|err| format!("--binding-ref {spec:?}: cannot resolve the cwd ({err})"))?
+            .join(path)
+    };
+    // Canonical (symlink-free) so the daemon pins the same bytes at fire
+    // time that this hash read — a locator that dereferences differently
+    // later is exactly the drift the seal exists to catch.
+    let canonical = std::fs::canonicalize(&absolute)
+        .map_err(|err| format!("--binding-ref {spec:?}: not readable ({err})"))?;
+    let sha256 = crate::agenda::digest_file(&canonical)
+        .map_err(|err| format!("--binding-ref {spec:?}: cannot hash ({err})"))?;
+    Ok(serde_json::json!({
+        "locator": format!("file:{}", canonical.display()),
+        "sha256": sha256,
+    }))
 }
 
 fn agenda_add_args(raw: &[String]) -> Result<Value, String> {
@@ -5150,6 +5200,8 @@ fn help_agenda() {
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
       [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
       # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor)\n\
+      [--binding-ref file:PATH]...   # sealed refs: sha256-pin content the goal depends on —\n\
+      # hashed here at propose time, covered by the approval digest, re-verified at every fire\n\
       [--project DIR]   # digest-bound project pin: where fired sessions run (absolute, must\n\
       # exist; omitted = the parking session's root, else the daemon default)\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
@@ -5229,7 +5281,12 @@ runs the goal (backend/model/effort), and editing the executor voids it\n\
 like any other revision; omitted fields inherit the daemon defaults\n\
 (explicit pin → daemon default → backend default). On a\n\
 standing approved item, `start` fires one extra occurrence of the approved\n\
-manifest immediately without touching the approval. Nothing fires until\n\
+manifest immediately without touching the approval. --binding-ref file:PATH\n\
+(repeatable) SEALS content the goal depends on: the file is sha256-pinned\n\
+at propose time on the digest-bound manifest — the approval covers the\n\
+referenced bytes, editing the pin re-opens review, and every fire\n\
+re-verifies the hash, refusing to spawn (occurrence `failed`, streak-\n\
+visible) if the file drifted from what was approved. Nothing fires until\n\
 the owner approves; approval is an owner-surface act (dashboard or an\n\
 owner shell) — agent and peer callers may propose but never approve, and\n\
 approval binds the exact manifest digest, so any revision voids it.\n\
@@ -5335,6 +5392,44 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// Sealed refs, pin (d): `--binding-ref` hashes at propose time — the
+    /// embedded pin is the sha256 of the file's bytes as THIS process
+    /// read them (NIST vector for "abc"), the locator canonicalizes under
+    /// `file:`, and every non-`file:` scheme refuses by name.
+    #[test]
+    fn binding_ref_flag_hashes_at_propose_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, b"abc").unwrap();
+        let value = binding_ref_propose_value(&format!("file:{}", brief.display())).unwrap();
+        let canonical = std::fs::canonicalize(&brief).unwrap();
+        assert_eq!(
+            value["locator"],
+            Value::String(format!("file:{}", canonical.display()))
+        );
+        assert_eq!(
+            value["sha256"],
+            Value::String(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()
+            ),
+            "the pin is the propose-time sha256 of the referenced bytes"
+        );
+        for bad in [
+            "body:x",
+            "git:brief.md@HEAD",
+            "/no-scheme",
+            "https://x/y",
+            "file:",
+        ] {
+            let err = binding_ref_propose_value(bad).unwrap_err();
+            assert!(err.contains("--binding-ref"), "{bad}: {err}");
+        }
+        let err =
+            binding_ref_propose_value(&format!("file:{}", dir.path().join("missing.md").display()))
+                .unwrap_err();
+        assert!(err.contains("not readable"), "{err}");
     }
 
     /// The read verbs' `/api` URL assembly: origin derived from the
