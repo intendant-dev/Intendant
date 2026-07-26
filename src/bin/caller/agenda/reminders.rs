@@ -687,14 +687,18 @@ pub(crate) struct SpawnOccurrence {
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
-/// approved revision digest + due instance — the RFC §7.5 shape. A
+/// approved revision digest + identity instant — the RFC §7.5 shape. A
 /// re-approved new revision is a new occurrence; a spent one never
-/// refires.
+/// refires. The identity instant is the series/one-shot/requested due
+/// instance for time-lane occurrences and the RAW trigger cause for
+/// triggered ones — scheduling floors (arm, cooldown) move when an
+/// occurrence fires, never what it is called, so a floor that advances
+/// cannot re-mint a spent cause.
 pub(crate) fn session_occurrence_id(
     item_id: &str,
     effect_id: &str,
     digest: &str,
-    fire_at_ms: u64,
+    identity_ms: u64,
 ) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
@@ -705,7 +709,7 @@ pub(crate) fn session_occurrence_id(
     hasher.update(b"\0");
     hasher.update(digest.as_bytes());
     hasher.update(b"\0");
-    hasher.update(fire_at_ms.to_string().as_bytes());
+    hasher.update(identity_ms.to_string().as_bytes());
     let out = hasher.finalize();
     let mut hex = String::with_capacity(32);
     for byte in out.iter().take(16) {
@@ -715,13 +719,21 @@ pub(crate) fn session_occurrence_id(
     hex
 }
 
-/// One trigger-bearing effect's current due state (Track T): the due
-/// instant — CAUSE-derived, so the same cause yields the same occurrence
-/// id across restarts and re-plans — and, for `on_item_match`, the
-/// batch it would carry.
+/// One trigger-bearing effect's current due state (Track T): when it
+/// fires, what names it, and, for `on_item_match`, the batch it would
+/// carry. Identity derives from the CAUSE, so the same cause yields the
+/// same occurrence id across restarts, re-plans, and floor movement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TriggerDue {
+    /// The scheduling instant: the cause, floored by arm + cooldown.
     pub(crate) due_ms: u64,
+    /// The identity instant: the RAW cause (dependency completion /
+    /// batch latest-arrival), never floored. The cooldown floor advances
+    /// past every terminal, so identity keyed on `due_ms` re-minted the
+    /// same spent cause once per cooldown, forever (the 2026-07-26 echo
+    /// loop); keyed here, a spent cause stays spent and a genuinely new
+    /// cause still fires no earlier than `due_ms`.
+    pub(crate) cause_ms: u64,
     pub(crate) matched_item_ids: Vec<String>,
 }
 
@@ -735,7 +747,10 @@ pub(crate) struct TriggerDue {
 /// never fire, no retro-matching) and the COOLDOWN floor `last terminal
 /// outcome + TRIGGER_COOLDOWN_MS` (T0 ruling 4 — the universal
 /// per-effect refire rate cap; first fires have no prior terminal and
-/// are unaffected).
+/// are unaffected). Both floors move `due_ms` only — `cause_ms` stays
+/// raw, because occurrence identity derives from the cause and a floor
+/// that advances (every terminal moves the cooldown) must never re-mint
+/// a spent one.
 pub(crate) fn trigger_due(
     items: &[AgendaItem],
     item: &AgendaItem,
@@ -769,6 +784,7 @@ pub(crate) fn trigger_due(
             }
             Some(TriggerDue {
                 due_ms: floored(cause),
+                cause_ms: cause,
                 matched_item_ids: Vec::new(),
             })
         }
@@ -814,11 +830,14 @@ pub(crate) fn trigger_due(
             }
             // The batching window (T0 ruling 5): due W after the LATEST
             // unconsumed arrival, so a burst coalesces into one firing
-            // carrying the whole batch.
+            // carrying the whole batch. Identity keys on the raw arrival
+            // itself — same principle, and it holds even when a
+            // dispatch-time consumed-annotation failed to land.
             Some(TriggerDue {
                 due_ms: floored(
                     latest_arrival.saturating_add(super::types::TRIGGER_BATCH_WINDOW_MS),
                 ),
+                cause_ms: latest_arrival,
                 matched_item_ids: matched,
             })
         }
@@ -956,45 +975,54 @@ pub(crate) fn plan(
             if effect.suspended() {
                 continue;
             }
-            // Candidate instants. One-shot: exactly the manifest instant
-            // (the pre-G3-pre path, byte-for-byte semantics). Standing:
-            // the LATEST due series instant only (a wake after downtime
-            // fires one catch-up, never a burst; skipped older instants
-            // get no journal rows — downtime stays visible as journal
-            // silence) plus any owner-requested instants; the next future
-            // series instant registers the wake. The series math lives in
+            // Candidate instants, as (fire, identity, recurring). One-shot:
+            // exactly the manifest instant (the pre-G3-pre path,
+            // byte-for-byte semantics). Standing: the LATEST due series
+            // instant only (a wake after downtime fires one catch-up,
+            // never a burst; skipped older instants get no journal rows —
+            // downtime stays visible as journal silence) plus any
+            // owner-requested instants; the next future series instant
+            // registers the wake. The series math lives in
             // [`series_instants`], shared with the display derivation.
             // Triggered manifests (Track T) are the third candidate
             // producer: `fire_at_ms` is the ARM FLOOR, never a fire
             // instant, and the one candidate comes from the shared
             // [`trigger_due`] cause derivation; owner-requested instants
-            // (run-now) still compose.
-            let mut candidates: Vec<(u64, bool)> = Vec::new();
+            // (run-now) still compose. Identity equals the fire instant
+            // for every candidate except the trigger's, whose identity is
+            // the RAW cause — floors delay the fire but never rename the
+            // occurrence, so a spent cause stays spent while the cooldown
+            // floor advances past each terminal.
+            let mut candidates: Vec<(u64, u64, bool)> = Vec::new();
             let mut trigger_batch: Vec<String> = Vec::new();
             let triggered = effect.manifest.trigger.is_some();
             if let Some(trig) = &effect.manifest.trigger {
                 let started = journal.started_sessions_for_item(&item.id);
                 if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started)
                 {
-                    candidates.push((due.due_ms, true));
+                    candidates.push((due.due_ms, due.cause_ms, true));
                     trigger_batch = due.matched_item_ids;
                 }
                 for req in &effect.requested {
-                    candidates.push((req.at_ms, true));
+                    candidates.push((req.at_ms, req.at_ms, true));
                 }
             } else {
                 match &effect.manifest.recurrence {
-                    None => candidates.push((effect.manifest.fire_at_ms, false)),
+                    None => candidates.push((
+                        effect.manifest.fire_at_ms,
+                        effect.manifest.fire_at_ms,
+                        false,
+                    )),
                     Some(rec) => {
                         let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
                         if let Some(due) = instants.due {
-                            candidates.push((due, true));
+                            candidates.push((due, due, true));
                         }
                         if let Some(upcoming) = instants.upcoming {
                             consider_wake(upcoming, &mut plan);
                         }
                         for req in &effect.requested {
-                            candidates.push((req.at_ms, true));
+                            candidates.push((req.at_ms, req.at_ms, true));
                         }
                     }
                 }
@@ -1007,9 +1035,13 @@ pub(crate) fn plan(
                     .last_run
                     .as_ref()
                     .is_some_and(|run| run.state == "started");
-            for (instant, recurring) in candidates {
-                let occurrence_id =
-                    session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, instant);
+            for (instant, identity_ms, recurring) in candidates {
+                let occurrence_id = session_occurrence_id(
+                    &item.id,
+                    &effect.effect_id,
+                    &approval.digest,
+                    identity_ms,
+                );
                 if in_flight.contains(&occurrence_id) {
                     continue;
                 }
@@ -1130,10 +1162,12 @@ pub(crate) fn effect_next_fire_ms(
     if effect.suspended() {
         return None;
     }
-    // Candidate instants, exactly as `plan` assembles them — including
-    // the trigger lane (Track T), which shares [`trigger_due`] with the
-    // planner so the two cannot drift.
-    let mut candidates: Vec<u64> = Vec::new();
+    // Candidate instants as (fire, identity), exactly as `plan` assembles
+    // them — including the trigger lane (Track T), which shares
+    // [`trigger_due`] with the planner so the two cannot drift, and the
+    // trigger candidate's RAW-cause identity, so the journal dedup below
+    // skips exactly what the planner skips.
+    let mut candidates: Vec<(u64, u64)> = Vec::new();
     let mut upcoming: Option<u64> = None;
     fn consider_upcoming(instant: u64, upcoming: &mut Option<u64>) {
         *upcoming = Some(upcoming.map_or(instant, |cur: u64| cur.min(instant)));
@@ -1142,32 +1176,32 @@ pub(crate) fn effect_next_fire_ms(
     if let Some(trig) = &effect.manifest.trigger {
         let started = journal.started_sessions_for_item(&item.id);
         if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started) {
-            candidates.push(due.due_ms);
+            candidates.push((due.due_ms, due.cause_ms));
         }
         for req in &effect.requested {
-            candidates.push(req.at_ms);
+            candidates.push((req.at_ms, req.at_ms));
         }
     } else {
         match &effect.manifest.recurrence {
-            None => candidates.push(effect.manifest.fire_at_ms),
+            None => candidates.push((effect.manifest.fire_at_ms, effect.manifest.fire_at_ms)),
             Some(rec) => {
                 let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
                 if let Some(due) = instants.due {
-                    candidates.push(due);
+                    candidates.push((due, due));
                 }
                 if let Some(next) = instants.upcoming {
                     consider_upcoming(next, &mut upcoming);
                 }
                 for req in &effect.requested {
-                    candidates.push(req.at_ms);
+                    candidates.push((req.at_ms, req.at_ms));
                 }
             }
         }
     }
     let mut fires_next_pass: Option<u64> = None;
-    for instant in candidates {
+    for (instant, identity_ms) in candidates {
         let occurrence_id =
-            session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, instant);
+            session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, identity_ms);
         let progress = journal.progress(&occurrence_id);
         // Spent or already executing (`plan` skips these), or crash
         // residue (`plan` resolves it through the crashed lane, never a
@@ -2864,7 +2898,13 @@ mod tests {
     /// A spent trigger occurrence never refires; a RE-completed
     /// dependency is a new cause and refires — floored by the effect's
     /// last terminal outcome + the cooldown (T0 ruling 4, the universal
-    /// per-effect rate cap).
+    /// per-effect rate cap). Blindspot, closed by
+    /// `trigger_spent_cause_never_reminted_by_the_advancing_cooldown_floor`:
+    /// the spent-cause act here runs with `last_run = None`, so no
+    /// cooldown floor is in force — this pin coexisted with identity
+    /// keyed on the floored due, which the production write-back
+    /// (every terminal lands on `last_run`) turned into a fresh
+    /// occurrence id per cooldown for the same spent cause.
     #[test]
     fn trigger_refire_needs_a_new_cause_and_respects_the_cooldown() {
         let dir = tempfile::tempdir().unwrap();
@@ -2910,6 +2950,120 @@ mod tests {
             Some(150_000 + TRIGGER_COOLDOWN_MS),
             "the cooldown floors the refire for on_unblock too"
         );
+    }
+
+    /// The live 2026-07-26 echo shape, closed: a terminal LATER than the
+    /// unchanged cause advances the cooldown floor, and the planner must
+    /// mint NOTHING at `terminal + cooldown` — occurrence identity
+    /// derives from the RAW cause, never the floored due. The write-back
+    /// records every terminal on `last_run` (the state the older pin
+    /// never constructs), so identity keyed on the floored due re-minted
+    /// the same spent cause once per cooldown, forever.
+    #[test]
+    fn trigger_spent_cause_never_reminted_by_the_advancing_cooldown_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let items = vec![done_at("node-a", 100_000), node];
+
+        // First plan names the occurrence by the raw cause instant.
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            120_000,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        let occurrence = planned.spawn[0].occurrence_id.clone();
+        let approval_digest = &items[1].effects[0].approval.as_ref().unwrap().digest;
+        assert_eq!(
+            occurrence,
+            session_occurrence_id("node-b", "ef-1", approval_digest, 100_000),
+            "trigger identity = the raw cause instant"
+        );
+
+        // It ran: journal terminal + the write-back's last_run record.
+        spend_occurrence(&mut journal, &occurrence, 150_000);
+        let mut node = items[1].clone();
+        node.effects[0].last_run = Some(AgendaRun {
+            occurrence_id: occurrence,
+            state: "completed".into(),
+            session_id: None,
+            at_ms: 150_000,
+            note: None,
+        });
+        let items = vec![done_at("node-a", 100_000), node];
+
+        // No new cause: nothing mints at the advanced floor, nor at any
+        // later instant (the live loop echoed once per cooldown).
+        let floor = 150_000 + TRIGGER_COOLDOWN_MS;
+        for now in [floor, floor + 60_000, floor + 4 * TRIGGER_COOLDOWN_MS] {
+            assert_eq!(
+                assert_agreement(&items, &items[1], &journal, &policy, now),
+                None,
+                "spent cause must stay spent as the floor advances (now={now})"
+            );
+        }
+    }
+
+    /// The same closure for `on_item_match`: identity keys on the
+    /// batch's raw latest-arrival, so a spent batch stays spent as the
+    /// floor advances — even when the dispatch-time consumed-annotation
+    /// never landed (its error path logs and continues; consumption must
+    /// not be the only guard against the echo).
+    #[test]
+    fn trigger_match_spent_batch_never_reminted_by_the_advancing_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let standing = triggered_item("steward", gate_trigger(), approved, approved);
+        let items = vec![standing, matching_question("q1", 20_000, None)];
+        let close = 20_000 + TRIGGER_BATCH_WINDOW_MS;
+
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            close,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        let occurrence = planned.spawn[0].occurrence_id.clone();
+        let approval_digest = &items[0].effects[0].approval.as_ref().unwrap().digest;
+        assert_eq!(
+            occurrence,
+            session_occurrence_id("steward", "ef-1", approval_digest, 20_000),
+            "batch identity = the raw latest-arrival"
+        );
+
+        // Ran to terminal; q1 stays open and UNCONSUMED (the annotation
+        // failure path) — the spent batch must still never re-mint.
+        spend_occurrence(&mut journal, &occurrence, close + 5_000);
+        let mut standing = items[0].clone();
+        standing.effects[0].last_run = Some(AgendaRun {
+            occurrence_id: occurrence,
+            state: "completed".into(),
+            session_id: None,
+            at_ms: close + 5_000,
+            note: None,
+        });
+        let items = vec![standing, matching_question("q1", 20_000, None)];
+        let floor = close + 5_000 + TRIGGER_COOLDOWN_MS;
+        for now in [floor, floor + TRIGGER_COOLDOWN_MS] {
+            assert_eq!(
+                assert_agreement(&items, &items[0], &journal, &policy, now),
+                None,
+                "spent batch must stay spent as the floor advances (now={now})"
+            );
+        }
     }
 
     /// A burst of matching arrivals coalesces into ONE occurrence whose
