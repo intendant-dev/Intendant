@@ -23298,6 +23298,19 @@ html.ui-v2 .ag2-sub {
   font-size: 13px;
   color: var(--text-2);
 }
+html.ui-v2 .ag2-head-tools {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+  margin-top: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+html.ui-v2 .ag2-depth button {
+  padding: 5px 12px;
+  font-size: 12px;
+}
 html.ui-v2 .ag2-bell {
   display: inline-flex;
   align-items: center;
@@ -23311,7 +23324,6 @@ html.ui-v2 .ag2-bell {
   padding: 6px 11px;
   cursor: pointer;
   flex-shrink: 0;
-  margin-top: 4px;
 }
 html.ui-v2 .ag2-bell:hover {
   border-color: var(--line-2);
@@ -24247,6 +24259,17 @@ html.ui-v2 .ag2-diary-item.plain {
 html.ui-v2 .ag2-diary-who {
   font-size: 11px;
   color: var(--text-3);
+}
+html.ui-v2 .ag2-diary-raw {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-ulid {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  white-space: nowrap;
 }
 
 /* ---- Empty state + footer ledger ---- */
@@ -36612,7 +36635,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '7201a6e5178dc146';
+const INTENDANT_APP_BUILD = '7f8b8570ec46a2bb';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -89648,6 +89671,30 @@ const agendaExpandedThreads = new Set();
 // ---- Lens + inspector view state (the redesigned tab). Ephemeral
 // browser state — never persisted, never on the wire.
 let agendaLens = 'now';
+
+// Progressive-disclosure depth for the whole tab — a persisted
+// presentation preference, never wire state: calm folds the machinery
+// away (triage/must-read chips, tags, exec labels, manifest plumbing,
+// the hood), standard is the working view, everything adds ids and raw
+// op coordinates inline. Gates read agendaDepthCalm()/agendaDepthAll()
+// at render time.
+let agendaDepth = 'standard';
+try {
+  const savedDepth = localStorage.getItem('ui2.agenda.depth');
+  if (['calm', 'standard', 'everything'].includes(savedDepth)) agendaDepth = savedDepth;
+} catch { /* storage unavailable — session-local default */ }
+
+function agendaDepthCalm() { return agendaDepth === 'calm'; }
+function agendaDepthAll() { return agendaDepth === 'everything'; }
+
+function agendaSetDepth(depth) {
+  if (!['calm', 'standard', 'everything'].includes(depth) || depth === agendaDepth) return;
+  agendaDepth = depth;
+  try { localStorage.setItem('ui2.agenda.depth', depth); } catch { /* session-local */ }
+  agendaDepthSyncSeg();
+  agendaRenderTab();
+  if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
+}
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;
@@ -91484,9 +91531,16 @@ function agendaEnsureScaffold() {
             <h2 class="ag2-title">Agenda</h2>
             <p class="ag2-sub">Parked intent that outlives any one session — one ledger for this daemon, every project.</p>
           </div>
-          <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
-            ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
-          </button>
+          <div class="ag2-head-tools">
+            <div class="ag2-seg ag2-depth" id="ag2-depth" role="group" aria-label="How much machinery to show">
+              <button type="button" data-depth="calm" title="Just what needs you — machinery folded away">Calm</button>
+              <button type="button" data-depth="standard" title="The working view">Standard</button>
+              <button type="button" data-depth="everything" title="Ids, digests, raw op coordinates — the whole engine room">Everything</button>
+            </div>
+            <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
+              ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
+            </button>
+          </div>
         </div>
         <div class="ag2-compose">
           <div class="ag2-seg" id="ag2-kind-seg" role="group" aria-label="Kind">
@@ -91529,6 +91583,16 @@ function agendaEnsureScaffold() {
   agendaWireScaffold();
 }
 
+// The depth seg's active state lives on the persistent scaffold, so it
+// syncs directly (wire time and every agendaSetDepth) rather than
+// through the groups re-render.
+function agendaDepthSyncSeg() {
+  const seg = document.getElementById('ag2-depth');
+  if (!seg) return;
+  seg.querySelectorAll('button[data-depth]').forEach((btn) =>
+    btn.classList.toggle('active', btn.dataset.depth === agendaDepth));
+}
+
 function agendaWireScaffold() {
   const kindSeg = document.getElementById('ag2-kind-seg');
   const title = document.getElementById('ag2-compose-title');
@@ -91569,6 +91633,11 @@ function agendaWireScaffold() {
     e.stopPropagation();
     agendaBellToggle();
   });
+  document.getElementById('ag2-depth').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-depth]');
+    if (btn) agendaSetDepth(btn.dataset.depth);
+  });
+  agendaDepthSyncSeg();
   const groups = document.getElementById('ag2-groups');
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
@@ -92034,14 +92103,16 @@ function agendaCardChips(item) {
         'Render-level flag only — completion never cascades'));
     }
   }
+  // Machinery chips — folded away at calm depth (status, due, blocked,
+  // and attention states above always show).
   const triage = agendaTriageInfo(item);
-  if (triage) {
+  if (triage && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(
       triage.rank !== null ? `triage #${triage.rank}` : 'triage',
       'iris', triage.text, true));
   }
   const mustReads = (item.refs || []).filter((r) => r.must_read).length;
-  if (mustReads) {
+  if (mustReads && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(`${mustReads} must-read`, 'iris',
       'Typed pointers the reading agent weighs — never orders'));
   }
@@ -92072,7 +92143,7 @@ function agendaCardByline(item, opts) {
             : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
   }
-  const selfDesc = p.source
+  const selfDesc = p.source && !agendaDepthCalm()
     ? '<span class="agenda-self-described" title="Self-described label — unverified, never an identity">· self-described</span>'
     : '';
   const bits = [
@@ -92085,7 +92156,7 @@ function agendaCardByline(item, opts) {
   if (hub && !opts.noHub) {
     bits.push(`<span>· in</span> <a class="ag2-hub-link" data-open-item="${escapeHtml(hub.id)}">${escapeHtml(hub.title.length > 34 ? `${hub.title.slice(0, 33)}…` : hub.title)}</a>`);
   }
-  (item.tags || []).slice(0, 3).forEach((tag) => {
+  (agendaDepthCalm() ? [] : (item.tags || []).slice(0, 3)).forEach((tag) => {
     bits.push(`<span class="ag2-tag">${escapeHtml(tag)}</span>`);
   });
   return bits.filter(Boolean).join(' ');
@@ -92141,7 +92212,9 @@ function agendaAutomationStripHtml(item) {
   const e = st.effect;
   const id = escapeHtml(item.id);
   const meta = [];
-  meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  if (!agendaDepthCalm()) {
+    meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  }
   meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
@@ -92429,7 +92502,13 @@ function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  const blockedLine = agendaBlockedLine(item);
+  // Calm depth folds prerequisite-only wait lines (the blocked chip
+  // still shows); an explicit uncleared blocker always renders — it
+  // names what someone must do.
+  const blockedRaw = agendaBlockedLine(item);
+  const blockedLine = blockedRaw
+    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
+    ? null : blockedRaw;
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -92443,6 +92522,7 @@ function agendaCardHtml(row) {
       <div class="ag2-card-titlerow">
         <span class="ag2-card-title${item.status === 'done' ? ' done' : ''}${item.status !== 'open' ? ' dim' : ''}">${escapeHtml(item.title)}</span>
         ${agendaCardChips(item)}
+        ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
@@ -92770,7 +92850,7 @@ function agendaInspectorRender() {
         ${agendaInspPrStateHtml(item)}
         ${agendaInspRefsHtml(item)}
         ${agendaInspThreadHtml(item)}
-        ${agendaHoodSectionHtml(item)}
+        ${agendaDepthCalm() ? '' : agendaHoodSectionHtml(item)}
       </div>
     </div>`;
   });
@@ -93069,11 +93149,15 @@ function agendaInspEffectHtml(item) {
       R('ends', `${st.rec.until_ms ? agendaAbsTime(st.rec.until_ms) : ''}${st.rec.max_occurrences ? `${st.rec.until_ms ? ' or ' : ''}after ${st.rec.max_occurrences} runs` : ''}`);
     }
     R('shape', `${m.interactive ? 'interactive — opens and waits for you' : 'goal run — autonomous, writes back'} · ${m.orchestrate ? 'orchestrated' : 'direct'}`);
-    R('project', m.project_root || 'inherited at fire time: parking session’s root, else daemon default', !!m.project_root);
-    const cfg = m.agent_config || null;
-    R('config', cfg
-      ? `${[cfg.agent, ...Object.entries(cfg).filter(([k]) => k !== 'agent').map(([, v]) => v)].filter(Boolean).join(' · ')} — explicit, recorded on the manifest`
-      : 'inherits daemon defaults (Settings → reasoning)', !!cfg);
+    // Manifest plumbing rows fold away at calm depth; the sealed facts
+    // stay one depth notch (or the raw sheet) away.
+    if (!agendaDepthCalm()) {
+      R('project', m.project_root || 'inherited at fire time: parking session’s root, else daemon default', !!m.project_root);
+      const cfg = m.agent_config || null;
+      R('config', cfg
+        ? `${[cfg.agent, ...Object.entries(cfg).filter(([k]) => k !== 'agent').map(([, v]) => v)].filter(Boolean).join(' · ')} — explicit, recorded on the manifest`
+        : 'inherits daemon defaults (Settings → reasoning)', !!cfg);
+    }
     if (st.rec) {
       R('on failure', `suspend after ${st.threshold} failed runs in a row — surfaced, never silently re-fired`);
     }
@@ -93090,7 +93174,7 @@ function agendaInspEffectHtml(item) {
       lastRun = `<div class="ag2-eff-lastrun">
         <div class="ag2-eff-lastrun-head">
           ${agendaChipHtml(`last run · ${run.state}`, runTone)}
-          <span class="ag2-hint">${escapeHtml(`${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
+          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
           ${sessionLink}
         </div>
         ${run.note ? `<div class="ag2-eff-note">${escapeHtml(run.note)}</div>` : ''}
@@ -93126,10 +93210,12 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
-        <span class="ag2-hint mono">digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}</span>
+        <span class="ag2-hint mono">${agendaDepthCalm()
+    ? (e.approval ? 'approved' : 'unapproved')
+    : `digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}`}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
-      <div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>
+      ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
       ${lastRun}
       ${acts.length ? `<div class="ag2-insp-actions">${acts.join('')}</div>` : ''}
     </div>`;
@@ -95410,7 +95496,8 @@ function agendaDiaryRowHtml(entry) {
       <span class="ag2-plan-time">${escapeHtml(envelope.at_ms ? agendaPlanHm(envelope.at_ms) : '—')}</span>
       <span class="ag2-diary-verb">${escapeHtml(verb)}</span>
       ${target}
-      ${who ? `<span class="ag2-diary-who">${escapeHtml(`by ${who}`)}</span>` : ''}
+      ${who && !agendaDepthCalm() ? `<span class="ag2-diary-who">${escapeHtml(`by ${who}`)}</span>` : ''}
+      ${agendaDepthAll() ? `<span class="ag2-diary-raw">${escapeHtml(raw)}</span>` : ''}
     </div>
   </div>`;
 }
@@ -95439,7 +95526,9 @@ function agendaDiarySegHtml() {
        class="${agendaDiaryFilter === id ? 'active' : ''}">${escapeHtml(label)}</button>`).join('');
   return `<div class="ag2-diary-bar">
     <div class="ag2-seg ag2-diary-seg" role="group" aria-label="Diary filter">${buttons}</div>
-    <span class="ag2-diary-hint">attributed, append-only — dismissals, failures, and revocations included</span>
+    <span class="ag2-diary-hint">${agendaDepthCalm()
+    ? 'what happened, day by day'
+    : 'attributed, append-only — dismissals, failures, and revocations included'}</span>
   </div>`;
 }
 

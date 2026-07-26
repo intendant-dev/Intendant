@@ -80,9 +80,16 @@ function agendaEnsureScaffold() {
             <h2 class="ag2-title">Agenda</h2>
             <p class="ag2-sub">Parked intent that outlives any one session — one ledger for this daemon, every project.</p>
           </div>
-          <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
-            ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
-          </button>
+          <div class="ag2-head-tools">
+            <div class="ag2-seg ag2-depth" id="ag2-depth" role="group" aria-label="How much machinery to show">
+              <button type="button" data-depth="calm" title="Just what needs you — machinery folded away">Calm</button>
+              <button type="button" data-depth="standard" title="The working view">Standard</button>
+              <button type="button" data-depth="everything" title="Ids, digests, raw op coordinates — the whole engine room">Everything</button>
+            </div>
+            <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
+              ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
+            </button>
+          </div>
         </div>
         <div class="ag2-compose">
           <div class="ag2-seg" id="ag2-kind-seg" role="group" aria-label="Kind">
@@ -125,6 +132,16 @@ function agendaEnsureScaffold() {
   agendaWireScaffold();
 }
 
+// The depth seg's active state lives on the persistent scaffold, so it
+// syncs directly (wire time and every agendaSetDepth) rather than
+// through the groups re-render.
+function agendaDepthSyncSeg() {
+  const seg = document.getElementById('ag2-depth');
+  if (!seg) return;
+  seg.querySelectorAll('button[data-depth]').forEach((btn) =>
+    btn.classList.toggle('active', btn.dataset.depth === agendaDepth));
+}
+
 function agendaWireScaffold() {
   const kindSeg = document.getElementById('ag2-kind-seg');
   const title = document.getElementById('ag2-compose-title');
@@ -165,6 +182,11 @@ function agendaWireScaffold() {
     e.stopPropagation();
     agendaBellToggle();
   });
+  document.getElementById('ag2-depth').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-depth]');
+    if (btn) agendaSetDepth(btn.dataset.depth);
+  });
+  agendaDepthSyncSeg();
   const groups = document.getElementById('ag2-groups');
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
@@ -630,14 +652,16 @@ function agendaCardChips(item) {
         'Render-level flag only — completion never cascades'));
     }
   }
+  // Machinery chips — folded away at calm depth (status, due, blocked,
+  // and attention states above always show).
   const triage = agendaTriageInfo(item);
-  if (triage) {
+  if (triage && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(
       triage.rank !== null ? `triage #${triage.rank}` : 'triage',
       'iris', triage.text, true));
   }
   const mustReads = (item.refs || []).filter((r) => r.must_read).length;
-  if (mustReads) {
+  if (mustReads && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(`${mustReads} must-read`, 'iris',
       'Typed pointers the reading agent weighs — never orders'));
   }
@@ -668,7 +692,7 @@ function agendaCardByline(item, opts) {
             : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
   }
-  const selfDesc = p.source
+  const selfDesc = p.source && !agendaDepthCalm()
     ? '<span class="agenda-self-described" title="Self-described label — unverified, never an identity">· self-described</span>'
     : '';
   const bits = [
@@ -681,7 +705,7 @@ function agendaCardByline(item, opts) {
   if (hub && !opts.noHub) {
     bits.push(`<span>· in</span> <a class="ag2-hub-link" data-open-item="${escapeHtml(hub.id)}">${escapeHtml(hub.title.length > 34 ? `${hub.title.slice(0, 33)}…` : hub.title)}</a>`);
   }
-  (item.tags || []).slice(0, 3).forEach((tag) => {
+  (agendaDepthCalm() ? [] : (item.tags || []).slice(0, 3)).forEach((tag) => {
     bits.push(`<span class="ag2-tag">${escapeHtml(tag)}</span>`);
   });
   return bits.filter(Boolean).join(' ');
@@ -737,7 +761,9 @@ function agendaAutomationStripHtml(item) {
   const e = st.effect;
   const id = escapeHtml(item.id);
   const meta = [];
-  meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  if (!agendaDepthCalm()) {
+    meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  }
   meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
@@ -1025,7 +1051,13 @@ function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  const blockedLine = agendaBlockedLine(item);
+  // Calm depth folds prerequisite-only wait lines (the blocked chip
+  // still shows); an explicit uncleared blocker always renders — it
+  // names what someone must do.
+  const blockedRaw = agendaBlockedLine(item);
+  const blockedLine = blockedRaw
+    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
+    ? null : blockedRaw;
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -1039,6 +1071,7 @@ function agendaCardHtml(row) {
       <div class="ag2-card-titlerow">
         <span class="ag2-card-title${item.status === 'done' ? ' done' : ''}${item.status !== 'open' ? ' dim' : ''}">${escapeHtml(item.title)}</span>
         ${agendaCardChips(item)}
+        ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}

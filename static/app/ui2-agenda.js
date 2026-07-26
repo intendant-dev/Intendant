@@ -41,6 +41,30 @@ const agendaExpandedThreads = new Set();
 // ---- Lens + inspector view state (the redesigned tab). Ephemeral
 // browser state — never persisted, never on the wire.
 let agendaLens = 'now';
+
+// Progressive-disclosure depth for the whole tab — a persisted
+// presentation preference, never wire state: calm folds the machinery
+// away (triage/must-read chips, tags, exec labels, manifest plumbing,
+// the hood), standard is the working view, everything adds ids and raw
+// op coordinates inline. Gates read agendaDepthCalm()/agendaDepthAll()
+// at render time.
+let agendaDepth = 'standard';
+try {
+  const savedDepth = localStorage.getItem('ui2.agenda.depth');
+  if (['calm', 'standard', 'everything'].includes(savedDepth)) agendaDepth = savedDepth;
+} catch { /* storage unavailable — session-local default */ }
+
+function agendaDepthCalm() { return agendaDepth === 'calm'; }
+function agendaDepthAll() { return agendaDepth === 'everything'; }
+
+function agendaSetDepth(depth) {
+  if (!['calm', 'standard', 'everything'].includes(depth) || depth === agendaDepth) return;
+  agendaDepth = depth;
+  try { localStorage.setItem('ui2.agenda.depth', depth); } catch { /* session-local */ }
+  agendaDepthSyncSeg();
+  agendaRenderTab();
+  if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
+}
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;

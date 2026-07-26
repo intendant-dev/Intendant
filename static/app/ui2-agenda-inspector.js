@@ -83,7 +83,7 @@ function agendaInspectorRender() {
         ${agendaInspPrStateHtml(item)}
         ${agendaInspRefsHtml(item)}
         ${agendaInspThreadHtml(item)}
-        ${agendaHoodSectionHtml(item)}
+        ${agendaDepthCalm() ? '' : agendaHoodSectionHtml(item)}
       </div>
     </div>`;
   });
@@ -382,11 +382,15 @@ function agendaInspEffectHtml(item) {
       R('ends', `${st.rec.until_ms ? agendaAbsTime(st.rec.until_ms) : ''}${st.rec.max_occurrences ? `${st.rec.until_ms ? ' or ' : ''}after ${st.rec.max_occurrences} runs` : ''}`);
     }
     R('shape', `${m.interactive ? 'interactive — opens and waits for you' : 'goal run — autonomous, writes back'} · ${m.orchestrate ? 'orchestrated' : 'direct'}`);
-    R('project', m.project_root || 'inherited at fire time: parking session’s root, else daemon default', !!m.project_root);
-    const cfg = m.agent_config || null;
-    R('config', cfg
-      ? `${[cfg.agent, ...Object.entries(cfg).filter(([k]) => k !== 'agent').map(([, v]) => v)].filter(Boolean).join(' · ')} — explicit, recorded on the manifest`
-      : 'inherits daemon defaults (Settings → reasoning)', !!cfg);
+    // Manifest plumbing rows fold away at calm depth; the sealed facts
+    // stay one depth notch (or the raw sheet) away.
+    if (!agendaDepthCalm()) {
+      R('project', m.project_root || 'inherited at fire time: parking session’s root, else daemon default', !!m.project_root);
+      const cfg = m.agent_config || null;
+      R('config', cfg
+        ? `${[cfg.agent, ...Object.entries(cfg).filter(([k]) => k !== 'agent').map(([, v]) => v)].filter(Boolean).join(' · ')} — explicit, recorded on the manifest`
+        : 'inherits daemon defaults (Settings → reasoning)', !!cfg);
+    }
     if (st.rec) {
       R('on failure', `suspend after ${st.threshold} failed runs in a row — surfaced, never silently re-fired`);
     }
@@ -403,7 +407,7 @@ function agendaInspEffectHtml(item) {
       lastRun = `<div class="ag2-eff-lastrun">
         <div class="ag2-eff-lastrun-head">
           ${agendaChipHtml(`last run · ${run.state}`, runTone)}
-          <span class="ag2-hint">${escapeHtml(`${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
+          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
           ${sessionLink}
         </div>
         ${run.note ? `<div class="ag2-eff-note">${escapeHtml(run.note)}</div>` : ''}
@@ -439,10 +443,12 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
-        <span class="ag2-hint mono">digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}</span>
+        <span class="ag2-hint mono">${agendaDepthCalm()
+    ? (e.approval ? 'approved' : 'unapproved')
+    : `digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}`}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
-      <div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>
+      ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
       ${lastRun}
       ${acts.length ? `<div class="ag2-insp-actions">${acts.join('')}</div>` : ''}
     </div>`;

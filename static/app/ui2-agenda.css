@@ -51,6 +51,19 @@ html.ui-v2 .ag2-sub {
   font-size: 13px;
   color: var(--text-2);
 }
+html.ui-v2 .ag2-head-tools {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+  margin-top: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+html.ui-v2 .ag2-depth button {
+  padding: 5px 12px;
+  font-size: 12px;
+}
 html.ui-v2 .ag2-bell {
   display: inline-flex;
   align-items: center;
@@ -64,7 +77,6 @@ html.ui-v2 .ag2-bell {
   padding: 6px 11px;
   cursor: pointer;
   flex-shrink: 0;
-  margin-top: 4px;
 }
 html.ui-v2 .ag2-bell:hover {
   border-color: var(--line-2);
@@ -1000,6 +1012,17 @@ html.ui-v2 .ag2-diary-item.plain {
 html.ui-v2 .ag2-diary-who {
   font-size: 11px;
   color: var(--text-3);
+}
+html.ui-v2 .ag2-diary-raw {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-ulid {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  white-space: nowrap;
 }
 
 /* ---- Empty state + footer ledger ---- */
