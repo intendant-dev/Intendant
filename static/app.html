@@ -36845,7 +36845,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'e52bf1968353ad26';
+const INTENDANT_APP_BUILD = '2c25e7d18d32e116';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -94138,8 +94138,7 @@ function agendaInspClick(e) {
       const st = agendaEffectState(item);
       if (st) {
         // Approve binds the digest of exactly the revision rendered.
-        agendaSendOp({ op: 'approve_effect', id: item.id, digest: st.effect.digest }, act)
-          .then((updated) => { if (updated) agendaApprovalMoment(updated); });
+        agendaSendOp({ op: 'approve_effect', id: item.id, digest: st.effect.digest }, act);
       }
       break;
     }

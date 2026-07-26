@@ -909,8 +909,7 @@ function agendaInspClick(e) {
       const st = agendaEffectState(item);
       if (st) {
         // Approve binds the digest of exactly the revision rendered.
-        agendaSendOp({ op: 'approve_effect', id: item.id, digest: st.effect.digest }, act)
-          .then((updated) => { if (updated) agendaApprovalMoment(updated); });
+        agendaSendOp({ op: 'approve_effect', id: item.id, digest: st.effect.digest }, act);
       }
       break;
     }
