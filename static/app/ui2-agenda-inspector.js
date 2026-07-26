@@ -370,14 +370,26 @@ function agendaInspEffectHtml(item) {
       suspended: ['amber', `Suspended — ${e.consecutive_failures} failures in a row`],
       running: ['iris', 'Running now'],
       finished: ['neutral', 'Ran — outcome below'],
+      watching: ['sky', 'Watching for matching items'],
+      waiting: ['sky', 'Armed — fires when the prerequisites complete'],
+      ready: ['iris', 'Prerequisites complete — fires within the minute'],
     };
     const [tone, stateLabel] = states[st.kind] || states.finished;
     const rows = [];
     const R = (k, v, mono) =>
       rows.push(`<div class="ag2-eff-k">${escapeHtml(k)}</div><div class="ag2-eff-v${mono ? ' mono' : ''}">${escapeHtml(v)}</div>`);
-    R('when', st.rec
-      ? `every ${agendaCadenceLabel(st.rec.every_ms)} · next ${agendaAbsTime(st.next)}`
-      : `${agendaAbsTime(m.fire_at_ms)} (${agendaRelTime(m.fire_at_ms)})`);
+    if (st.trig) {
+      R('fires', st.trig.kind === 'on_item_match'
+        ? `when a NEW open ${st.trig.item_kind || 'item'} carries ${(st.trig.tags || []).length ? `tags ${st.trig.tags.join(', ')}` : 'the matched shape'} — arrivals batch for a minute`
+        : 'the moment every prerequisite completes — no clock involved');
+      if (!agendaDepthCalm()) {
+        R('guardrails', `arrivals coalesce · one occurrence in flight · suspends after ${st.threshold} failures in a row`);
+      }
+    } else {
+      R('when', st.rec
+        ? `every ${agendaCadenceLabel(st.rec.every_ms)} · next ${agendaAbsTime(st.next)}`
+        : `${agendaAbsTime(m.fire_at_ms)} (${agendaRelTime(m.fire_at_ms)})`);
+    }
     if (st.rec && (st.rec.until_ms || st.rec.max_occurrences)) {
       R('ends', `${st.rec.until_ms ? agendaAbsTime(st.rec.until_ms) : ''}${st.rec.max_occurrences ? `${st.rec.until_ms ? ' or ' : ''}after ${st.rec.max_occurrences} runs` : ''}`);
     }
@@ -420,7 +432,7 @@ function agendaInspEffectHtml(item) {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${String(e.digest || '').slice(0, 8)}… — any edit voids it`);
       A('Edit schedule…', 'sched');
-    } else if (st.kind === 'armed') {
+    } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
       A('Revoke approval', 'eff-revoke', 'danger', 'Instant, owner-surface only');
     } else if (st.kind === 'standing') {

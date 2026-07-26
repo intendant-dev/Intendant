@@ -199,6 +199,25 @@ function agendaPlanEvents() {
           'Consecutive non-success outcomes since the last approval')],
         note: 'nothing fires while suspended — re-approving the unchanged digest re-arms the series',
       });
+    } else if (st.kind === 'watching') {
+      const predicate = `${st.trig.item_kind || 'item'}${(st.trig.tags || []).length ? ` + ${st.trig.tags.join(',')}` : ''}`;
+      events.push({
+        at: now, item, what: 'watching for matching items', tone: 'sky', pulse: 'slow',
+        chips: [agendaChipHtml(predicate, 'sky',
+          'Fires when a NEW open item of this kind carries these tags — arrivals batch for a minute')],
+        note: null,
+      });
+    } else if (st.kind === 'waiting') {
+      events.push({
+        at: now, item, what: 'armed — fires on unblock', tone: 'sky', pulse: '',
+        chips: [],
+        note: 'fires the moment its prerequisites complete — no clock involved',
+      });
+    } else if (st.kind === 'ready') {
+      events.push({
+        at: now, item, what: 'prerequisites complete — fires within the minute',
+        tone: 'iris', pulse: 'fast', chips: [], note: null,
+      });
     }
     // Fire rows ride the SERVED planner instant exclusively: absent
     // means nothing will fire (unapproved, suspended, spent, exhausted),

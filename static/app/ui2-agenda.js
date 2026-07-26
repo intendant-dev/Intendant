@@ -338,16 +338,24 @@ function agendaBlockedLine(item) {
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
-// running | suspended | pending | standing | armed | finished. Mirrors
-// the daemon's fold judgments (AgendaEffect::suspended, the scheduler's
-// next-instant derivation) — derived here every paint, never stored.
+// running | suspended | pending | standing | armed | finished, plus the
+// trigger vocabulary (Track T manifests carry `trigger` INSTEAD of a
+// clock cadence): watching (on_item_match, approved), waiting
+// (on_unblock, prerequisites still open), ready (on_unblock, every
+// prerequisite complete — the scheduler dispatches within the minute).
+// Mirrors the daemon's fold judgments (AgendaEffect::suspended, the
+// scheduler's next-instant derivation, the trigger arm rules) — derived
+// here every paint, never stored.
 function agendaEffectState(item) {
   const effect = (item.effects || [])[0];
   if (!effect || !effect.manifest) return null;
   const manifest = effect.manifest;
   const rec = manifest.recurrence || null;
-  const threshold = rec ? Math.max(1, rec.suspend_after_failures || 3) : 0;
-  const suspended = !!rec && (effect.consecutive_failures || 0) >= threshold;
+  const trig = manifest.trigger || null;
+  // Failure-suspend covers standing series AND triggered mandates (the
+  // C-floor guardrail); one-shot clock manifests never suspend.
+  const threshold = rec || trig ? Math.max(1, (rec && rec.suspend_after_failures) || 3) : 0;
+  const suspended = !!(rec || trig) && (effect.consecutive_failures || 0) >= threshold;
   const running = !!(effect.last_run && effect.last_run.state === 'started');
   // The daemon decorates each effect with the planner's REAL next firing
   // instant (`next_fire_ms`, absent when nothing will fire) — prefer it
@@ -361,9 +369,12 @@ function agendaEffectState(item) {
   const kind = running ? 'running'
     : suspended ? 'suspended'
       : !effect.approval ? 'pending'
-        : rec ? 'standing'
-          : next > Date.now() ? 'armed' : 'finished';
-  return { effect, manifest, rec, threshold, suspended, running, next, kind };
+        : trig ? (trig.kind === 'on_item_match' ? 'watching'
+          : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
+            ? 'ready' : 'waiting')
+          : rec ? 'standing'
+            : next > Date.now() ? 'armed' : 'finished';
+  return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 
 // One-line executor description for a manifest's `agent_config` block:

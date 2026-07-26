@@ -24272,6 +24272,79 @@ html.ui-v2 .ag2-ulid {
   white-space: nowrap;
 }
 
+/* ---- Workflow pipeline strip: node chains on hub cards + the hubs
+   lens. Dots are static siblings (unlike the timeline's absolute
+   .ag2-plan-dot), so they carry their own tone classes; pulse rides the
+   shared ui2-pulse keyframes. ---- */
+
+html.ui-v2 .ag2-pipeline {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin: 5px 0 4px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+html.ui-v2 .ag2-pipe-node {
+  flex: 1;
+  min-width: 116px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 9px;
+  padding: 6px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+html.ui-v2 .ag2-pipe-node:hover {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+html.ui-v2 .ag2-pipe-arrow {
+  align-self: center;
+  color: var(--text-3);
+  padding: 0 5px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-pipe-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+html.ui-v2 .ag2-pipe-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-pipe-dot.t-sky { background: var(--sky); }
+html.ui-v2 .ag2-pipe-dot.t-iris { background: var(--iris); }
+html.ui-v2 .ag2-pipe-dot.t-amber { background: var(--amber); }
+html.ui-v2 .ag2-pipe-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-pipe-dot.t-rose { background: var(--rose); }
+html.ui-v2 .ag2-pipe-dot.t-neutral { background: var(--neutral-dot); }
+html.ui-v2 .ag2-pipe-dot.pulse.slow { animation: ui2-pulse 2s ease-in-out infinite; }
+html.ui-v2 .ag2-pipe-dot.pulse.fast { animation: ui2-pulse 1.3s ease-in-out infinite; }
+html.ui-v2 .ag2-pipe-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 .ag2-pipe-state {
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-pipe-exec {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+
 /* ---- Empty state + footer ledger ---- */
 
 html.ui-v2 .ag2-empty {
@@ -36635,7 +36708,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '7f8b8570ec46a2bb';
+const INTENDANT_APP_BUILD = 'e61ac05d4f99e2ce';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -89968,16 +90041,24 @@ function agendaBlockedLine(item) {
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
-// running | suspended | pending | standing | armed | finished. Mirrors
-// the daemon's fold judgments (AgendaEffect::suspended, the scheduler's
-// next-instant derivation) — derived here every paint, never stored.
+// running | suspended | pending | standing | armed | finished, plus the
+// trigger vocabulary (Track T manifests carry `trigger` INSTEAD of a
+// clock cadence): watching (on_item_match, approved), waiting
+// (on_unblock, prerequisites still open), ready (on_unblock, every
+// prerequisite complete — the scheduler dispatches within the minute).
+// Mirrors the daemon's fold judgments (AgendaEffect::suspended, the
+// scheduler's next-instant derivation, the trigger arm rules) — derived
+// here every paint, never stored.
 function agendaEffectState(item) {
   const effect = (item.effects || [])[0];
   if (!effect || !effect.manifest) return null;
   const manifest = effect.manifest;
   const rec = manifest.recurrence || null;
-  const threshold = rec ? Math.max(1, rec.suspend_after_failures || 3) : 0;
-  const suspended = !!rec && (effect.consecutive_failures || 0) >= threshold;
+  const trig = manifest.trigger || null;
+  // Failure-suspend covers standing series AND triggered mandates (the
+  // C-floor guardrail); one-shot clock manifests never suspend.
+  const threshold = rec || trig ? Math.max(1, (rec && rec.suspend_after_failures) || 3) : 0;
+  const suspended = !!(rec || trig) && (effect.consecutive_failures || 0) >= threshold;
   const running = !!(effect.last_run && effect.last_run.state === 'started');
   // The daemon decorates each effect with the planner's REAL next firing
   // instant (`next_fire_ms`, absent when nothing will fire) — prefer it
@@ -89991,9 +90072,12 @@ function agendaEffectState(item) {
   const kind = running ? 'running'
     : suspended ? 'suspended'
       : !effect.approval ? 'pending'
-        : rec ? 'standing'
-          : next > Date.now() ? 'armed' : 'finished';
-  return { effect, manifest, rec, threshold, suspended, running, next, kind };
+        : trig ? (trig.kind === 'on_item_match' ? 'watching'
+          : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
+            ? 'ready' : 'waiting')
+          : rec ? 'standing'
+            : next > Date.now() ? 'armed' : 'finished';
+  return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 
 // One-line executor description for a manifest's `agent_config` block:
@@ -92088,6 +92172,16 @@ function agendaCardChips(item) {
         `One approval covers the series · next ${agendaAbsTime(st.next)}`));
     } else if (st.kind === 'armed') {
       chips.push(agendaChipHtml('armed', 'sky', `Fires ${agendaAbsTime(st.next)}`));
+    } else if (st.kind === 'watching') {
+      const predicate = `${st.trig.item_kind || 'item'}${(st.trig.tags || []).length ? ` + ${st.trig.tags.join(',')}` : ''}`;
+      chips.push(agendaChipHtml(agendaDepthCalm() ? 'watching' : `watching · ${predicate}`, 'sky',
+        'Fires when a NEW open item matches — arrivals batch for a minute'));
+    } else if (st.kind === 'waiting') {
+      chips.push(agendaChipHtml('auto · on unblock', 'sky',
+        'Armed — fires the moment every prerequisite completes; no one has to remember', true));
+    } else if (st.kind === 'ready') {
+      chips.push(agendaChipHtml('fires momentarily', 'iris',
+        'Prerequisites complete — the scheduler dispatches within the minute'));
     }
   }
   const kids = agendaChildrenOf(item.id);
@@ -92215,7 +92309,9 @@ function agendaAutomationStripHtml(item) {
   if (!agendaDepthCalm()) {
     meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
   }
-  meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
+  meta.push(`<span>${escapeHtml(st.trig
+    ? (st.trig.kind === 'on_item_match' ? 'on matching items' : 'on unblock')
+    : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
@@ -92247,13 +92343,73 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing' && e.next_fire_ms) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="request_occurrence" data-id="${id}" title="One extra occurrence of the approved digest — the standing approval is untouched">Run now</button>`
       + `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
-  } else if (st.kind === 'armed') {
+  } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
   return `<div class="ag2-eff ag2-auto t-${st.kind === 'pending' || st.kind === 'suspended' ? 'amber' : 'iris'}">
     <span class="ag2-auto-meta">${meta.join('<span class="ag2-auto-dot">·</span>')}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
+}
+
+// ---- Workflow pipeline strip (hub cards + the hubs lens) ----
+
+// A hub reads as a pipeline when at least two children carry
+// on_unblock-triggered manifests — the workflow stamp's shape, DERIVED
+// from the graph every paint; no workflow-level object or marker exists
+// anywhere (Track T's contract).
+function agendaPipelineNodes(hub) {
+  const kids = agendaChildrenOf(hub.id).filter((k) =>
+    (k.effects || []).some((e) => e.manifest && e.manifest.trigger
+      && e.manifest.trigger.kind === 'on_unblock'));
+  if (kids.length < 2) return null;
+  // relies_on topological order within the set (bounded passes; a cycle
+  // or cross-hub dependency appends in creation order at the tail).
+  const inSet = new Set(kids.map((k) => k.id));
+  const order = [];
+  const placed = new Set();
+  for (let pass = 0; pass < kids.length && order.length < kids.length; pass++) {
+    kids.forEach((k) => {
+      if (placed.has(k.id)) return;
+      const deps = (k.relies_on || []).map((l) => l.target_id).filter((id) => inSet.has(id));
+      if (deps.every((id) => placed.has(id))) {
+        placed.add(k.id);
+        order.push(k);
+      }
+    });
+  }
+  kids.forEach((k) => { if (!placed.has(k.id)) order.push(k); });
+  return order;
+}
+
+function agendaPipelineStripHtml(hub) {
+  const nodes = agendaPipelineNodes(hub);
+  if (!nodes) return '';
+  const cells = nodes.map((node, i) => {
+    const st = agendaEffectState(node);
+    let tone = 'neutral';
+    let state = 'parked';
+    let pulse = '';
+    if (node.status === 'done') { tone = 'green'; state = 'done'; }
+    else if (node.status === 'retired') { state = 'retired'; }
+    else if (st) {
+      if (st.kind === 'running') { tone = 'iris'; state = 'running'; pulse = 'fast'; }
+      else if (st.kind === 'ready') { tone = 'iris'; state = 'fires momentarily'; pulse = 'slow'; }
+      else if (st.kind === 'waiting') { tone = 'sky'; state = 'waiting on prerequisites'; }
+      else if (st.kind === 'pending') { tone = 'amber'; state = 'needs approval'; }
+      else if (st.kind === 'suspended') { tone = 'amber'; state = `suspended · ${st.effect.consecutive_failures} failures`; }
+      else { state = st.kind; }
+    }
+    const exec = st && !agendaDepthCalm() ? agendaExecutorLabel(st.manifest.agent_config) : '';
+    const arrow = i ? '<span class="ag2-pipe-arrow" aria-hidden="true">→</span>' : '';
+    const title = String(node.title || '');
+    return `${arrow}<button type="button" class="ag2-pipe-node" data-open-item="${escapeHtml(node.id)}" title="${escapeHtml(`${title} — ${state}`)}">
+      <span class="ag2-pipe-head"><span class="ag2-pipe-dot t-${tone}${pulse ? ` pulse ${pulse}` : ''}"></span><span class="ag2-pipe-title">${escapeHtml(title.length > 22 ? `${title.slice(0, 21)}…` : title)}</span></span>
+      <span class="ag2-pipe-state">${escapeHtml(state)}</span>
+      ${exec ? `<span class="ag2-pipe-exec">${escapeHtml(exec)}</span>` : ''}
+    </button>`;
+  });
+  return `<div class="ag2-pipeline">${cells.join('')}</div>`;
 }
 
 // ---- Inline question answering ----
@@ -92526,6 +92682,7 @@ function agendaCardHtml(row) {
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
     </div>
@@ -92624,12 +92781,14 @@ function agendaRenderTab() {
       const hubLink = group.hubId
         ? `<a class="ag2-hub-open" data-open-item="${escapeHtml(group.hubId)}">open the hub ›</a>`
         : '';
+      const hub = group.hubId ? agendaFindItem(group.hubId) : null;
       return `<div class="ag2-group">
         <div class="ag2-group-head">
           <span class="ag2-group-label">${escapeHtml(group.label)}</span>
           <span class="ag2-group-hint">${escapeHtml(group.hint)}</span>
           ${hubLink}
         </div>
+        ${hub ? agendaPipelineStripHtml(hub) : ''}
         <div class="ag2-cards">${group.rows.map(agendaCardHtml).join('')}</div>
       </div>`;
     }).join('');
@@ -93137,14 +93296,26 @@ function agendaInspEffectHtml(item) {
       suspended: ['amber', `Suspended — ${e.consecutive_failures} failures in a row`],
       running: ['iris', 'Running now'],
       finished: ['neutral', 'Ran — outcome below'],
+      watching: ['sky', 'Watching for matching items'],
+      waiting: ['sky', 'Armed — fires when the prerequisites complete'],
+      ready: ['iris', 'Prerequisites complete — fires within the minute'],
     };
     const [tone, stateLabel] = states[st.kind] || states.finished;
     const rows = [];
     const R = (k, v, mono) =>
       rows.push(`<div class="ag2-eff-k">${escapeHtml(k)}</div><div class="ag2-eff-v${mono ? ' mono' : ''}">${escapeHtml(v)}</div>`);
-    R('when', st.rec
-      ? `every ${agendaCadenceLabel(st.rec.every_ms)} · next ${agendaAbsTime(st.next)}`
-      : `${agendaAbsTime(m.fire_at_ms)} (${agendaRelTime(m.fire_at_ms)})`);
+    if (st.trig) {
+      R('fires', st.trig.kind === 'on_item_match'
+        ? `when a NEW open ${st.trig.item_kind || 'item'} carries ${(st.trig.tags || []).length ? `tags ${st.trig.tags.join(', ')}` : 'the matched shape'} — arrivals batch for a minute`
+        : 'the moment every prerequisite completes — no clock involved');
+      if (!agendaDepthCalm()) {
+        R('guardrails', `arrivals coalesce · one occurrence in flight · suspends after ${st.threshold} failures in a row`);
+      }
+    } else {
+      R('when', st.rec
+        ? `every ${agendaCadenceLabel(st.rec.every_ms)} · next ${agendaAbsTime(st.next)}`
+        : `${agendaAbsTime(m.fire_at_ms)} (${agendaRelTime(m.fire_at_ms)})`);
+    }
     if (st.rec && (st.rec.until_ms || st.rec.max_occurrences)) {
       R('ends', `${st.rec.until_ms ? agendaAbsTime(st.rec.until_ms) : ''}${st.rec.max_occurrences ? `${st.rec.until_ms ? ' or ' : ''}after ${st.rec.max_occurrences} runs` : ''}`);
     }
@@ -93187,7 +93358,7 @@ function agendaInspEffectHtml(item) {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${String(e.digest || '').slice(0, 8)}… — any edit voids it`);
       A('Edit schedule…', 'sched');
-    } else if (st.kind === 'armed') {
+    } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
       A('Revoke approval', 'eff-revoke', 'danger', 'Instant, owner-surface only');
     } else if (st.kind === 'standing') {
@@ -95167,6 +95338,25 @@ function agendaPlanEvents() {
           'Consecutive non-success outcomes since the last approval')],
         note: 'nothing fires while suspended — re-approving the unchanged digest re-arms the series',
       });
+    } else if (st.kind === 'watching') {
+      const predicate = `${st.trig.item_kind || 'item'}${(st.trig.tags || []).length ? ` + ${st.trig.tags.join(',')}` : ''}`;
+      events.push({
+        at: now, item, what: 'watching for matching items', tone: 'sky', pulse: 'slow',
+        chips: [agendaChipHtml(predicate, 'sky',
+          'Fires when a NEW open item of this kind carries these tags — arrivals batch for a minute')],
+        note: null,
+      });
+    } else if (st.kind === 'waiting') {
+      events.push({
+        at: now, item, what: 'armed — fires on unblock', tone: 'sky', pulse: '',
+        chips: [],
+        note: 'fires the moment its prerequisites complete — no clock involved',
+      });
+    } else if (st.kind === 'ready') {
+      events.push({
+        at: now, item, what: 'prerequisites complete — fires within the minute',
+        tone: 'iris', pulse: 'fast', chips: [], note: null,
+      });
     }
     // Fire rows ride the SERVED planner instant exclusively: absent
     // means nothing will fire (unapproved, suspended, spent, exhausted),
@@ -96220,7 +96410,7 @@ function agendaPaletteEntries(query) {
 // ---- Workflow templates: stamp + one-gesture approval (Track T) ----
 // A workflow template stamps a small item-graph: an instance HUB whose
 // body is the workflow's living orientation document, N node items
-// placed under it, relies_on edges, and one on_unblock-triggered
+// placed under it, relies_on links, and one on_unblock-triggered
 // manifest per node. STAMPING parks and proposes only; the approval
 // sheet then previews the whole graph, and the owner's single confirm
 // emits one ordinary per-node approval op — the UI batches, the

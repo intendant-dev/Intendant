@@ -1025,6 +1025,79 @@ html.ui-v2 .ag2-ulid {
   white-space: nowrap;
 }
 
+/* ---- Workflow pipeline strip: node chains on hub cards + the hubs
+   lens. Dots are static siblings (unlike the timeline's absolute
+   .ag2-plan-dot), so they carry their own tone classes; pulse rides the
+   shared ui2-pulse keyframes. ---- */
+
+html.ui-v2 .ag2-pipeline {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin: 5px 0 4px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+html.ui-v2 .ag2-pipe-node {
+  flex: 1;
+  min-width: 116px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 9px;
+  padding: 6px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+}
+html.ui-v2 .ag2-pipe-node:hover {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+html.ui-v2 .ag2-pipe-arrow {
+  align-self: center;
+  color: var(--text-3);
+  padding: 0 5px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-pipe-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+html.ui-v2 .ag2-pipe-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-pipe-dot.t-sky { background: var(--sky); }
+html.ui-v2 .ag2-pipe-dot.t-iris { background: var(--iris); }
+html.ui-v2 .ag2-pipe-dot.t-amber { background: var(--amber); }
+html.ui-v2 .ag2-pipe-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-pipe-dot.t-rose { background: var(--rose); }
+html.ui-v2 .ag2-pipe-dot.t-neutral { background: var(--neutral-dot); }
+html.ui-v2 .ag2-pipe-dot.pulse.slow { animation: ui2-pulse 2s ease-in-out infinite; }
+html.ui-v2 .ag2-pipe-dot.pulse.fast { animation: ui2-pulse 1.3s ease-in-out infinite; }
+html.ui-v2 .ag2-pipe-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+html.ui-v2 .ag2-pipe-state {
+  font-size: 10px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-pipe-exec {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+
 /* ---- Empty state + footer ledger ---- */
 
 html.ui-v2 .ag2-empty {

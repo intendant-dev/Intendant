@@ -637,6 +637,16 @@ function agendaCardChips(item) {
         `One approval covers the series · next ${agendaAbsTime(st.next)}`));
     } else if (st.kind === 'armed') {
       chips.push(agendaChipHtml('armed', 'sky', `Fires ${agendaAbsTime(st.next)}`));
+    } else if (st.kind === 'watching') {
+      const predicate = `${st.trig.item_kind || 'item'}${(st.trig.tags || []).length ? ` + ${st.trig.tags.join(',')}` : ''}`;
+      chips.push(agendaChipHtml(agendaDepthCalm() ? 'watching' : `watching · ${predicate}`, 'sky',
+        'Fires when a NEW open item matches — arrivals batch for a minute'));
+    } else if (st.kind === 'waiting') {
+      chips.push(agendaChipHtml('auto · on unblock', 'sky',
+        'Armed — fires the moment every prerequisite completes; no one has to remember', true));
+    } else if (st.kind === 'ready') {
+      chips.push(agendaChipHtml('fires momentarily', 'iris',
+        'Prerequisites complete — the scheduler dispatches within the minute'));
     }
   }
   const kids = agendaChildrenOf(item.id);
@@ -764,7 +774,9 @@ function agendaAutomationStripHtml(item) {
   if (!agendaDepthCalm()) {
     meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
   }
-  meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
+  meta.push(`<span>${escapeHtml(st.trig
+    ? (st.trig.kind === 'on_item_match' ? 'on matching items' : 'on unblock')
+    : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
@@ -796,13 +808,73 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing' && e.next_fire_ms) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="request_occurrence" data-id="${id}" title="One extra occurrence of the approved digest — the standing approval is untouched">Run now</button>`
       + `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
-  } else if (st.kind === 'armed') {
+  } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
   return `<div class="ag2-eff ag2-auto t-${st.kind === 'pending' || st.kind === 'suspended' ? 'amber' : 'iris'}">
     <span class="ag2-auto-meta">${meta.join('<span class="ag2-auto-dot">·</span>')}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
+}
+
+// ---- Workflow pipeline strip (hub cards + the hubs lens) ----
+
+// A hub reads as a pipeline when at least two children carry
+// on_unblock-triggered manifests — the workflow stamp's shape, DERIVED
+// from the graph every paint; no workflow-level object or marker exists
+// anywhere (Track T's contract).
+function agendaPipelineNodes(hub) {
+  const kids = agendaChildrenOf(hub.id).filter((k) =>
+    (k.effects || []).some((e) => e.manifest && e.manifest.trigger
+      && e.manifest.trigger.kind === 'on_unblock'));
+  if (kids.length < 2) return null;
+  // relies_on topological order within the set (bounded passes; a cycle
+  // or cross-hub dependency appends in creation order at the tail).
+  const inSet = new Set(kids.map((k) => k.id));
+  const order = [];
+  const placed = new Set();
+  for (let pass = 0; pass < kids.length && order.length < kids.length; pass++) {
+    kids.forEach((k) => {
+      if (placed.has(k.id)) return;
+      const deps = (k.relies_on || []).map((l) => l.target_id).filter((id) => inSet.has(id));
+      if (deps.every((id) => placed.has(id))) {
+        placed.add(k.id);
+        order.push(k);
+      }
+    });
+  }
+  kids.forEach((k) => { if (!placed.has(k.id)) order.push(k); });
+  return order;
+}
+
+function agendaPipelineStripHtml(hub) {
+  const nodes = agendaPipelineNodes(hub);
+  if (!nodes) return '';
+  const cells = nodes.map((node, i) => {
+    const st = agendaEffectState(node);
+    let tone = 'neutral';
+    let state = 'parked';
+    let pulse = '';
+    if (node.status === 'done') { tone = 'green'; state = 'done'; }
+    else if (node.status === 'retired') { state = 'retired'; }
+    else if (st) {
+      if (st.kind === 'running') { tone = 'iris'; state = 'running'; pulse = 'fast'; }
+      else if (st.kind === 'ready') { tone = 'iris'; state = 'fires momentarily'; pulse = 'slow'; }
+      else if (st.kind === 'waiting') { tone = 'sky'; state = 'waiting on prerequisites'; }
+      else if (st.kind === 'pending') { tone = 'amber'; state = 'needs approval'; }
+      else if (st.kind === 'suspended') { tone = 'amber'; state = `suspended · ${st.effect.consecutive_failures} failures`; }
+      else { state = st.kind; }
+    }
+    const exec = st && !agendaDepthCalm() ? agendaExecutorLabel(st.manifest.agent_config) : '';
+    const arrow = i ? '<span class="ag2-pipe-arrow" aria-hidden="true">→</span>' : '';
+    const title = String(node.title || '');
+    return `${arrow}<button type="button" class="ag2-pipe-node" data-open-item="${escapeHtml(node.id)}" title="${escapeHtml(`${title} — ${state}`)}">
+      <span class="ag2-pipe-head"><span class="ag2-pipe-dot t-${tone}${pulse ? ` pulse ${pulse}` : ''}"></span><span class="ag2-pipe-title">${escapeHtml(title.length > 22 ? `${title.slice(0, 21)}…` : title)}</span></span>
+      <span class="ag2-pipe-state">${escapeHtml(state)}</span>
+      ${exec ? `<span class="ag2-pipe-exec">${escapeHtml(exec)}</span>` : ''}
+    </button>`;
+  });
+  return `<div class="ag2-pipeline">${cells.join('')}</div>`;
 }
 
 // ---- Inline question answering ----
@@ -1075,6 +1147,7 @@ function agendaCardHtml(row) {
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
     </div>
@@ -1173,12 +1246,14 @@ function agendaRenderTab() {
       const hubLink = group.hubId
         ? `<a class="ag2-hub-open" data-open-item="${escapeHtml(group.hubId)}">open the hub ›</a>`
         : '';
+      const hub = group.hubId ? agendaFindItem(group.hubId) : null;
       return `<div class="ag2-group">
         <div class="ag2-group-head">
           <span class="ag2-group-label">${escapeHtml(group.label)}</span>
           <span class="ag2-group-hint">${escapeHtml(group.hint)}</span>
           ${hubLink}
         </div>
+        ${hub ? agendaPipelineStripHtml(hub) : ''}
         <div class="ag2-cards">${group.rows.map(agendaCardHtml).join('')}</div>
       </div>`;
     }).join('');
