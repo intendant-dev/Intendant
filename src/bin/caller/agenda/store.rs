@@ -1242,8 +1242,11 @@ impl AgendaStore {
                 // own read already contradicts would only park a manifest
                 // whose every firing refuses — the project_root precedent
                 // (name the deterministic fire-time refusal at review
-                // time).
-                let binding_refs = validate_binding_refs(binding_refs)?;
+                // time). The verified bytes are SEALED into the snapshot
+                // store in the same act: preservation starts at propose,
+                // so the revision the owner reviews is the revision every
+                // fire serves, whatever happens to the live file later.
+                let binding_refs = validate_binding_refs(binding_refs, &self.dir)?;
                 // v1: one session effect per item — a re-propose revises it
                 // (stable effect_id lineage, fresh digest, approval void).
                 let effect_id = item
@@ -2156,9 +2159,14 @@ pub(crate) fn binding_ref_path(locator: &str) -> Result<&Path, String> {
 /// daemon's OWN read of the live bytes — a pin this read already
 /// contradicts would only park a manifest whose every firing refuses,
 /// so the contradiction is named at review time (the project_root
-/// precedent). Pins normalize to lowercase hex; the returned refs are
-/// what the digest-bound manifest records.
-fn validate_binding_refs(refs: Vec<BindingRef>) -> Result<Vec<BindingRef>, AgendaError> {
+/// precedent). The verified bytes are sealed into the snapshot store in
+/// the same act (single read: the bytes hashed ARE the bytes preserved —
+/// no re-read window). Pins normalize to lowercase hex; the returned
+/// refs are what the digest-bound manifest records.
+fn validate_binding_refs(
+    refs: Vec<BindingRef>,
+    agenda_dir: &Path,
+) -> Result<Vec<BindingRef>, AgendaError> {
     if refs.len() > MAX_BINDING_REFS_PER_MANIFEST {
         return Err(AgendaError::Invalid(format!(
             "a manifest seals at most {MAX_BINDING_REFS_PER_MANIFEST} binding refs"
@@ -2192,60 +2200,28 @@ fn validate_binding_refs(refs: Vec<BindingRef>) -> Result<Vec<BindingRef>, Agend
                  binding refs seal working artifacts, not archives"
             )));
         }
-        let live = digest_file(path).map_err(|err| {
-            AgendaError::Invalid(format!("cannot hash binding ref {locator}: {err}"))
+        let bytes = std::fs::read(path).map_err(|err| {
+            AgendaError::Invalid(format!("cannot read binding ref {locator}: {err}"))
         })?;
+        let live = super::sealed_blobs::digest_bytes(&bytes);
         if live != sha256 {
             return Err(AgendaError::Invalid(format!(
                 "binding ref {locator}: the proposed pin {sha256} does not match the \
                  live content ({live}) — re-read the file and re-propose"
             )));
         }
+        // Seal failure refuses the propose: a manifest whose snapshot
+        // never existed would refuse every firing — fail closed at the
+        // ceremony, not at 3am.
+        super::sealed_blobs::seal_content(agenda_dir, &sha256, &bytes).map_err(|err| {
+            AgendaError::Io(std::io::Error::new(
+                err.kind(),
+                format!("sealing binding ref {locator}: {err}"),
+            ))
+        })?;
         validated.push(BindingRef { locator, sha256 });
     }
     Ok(validated)
-}
-
-/// Fire-time seal check of one binding ref (sealed refs): the live file
-/// must still hash to the approved pin exactly. `Err` carries the named
-/// occurrence-failure reason — the scheduler journals it and refuses to
-/// spawn, so an approved goal never runs against silently drifted or
-/// unreadable referenced content.
-pub(crate) fn verify_binding_ref(binding_ref: &BindingRef) -> Result<(), String> {
-    let path = binding_ref_path(&binding_ref.locator)?;
-    let live = match std::fs::metadata(path) {
-        Ok(meta) if !meta.is_file() => {
-            return Err(format!(
-                "binding ref unreadable: {} (not a regular file)",
-                binding_ref.locator
-            ))
-        }
-        Ok(meta) if meta.len() > MAX_REF_FILE_HASH_BYTES => {
-            // Grown past the hash bound = changed by size alone; attach
-            // only ever pinned content within the bound (G1's rule).
-            return Err(format!(
-                "binding ref drifted: {} — the live file outgrew the \
-                 {MAX_REF_FILE_HASH_BYTES}-byte seal bound",
-                binding_ref.locator
-            ));
-        }
-        Ok(_) => digest_file(path)
-            .map_err(|err| format!("binding ref unreadable: {} ({err})", binding_ref.locator))?,
-        Err(err) => {
-            return Err(format!(
-                "binding ref unreadable: {} ({err})",
-                binding_ref.locator
-            ))
-        }
-    };
-    if live != binding_ref.sha256 {
-        return Err(format!(
-            "binding ref drifted: {} — approved sha256 {}, live file {live}; \
-             re-propose and re-approve to reseal",
-            binding_ref.locator, binding_ref.sha256
-        ));
-    }
-    Ok(())
 }
 
 fn validate_title(title: &str) -> Result<String, AgendaError> {
@@ -4330,6 +4306,18 @@ mod tests {
             sealed.effects[0].manifest.binding_refs,
             "replay converges — the op carries the sealed manifest verbatim"
         );
+        // The verified bytes were SEALED in the same act: the snapshot
+        // store holds the exact content under its pin (pin 3, atomic
+        // propose-time preservation).
+        assert_eq!(
+            std::fs::read(super::super::sealed_blobs::sealed_blob_path(
+                dir.path(),
+                &pin
+            ))
+            .unwrap(),
+            b"the sealed brief\n",
+            "propose seals the reviewed bytes content-addressed"
+        );
 
         // A pin the daemon's read contradicts refuses by name.
         let err = store
@@ -4423,43 +4411,6 @@ mod tests {
                 .contains(&MAX_BINDING_REFS_PER_MANIFEST.to_string()),
             "{err}"
         );
-    }
-
-    /// Fire-time seal check: unchanged content passes; drifted content,
-    /// missing files, and non-`file:` locators refuse with exactly the
-    /// named reasons the scheduler journals against the occurrence.
-    #[test]
-    fn verify_binding_ref_names_drift_and_unreadable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sealed.md");
-        std::fs::write(&path, b"v1").unwrap();
-        let pin = digest_file(&path).unwrap();
-        let bref = BindingRef {
-            locator: format!("file:{}", path.display()),
-            sha256: pin,
-        };
-        assert_eq!(verify_binding_ref(&bref), Ok(()));
-
-        std::fs::write(&path, "v2 — amended under an armed approval").unwrap();
-        let err = verify_binding_ref(&bref).unwrap_err();
-        assert!(
-            err.starts_with(&format!("binding ref drifted: file:{}", path.display())),
-            "{err}"
-        );
-
-        std::fs::remove_file(&path).unwrap();
-        let err = verify_binding_ref(&bref).unwrap_err();
-        assert!(
-            err.starts_with(&format!("binding ref unreadable: file:{}", path.display())),
-            "{err}"
-        );
-
-        let err = verify_binding_ref(&BindingRef {
-            locator: "/no-scheme".into(),
-            sha256: "aa".repeat(32),
-        })
-        .unwrap_err();
-        assert!(err.contains("file:<absolute path>"), "{err}");
     }
 
     /// The sealed-refs twin of the cross-build rider: a build that

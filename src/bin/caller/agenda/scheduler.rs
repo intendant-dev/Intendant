@@ -76,6 +76,11 @@ struct PendingDispatch {
     /// than re-resolving (the manifest the owner approved has one
     /// resolution instant).
     project_root: String,
+    /// The binding refs' rider lines minted by the dispatch-time seal
+    /// verification — retries reuse them for the same reason as the
+    /// project: one verification instant per occurrence, identical task
+    /// bytes on every send.
+    binding_ref_lines: Vec<String>,
     first_attempt_ms: u64,
     last_attempt_ms: u64,
 }
@@ -505,17 +510,24 @@ fn dispatch_session(
             return false;
         }
     };
-    // Fire-time seal check (sealed refs): every binding ref must still
-    // hash to its approved pin — an approved goal never spawns against
-    // silently drifted or unreadable referenced content. The refusal is
-    // this occurrence's terminal `failed` outcome with the named reason,
-    // written back to the item and counted by the standing failure
-    // streak, so a stale standing manifest suspends and surfaces to the
-    // owner instead of firing over its own drift again and again.
+    // Fire-time seal verification (sealed refs): every binding ref's
+    // SNAPSHOT must verify against its approved pin — the sealed bytes
+    // are the binding content the fired session reads, so live-file
+    // drift only annotates the rider line (the deliberate PR-B
+    // semantics shift, stated in `sealed_blobs`). Refusal remains where
+    // preservation itself failed — corrupt or unreconstructable
+    // snapshot — as this occurrence's terminal `failed` outcome with
+    // the named reason, written back to the item and counted by the
+    // standing failure streak, so a broken seal suspends and surfaces
+    // to the owner instead of firing over it again and again.
+    let mut binding_ref_lines = Vec::with_capacity(spawn.binding_refs.len());
     for binding_ref in &spawn.binding_refs {
-        if let Err(why) = super::store::verify_binding_ref(binding_ref) {
-            resolve_spawnless(handle, journal, &spawn, OccurrenceState::Failed, now, &why);
-            return false;
+        match super::sealed_blobs::verify_sealed_binding_ref(handle.dir(), binding_ref) {
+            Ok(verification) => binding_ref_lines.push(verification.rider_line(binding_ref)),
+            Err(why) => {
+                resolve_spawnless(handle, journal, &spawn, OccurrenceState::Failed, now, &why);
+                return false;
+            }
         }
     }
     if !session_record(journal, &spawn, now, OccurrenceState::Prepared, None) {
@@ -552,13 +564,14 @@ fn dispatch_session(
     // it unconditionally made orchestrate manifests run Direct — the
     // defect the agenda chapter documented).
     let project_root = project_root.to_string_lossy().into_owned();
-    send_start_task(handle, &spawn, &project_root);
+    send_start_task(handle, &spawn, &project_root, &binding_ref_lines);
     let now = now_ms();
     state.awaiting.insert(
         spawn.occurrence_id.clone(),
         PendingDispatch {
             spawn,
             project_root,
+            binding_ref_lines,
             first_attempt_ms: now,
             last_attempt_ms: now,
         },
@@ -569,7 +582,12 @@ fn dispatch_session(
 /// The occurrence's `StartTask`, identical on first send and every
 /// retry — the delegation id is the occurrence id, so the supervisor's
 /// dedup collapses duplicates onto the original session.
-fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root: &str) {
+fn send_start_task(
+    handle: &AgendaHandle,
+    spawn: &SpawnOccurrence,
+    project_root: &str,
+    binding_ref_lines: &[String],
+) {
     // Interactive spawns mirror the composer's launch shape; goal runs
     // stay explicit (`direct` outranks `orchestrate` at launch — see the
     // agenda chapter).
@@ -581,21 +599,21 @@ fn send_start_task(handle: &AgendaHandle, spawn: &SpawnOccurrence, project_root:
     // Every fired session's task carries a data rider naming its source:
     // the agenda item + occurrence that fired it, so goal self-references
     // ("THIS item", "your prerequisite item") resolve mechanically through
-    // the session's own attributed ctl; each binding ref adds one line —
-    // locator + approved sha256, verified at fire (sealed refs: the
-    // CONTENT behind a verified pin is what the owner reviewed and may
-    // carry instructions; the line itself is a pointer); an on_item_match
-    // batch adds its matched ids (Track T). All rider lines are data to
-    // act on under the approved goal, never instructions themselves.
+    // the session's own attributed ctl; each binding ref adds its
+    // dispatch-minted line — locator + approved sha256 + the SEALED
+    // snapshot path the session reads as the binding content (sealed
+    // refs: what a verified seal serves is what the owner reviewed and
+    // may carry instructions; the line itself is a pointer); an
+    // on_item_match batch adds its matched ids (Track T). All rider
+    // lines are data to act on under the approved goal, never
+    // instructions themselves.
     let mut task = format!(
         "{}\n\nFired from agenda item {} (occurrence {})",
         spawn.goal, spawn.item_id, spawn.occurrence_id
     );
-    for binding_ref in &spawn.binding_refs {
-        task.push_str(&format!(
-            "\nBinding ref {} sha256 {} — verified at fire",
-            binding_ref.locator, binding_ref.sha256
-        ));
+    for line in binding_ref_lines {
+        task.push('\n');
+        task.push_str(line);
     }
     if !spawn.matched_item_ids.is_empty() {
         task.push_str(&format!(
@@ -650,7 +668,12 @@ fn sweep_pending_dispatches(
                  (the supervisor's delegation dedup makes this exactly-once)",
                 now.saturating_sub(pending.first_attempt_ms) / 1000
             );
-            send_start_task(handle, &pending.spawn, &pending.project_root);
+            send_start_task(
+                handle,
+                &pending.spawn,
+                &pending.project_root,
+                &pending.binding_ref_lines,
+            );
             pending.last_attempt_ms = now;
         }
     }
@@ -1438,27 +1461,26 @@ mod tests {
         }
         assert_eq!(dispatched.len(), 1, "the sealed manifest dispatches");
         let occurrence_id = dispatched[0].1.strip_prefix(DELEGATION_PREFIX).unwrap();
+        let sealed_path = super::super::sealed_blobs::sealed_blob_path(handle.dir(), &pin);
         assert_eq!(
             dispatched[0].0,
             format!(
                 "act on the sealed brief\n\nFired from agenda item {item_id} \
                  (occurrence {occurrence_id})\nBinding ref {locator} sha256 {pin} \
-                 — verified at fire"
+                 — sealed copy {}, verified at fire",
+                sealed_path.display()
             ),
-            "each binding ref rides the fired task as one data line"
+            "each binding ref rides the fired task as one data line naming the sealed copy"
         );
     }
 
-    /// Sealed refs, pin (b): the live-failure shape. An approved STANDING
-    /// manifest whose referenced file changes after approval refuses to
-    /// spawn at fire time — no StartTask, the occurrence journals
-    /// terminal `failed` with the named drift reason, the write-back
-    /// lands on the item, and the failure counts on the standing streak
-    /// (the suspension counter) so a stale manifest suspends and
-    /// surfaces instead of firing over its own drift. A deleted ref
-    /// refuses the same way under the `unreadable` name.
+    /// Sealed refs (PR B): the preservation shape. A live file amended —
+    /// or deleted — under an armed approval no longer refuses the fire:
+    /// the SEALED snapshot is the binding content, the rider line points
+    /// at it and notes the drift informationally, and the sealed bytes
+    /// stay exactly what the owner approved.
     #[tokio::test]
-    async fn binding_ref_drift_refuses_spawn_and_journals_failed() {
+    async fn sealed_refs_serve_sealed_bytes_despite_live_drift() {
         let dir = tempfile::tempdir().unwrap();
         let default_project = tempfile::tempdir().unwrap();
         let content = tempfile::tempdir().unwrap();
@@ -1466,8 +1488,105 @@ mod tests {
         let vanishing = content.path().join("vanishing.md");
         std::fs::write(&drifting, b"approved bytes\n").unwrap();
         std::fs::write(&vanishing, b"soon gone\n").unwrap();
-        let drifting_locator = format!("file:{}", drifting.display());
-        let vanishing_locator = format!("file:{}", vanishing.display());
+        let drifting_pin = super::super::store::digest_file(&drifting).unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let drift_item = approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "sweep with the approved brief",
+            vec![BindingRef {
+                locator: format!("file:{}", drifting.display()),
+                sha256: drifting_pin.clone(),
+            }],
+            None,
+        );
+        let vanish_item = approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "sweep with the vanishing brief",
+            vec![BindingRef {
+                locator: format!("file:{}", vanishing.display()),
+                sha256: super::super::store::digest_file(&vanishing).unwrap(),
+            }],
+            None,
+        );
+
+        // The live specimen: the referenced file is amended (and the
+        // other deleted) UNDER the armed approval.
+        std::fs::write(&drifting, b"amended after approval\n").unwrap();
+        std::fs::remove_file(&vanishing).unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut tasks = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
+                tasks.push(task);
+            }
+        }
+        assert_eq!(
+            tasks.len(),
+            2,
+            "sealed snapshots fire despite live drift — that is the preservation point"
+        );
+        let drift_task = tasks
+            .iter()
+            .find(|t| t.starts_with("sweep with the approved brief"))
+            .expect("the drifted-ref manifest fires");
+        let sealed_path = super::super::sealed_blobs::sealed_blob_path(handle.dir(), &drifting_pin);
+        assert!(
+            drift_task.contains(&format!("sealed copy {}", sealed_path.display())),
+            "the rider points the session at the sealed snapshot: {drift_task}"
+        );
+        assert!(
+            drift_task.ends_with("(live file drifted from sealed revision)"),
+            "drift is noted informationally: {drift_task}"
+        );
+        assert_eq!(
+            std::fs::read(&sealed_path).unwrap(),
+            b"approved bytes\n",
+            "the sealed revision is byte-identical to what the owner approved"
+        );
+        let vanish_task = tasks
+            .iter()
+            .find(|t| t.starts_with("sweep with the vanishing brief"))
+            .expect("the deleted-ref manifest fires");
+        assert!(
+            vanish_task
+                .ends_with("(live file unreadable; the sealed revision is the binding content)"),
+            "a deleted live file is an informational note, not a refusal: {vanish_task}"
+        );
+        let (items, _, _) = handle.snapshot();
+        for id in [&drift_item, &vanish_item] {
+            let item = items.iter().find(|i| i.id == *id).unwrap();
+            assert_eq!(
+                item.effects[0].consecutive_failures, 0,
+                "serving sealed bytes is success-shaped, never a streak entry"
+            );
+        }
+    }
+
+    /// Sealed refs (PR B): refusal remains where PRESERVATION itself
+    /// broke. A corrupt snapshot (bytes under the pin's name no longer
+    /// hash to it) and an unreconstructable one (snapshot gone AND the
+    /// live file drifted) refuse the spawn — no StartTask, terminal
+    /// `failed` journaled with the named reason, write-back on the item,
+    /// streak-counted so a standing manifest suspends and surfaces.
+    #[tokio::test]
+    async fn broken_seal_refuses_spawn_and_journals_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let corrupt = content.path().join("corrupt.md");
+        let unreconstructable = content.path().join("unreconstructable.md");
+        std::fs::write(&corrupt, b"corrupt case approved bytes\n").unwrap();
+        std::fs::write(&unreconstructable, b"unreconstructable approved bytes\n").unwrap();
+        let corrupt_locator = format!("file:{}", corrupt.display());
+        let unrecon_locator = format!("file:{}", unreconstructable.display());
+        let corrupt_pin = super::super::store::digest_file(&corrupt).unwrap();
+        let unrecon_pin = super::super::store::digest_file(&unreconstructable).unwrap();
         let handle = handle_with_default_project(dir.path(), default_project.path());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
@@ -1479,31 +1598,41 @@ mod tests {
                 suspend_after_failures: None,
             })
         };
-        let drift_item = approved_sealed_item(
+        let corrupt_item = approved_sealed_item(
             &handle,
             now_ms() - 60_000,
-            "sweep with the approved brief",
+            "sweep with the corrupt seal",
             vec![BindingRef {
-                locator: drifting_locator.clone(),
-                sha256: super::super::store::digest_file(&drifting).unwrap(),
+                locator: corrupt_locator.clone(),
+                sha256: corrupt_pin.clone(),
             }],
             recurrence(),
         );
-        let vanish_item = approved_sealed_item(
+        let unrecon_item = approved_sealed_item(
             &handle,
             now_ms() - 60_000,
-            "sweep with the vanishing brief",
+            "sweep with the unreconstructable seal",
             vec![BindingRef {
-                locator: vanishing_locator.clone(),
-                sha256: super::super::store::digest_file(&vanishing).unwrap(),
+                locator: unrecon_locator.clone(),
+                sha256: unrecon_pin.clone(),
             }],
             recurrence(),
         );
 
-        // The live specimen: the referenced file is amended (and the
-        // other deleted) UNDER the armed approval.
-        std::fs::write(&drifting, b"amended after approval\n").unwrap();
-        std::fs::remove_file(&vanishing).unwrap();
+        // Corruption class 1: the snapshot's bytes rot under the pin.
+        std::fs::write(
+            super::super::sealed_blobs::sealed_blob_path(handle.dir(), &corrupt_pin),
+            b"bitrot",
+        )
+        .unwrap();
+        // Corruption class 2: the snapshot vanishes AND the live file
+        // drifted — the approved revision is gone from both worlds.
+        std::fs::remove_file(super::super::sealed_blobs::sealed_blob_path(
+            handle.dir(),
+            &unrecon_pin,
+        ))
+        .unwrap();
+        std::fs::write(&unreconstructable, b"amended after approval\n").unwrap();
 
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state).await;
@@ -1513,16 +1642,16 @@ mod tests {
                     event,
                     AppEvent::ControlCommand(ControlMsg::StartTask { .. })
                 ),
-                "a drifted seal must not spawn"
+                "a broken seal must not spawn"
             );
         }
         let (items, _, _) = handle.snapshot();
-        let drifted = items.iter().find(|i| i.id == drift_item).unwrap();
-        let run = drifted.effects[0].last_run.as_ref().unwrap();
+        let corrupted = items.iter().find(|i| i.id == corrupt_item).unwrap();
+        let run = corrupted.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "failed");
         let note = run.note.as_deref().unwrap_or_default();
         assert!(
-            note.starts_with(&format!("binding ref drifted: {drifting_locator}")),
+            note.starts_with(&format!("binding ref snapshot corrupt: {corrupt_locator}")),
             "the named reason reaches the item: {note}"
         );
         assert_eq!(
@@ -1531,33 +1660,71 @@ mod tests {
             "the journal records the terminal refusal"
         );
         assert_eq!(
-            drifted.effects[0].consecutive_failures, 1,
+            corrupted.effects[0].consecutive_failures, 1,
             "the refusal counts on the standing streak — suspension machinery sees it"
         );
-        let vanished = items.iter().find(|i| i.id == vanish_item).unwrap();
-        let run = vanished.effects[0].last_run.as_ref().unwrap();
+        let unrecon = items.iter().find(|i| i.id == unrecon_item).unwrap();
+        let run = unrecon.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "failed");
         let note = run.note.as_deref().unwrap_or_default();
         assert!(
-            note.starts_with(&format!("binding ref unreadable: {vanishing_locator}")),
-            "the unreadable case refuses under its own name: {note}"
+            note.starts_with(&format!(
+                "binding ref snapshot missing and live file drifted: {unrecon_locator}"
+            )),
+            "the unreconstructable case refuses under its own name: {note}"
         );
-        assert_eq!(vanished.effects[0].consecutive_failures, 1);
+        assert_eq!(unrecon.effects[0].consecutive_failures, 1);
+    }
 
-        // Restoring the approved bytes does not resurrect the SPENT
-        // occurrence — the next series instant fires normally instead.
-        std::fs::write(&drifting, b"approved bytes\n").unwrap();
+    /// Sealed refs (PR B): the A→B window heal. A manifest approved with
+    /// a hash pin but NO snapshot (sealed on the hash-pin build before
+    /// the store existed) fires when the live bytes still match the
+    /// approved pin — the verifier seals them in place first, so
+    /// preservation begins retroactively instead of refusing a firing
+    /// with zero corruption behind it.
+    #[tokio::test]
+    async fn missing_snapshot_heals_from_live_bytes_matching_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let brief = content.path().join("brief.md");
+        std::fs::write(&brief, b"pin-era approved bytes\n").unwrap();
+        let pin = super::super::store::digest_file(&brief).unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "act on the pin-era brief",
+            vec![BindingRef {
+                locator: format!("file:{}", brief.display()),
+                sha256: pin.clone(),
+            }],
+            None,
+        );
+        // Simulate the PR-A-era manifest: the pin exists, the snapshot
+        // does not (today's propose seals it — delete to reconstruct).
+        let sealed_path = super::super::sealed_blobs::sealed_blob_path(handle.dir(), &pin);
+        std::fs::remove_file(&sealed_path).unwrap();
+
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state).await;
+        let mut spawned = 0;
         while let Ok(event) = rx.try_recv() {
-            assert!(
-                !matches!(
-                    event,
-                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
-                ),
-                "a spent refused occurrence must not re-dispatch inside its instant"
-            );
+            if matches!(
+                event,
+                AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+            ) {
+                spawned += 1;
+            }
         }
+        assert_eq!(spawned, 1, "the healable window fires");
+        assert_eq!(
+            std::fs::read(&sealed_path).unwrap(),
+            b"pin-era approved bytes\n",
+            "the verifier sealed the live bytes that matched the approved pin"
+        );
     }
 
     /// The A5 lifecycle at unit level: an approved due manifest dispatches

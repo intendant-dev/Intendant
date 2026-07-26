@@ -35,6 +35,7 @@ mod handle;
 mod mandate_templates;
 mod reminders;
 mod scheduler;
+mod sealed_blobs;
 mod spawn_project;
 mod store;
 mod types;
