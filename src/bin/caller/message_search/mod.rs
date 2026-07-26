@@ -17,6 +17,7 @@
 //! can reactivate messages (plan D2).
 
 pub(crate) mod cursor;
+mod export;
 mod extract_claude;
 mod extract_codex;
 mod extract_intendant;
@@ -25,6 +26,7 @@ mod extract_pi;
 mod indexer;
 mod query;
 mod record;
+mod redact;
 mod store;
 
 // The session-detail `locate=` resolver (web_gateway/session_catalog/
@@ -33,6 +35,7 @@ mod store;
 // follow-up line parser from here.
 #[cfg(test)]
 pub(crate) use cursor::SourceCursor;
+pub(crate) use export::transcripts_cli;
 pub(crate) use extract_intendant::parse_round_follow_up;
 pub(crate) use indexer::{refresh_if_stale, spawn_indexer};
 pub(crate) use query::{parse_sources, run_message_search, MessageSearchParams};

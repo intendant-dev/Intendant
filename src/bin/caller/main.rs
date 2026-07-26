@@ -3230,6 +3230,20 @@ async fn main() -> Result<(), CallerError> {
         }
     }
 
+    // Intercept `intendant transcripts …` — the keyless, daemonless
+    // prose-export lane (Track NS, ruled R1): enumerates the raw
+    // per-backend transcript stores and emits deterministic prose-only
+    // JSONL through the message-search extractors, with export-time
+    // redaction on by default (R8). Like `org`/`coordination`: local file
+    // access only — no daemon reach, no provider keys, no IAM surface.
+    if env::args().nth(1).as_deref() == Some("transcripts") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        match message_search::transcripts_cli(&argv) {
+            0 => return Ok(()),
+            code => std::process::exit(code),
+        }
+    }
+
     // Intercept `intendant custody <action>` — show, migrate, or restore
     // OS-keystore custody of the access private-key estate (Track K).
     // Keyless and local like `org`; migration is opt-in by ruling, never
