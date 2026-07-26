@@ -745,6 +745,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "run the cert sweep and report".into(),
@@ -1631,6 +1632,7 @@ mod tests {
         let first = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "summarize the week".into(),
@@ -1672,6 +1674,7 @@ mod tests {
         let revised = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "summarize the week AND email it".into(),
@@ -1823,6 +1826,7 @@ mod tests {
         let proposed = handle
             .apply(
                 AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
                     recurrence: None,
                     id: item.id.clone(),
                     goal: "summarize the week".into(),
