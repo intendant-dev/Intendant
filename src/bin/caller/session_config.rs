@@ -415,13 +415,15 @@ pub fn normalize_codex_context_archive(mode: Option<&str>) -> Option<String> {
 }
 
 /// Per-session Claude model pin. `None` clears (inherit); "default" is safe
-/// as a clear sentinel here because it is never a model id or alias.
+/// as a clear sentinel here because it is never a model id or alias. Values
+/// canonicalize through the project-level normalizer (dropped-prefix repair,
+/// alias/full-id pass-through).
 pub fn normalize_claude_model(model: Option<&str>) -> Option<String> {
     let trimmed = model.map(str::trim).filter(|value| !value.is_empty())?;
     if matches!(trimmed, "inherit" | "default" | "global") {
         return None;
     }
-    Some(trimmed.to_string())
+    crate::project::normalize_claude_model(Some(trimmed))
 }
 
 /// Per-session permission-mode pin. Unlike the other fields, "default" is a

@@ -706,6 +706,31 @@ pub(crate) fn validate_launch_config(
     Ok(())
 }
 
+/// Advisory intake note for a `claude_model` pin the Claude Code CLI's
+/// vocabulary doesn't recognize even after canonicalization — neither an
+/// alias, nor a `claude-*` id, nor a repairable dropped-prefix form. Never
+/// a rejection: intake stays deliberately permissive on model pins (the
+/// backend and model resolve at fire time, and unknown FUTURE ids must
+/// pass through), so the caller logs this and the propose proceeds.
+pub(crate) fn unrecognized_claude_model_warning(
+    config: &crate::event::AgentLaunchConfig,
+) -> Option<String> {
+    let pinned = config
+        .claude_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())?;
+    let resolved = crate::project::normalize_claude_model(Some(pinned))?;
+    if crate::project::claude_model_is_recognized(&resolved) {
+        return None;
+    }
+    Some(format!(
+        "claude_model '{pinned}' is neither a Claude Code model alias ({}) nor a claude-* id — \
+         the pin passes through as-is and the CLI may refuse it at fire time",
+        crate::project::CLAUDE_MODEL_ALIASES.join("/")
+    ))
+}
+
 pub(crate) fn codex_fast_new_session_agent(agent: Option<&str>) -> Result<String, String> {
     match SessionAgentSelection::from_wire(agent)? {
         SessionAgentSelection::Configured => Ok("codex".to_string()),
@@ -955,7 +980,13 @@ pub(crate) fn apply_session_claude_model(
 ) -> Result<(), String> {
     match backend {
         external_agent::AgentBackend::ClaudeCode => {
-            project.config.agent.claude_code.model = Some(model);
+            // Canonicalized at the resolution seam, not just at intake, so
+            // an already-approved manifest carrying a dropped-prefix pin
+            // ("fable-5") fires as the id the CLI accepts instead of dying
+            // at spawn — approvals bind manifest digests, so healing here
+            // never voids a standing approval.
+            project.config.agent.claude_code.model =
+                crate::project::normalize_claude_model(Some(&model));
             Ok(())
         }
         _ => Err("claude_model requires Claude Code".to_string()),
@@ -1640,6 +1671,80 @@ mod tests {
         );
     }
 
+    /// The fire-time heal for the fable-5 landmine (2026-07-26): approved
+    /// manifests carry `claude_model: "fable-5"`, a dropped-prefix form
+    /// the CC CLI refuses at spawn — and approval binds the manifest
+    /// digest, so the fix cannot rewrite them. Applying the pin
+    /// canonicalizes instead: a manifest proposed with "fable-5" fires as
+    /// `claude-fable-5` without re-approval.
+    #[test]
+    fn session_claude_model_pin_heals_dropped_prefix_at_fire_time() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        let claude = external_agent::AgentBackend::ClaudeCode;
+        apply_session_claude_model(&mut project, &claude, "fable-5".to_string()).unwrap();
+        assert_eq!(
+            project.config.agent.claude_code.model.as_deref(),
+            Some("claude-fable-5")
+        );
+        // Aliases and full ids stay exactly as pinned.
+        apply_session_claude_model(&mut project, &claude, "haiku".to_string()).unwrap();
+        assert_eq!(
+            project.config.agent.claude_code.model.as_deref(),
+            Some("haiku")
+        );
+        // Unknown ids pass through untouched (forward compatibility).
+        apply_session_claude_model(&mut project, &claude, "claude-future-9".to_string()).unwrap();
+        assert_eq!(
+            project.config.agent.claude_code.model.as_deref(),
+            Some("claude-future-9")
+        );
+        // The wrong backend still refuses.
+        assert!(apply_session_claude_model(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "fable".to_string()
+        )
+        .is_err());
+    }
+
+    /// The propose-time advisory (intake stays permissive per the AU
+    /// ruling — no hard rejection of unknown model pins): only strings
+    /// that are unrecognized AND unrepairable warn; aliases, full ids,
+    /// and repairable dropped-prefix forms stay silent.
+    #[test]
+    fn unrecognized_claude_model_warning_fires_only_for_unknown_shapes() {
+        let config = |model: &str| crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            claude_model: Some(model.to_string()),
+            ..Default::default()
+        };
+        for silent in [
+            "fable",
+            "claude-fable-5",
+            "fable-5",
+            "claude-future-9",
+            "  ",
+        ] {
+            assert_eq!(
+                unrecognized_claude_model_warning(&config(silent)),
+                None,
+                "{silent:?} must not warn"
+            );
+        }
+        let warning = unrecognized_claude_model_warning(&config("gpt-x")).expect("warns");
+        assert!(
+            warning.contains("'gpt-x'"),
+            "warning names the pin: {warning}"
+        );
+        assert_eq!(
+            unrecognized_claude_model_warning(&crate::event::AgentLaunchConfig::default()),
+            None
+        );
+    }
+
     /// The create/resume wire normalizers must treat the `inherit` sentinel
     /// (and empty strings) as "no per-session override" — not pin the
     /// project-level default. Explicit values still pin, and absent stays
@@ -1963,6 +2068,11 @@ mod tests {
         };
 
         ok(AgentLaunchConfig::default());
+        // A dropped-prefix model pin stays ACCEPTED at intake (the AU
+        // ruling keeps intake permissive on model pins — fire-time
+        // resolution; `apply_session_claude_model` canonicalizes
+        // "fable-5" there, so the manifest fires as claude-fable-5
+        // instead of dying at spawn).
         ok(AgentLaunchConfig {
             agent: Some("claude-code".into()),
             claude_model: Some("fable-5".into()),

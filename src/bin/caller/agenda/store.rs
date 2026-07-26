@@ -458,6 +458,11 @@ impl AgendaStore {
         if let Some(config) = agent_config.as_deref() {
             crate::session_supervisor::validate_launch_config(config)
                 .map_err(AgendaError::Invalid)?;
+            if let Some(warning) =
+                crate::session_supervisor::unrecognized_claude_model_warning(config)
+            {
+                eprintln!("[agenda] start-now advisory: {warning}");
+            }
         }
         // Absent defaults to interactive (owner-ratified): the session
         // opens with the item and waits for the owner.
@@ -1147,6 +1152,11 @@ impl AgendaStore {
                 if let Some(config) = agent_config.as_deref() {
                     crate::session_supervisor::validate_launch_config(config)
                         .map_err(AgendaError::Invalid)?;
+                    if let Some(warning) =
+                        crate::session_supervisor::unrecognized_claude_model_warning(config)
+                    {
+                        eprintln!("[agenda] propose advisory: {warning}");
+                    }
                 }
                 if let Some(rec) = &recurrence {
                     if rec.every_ms < super::types::RECURRENCE_MIN_EVERY_MS {
@@ -4137,7 +4147,7 @@ mod tests {
             project_root: None,
             agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
                 agent: Some("claude-code".into()),
-                claude_model: Some("fable-5".into()),
+                claude_model: Some("claude-fable-5".into()),
                 claude_effort: Some("max".into()),
                 ..Default::default()
             })),
@@ -4320,7 +4330,7 @@ mod tests {
 
         let config = crate::event::AgentLaunchConfig {
             agent: Some("claude-code".into()),
-            claude_model: Some("fable-5".into()),
+            claude_model: Some("claude-fable-5".into()),
             claude_effort: Some("max".into()),
             ..Default::default()
         };

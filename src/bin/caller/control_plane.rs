@@ -549,11 +549,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
         }
         ControlMsg::SetClaudeModel { model } => {
             // Empty/whitespace clears the override — matches the dashboard
-            // input semantics for the Codex model field.
-            let normalized: Option<String> = model
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+            // input semantics for the Codex model field. Values canonicalize
+            // (dropped-prefix repair) like the settings lane.
+            let normalized: Option<String> =
+                crate::project::normalize_claude_model(model.as_deref());
             {
                 let mut guard = state.claude_config.write().await;
                 guard.model = normalized.clone();

@@ -2078,7 +2078,7 @@ mod tests {
             .unwrap();
         let config = crate::event::AgentLaunchConfig {
             agent: Some("claude-code".into()),
-            claude_model: Some("fable-5".into()),
+            claude_model: Some("claude-fable-5".into()),
             claude_effort: Some("max".into()),
             ..Default::default()
         };

@@ -690,13 +690,10 @@ pub(crate) fn apply_settings_payload(
             normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
     }
     if payload.claude_model.is_some() {
-        // Empty clears the override (claude picks its configured default).
-        config.agent.claude_code.model = payload
-            .claude_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        // Empty clears the override (claude picks its configured default);
+        // values canonicalize (dropped-prefix repair) like claude_effort.
+        config.agent.claude_code.model =
+            crate::project::normalize_claude_model(payload.claude_model.as_deref());
     }
     if payload.claude_effort.is_some() {
         // Empty clears the daemon default (the CLI picks per model), like

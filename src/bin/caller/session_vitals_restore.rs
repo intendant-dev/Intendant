@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(cache.last_activity_epoch, 1_000_000);
         assert_eq!(cache.recovered_at_epoch, Some(1_000_000));
 
-        // Context: fable-5 → 1M window from the model-family table.
+        // Context: claude-fable-5 → 1M window from the model-family table.
         let context = facts.context.as_ref().expect("context");
         assert_eq!(context.tokens_used, 2 + 55_796 + 3_240 + 521);
         assert_eq!(context.context_window, 1_000_000);

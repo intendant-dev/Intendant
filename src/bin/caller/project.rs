@@ -586,6 +586,50 @@ pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     }
 }
 
+/// The Claude Code CLI's model-alias vocabulary: the four family words its
+/// `--model` help documents ("Model alias (e.g. 'fable', 'opus', 'sonnet',
+/// 'haiku') or full model ID (e.g. 'claude-fable-5')"). Verified firsthand
+/// against CC 2.1.220 (2026-07-26): the binary's alias map resolves
+/// {fable→claude-fable-5, opus→claude-opus-5, sonnet→claude-sonnet-5,
+/// haiku→claude-haiku-4-5}, and live `--model` probes accept each alias and
+/// full id while refusing bare family-version forms ("fable-5", "opus-5").
+pub const CLAUDE_MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// True when a model string is in the CLI's accepted shape: one of the
+/// [`CLAUDE_MODEL_ALIASES`] or a full `claude-*` id (the namespace every
+/// registry id carries; unknown `claude-*` ids stay recognized for forward
+/// compatibility with newer models).
+pub fn claude_model_is_recognized(model: &str) -> bool {
+    CLAUDE_MODEL_ALIASES.contains(&model) || model.starts_with("claude-")
+}
+
+/// Canonicalize a Claude Code model selection. Empty, "default", and
+/// "inherit" mean "no pin" (the CLI picks its configured default — neither
+/// is ever a model id or alias, so both are safe clear sentinels). Aliases
+/// and full `claude-*` ids pass through untouched. A bare family-version
+/// form — an alias word plus a dashed version tail, "fable-5" — is the
+/// dropped-prefix mistake the CLI refuses at spawn ("There's an issue with
+/// the selected model", proven live 2026-07-26 against CC 2.1.220), so it
+/// canonicalizes to the `claude-` full id the CLI does accept. Anything
+/// else passes through trimmed for forward compatibility.
+pub fn normalize_claude_model(model: Option<&str>) -> Option<String> {
+    let trimmed = model.map(str::trim).filter(|s| !s.is_empty())?;
+    if matches!(trimmed, "default" | "inherit") {
+        return None;
+    }
+    if !claude_model_is_recognized(trimmed) {
+        if let Some((family, version)) = trimmed.split_once('-') {
+            if CLAUDE_MODEL_ALIASES.contains(&family)
+                && !version.is_empty()
+                && version.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            {
+                return Some(format!("claude-{trimmed}"));
+            }
+        }
+    }
+    Some(trimmed.to_string())
+}
+
 /// Canonicalize a Claude Code permission mode. The CLI's modes on 2.1.206
 /// are `default` (alias `manual`), `acceptEdits`, `plan`, `auto`
 /// (classifier-based approvals), `dontAsk` (auto-deny anything that would
@@ -2070,6 +2114,55 @@ mod tests {
         // Whitespace-only entries behave like unset.
         cfg.managed_command = Some("   ".to_string());
         assert_eq!(cfg.effective_command(true), "codex");
+    }
+
+    /// The Claude Code model canonicalizer: aliases and `claude-*` ids
+    /// survive untouched, dropped-prefix family-version forms repair to
+    /// the full id (the fleet's "fable-5" landmine — the CLI refuses the
+    /// bare form at spawn, probed live on CC 2.1.220), sentinels clear,
+    /// and everything else passes through for forward compatibility.
+    #[test]
+    fn claude_model_canonicalizes_dropped_prefix_forms_only() {
+        for alias in CLAUDE_MODEL_ALIASES {
+            assert_eq!(normalize_claude_model(Some(alias)).as_deref(), Some(alias));
+            assert!(claude_model_is_recognized(alias));
+        }
+        for id in [
+            "claude-fable-5",
+            "claude-haiku-4-5",
+            "claude-opus-4-8",
+            "claude-future-model-9",
+        ] {
+            assert_eq!(normalize_claude_model(Some(id)).as_deref(), Some(id));
+            assert!(claude_model_is_recognized(id));
+        }
+        for (bare, repaired) in [
+            ("fable-5", "claude-fable-5"),
+            (" opus-5 ", "claude-opus-5"),
+            ("sonnet-4-6", "claude-sonnet-4-6"),
+            ("haiku-4-5", "claude-haiku-4-5"),
+        ] {
+            assert_eq!(
+                normalize_claude_model(Some(bare)).as_deref(),
+                Some(repaired),
+                "bare form {bare:?} must repair to the full id"
+            );
+        }
+        for cleared in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("default"),
+            Some("inherit"),
+        ] {
+            assert_eq!(normalize_claude_model(cleared), None);
+        }
+        // Never invent a repair: non-family heads, non-numeric tails, and
+        // unfamiliar casing pass through as typed.
+        for other in ["gpt-x", "fable-x", "opus-", "Fable-5", "kimi-k2"] {
+            assert_eq!(normalize_claude_model(Some(other)).as_deref(), Some(other));
+            assert!(!claude_model_is_recognized(other));
+        }
     }
 
     #[test]

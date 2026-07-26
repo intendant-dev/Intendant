@@ -4038,7 +4038,7 @@ mod tests {
                     project_root: None,
                     agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
                         agent: Some("claude-code".into()),
-                        claude_model: Some("fable-5".into()),
+                        claude_model: Some("claude-fable-5".into()),
                         claude_effort: Some("max".into()),
                         ..Default::default()
                     })),
@@ -4055,7 +4055,7 @@ mod tests {
         let line = serde_json::to_string(&executor).unwrap();
         assert_eq!(
             line,
-            r#"{"v":1,"at_ms":50,"op":{"type":"propose_effect","id":"01X","effect_id":"ef-1","manifest":{"goal":"standing","fire_at_ms":1000,"agent_config":{"agent":"claude-code","claude_model":"fable-5","claude_effort":"max"},"recurrence":{"every_ms":3600000,"max_occurrences":4}}}}"#
+            r#"{"v":1,"at_ms":50,"op":{"type":"propose_effect","id":"01X","effect_id":"ef-1","manifest":{"goal":"standing","fire_at_ms":1000,"agent_config":{"agent":"claude-code","claude_model":"claude-fable-5","claude_effort":"max"},"recurrence":{"every_ms":3600000,"max_occurrences":4}}}}"#
         );
         assert_eq!(
             serde_json::from_str::<AgendaOpRecord>(&line).unwrap(),
