@@ -96,11 +96,94 @@ html.ui-v2 .ag2-compose {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
   margin: 16px 0 12px;
+}
+html.ui-v2 .ag2-rich-toggle {
+  background: none;
+  border: 1px dashed var(--line-2);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-rich-toggle:hover,
+html.ui-v2 .ag2-rich-toggle.on {
+  border-color: var(--iris);
+  color: var(--iris-2);
+}
+html.ui-v2 .ag2-rich-row {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+html.ui-v2 .ag2-rich-eyebrow {
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-rich-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 3px 6px 3px 11px;
+  font-size: 12px;
+  font-weight: 600;
+}
+html.ui-v2 .ag2-rich-chip button {
+  background: none;
+  border: 0;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 3px;
+}
+html.ui-v2 .ag2-rich-chip button:hover {
+  color: var(--rose);
+}
+html.ui-v2 .ag2-rich-row input {
+  flex: 0 1 200px;
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 11px;
+}
+html.ui-v2 #ag2-rich-multi {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 11px;
+  cursor: pointer;
+}
+html.ui-v2 #ag2-rich-multi.on {
+  border-color: var(--iris);
+  color: var(--iris-2);
+  background: var(--surface-2);
+}
+html.ui-v2 .ag2-rich-hint {
+  font-size: 10.5px;
+  color: var(--text-3);
 }
 html.ui-v2 .ag2-compose input {
   flex: 1;

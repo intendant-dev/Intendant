@@ -263,9 +263,10 @@ async function agendaSendOp(params, button) {
     const resp = await daemonApi.request('api_agenda_op', params);
     if (resp.ok && resp.body && resp.body.item) {
       // The event lane repaints too; merging here keeps the UI honest
-      // even if this tab's event socket is briefly down.
+      // even if this tab's event socket is briefly down. Returns the
+      // item (truthy) so multi-op gestures can chain on the minted id.
       agendaObserveServerMessage({ item: resp.body.item });
-      return true;
+      return resp.body.item;
     }
     const message = (resp.body && resp.body.error) || `agenda op failed (${resp.status})`;
     agendaFlashError(message);

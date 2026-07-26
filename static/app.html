@@ -23343,11 +23343,94 @@ html.ui-v2 .ag2-compose {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
   margin: 16px 0 12px;
+}
+html.ui-v2 .ag2-rich-toggle {
+  background: none;
+  border: 1px dashed var(--line-2);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+html.ui-v2 .ag2-rich-toggle:hover,
+html.ui-v2 .ag2-rich-toggle.on {
+  border-color: var(--iris);
+  color: var(--iris-2);
+}
+html.ui-v2 .ag2-rich-row {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+html.ui-v2 .ag2-rich-eyebrow {
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-rich-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 3px 6px 3px 11px;
+  font-size: 12px;
+  font-weight: 600;
+}
+html.ui-v2 .ag2-rich-chip button {
+  background: none;
+  border: 0;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 3px;
+}
+html.ui-v2 .ag2-rich-chip button:hover {
+  color: var(--rose);
+}
+html.ui-v2 .ag2-rich-row input {
+  flex: 0 1 200px;
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 4px 11px;
+}
+html.ui-v2 #ag2-rich-multi {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 11px;
+  cursor: pointer;
+}
+html.ui-v2 #ag2-rich-multi.on {
+  border-color: var(--iris);
+  color: var(--iris-2);
+  background: var(--surface-2);
+}
+html.ui-v2 .ag2-rich-hint {
+  font-size: 10.5px;
+  color: var(--text-3);
 }
 html.ui-v2 .ag2-compose input {
   flex: 1;
@@ -36708,7 +36791,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'e61ac05d4f99e2ce';
+const INTENDANT_APP_BUILD = '0aaf6fcab8f52c48';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -89966,9 +90049,10 @@ async function agendaSendOp(params, button) {
     const resp = await daemonApi.request('api_agenda_op', params);
     if (resp.ok && resp.body && resp.body.item) {
       // The event lane repaints too; merging here keeps the UI honest
-      // even if this tab's event socket is briefly down.
+      // even if this tab's event socket is briefly down. Returns the
+      // item (truthy) so multi-op gestures can chain on the minted id.
       agendaObserveServerMessage({ item: resp.body.item });
-      return true;
+      return resp.body.item;
     }
     const message = (resp.body && resp.body.error) || `agenda op failed (${resp.status})`;
     agendaFlashError(message);
@@ -91601,6 +91685,14 @@ const AGENDA_COMPOSE_PLACEHOLDERS = {
 
 let agendaComposeKind = 'task';
 
+// Rich-ask composing (question kind only): the owner builds pick-one /
+// pick-many options inline and the compose bar parks `{op:'ask'}` — the
+// same durable rich-ask lane sessions use; options render on every
+// dashboard's question rail, nothing blocks, nothing expires.
+let agendaRichOn = false;
+let agendaRichOptions = [];
+let agendaRichMulti = false;
+
 // ---- Scaffold ----
 
 function agendaEnsureScaffold() {
@@ -91634,6 +91726,8 @@ function agendaEnsureScaffold() {
           </div>
           <input id="ag2-compose-title" type="text" maxlength="500" autocomplete="off"
                  placeholder="${escapeHtml(AGENDA_COMPOSE_PLACEHOLDERS.task)}" aria-label="New agenda item title" />
+          <button type="button" class="ag2-rich-toggle" id="ag2-rich-toggle" hidden
+                  title="Give the owner options to pick from — the question still parks durably and resolves everywhere">+ options</button>
           <select id="ag2-compose-due" aria-label="Reminder"
                   title="A due time delivers a reminder to you — it never authorizes work">
             <option value="">No reminder</option>
@@ -91643,6 +91737,7 @@ function agendaEnsureScaffold() {
             <option value="mon">Next Monday 09:00</option>
           </select>
           <button type="button" class="ag2-park" id="ag2-park">Park</button>
+          <div class="ag2-rich-row" id="ag2-rich-row" hidden></div>
         </div>
         <div class="ag2-lensbar">
           <div class="ag2-seg ag2-lenses" id="ag2-lenses" role="tablist" aria-label="Agenda lens"></div>
@@ -91667,6 +91762,29 @@ function agendaEnsureScaffold() {
   agendaWireScaffold();
 }
 
+// ---- Rich-ask compose row (persistent scaffold; re-rendered on state) ----
+
+function agendaRichRowRender() {
+  const row = document.getElementById('ag2-rich-row');
+  const toggle = document.getElementById('ag2-rich-toggle');
+  if (!row || !toggle) return;
+  const isQuestion = agendaComposeKind === 'question';
+  toggle.hidden = !isQuestion;
+  toggle.classList.toggle('on', agendaRichOn);
+  row.hidden = !isQuestion || !agendaRichOn;
+  if (row.hidden) {
+    row.innerHTML = '';
+    return;
+  }
+  const chips = agendaRichOptions.map((label, i) =>
+    `<span class="ag2-rich-chip">${escapeHtml(label)}<button type="button" data-rich-remove="${i}" title="Remove option">×</button></span>`).join('');
+  row.innerHTML = `<span class="ag2-rich-eyebrow">Options</span>
+    ${chips}
+    <input type="text" maxlength="80" id="ag2-rich-draft" placeholder="Add an option, press Enter…" aria-label="Add an option" />
+    <button type="button" id="ag2-rich-multi" class="${agendaRichMulti ? 'on' : ''}" title="Allow picking more than one option">pick many</button>
+    <span class="ag2-rich-hint">Parks as a rich ask — options render on every dashboard’s question rail; nothing blocks, nothing expires.</span>`;
+}
+
 // The depth seg's active state lives on the persistent scaffold, so it
 // syncs directly (wire time and every agendaSetDepth) rather than
 // through the groups re-render.
@@ -91687,7 +91805,43 @@ function agendaWireScaffold() {
         b.classList.toggle('active', b === btn));
       title.placeholder = AGENDA_COMPOSE_PLACEHOLDERS[agendaComposeKind]
         || AGENDA_COMPOSE_PLACEHOLDERS.task;
+      agendaRichRowRender();
     });
+  });
+  document.getElementById('ag2-rich-toggle').addEventListener('click', () => {
+    agendaRichOn = !agendaRichOn;
+    agendaRichRowRender();
+    const draft = document.getElementById('ag2-rich-draft');
+    if (draft) draft.focus();
+  });
+  const richRow = document.getElementById('ag2-rich-row');
+  richRow.addEventListener('click', (e) => {
+    const remove = e.target.closest('[data-rich-remove]');
+    if (remove) {
+      agendaRichOptions.splice(Number(remove.dataset.richRemove), 1);
+      agendaRichRowRender();
+      return;
+    }
+    if (e.target.closest('#ag2-rich-multi')) {
+      agendaRichMulti = !agendaRichMulti;
+      agendaRichRowRender();
+    }
+  });
+  richRow.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.closest('#ag2-rich-draft')) return;
+    e.preventDefault();
+    const draft = e.target;
+    const label = (draft.value || '').trim();
+    if (!label || agendaRichOptions.includes(label)) return;
+    if (agendaRichOptions.length >= 4) {
+      agendaFlashError('Four options at most — the rail renders up to four.');
+      return;
+    }
+    agendaRichOptions.push(label);
+    draft.value = '';
+    agendaRichRowRender();
+    const next = document.getElementById('ag2-rich-draft');
+    if (next) next.focus();
   });
   document.getElementById('ag2-park').addEventListener('click', agendaComposePark);
   title.addEventListener('keydown', (e) => {
@@ -91791,16 +91945,47 @@ async function agendaComposePark() {
     title.focus();
     return;
   }
-  const params = { op: 'add', kind: agendaComposeKind, title: text };
+  const rich = agendaComposeKind === 'question' && agendaRichOn
+    && agendaRichOptions.length > 0;
   const dueMs = agendaDuePresetMs(due.value);
-  if (dueMs) params.due_ms = dueMs;
+  let params;
+  if (rich) {
+    // The same durable rich-ask lane sessions use (AgendaCommand::Ask):
+    // the daemon mints the item and the rail ask_id; options land on
+    // every dashboard's question rail. A due reminder rides a follow-up
+    // patch — the ask command deliberately carries no reminder field.
+    params = {
+      op: 'ask',
+      questions: [{
+        question: text,
+        options: agendaRichOptions.map((label) => ({ label })),
+        pick_max: agendaRichMulti ? agendaRichOptions.length : 1,
+      }],
+    };
+  } else {
+    params = { op: 'add', kind: agendaComposeKind, title: text };
+    if (dueMs) params.due_ms = dueMs;
+  }
   const ok = await agendaSendOp(params, btn);
   if (ok) {
+    if (rich && dueMs && ok.id) {
+      // The reminder rides a follow-up patch on the minted item — the
+      // ask command itself deliberately carries no reminder field.
+      await agendaSendOp({ op: 'patch', id: ok.id, patch: { due_ms: dueMs } });
+    }
     title.value = '';
     due.value = '';
     title.focus();
+    if (rich) {
+      agendaRichOptions = [];
+      agendaRichMulti = false;
+      agendaRichOn = false;
+      agendaRichRowRender();
+    }
     if (typeof showControlToast === 'function') {
-      showControlToast('success', `Parked${dueMs ? ' — reminder set' : ''}.`);
+      showControlToast('success', rich
+        ? `Parked as a rich ask — ${params.questions[0].options.length} options on the question rail.`
+        : `Parked${dueMs ? ' — reminder set' : ''}.`);
     }
   }
 }
