@@ -568,6 +568,8 @@ pub(crate) enum ProtocolSurface {
     CodexServerRequest,
     CodexUnsupportedServerRequest,
     CodexItemType,
+    CodexUnhandledItemType,
+    CodexUnhandledNotification,
     KimiRootField,
     KimiEvent,
     PiEnvelope,
@@ -597,6 +599,8 @@ impl ProtocolSurface {
             Self::CodexServerRequest => "codex_server_request",
             Self::CodexUnsupportedServerRequest => "codex_unsupported_server_request",
             Self::CodexItemType => "codex_item_type",
+            Self::CodexUnhandledItemType => "codex_unhandled_item_type",
+            Self::CodexUnhandledNotification => "codex_unhandled_notification",
             Self::KimiRootField => "kimi_root_field",
             Self::KimiEvent => "kimi_event",
             Self::PiEnvelope => "pi_envelope",
@@ -714,6 +718,19 @@ impl ProtocolFinding {
                 expected,
                 actual
             ),
+            _ if matches!(
+                self.surface,
+                ProtocolSurface::CodexUnhandledItemType
+                    | ProtocolSurface::CodexUnhandledNotification
+            ) =>
+            {
+                format!(
+                    "{} protocol drift observed at {}: '{}' has no adapter handler (payload dropped)",
+                    backend,
+                    self.surface.as_str(),
+                    self.identifier
+                )
+            }
             _ => format!(
                 "{} protocol drift observed at {}: unknown identifier '{}'",
                 backend,
@@ -1205,6 +1222,49 @@ pub(crate) fn codex_findings(value: &serde_json::Value) -> Vec<ProtocolFinding> 
         }
     }
     findings
+}
+
+/// A vocabulary-known-but-unhandled finding: the reader recognized the wire
+/// token as pinned Codex vocabulary yet dropped the payload because no
+/// translation arm consumes it. This is the drift class `codex_findings`
+/// is structurally blind to — the token being pinned as known is exactly
+/// what kept the 0.145 unified-exec begins invisible — so the reader's
+/// catch-all arms report it explicitly. Pinned identifiers are named
+/// verbatim (they are this adapter's own compiled-in vocabulary); anything
+/// else stays redacted like every other unknown identifier.
+fn codex_unhandled_finding(
+    surface: ProtocolSurface,
+    token: &str,
+    pinned: &[&str],
+) -> ProtocolFinding {
+    let token = token.trim();
+    if pinned.contains(&token) {
+        ProtocolFinding {
+            surface,
+            identifier: token.to_string(),
+            expected_kind: None,
+            actual_kind: None,
+            severity: FindingSeverity::Warning,
+        }
+    } else {
+        ProtocolFinding::unknown(surface, token, FindingSeverity::Warning)
+    }
+}
+
+pub(crate) fn codex_unhandled_item_type_finding(item_type: &str) -> ProtocolFinding {
+    codex_unhandled_finding(
+        ProtocolSurface::CodexUnhandledItemType,
+        item_type,
+        CODEX_ITEM_TYPES,
+    )
+}
+
+pub(crate) fn codex_unhandled_notification_finding(method: &str) -> ProtocolFinding {
+    codex_unhandled_finding(
+        ProtocolSurface::CodexUnhandledNotification,
+        method,
+        CODEX_NOTIFICATION_METHODS,
+    )
 }
 
 /// Redacted compatibility checks for one Kimi server-v1 WebSocket event.
@@ -2549,6 +2609,27 @@ mod tests {
         assert!(!codex_server_request_is_supported(
             "item/tool/requestUserInput"
         ));
+    }
+
+    #[test]
+    fn codex_unhandled_findings_name_pinned_vocabulary_verbatim() {
+        // Pinned tokens are this adapter's own compiled-in vocabulary — the
+        // finding names them plainly so "known but dropped" is actionable.
+        let finding = codex_unhandled_item_type_finding("dynamicToolCall");
+        assert_eq!(finding.surface, ProtocolSurface::CodexUnhandledItemType);
+        assert_eq!(finding.identifier, "dynamicToolCall");
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+
+        let method = codex_unhandled_notification_finding("account/updated");
+        assert_eq!(method.surface, ProtocolSurface::CodexUnhandledNotification);
+        assert_eq!(method.identifier, "account/updated");
+
+        // Anything off the pinned lists stays redacted like every other
+        // unknown identifier.
+        let novel_type = codex_unhandled_item_type_finding("totallyNovelType");
+        assert!(novel_type.identifier.starts_with("<unknown:"));
+        let novel_method = codex_unhandled_notification_finding("item/fancy/new");
+        assert!(novel_method.identifier.starts_with("<unknown:"));
     }
 
     #[test]
