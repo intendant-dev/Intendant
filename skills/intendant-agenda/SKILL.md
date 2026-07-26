@@ -106,6 +106,12 @@ dashboard, attributed to your session.
   digest, so revising the manifest (re-running `schedule`) voids any
   approval. The outcome writes back to the item (`effects[].last_run`
   in `list --json`: state, session id, note) — check it next session.
+  If the goal depends on a file (a brief, a rider), seal it:
+  `--binding-ref file:PATH` (repeatable) sha256-pins the content at
+  propose time under the approval digest — editing the file after
+  approval makes the next fire refuse (occurrence `failed`, named
+  reason) instead of running against drifted content, so keep sealed
+  files stable or re-propose after editing them.
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.

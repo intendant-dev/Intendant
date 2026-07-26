@@ -386,6 +386,33 @@ lands: a mandate whose SUB-agents park matching items can cycle at the
 cooldown rate — visible in the journal, bounded by suspension. An
 event trigger never widens who approves manifests.
 
+**Hash-pinned binding refs (sealed refs, owner-ruled 2026-07-26).** The
+approval digest covers the manifest, but a goal often *references*
+content — a must-read brief, a mandate rider — that lived outside the
+digest and stayed editable under an armed approval. A manifest may now
+carry `binding_refs` (`[{locator, sha256}]`, additive — absent means
+none and legacy digests are unchanged): `ctl agenda schedule
+--binding-ref file:PATH` (repeatable) hashes the file **at propose
+time** and embeds the pin; because the pins are manifest bytes, the
+approval digest covers them, and changing a ref is a revision that
+re-opens review. Intake verifies each pin against the daemon's own read
+(mismatch, unreadable path, or a non-`file:` locator refuses by name —
+v1 seals absolute `file:` paths only; `body:` and `git:` forms are
+future vocabulary), and **every fire re-verifies**: a drifted or
+unreadable ref refuses to spawn — the occurrence journals terminal
+`failed` with the named reason (`binding ref drifted: <locator>` /
+`binding ref unreadable: <locator>`), the write-back lands on the item,
+and the failure counts on the standing streak, so a stale standing
+manifest suspends and surfaces to the owner instead of firing over its
+own drift. Each fired task carries one data line per ref (locator +
+approved sha256, verified at fire) under the source rider. Doctrine:
+the *content behind a verified pin* is exactly what the owner reviewed
+and may carry instructions for the fired session; everything else a
+fired session reads — bodies, annotations, unhashed G1 refs — remains
+data, never instructions. On older builds a sealed manifest degrades
+fail-closed like recurrence/trigger: digest mismatch, never an unsealed
+firing.
+
 **Start now** (`start_now`, `ctl agenda start`, the item's button) is the
 owner's act-on-item. On dashboard surfaces the button opens a **confirm
 sheet** (bottom sheet on coarse pointers and narrow viewports, anchored
