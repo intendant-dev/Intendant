@@ -854,7 +854,10 @@ html.ui-v2 .ag2-graph-swatch.s-line.t-dep { border-top: 2px solid rgba(var(--ros
 
 /* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows
    ride the shared .ag2-chip family; dots pulse via the shared ui2-pulse
-   keyframes, which the global reduced-motion rule collapses. ---- */
+   keyframes, which the global reduced-motion rule collapses. The
+   .ag2-plan-day/-rail/-row/-dot/-time structural classes are the
+   family's day-grouped-timeline shapes, shared with the Diary lens
+   (ui2-agenda-diary.js). ---- */
 
 html.ui-v2 .ag2-plan {
   margin-bottom: 22px;
@@ -901,6 +904,7 @@ html.ui-v2 .ag2-plan-dot.t-sky { background: var(--sky); }
 html.ui-v2 .ag2-plan-dot.t-iris { background: var(--iris); }
 html.ui-v2 .ag2-plan-dot.t-amber { background: var(--amber); }
 html.ui-v2 .ag2-plan-dot.t-green { background: var(--green); }
+html.ui-v2 .ag2-plan-dot.t-rose { background: var(--rose); }
 html.ui-v2 .ag2-plan-dot.t-neutral { background: var(--neutral-dot); }
 html.ui-v2 .ag2-plan-dot.pulse.slow { animation: ui2-pulse 2s ease-in-out infinite; }
 html.ui-v2 .ag2-plan-dot.pulse.fast { animation: ui2-pulse 1.3s ease-in-out infinite; }
@@ -937,6 +941,64 @@ html.ui-v2 .ag2-plan-note {
 }
 html.ui-v2 .ag2-plan-foot {
   font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* ---- Diary lens: the op log as a day-grouped narrative. Reuses the
+   Upcoming lens's timeline shapes above; only the diary-specific bits
+   live here. Rows are not wholly clickable — the item title button is
+   the only opener. ---- */
+
+html.ui-v2 .ag2-diary {
+  margin-bottom: 22px;
+}
+html.ui-v2 .ag2-diary-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-diary-seg button {
+  padding: 4px 11px;
+  font-size: 11.5px;
+}
+html.ui-v2 .ag2-diary-hint {
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-diary-row {
+  cursor: default;
+  padding-bottom: 11px;
+}
+html.ui-v2 .ag2-diary-verb {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+html.ui-v2 .ag2-diary-item {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+html.ui-v2 .ag2-diary-item:hover {
+  color: var(--iris-2);
+}
+html.ui-v2 .ag2-diary-item.plain {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+  cursor: default;
+}
+html.ui-v2 .ag2-diary-who {
+  font-size: 11px;
   color: var(--text-3);
 }
 
