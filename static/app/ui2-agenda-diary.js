@@ -205,7 +205,8 @@ function agendaDiaryRowHtml(entry) {
       <span class="ag2-plan-time">${escapeHtml(envelope.at_ms ? agendaPlanHm(envelope.at_ms) : '—')}</span>
       <span class="ag2-diary-verb">${escapeHtml(verb)}</span>
       ${target}
-      ${who ? `<span class="ag2-diary-who">${escapeHtml(`by ${who}`)}</span>` : ''}
+      ${who && !agendaDepthCalm() ? `<span class="ag2-diary-who">${escapeHtml(`by ${who}`)}</span>` : ''}
+      ${agendaDepthAll() ? `<span class="ag2-diary-raw">${escapeHtml(raw)}</span>` : ''}
     </div>
   </div>`;
 }
@@ -234,7 +235,9 @@ function agendaDiarySegHtml() {
        class="${agendaDiaryFilter === id ? 'active' : ''}">${escapeHtml(label)}</button>`).join('');
   return `<div class="ag2-diary-bar">
     <div class="ag2-seg ag2-diary-seg" role="group" aria-label="Diary filter">${buttons}</div>
-    <span class="ag2-diary-hint">attributed, append-only — dismissals, failures, and revocations included</span>
+    <span class="ag2-diary-hint">${agendaDepthCalm()
+    ? 'what happened, day by day'
+    : 'attributed, append-only — dismissals, failures, and revocations included'}</span>
   </div>`;
 }
 

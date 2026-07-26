@@ -41,6 +41,30 @@ const agendaExpandedThreads = new Set();
 // ---- Lens + inspector view state (the redesigned tab). Ephemeral
 // browser state — never persisted, never on the wire.
 let agendaLens = 'now';
+
+// Progressive-disclosure depth for the whole tab — a persisted
+// presentation preference, never wire state: calm folds the machinery
+// away (triage/must-read chips, tags, exec labels, manifest plumbing,
+// the hood), standard is the working view, everything adds ids and raw
+// op coordinates inline. Gates read agendaDepthCalm()/agendaDepthAll()
+// at render time.
+let agendaDepth = 'standard';
+try {
+  const savedDepth = localStorage.getItem('ui2.agenda.depth');
+  if (['calm', 'standard', 'everything'].includes(savedDepth)) agendaDepth = savedDepth;
+} catch { /* storage unavailable — session-local default */ }
+
+function agendaDepthCalm() { return agendaDepth === 'calm'; }
+function agendaDepthAll() { return agendaDepth === 'everything'; }
+
+function agendaSetDepth(depth) {
+  if (!['calm', 'standard', 'everything'].includes(depth) || depth === agendaDepth) return;
+  agendaDepth = depth;
+  try { localStorage.setItem('ui2.agenda.depth', depth); } catch { /* session-local */ }
+  agendaDepthSyncSeg();
+  agendaRenderTab();
+  if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
+}
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;
@@ -239,9 +263,10 @@ async function agendaSendOp(params, button) {
     const resp = await daemonApi.request('api_agenda_op', params);
     if (resp.ok && resp.body && resp.body.item) {
       // The event lane repaints too; merging here keeps the UI honest
-      // even if this tab's event socket is briefly down.
+      // even if this tab's event socket is briefly down. Returns the
+      // item (truthy) so multi-op gestures can chain on the minted id.
       agendaObserveServerMessage({ item: resp.body.item });
-      return true;
+      return resp.body.item;
     }
     const message = (resp.body && resp.body.error) || `agenda op failed (${resp.status})`;
     agendaFlashError(message);
@@ -314,16 +339,24 @@ function agendaBlockedLine(item) {
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
-// running | suspended | pending | standing | armed | finished. Mirrors
-// the daemon's fold judgments (AgendaEffect::suspended, the scheduler's
-// next-instant derivation) — derived here every paint, never stored.
+// running | suspended | pending | standing | armed | finished, plus the
+// trigger vocabulary (Track T manifests carry `trigger` INSTEAD of a
+// clock cadence): watching (on_item_match, approved), waiting
+// (on_unblock, prerequisites still open), ready (on_unblock, every
+// prerequisite complete — the scheduler dispatches within the minute).
+// Mirrors the daemon's fold judgments (AgendaEffect::suspended, the
+// scheduler's next-instant derivation, the trigger arm rules) — derived
+// here every paint, never stored.
 function agendaEffectState(item) {
   const effect = (item.effects || [])[0];
   if (!effect || !effect.manifest) return null;
   const manifest = effect.manifest;
   const rec = manifest.recurrence || null;
-  const threshold = rec ? Math.max(1, rec.suspend_after_failures || 3) : 0;
-  const suspended = !!rec && (effect.consecutive_failures || 0) >= threshold;
+  const trig = manifest.trigger || null;
+  // Failure-suspend covers standing series AND triggered mandates (the
+  // C-floor guardrail); one-shot clock manifests never suspend.
+  const threshold = rec || trig ? Math.max(1, (rec && rec.suspend_after_failures) || 3) : 0;
+  const suspended = !!(rec || trig) && (effect.consecutive_failures || 0) >= threshold;
   const running = !!(effect.last_run && effect.last_run.state === 'started');
   // The daemon decorates each effect with the planner's REAL next firing
   // instant (`next_fire_ms`, absent when nothing will fire) — prefer it
@@ -337,9 +370,12 @@ function agendaEffectState(item) {
   const kind = running ? 'running'
     : suspended ? 'suspended'
       : !effect.approval ? 'pending'
-        : rec ? 'standing'
-          : next > Date.now() ? 'armed' : 'finished';
-  return { effect, manifest, rec, threshold, suspended, running, next, kind };
+        : trig ? (trig.kind === 'on_item_match' ? 'watching'
+          : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
+            ? 'ready' : 'waiting')
+          : rec ? 'standing'
+            : next > Date.now() ? 'armed' : 'finished';
+  return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 
 // One-line executor description for a manifest's `agent_config` block:

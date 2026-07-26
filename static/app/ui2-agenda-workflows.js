@@ -1,7 +1,7 @@
 // ---- Workflow templates: stamp + one-gesture approval (Track T) ----
 // A workflow template stamps a small item-graph: an instance HUB whose
 // body is the workflow's living orientation document, N node items
-// placed under it, relies_on edges, and one on_unblock-triggered
+// placed under it, relies_on links, and one on_unblock-triggered
 // manifest per node. STAMPING parks and proposes only; the approval
 // sheet then previews the whole graph, and the owner's single confirm
 // emits one ordinary per-node approval op — the UI batches, the

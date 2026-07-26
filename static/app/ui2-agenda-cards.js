@@ -66,6 +66,14 @@ const AGENDA_COMPOSE_PLACEHOLDERS = {
 
 let agendaComposeKind = 'task';
 
+// Rich-ask composing (question kind only): the owner builds pick-one /
+// pick-many options inline and the compose bar parks `{op:'ask'}` — the
+// same durable rich-ask lane sessions use; options render on every
+// dashboard's question rail, nothing blocks, nothing expires.
+let agendaRichOn = false;
+let agendaRichOptions = [];
+let agendaRichMulti = false;
+
 // ---- Scaffold ----
 
 function agendaEnsureScaffold() {
@@ -80,9 +88,16 @@ function agendaEnsureScaffold() {
             <h2 class="ag2-title">Agenda</h2>
             <p class="ag2-sub">Parked intent that outlives any one session — one ledger for this daemon, every project.</p>
           </div>
-          <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
-            ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
-          </button>
+          <div class="ag2-head-tools">
+            <div class="ag2-seg ag2-depth" id="ag2-depth" role="group" aria-label="How much machinery to show">
+              <button type="button" data-depth="calm" title="Just what needs you — machinery folded away">Calm</button>
+              <button type="button" data-depth="standard" title="The working view">Standard</button>
+              <button type="button" data-depth="everything" title="Ids, digests, raw op coordinates — the whole engine room">Everything</button>
+            </div>
+            <button type="button" class="ag2-bell" id="ag2-bell" title="Reminder delivery policy — owner authority (settings.manage)">
+              ${typeof ui2Icon === 'function' ? ui2Icon('bell', 14) : ''}<span>Reminders</span><span class="ag2-bell-dot" id="ag2-bell-dot" hidden title="Quiet hours are active now"></span>
+            </button>
+          </div>
         </div>
         <div class="ag2-compose">
           <div class="ag2-seg" id="ag2-kind-seg" role="group" aria-label="Kind">
@@ -92,6 +107,8 @@ function agendaEnsureScaffold() {
           </div>
           <input id="ag2-compose-title" type="text" maxlength="500" autocomplete="off"
                  placeholder="${escapeHtml(AGENDA_COMPOSE_PLACEHOLDERS.task)}" aria-label="New agenda item title" />
+          <button type="button" class="ag2-rich-toggle" id="ag2-rich-toggle" hidden
+                  title="Give the owner options to pick from — the question still parks durably and resolves everywhere">+ options</button>
           <select id="ag2-compose-due" aria-label="Reminder"
                   title="A due time delivers a reminder to you — it never authorizes work">
             <option value="">No reminder</option>
@@ -101,6 +118,7 @@ function agendaEnsureScaffold() {
             <option value="mon">Next Monday 09:00</option>
           </select>
           <button type="button" class="ag2-park" id="ag2-park">Park</button>
+          <div class="ag2-rich-row" id="ag2-rich-row" hidden></div>
         </div>
         <div class="ag2-lensbar">
           <div class="ag2-seg ag2-lenses" id="ag2-lenses" role="tablist" aria-label="Agenda lens"></div>
@@ -125,6 +143,39 @@ function agendaEnsureScaffold() {
   agendaWireScaffold();
 }
 
+// ---- Rich-ask compose row (persistent scaffold; re-rendered on state) ----
+
+function agendaRichRowRender() {
+  const row = document.getElementById('ag2-rich-row');
+  const toggle = document.getElementById('ag2-rich-toggle');
+  if (!row || !toggle) return;
+  const isQuestion = agendaComposeKind === 'question';
+  toggle.hidden = !isQuestion;
+  toggle.classList.toggle('on', agendaRichOn);
+  row.hidden = !isQuestion || !agendaRichOn;
+  if (row.hidden) {
+    row.innerHTML = '';
+    return;
+  }
+  const chips = agendaRichOptions.map((label, i) =>
+    `<span class="ag2-rich-chip">${escapeHtml(label)}<button type="button" data-rich-remove="${i}" title="Remove option">×</button></span>`).join('');
+  row.innerHTML = `<span class="ag2-rich-eyebrow">Options</span>
+    ${chips}
+    <input type="text" maxlength="80" id="ag2-rich-draft" placeholder="Add an option, press Enter…" aria-label="Add an option" />
+    <button type="button" id="ag2-rich-multi" class="${agendaRichMulti ? 'on' : ''}" title="Allow picking more than one option">pick many</button>
+    <span class="ag2-rich-hint">Parks as a rich ask — options render on every dashboard’s question rail; nothing blocks, nothing expires.</span>`;
+}
+
+// The depth seg's active state lives on the persistent scaffold, so it
+// syncs directly (wire time and every agendaSetDepth) rather than
+// through the groups re-render.
+function agendaDepthSyncSeg() {
+  const seg = document.getElementById('ag2-depth');
+  if (!seg) return;
+  seg.querySelectorAll('button[data-depth]').forEach((btn) =>
+    btn.classList.toggle('active', btn.dataset.depth === agendaDepth));
+}
+
 function agendaWireScaffold() {
   const kindSeg = document.getElementById('ag2-kind-seg');
   const title = document.getElementById('ag2-compose-title');
@@ -135,7 +186,43 @@ function agendaWireScaffold() {
         b.classList.toggle('active', b === btn));
       title.placeholder = AGENDA_COMPOSE_PLACEHOLDERS[agendaComposeKind]
         || AGENDA_COMPOSE_PLACEHOLDERS.task;
+      agendaRichRowRender();
     });
+  });
+  document.getElementById('ag2-rich-toggle').addEventListener('click', () => {
+    agendaRichOn = !agendaRichOn;
+    agendaRichRowRender();
+    const draft = document.getElementById('ag2-rich-draft');
+    if (draft) draft.focus();
+  });
+  const richRow = document.getElementById('ag2-rich-row');
+  richRow.addEventListener('click', (e) => {
+    const remove = e.target.closest('[data-rich-remove]');
+    if (remove) {
+      agendaRichOptions.splice(Number(remove.dataset.richRemove), 1);
+      agendaRichRowRender();
+      return;
+    }
+    if (e.target.closest('#ag2-rich-multi')) {
+      agendaRichMulti = !agendaRichMulti;
+      agendaRichRowRender();
+    }
+  });
+  richRow.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.closest('#ag2-rich-draft')) return;
+    e.preventDefault();
+    const draft = e.target;
+    const label = (draft.value || '').trim();
+    if (!label || agendaRichOptions.includes(label)) return;
+    if (agendaRichOptions.length >= 4) {
+      agendaFlashError('Four options at most — the rail renders up to four.');
+      return;
+    }
+    agendaRichOptions.push(label);
+    draft.value = '';
+    agendaRichRowRender();
+    const next = document.getElementById('ag2-rich-draft');
+    if (next) next.focus();
   });
   document.getElementById('ag2-park').addEventListener('click', agendaComposePark);
   title.addEventListener('keydown', (e) => {
@@ -165,6 +252,11 @@ function agendaWireScaffold() {
     e.stopPropagation();
     agendaBellToggle();
   });
+  document.getElementById('ag2-depth').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-depth]');
+    if (btn) agendaSetDepth(btn.dataset.depth);
+  });
+  agendaDepthSyncSeg();
   const groups = document.getElementById('ag2-groups');
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
@@ -234,16 +326,47 @@ async function agendaComposePark() {
     title.focus();
     return;
   }
-  const params = { op: 'add', kind: agendaComposeKind, title: text };
+  const rich = agendaComposeKind === 'question' && agendaRichOn
+    && agendaRichOptions.length > 0;
   const dueMs = agendaDuePresetMs(due.value);
-  if (dueMs) params.due_ms = dueMs;
+  let params;
+  if (rich) {
+    // The same durable rich-ask lane sessions use (AgendaCommand::Ask):
+    // the daemon mints the item and the rail ask_id; options land on
+    // every dashboard's question rail. A due reminder rides a follow-up
+    // patch — the ask command deliberately carries no reminder field.
+    params = {
+      op: 'ask',
+      questions: [{
+        question: text,
+        options: agendaRichOptions.map((label) => ({ label })),
+        pick_max: agendaRichMulti ? agendaRichOptions.length : 1,
+      }],
+    };
+  } else {
+    params = { op: 'add', kind: agendaComposeKind, title: text };
+    if (dueMs) params.due_ms = dueMs;
+  }
   const ok = await agendaSendOp(params, btn);
   if (ok) {
+    if (rich && dueMs && ok.id) {
+      // The reminder rides a follow-up patch on the minted item — the
+      // ask command itself deliberately carries no reminder field.
+      await agendaSendOp({ op: 'patch', id: ok.id, patch: { due_ms: dueMs } });
+    }
     title.value = '';
     due.value = '';
     title.focus();
+    if (rich) {
+      agendaRichOptions = [];
+      agendaRichMulti = false;
+      agendaRichOn = false;
+      agendaRichRowRender();
+    }
     if (typeof showControlToast === 'function') {
-      showControlToast('success', `Parked${dueMs ? ' — reminder set' : ''}.`);
+      showControlToast('success', rich
+        ? `Parked as a rich ask — ${params.questions[0].options.length} options on the question rail.`
+        : `Parked${dueMs ? ' — reminder set' : ''}.`);
     }
   }
 }
@@ -615,6 +738,16 @@ function agendaCardChips(item) {
         `One approval covers the series · next ${agendaAbsTime(st.next)}`));
     } else if (st.kind === 'armed') {
       chips.push(agendaChipHtml('armed', 'sky', `Fires ${agendaAbsTime(st.next)}`));
+    } else if (st.kind === 'watching') {
+      const predicate = `${st.trig.item_kind || 'item'}${(st.trig.tags || []).length ? ` + ${st.trig.tags.join(',')}` : ''}`;
+      chips.push(agendaChipHtml(agendaDepthCalm() ? 'watching' : `watching · ${predicate}`, 'sky',
+        'Fires when a NEW open item matches — arrivals batch for a minute'));
+    } else if (st.kind === 'waiting') {
+      chips.push(agendaChipHtml('auto · on unblock', 'sky',
+        'Armed — fires the moment every prerequisite completes; no one has to remember', true));
+    } else if (st.kind === 'ready') {
+      chips.push(agendaChipHtml('fires momentarily', 'iris',
+        'Prerequisites complete — the scheduler dispatches within the minute'));
     }
   }
   const kids = agendaChildrenOf(item.id);
@@ -630,14 +763,16 @@ function agendaCardChips(item) {
         'Render-level flag only — completion never cascades'));
     }
   }
+  // Machinery chips — folded away at calm depth (status, due, blocked,
+  // and attention states above always show).
   const triage = agendaTriageInfo(item);
-  if (triage) {
+  if (triage && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(
       triage.rank !== null ? `triage #${triage.rank}` : 'triage',
       'iris', triage.text, true));
   }
   const mustReads = (item.refs || []).filter((r) => r.must_read).length;
-  if (mustReads) {
+  if (mustReads && !agendaDepthCalm()) {
     chips.push(agendaChipHtml(`${mustReads} must-read`, 'iris',
       'Typed pointers the reading agent weighs — never orders'));
   }
@@ -668,7 +803,7 @@ function agendaCardByline(item, opts) {
             : p.kind === 'peer' ? 'a peer daemon' : (p.kind || 'unattributed');
     by = `by <span title="${escapeHtml(tip)}">${escapeHtml(label)}</span>`;
   }
-  const selfDesc = p.source
+  const selfDesc = p.source && !agendaDepthCalm()
     ? '<span class="agenda-self-described" title="Self-described label — unverified, never an identity">· self-described</span>'
     : '';
   const bits = [
@@ -681,7 +816,7 @@ function agendaCardByline(item, opts) {
   if (hub && !opts.noHub) {
     bits.push(`<span>· in</span> <a class="ag2-hub-link" data-open-item="${escapeHtml(hub.id)}">${escapeHtml(hub.title.length > 34 ? `${hub.title.slice(0, 33)}…` : hub.title)}</a>`);
   }
-  (item.tags || []).slice(0, 3).forEach((tag) => {
+  (agendaDepthCalm() ? [] : (item.tags || []).slice(0, 3)).forEach((tag) => {
     bits.push(`<span class="ag2-tag">${escapeHtml(tag)}</span>`);
   });
   return bits.filter(Boolean).join(' ');
@@ -737,8 +872,12 @@ function agendaAutomationStripHtml(item) {
   const e = st.effect;
   const id = escapeHtml(item.id);
   const meta = [];
-  meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
-  meta.push(`<span>${escapeHtml(st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
+  if (!agendaDepthCalm()) {
+    meta.push(`<span class="ag2-auto-exec" title="Executor — digest-bound like the rest of the manifest: editing it voids the approval">${escapeHtml(agendaExecutorLabel(st.manifest.agent_config))}</span>`);
+  }
+  meta.push(`<span>${escapeHtml(st.trig
+    ? (st.trig.kind === 'on_item_match' ? 'on matching items' : 'on unblock')
+    : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
@@ -770,13 +909,73 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing' && e.next_fire_ms) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="request_occurrence" data-id="${id}" title="One extra occurrence of the approved digest — the standing approval is untouched">Run now</button>`
       + `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
-  } else if (st.kind === 'armed') {
+  } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
   return `<div class="ag2-eff ag2-auto t-${st.kind === 'pending' || st.kind === 'suspended' ? 'amber' : 'iris'}">
     <span class="ag2-auto-meta">${meta.join('<span class="ag2-auto-dot">·</span>')}</span>
     <span class="ag2-spacer"></span>${actions}
   </div>`;
+}
+
+// ---- Workflow pipeline strip (hub cards + the hubs lens) ----
+
+// A hub reads as a pipeline when at least two children carry
+// on_unblock-triggered manifests — the workflow stamp's shape, DERIVED
+// from the graph every paint; no workflow-level object or marker exists
+// anywhere (Track T's contract).
+function agendaPipelineNodes(hub) {
+  const kids = agendaChildrenOf(hub.id).filter((k) =>
+    (k.effects || []).some((e) => e.manifest && e.manifest.trigger
+      && e.manifest.trigger.kind === 'on_unblock'));
+  if (kids.length < 2) return null;
+  // relies_on topological order within the set (bounded passes; a cycle
+  // or cross-hub dependency appends in creation order at the tail).
+  const inSet = new Set(kids.map((k) => k.id));
+  const order = [];
+  const placed = new Set();
+  for (let pass = 0; pass < kids.length && order.length < kids.length; pass++) {
+    kids.forEach((k) => {
+      if (placed.has(k.id)) return;
+      const deps = (k.relies_on || []).map((l) => l.target_id).filter((id) => inSet.has(id));
+      if (deps.every((id) => placed.has(id))) {
+        placed.add(k.id);
+        order.push(k);
+      }
+    });
+  }
+  kids.forEach((k) => { if (!placed.has(k.id)) order.push(k); });
+  return order;
+}
+
+function agendaPipelineStripHtml(hub) {
+  const nodes = agendaPipelineNodes(hub);
+  if (!nodes) return '';
+  const cells = nodes.map((node, i) => {
+    const st = agendaEffectState(node);
+    let tone = 'neutral';
+    let state = 'parked';
+    let pulse = '';
+    if (node.status === 'done') { tone = 'green'; state = 'done'; }
+    else if (node.status === 'retired') { state = 'retired'; }
+    else if (st) {
+      if (st.kind === 'running') { tone = 'iris'; state = 'running'; pulse = 'fast'; }
+      else if (st.kind === 'ready') { tone = 'iris'; state = 'fires momentarily'; pulse = 'slow'; }
+      else if (st.kind === 'waiting') { tone = 'sky'; state = 'waiting on prerequisites'; }
+      else if (st.kind === 'pending') { tone = 'amber'; state = 'needs approval'; }
+      else if (st.kind === 'suspended') { tone = 'amber'; state = `suspended · ${st.effect.consecutive_failures} failures`; }
+      else { state = st.kind; }
+    }
+    const exec = st && !agendaDepthCalm() ? agendaExecutorLabel(st.manifest.agent_config) : '';
+    const arrow = i ? '<span class="ag2-pipe-arrow" aria-hidden="true">→</span>' : '';
+    const title = String(node.title || '');
+    return `${arrow}<button type="button" class="ag2-pipe-node" data-open-item="${escapeHtml(node.id)}" title="${escapeHtml(`${title} — ${state}`)}">
+      <span class="ag2-pipe-head"><span class="ag2-pipe-dot t-${tone}${pulse ? ` pulse ${pulse}` : ''}"></span><span class="ag2-pipe-title">${escapeHtml(title.length > 22 ? `${title.slice(0, 21)}…` : title)}</span></span>
+      <span class="ag2-pipe-state">${escapeHtml(state)}</span>
+      ${exec ? `<span class="ag2-pipe-exec">${escapeHtml(exec)}</span>` : ''}
+    </button>`;
+  });
+  return `<div class="ag2-pipeline">${cells.join('')}</div>`;
 }
 
 // ---- Inline question answering ----
@@ -1025,7 +1224,13 @@ function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  const blockedLine = agendaBlockedLine(item);
+  // Calm depth folds prerequisite-only wait lines (the blocked chip
+  // still shows); an explicit uncleared blocker always renders — it
+  // names what someone must do.
+  const blockedRaw = agendaBlockedLine(item);
+  const blockedLine = blockedRaw
+    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
+    ? null : blockedRaw;
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -1039,9 +1244,11 @@ function agendaCardHtml(row) {
       <div class="ag2-card-titlerow">
         <span class="ag2-card-title${item.status === 'done' ? ' done' : ''}${item.status !== 'open' ? ' dim' : ''}">${escapeHtml(item.title)}</span>
         ${agendaCardChips(item)}
+        ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
       ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
     </div>
@@ -1140,12 +1347,14 @@ function agendaRenderTab() {
       const hubLink = group.hubId
         ? `<a class="ag2-hub-open" data-open-item="${escapeHtml(group.hubId)}">open the hub ›</a>`
         : '';
+      const hub = group.hubId ? agendaFindItem(group.hubId) : null;
       return `<div class="ag2-group">
         <div class="ag2-group-head">
           <span class="ag2-group-label">${escapeHtml(group.label)}</span>
           <span class="ag2-group-hint">${escapeHtml(group.hint)}</span>
           ${hubLink}
         </div>
+        ${hub ? agendaPipelineStripHtml(hub) : ''}
         <div class="ag2-cards">${group.rows.map(agendaCardHtml).join('')}</div>
       </div>`;
     }).join('');
