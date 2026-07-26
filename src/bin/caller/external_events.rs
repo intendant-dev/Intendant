@@ -1591,8 +1591,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // A fatal error the wrapper deems unrecoverable is the
                 // round's honest cause; recoverable ones resolve through
                 // the recovery precedence at the exit instead.
-                let fatal_round_error =
-                    (!will_retry && event_is_primary && !recovery_required).then(|| content.clone());
+                let fatal_round_error = (!will_retry && event_is_primary && !recovery_required)
+                    .then(|| content.clone());
                 config.bus.send(AppEvent::LogEntry {
                     session_id: config.session_id.clone(),
                     level: if will_retry || recovery_required {
