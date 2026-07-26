@@ -1886,10 +1886,7 @@ mod tests {
                 "ui2-vault.css lost the chip rule for {class}"
             );
         }
-        for (name, content) in [
-            ("32-vault-custody.js", fragment),
-            ("ui2-vault.css", styles),
-        ] {
+        for (name, content) in [("32-vault-custody.js", fragment), ("ui2-vault.css", styles)] {
             for line in content.lines() {
                 if line.contains("is-progress") {
                     assert!(

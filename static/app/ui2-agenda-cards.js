@@ -918,6 +918,33 @@ function agendaAutomationStripHtml(item) {
   </div>`;
 }
 
+// The explicit "now armed" moment (UX0 ruling; UX2): approving is never
+// a silent state flip — one toast says what is now true and what
+// happens next, mirroring the workflow sheet's proven pattern. Derives
+// from the RESPONSE item, so the line states the daemon's post-approve
+// truth, not a prediction.
+function agendaApprovalMoment(item) {
+  if (typeof showControlToast !== 'function') return;
+  const st = agendaEffectState(item);
+  let line = 'Approved — the manifest is armed. Revoke anytime on the card.';
+  if (st) {
+    if (st.kind === 'standing') {
+      line = `Approved — standing series armed: every ${agendaCadenceLabel(st.rec.every_ms)}, next ${agendaAbsTime(st.next)}. Revoke anytime on the card.`;
+    } else if (st.kind === 'armed') {
+      line = `Approved — armed; fires ${agendaAbsTime(st.next)}. Watch it on the Automations lens; revoke anytime.`;
+    } else if (st.kind === 'watching') {
+      line = 'Approved — watching; fires when a new matching item arrives (arrivals batch for a minute). Revoke anytime.';
+    } else if (st.kind === 'waiting') {
+      line = 'Approved — armed; fires the moment every prerequisite completes. Revoke anytime.';
+    } else if (st.kind === 'ready') {
+      line = 'Approved — prerequisites already complete; the session fires within the minute.';
+    } else if (st.kind === 'running') {
+      line = 'Approved — an occurrence is already in flight.';
+    }
+  }
+  showControlToast('success', line);
+}
+
 // ---- Workflow pipeline strip (hub cards + the hubs lens) ----
 
 // A hub reads as a pipeline when at least two children carry
@@ -1389,7 +1416,9 @@ function agendaGroupsClick(e) {
     const params = { op: opBtn.dataset.opBtn, id: opBtn.dataset.id };
     // Approve binds the digest of the revision this render showed.
     if (opBtn.dataset.digest) params.digest = opBtn.dataset.digest;
-    agendaSendOp(params, opBtn);
+    agendaSendOp(params, opBtn).then((item) => {
+      if (item && params.op === 'approve_effect') agendaApprovalMoment(item);
+    });
     return;
   }
   const jump = e.target.closest('[data-jump-session]');
