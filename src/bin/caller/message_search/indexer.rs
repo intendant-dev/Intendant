@@ -1323,7 +1323,12 @@ fn file_mtime_ms(path: &Path) -> i64 {
 
 /// Depth-bounded recursive collection of files with `suffix` (strict
 /// suffix match — `.jsonl.backup` siblings never qualify).
-fn collect_suffix_files(root: &Path, suffix: &str, max_depth: usize, out: &mut Vec<PathBuf>) {
+pub(super) fn collect_suffix_files(
+    root: &Path,
+    suffix: &str,
+    max_depth: usize,
+    out: &mut Vec<PathBuf>,
+) {
     if max_depth == 0 {
         return;
     }
