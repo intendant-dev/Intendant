@@ -880,6 +880,23 @@ html.ui-v2 #access-github-integration-section .vault-chip.warn {
   color: var(--amber);
 }
 
+/* Orientation first: one human sentence — what is true, what happens
+   next — before any chips. */
+html.ui-v2 #access-github-integration-section .vault-orientation {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  margin: 4px 0 10px;
+  max-width: 62ch;
+}
+html.ui-v2 #access-github-integration-section .vault-orientation.is-success { color: var(--green); }
+html.ui-v2 #access-github-integration-section .vault-orientation.is-attention { color: var(--amber); }
+html.ui-v2 #access-github-integration-section .vault-orientation.is-refusal { color: var(--rose); }
+html.ui-v2 #access-github-integration-section .vault-orientation.is-progress {
+  color: var(--sky);
+  animation: ui2-pulse 2.4s ease-in-out infinite;
+}
+
 /* The ceremony feedback grammar (UX0 ruling, pinned vocabulary):
    is-progress — in flight, no user action (sky, pulse);
    is-attention — waits on a user decision (amber, correctly);

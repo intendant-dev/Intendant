@@ -1366,7 +1366,7 @@ function agendaRenderTab() {
       : agendaLens === 'now'
         ? 'The agenda is quiet — everything parked is either moving or waiting politely.'
         : agendaLens === 'automations'
-          ? 'Schedule a standing session on any item (its Schedule section, or ctl agenda schedule) and it appears here with its approval, cadence, and run history.'
+          ? 'Schedule a standing session on any item (its Schedule section, or ctl agenda schedule) and it appears here with its approval, cadence, and run history. PR cards appear once GitHub is connected and watching repositories — Vault → GitHub.'
           : 'Park something above, or let your sessions park as they work.';
     groupsHost.innerHTML = `<div class="ag2-empty">
       <div class="ag2-empty-glyph">◍</div>

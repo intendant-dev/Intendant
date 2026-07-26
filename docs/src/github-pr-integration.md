@@ -112,6 +112,18 @@ for every PR on the fleet, watched or not. Both exist on purpose.
   custody backend yet (Windows/Linux until their Track K slices), the
   configure gesture fails with a named error rather than degrading to a
   file.
+- **A rebuilt binary re-asks the macOS Keychain — once.** The custody
+  entry's ACL names the binary that created it; after any rebuild the
+  first custody touch makes macOS raise a SecurityAgent authorization
+  ("intendant-bin wants to use your confidential information…"), which
+  can hide behind windows or on another desktop. Click **Always Allow**
+  for the new binary. While the dialog waits, the parked custody call
+  runs on a surrendered runtime slot (`custody_blocking`,
+  `block_in_place`) so the daemon keeps serving, and the dashboard's
+  GitHub section names the situation after 20 s instead of showing an
+  eternal progress line. Development builds re-prompt on every rebuild;
+  signed releases keep one stable identity (see the TCC/signing notes
+  in the release docs).
 - **Read-only by construction and by permission set.** The App needs
   exactly: `Metadata: read` (baseline), `Pull requests: read`,
   `Checks: read`. Nothing else — no Contents, no Issues, no write
