@@ -879,6 +879,60 @@ html.ui-v2 #access-github-integration-section .vault-chip.warn {
   border-color: rgba(var(--amber-rgb), .26);
   color: var(--amber);
 }
+
+/* The ceremony feedback grammar (UX0 ruling, pinned vocabulary):
+   is-progress — in flight, no user action (sky, pulse);
+   is-attention — waits on a user decision (amber, correctly);
+   is-success — explicit success with the next action (green);
+   is-refusal — named reason + what to do (rose).
+   The legacy warning class may never co-occur with the progress
+   presentation — the pin in routes_github.rs enforces it per line. */
+html.ui-v2 #access-github-integration-section .vault-chip.is-progress {
+  background: rgba(var(--sky-rgb), .12);
+  border-color: rgba(var(--sky-rgb), .26);
+  color: var(--sky);
+  animation: ui2-pulse 2s ease-in-out infinite;
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-attention {
+  background: rgba(var(--amber-rgb), .14);
+  border-color: rgba(var(--amber-rgb), .26);
+  color: var(--amber);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-success {
+  background: rgba(var(--green-rgb), .12);
+  border-color: rgba(var(--green-rgb), .26);
+  color: var(--green);
+}
+html.ui-v2 #access-github-integration-section .vault-chip.is-refusal {
+  background: rgba(var(--rose-rgb), .12);
+  border-color: rgba(var(--rose-rgb), .28);
+  color: var(--rose);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-progress {
+  color: var(--sky);
+  animation: ui2-pulse 2.4s ease-in-out infinite;
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-attention {
+  color: var(--amber);
+}
+html.ui-v2 #access-github-integration-section .vault-connect-hint.is-refusal {
+  color: var(--rose);
+}
+html.ui-v2 #access-github-integration-section .vault-install-link.primary {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 16px;
+  border-radius: 9px;
+  background: var(--iris);
+  color: var(--on-accent, #fff);
+  font-size: 12.5px;
+  font-weight: 800;
+  text-decoration: none;
+}
+html.ui-v2 #access-github-integration-section .vault-install-link.primary:hover {
+  filter: brightness(1.08);
+  text-decoration: none;
+}
 html.ui-v2 #access-github-integration-section .vault-form-grid {
   display: grid;
   grid-template-columns: minmax(120px, 170px) 1fr;
