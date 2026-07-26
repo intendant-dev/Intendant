@@ -268,6 +268,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
     let mut pending_context_rewind_turn_stop = ManagedContextRewindTurnStopTracker::default();
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
+    // The cause of a fatal, non-recoverable backend error that ended the
+    // round with no real completion (the launch-refusal class). Cleared by
+    // a real turn completion inside the grace window; consumed at the exit,
+    // where a zero-turn round resolves as `TurnFailed` instead of lying
+    // with a completion.
+    let mut pending_fatal_round_error: Option<String> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
     let managed_context_density_steer_suppressed = managed_context_recovery_kickstart
@@ -1135,6 +1141,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             pending_context_rewind.take(),
                             pending_context_rewind_turn_stop.status(),
                             pending_backend_recovery.take(),
+                            pending_fatal_round_error.take(),
                             message,
                             turns_in_round,
                         );
@@ -1157,6 +1164,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     pending_context_rewind.take(),
                     pending_context_rewind_turn_stop.status(),
                     pending_backend_recovery.take(),
+                    pending_fatal_round_error.take(),
                     message,
                     turns_in_round,
                 );
@@ -1580,6 +1588,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         l.error(&content);
                     }
                 });
+                // A fatal error the wrapper deems unrecoverable is the
+                // round's honest cause; recoverable ones resolve through
+                // the recovery precedence at the exit instead.
+                let fatal_round_error =
+                    (!will_retry && event_is_primary && !recovery_required).then(|| content.clone());
                 config.bus.send(AppEvent::LogEntry {
                     session_id: config.session_id.clone(),
                     level: if will_retry || recovery_required {
@@ -1610,6 +1623,11 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // still takes precedence at the exit.
                 if !will_retry && event_is_primary && pending_turn_completion.is_none() {
                     pending_turn_completion = Some((None, turns_in_round));
+                    // First cause wins; an already-buffered REAL completion
+                    // (the branch guard above) never gets a fatal cause.
+                    if let Some(reason) = fatal_round_error {
+                        pending_fatal_round_error.get_or_insert(reason);
+                    }
                     if active_side_turns.is_empty() {
                         post_turn_sleep_active = true;
                         post_turn_sleep
@@ -2641,6 +2659,9 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     });
                 }
                 pending_turn_completion = Some((message, turns_in_round));
+                // A real completion inside the grace window supersedes a
+                // buffered fatal cause — the turn did land after all.
+                pending_fatal_round_error = None;
                 if active_side_turns.is_empty() {
                     post_turn_sleep_active = true;
                     post_turn_sleep
@@ -3327,6 +3348,230 @@ mod tests {
             ["mid-turn steer text"],
             "targeted steer must reach the backend steer hook"
         );
+    }
+
+    fn drain_outcome_name(outcome: &DrainOutcome) -> &'static str {
+        match outcome {
+            DrainOutcome::TurnCompleted { .. } => "TurnCompleted",
+            DrainOutcome::TurnFailed { .. } => "TurnFailed",
+            DrainOutcome::Terminated { .. } => "Terminated",
+            DrainOutcome::ChannelClosed => "ChannelClosed",
+            DrainOutcome::RecoveryRequired { .. } => "RecoveryRequired",
+            DrainOutcome::Interrupted { .. } => "Interrupted",
+            DrainOutcome::ContextRewindRequested { .. } => "ContextRewindRequested",
+            DrainOutcome::LimitRejected { .. } => "LimitRejected",
+        }
+    }
+
+    /// The launch-refusal pin (2026-07-26): a fatal, non-recoverable
+    /// backend error that ends a round with ZERO completed turns must
+    /// drain as `TurnFailed` — the specimen (Claude Code refusing the
+    /// `fable-5` model pin at spawn) previously exited `TurnCompleted`,
+    /// rode a DoneSignal, and journaled its scheduled occurrence
+    /// COMPLETED with the failure invisible (occurrence 21fe746a).
+    #[tokio::test]
+    async fn fatal_backend_error_with_zero_turns_drains_as_turn_failed() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("cc-session".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("cc-session".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Claude Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+            coordination_declaration: None,
+        };
+        let refusal = "There's an issue with the selected model (fable-5). It may not exist \
+                       or you may not have access to it.";
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::BackendError {
+                message: refusal.to_string(),
+                code: Some("success".to_string()),
+                details: None,
+                will_retry: false,
+                likely_generation_starvation: false,
+                recovery_hint: None,
+            })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        match outcome {
+            DrainOutcome::TurnFailed {
+                reason,
+                turns_in_round,
+            } => {
+                assert_eq!(turns_in_round, 0);
+                assert!(
+                    reason.contains("fable-5") && reason.contains("backend error"),
+                    "reason carries the cause: {reason}"
+                );
+            }
+            other => panic!(
+                "zero-turn fatal backend error must drain TurnFailed, got {}",
+                drain_outcome_name(&other)
+            ),
+        }
+    }
+
+    /// A real turn completion inside the grace window supersedes a buffered
+    /// fatal cause, and a fatal error that ends a round AFTER completed
+    /// turns keeps the completion shape (real work happened) — only the
+    /// did-nothing round fails.
+    #[tokio::test]
+    async fn fatal_backend_error_yields_to_real_completions_and_real_turns() {
+        for (feed_real_completion, feed_tool_start) in [(true, false), (false, true)] {
+            let bus = EventBus::new();
+            let mut bus_rx_for_drain = bus.subscribe();
+            let dir = tempfile::tempdir().unwrap();
+            let log_dir = dir.path().join("session");
+            let session_log: SharedSessionLog = Arc::new(Mutex::new(
+                session_log::SessionLog::open(log_dir.clone()).unwrap(),
+            ));
+            let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+            let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+            let config = DrainConfig {
+                bus: &bus,
+                web_port: None,
+                session_id: Some("cc-session".to_string()),
+                alias_session_id: None,
+                backend_thread_id: Some("cc-session".to_string()),
+                autonomy,
+                session_log: &session_log,
+                project_root: dir.path(),
+                log_dir: &log_dir,
+                approval_registry: &approval_registry,
+                json_approval: None,
+                agent_source: Some("Claude Code".to_string()),
+                suppress_agent_started: false,
+                persist_model_responses_inline: true,
+                headless: true,
+                context_injection: &context_injection,
+                reload_credentials: None,
+                coordination_declaration: None,
+            };
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            if feed_tool_start {
+                event_tx
+                    .send(external_agent::AgentEvent::ToolStarted {
+                        item_id: "tool-1".to_string(),
+                        tool_name: "bash".to_string(),
+                        preview: "ls".to_string(),
+                        message_uuid: None,
+                    })
+                    .unwrap();
+            }
+            event_tx
+                .send(external_agent::AgentEvent::BackendError {
+                    message: "transient provider outage".to_string(),
+                    code: None,
+                    details: None,
+                    will_retry: false,
+                    likely_generation_starvation: false,
+                    recovery_hint: None,
+                })
+                .unwrap();
+            if feed_real_completion {
+                event_tx
+                    .send(external_agent::AgentEvent::TurnCompleted {
+                        message: Some("recovered and finished".to_string()),
+                    })
+                    .unwrap();
+            }
+            drop(event_tx);
+
+            let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let steers = Arc::new(Mutex::new(Vec::new()));
+            let mut agent: Box<dyn external_agent::ExternalAgent> =
+                Box::new(ManagedDrainTestAgent {
+                    interrupts: interrupts.clone(),
+                    steers: steers.clone(),
+                });
+            let mut stats = LoopStats::default();
+            let mut diff_tracker = ExternalDiffDeltaTracker::default();
+            let mut pending_runtime_steers = std::collections::VecDeque::new();
+            let mut handled_steer_ids = std::collections::HashSet::new();
+            let mut cancelled_follow_ups = HashSet::new();
+            let mut dedupe = CodexThreadActionDedupe::default();
+
+            let outcome = drain_external_agent_events(
+                &mut agent,
+                &mut event_rx,
+                &mut bus_rx_for_drain,
+                &config,
+                &mut stats,
+                &mut diff_tracker,
+                &mut pending_runtime_steers,
+                &mut handled_steer_ids,
+                &mut cancelled_follow_ups,
+                &mut dedupe,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .await;
+            assert!(
+                matches!(outcome, DrainOutcome::TurnCompleted { .. }),
+                "fatal error must not fail a round with real work \
+                 (real_completion={feed_real_completion}, tool_start={feed_tool_start}); \
+                 got {}",
+                drain_outcome_name(&outcome)
+            );
+        }
     }
 
     #[tokio::test]
