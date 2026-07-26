@@ -6,7 +6,12 @@
 //! a ref is a pointer (locator + attach-time digest), never content: no
 //! file bytes, copies, or uploads enter the agenda for refs, here or in
 //! the op log. If a future feature wants ref-adjacent bytes, that is a new
-//! owner decision, not an extension of this store.
+//! owner decision, not an extension of this store. (That decision arrived:
+//! the sealed-refs ruling, owner-approved 2026-07-26, snapshots BINDING
+//! refs' bytes — in the sibling content-addressed [`super::sealed_blobs`]
+//! store, `blobs/<sha256>` files beside this store's per-item directories,
+//! never through these functions or lifecycles. Plain G1 refs remain
+//! pointers.)
 //!
 //! **Copy, don't reference** (ratified guardrail): at park time preview
 //! bytes are committed HERE, under the agenda's own directory

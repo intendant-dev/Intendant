@@ -398,20 +398,27 @@ approval digest covers them, and changing a ref is a revision that
 re-opens review. Intake verifies each pin against the daemon's own read
 (mismatch, unreadable path, or a non-`file:` locator refuses by name —
 v1 seals absolute `file:` paths only; `body:` and `git:` forms are
-future vocabulary), and **every fire re-verifies**: a drifted or
-unreadable ref refuses to spawn — the occurrence journals terminal
-`failed` with the named reason (`binding ref drifted: <locator>` /
-`binding ref unreadable: <locator>`), the write-back lands on the item,
-and the failure counts on the standing streak, so a stale standing
-manifest suspends and surfaces to the owner instead of firing over its
-own drift. Each fired task carries one data line per ref (locator +
-approved sha256, verified at fire) under the source rider. Doctrine:
-the *content behind a verified pin* is exactly what the owner reviewed
-and may carry instructions for the fired session; everything else a
-fired session reads — bodies, annotations, unhashed G1 refs — remains
-data, never instructions. On older builds a sealed manifest degrades
-fail-closed like recurrence/trigger: digest mismatch, never an unsealed
-firing.
+future vocabulary) and **seals the verified bytes** into the
+content-addressed snapshot store (`<agenda dir>/blobs/<sha256>`, atomic
+writes, dedup by hash; GC deliberately deferred). **Every fire verifies
+the snapshot**: the sealed bytes are the binding content — the fired
+task's rider line points the session at the sealed copy, and a live
+file that drifted (or vanished) after approval is an *informational
+note* (`live file drifted from sealed revision`), never a refusal.
+Refusal remains where preservation itself broke: a corrupt snapshot
+(bytes no longer hash to the pin) or a missing one that cannot be
+healed from live bytes still matching the pin — the occurrence journals
+terminal `failed` with the named reason (`binding ref snapshot
+corrupt/missing: <locator>`), the write-back lands on the item, and the
+failure counts on the standing streak, so a broken seal suspends and
+surfaces to the owner. Each fired task carries one data line per ref
+(locator + approved sha256 + sealed-copy path, verified at fire) under
+the source rider. Doctrine: the *content a verified seal serves* is
+exactly what the owner reviewed and may carry instructions for the
+fired session; everything else a fired session reads — bodies,
+annotations, unhashed G1 refs — remains data, never instructions. On
+older builds a sealed manifest degrades fail-closed like
+recurrence/trigger: digest mismatch, never an unsealed firing.
 
 **Start now** (`start_now`, `ctl agenda start`, the item's button) is the
 owner's act-on-item. On dashboard surfaces the button opens a **confirm
