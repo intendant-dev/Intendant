@@ -650,6 +650,26 @@ html.ui-v2 .ag2-eff.t-amber {
   border: 1px solid rgba(var(--amber-rgb), 0.26);
 }
 html.ui-v2 .ag2-eff.t-amber .ag2-eff-line { color: var(--amber); }
+html.ui-v2 .ag2-eff.t-sky {
+  background: rgba(var(--sky-rgb), .08);
+  border: 1px solid rgba(var(--sky-rgb), .2);
+}
+html.ui-v2 .ag2-eff.t-sky .ag2-eff-line { color: var(--sky); }
+html.ui-v2 .ag2-eff.t-green {
+  background: rgba(var(--green-rgb), .08);
+  border: 1px solid rgba(var(--green-rgb), .2);
+}
+html.ui-v2 .ag2-eff.t-green .ag2-eff-line { color: var(--green); }
+/* The refusal painted at the card that asked (UX2 grammar): transient —
+   the next list render sweeps it. */
+html.ui-v2 .ag2-card-refusal {
+  font-size: 12px;
+  color: var(--rose);
+  border-left: 2px solid rgba(var(--rose-rgb), .55);
+  padding-left: 9px;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
 html.ui-v2 .ag2-eff.t-iris {
   background: rgba(var(--iris-rgb), 0.08);
   border: 1px solid rgba(var(--iris-rgb), 0.26);

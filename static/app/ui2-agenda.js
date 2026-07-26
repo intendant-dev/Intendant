@@ -270,13 +270,33 @@ async function agendaSendOp(params, button) {
     }
     const message = (resp.body && resp.body.error) || `agenda op failed (${resp.status})`;
     agendaFlashError(message);
+    agendaPaintRefusal(button, message);
     return false;
   } catch (e) {
-    agendaFlashError(String(e && e.message || e));
+    const message = String(e && e.message || e);
+    agendaFlashError(message);
+    agendaPaintRefusal(button, message);
     return false;
   } finally {
     if (button) button.disabled = false;
   }
+}
+
+// The refusal painted AT the surface that refused (UX0 ruling; UX2) —
+// the top-of-tab flash evaporates in 6 s and sits far from the card
+// that asked. Transient by construction: the next render of the card
+// list sweeps it.
+function agendaPaintRefusal(button, message) {
+  const card = button && button.closest && button.closest('.ag2-card');
+  if (!card) return;
+  const previous = card.querySelector('.ag2-card-refusal');
+  if (previous) previous.remove();
+  const main = card.querySelector('.ag2-card-main');
+  if (!main) return;
+  const line = document.createElement('div');
+  line.className = 'ag2-card-refusal is-refusal';
+  line.textContent = message;
+  main.appendChild(line);
 }
 
 // Refused ops surface inline on the tab's notice line (and the ledger
