@@ -1951,6 +1951,124 @@ mod tests {
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
     }
 
+    /// The duplicate-orchestrator regression, live shape (2026-07-26): a
+    /// firing is `started`; the manifest is re-proposed mid-flight (the
+    /// fold swaps the effect object) and re-approved. The swap must not
+    /// blind the no-overlap hold — the swap carries the live run forward
+    /// on the effect, the item's started-without-terminal journal row
+    /// holds regardless, the pass after re-approval dispatches NOTHING,
+    /// and the revision fires exactly once the old firing resolves.
+    #[tokio::test]
+    async fn revision_mid_firing_holds_until_the_started_row_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
+
+        // Fire + receipt: the run is live.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut first = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                first = Some(delegation_id);
+            }
+        }
+        let first = first.expect("the approved manifest dispatches");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: first,
+                session_id: "sess-live".into(),
+            },
+        );
+
+        // Swap mid-flight: re-propose (new bytes), then owner re-approval.
+        let revised = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    recurrence: None,
+                    id: item_id.clone(),
+                    goal: "run the nightly sweep, rev 2".into(),
+                    fire_at_ms: now_ms() - 30_000,
+                    orchestrate: false,
+                    source: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            revised.effects[0]
+                .last_run
+                .as_ref()
+                .map(|run| run.state.as_str()),
+            Some("started"),
+            "a mid-flight revision carries the live run forward"
+        );
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item_id.clone(),
+                    digest: revised.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        // The pass after swap + re-approval plans NOTHING for the item —
+        // the defect dispatched a duplicate orchestrator right here.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "a live firing must hold the re-approved manifest closed"
+            );
+        }
+
+        // The old firing settles → the hold releases → rev 2 fires.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("sess-live".into()),
+                message: Some("old firing done".into()),
+            },
+        );
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut second = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                second = Some(delegation_id);
+            }
+        }
+        assert!(
+            second.is_some(),
+            "the revision fires once the started row resolves"
+        );
+    }
+
     /// F3 start-now rides the ordinary scheduled lane end to end at unit
     /// level: the gesture's approved now-manifest dispatches exactly one
     /// delegation-tagged StartTask on the next pass, the receipt journals
