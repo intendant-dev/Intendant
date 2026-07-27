@@ -395,6 +395,22 @@ impl OccurrenceJournal {
             .collect()
     }
 
+    /// True while any session occurrence of this item is `started` with no
+    /// terminal record — the journal-derived no-overlap hold. The journal
+    /// is the one record of a live firing that survives a manifest
+    /// re-propose: the fold replaces the effect object, and a re-approval's
+    /// fresh digest mints occurrence ids the per-occurrence dedup has never
+    /// seen, so effect state alone goes blind mid-swap. Never a wedge:
+    /// every `started` row resolves through the write-back's terminal or
+    /// the boot/lag passes' fail-closed `unknown`.
+    pub(crate) fn started_unresolved_for_item(&self, item_id: &str) -> bool {
+        self.state.values().any(|progress| {
+            progress.item_id.as_deref() == Some(item_id)
+                && progress.started.is_some()
+                && progress.terminal.is_none()
+        })
+    }
+
     /// Occurrences with a `prepared` record but no terminal one — a crash
     /// interrupted delivery; at-least-once means they retry. (The planner
     /// derives retries from item state; this is the test/diagnostic view.)
@@ -1033,12 +1049,20 @@ pub(crate) fn plan(
             }
             // No-overlap (G3-pre): while any occurrence of this effect is
             // dispatched or running, fire nothing new — the write-back
-            // nudge replans when it settles.
+            // nudge replans when it settles. The hold derives from the
+            // JOURNAL, item-wide, not just the effect object: a re-propose
+            // replaces the effect (approval void, `last_run` at best
+            // carried) while the swapped-out revision's firing may still
+            // run, and the re-approved digest mints occurrence ids the
+            // per-occurrence dedup below has never seen — the
+            // started-without-terminal row is the record of that live
+            // firing which survives the swap.
             let overlap = in_flight_effects.contains(&effect.effect_id)
                 || effect
                     .last_run
                     .as_ref()
-                    .is_some_and(|run| run.state == "started");
+                    .is_some_and(|run| run.state == "started")
+                || journal.started_unresolved_for_item(&item.id);
             for (instant, identity_ms, recurring) in candidates {
                 let occurrence_id = session_occurrence_id(
                     &item.id,
@@ -1150,9 +1174,10 @@ pub(crate) fn plan(
 /// is a candidate; spent ones are journal-deduped). The one deliberate
 /// difference: transient execution state — the scheduler's private
 /// in-flight set, and the no-overlap hold while a run of this effect is
-/// still `started` — only DELAYS a fire, so a due instant held by either
-/// keeps showing here (it fires when the run settles; mid-dispatch, the
-/// write-back settles the display). The
+/// still `started` (per the effect object or any started-without-terminal
+/// journal row of the item) — only DELAYS a fire, so a due instant held
+/// by either keeps showing here (it fires when the run settles;
+/// mid-dispatch, the write-back settles the display). The
 /// `next_fire_agrees_with_the_planner` differential test pins this mirror
 /// to `plan` itself.
 pub(crate) fn effect_next_fire_ms(
@@ -1956,6 +1981,107 @@ mod tests {
             &effects_in_flight,
         );
         assert!(held.spawn.is_empty());
+    }
+
+    /// The duplicate-orchestrator regression (live shape 2026-07-26): a
+    /// firing is `started`, the manifest is re-proposed and re-approved —
+    /// the fold swaps the effect object, and the fresh digest mints
+    /// occurrence ids the per-occurrence dedup has never seen. Even when
+    /// the effect object claims no live run (`last_run: None`, the
+    /// swapped shape), the item's started-without-terminal JOURNAL row
+    /// holds every schedule firing of that item closed until it resolves;
+    /// unrelated items keep their own per-effect semantics and fire.
+    #[test]
+    fn started_journal_row_holds_the_item_across_a_manifest_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal_at(dir.path());
+        let policy = ReminderPolicy::default();
+        let now = 100_000;
+
+        // The swapped-out revision's firing: `started`, no terminal. Its
+        // occurrence id derives from the OLD digest — nothing the
+        // re-approved effect will ever recompute.
+        for (at_ms, state) in [
+            (now - 10_000, OccurrenceState::Prepared),
+            (now - 9_000, OccurrenceState::Started),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms,
+                    occurrence_id: "occ-old-digest".into(),
+                    item_id: "swapped".into(),
+                    due_ms: now - 10_000,
+                    state,
+                    urgency: None,
+                    session_id: Some("sess-live".into()),
+                })
+                .unwrap();
+        }
+
+        // The post-swap effect object: fresh digest + approval,
+        // `last_run: None` — exactly what the planner saw live.
+        let swapped = one_shot_item("swapped", now - 5_000);
+        let unrelated = one_shot_item("unrelated", now - 5_000);
+        let held = plan(
+            &[swapped.clone(), unrelated.clone()],
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(
+            held.spawn.iter().all(|s| s.item_id != "swapped"),
+            "a started-without-terminal row must hold the item: {held:?}"
+        );
+        assert!(
+            held.missed_sessions.iter().all(|s| s.item_id != "swapped"),
+            "a held instant is delayed, never missed: {held:?}"
+        );
+        assert!(held.crashed.is_empty(), "{held:?}");
+        assert_eq!(
+            held.spawn
+                .iter()
+                .filter(|s| s.item_id == "unrelated")
+                .count(),
+            1,
+            "the hold is per-item — unrelated items keep firing: {held:?}"
+        );
+
+        // The old firing resolves → the hold releases and the
+        // re-approved instant fires.
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: now,
+                occurrence_id: "occ-old-digest".into(),
+                item_id: "swapped".into(),
+                due_ms: now - 10_000,
+                state: OccurrenceState::Completed,
+                urgency: None,
+                session_id: Some("sess-live".into()),
+            })
+            .unwrap();
+        let released = plan(
+            &[swapped, unrelated],
+            &journal,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            released
+                .spawn
+                .iter()
+                .filter(|s| s.item_id == "swapped")
+                .count(),
+            1,
+            "the hold releases when the started row resolves: {released:?}"
+        );
     }
 
     fn journal_at(dir: &Path) -> OccurrenceJournal {
@@ -3145,18 +3271,27 @@ mod tests {
         let policy = ReminderPolicy::default();
         let approved = 10_000;
         let standing = triggered_item("steward", gate_trigger(), approved, approved);
-        journal
-            .append(&OccurrenceRecord {
-                v: 1,
-                at_ms: 15_000,
-                occurrence_id: "occ-prior".into(),
-                item_id: "steward".into(),
-                due_ms: 15_000,
-                state: OccurrenceState::Started,
-                urgency: None,
-                session_id: Some("sess-fired".into()),
-            })
-            .unwrap();
+        // The prior firing SETTLED: loop exclusion derives from the
+        // started row's attribution, which survives the terminal — a
+        // still-unresolved row would trip the item-wide no-overlap hold
+        // and this pass would (correctly) plan nothing at all.
+        for (at_ms, state) in [
+            (15_000, OccurrenceState::Started),
+            (15_500, OccurrenceState::Completed),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms,
+                    occurrence_id: "occ-prior".into(),
+                    item_id: "steward".into(),
+                    due_ms: 15_000,
+                    state,
+                    urgency: None,
+                    session_id: Some("sess-fired".into()),
+                })
+                .unwrap();
+        }
 
         let mut consumed = matching_question("q-consumed", 20_000, None);
         consumed.annotations.push(AgendaAnnotation {

@@ -485,6 +485,12 @@ pub struct AgendaEffect {
     /// Owner approval of exactly `digest`; cleared by any re-propose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval: Option<AgendaApproval>,
+    /// Latest occurrence write-back on this effect lineage. A re-propose
+    /// clears a settled outcome (a fresh revision shows no stale outcome
+    /// view) but carries a `started` run forward — the firing belongs to
+    /// the `effect_id` lineage, not the digest, and the no-overlap hold,
+    /// run-now's one-occurrence-at-a-time gate, and boot recovery's
+    /// lineage match must survive a mid-firing revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_run: Option<AgendaRun>,
     /// Consecutive non-success (`failed`/`unknown`) occurrence outcomes
@@ -1875,7 +1881,7 @@ pub(crate) fn apply_op(
                 return Some(format!("propose_effect for unknown {id} ignored"));
             };
             let actor = rec.actor.clone().unwrap_or_default();
-            let effect = AgendaEffect {
+            let mut effect = AgendaEffect {
                 effect_id: effect_id.clone(),
                 digest: manifest_digest(id, effect_id, manifest),
                 manifest: manifest.clone(),
@@ -1893,7 +1899,21 @@ pub(crate) fn apply_op(
                 next_fire_ms: None,
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
-                Some(existing) => *existing = effect,
+                Some(existing) => {
+                    // A run still in flight belongs to the effect_id
+                    // lineage, not the digest: the write-back and boot
+                    // recovery match outcomes by `last_run`, and the
+                    // planner's no-overlap hold and run-now's
+                    // one-occurrence-at-a-time gate read it — a swap
+                    // mid-firing must not blind them. A SETTLED outcome
+                    // still clears: a fresh revision shows no stale
+                    // outcome view.
+                    effect.last_run = existing
+                        .last_run
+                        .take()
+                        .filter(|run| run.state == "started");
+                    *existing = effect;
+                }
                 None => item.effects.push(effect),
             }
             item.updated_ms = at_ms;
