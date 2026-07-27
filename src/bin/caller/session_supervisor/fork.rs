@@ -481,6 +481,40 @@ impl SessionSupervisor {
         match self.fork_claude_session(&session_token, &anchor).await {
             Ok((resolved_backend_id, child_uuid, kept_lines, parent_project_root)) => {
                 let child_short: String = child_uuid.chars().take(8).collect();
+                // Edit semantics are REPLACE even on this last-resort
+                // rung: the parent's continuation past the edited turn is
+                // semantically dead, so stop its live wrapper and retire
+                // the lineage to the child BEFORE activation — leaving
+                // both branches alive is how the 2026-07-27 duplicate
+                // orchestrators happened. The explicit fork verb
+                // (`fork_session_at_anchor`) deliberately does neither.
+                if let Some(live) = self
+                    .live_external_wrapper_for(
+                        "claude-code",
+                        &[&session_token, &resolved_backend_id],
+                    )
+                    .await
+                {
+                    if let Some(stopped) = self
+                        .stop_managed_session(Some(live), super::CLAUDE_EDIT_SUPERSEDED_STOP_REASON)
+                        .await
+                    {
+                        self.wait_for_stopped_session(stopped).await;
+                    }
+                }
+                if let Err(error) = crate::external_wrapper_index::record_lineage_retired(
+                    &self.logs_home(),
+                    "claude-code",
+                    &resolved_backend_id,
+                    &child_uuid,
+                ) {
+                    self.warn(&format!(
+                        "could not retire claude-code lineage {} to its edit branch {}: {}",
+                        short_session(&resolved_backend_id),
+                        child_short,
+                        error
+                    ));
+                }
                 self.announce_claude_fork(
                     "claude-code",
                     resolved_backend_id,

@@ -33,6 +33,12 @@ use super::*;
 /// handling treats it as a user-requested stop (`external_mode.rs`).
 pub(crate) const CLAUDE_EDIT_INPLACE_STOP_REASON: &str = "rewinding in place for an edited message";
 
+/// Stop reason the FORK rung uses on the parent it replaces: edit
+/// semantics are replace even on the last-resort rung, so the parent
+/// wrapper stops and the lineage retires to the child instead of
+/// staying alive beside it (RC1 of the 2026-07-27 incident).
+pub(crate) const CLAUDE_EDIT_SUPERSEDED_STOP_REASON: &str = "superseded by an edit branch";
+
 /// How long the ladder listens for the wire rung's outcome before
 /// reaping the listener task. NOT a fallback trigger: a queued edit on
 /// a parked wrapper may legitimately take hours, and racing surgery

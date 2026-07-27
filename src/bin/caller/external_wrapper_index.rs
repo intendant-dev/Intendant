@@ -136,6 +136,26 @@ pub struct ExternalWrapperRecord {
     /// migrate (Codex `sessions/` → `archived_sessions/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_path: Option<String>,
+    /// Durable owner-stop tombstone (unix seconds), written by
+    /// [`record_user_stop`] on every row of the lineage's group. While
+    /// set, [`admit`] refuses automatic revival lanes (`Resume`); only a
+    /// deliberate gesture (`Restart` / `Revive`) clears it. Survives
+    /// daemon restarts by construction — it lives in this file. (An
+    /// OLDER binary rewriting the index drops unknown fields, which
+    /// degrades the tombstone to the pre-PR in-memory behavior; the
+    /// newer daemon is the only writer in a normal deployment.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by_user_at_secs: Option<u64>,
+    /// The backend session id this lineage was REPLACED by (an
+    /// edit-branch child), written by [`record_lineage_retired`] on
+    /// every row of the group. While set, [`admit`] refuses
+    /// `Resume`/`Restart`/`Revive` with the successor so a retired
+    /// parent is never stood back up beside its replacement — the
+    /// 2026-07-27 duplicate-orchestrator shape. Explicit anchor forks
+    /// (`ForkChild`) stay allowed: branching a retired lineage is
+    /// legitimate history use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_successor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -374,6 +394,8 @@ pub fn upsert(
             updated_at_secs,
             state: WrapperState::Active,
             rollout_path: None,
+            stopped_by_user_at_secs: None,
+            retired_successor: None,
         });
     }
 
@@ -501,6 +523,8 @@ pub fn backfill(
             updated_at_secs,
             state: WrapperState::Active,
             rollout_path: None,
+            stopped_by_user_at_secs: None,
+            retired_successor: None,
         });
     } else {
         // Some row already holds this backend session, or this wrapper is
@@ -515,6 +539,8 @@ pub fn backfill(
             updated_at_secs: 0,
             state: WrapperState::Superseded,
             rollout_path: None,
+            stopped_by_user_at_secs: None,
+            retired_successor: None,
         });
     }
 
@@ -746,6 +772,284 @@ pub fn wrappers_for(
     });
     records.sort_by(wrapper_preference);
     records
+}
+
+/// What a caller is trying to do to a backend lineage, for [`admit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrapperLineageIntent {
+    /// An automatic lane: frontend auto-attach escalations, follow-up
+    /// driven attaches. Refused on stopped AND retired lineages.
+    Resume,
+    /// The owner's Restart gesture: supersedes a live wrapper and
+    /// revives a stopped lineage, but never a retired one.
+    Restart,
+    /// Explicit anchor forks: a NEW backend id is born, so lineage
+    /// tombstones on the parent never apply.
+    ForkChild,
+    /// A deliberate resume (dashboard Attach, `ctl session resume`, the
+    /// edit ladder's same-id surgery resume): revives a stopped
+    /// lineage, refuses a retired one.
+    Revive,
+}
+
+/// The admission verdict for spawning a wrapper on a backend lineage.
+#[derive(Debug)]
+pub enum WrapperAdmission {
+    /// Spawn. Hold the reservation (when one is issued) until the new
+    /// wrapper is registered; dropping it releases the lineage.
+    Admitted(Option<WrapperLaunchReservation>),
+    /// A live wrapper already serves this lineage — deliver the intent
+    /// (attach ack / task as follow-up) to it instead of spawning.
+    RouteToLive { wrapper_session_id: String },
+    /// Another launch for this lineage is in flight; spawning a second
+    /// wrapper would recreate the duplicate-orchestrator shape.
+    AlreadyLaunching,
+    /// The owner stopped this lineage; only a deliberate gesture
+    /// revives it.
+    RefusedStopped { stopped_at_secs: u64 },
+    /// The lineage was replaced by an edit-branch child; continue there.
+    RefusedRetired { successor: String },
+}
+
+/// In-flight launch reservations per `(source, backend_session_id)` —
+/// the in-memory half of admission (launches die with the daemon, so
+/// this is deliberately not persisted). Guarded by [`INDEX_LOCK`] like
+/// every other admission read/write.
+static LAUNCH_RESERVATIONS: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+static RESERVATION_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn launch_reservations() -> &'static Mutex<HashMap<(String, String), u64>> {
+    LAUNCH_RESERVATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// RAII hold on a lineage's launch slot. Dropped when the launch body
+/// finishes (the new wrapper is registered by then) or fails — either
+/// way the lineage becomes admittable again.
+#[derive(Debug)]
+pub struct WrapperLaunchReservation {
+    source: String,
+    backend_session_id: String,
+    nonce: u64,
+}
+
+impl Drop for WrapperLaunchReservation {
+    fn drop(&mut self) {
+        let mut reservations = launch_reservations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (self.source.clone(), self.backend_session_id.clone());
+        if reservations.get(&key) == Some(&self.nonce) {
+            reservations.remove(&key);
+        }
+    }
+}
+
+/// CAS admission for standing up a wrapper on `(source,
+/// backend_session_id)` — the single gate every external spawn lane
+/// (resume, restart, revive, edit-surgery resume) consults before
+/// creating another wrapper, under the same lock the index writes hold.
+/// `live_wrapper_session_id` is the caller-resolved live wrapper for
+/// the lineage (supervisor entry with an OPEN follow-up channel —
+/// liveness, never phase: a "done"-phase wrapper still serving
+/// follow-ups is live).
+///
+/// Ordering: durable refusals (stopped / retired) first, then routing
+/// to the live wrapper, then the in-flight-launch reservation. A
+/// `Restart` supersedes a live wrapper instead of routing to it — the
+/// caller stops it while holding the returned reservation, which is
+/// what makes restart-vs-restart (and restart-vs-resume) races
+/// single-winner.
+pub fn admit(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    intent: WrapperLineageIntent,
+    live_wrapper_session_id: Option<&str>,
+) -> Result<WrapperAdmission, String> {
+    let source = crate::session_names::normalize_source(source);
+    let backend_session_id = backend_session_id.trim().to_string();
+    if source.is_empty() || backend_session_id.is_empty() {
+        return Ok(WrapperAdmission::Admitted(None));
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if intent != WrapperLineageIntent::ForkChild {
+        let (stopped_at, successor) = with_index_unlocked(home, |index| {
+            let rows = index.wrappers.iter().filter(|record| {
+                record.source == source && record.backend_session_id == backend_session_id
+            });
+            let mut stopped_at: Option<u64> = None;
+            let mut successor: Option<String> = None;
+            for record in rows {
+                stopped_at = stopped_at.max(record.stopped_by_user_at_secs);
+                if successor.is_none() {
+                    successor = record.retired_successor.clone();
+                }
+            }
+            (stopped_at, successor)
+        });
+        if let Some(successor) = successor {
+            return Ok(WrapperAdmission::RefusedRetired { successor });
+        }
+        if let Some(stopped_at_secs) = stopped_at {
+            match intent {
+                WrapperLineageIntent::Resume => {
+                    return Ok(WrapperAdmission::RefusedStopped { stopped_at_secs });
+                }
+                WrapperLineageIntent::Restart | WrapperLineageIntent::Revive => {
+                    // The deliberate gesture clears the tombstone.
+                    let mut index = with_index_unlocked(home, |index| index.clone());
+                    for record in index.wrappers.iter_mut().filter(|record| {
+                        record.source == source && record.backend_session_id == backend_session_id
+                    }) {
+                        record.stopped_by_user_at_secs = None;
+                    }
+                    write_index_unlocked(home, &index)?;
+                    note_index_written(home, &index);
+                }
+                WrapperLineageIntent::ForkChild => unreachable!("guarded above"),
+            }
+        }
+    }
+
+    if let Some(live) = live_wrapper_session_id
+        .map(str::trim)
+        .filter(|live| !live.is_empty())
+    {
+        match intent {
+            WrapperLineageIntent::Resume | WrapperLineageIntent::Revive => {
+                return Ok(WrapperAdmission::RouteToLive {
+                    wrapper_session_id: live.to_string(),
+                });
+            }
+            // Restart supersedes; ForkChild never attaches to its parent.
+            WrapperLineageIntent::Restart | WrapperLineageIntent::ForkChild => {}
+        }
+    }
+
+    if intent == WrapperLineageIntent::ForkChild {
+        // The fork's own identity is a fresh backend id announced later;
+        // it never contends for the parent lineage's launch slot.
+        return Ok(WrapperAdmission::Admitted(None));
+    }
+
+    let mut reservations = launch_reservations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (source.clone(), backend_session_id.clone());
+    if reservations.contains_key(&key) {
+        return Ok(WrapperAdmission::AlreadyLaunching);
+    }
+    let nonce = RESERVATION_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    reservations.insert(key, nonce);
+    Ok(WrapperAdmission::Admitted(Some(WrapperLaunchReservation {
+        source,
+        backend_session_id,
+        nonce,
+    })))
+}
+
+/// Read-only tombstone probe for a lineage:
+/// `(stopped_by_user_at_secs, retired_successor)`. For callers that
+/// must decide BEFORE side effects (a restart refuses a retired lineage
+/// before stopping anything) — [`admit`] stays the authoritative gate.
+pub fn lineage_tombstones(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+) -> (Option<u64>, Option<String>) {
+    let source = crate::session_names::normalize_source(source);
+    let backend_session_id = backend_session_id.trim();
+    if source.is_empty() || backend_session_id.is_empty() {
+        return (None, None);
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    with_index_unlocked(home, |index| {
+        let mut stopped_at: Option<u64> = None;
+        let mut successor: Option<String> = None;
+        for record in index.wrappers.iter().filter(|record| {
+            record.source == source && record.backend_session_id == backend_session_id
+        }) {
+            stopped_at = stopped_at.max(record.stopped_by_user_at_secs);
+            if successor.is_none() {
+                successor = record.retired_successor.clone();
+            }
+        }
+        (stopped_at, successor)
+    })
+}
+
+/// Durable owner-stop tombstone for a lineage: every group row gets the
+/// stamp so the fact survives any single row's pruning. No-op for a
+/// lineage the index has never seen (a stop before identity commit
+/// leaves nothing durable to revive either).
+pub fn record_user_stop(home: &Path, source: &str, backend_session_id: &str) -> Result<(), String> {
+    stamp_group(home, source, backend_session_id, |record| {
+        record.stopped_by_user_at_secs = Some(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+    })
+}
+
+/// Durable retirement of a lineage replaced by an edit-branch child.
+pub fn record_lineage_retired(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    successor_backend_session_id: &str,
+) -> Result<(), String> {
+    let successor = successor_backend_session_id.trim().to_string();
+    if successor.is_empty() {
+        return Ok(());
+    }
+    stamp_group(home, source, backend_session_id, move |record| {
+        record.retired_successor = Some(successor.clone());
+    })
+}
+
+fn stamp_group(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    stamp: impl Fn(&mut ExternalWrapperRecord),
+) -> Result<(), String> {
+    let source = crate::session_names::normalize_source(source);
+    let backend_session_id = backend_session_id.trim();
+    if source.is_empty() || backend_session_id.is_empty() {
+        return Ok(());
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let any = with_index_unlocked(home, |index| {
+        index.wrappers.iter().any(|record| {
+            record.source == source && record.backend_session_id == backend_session_id
+        })
+    });
+    if !any {
+        return Ok(());
+    }
+    let mut index = with_index_unlocked(home, |index| index.clone());
+    for record in index
+        .wrappers
+        .iter_mut()
+        .filter(|record| record.source == source && record.backend_session_id == backend_session_id)
+    {
+        stamp(record);
+    }
+    write_index_unlocked(home, &index)?;
+    note_index_written(home, &index);
+    Ok(())
 }
 
 /// Resolve an arbitrary wrapper session id — active OR superseded — to its
@@ -1822,5 +2126,315 @@ mod tests {
             resolved_rollout_path(home.path(), "codex", backend_id, |_| true),
             None
         );
+    }
+
+    fn admission_home_with_wrapper(
+        wrapper_id: &str,
+        backend_id: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let log_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        upsert(
+            home.path(),
+            "claude-code",
+            backend_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+        (home, log_dir)
+    }
+
+    fn active_rows_per_group(home: &Path) -> HashMap<(String, String), usize> {
+        let _guard = INDEX_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        with_index_unlocked(home, |index| {
+            let mut map: HashMap<(String, String), usize> = HashMap::new();
+            for record in &index.wrappers {
+                if record.state == WrapperState::Active {
+                    *map.entry((record.source.clone(), record.backend_session_id.clone()))
+                        .or_default() += 1;
+                }
+            }
+            map
+        })
+    }
+
+    /// The commission's pin: however upserts, backfills, and admissions
+    /// interleave, no `(source, backend_session_id)` group ever holds two
+    /// Active rows — that is the on-disk half of "one live wrapper per
+    /// backend lineage".
+    #[test]
+    fn wrapper_index_never_holds_two_active_entries_for_one_backend_group() {
+        let home = tempfile::tempdir().unwrap();
+        let backend_a = "5d000000-0000-4000-8000-00000000000a";
+        let backend_b = "5d000000-0000-4000-8000-00000000000b";
+        let wrappers = [
+            "aaaa0000-0000-4000-8000-000000000001",
+            "aaaa0000-0000-4000-8000-000000000002",
+            "aaaa0000-0000-4000-8000-000000000003",
+        ];
+        let dir_for = |wrapper: &str| {
+            let dir = home.path().join(".intendant").join("logs").join(wrapper);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // Interleave activating upserts (identity commits), scan-shaped
+        // backfills, admissions with reservations, and cross-group
+        // wrapper reuse (a wrapper restarting onto another backend id).
+        let ops: Vec<Box<dyn Fn(&Path)>> = vec![
+            Box::new(move |h| {
+                upsert(
+                    h,
+                    "claude-code",
+                    backend_a,
+                    wrappers[0],
+                    &dir_for(wrappers[0]),
+                    None,
+                )
+                .unwrap();
+            }),
+            Box::new(move |h| {
+                backfill(
+                    h,
+                    "claude-code",
+                    backend_a,
+                    wrappers[1],
+                    &dir_for(wrappers[1]),
+                    None,
+                )
+                .unwrap();
+            }),
+            Box::new(move |h| {
+                let admission = admit(
+                    h,
+                    "claude-code",
+                    backend_a,
+                    WrapperLineageIntent::Restart,
+                    None,
+                )
+                .unwrap();
+                assert!(matches!(admission, WrapperAdmission::Admitted(_)));
+            }),
+            Box::new(move |h| {
+                upsert(
+                    h,
+                    "claude-code",
+                    backend_a,
+                    wrappers[1],
+                    &dir_for(wrappers[1]),
+                    None,
+                )
+                .unwrap();
+            }),
+            Box::new(move |h| {
+                upsert(
+                    h,
+                    "claude-code",
+                    backend_b,
+                    wrappers[1],
+                    &dir_for(wrappers[1]),
+                    None,
+                )
+                .unwrap();
+            }),
+            Box::new(move |h| {
+                backfill(
+                    h,
+                    "claude-code",
+                    backend_b,
+                    wrappers[2],
+                    &dir_for(wrappers[2]),
+                    None,
+                )
+                .unwrap();
+            }),
+            Box::new(move |h| {
+                upsert(
+                    h,
+                    "claude-code",
+                    backend_a,
+                    wrappers[2],
+                    &dir_for(wrappers[2]),
+                    None,
+                )
+                .unwrap();
+            }),
+        ];
+        for (step, op) in ops.iter().enumerate() {
+            op(home.path());
+            for (group, active) in active_rows_per_group(home.path()) {
+                assert!(
+                    active <= 1,
+                    "step {step}: group {group:?} holds {active} active rows"
+                );
+            }
+        }
+    }
+
+    /// The commission's pin: an owner stop is durable across a daemon
+    /// restart — the tombstone lives in the index FILE, and admission
+    /// refuses the automatic revival lane while it stands. A deliberate
+    /// Restart clears it.
+    #[test]
+    fn stop_tombstone_survives_daemon_restart() {
+        let backend_id = "5d100000-0000-4000-8000-000000000001";
+        let wrapper_id = "bbbb0000-0000-4000-8000-000000000001";
+        let (home, _log_dir) = admission_home_with_wrapper(wrapper_id, backend_id);
+
+        record_user_stop(home.path(), "claude-code", backend_id).unwrap();
+
+        // The tombstone is ON DISK (what a daemon restart re-reads), not
+        // only in this process's cache.
+        let raw = std::fs::read_to_string(index_path(home.path())).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            disk["wrappers"][0]["stopped_by_user_at_secs"]
+                .as_u64()
+                .is_some(),
+            "{disk}"
+        );
+
+        // The automatic lane is refused…
+        match admit(
+            home.path(),
+            "claude-code",
+            backend_id,
+            WrapperLineageIntent::Resume,
+            None,
+        )
+        .unwrap()
+        {
+            WrapperAdmission::RefusedStopped { stopped_at_secs } => {
+                assert!(stopped_at_secs > 0);
+            }
+            other => panic!("expected RefusedStopped, got {other:?}"),
+        }
+        // …until the owner's deliberate gesture revives the lineage.
+        let admission = admit(
+            home.path(),
+            "claude-code",
+            backend_id,
+            WrapperLineageIntent::Restart,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(admission, WrapperAdmission::Admitted(Some(_))));
+        let raw = std::fs::read_to_string(index_path(home.path())).unwrap();
+        assert!(
+            !raw.contains("stopped_by_user_at_secs"),
+            "tombstone must clear"
+        );
+    }
+
+    #[test]
+    fn admission_routes_resumes_to_live_wrappers_and_serializes_launches() {
+        let backend_id = "5d200000-0000-4000-8000-000000000001";
+        let wrapper_id = "cccc0000-0000-4000-8000-000000000001";
+        let (home, _log_dir) = admission_home_with_wrapper(wrapper_id, backend_id);
+
+        // A live wrapper absorbs resumes and revives instead of spawning.
+        match admit(
+            home.path(),
+            "claude-code",
+            backend_id,
+            WrapperLineageIntent::Resume,
+            Some(wrapper_id),
+        )
+        .unwrap()
+        {
+            WrapperAdmission::RouteToLive { wrapper_session_id } => {
+                assert_eq!(wrapper_session_id, wrapper_id);
+            }
+            other => panic!("expected RouteToLive, got {other:?}"),
+        }
+
+        // Restart supersedes the live wrapper: it takes the launch slot.
+        let first = admit(
+            home.path(),
+            "claude-code",
+            backend_id,
+            WrapperLineageIntent::Restart,
+            Some(wrapper_id),
+        )
+        .unwrap();
+        let WrapperAdmission::Admitted(Some(reservation)) = first else {
+            panic!("expected a reserved admission, got {first:?}");
+        };
+        // A second restart (or a resume) while the launch is in flight
+        // must not mint a second wrapper.
+        assert!(matches!(
+            admit(
+                home.path(),
+                "claude-code",
+                backend_id,
+                WrapperLineageIntent::Restart,
+                None
+            )
+            .unwrap(),
+            WrapperAdmission::AlreadyLaunching
+        ));
+        assert!(matches!(
+            admit(
+                home.path(),
+                "claude-code",
+                backend_id,
+                WrapperLineageIntent::Revive,
+                None
+            )
+            .unwrap(),
+            WrapperAdmission::AlreadyLaunching
+        ));
+        drop(reservation);
+        assert!(matches!(
+            admit(
+                home.path(),
+                "claude-code",
+                backend_id,
+                WrapperLineageIntent::Revive,
+                None
+            )
+            .unwrap(),
+            WrapperAdmission::Admitted(Some(_))
+        ));
+    }
+
+    #[test]
+    fn retired_lineage_refuses_revival_but_allows_explicit_forks() {
+        let backend_id = "5d300000-0000-4000-8000-000000000001";
+        let successor = "5d300000-0000-4000-8000-000000000002";
+        let wrapper_id = "dddd0000-0000-4000-8000-000000000001";
+        let (home, _log_dir) = admission_home_with_wrapper(wrapper_id, backend_id);
+
+        record_lineage_retired(home.path(), "claude-code", backend_id, successor).unwrap();
+
+        for intent in [
+            WrapperLineageIntent::Resume,
+            WrapperLineageIntent::Restart,
+            WrapperLineageIntent::Revive,
+        ] {
+            match admit(home.path(), "claude-code", backend_id, intent, None).unwrap() {
+                WrapperAdmission::RefusedRetired { successor: got } => {
+                    assert_eq!(got, successor, "{intent:?}");
+                }
+                other => panic!("{intent:?}: expected RefusedRetired, got {other:?}"),
+            }
+        }
+        // Branching a retired lineage stays legitimate.
+        assert!(matches!(
+            admit(
+                home.path(),
+                "claude-code",
+                backend_id,
+                WrapperLineageIntent::ForkChild,
+                None
+            )
+            .unwrap(),
+            WrapperAdmission::Admitted(None)
+        ));
     }
 }

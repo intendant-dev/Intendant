@@ -934,6 +934,137 @@ impl SessionSupervisor {
             }
         };
 
+        // Lineage admission (external only): ONE live wrapper per backend
+        // lineage. Stopped/retired tombstones refuse the automatic lanes,
+        // resumes route to the live wrapper (liveness = open channel,
+        // never phase), and the launch reservation makes concurrent
+        // restart/resume races single-winner. The reservation is held
+        // until this call returns — the new wrapper is registered inside
+        // `spawn_agent_session` before then.
+        let mut _lineage_reservation: Option<
+            crate::external_wrapper_index::WrapperLaunchReservation,
+        > = None;
+        if external_backend.is_some() {
+            use crate::external_wrapper_index::{
+                admit, WrapperAdmission as Admission, WrapperLineageIntent as Intent,
+            };
+            let intent = if fork {
+                Intent::ForkChild
+            } else if force_new {
+                Intent::Restart
+            } else if auto_attach {
+                Intent::Resume
+            } else {
+                Intent::Revive
+            };
+            if let Some(backend_group_id) =
+                self.external_lineage_backend_id(&source_norm, &session_id, &resume_token)
+            {
+                let mut live = self
+                    .live_external_wrapper_for(
+                        &source_norm,
+                        &[&session_id, &resume_token, &backend_group_id],
+                    )
+                    .await;
+                if live.is_none() {
+                    // The lineage's indexed active wrapper may carry an id
+                    // the request never named.
+                    if let Some(indexed) = crate::external_wrapper_index::active_wrapper_for(
+                        &self.logs_home(),
+                        &source_norm,
+                        &backend_group_id,
+                    ) {
+                        live = self
+                            .live_external_wrapper_for(
+                                &source_norm,
+                                &[&indexed.intendant_session_id],
+                            )
+                            .await;
+                    }
+                }
+                match admit(
+                    &self.logs_home(),
+                    &source_norm,
+                    &backend_group_id,
+                    intent,
+                    live.as_deref(),
+                ) {
+                    Ok(Admission::Admitted(reservation)) => {
+                        _lineage_reservation = reservation;
+                    }
+                    Ok(Admission::RouteToLive { wrapper_session_id }) => {
+                        if let Some(task) = resume_task {
+                            self.route_follow_up(
+                                Some(wrapper_session_id),
+                                task,
+                                direct,
+                                attachments,
+                                None,
+                            )
+                            .await;
+                        } else {
+                            {
+                                let mut state = self.state.lock().await;
+                                state.active_session_id = Some(wrapper_session_id);
+                            }
+                            self.emit_attached_status(&resume_token, &source_norm).await;
+                            self.config.bus.send(AppEvent::SessionAttached {
+                                session_id: resume_token.clone(),
+                                source: source_norm.clone(),
+                            });
+                        }
+                        return;
+                    }
+                    Ok(Admission::AlreadyLaunching) => {
+                        let message = format!(
+                            "{} session {} is already starting — not spawning a second wrapper",
+                            source_norm,
+                            short_session(&backend_group_id)
+                        );
+                        self.warn(&message);
+                        self.ack_targeted_action_noop(&resume_token, &message);
+                        return;
+                    }
+                    Ok(Admission::RefusedStopped { stopped_at_secs }) => {
+                        let age_minutes = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|now| now.as_secs().saturating_sub(stopped_at_secs) / 60)
+                            .unwrap_or(0);
+                        let message = format!(
+                            "{} session {} was stopped by you {} minute(s) ago — automatic revival is off; use Restart (or resume it deliberately) to revive it",
+                            source_norm,
+                            short_session(&backend_group_id),
+                            age_minutes
+                        );
+                        self.warn(&message);
+                        self.ack_targeted_action_noop(&resume_token, &message);
+                        return;
+                    }
+                    Ok(Admission::RefusedRetired { successor }) => {
+                        let message = format!(
+                            "{} session {} was replaced by an edit branch — continue in {} instead",
+                            source_norm,
+                            short_session(&backend_group_id),
+                            short_session(&successor)
+                        );
+                        self.warn(&message);
+                        self.ack_targeted_action_noop(&resume_token, &message);
+                        return;
+                    }
+                    Err(error) => {
+                        // A broken index must not brick resumes; say so
+                        // loudly and proceed unguarded.
+                        self.warn(&format!(
+                            "wrapper-index admission unavailable for {} session {}: {} — proceeding without the lineage gate",
+                            source_norm,
+                            short_session(&backend_group_id),
+                            error
+                        ));
+                    }
+                }
+            }
+        }
+
         if resume_task.is_none() {
             if let Some(existing_id) = self
                 .find_managed_session_id(&source_norm, &session_id, &resume_token)
@@ -1298,6 +1429,83 @@ impl SessionSupervisor {
                             .map(|_| resolved)
                     })
             })
+    }
+
+    /// The LIVE wrapper for an external lineage: a supervisor entry with
+    /// an OPEN follow-up channel — liveness, never phase. This is the
+    /// admission-side twin of [`Self::find_managed_session_id`], which
+    /// keeps its phase filter for input-delivery decisions: a wrapper
+    /// whose phase says "done" but which still holds its channel is
+    /// alive (it serves follow-ups and must be stoppable/supersedable),
+    /// and conflating the two is how the 2026-07-27 incident's restarts
+    /// minted duplicate wrappers.
+    pub(crate) async fn live_external_wrapper_for(
+        &self,
+        source: &str,
+        candidate_ids: &[&str],
+    ) -> Option<String> {
+        let state = self.state.lock().await;
+        let live = |session: &ManagedSession| {
+            session.source == source && !session.follow_up_tx.is_closed()
+        };
+        state
+            .sessions
+            .values()
+            .find(|session| live(session) && candidate_ids.contains(&session.session_id.as_str()))
+            .map(|session| session.session_id.clone())
+            .or_else(|| {
+                candidate_ids.iter().find_map(|candidate| {
+                    let resolved = state.resolve_session_id(candidate)?;
+                    state
+                        .sessions
+                        .get(&resolved)
+                        .filter(|session| live(session))
+                        .map(|_| resolved)
+                })
+            })
+    }
+
+    /// Resolve the backend lineage group id an external resume/restart
+    /// addresses, for [`crate::external_wrapper_index::admit`]: the
+    /// wrapper index first (works for wrapper ids and backend ids
+    /// alike), then persisted identity, then the token itself when it is
+    /// already a canonical backend id for the source. `None` means the
+    /// lineage has no resolvable group (a fresh backend id the store has
+    /// never seen) — admission is skipped, exactly like today.
+    pub(crate) fn external_lineage_backend_id(
+        &self,
+        source: &str,
+        session_id: &str,
+        resume_token: &str,
+    ) -> Option<String> {
+        let home = self.logs_home();
+        for candidate in [resume_token, session_id] {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some((indexed_source, backend_id)) =
+                crate::external_wrapper_index::conversation_for_wrapper(&home, candidate)
+            {
+                if indexed_source == source {
+                    return Some(backend_id);
+                }
+            }
+            if !crate::external_wrapper_index::wrappers_for(&home, source, candidate).is_empty() {
+                return Some(candidate.to_string());
+            }
+            if let Some((persisted_source, backend_id)) =
+                persisted_external_identity_for_session_in_home(&home, candidate)
+            {
+                if persisted_source == source {
+                    return Some(backend_id);
+                }
+            }
+            if crate::external_agent::source_session_id_is_canonical(source, candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+        None
     }
 }
 
