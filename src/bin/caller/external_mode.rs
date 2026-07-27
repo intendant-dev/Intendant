@@ -1806,6 +1806,7 @@ pub(crate) async fn run_external_agent_mode(
         let edit_user_turn_index = followup.edit_user_turn_index;
         let edit_user_turn_revision = followup.edit_user_turn_revision;
         let edit_original_text = followup.edit_original_text;
+        let claude_inplace_rewind_targets = followup.claude_inplace_rewind_targets;
         let unresolved_attachment_ids = followup.unresolved_attachment_ids;
         let target_session_id = followup.target_session_id.clone();
         let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
@@ -2126,6 +2127,9 @@ pub(crate) async fn run_external_agent_mode(
                                 edit_original_text: edit_original_text.clone(),
                                 unresolved_attachment_ids: unresolved_attachment_ids.clone(),
                                 target_session_id: target_session_id.clone(),
+                                // Codex managed-context lane: never a
+                                // claude in-place edit.
+                                claude_inplace_rewind_targets: Vec::new(),
                                 managed_context_recovery_kickstart: false,
                                 managed_context_density_handoff: false,
                                 managed_context_density_handoff_completed: false,
@@ -2202,6 +2206,9 @@ pub(crate) async fn run_external_agent_mode(
                                 edit_original_text: edit_original_text.clone(),
                                 unresolved_attachment_ids: unresolved_attachment_ids.clone(),
                                 target_session_id: target_session_id.clone(),
+                                // Codex managed-context lane: never a
+                                // claude in-place edit.
+                                claude_inplace_rewind_targets: Vec::new(),
                                 managed_context_recovery_kickstart: false,
                                 managed_context_density_handoff: false,
                                 managed_context_density_handoff_completed: false,
@@ -2258,7 +2265,82 @@ pub(crate) async fn run_external_agent_mode(
         }
 
         let mut replacement_for_user_turn_index = None;
-        if let Some(user_turn_index) = edit_user_turn_index {
+        // Claude Code in-place edit: transcript-addressed (the supervisor
+        // resolved the uuid walk-back list), so it never consults the
+        // index-addressed `supports_user_message_rewind` protocol below.
+        // Refusals hand the edit BACK to the supervisor's ladder via the
+        // `rewind-unavailable` status — this arm must never service a
+        // refused edit itself, or two rungs would both run it.
+        let claude_inplace_edit = edit_user_turn_index.is_some()
+            && backend == external_agent::AgentBackend::ClaudeCode
+            && !claude_inplace_rewind_targets.is_empty();
+        if claude_inplace_edit {
+            let user_turn_index = edit_user_turn_index.unwrap_or_default();
+            bus.send(AppEvent::UserMessageEditStatus {
+                session_id: live_session_id.clone(),
+                user_turn_index,
+                status: "running".to_string(),
+                message: "rewinding this session in place — the edited prompt continues here"
+                    .to_string(),
+            });
+            let mut rewind_refusal: Option<String> = None;
+            for target_uuid in &claude_inplace_rewind_targets {
+                match agent
+                    .rewind_conversation_to_message(target_uuid, true)
+                    .await
+                {
+                    Ok(outcome) if outcome.rewound => {}
+                    Ok(outcome) => {
+                        rewind_refusal = Some(outcome.detail.unwrap_or_else(|| {
+                            "the CLI refused the rewind without a reason".to_string()
+                        }));
+                        break;
+                    }
+                    Err(err) => {
+                        rewind_refusal = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = rewind_refusal {
+                let message = format!("in-place rewind unavailable: {reason}");
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::UserMessageEditStatus {
+                    session_id: live_session_id.clone(),
+                    user_turn_index,
+                    status: "rewind-unavailable".to_string(),
+                    message,
+                });
+                continue;
+            }
+            let turns_removed = claude_inplace_rewind_targets.len() as u32;
+            // Supervision-run turn bookkeeping is best-effort here: the
+            // transcript is truth after a rewind, and resumes re-seed
+            // from it; an out-of-range index only means this run's
+            // counter drift stays cosmetic.
+            if user_turn_index >= 1 && user_turn_index <= user_turn_revisions.active_count() {
+                user_turn_revisions.rewind_from_turn(user_turn_index);
+                round = user_turn_index.saturating_sub(1) as usize;
+            }
+            replacement_for_user_turn_index = Some(user_turn_index);
+            let message = format!(
+                "Rewound {} conversation turn{} in place; the edited prompt continues in this session",
+                turns_removed,
+                if turns_removed == 1 { "" } else { "s" }
+            );
+            slog(&session_log, |l| l.info(&message));
+            bus.send(AppEvent::UserMessageRewind {
+                session_id: live_session_id.clone(),
+                user_turn_index,
+                turns_removed,
+            });
+            bus.send(AppEvent::UserMessageEditStatus {
+                session_id: live_session_id.clone(),
+                user_turn_index,
+                status: "ok".to_string(),
+                message,
+            });
+        } else if let Some(user_turn_index) = edit_user_turn_index {
             bus.send(AppEvent::UserMessageEditStatus {
                 session_id: live_session_id.clone(),
                 user_turn_index,
@@ -3781,7 +3863,8 @@ pub(crate) async fn run_external_agent_mode(
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
                 let user_requested_stop =
-                    matches!(reason.as_str(), "stopped by user" | "restarting session");
+                    matches!(reason.as_str(), "stopped by user" | "restarting session")
+                        || reason == crate::session_supervisor::CLAUDE_EDIT_INPLACE_STOP_REASON;
                 if codex_managed_context_enabled && !user_requested_stop {
                     match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
