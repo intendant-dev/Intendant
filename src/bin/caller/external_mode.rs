@@ -3864,7 +3864,8 @@ pub(crate) async fn run_external_agent_mode(
                 stats.rounds = round;
                 let user_requested_stop =
                     matches!(reason.as_str(), "stopped by user" | "restarting session")
-                        || reason == crate::session_supervisor::CLAUDE_EDIT_INPLACE_STOP_REASON;
+                        || reason == crate::session_supervisor::CLAUDE_EDIT_INPLACE_STOP_REASON
+                        || reason == crate::session_supervisor::CLAUDE_EDIT_SUPERSEDED_STOP_REASON;
                 if codex_managed_context_enabled && !user_requested_stop {
                     match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {

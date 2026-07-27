@@ -778,7 +778,7 @@ impl SessionSupervisor {
     /// render in that session's window through the ordinary log lane, so a
     /// targeted user action never evaporates silently (`route_interrupt`'s
     /// `Interrupted` ack is the twin of this pattern).
-    fn ack_targeted_action_noop(&self, session_id: &str, content: &str) {
+    pub(crate) fn ack_targeted_action_noop(&self, session_id: &str, content: &str) {
         self.config.bus.send(AppEvent::LogEntry {
             session_id: Some(session_id.to_string()),
             level: "warn".to_string(),
@@ -911,6 +911,30 @@ impl SessionSupervisor {
             self.ack_targeted_action_noop(&target_id, "Session already ended — nothing to stop.");
             return None;
         };
+        // An owner stop is TERMINAL for the lineage: write the durable
+        // tombstone (it survives daemon restarts) so no automatic lane —
+        // auto-attach escalation, follow-up-driven resume — stands the
+        // lineage back up. Only the owner's deliberate Restart/resume
+        // revives it (`external_wrapper_index::admit`). In-memory halt
+        // marks stay as the fast secondary for pre-identity sessions.
+        if reason == "stopped by user" && session.source != "intendant" {
+            if let Some(backend_group_id) =
+                self.external_lineage_backend_id(&session.source, &canonical, &canonical)
+            {
+                if let Err(error) = crate::external_wrapper_index::record_user_stop(
+                    &self.logs_home(),
+                    &session.source,
+                    &backend_group_id,
+                ) {
+                    self.warn(&format!(
+                        "could not record the stop tombstone for {} session {}: {}",
+                        session.source,
+                        short_session(&backend_group_id),
+                        error
+                    ));
+                }
+            }
+        }
         self.config.bus.send(AppEvent::SessionStopRequested {
             session_id: Some(canonical.clone()),
             reason: reason.to_string(),
@@ -965,20 +989,37 @@ impl SessionSupervisor {
             return;
         }
         let resume_token = resume_id.clone().unwrap_or_else(|| session_id.clone());
-        let restart_key = format!("{}:{}", source_norm, resume_token);
+        // A retired lineage (replaced by an edit branch) refuses the
+        // restart BEFORE anything is stopped: standing the parent back up
+        // beside its replacement is the duplicate-orchestrator shape.
+        // Concurrent-restart dedupe is the admission gate's launch
+        // reservation inside `resume_session` — the old time-window
+        // heuristic (`mark_restart_requested`) is retired.
+        if let Some(backend_group_id) =
+            self.external_lineage_backend_id(&source_norm, &session_id, &resume_token)
         {
-            let mut state = self.state.lock().await;
-            if !state.mark_restart_requested(&restart_key) {
-                drop(state);
-                self.warn(&format!(
-                    "Restart session ignored: {} was already restarted recently",
-                    short_session(&resume_token)
-                ));
+            let (_, successor) = crate::external_wrapper_index::lineage_tombstones(
+                &self.logs_home(),
+                &source_norm,
+                &backend_group_id,
+            );
+            if let Some(successor) = successor {
+                let message = format!(
+                    "{} session {} was replaced by an edit branch — continue in {} instead",
+                    source_norm,
+                    short_session(&backend_group_id),
+                    short_session(&successor)
+                );
+                self.warn(&message);
+                self.ack_targeted_action_noop(&resume_token, &message);
                 return;
             }
         }
+        // Liveness, never phase: a wrapper whose phase chip says "done"
+        // but which still holds its follow-up channel is alive and must
+        // be superseded, or the restart mints a duplicate beside it.
         if let Some(existing_id) = self
-            .find_managed_session_id(&source_norm, &session_id, &resume_token)
+            .live_external_wrapper_for(&source_norm, &[&session_id, &resume_token])
             .await
         {
             if let Some(stopped) = self
@@ -3865,5 +3906,195 @@ mod tests {
         )
         .is_none());
         assert!(edit_attach_request(None, None, None, None).is_none());
+    }
+
+    /// Hermetic lineage rig: a persisted wrapper (log dir + index row)
+    /// for a claude-code backend id under a temp home, plus a supervisor
+    /// whose persisted-session resolution reads that home.
+    fn lineage_rig(
+        backend_id: &str,
+        wrapper_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        SessionSupervisor,
+        EventBus,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let log_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "claude-code",
+            backend_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+        let bus = EventBus::new();
+        let mut config =
+            (*test_supervisor(project.path().to_path_buf(), bus.clone()).config).clone();
+        config.logs_home_override = Some(home.path().to_path_buf());
+        let supervisor = SessionSupervisor::new(config);
+        (home, project, supervisor, bus)
+    }
+
+    /// The commission's pin: a restart (or resume) aimed at a lineage
+    /// that was RETIRED to an edit-branch successor spawns nothing,
+    /// stops nothing, and answers with the successor — the parent stands
+    /// down instead of being stood back up beside its replacement.
+    #[tokio::test]
+    async fn respawn_finds_successor_and_stands_down() {
+        let backend_id = "6d000000-0000-4000-8000-000000000001";
+        let successor = "6d000000-0000-4000-8000-000000000002";
+        let wrapper_id = "eeee0000-0000-4000-8000-000000000001";
+        let (home, project, supervisor, bus) = lineage_rig(backend_id, wrapper_id);
+        crate::external_wrapper_index::record_lineage_retired(
+            home.path(),
+            "claude-code",
+            backend_id,
+            successor,
+        )
+        .unwrap();
+
+        // A live wrapper for the retired parent (the incident's shape:
+        // the parent lingered attachable). The refusal must leave it
+        // untouched — refusing means refusing, not stop-then-refuse.
+        let (tx, mut rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session(backend_id, "claude-code");
+            session.project_root = project.path().to_path_buf();
+            session.follow_up_tx = tx;
+            state.sessions.insert(backend_id.to_string(), session);
+        }
+
+        let mut bus_rx = bus.subscribe();
+        supervisor
+            .restart_session(
+                "claude-code".to_string(),
+                backend_id.to_string(),
+                Some(backend_id.to_string()),
+                None,
+                None,
+                Some(true),
+                Vec::new(),
+                LaunchOverrides::default(),
+            )
+            .await;
+
+        assert_eq!(
+            supervisor.state.lock().await.sessions.len(),
+            1,
+            "the retired lineage must not be respawned"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no delivery and no stop may reach the standing wrapper"
+        );
+        let mut saw_successor_pointer = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::LogEntry { content, .. } = event {
+                if content.contains("replaced by an edit branch")
+                    && content.contains(&successor[..8])
+                {
+                    saw_successor_pointer = true;
+                }
+            }
+        }
+        assert!(saw_successor_pointer, "the refusal must name the successor");
+    }
+
+    /// Liveness, never phase: a wrapper whose phase says "done" but
+    /// whose follow-up channel is open absorbs a task-carrying resume as
+    /// a follow-up instead of a second wrapper being spawned beside it.
+    #[tokio::test]
+    async fn resume_routes_to_live_wrapper_regardless_of_phase() {
+        let backend_id = "6d100000-0000-4000-8000-000000000001";
+        let wrapper_id = "eeee0000-0000-4000-8000-000000000011";
+        let (_home, project, supervisor, _bus) = lineage_rig(backend_id, wrapper_id);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session(backend_id, "claude-code");
+            session.project_root = project.path().to_path_buf();
+            session.phase = "done".to_string();
+            session.follow_up_tx = tx;
+            state.sessions.insert(backend_id.to_string(), session);
+        }
+
+        supervisor
+            .resume_session(
+                "claude-code".to_string(),
+                backend_id.to_string(),
+                Some(backend_id.to_string()),
+                None,
+                Some("follow this up".to_string()),
+                Some(true),
+                Vec::new(),
+                false,
+                None,
+                LaunchOverrides::default(),
+                false,
+                false,
+            )
+            .await;
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("task delivered to the done-phase live wrapper")
+            .expect("channel open");
+        assert_eq!(delivered.text, "follow this up");
+        assert_eq!(
+            supervisor.state.lock().await.sessions.len(),
+            1,
+            "no second wrapper may be spawned for a live lineage"
+        );
+    }
+
+    /// A stopped lineage's tombstone blocks the AUTOMATIC revival lane
+    /// (auto-attach escalation) with an honest answer and no spawn.
+    #[tokio::test]
+    async fn stopped_lineage_refuses_auto_attach_revival() {
+        let backend_id = "6d200000-0000-4000-8000-000000000001";
+        let wrapper_id = "eeee0000-0000-4000-8000-000000000021";
+        let (home, _project, supervisor, bus) = lineage_rig(backend_id, wrapper_id);
+        crate::external_wrapper_index::record_user_stop(home.path(), "claude-code", backend_id)
+            .unwrap();
+
+        let mut bus_rx = bus.subscribe();
+        supervisor
+            .resume_session(
+                "claude-code".to_string(),
+                backend_id.to_string(),
+                Some(backend_id.to_string()),
+                None,
+                Some("the halted prompt".to_string()),
+                Some(true),
+                Vec::new(),
+                false,
+                None,
+                LaunchOverrides::default(),
+                false,
+                true, // auto_attach: the frontend escalation lane
+            )
+            .await;
+
+        assert!(
+            supervisor.state.lock().await.sessions.is_empty(),
+            "a stopped lineage must not be auto-revived"
+        );
+        let mut saw_refusal = false;
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::LogEntry { content, .. } = event {
+                if content.contains("stopped by you") {
+                    saw_refusal = true;
+                }
+            }
+        }
+        assert!(saw_refusal, "the refusal must be reported honestly");
     }
 }

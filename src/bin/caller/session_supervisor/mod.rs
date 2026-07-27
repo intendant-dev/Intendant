@@ -23,7 +23,7 @@ pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
 mod claude_edit;
-pub(crate) use claude_edit::CLAUDE_EDIT_INPLACE_STOP_REASON;
+pub(crate) use claude_edit::{CLAUDE_EDIT_INPLACE_STOP_REASON, CLAUDE_EDIT_SUPERSEDED_STOP_REASON};
 mod dispatch;
 mod fork;
 mod registry;
@@ -130,7 +130,6 @@ impl ForegroundSupervisorHandle {
 
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bound on the peer-delegation dedup ledger (`delegation_receipts`).
 /// Entries only need to outlive the delegating side's bounded re-send
 /// window (~30 s), so a FIFO of this size is generous; the bound keeps
@@ -160,7 +159,6 @@ pub(crate) struct SupervisorState {
     related_sessions: HashMap<String, RelatedSession>,
     active_session_id: Option<String>,
     next_session_instance: u64,
-    restart_dedupe: HashMap<String, std::time::Instant>,
     external_attach_dedupe: HashMap<String, std::time::Instant>,
     /// Ids (wrapper AND native) of every external session that announced a
     /// SessionIdentity on this bus — including sessions the supervisor does
@@ -444,18 +442,6 @@ impl SupervisorState {
             return None;
         }
         self.remove_session(&canonical)
-    }
-
-    fn mark_restart_requested(&mut self, key: &str) -> bool {
-        let now = std::time::Instant::now();
-        self.restart_dedupe
-            .retain(|_, expires_at| *expires_at > now);
-        if self.restart_dedupe.contains_key(key) {
-            return false;
-        }
-        self.restart_dedupe
-            .insert(key.to_string(), now + SESSION_RESTART_DEDUPE_WINDOW);
-        true
     }
 
     fn mark_external_attach_requested(&mut self, keys: &[String]) -> bool {
@@ -1023,15 +1009,6 @@ mod tests {
         assert!(state.session_is_managed("thread"));
         assert!(state.remove_session_instance("thread", 1).is_some());
         assert!(!state.session_is_managed("thread"));
-    }
-
-    #[test]
-    fn supervisor_state_dedupes_concurrent_restart_requests() {
-        let mut state = SupervisorState::default();
-
-        assert!(state.mark_restart_requested("codex:thread"));
-        assert!(!state.mark_restart_requested("codex:thread"));
-        assert!(state.mark_restart_requested("codex:other-thread"));
     }
 
     /// The user-halt ledger behind the auto-attach cancel: marks are
