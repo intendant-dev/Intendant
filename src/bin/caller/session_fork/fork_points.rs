@@ -413,23 +413,60 @@ pub(crate) fn native_fork_points(
     Ok(catalog)
 }
 
-/// Resolve the fork anchor for an edited Claude Code user message by its
-/// exact prose. Claude Code has no in-place rewind on the supervision
-/// wire, so an edit is serviced as an anchor-fork branch — and the
-/// edited row's original text is the address: match it against the
-/// active chain's user turns and anchor at the unique match's parent.
-/// Text stays the anchor key even though resumes now seed the live
-/// lane's `user_turn_index` from the transcript
+/// A resolved Claude Code edit target: everything each rung of the
+/// pencil's in-place ladder needs (`session_supervisor/claude_edit.rs`).
+/// `fork_anchor` cuts at the edited row's PARENT — the fork rung's
+/// chain-slice anchor and the surgery rung's kept tail. `None` means the
+/// edited row is the session's first message: the wire rung may still
+/// serve it (CC's own first-message rewind, feature-gated), the
+/// truncation and fork rungs refuse it.
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeEditAnchor {
+    /// The edited user row itself — the wire rewind's `target_message_uuid`
+    /// and the surgery rung's cut row.
+    pub(crate) target_user_uuid: String,
+    /// Chain-slice anchor at the edited row's parent, for the fork rung.
+    /// `None` for a first-message edit.
+    pub(crate) fork_anchor: Option<ForkAnchorSpec>,
+    /// Real human user rows AFTER the target on the active chain,
+    /// newest first. CC's wire rewind only accepts the CURRENT last
+    /// human turn per call, so an earlier edit rewinds these first, in
+    /// this order, then the target itself.
+    pub(crate) later_human_rows: Vec<String>,
+}
+
+impl ClaudeEditAnchor {
+    /// The wire rung's call order: every later human row newest-first,
+    /// then the edited row itself.
+    pub(crate) fn rewind_targets_newest_first(&self) -> Vec<String> {
+        let mut targets = self.later_human_rows.clone();
+        targets.push(self.target_user_uuid.clone());
+        targets
+    }
+}
+
+/// Resolve an edited Claude Code user message to its transcript address
+/// by its exact prose: match it against the active chain's user turns,
+/// refusing ambiguity or absence rather than guessing (the transcript's
+/// inline fork affordance covers those cases exactly). Text stays the
+/// address even though resumes now seed the live lane's
+/// `user_turn_index` from the transcript
 /// (`claude_user_turn_state_from_history`; `--fork-session` resumes
 /// seed from the fork source via
 /// `claude_user_turn_state_from_fork_source`): the seed is best-effort,
-/// while prose matching addresses the chain regardless. Ambiguity or
-/// absence is a refusal, never a guess — the transcript's inline fork
-/// affordance covers those cases exactly.
+/// while prose matching addresses the chain regardless.
+///
+/// Only REAL human prompt rows are candidates (no meta, compact-summary,
+/// sidechain, tool_result-only, or harness-injected rows): CC's own wire
+/// rewind accepts ANY `type:"user"` row as a target — including
+/// tool_result rows, observed live splicing mid-turn — so the daemon
+/// must never offer those. `later_human_rows` mirrors CC's own
+/// walk-back predicate instead (harness-injected prompts ARE real human
+/// turns to CC and must be counted), minus the prose filter.
 pub(crate) fn claude_edit_branch_anchor(
     transcript_path: &Path,
     original_text: &str,
-) -> Result<ForkAnchorSpec, String> {
+) -> Result<ClaudeEditAnchor, String> {
     let wanted = original_text.trim();
     if wanted.is_empty() {
         return Err("the edited row carried no original text to locate".to_string());
@@ -448,6 +485,9 @@ pub(crate) fn claude_edit_branch_anchor(
     let file = std::fs::File::open(transcript_path)
         .map_err(|err| format!("transcript open failed: {err}"))?;
     let mut matches: Vec<(String, Option<String>)> = Vec::new();
+    // Every on-chain human user row in file order, prose-matching or not
+    // — the walk-back universe the wire rung counts positions in.
+    let mut human_rows: Vec<String> = Vec::new();
     for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
         let Ok(line) = line else { continue };
         let trimmed = line.trim();
@@ -499,9 +539,14 @@ pub(crate) fn claude_edit_branch_anchor(
             .next()
             .unwrap_or("")
             .trim();
-        if prose.is_empty()
-            || crate::external_agent::transcript_text::is_injected_external_user_text(prose)
-        {
+        if prose.is_empty() {
+            // tool_result-only content yields no prose: not a human turn.
+            continue;
+        }
+        human_rows.push(uuid.to_string());
+        if crate::external_agent::transcript_text::is_injected_external_user_text(prose) {
+            // Harness rows count for the walk-back but are never the
+            // edited row itself.
             continue;
         }
         if prose == wanted {
@@ -520,17 +565,29 @@ pub(crate) fn claude_edit_branch_anchor(
              abandoned branch or behind a compaction) — use the transcript row's fork button"
                 .to_string(),
         ),
-        [(_, parent)] => match parent {
-            Some(parent) => Ok(ForkAnchorSpec {
-                kind: "message".to_string(),
-                turn: None,
-                item_id: None,
-                position: None,
-                seq: None,
-                message_uuid: Some(parent.clone()),
-            }),
-            None => Err("cannot branch from before the session's first message".to_string()),
-        },
+        [(uuid, parent)] => {
+            let later_human_rows: Vec<String> = match human_rows.iter().position(|row| row == uuid)
+            {
+                Some(target_position) => human_rows[target_position + 1..]
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            Ok(ClaudeEditAnchor {
+                target_user_uuid: uuid.clone(),
+                fork_anchor: parent.as_ref().map(|parent| ForkAnchorSpec {
+                    kind: "message".to_string(),
+                    turn: None,
+                    item_id: None,
+                    position: None,
+                    seq: None,
+                    message_uuid: Some(parent.clone()),
+                }),
+                later_human_rows,
+            })
+        }
         many => Err(format!(
             "this prompt appears {} times in the session — use the transcript row's fork \
              button to pick the exact occurrence",
@@ -1131,8 +1188,57 @@ mod tests {
         // The abandoned duplicate is off-chain and must not create
         // ambiguity: the unique on-chain match anchors at its parent.
         let anchor = claude_edit_branch_anchor(&path, "do the thing").expect("anchor");
-        assert_eq!(anchor.kind, "message");
-        assert_eq!(anchor.message_uuid.as_deref(), Some("a1"));
+        let fork_anchor = anchor.fork_anchor.as_ref().expect("fork anchor");
+        assert_eq!(fork_anchor.kind, "message");
+        assert_eq!(fork_anchor.message_uuid.as_deref(), Some("a1"));
+        assert_eq!(anchor.target_user_uuid, "u2b");
+        assert!(anchor.later_human_rows.is_empty());
+        assert_eq!(
+            anchor.rewind_targets_newest_first(),
+            vec!["u2b".to_string()]
+        );
+    }
+
+    /// The wire rung rewinds every later human turn newest-first, then
+    /// the target; tool_result user rows are NOT human turns and never
+    /// appear — CC's own handler happily splices at them (observed
+    /// live), so the daemon must never offer them.
+    #[test]
+    fn claude_edit_anchor_returns_target_user_uuid_and_walk_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.jsonl");
+        let tool_result_row = serde_json::json!({
+            "uuid": "tr1",
+            "parentUuid": "u2",
+            "type": "user",
+            "timestamp": "2026-07-19T00:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ran"}]},
+        })
+        .to_string();
+        let lines = [
+            edit_fixture_line("u1", None, "user", "first prompt"),
+            edit_fixture_line("a1", Some("u1"), "assistant", "ok"),
+            edit_fixture_line("u2", Some("a1"), "user", "edit me"),
+            tool_result_row,
+            edit_fixture_line("a2", Some("tr1"), "assistant", "done"),
+            edit_fixture_line("u3", Some("a2"), "user", "later one"),
+            edit_fixture_line("a3", Some("u3"), "assistant", "more"),
+            edit_fixture_line("u4", Some("a3"), "user", "later two"),
+            edit_fixture_line("a4", Some("u4"), "assistant", "end"),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let anchor = claude_edit_branch_anchor(&path, "edit me").expect("anchor");
+        assert_eq!(anchor.target_user_uuid, "u2");
+        assert_eq!(
+            anchor.later_human_rows,
+            vec!["u4".to_string(), "u3".to_string()],
+            "later human rows must come newest-first and exclude tool_result rows"
+        );
+        assert_eq!(
+            anchor.rewind_targets_newest_first(),
+            vec!["u4".to_string(), "u3".to_string(), "u2".to_string()]
+        );
     }
 
     #[test]
@@ -1152,7 +1258,14 @@ mod tests {
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let anchor = claude_edit_branch_anchor(&path, "run the tests").expect("anchor");
-        assert_eq!(anchor.message_uuid.as_deref(), Some("a1"));
+        assert_eq!(
+            anchor
+                .fork_anchor
+                .as_ref()
+                .and_then(|a| a.message_uuid.as_deref()),
+            Some("a1")
+        );
+        assert_eq!(anchor.target_user_uuid, "u2");
     }
 
     #[test]
@@ -1173,7 +1286,14 @@ mod tests {
         assert!(ambiguous.contains("2 times"), "{ambiguous}");
         let missing = claude_edit_branch_anchor(&path, "never said this").expect_err("missing");
         assert!(missing.contains("not found"), "{missing}");
-        let first = claude_edit_branch_anchor(&path, "first prompt").expect_err("first turn");
-        assert!(first.contains("first message"), "{first}");
+        // A first-message edit resolves (the wire rung may serve it) but
+        // carries no fork anchor: the truncation and fork rungs refuse.
+        let first = claude_edit_branch_anchor(&path, "first prompt").expect("first turn");
+        assert_eq!(first.target_user_uuid, "u1");
+        assert!(first.fork_anchor.is_none());
+        assert_eq!(
+            first.later_human_rows,
+            vec!["u3".to_string(), "u2".to_string()]
+        );
     }
 }

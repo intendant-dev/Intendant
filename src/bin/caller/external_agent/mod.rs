@@ -1073,6 +1073,14 @@ impl AgentBackend {
         }
     }
 
+    /// Whether the wrapper's INDEX-ADDRESSED edit protocol serves this
+    /// backend: the edited turn is located by its supervision-run
+    /// `user_turn_index` and rolled back by turn count
+    /// (`rollback_turns`). Claude Code is deliberately NOT here even
+    /// though it rewinds in place since CC ≥2.1.218: its wire rewind is
+    /// transcript-addressed (`rewind_conversation` by message uuid), so
+    /// claude-code edits route through the supervisor's in-place ladder
+    /// (`claude_edit_in_place_ladder`) before this gate is consulted.
     pub fn supports_user_message_rewind(&self) -> bool {
         matches!(self, AgentBackend::Codex | AgentBackend::Kimi)
     }
@@ -1804,6 +1812,16 @@ pub struct AutonomousGoalPauseResult {
     pub paused: bool,
 }
 
+/// Outcome of a message-addressed conversation rewind
+/// (`ExternalAgent::rewind_conversation_to_message`). A wire-level
+/// refusal is a NORMAL outcome (`rewound: false` + the backend's reason
+/// in `detail`), distinct from transport errors.
+#[derive(Debug, Clone)]
+pub struct ConversationRewindOutcome {
+    pub rewound: bool,
+    pub detail: Option<String>,
+}
+
 /// Trait for opaque external agent backends.
 ///
 /// Intendant supervises the agent, bridges approval requests to its
@@ -2075,6 +2093,28 @@ pub trait ExternalAgent: Send + Sync {
 
     fn supports_item_anchor_rewind(&self) -> bool {
         false
+    }
+
+    /// Rewind the backend's ACTIVE conversation to just before the given
+    /// message: the target and everything after leave the model's
+    /// context, and the next user message continues from the preserved
+    /// prefix. Claude Code implements this over its stream-json control
+    /// wire (`rewind_conversation`, CC ≥2.1.218); other backends use the
+    /// default error and callers fall back per their own ladder.
+    ///
+    /// Wire-level REFUSALS (target not found, stale target, first-message
+    /// gate off, still busy after the retry budget) return
+    /// `Ok(outcome)` with `rewound: false` and the reason in `detail` —
+    /// only transport/process failures are `Err`.
+    async fn rewind_conversation_to_message(
+        &mut self,
+        target_message_uuid: &str,
+        interrupt_if_running: bool,
+    ) -> Result<ConversationRewindOutcome, CallerError> {
+        let _ = (target_message_uuid, interrupt_if_running);
+        Err(CallerError::ExternalAgent(
+            "message-addressed conversation rewind not supported by this backend".into(),
+        ))
     }
 
     /// Ask the backend to drop the last `turns_to_drop` conversational
@@ -2836,6 +2876,10 @@ mod tests {
     #[test]
     fn user_message_rewind_capability_is_explicit() {
         assert!(AgentBackend::Codex.supports_user_message_rewind());
+        // ClaudeCode is false HERE because this gate is the
+        // index-addressed protocol only: claude-code edits rewind in
+        // place via the transcript-addressed ladder
+        // (`claude_edit_in_place_ladder`), routed before this gate.
         assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
         assert!(AgentBackend::Kimi.supports_user_message_rewind());
         assert!(!AgentBackend::Pi.supports_user_message_rewind());

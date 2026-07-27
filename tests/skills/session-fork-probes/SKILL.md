@@ -85,23 +85,31 @@ What these pin (CC 2.1.211 semantics the surgery engine assumes):
 The script exits non-zero on any unexpected verdict and prints the exact
 cleanup command for the scratch project dir.
 
-## Tripwire — the claude rewind wire surface (checked against 2.1.215)
+## The claude rewind wire — LANDED (CC ≥2.1.218); probe on every bump
 
-The claude TUI's `/rewind` is real, and as of CC **2.1.215** part of it
-reached the headless control wire: the stream-json control request
-`{subtype: "rewind_files", user_message_id, dry_run}` restores checkpoint
-**file state** to a given user message (SDK method `rewindFiles`).
-**Conversation** rewind remains TUI-internal (`repl_rewind_conversation`;
-internal contract names a `target_message_uuid`) — there is **no**
-stream-json subtype for it, which is why a supervisor edit of a claude
-message is serviced as an anchor-fork *branch*, never an in-place rewind.
+The 2.1.215-era tripwire fired: since CC **2.1.218** the stream-json
+control wire handles `{subtype: "rewind_conversation",
+target_message_uuid, interrupt_if_running}` — true in-place conversation
+rewind of the same session id, proven live 2026-07-27 on 2.1.220. The
+daemon's pencil edits now ride it (`session_supervisor/claude_edit.rs`:
+wire rewind → same-id transcript surgery → anchor fork, in that order),
+and the build pins the subtype token (`rewind_wire_subtype_canary`) plus
+a runtime binary scan (`claude_rewind_wire_capability`) that skips the
+wire rung loudly when the installed CLI predates it.
 
-Watch on every CC upgrade (grep the versioned binary under
-`~/.local/share/claude/versions/` for `subtype:"rewind`):
-- `rewind_conversation` (or similar) appearing as a wire subtype → claude
-  edits can graduate from branch-on-edit to true in-place rewind; revisit
-  `session_supervisor/fork.rs::fork_claude_edit_branch` and the
-  `supports_user_message_rewind()` gate.
-- `rewind_files` semantics vs forked children: a chain-slice child keeps
-  parent-era `user_message_id`s — whether the child can restore the
-  parent's file checkpoints is unprobed. Probe before building on it.
+**Run `spike3_cc_rewind.py` on every CC upgrade** (and whenever pencil
+edits misbehave): it exercises the wire contract for real — refusal
+vocabulary ("stale target" / "target not found" / "turn running"), the
+last-human-turn-only constraint, ghost-free continuation, the
+append-only `last-prompt` pin, restart continuity, `interrupt_if_running`
+mid-turn, the remote `tengu_rewind_first_message` gate direction, and the
+Lane-B truncation + sidecar-survival contract. Any drift exits non-zero.
+
+Still-open adjacent surface:
+- `rewind_files` (checkpoint **file state** restore, present since
+  2.1.215, `user_message_id`-keyed): availability under `-p` mode is
+  unprobed, and pruned turns' file side effects survive both rewind
+  lanes until it's built on. Probe before building.
+- `rewind_conversation` targets pre-compaction rows only while they are
+  in the CLI's memory: after auto-compaction expect "target not found"
+  (the surgery/fork rungs cover those edits).

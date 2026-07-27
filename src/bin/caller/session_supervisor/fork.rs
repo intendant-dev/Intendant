@@ -464,84 +464,21 @@ impl SessionSupervisor {
         .await;
     }
 
-    /// Chain-slice the parent transcript into a fresh child uuid in the
-    /// same project dir. Returns `(parent_backend_id, child_uuid,
-    /// kept_lines, parent_project_root)`.
-    /// Service an EDIT of a claude-code user message as an anchor-fork
-    /// branch: Claude Code has no in-place rewind on the supervision wire
-    /// (its /rewind is an interactive TUI feature of the CLI itself), so
-    /// "edit turn N and redo" becomes "fork from before that message and
-    /// run the edited prompt in the child". The live lane's turn numbers
-    /// count this supervision run — not the transcript chain — so the
-    /// edited row is located by its exact original prose
-    /// (`claude_edit_branch_anchor`), refusing ambiguity rather than
-    /// guessing; the transcript's inline fork affordance covers refusals.
-    pub(crate) async fn fork_claude_edit_branch(
+    /// The fork rung with a pre-resolved anchor: emits the honest
+    /// "running" reason (why the edit is branching instead of rewinding
+    /// in place), chain-slices the parent, and activates the child with
+    /// the edited prompt.
+    pub(crate) async fn fork_claude_edit_branch_from_anchor(
         &self,
         request: super::EditUserMessageRequest,
-        target: super::EditRouteTarget,
+        session_token: String,
+        anchor: ForkAnchorSpec,
+        running_reason: String,
     ) {
-        let sid = Some(target.managed_id.clone());
+        let sid = Some(session_token.clone());
         let turn = request.user_turn_index;
-        let Some(original_text) = request
-            .original_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-        else {
-            self.emit_edit_user_message_status(
-                sid,
-                turn,
-                "failed",
-                "the edited row carried no original text to locate in the transcript",
-            );
-            return;
-        };
-        self.emit_edit_user_message_status(
-            sid.clone(),
-            turn,
-            "running",
-            "Claude Code cannot rewind in place — branching into a new session from before this message",
-        );
-        let token = target.managed_id.clone();
-        let home = self.logs_home();
-        let backend_id = match persisted_external_identity_for_session_in_home(&home, &token) {
-            Some((source, id)) if source == "claude-code" => id,
-            Some((source, _)) => {
-                self.emit_edit_user_message_status(
-                    sid,
-                    turn,
-                    "failed",
-                    format!("session is a {source} session, not claude-code"),
-                );
-                return;
-            }
-            None => token.clone(),
-        };
-        let Some(transcript) = crate::web_gateway::find_claude_session_file(&home, &backend_id)
-        else {
-            self.emit_edit_user_message_status(
-                sid,
-                turn,
-                "failed",
-                format!("transcript for claude-code session {backend_id} not found"),
-            );
-            return;
-        };
-        let anchor = match tokio::task::spawn_blocking(move || {
-            crate::session_fork::claude_edit_branch_anchor(&transcript, &original_text)
-        })
-        .await
-        .unwrap_or_else(|err| Err(format!("anchor resolution task failed: {err}")))
-        {
-            Ok(anchor) => anchor,
-            Err(reason) => {
-                self.emit_edit_user_message_status(sid, turn, "failed", reason);
-                return;
-            }
-        };
-        match self.fork_claude_session(&token, &anchor).await {
+        self.emit_edit_user_message_status(sid.clone(), turn, "running", running_reason);
+        match self.fork_claude_session(&session_token, &anchor).await {
             Ok((resolved_backend_id, child_uuid, kept_lines, parent_project_root)) => {
                 let child_short: String = child_uuid.chars().take(8).collect();
                 self.announce_claude_fork(
@@ -577,6 +514,9 @@ impl SessionSupervisor {
         }
     }
 
+    /// Chain-slice the parent transcript into a fresh child uuid in the
+    /// same project dir. Returns `(parent_backend_id, child_uuid,
+    /// kept_lines, parent_project_root)`.
     async fn fork_claude_session(
         &self,
         token: &str,
@@ -885,16 +825,16 @@ mod tests {
         assert!(error.contains("before the latest compaction"), "{error}");
     }
 
-    /// The edit-as-branch path must hand the request's attachment ids to
-    /// the child's resume call (they used to be dropped with a "not
-    /// carried yet" notice). The child uuid is minted inside the fork
-    /// surgery, so the test learns it from the `SessionForkResult` event
-    /// while the resume body is held at the launch gate, registers a
-    /// managed child under that uuid, and opens the gate: the resume
+    /// The edit ladder's FORK RUNG must hand the request's attachment
+    /// ids to the child's resume call (they used to be dropped with a
+    /// "not carried yet" notice). The child uuid is minted inside the
+    /// fork surgery, so the test learns it from the `SessionForkResult`
+    /// event while the resume body is held at the launch gate, registers
+    /// a managed child under that uuid, and opens the gate: the resume
     /// funnel then routes the edited prompt as a follow-up to the child,
     /// where the staged upload must arrive resolved.
     #[tokio::test]
-    async fn edit_branch_fork_carries_attachments_into_child_first_task() {
+    async fn edit_fork_rung_carries_attachments_into_child_first_task() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let parent_id = "3b8e2a51-0000-4000-8000-0000000000aa";
@@ -909,11 +849,8 @@ mod tests {
             claude_fixture_line("u2", Some("a1"), "user", "do the thing"),
             claude_fixture_line("a2", Some("u2"), "assistant", "done"),
         ];
-        std::fs::write(
-            project_dir.join(format!("{parent_id}.jsonl")),
-            lines.join("\n"),
-        )
-        .unwrap();
+        let transcript_path = project_dir.join(format!("{parent_id}.jsonl"));
+        std::fs::write(&transcript_path, lines.join("\n")).unwrap();
 
         // A real staged upload in the project-scoped store, so delivery
         // resolves the ref exactly as a plain dashboard message would.
@@ -940,14 +877,6 @@ mod tests {
         config.launch_gate_for_tests = Some(gate_rx);
         let supervisor = SessionSupervisor::new(config);
 
-        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
-        let target = super::super::EditRouteTarget {
-            managed_id: parent_id.to_string(),
-            source: "claude-code".to_string(),
-            project_root: project.path().to_path_buf(),
-            session_dir: project.path().join("unused-session-dir"),
-            follow_up_tx: dummy_tx,
-        };
         let request = super::super::EditUserMessageRequest {
             requested_id: "edit-req-1".to_string(),
             user_turn_index: 2,
@@ -956,11 +885,26 @@ mod tests {
             text: "do the thing with the attachment".to_string(),
             attachments: vec![upload_ref],
         };
+        let anchor =
+            crate::session_fork::claude_edit_branch_anchor(&transcript_path, "do the thing")
+                .expect("anchor resolves");
+        let fork_anchor = anchor
+            .fork_anchor
+            .expect("non-first turn has a fork anchor");
 
         let mut bus_rx = bus.subscribe();
         let fork_task = {
             let supervisor = supervisor.clone();
-            tokio::spawn(async move { supervisor.fork_claude_edit_branch(request, target).await })
+            tokio::spawn(async move {
+                supervisor
+                    .fork_claude_edit_branch_from_anchor(
+                        request,
+                        parent_id.to_string(),
+                        fork_anchor,
+                        "test: forced fork rung".to_string(),
+                    )
+                    .await
+            })
         };
 
         // The announce emits the child uuid before resume hits the gate.

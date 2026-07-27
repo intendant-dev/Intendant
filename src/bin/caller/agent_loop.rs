@@ -154,6 +154,11 @@ pub(crate) struct FollowUpMessage {
     pub(crate) edit_original_text: Option<String>,
     pub(crate) unresolved_attachment_ids: Vec<String>,
     pub(crate) target_session_id: Option<String>,
+    /// Claude Code in-place edit: transcript uuids to rewind over the
+    /// control wire, newest-first, ending with the edited row itself
+    /// (resolved by the supervisor's `claude_edit_in_place_ladder`).
+    /// Empty for every other message kind.
+    pub(crate) claude_inplace_rewind_targets: Vec<String>,
     pub(crate) managed_context_recovery_kickstart: bool,
     pub(crate) managed_context_density_handoff: bool,
     pub(crate) managed_context_density_handoff_completed: bool,
@@ -171,6 +176,7 @@ impl FollowUpMessage {
             edit_original_text: None,
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
+            claude_inplace_rewind_targets: Vec::new(),
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
             managed_context_density_handoff_completed: false,
@@ -188,6 +194,7 @@ impl FollowUpMessage {
             edit_original_text: None,
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
+            claude_inplace_rewind_targets: Vec::new(),
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
             managed_context_density_handoff_completed: false,
@@ -205,6 +212,7 @@ impl FollowUpMessage {
             edit_original_text: None,
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
+            claude_inplace_rewind_targets: Vec::new(),
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
             managed_context_density_handoff_completed: false,
@@ -229,6 +237,7 @@ impl FollowUpMessage {
             edit_original_text: original_text,
             unresolved_attachment_ids,
             target_session_id: None,
+            claude_inplace_rewind_targets: Vec::new(),
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
             managed_context_density_handoff_completed: false,
@@ -237,6 +246,11 @@ impl FollowUpMessage {
 
     pub(crate) fn for_target(mut self, target_session_id: Option<String>) -> Self {
         self.target_session_id = target_session_id;
+        self
+    }
+
+    pub(crate) fn with_claude_inplace_rewind_targets(mut self, targets: Vec<String>) -> Self {
+        self.claude_inplace_rewind_targets = targets;
         self
     }
 

@@ -25,11 +25,13 @@
 //!   undo on the idle child before subscription or its first prompt. Item,
 //!   message, and independently addressed child-agent anchors stay unsupported.
 
+mod claude_inplace;
 mod claude_surgery;
 mod claude_tree;
 mod codex_stage;
 mod fork_points;
 mod native;
+pub(crate) use claude_inplace::*;
 pub(crate) use claude_surgery::*;
 pub(crate) use claude_tree::*;
 pub(crate) use codex_stage::*;

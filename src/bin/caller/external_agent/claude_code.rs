@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 
@@ -7,15 +7,15 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::CallerError;
 use crate::session_activity::ActivityObservation as ActivityObs;
 
 use super::{
     normalize_plan_status, AgentConfig, AgentEvent, AgentImageAttachment, AgentThread,
-    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, GoalActionOutcome,
-    GoalEngine, SubAgentState, ToolCompletionStatus,
+    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ConversationRewindOutcome,
+    ExternalAgent, GoalActionOutcome, GoalEngine, SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -178,6 +178,124 @@ fn lock_pending(
     match pending.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Waiters for `control_response`s to OUR outbound `control_request`s,
+/// keyed by request_id — the correlated upgrade over the historically
+/// fire-and-forget `write_control_request`. The reader completes a
+/// waiter with the envelope's whole `response` object; requests without
+/// a registered waiter keep the fire-and-forget log behavior.
+type PendingControlResponses = Arc<StdMutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
+
+fn lock_pending_controls(
+    pending: &PendingControlResponses,
+) -> StdMutexGuard<'_, HashMap<String, oneshot::Sender<serde_json::Value>>> {
+    match pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The stream-json control subtype for CC's native in-place conversation
+/// rewind. Present in the installed CLI since 2.1.218; `rewind_wire_subtype_canary`
+/// pins this token and the probe mechanics, and
+/// `tests/skills/session-fork-probes/` carries the live-binary probe run
+/// on every CC bump.
+pub(crate) const CLAUDE_REWIND_WIRE_SUBTYPE: &str = "rewind_conversation";
+
+/// The CLI answers a rewind in ~0.1 s when idle and within its own 10 s
+/// interrupt wait when aborting a turn; past this the subtype is being
+/// ignored and the ladder should fall back.
+const CC_REWIND_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// After a `result` line the CLI stays non-idle briefly (worst observed
+/// 3.3 s → `"turn running"` refusals); this retry cadence and budget
+/// absorb that window without masking a genuinely stuck session.
+const CC_REWIND_BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const CC_REWIND_BUSY_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What a scan of the installed CC binary says about the rewind wire
+/// subtype. `Unknown` (unresolvable or unreadable executable — e.g. a
+/// wrapper script) is treated optimistically by callers: the wire
+/// refusal→fallback ladder catches a CLI that doesn't answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeRewindWireCapability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+/// Capability-probe the configured CC executable for
+/// [`CLAUDE_REWIND_WIRE_SUBTYPE`]. Reads the binary in chunks (the CLI
+/// is ~250 MB) and caches the verdict per executable fingerprint, so
+/// the cost is paid once per installed version, not per edit.
+pub(crate) fn claude_rewind_wire_capability(command: &str) -> ClaudeRewindWireCapability {
+    static CACHE: std::sync::OnceLock<StdMutex<HashMap<String, (String, bool)>>> =
+        std::sync::OnceLock::new();
+    let Some(fingerprint) = super::protocol_watch::executable_fingerprint(command) else {
+        return ClaudeRewindWireCapability::Unknown;
+    };
+    let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    {
+        let guard = match cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((digest, found)) = guard.get(&fingerprint.canonical_path) {
+            if *digest == fingerprint.digest {
+                return if *found {
+                    ClaudeRewindWireCapability::Supported
+                } else {
+                    ClaudeRewindWireCapability::Unsupported
+                };
+            }
+        }
+    }
+    let found = match binary_contains_token(
+        Path::new(&fingerprint.canonical_path),
+        CLAUDE_REWIND_WIRE_SUBTYPE.as_bytes(),
+    ) {
+        Ok(found) => found,
+        Err(_) => return ClaudeRewindWireCapability::Unknown,
+    };
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(fingerprint.canonical_path, (fingerprint.digest, found));
+    if found {
+        ClaudeRewindWireCapability::Supported
+    } else {
+        ClaudeRewindWireCapability::Unsupported
+    }
+}
+
+/// Chunked byte-substring scan (8 MiB windows overlapped by the token
+/// length), so a quarter-gigabyte executable never sits in memory whole.
+fn binary_contains_token(path: &Path, token: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read;
+    if token.is_empty() {
+        return Ok(true);
+    }
+    const CHUNK: usize = 8 * 1024 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; CHUNK + token.len() - 1];
+    let mut carry = 0usize;
+    loop {
+        let read = file.read(&mut buf[carry..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let filled = carry + read;
+        if buf[..filled]
+            .windows(token.len())
+            .any(|window| window == token)
+        {
+            return Ok(true);
+        }
+        carry = token.len().saturating_sub(1).min(filled);
+        let tail_start = filled - carry;
+        buf.copy_within(tail_start..filled, 0);
     }
 }
 
@@ -1177,6 +1295,9 @@ fn append_capped(dst: &mut String, src: &str, cap: usize) -> bool {
 struct CcReader {
     shared: Arc<CcShared>,
     pending_approvals: PendingApprovals,
+    /// Waiters for correlated outbound control requests; completed in
+    /// `handle_control_response`, keyed by request_id.
+    pending_control_responses: PendingControlResponses,
     /// True when an Intendant MCP endpoint was injected, so a missing or
     /// unhealthy `intendant` entry in the init message warrants a warning.
     expect_intendant_mcp: bool,
@@ -1293,11 +1414,13 @@ impl CcReader {
     fn new(
         shared: Arc<CcShared>,
         pending_approvals: PendingApprovals,
+        pending_control_responses: PendingControlResponses,
         expect_intendant_mcp: bool,
     ) -> Self {
         Self {
             shared,
             pending_approvals,
+            pending_control_responses,
             expect_intendant_mcp,
             approval_counter: 0,
             open_tools: HashMap::new(),
@@ -3283,6 +3406,14 @@ impl CcReader {
             .get("request_id")
             .and_then(|r| r.as_str())
             .unwrap_or("?");
+        // A correlated request's waiter takes the whole response object;
+        // fire-and-forget requests keep the log-only treatment below.
+        if let Some(waiter) =
+            lock_pending_controls(&self.pending_control_responses).remove(request_id)
+        {
+            let _ = waiter.send(response.clone());
+            return;
+        }
         if response.get("subtype").and_then(|s| s.as_str()) == Some("error") {
             let error = response
                 .get("error")
@@ -3584,6 +3715,9 @@ pub struct ClaudeCodeAgent {
     shared: Arc<CcShared>,
     /// Ids for client→CLI control requests (interrupts).
     control_counter: AtomicU64,
+    /// Correlated-response waiters shared with the reader
+    /// (`write_control_request_correlated`).
+    pending_control_responses: PendingControlResponses,
 }
 
 impl ClaudeCodeAgent {
@@ -3618,6 +3752,7 @@ impl ClaudeCodeAgent {
             mcp_session_id: None,
             shared: Arc::new(CcShared::new(None)),
             control_counter: AtomicU64::new(0),
+            pending_control_responses: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -3760,7 +3895,8 @@ impl ClaudeCodeAgent {
     /// Send a live-reconfig control request (verified on CC 2.1.201:
     /// `set_model` and `set_permission_mode` succeed on a running process —
     /// no restart). Fire-and-forget like interrupt: the reader logs the
-    /// CLI's ack or failure when the `control_response` arrives.
+    /// CLI's ack or failure when the `control_response` arrives. Ops that
+    /// need the CLI's answer use `write_control_request_correlated`.
     async fn write_control_request(
         &mut self,
         kind: &str,
@@ -3780,6 +3916,117 @@ impl ClaudeCodeAgent {
         };
         let line = serde_json::to_string(&request)?;
         self.write_line(&line).await
+    }
+
+    /// The correlated twin of `write_control_request`: registers a
+    /// waiter BEFORE the write so the reader cannot race the
+    /// registration, and hands back the receiver the reader completes
+    /// with the envelope's `response` object. The caller owns the
+    /// timeout and MUST call `abandon_control_waiter` on expiry so the
+    /// map never leaks a dead entry.
+    async fn write_control_request_correlated(
+        &mut self,
+        kind: &str,
+        request: serde_json::Value,
+    ) -> Result<(String, oneshot::Receiver<serde_json::Value>), CallerError> {
+        if self.writer.is_none() {
+            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        }
+        let request_id = format!(
+            "intendant-{kind}-{}",
+            self.control_counter.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let (tx, rx) = oneshot::channel();
+        lock_pending_controls(&self.pending_control_responses).insert(request_id.clone(), tx);
+        let envelope = CcControlRequest {
+            msg_type: "control_request".into(),
+            request_id: request_id.clone(),
+            request,
+        };
+        let line = match serde_json::to_string(&envelope) {
+            Ok(line) => line,
+            Err(err) => {
+                self.abandon_control_waiter(&request_id);
+                return Err(err.into());
+            }
+        };
+        if let Err(err) = self.write_line(&line).await {
+            self.abandon_control_waiter(&request_id);
+            return Err(err);
+        }
+        Ok((request_id, rx))
+    }
+
+    fn abandon_control_waiter(&self, request_id: &str) {
+        lock_pending_controls(&self.pending_control_responses).remove(request_id);
+    }
+
+    /// One `rewind_conversation` control round-trip. Distinguishes the
+    /// wire's three shapes: success-subtype with `rewound: true`,
+    /// success-subtype refusal (`rewound: false` + `error` string — the
+    /// CLI's normal way of saying no), and error-subtype (malformed
+    /// request / unknown subtype on an older CLI). Only transport
+    /// failures are `Err`.
+    async fn rewind_conversation_once(
+        &mut self,
+        target_message_uuid: &str,
+        interrupt_if_running: bool,
+    ) -> Result<ConversationRewindOutcome, CallerError> {
+        let (request_id, rx) = self
+            .write_control_request_correlated(
+                "rewind",
+                serde_json::json!({
+                    "subtype": CLAUDE_REWIND_WIRE_SUBTYPE,
+                    "target_message_uuid": target_message_uuid,
+                    "interrupt_if_running": interrupt_if_running,
+                }),
+            )
+            .await?;
+        let response = match tokio::time::timeout(CC_REWIND_RESPONSE_TIMEOUT, rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                // Reader dropped the sender (process shutdown mid-wait).
+                self.abandon_control_waiter(&request_id);
+                return Err(CallerError::ExternalAgent(
+                    "claude-code exited before answering the rewind request".into(),
+                ));
+            }
+            Err(_) => {
+                self.abandon_control_waiter(&request_id);
+                // A CLI that never answers (subtype silently ignored) is
+                // a refusal, not a transport failure: the ladder's next
+                // rung serves the edit.
+                return Ok(ConversationRewindOutcome {
+                    rewound: false,
+                    detail: Some(format!(
+                        "no control_response within {}s",
+                        CC_REWIND_RESPONSE_TIMEOUT.as_secs()
+                    )),
+                });
+            }
+        };
+        if response.get("subtype").and_then(|s| s.as_str()) == Some("error") {
+            return Ok(ConversationRewindOutcome {
+                rewound: false,
+                detail: Some(
+                    response
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("control request failed")
+                        .to_string(),
+                ),
+            });
+        }
+        let payload = response.get("response");
+        let rewound = payload
+            .and_then(|p| p.get("rewound"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let detail = payload
+            .and_then(|p| p.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Ok(ConversationRewindOutcome { rewound, detail })
     }
 
     /// Live model switch. Only changes the RUNNING process (and the latch a
@@ -4090,6 +4337,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         let reader_state = CcReader::new(
             Arc::clone(&self.shared),
             Arc::clone(&self.pending_approvals),
+            Arc::clone(&self.pending_control_responses),
             web_port.is_some(),
         )
         .with_task_spawn_resolver(spawn_resolver);
@@ -4284,6 +4532,30 @@ impl ExternalAgent for ClaudeCodeAgent {
         Ok(())
     }
 
+    async fn rewind_conversation_to_message(
+        &mut self,
+        target_message_uuid: &str,
+        interrupt_if_running: bool,
+    ) -> Result<ConversationRewindOutcome, CallerError> {
+        let started = std::time::Instant::now();
+        loop {
+            let outcome = self
+                .rewind_conversation_once(target_message_uuid, interrupt_if_running)
+                .await?;
+            if outcome.rewound {
+                return Ok(outcome);
+            }
+            let busy = outcome.detail.as_deref().is_some_and(|detail| {
+                let detail = detail.to_ascii_lowercase();
+                detail.contains("turn running") || detail.contains("commands queued")
+            });
+            if !busy || started.elapsed() >= CC_REWIND_BUSY_RETRY_BUDGET {
+                return Ok(outcome);
+            }
+            tokio::time::sleep(CC_REWIND_BUSY_RETRY_INTERVAL).await;
+        }
+    }
+
     async fn resolve_approval(
         &mut self,
         request_id: &str,
@@ -4404,6 +4676,7 @@ mod tests {
     fn test_reader() -> CcReader {
         CcReader::new(
             Arc::new(CcShared::new(None)),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             true,
         )
@@ -6284,6 +6557,7 @@ mod tests {
         let mut reader = CcReader::new(
             Arc::new(CcShared::new(None)),
             Arc::new(StdMutex::new(HashMap::new())),
+            Arc::new(StdMutex::new(HashMap::new())),
             false,
         );
         let out = reader.process_line(
@@ -6337,6 +6611,7 @@ mod tests {
         let reader_shared = Arc::new(CcShared::new(None));
         let mut reader = CcReader::new(
             Arc::clone(&reader_shared),
+            Arc::new(StdMutex::new(HashMap::new())),
             Arc::new(StdMutex::new(HashMap::new())),
             true,
         );
@@ -8299,6 +8574,99 @@ mod tests {
         assert_eq!(json["type"], "control_request");
         assert_eq!(json["request_id"], "intendant-interrupt-1");
         assert_eq!(json["request"]["subtype"], "interrupt");
+    }
+
+    #[test]
+    fn rewind_conversation_control_request_serialization() {
+        let request = CcControlRequest {
+            msg_type: "control_request".into(),
+            request_id: "intendant-rewind-1".into(),
+            request: serde_json::json!({
+                "subtype": CLAUDE_REWIND_WIRE_SUBTYPE,
+                "target_message_uuid": "6a6d0939-0000-4000-8000-000000000000",
+                "interrupt_if_running": true,
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["type"], "control_request");
+        assert_eq!(json["request"]["subtype"], "rewind_conversation");
+        assert_eq!(
+            json["request"]["target_message_uuid"],
+            "6a6d0939-0000-4000-8000-000000000000"
+        );
+        assert_eq!(json["request"]["interrupt_if_running"], true);
+    }
+
+    /// The reader must complete a registered correlated waiter with the
+    /// envelope's whole `response` object — and keep the fire-and-forget
+    /// log treatment for unregistered request ids.
+    #[test]
+    fn control_response_completes_pending_rewind_waiter() {
+        let pending_controls: PendingControlResponses = Arc::new(StdMutex::new(HashMap::new()));
+        let mut reader = CcReader::new(
+            Arc::new(CcShared::new(None)),
+            Arc::new(StdMutex::new(HashMap::new())),
+            Arc::clone(&pending_controls),
+            true,
+        );
+        let (tx, mut rx) = oneshot::channel();
+        lock_pending_controls(&pending_controls).insert("intendant-rewind-1".into(), tx);
+
+        let out = reader.process_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"intendant-rewind-1","response":{"rewound":true,"targetMessageUuid":"6a6d0939","prefillText":"…","precedingAssistantUuid":"704a78c2"}}}"#,
+        );
+        let payload = rx.try_recv().expect("waiter completed");
+        assert_eq!(payload["subtype"], "success");
+        assert_eq!(payload["response"]["rewound"], true);
+        assert!(
+            lock_pending_controls(&pending_controls).is_empty(),
+            "completed waiter must leave the map"
+        );
+        // The correlated path handled it: no ack log line.
+        assert!(!out.events.iter().any(
+            |e| matches!(e, AgentEvent::Log { message, .. } if message.contains("acknowledged"))
+        ));
+
+        // An unregistered id keeps today's log-only treatment.
+        let out = reader.process_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"intendant-set-model-9"}}"#,
+        );
+        assert!(out.events.iter().any(
+            |e| matches!(e, AgentEvent::Log { message, .. } if message.contains("acknowledged"))
+        ));
+    }
+
+    /// The commission's canary: pins the wire subtype token this build
+    /// speaks and the binary-probe mechanics that gate the ladder's wire
+    /// rung. If Claude Code renames or drops `rewind_conversation`, the
+    /// live probe (tests/skills/session-fork-probes) and the runtime
+    /// capability check fail loud instead of silently forking again —
+    /// and if this constant drifts from the serialized request, this
+    /// test fails at build time.
+    #[test]
+    fn rewind_wire_subtype_canary() {
+        assert_eq!(CLAUDE_REWIND_WIRE_SUBTYPE, "rewind_conversation");
+
+        let dir = tempfile::tempdir().unwrap();
+        // Token straddling a chunk boundary must still be found: build a
+        // synthetic binary bigger than one 8 MiB scan chunk with the
+        // token planted right across the boundary.
+        let chunk = 8 * 1024 * 1024;
+        let token = CLAUDE_REWIND_WIRE_SUBTYPE.as_bytes();
+        let mut straddling = vec![0u8; chunk + 64];
+        let start = chunk - token.len() / 2;
+        straddling[start..start + token.len()].copy_from_slice(token);
+        let with_token = dir.path().join("cc-with-token.bin");
+        std::fs::write(&with_token, &straddling).unwrap();
+        assert!(binary_contains_token(&with_token, token).unwrap());
+
+        let without = dir.path().join("cc-without.bin");
+        std::fs::write(&without, vec![0u8; 1024]).unwrap();
+        assert!(!binary_contains_token(&without, token).unwrap());
+        // A partial token must not match.
+        let partial = dir.path().join("cc-partial.bin");
+        std::fs::write(&partial, b"rewind_conversatio".as_slice()).unwrap();
+        assert!(!binary_contains_token(&partial, token).unwrap());
     }
 
     #[test]

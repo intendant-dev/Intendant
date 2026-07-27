@@ -436,13 +436,10 @@ function renderEditMessageChip() {
     return;
   }
   const sid = shortSessionId(editMessageDraft.sessionId);
-  // Claude Code has no in-place rewind on the supervision wire: an edit
-  // there is serviced as an anchor-fork branch, so label it honestly.
-  const meta = typeof sessionConfigMetadata === 'function'
-    ? sessionConfigMetadata(editMessageDraft.sessionId)
-    : null;
-  const source = typeof sessionConfigSource === 'function' ? sessionConfigSource(meta) : '';
-  const branching = editMessageDraft.historical || source === 'claude-code';
+  // Every live backend now rewinds edits in place (Claude Code since
+  // CC 2.1.218 via the daemon's in-place ladder); only historical rows
+  // still branch, so only they get the branching label.
+  const branching = editMessageDraft.historical;
   const action = branching ? 'Branching' : 'Editing';
   label.textContent = `${action} ${sid} #${editMessageDraft.userTurnIndex}`;
   chip.title = branching

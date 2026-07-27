@@ -306,7 +306,9 @@ impl SessionSupervisor {
 
         let (target_id, entry, relation) = self.lookup_edit_route_target(&requested_id).await;
         if entry.is_none() {
-            if let Some(attach) = edit_attach_request(source, resume_id, project_root, direct) {
+            if let Some(attach) =
+                edit_attach_request(source.clone(), resume_id, project_root, direct)
+            {
                 let lookup_id = attach
                     .resume_id
                     .as_deref()
@@ -351,6 +353,18 @@ impl SessionSupervisor {
                     codex_context_archive: None,
                 })
                 .await;
+                return;
+            }
+            // A detached claude-code session needs no attach round-trip:
+            // with no process on the transcript, the ladder's surgery
+            // rung edits the store directly and resumes the same id.
+            let claude_detached = source.as_deref() == Some("claude-code") || {
+                let home = self.logs_home();
+                persisted_external_identity_for_session_in_home(&home, &requested_id)
+                    .is_some_and(|(persisted_source, _)| persisted_source == "claude-code")
+            };
+            if claude_detached {
+                self.claude_edit_in_place_ladder(request, None).await;
                 return;
             }
         }
@@ -499,11 +513,12 @@ impl SessionSupervisor {
             return;
         };
         if backend == external_agent::AgentBackend::ClaudeCode {
-            // No in-place rewind exists on the claude-code supervision
-            // wire — service the edit as an anchor-fork branch instead
-            // (the child keeps everything before the edited message and
-            // the edited prompt becomes its first task).
-            self.fork_claude_edit_branch(request, target).await;
+            // Claude Code edits rewind the SAME backend session in place
+            // (wire rewind → transcript surgery → fork as the labeled
+            // last resort) — the ladder owns rung selection and every
+            // fallback (`claude_edit.rs`).
+            self.claude_edit_in_place_ladder(request, Some(target))
+                .await;
             return;
         }
         if !backend.supports_user_message_rewind() {

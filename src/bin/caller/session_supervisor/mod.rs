@@ -22,6 +22,8 @@ mod sub_agents;
 pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
+mod claude_edit;
+pub(crate) use claude_edit::CLAUDE_EDIT_INPLACE_STOP_REASON;
 mod dispatch;
 mod fork;
 mod registry;
@@ -83,6 +85,13 @@ pub struct SessionSupervisorConfig {
     /// in-flight while asserting what the intake still serves. None in
     /// production (zero cost).
     pub launch_gate_for_tests: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Test seam for the claude edit ladder's CLI capability probe: when
+    /// set, the ladder uses this verdict instead of scanning the
+    /// project-configured executable — the real probe reads a
+    /// quarter-gigabyte binary off the machine, which hermetic tests
+    /// must never touch. None in production.
+    pub claude_rewind_capability_for_tests:
+        Option<external_agent::claude_code::ClaudeRewindWireCapability>,
     /// The daemon's agenda authority, when this process runs one (the
     /// gateway shapes wire it through). The ask-delivery arm records
     /// whether a recorded answer reached a live asking session
@@ -881,6 +890,7 @@ mod tests {
             git_vitals_targets: None,
             hosted_control_cert_dir: None,
             launch_gate_for_tests: None,
+            claude_rewind_capability_for_tests: None,
             agenda: None,
         })
     }
