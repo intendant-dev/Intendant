@@ -79,12 +79,7 @@ impl GridEnvelopeJoins {
     }
 
     /// Attach the envelope blocks to one intendant wrapper row.
-    pub(crate) fn attach(
-        &self,
-        row: &mut serde_json::Value,
-        session_id: &str,
-        dir: &Path,
-    ) {
+    pub(crate) fn attach(&self, row: &mut serde_json::Value, session_id: &str, dir: &Path) {
         if let Some(envelope) = self
             .agenda
             .as_ref()
@@ -119,8 +114,7 @@ impl GridEnvelopeJoins {
             row["agenda"] = block;
         }
 
-        let (Some(boot), Some(live)) = (self.boot.as_ref(), self.live_wrappers.as_ref())
-        else {
+        let (Some(boot), Some(live)) = (self.boot.as_ref(), self.live_wrappers.as_ref()) else {
             return;
         };
         let live_wrapper = live.contains(session_id);
@@ -131,8 +125,8 @@ impl GridEnvelopeJoins {
         // transcript-less dirs can over-claim currency after any file
         // lands in the dir — the fail direction that never wrongly
         // claims safe-to-close.
-        let current = live_wrapper
-            || super::caches::session_activity_mtime_secs(dir) >= boot.start_secs;
+        let current =
+            live_wrapper || super::caches::session_activity_mtime_secs(dir) >= boot.start_secs;
         row["boot"] = serde_json::json!({
             "era": if current { "current" } else { "preboot" },
             "live_wrapper": live_wrapper,
@@ -184,8 +178,7 @@ mod tests {
     ) -> GridEnvelopeJoins {
         GridEnvelopeJoins {
             boot: boot_start_secs.map(|start_secs| CurrentBoot { start_secs }),
-            live_wrappers: live
-                .map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+            live_wrappers: live.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
             agenda,
         }
     }

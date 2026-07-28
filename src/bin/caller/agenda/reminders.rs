@@ -473,9 +473,7 @@ impl OccurrenceJournal {
     /// [`Self::started_sessions_for_item`] on why history, not tip).
     /// Rows that never retained an item id (boot-recovery unknowns) are
     /// unattributable and skipped.
-    pub(crate) fn session_links(
-        &self,
-    ) -> std::collections::HashMap<String, SessionOccurrenceLink> {
+    pub(crate) fn session_links(&self) -> std::collections::HashMap<String, SessionOccurrenceLink> {
         let mut links = std::collections::HashMap::new();
         for (occurrence_id, progress) in &self.state {
             let Some(item_id) = progress
@@ -1680,10 +1678,20 @@ mod tests {
         };
         // occ-1: started by s1, re-keyed to successor s2, then completed.
         journal
-            .append(&row("occ-1", "item-a", OccurrenceState::Started, Some("s1")))
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Started,
+                Some("s1"),
+            ))
             .unwrap();
         journal
-            .append(&row("occ-1", "item-a", OccurrenceState::Started, Some("s2")))
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Started,
+                Some("s2"),
+            ))
             .unwrap();
         journal
             .append(&row(
@@ -1695,7 +1703,12 @@ mod tests {
             .unwrap();
         // occ-2: still running.
         journal
-            .append(&row("occ-2", "item-b", OccurrenceState::Started, Some("s3")))
+            .append(&row(
+                "occ-2",
+                "item-b",
+                OccurrenceState::Started,
+                Some("s3"),
+            ))
             .unwrap();
         // occ-3: boot-recovery shape — no item id retained.
         journal

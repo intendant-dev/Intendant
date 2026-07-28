@@ -731,9 +731,10 @@ impl AgendaHandle {
                     let sealed_inputs = item
                         .and_then(|item| {
                             item.effects.iter().find(|effect| {
-                                effect.last_run.as_ref().is_some_and(|run| {
-                                    run.occurrence_id == link.occurrence_id
-                                })
+                                effect
+                                    .last_run
+                                    .as_ref()
+                                    .is_some_and(|run| run.occurrence_id == link.occurrence_id)
                             })
                         })
                         .map(|effect| effect.manifest.binding_refs.clone())
@@ -897,7 +898,9 @@ mod tests {
 
         let envelopes = handle.session_agenda_envelopes().unwrap();
         for lineage_member in ["sess-fired", "sess-successor"] {
-            let envelope = envelopes.get(lineage_member).expect("lineage member enveloped");
+            let envelope = envelopes
+                .get(lineage_member)
+                .expect("lineage member enveloped");
             assert_eq!(envelope.item_id, item.id);
             assert_eq!(envelope.item_title.as_deref(), Some("envelope source"));
             assert_eq!(envelope.occurrence_id, occ);
@@ -911,7 +914,10 @@ mod tests {
         }
         let orphan = envelopes.get("sess-orphan").expect("orphan linked");
         assert_eq!(orphan.item_id, "01GONE");
-        assert_eq!(orphan.item_title, None, "a deleted item degrades to id-only");
+        assert_eq!(
+            orphan.item_title, None,
+            "a deleted item degrades to id-only"
+        );
         assert!(orphan.sealed_inputs.is_empty());
     }
 
