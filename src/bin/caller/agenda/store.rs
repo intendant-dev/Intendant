@@ -5591,6 +5591,33 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
     }
 
+    /// Steward N1 (slice-1 gate): the deleted registry invariants used
+    /// to check at CI time that shipped defaults respect the intake
+    /// floors; under one-authority that check moved to stamp time — so
+    /// stamp EVERY house definition through the real intake here, and a
+    /// shipped default that the intake would refuse fails the suite
+    /// again instead of failing at the owner's first stamp.
+    #[test]
+    fn house_definitions_stamp_through_the_real_intake() {
+        for (name, _) in super::super::definitions::HOUSE_DEFINITIONS {
+            let (_root, mut store) = stamp_rig();
+            let outcome = store
+                .apply_stamp_command(stamp_cmd(name), owner(), 5000)
+                .unwrap_or_else(|err| panic!("house definition {name} refused at stamp: {err}"));
+            assert!(!outcome.nodes.is_empty(), "{name} stamped no nodes");
+            for node in &outcome.nodes {
+                assert!(
+                    node.item
+                        .effects
+                        .first()
+                        .is_some_and(|e| e.approval.is_none()),
+                    "{name}/{} must propose unapproved",
+                    node.node_id
+                );
+            }
+        }
+    }
+
     #[test]
     fn frontmatter_prefills_pass_the_same_manifest_intake() {
         // The steward-gate trigger prefill lands as the ordinary

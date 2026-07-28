@@ -252,7 +252,7 @@ async fn agenda_handle(
 
 /// Transport-neutral core of `GET /api/agenda/definitions` (tunnel twin
 /// `api_agenda_definitions`): the automation-definition catalog — house
-/// + personal libraries, each validated, with provenance/shadowing
+/// and personal libraries, each validated, with provenance/shadowing
 /// visible and invalid entries listed with their refusal reason.
 /// Read-only; listing grants nothing (bindingness requires the stamp
 /// seal under an approval digest).
