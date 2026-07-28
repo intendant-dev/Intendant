@@ -1041,6 +1041,42 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// Stamp an automation definition (Track AW): the daemon resolves the
+    /// named `automations/<name>/SKILL.md` (or an explicit `file:` path),
+    /// reads it ONCE, validates it as a definition, seals those bytes,
+    /// PARKS the instance graph — an action's single task, or a
+    /// workflow's hub note + placed node tasks + `relies_on` edges — and
+    /// PROPOSES one manifest per node: goal = the machinery-minted
+    /// execution preamble, the definition pinned as a binding ref on
+    /// every node (all N share one `{locator, sha256}`; the snapshot
+    /// store dedups by construction). Approves NOTHING — per-effect
+    /// approvals stay the owner's ordinary act, batched by the approval
+    /// sheet's single pinned emitter for workflows. Overrides here are
+    /// prefills into the same manifest intake every hand-proposed
+    /// manifest passes, never around it.
+    Stamp {
+        /// Catalog name (personal shadows house) or
+        /// `file:<absolute path>/SKILL.md`.
+        definition: String,
+        /// Instance project pin, overriding any definition prefill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        /// First fire / arm floor (defaults to the stamp instant).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fire_at_ms: Option<u64>,
+        /// Action-only cadence overrides of the definition's prefill —
+        /// refused by name on workflow definitions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        every_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suspend_after: Option<u32>,
+        /// Action-only executor override (replaces the node's prefills
+        /// wholesale when non-empty).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Owner "run the standing manifest now" (G3-pre): one extra
     /// occurrence of the item's ALREADY-APPROVED recurring manifest at
     /// this instant — within the reviewed decision, so no new approval
@@ -1254,7 +1290,8 @@ impl AgendaCommand {
             | AgendaCommand::AddRelatesTo { source, .. }
             | AgendaCommand::RemoveRelatesTo { source, .. }
             | AgendaCommand::AddRef { source, .. }
-            | AgendaCommand::RemoveRef { source, .. } => source.take(),
+            | AgendaCommand::RemoveRef { source, .. }
+            | AgendaCommand::Stamp { source, .. } => source.take(),
             AgendaCommand::Ask { .. }
             | AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. }

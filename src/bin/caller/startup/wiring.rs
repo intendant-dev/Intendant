@@ -326,6 +326,19 @@ pub(crate) fn spawn_mode_web_gateway(
         crate::agenda::journal_generation_floor(&agenda_dir),
     ));
     mcp_http_state.handover = Some(handover.clone());
+    // House automation definitions materialize into the state root at
+    // boot, BEFORE any stamp can resolve them (Track AW, ruling R1): v1
+    // binding refs are `file:` only, so the embedded set needs real
+    // paths to hash and seal — a packaged install has no repo checkout.
+    // The parent derivation is the stamp lane's own (state root =
+    // the agenda dir's parent), so resolution and materialization can
+    // never disagree. Failure degrades to named stamp-time refusals,
+    // never a refused boot.
+    if let Some(state_root) = agenda_dir.parent() {
+        if let Err(err) = crate::agenda::materialize_house_definitions(state_root) {
+            eprintln!("[agenda] materializing house definitions: {err}");
+        }
+    }
     // The daemon's agenda ledger: one single-writer handle shared by the
     // MCP tools, the HTTP routes, and the dashboard tunnel twins, plus
     // the reminder scheduler that delivers due items through the

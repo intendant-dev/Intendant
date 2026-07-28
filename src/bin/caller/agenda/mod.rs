@@ -31,6 +31,7 @@
 
 mod ask;
 mod blobs;
+mod definitions;
 mod handle;
 mod mandate_templates;
 mod reminders;
@@ -42,6 +43,7 @@ mod types;
 
 pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;
+pub(crate) use definitions::materialize_house_definitions;
 pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::{
     journal_generation_floor, AgendaOccurrencesPage, ReminderPolicyPatch,

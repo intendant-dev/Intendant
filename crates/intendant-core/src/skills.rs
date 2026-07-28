@@ -63,11 +63,17 @@ pub struct Skill {
     pub source: SkillSource,
 }
 
-/// Parse a SKILL.md file's content into config + body.
+/// Split a `SKILL.md`-shaped document into its raw YAML frontmatter and
+/// markdown body.
 ///
 /// The file must start with `---`, followed by YAML frontmatter, closed by
-/// another `---` line. Everything after is the body.
-pub fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig, String), String> {
+/// another `---` line. Everything after is the body. Shared by the lenient
+/// skills lane ([`parse_skill_md`]) and the strict conforming-subset lane
+/// ([`parse_frontmatter_strict`])'s callers.
+pub fn split_frontmatter<'a>(
+    content: &'a str,
+    source_path: &Path,
+) -> Result<(&'a str, &'a str), String> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
         return Err(format!(
@@ -89,15 +95,179 @@ pub fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig,
 
     let yaml_str = &rest[..closing_pos];
     let body_start = closing_pos + 4; // skip "\n---"
-    let body = rest[body_start..]
-        .trim_start_matches(['\r', '\n'])
-        .to_string();
+    let body = rest[body_start..].trim_start_matches(['\r', '\n']);
+    Ok((yaml_str, body))
+}
+
+/// Parse a SKILL.md file's content into config + body.
+pub fn parse_skill_md(content: &str, source_path: &Path) -> Result<(SkillConfig, String), String> {
+    let (yaml_str, body) = split_frontmatter(content, source_path)?;
 
     // Parse YAML frontmatter manually (flat key-value) to avoid serde_yaml dependency.
     let config =
         parse_frontmatter(yaml_str).map_err(|e| format!("{}: {}", source_path.display(), e))?;
 
-    Ok((config, body))
+    Ok((config, body.to_string()))
+}
+
+/// One value in the strict frontmatter lane: a scalar, or a one-level map
+/// of string scalars (the Agent Skills spec's `metadata:` shape — its only
+/// nested form).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontmatterValue {
+    Scalar(String),
+    Map(Vec<(String, String)>),
+}
+
+/// Parse frontmatter as the agentskills.io **conforming subset**: flat
+/// `key: value` scalars (quotes stripped, `>`/`|` block scalars joined as
+/// in the lenient lane) plus at most one level of string-to-string maps
+/// (`metadata:`). Where the lenient skills parser skips what it does not
+/// understand, this lane REFUSES it by name: junk lines, duplicate keys,
+/// flow syntax, list items, block scalars inside maps, and any nesting
+/// beyond a map's single level are errors — spec conformance is the
+/// deny-unknown rigor at this layer. Key vocabulary is the CALLER's to
+/// enforce; this parses shape only.
+pub fn parse_frontmatter_strict(yaml: &str) -> Result<Vec<(String, FrontmatterValue)>, String> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut entries: Vec<(String, FrontmatterValue)> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            i += 1;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return Err(format!(
+                "unexpected indented line {line:?} — one-level maps follow an empty-valued key"
+            ));
+        }
+        let Some(colon_pos) = line.find(':') else {
+            return Err(format!("{line:?} is not a `key: value` line"));
+        };
+        let key = line[..colon_pos].trim();
+        if key.is_empty() {
+            return Err(format!("{line:?} has an empty key"));
+        }
+        if entries.iter().any(|(seen, _)| seen == key) {
+            return Err(format!("duplicate frontmatter key {key:?}"));
+        }
+        let raw_value = line[colon_pos + 1..].trim();
+
+        if raw_value == ">" || raw_value == "|" {
+            // Block scalar, exactly the lenient lane's joining rule.
+            let mut parts = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let cont = lines[i];
+                if cont.is_empty() || cont.starts_with(' ') || cont.starts_with('\t') {
+                    parts.push(cont.trim());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let joined = parts.join(if raw_value == ">" { " " } else { "\n" });
+            entries.push((key.to_string(), FrontmatterValue::Scalar(joined)));
+            continue;
+        }
+
+        if raw_value.is_empty() {
+            // Empty value: a one-level map when indented `k: v` children
+            // follow, otherwise an empty scalar.
+            let mut children: Vec<(String, String)> = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let child = lines[i];
+                if child.trim().is_empty() {
+                    // A blank line inside a child run is allowed only while
+                    // more children follow; trailing blanks fall through.
+                    let more = lines[i + 1..].iter().any(|l| !l.trim().is_empty());
+                    let next_indented = lines[i + 1..]
+                        .iter()
+                        .find(|l| !l.trim().is_empty())
+                        .is_some_and(|l| l.starts_with(' ') || l.starts_with('\t'));
+                    if more && next_indented {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if !child.starts_with(' ') && !child.starts_with('\t') {
+                    break;
+                }
+                let child_line = child.trim();
+                let Some(child_colon) = child_line.find(':') else {
+                    return Err(format!(
+                        "map entry {child_line:?} under {key:?} is not a `key: value` line"
+                    ));
+                };
+                let child_key = child_line[..child_colon].trim();
+                let child_value = child_line[child_colon + 1..].trim();
+                if child_key.is_empty() {
+                    return Err(format!(
+                        "map entry {child_line:?} under {key:?} has an empty key"
+                    ));
+                }
+                if children.iter().any(|(seen, _)| seen == child_key) {
+                    return Err(format!("duplicate map key {child_key:?} under {key:?}"));
+                }
+                if child_value.is_empty() {
+                    return Err(format!(
+                        "map entry {child_key:?} under {key:?} has no scalar value — \
+                         nesting beyond one level is outside the conforming subset"
+                    ));
+                }
+                if child_value == ">" || child_value == "|" {
+                    return Err(format!(
+                        "map entry {child_key:?} under {key:?} uses a block scalar — \
+                         map values are plain scalars in the conforming subset"
+                    ));
+                }
+                if child_value.starts_with('{') || child_value.starts_with('[') {
+                    return Err(format!(
+                        "map entry {child_key:?} under {key:?} uses flow syntax — \
+                         outside the conforming subset"
+                    ));
+                }
+                children.push((child_key.to_string(), strip_quotes(child_value)));
+                i += 1;
+            }
+            let value = if children.is_empty() {
+                FrontmatterValue::Scalar(String::new())
+            } else {
+                FrontmatterValue::Map(children)
+            };
+            entries.push((key.to_string(), value));
+            continue;
+        }
+
+        if raw_value.starts_with('{') || raw_value.starts_with('[') {
+            return Err(format!(
+                "{key:?} uses flow syntax — outside the conforming subset"
+            ));
+        }
+        entries.push((
+            key.to_string(),
+            FrontmatterValue::Scalar(strip_quotes(raw_value)),
+        ));
+        i += 1;
+    }
+
+    Ok(entries)
+}
+
+/// Strip one matching pair of surrounding quotes (the lenient lane's rule).
+fn strip_quotes(v: &str) -> String {
+    if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+        || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+    {
+        v[1..v.len() - 1].to_string()
+    } else {
+        v.to_string()
+    }
 }
 
 /// Parse flat YAML-like frontmatter into a SkillConfig.
@@ -731,5 +901,125 @@ Instructions here.
         let (config, _) = parse_skill_md(content, Path::new("test/SKILL.md")).unwrap();
         assert_eq!(config.name, "quoted-name");
         assert_eq!(config.description, "single quoted");
+    }
+
+    // ---- The strict conforming-subset lane ----
+
+    fn strict(yaml: &str) -> Result<Vec<(String, FrontmatterValue)>, String> {
+        parse_frontmatter_strict(yaml)
+    }
+
+    #[test]
+    fn strict_parses_scalars_and_one_level_map() {
+        let entries = strict(
+            "name: fix-task\ndescription: \"a workflow\"\nmetadata:\n  title: Fix-task workflow\n  team: 'house'\nlicense: MIT\n",
+        )
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "name".to_string(),
+                    FrontmatterValue::Scalar("fix-task".to_string())
+                ),
+                (
+                    "description".to_string(),
+                    FrontmatterValue::Scalar("a workflow".to_string())
+                ),
+                (
+                    "metadata".to_string(),
+                    FrontmatterValue::Map(vec![
+                        ("title".to_string(), "Fix-task workflow".to_string()),
+                        ("team".to_string(), "house".to_string()),
+                    ])
+                ),
+                (
+                    "license".to_string(),
+                    FrontmatterValue::Scalar("MIT".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_supports_block_scalars_and_comments_like_the_lenient_lane() {
+        let entries =
+            strict("# a comment\ndescription: >\n  spans two\n  lines\nname: x\n").unwrap();
+        assert_eq!(
+            entries[0],
+            (
+                "description".to_string(),
+                FrontmatterValue::Scalar("spans two lines".to_string())
+            )
+        );
+        assert_eq!(
+            entries[1],
+            (
+                "name".to_string(),
+                FrontmatterValue::Scalar("x".to_string())
+            )
+        );
+        // Empty-valued key with no children is an empty scalar, the
+        // lenient lane's `compatibility:` shape.
+        let entries = strict("license:\nname: x\n").unwrap();
+        assert_eq!(
+            entries[0],
+            (
+                "license".to_string(),
+                FrontmatterValue::Scalar(String::new())
+            )
+        );
+    }
+
+    #[test]
+    fn strict_refuses_junk_duplicates_and_flow_syntax_by_name() {
+        let junk = strict("name: x\njust some prose\n").unwrap_err();
+        assert!(junk.contains("not a `key: value` line"), "{junk}");
+
+        let dup = strict("name: x\nname: y\n").unwrap_err();
+        assert!(dup.contains("duplicate frontmatter key \"name\""), "{dup}");
+
+        let flow = strict("metadata: {a: b}\n").unwrap_err();
+        assert!(flow.contains("flow syntax"), "{flow}");
+
+        let list = strict("tags:\n  - gate\n").unwrap_err();
+        assert!(list.contains("not a `key: value` line"), "{list}");
+
+        let orphan = strict("  indented: first\n").unwrap_err();
+        assert!(orphan.contains("unexpected indented line"), "{orphan}");
+    }
+
+    #[test]
+    fn strict_refuses_nesting_beyond_one_level() {
+        let nested = strict("metadata:\n  inner:\n    deep: value\n").unwrap_err();
+        assert!(nested.contains("nesting beyond one level"), "{nested}");
+        let dup = strict("metadata:\n  a: x\n  a: y\n").unwrap_err();
+        assert!(dup.contains("duplicate map key \"a\""), "{dup}");
+        let block = strict("metadata:\n  a: >\n    text\n").unwrap_err();
+        assert!(block.contains("block scalar"), "{block}");
+    }
+
+    #[test]
+    fn strict_allows_blank_lines_inside_a_map_run() {
+        let entries = strict("metadata:\n  a: x\n\n  b: y\nname: z\n").unwrap();
+        assert_eq!(
+            entries[0],
+            (
+                "metadata".to_string(),
+                FrontmatterValue::Map(vec![
+                    ("a".to_string(), "x".to_string()),
+                    ("b".to_string(), "y".to_string()),
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn split_frontmatter_matches_the_lenient_split() {
+        let (yaml, body) = split_frontmatter(FULL_SKILL, Path::new("t/SKILL.md")).unwrap();
+        assert!(yaml.contains("name: deploy-staging"));
+        assert!(body.starts_with("Run the deploy script:"));
+        assert!(split_frontmatter("no frontmatter", Path::new("t/SKILL.md")).is_err());
+        assert!(split_frontmatter("---\nname: x\n", Path::new("t/SKILL.md")).is_err());
     }
 }

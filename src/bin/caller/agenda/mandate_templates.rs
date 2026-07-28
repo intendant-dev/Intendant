@@ -1,18 +1,18 @@
-// The registry's runtime consumers (a ctl template verb, a served
-// catalog) are follow-up seeds; today it exists as the parity ANCHOR the
-// docs walkthroughs and the dashboard's template table are pinned to —
-// deliberate, not dead (the tests below are its live readers).
+// MIGRATION WINDOW (Track AW): content authority is moving to the
+// sealed automation definitions under `automations/<name>/SKILL.md`
+// (see `definitions.rs`). During the window this registry coexists with
+// the files under a byte-parity test below, so neither can drift; the
+// dashboard fragments' template tables stay pinned HERE until the sheet
+// cutover, when this file and those tables are deleted together.
 #![allow(dead_code)]
 
 //! The mandate template library (Track AU): the shipped standing-mandate
-//! texts as DATA — one authority for the dashboard's create-from-template
-//! flow and the docs' walkthroughs. A template is text the owner reads,
-//! parks, and approves; never instructions to the session rendering or
-//! parking it. The docs chapter and the dashboard fragment carry copies
-//! pinned by the parity tests below — a template edit that forgets either
-//! mirror fails the suite instead of shipping as drift. Future mandates
-//! (reconciliation, conductor — commissioned separately) join by adding
-//! an entry here and its two pinned copies.
+//! texts as DATA — the dashboard's create-from-template tables are
+//! pinned to this registry, and the registry itself is byte-parity
+//! pinned to the automation definition files (the new content
+//! authority; the docs walkthrough pins moved there). A template is
+//! text the owner reads, parks, and approves; never instructions to the
+//! session rendering or parking it.
 
 /// One shipped mandate template. `mandate` is both the parked item body
 /// and the scheduled goal, so the standing lane and Run now carry
@@ -348,41 +348,87 @@ you."#,
 mod tests {
     use super::*;
 
-    fn docs() -> &'static str {
-        include_str!("../../../../docs/src/agenda-and-memory.md")
-    }
-
-    fn docs_block_after(header: &str) -> &'static str {
-        let docs = docs();
-        let at = docs.find(header).expect("docs section header present");
-        let open = docs[at..].find("```text\n").expect("fenced mandate block") + at + 8;
-        let close = docs[open..].find("```").expect("fence closes") + open;
-        docs[open..close].trim_end_matches('\n')
-    }
-
-    fn by_id(id: &str) -> &'static MandateTemplate {
-        MANDATE_TEMPLATES
-            .iter()
-            .find(|t| t.id == id)
-            .expect("template present")
-    }
-
-    /// The registry is the source of truth; the docs walkthrough blocks
-    /// are pinned copies. Byte equality, both mandates — an edit to
-    /// either side alone fails here.
+    /// The two-sources window's confinement (Track AW §2.8): while the
+    /// registry and the definition files coexist, they are byte-parity
+    /// pinned — ids, titles, prose, cadence defaults, predicates,
+    /// executor prefills, and edges — so neither can drift. This test
+    /// dies with the registry at the sheet cutover.
     #[test]
-    fn docs_walkthrough_blocks_byte_match_the_registry() {
+    fn registry_files_byte_parity_during_the_window() {
+        let defs = super::super::definitions::house_definitions();
+        let by_name = |name: &str| {
+            defs.iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("no house definition file for template {name}"))
+        };
+        let kind_word = |kind: crate::agenda::AgendaKind| match kind {
+            crate::agenda::AgendaKind::Note => "note",
+            crate::agenda::AgendaKind::Task => "task",
+            crate::agenda::AgendaKind::Question => "question",
+        };
+        for template in MANDATE_TEMPLATES {
+            let def = by_name(template.id);
+            assert_eq!(def.title, template.title, "{} title", template.id);
+            assert_eq!(def.nodes.len(), 1, "{} arity", template.id);
+            assert_eq!(
+                def.nodes[0].goal, template.mandate,
+                "{} mandate",
+                template.id
+            );
+            let cadence = def.nodes[0]
+                .cadence
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} cadence prefill", template.id));
+            assert_eq!(cadence.every_ms, template.default_every_ms);
+            assert_eq!(cadence.suspend_after, Some(template.default_suspend_after));
+            assert!(def.nodes[0].trigger.is_none());
+        }
+        for template in TRIGGERED_MANDATE_TEMPLATES {
+            let def = by_name(template.id);
+            assert_eq!(def.title, template.title);
+            assert_eq!(def.nodes.len(), 1);
+            let node = &def.nodes[0];
+            assert_eq!(node.goal, template.mandate, "{} mandate", template.id);
+            let trigger = node
+                .trigger
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} trigger prefill", template.id));
+            assert_eq!(kind_word(trigger.item_kind), template.item_kind);
+            assert_eq!(trigger.tags, template.tags);
+            assert_eq!(node.agent.as_deref(), template.agent);
+            assert_eq!(node.model.as_deref(), template.claude_model);
+            assert_eq!(node.effort.as_deref(), template.claude_effort);
+        }
+        for workflow in WORKFLOW_TEMPLATES {
+            let def = by_name(workflow.id);
+            assert_eq!(def.title, workflow.title);
+            assert_eq!(
+                def.orientation, workflow.orientation,
+                "{} orientation",
+                workflow.id
+            );
+            assert_eq!(def.nodes.len(), workflow.nodes.len());
+            for (file_node, reg_node) in def.nodes.iter().zip(workflow.nodes) {
+                assert_eq!(file_node.id, reg_node.slug);
+                assert_eq!(file_node.title, reg_node.title);
+                assert_eq!(file_node.goal, reg_node.goal, "node {} goal", reg_node.slug);
+                assert_eq!(file_node.agent.as_deref(), reg_node.agent);
+                assert_eq!(file_node.model.as_deref(), reg_node.claude_model);
+                assert_eq!(file_node.effort.as_deref(), reg_node.claude_effort);
+            }
+            let file_edges = def.edges();
+            let registry_edges: Vec<(String, String)> = workflow
+                .edges
+                .iter()
+                .map(|(node, dep)| (node.to_string(), dep.to_string()))
+                .collect();
+            assert_eq!(file_edges, registry_edges, "{} edges", workflow.id);
+        }
+        // Every house definition maps back to a registry entry — the
+        // window admits no unmirrored file.
         assert_eq!(
-            docs_block_after("### The triage mandate"),
-            by_id("triage").mandate,
-        );
-        assert_eq!(
-            docs_block_after("### The housekeeping recipe"),
-            by_id("housekeeping").mandate,
-        );
-        assert_eq!(
-            docs_block_after("### The agenda-reconciliation mandate"),
-            by_id("agenda-reconciliation").mandate,
+            defs.len(),
+            MANDATE_TEMPLATES.len() + TRIGGERED_MANDATE_TEMPLATES.len() + WORKFLOW_TEMPLATES.len()
         );
     }
 
@@ -418,55 +464,7 @@ mod tests {
         );
     }
 
-    /// Registry invariants: unique non-empty ids, non-empty text, sane
-    /// walkthrough defaults (cadence at or above the intake floor).
-    #[test]
-    fn registry_invariants() {
-        let mut seen = std::collections::BTreeSet::new();
-        for template in MANDATE_TEMPLATES {
-            assert!(!template.id.is_empty() && !template.title.is_empty());
-            assert!(!template.mandate.trim().is_empty());
-            assert!(seen.insert(template.id), "duplicate template id");
-            assert!(template.default_every_ms >= super::super::types::RECURRENCE_MIN_EVERY_MS);
-            assert!(template.default_suspend_after >= 1);
-        }
-    }
-
     // ---- Track T: workflow templates ----
-
-    /// Consecutive ```text blocks after a docs header, in order.
-    fn docs_blocks_after(header: &str, count: usize) -> Vec<&'static str> {
-        let docs = docs();
-        let mut at = docs.find(header).expect("docs section header present");
-        let mut blocks = Vec::new();
-        for _ in 0..count {
-            let open = docs[at..].find("```text\n").expect("fenced block") + at + 8;
-            let close = docs[open..].find("```").expect("fence closes") + open;
-            blocks.push(docs[open..close].trim_end_matches('\n'));
-            at = close + 3;
-        }
-        blocks
-    }
-
-    /// The workflow walkthroughs' pinned copies: per workflow, the
-    /// orientation block then each node goal, in declaration order —
-    /// byte equality with the registry, the mandate-pin discipline
-    /// extended. Header convention: `### The <id> workflow`.
-    #[test]
-    fn workflow_walkthrough_blocks_byte_match_the_registry() {
-        for workflow in WORKFLOW_TEMPLATES {
-            let header = format!("### The {} workflow", workflow.id);
-            let blocks = docs_blocks_after(&header, 1 + workflow.nodes.len());
-            assert_eq!(
-                blocks[0], workflow.orientation,
-                "{} orientation block drifted",
-                workflow.id
-            );
-            for (node, block) in workflow.nodes.iter().zip(&blocks[1..]) {
-                assert_eq!(*block, node.goal, "node {} goal drifted", node.slug);
-            }
-        }
-    }
 
     /// The dashboard's workflow data (the stamp flow's fragment) is the
     /// second pinned copy: id, orientation, every slug and node goal,
@@ -553,27 +551,6 @@ mod tests {
         );
     }
 
-    /// The steward-gate walkthrough (T3): the docs block byte-matches
-    /// the registry — whose text is the T0 ruling's amended canonical
-    /// block — and the honesty note appears verbatim in the docs prose.
-    #[test]
-    fn steward_walkthrough_block_and_honesty_note_byte_match() {
-        let steward = &TRIGGERED_MANDATE_TEMPLATES[0];
-        assert_eq!(
-            docs_block_after("### The steward-gate mandate"),
-            steward.mandate,
-            "the steward mandate block drifted from the ruling's canonical text"
-        );
-        assert!(
-            docs().contains(
-                "a Fable-5 steward session RULES within delegated bounds and\n\
-                 FLAGS owner-decisions to the rail — it inherits the human steward's\n\
-                 delegation, not the owner's authority."
-            ),
-            "the honesty note must appear verbatim in the docs"
-        );
-    }
-
     /// The dashboard's triggered-mandate data is the second pinned copy.
     #[test]
     fn dashboard_triggered_mandate_data_carries_the_registry_verbatim() {
@@ -594,30 +571,6 @@ mod tests {
                 "fragment predicate kind drifted for {}",
                 template.id
             );
-        }
-    }
-
-    /// Triggered-mandate registry invariants: ids unique across every
-    /// template table, a lawful predicate (kind word + 1..=8 non-empty
-    /// tags — the intake bounds), non-empty text.
-    #[test]
-    fn triggered_mandate_registry_invariants() {
-        let mut ids: std::collections::BTreeSet<&str> = MANDATE_TEMPLATES
-            .iter()
-            .map(|t| t.id)
-            .chain(WORKFLOW_TEMPLATES.iter().map(|t| t.id))
-            .collect();
-        for template in TRIGGERED_MANDATE_TEMPLATES {
-            assert!(!template.id.is_empty() && !template.title.is_empty());
-            assert!(!template.mandate.trim().is_empty());
-            assert!(ids.insert(template.id), "template id collides");
-            assert!(matches!(template.item_kind, "note" | "task" | "question"));
-            assert!(
-                (1..=super::super::types::TRIGGER_MATCH_TAGS_MAX).contains(&template.tags.len())
-            );
-            for tag in template.tags {
-                assert!(!tag.trim().is_empty());
-            }
         }
     }
 
@@ -675,61 +628,9 @@ mod tests {
         }
     }
 
-    /// Workflow registry invariants: ids unique and disjoint from the
-    /// mandate table, bounded node counts, unique slugs, edges naming
-    /// declared slugs only, and an acyclic edge set (Kahn) — the
-    /// shipped-template half of the stamp-time DAG rule (T0 ruling 8).
-    #[test]
-    fn workflow_registry_invariants() {
-        let mut ids: std::collections::BTreeSet<&str> =
-            MANDATE_TEMPLATES.iter().map(|t| t.id).collect();
-        for workflow in WORKFLOW_TEMPLATES {
-            assert!(!workflow.id.is_empty() && !workflow.title.is_empty());
-            assert!(!workflow.orientation.trim().is_empty());
-            assert!(ids.insert(workflow.id), "template id collides");
-            assert!(
-                (1..=8).contains(&workflow.nodes.len()),
-                "node count out of bounds"
-            );
-            let mut slugs = std::collections::BTreeSet::new();
-            for node in workflow.nodes {
-                assert!(!node.slug.is_empty() && !node.title.is_empty());
-                assert!(!node.goal.trim().is_empty());
-                assert!(slugs.insert(node.slug), "duplicate node slug");
-            }
-            let mut inbound: std::collections::BTreeMap<&str, usize> =
-                slugs.iter().map(|s| (*s, 0)).collect();
-            for (node, dep) in workflow.edges {
-                assert!(slugs.contains(node), "edge names undeclared node {node}");
-                assert!(slugs.contains(dep), "edge names undeclared dep {dep}");
-                assert_ne!(node, dep, "self-edge");
-                *inbound.get_mut(node).unwrap() += 1;
-            }
-            // Kahn: repeatedly remove zero-inbound nodes; leftovers = cycle.
-            let mut remaining: std::collections::BTreeSet<&str> = slugs.clone();
-            loop {
-                let free: Vec<&str> = remaining
-                    .iter()
-                    .filter(|slug| inbound[**slug] == 0)
-                    .copied()
-                    .collect();
-                if free.is_empty() {
-                    break;
-                }
-                for slug in free {
-                    remaining.remove(slug);
-                    for (node, dep) in workflow.edges {
-                        if *dep == slug && remaining.contains(node) {
-                            *inbound.get_mut(node).unwrap() -= 1;
-                        }
-                    }
-                }
-            }
-            assert!(
-                remaining.is_empty(),
-                "workflow {} edge set has a cycle: {remaining:?}",
-                workflow.id
-            );
-        }
-    }
+    // The registry's shape invariants (unique ids, node bounds, the
+    // Kahn DAG rule, predicate bounds) moved to the definition
+    // validator in `definitions.rs` — `registry_files_byte_parity_
+    // during_the_window` above binds this registry to those validated
+    // files, so the rules still cover every entry here transitively.
 }

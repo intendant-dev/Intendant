@@ -152,6 +152,13 @@ impl AgendaHandle {
         cmd: AgendaCommand,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
+        // Stamp (Track AW) has a graph-shaped twin; the generic op lane
+        // gets the primary item (the hub, or an action's single item).
+        if matches!(cmd, AgendaCommand::Stamp { .. }) {
+            return self
+                .stamp(cmd, actor)
+                .map(|outcome| outcome.primary().clone());
+        }
         Self::authorize_command(&cmd, actor.as_ref())?;
         // Start-now resolves its project HERE, at the tenant edge where the
         // daemon context lives: explicit pick → the parking session's
@@ -304,6 +311,56 @@ impl AgendaHandle {
         }
         self.reminder_nudge.notify_waiters();
         Ok(item)
+    }
+
+    /// Stamp an automation definition (Track AW): the graph-shaped twin
+    /// of [`Self::apply`] for the `stamp` command. Parks and proposes
+    /// only — approval stays the owner's per-effect act (the workflow
+    /// approval sheet batches the clicks through its single pinned
+    /// emitter; an action lands on the ordinary card). Broadcasts every
+    /// touched item and badges the attention rail ONCE for the whole
+    /// instance instead of once per node.
+    pub(crate) fn stamp(
+        &self,
+        cmd: AgendaCommand,
+        actor: Option<AgendaActor>,
+    ) -> Result<super::store::AgendaStampOutcome, AgendaError> {
+        Self::authorize_command(&cmd, actor.as_ref())?;
+        let (mut outcome, counts) = {
+            let mut store = self.lock();
+            let outcome = store.apply_stamp_command(cmd, actor, now_ms())?;
+            let counts = store.counts();
+            (outcome, counts)
+        };
+        if let Some(hub) = outcome.hub.as_mut() {
+            self.decorate_item(hub);
+            self.bus.send(AppEvent::AgendaChanged {
+                item: hub.clone(),
+                counts,
+            });
+        }
+        for node in outcome.nodes.iter_mut() {
+            self.decorate_item(&mut node.item);
+            self.bus.send(AppEvent::AgendaChanged {
+                item: node.item.clone(),
+                counts,
+            });
+        }
+        let manifests = outcome.nodes.len();
+        self.bus.send(AppEvent::UserNotification {
+            session_id: None,
+            id: format!("agenda-effect-{}", outcome.primary().id),
+            title: Some("Stamped automation awaits your approval".to_string()),
+            text: format!(
+                "{} — {manifests} manifest{} proposed; nothing runs unapproved.",
+                outcome.title,
+                if manifests == 1 { "" } else { "s" }
+            ),
+            urgency: crate::types::NotificationUrgency::Attention,
+            ts: now_ms(),
+        });
+        self.reminder_nudge.notify_waiters();
+        Ok(outcome)
     }
 
     /// Emit the rail announcement for an open ask-backed item. `session`
@@ -707,6 +764,55 @@ mod tests {
             )
             .is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stamp_broadcasts_each_item_and_badges_once() {
+        let root = tempfile::tempdir().unwrap();
+        super::super::definitions::materialize_house_definitions(root.path()).unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda);
+        // Stamping parks + proposes, so agent sessions may do it —
+        // approval stays the owner-surface act the existing gate tests
+        // pin.
+        let outcome = handle
+            .stamp(
+                AgendaCommand::Stamp {
+                    definition: "fix-task".into(),
+                    project_root: None,
+                    fire_at_ms: None,
+                    every_ms: None,
+                    suspend_after: None,
+                    agent_config: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-1")),
+            )
+            .unwrap();
+        assert_eq!(outcome.nodes.len(), 4);
+        assert!(outcome.hub.is_some());
+        // Every touched item broadcasts (hub + four nodes); the
+        // attention rail badges ONCE for the whole instance.
+        let mut changed = 0;
+        let mut notified = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::AgendaChanged { .. } => changed += 1,
+                AppEvent::UserNotification { title, .. } => {
+                    notified += 1;
+                    assert_eq!(
+                        title.as_deref(),
+                        Some("Stamped automation awaits your approval")
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(changed, 5);
+        assert_eq!(notified, 1);
     }
 
     fn actor(kind: &str, session: Option<&str>) -> Option<AgendaActor> {
