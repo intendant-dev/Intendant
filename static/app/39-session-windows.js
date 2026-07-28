@@ -475,8 +475,53 @@ function sessionGoalSignature(goal) {
   ].join('\u001f');
 }
 
+// Grid-envelope blocks (catalog-row `agenda` + `boot`, grid_envelope.rs):
+// served precomputed in the one daemon payload — the SPA validates shape
+// and renders, never joins.
+function normalizeSessionAgendaEnvelope(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const itemId = compactSessionText(raw.item_id || raw.itemId);
+  if (!itemId) return null;
+  const out = { itemId };
+  const itemTitle = compactSessionText(raw.item_title || raw.itemTitle);
+  if (itemTitle) out.itemTitle = itemTitle;
+  const occ = raw.occurrence;
+  if (occ && typeof occ === 'object') {
+    const id = compactSessionText(occ.id);
+    if (id) {
+      out.occurrence = { id };
+      const state = compactSessionText(occ.state);
+      if (state) out.occurrence.state = state.toLowerCase();
+    }
+  }
+  const rawRefs = raw.sealed_inputs ?? raw.sealedInputs;
+  const sealed = (Array.isArray(rawRefs) ? rawRefs : [])
+    .map((ref) => ({
+      locator: String(ref?.locator || ''),
+      sha256: String(ref?.sha256 || ''),
+    }))
+    .filter((ref) => ref.sha256);
+  if (sealed.length) out.sealedInputs = sealed;
+  return out;
+}
+
+function normalizeSessionBootEra(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const era = String(raw.era || '').toLowerCase();
+  if (era !== 'current' && era !== 'preboot') return null;
+  return {
+    era,
+    liveWrapper: raw.live_wrapper === true || raw.liveWrapper === true,
+    ghost: raw.ghost === true,
+  };
+}
+
 function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
+  const agendaEnvelope = normalizeSessionAgendaEnvelope(meta.agenda);
+  if (agendaEnvelope) out.agenda = agendaEnvelope;
+  const bootEra = normalizeSessionBootEra(meta.boot);
+  if (bootEra) out.boot = bootEra;
   const name = compactSessionText(meta.name || meta.display_name || meta.displayName || meta.thread_name || meta.threadName || meta.title);
   if (name) out.name = name;
   const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
@@ -593,6 +638,18 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.relationshipEphemeral === undefined ? '' : (meta.relationshipEphemeral ? '1' : '0'),
     meta.phase || '',
     meta.ended === undefined ? '' : (meta.ended ? '1' : '0'),
+    meta.agenda
+      ? [
+        meta.agenda.itemId,
+        meta.agenda.itemTitle || '',
+        meta.agenda.occurrence?.id || '',
+        meta.agenda.occurrence?.state || '',
+        (meta.agenda.sealedInputs || []).map((ref) => ref.sha256).join(','),
+      ].join('|')
+      : '',
+    meta.boot
+      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}`
+      : '',
   ].join('\u001f');
 }
 
@@ -966,10 +1023,26 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
-  if (label === '7d-overage') return '7-day overage';
+  // Claude's own product wording: the overage window is the paid "extra
+  // usage" allowance, and naming it a variant of "7-day" is what made
+  // two distinct gauges read as one chip rendered twice.
+  if (label === '7d-overage') return '7-day extra usage';
   // Unknown window names arrive as raw provider vocabulary — keep every
   // word (the pane owns the full name), just soften the wire spelling.
   return String(label || '').replace(/_/g, ' ').trim();
+}
+
+// Compact chip form of a window's credential-era account label. The
+// daemon sends `account` only while MORE than one credential era is live
+// for the backend (single-account steady state stays suffix-free), so
+// presence alone means "label this chip apart". Emails compress to their
+// local part — the pane and tooltips keep the full label.
+function vitalsLimitAccountShort(account) {
+  const raw = String(account || '').trim();
+  if (!raw) return '';
+  const at = raw.indexOf('@');
+  const short = at > 0 ? raw.slice(0, at) : raw;
+  return short.length > 14 ? `${short.slice(0, 13)}…` : short;
 }
 
 // Compact chip form of a limit-window label. Known labels pass through;
@@ -980,6 +1053,9 @@ function vitalsLimitLabelLong(label) {
 // the full name stays available in the pane (vitalsLimitLabelLong).
 function vitalsLimitLabelShort(label) {
   const raw = String(label || '').trim();
+  // The 7-day overage window: "extra", never "-overage" — beside the base
+  // "7d" chip the shared prefix + hyphen chain read as a duplicate.
+  if (raw === '7d-overage') return '7d extra';
   // Already-compact daemon labels ("5h", "7d", "30d", "1w").
   if (/^\d+\s*(mo|[smhdw])$/i.test(raw)) return raw.replace(/\s+/g, '');
   const NUMBER_WORDS = {
@@ -1195,6 +1271,10 @@ const VITALS_ICON_PATHS = {
   triangle: '<path d="M12 3 22 20H2Z"/><path d="M12 10v4.5"/><path d="M12 17.5v.5"/>',
   push: '<path d="M12 19V7"/><path d="M7.5 11.5 12 7l4.5 4.5"/><path d="M6 3.5h12"/>',
   gauge: '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/>',
+  // The gauge with a "+" riding its top-right shoulder: the 7-day
+  // overage ("extra usage") window — visibly a sibling of the base
+  // gauge, never its pixel-identical twin.
+  'gauge-plus': '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/><path d="M18.5 3.5v5"/><path d="M16 6h5"/>',
   branch: '<path d="M6 4v11"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M18 8.4v2.2a4 4 0 0 1-4 4H10"/>',
   folder: '<rect x="4" y="4" width="12" height="12" rx="2.5"/><path d="M20 9v8.5A2.5 2.5 0 0 1 17.5 20H9"/>',
   pencil: '<path d="M14.5 5.5l4 4"/><path d="M4 20l1-4.5L15.5 5a2.12 2.12 0 0 1 3 3L8 18.5Z"/>',
@@ -1556,24 +1636,31 @@ const VITALS_SYMBOLS = {
     // window) until the next report. Chips always speak the SHORT window
     // grammar ("▮95% 7d-overage · ↻6:12:03") — a full provider sentence
     // in a header chip is the failure mode; the pane keeps the full name.
-    icon: 'gauge',
+    // The overage ("extra usage") window gets its own glyph: beside the
+    // base 7d chip a pixel-identical gauge is what made two real windows
+    // read as a duplicate.
+    icon: (v) => (String(v.label || '').includes('overage') ? 'gauge-plus' : 'gauge'),
     chip: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}${suffix}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
-      return `${label} ${mark}${reset}`;
+      return `${label} ${mark}${reset}${suffix}`;
     },
     // Fact-line twin of the chip grammar: the gauge icon plus severity
     // color carry what the ⛔/⚠/▮ glyphs said, so the mark is always the
     // provider's word.
     factText: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}`;
-      return `${label} ${v.statusWord}${reset}`;
+      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}${suffix}`;
+      return `${label} ${v.statusWord}${reset}${suffix}`;
     },
     explain: (v) => {
       const lines = [];
@@ -1590,6 +1677,7 @@ const VITALS_SYMBOLS = {
       if (v.reset) lines.push(`The window resets in ${v.reset}${wall ? ` — at ${wall}` : ''}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
+      if (v.account) lines.push(`This window belongs to the “${v.account}” sign-in — sessions running under a different account track their own windows.`);
       if (v.observedAgo) lines.push(`Last provider report: ${v.observedAgo} ago. Windows are account-wide, so any session's report updates this.`);
       return lines;
     },
@@ -1602,6 +1690,91 @@ const VITALS_SYMBOLS = {
       return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ${v.reset}` : ''}`;
     },
   },
+  // ── Grid envelope (catalog-row `agenda` + `boot` blocks, served
+  // precomputed by grid_envelope.rs — one daemon payload, no SPA
+  // joins). Quiet session-facts chips like model/permissions; only a
+  // ghost elevates.
+  'agenda-source': {
+    label: 'Source item',
+    priority: 27,
+    icon: 'bolt',
+    chip: (v) => `⚡ ${v.shortId}`,
+    // Hover = explain[0], so the full title rides the chip tooltip.
+    explain: (v) => [
+      v.title
+        ? `Fired from agenda item “${v.title}”.`
+        : 'Fired from an agenda item (title unavailable — the item may be gone).',
+      `Item id: ${v.itemId}`,
+    ],
+    action: (v) => {
+      const actions = [];
+      if (typeof agendaOpenInspector === 'function') {
+        actions.push({
+          label: 'Open the agenda card',
+          run: () => {
+            if (typeof switchTab === 'function') switchTab('agenda');
+            agendaOpenInspector(v.itemId);
+          },
+        });
+      }
+      actions.push({ label: 'Copy item id', run: () => vitalsCopyText(v.itemId) });
+      return actions;
+    },
+  },
+  'agenda-occurrence': {
+    label: 'Occurrence',
+    priority: 26,
+    icon: (v) => (v.state === 'started' ? 'dots' : v.state === 'completed' ? 'check' : 'triangle'),
+    chip: (v) => `${v.glyph} ${v.state}`,
+    // The occurrence object is the extensible slot: Track AO's
+    // attestation lands beside `state` on the same wire.
+    explain: (v) => [
+      v.state === 'started'
+        ? 'This firing is still running — no terminal record yet.'
+        : `This firing resolved: ${v.state}.`,
+      `Occurrence id: ${v.occurrenceId}`,
+    ],
+    action: (v) => [
+      { label: 'Copy occurrence id', run: () => vitalsCopyText(v.occurrenceId) },
+    ],
+  },
+  'sealed-inputs': {
+    label: 'Sealed inputs',
+    priority: 25,
+    icon: 'shield',
+    chip: (v) => `⛉ ${v.count} sealed`,
+    explain: (v) => [
+      `${v.count} sealed input${v.count === 1 ? '' : 's'} rode this firing — digest-bound copies of what the approval covered.`,
+      ...v.refs.map((ref) => `${ref.name} — sha256 ${ref.shortDigest}`),
+    ],
+    action: (v) => v.refs.map((ref) => ({
+      label: `Copy full sha256 — ${ref.name} (${ref.shortDigest})`,
+      run: () => vitalsCopyText(ref.sha256),
+    })),
+  },
+  boot: {
+    label: 'Boot era',
+    priority: 24,
+    icon: (v) => (v.ghost ? 'slash' : 'clock'),
+    chip: (v) => (v.ghost ? '👻 ghost' : v.era === 'preboot' ? '↻ pre-boot' : '↻ this boot'),
+    explain: (v) => {
+      if (v.ghost) {
+        return [
+          'This session predates the current daemon boot and no live wrapper backs it — a ghost window.',
+          'Closing it is safe; nothing is running behind it.',
+        ];
+      }
+      return [
+        v.era === 'preboot'
+          ? 'This session predates the current daemon boot.'
+          : 'This session belongs to the current daemon boot.',
+        v.liveWrapper
+          ? 'A live wrapper backs it right now.'
+          : 'No live wrapper backs it right now.',
+      ];
+    },
+    brief: (v) => (v.ghost ? 'Ghost — pre-boot, nothing behind it; safe to close' : ''),
+  },
 };
 
 // Fixed display order for chips and the glossary (semantic, not priority:
@@ -1609,7 +1782,8 @@ const VITALS_SYMBOLS = {
 // model + permissions form the session-facts group, right after the live
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
-  'health', 'activity', 'model', 'permissions', 'worktree', 'branch', 'dirty',
+  'health', 'activity', 'model', 'permissions', 'agenda-source',
+  'agenda-occurrence', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -1807,6 +1981,50 @@ function vitalsChipModels(vitals, meta, sessionId) {
     });
   }
 
+  // Grid envelope (the catalog-row `agenda` + `boot` blocks).
+  const agendaMeta = meta?.agenda && typeof meta.agenda === 'object' ? meta.agenda : null;
+  if (agendaMeta?.itemId) {
+    push('agenda-source', 'agenda-source', {
+      itemId: agendaMeta.itemId,
+      shortId: agendaMeta.itemId.length > 12 ? agendaMeta.itemId.slice(0, 12) : agendaMeta.itemId,
+      title: agendaMeta.itemTitle || '',
+    });
+    const occurrence = agendaMeta.occurrence;
+    if (occurrence?.id) {
+      const state = occurrence.state || 'started';
+      push('agenda-occurrence', 'agenda-occurrence', {
+        occurrenceId: occurrence.id,
+        state,
+        glyph: ({ started: '▶', completed: '✓', failed: '✕', missed: '⌀', unknown: '?' })[state] || '▸',
+      }, {
+        tone: state === 'failed' || state === 'unknown' || state === 'missed' ? 'warn' : '',
+      });
+    }
+    const sealedRefs = Array.isArray(agendaMeta.sealedInputs) ? agendaMeta.sealedInputs : [];
+    if (sealedRefs.length) {
+      push('sealed-inputs', 'sealed-inputs', {
+        count: sealedRefs.length,
+        refs: sealedRefs.map((ref) => ({
+          name: String(ref.locator || '').split('/').pop() || 'input',
+          sha256: ref.sha256,
+          // The one short-digest formatter (ui2-agenda.js) — shared,
+          // never re-minted here.
+          shortDigest: agendaShortDigest(ref.sha256),
+        })),
+      });
+    }
+  }
+  const bootMeta = meta?.boot && typeof meta.boot === 'object' ? meta.boot : null;
+  if (bootMeta?.era) {
+    push('boot', 'boot', {
+      era: bootMeta.era,
+      liveWrapper: bootMeta.liveWrapper === true,
+      ghost: bootMeta.ghost === true,
+    }, {
+      severity: bootMeta.ghost ? 'warn' : '',
+    });
+  }
+
   const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
   if (git) {
     const branch = String(git.branch || '').trim();
@@ -1887,6 +2105,10 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const observedAgoSecs = Number.isFinite(observedAt) && observedAt > 0
       ? Math.floor(Date.now() / 1000 - observedAt)
       : null;
+    // Credential-era attribution: present only while the daemon sees
+    // more than one live era for the backend — the cue to suffix the
+    // chip apart from another account's same-named window.
+    const account = String(w?.account || '').trim();
     push('limit', `limit:${label}`, {
       label,
       usedPct,
@@ -1894,6 +2116,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       reset,
       resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
       rolled,
+      account,
       observedAgo: observedAgoSecs !== null && observedAgoSecs > 120
         ? formatActivityElapsed(observedAgoSecs)
         : '',
@@ -1903,7 +2126,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // The countdown ticks in place (cache-ttl pattern): the sig excludes
       // it so the 1 Hz ticker hits the stable-DOM fast path.
       ticking: !!reset,
-      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}`,
+      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}|${account}`,
     });
   }
 
@@ -2027,6 +2250,16 @@ function vitalsAttentionSummary(models) {
   };
 }
 
+// One aria grammar for the attention chip, shared by the build and the
+// 1 Hz in-place ticker so the announced text can never lag the visible
+// countdown.
+function vitalsAttentionAriaLabel(attention) {
+  const top = `${attention.top.label}: ${attention.top.factText || attention.top.text}`;
+  return attention.aggregate
+    ? `${top}, plus ${attention.extra} more — show all vitals`
+    : top;
+}
+
 // Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 //
@@ -2078,15 +2311,19 @@ function renderSessionWindowVitals(win, vitals) {
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
     // Every ticking model updates in place by id — cache-ttl, activity,
-    // and each limit window's exact reset countdown.
+    // and each limit window's exact reset countdown. The aria-label
+    // carries the same countdown text, so it ticks too: a screen reader
+    // must never be read a staler countdown than the one on screen.
     const tickingById = new Map(models.filter((m) => m.ticking).map((m) => [m.id, m]));
     if (tickingById.size) {
       for (const chip of win.vitals.querySelectorAll('.vit-chip')) {
         const model = tickingById.get(chip.dataset.chip || '');
         if (!model) continue;
+        const factText = model.factText || model.text;
         const txt = chip.querySelector('.vit-txt');
-        if (txt) txt.textContent = model.factText || model.text;
+        if (txt) txt.textContent = factText;
         chip.title = model.explainLines[0] || model.label;
+        chip.setAttribute('aria-label', factText ? `${model.label}: ${factText}` : model.label);
       }
     }
     // The attention chip mirrors its top model's text (elapsed/quiet
@@ -2097,6 +2334,7 @@ function renderSessionWindowVitals(win, vitals) {
       const attnTxt = attnChip.querySelector('.vit-txt');
       if (attention && attnTxt && attnTxt.textContent !== attention.factText) {
         attnTxt.textContent = attention.factText;
+        attnChip.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
       }
     }
     return models.some((m) => m.ticking);
@@ -2149,9 +2387,7 @@ function renderSessionWindowVitals(win, vitals) {
     attn.title = attention.aggregate
       ? 'Needs attention — show all vitals'
       : (attention.top.explainLines[0] || attention.top.label);
-    attn.setAttribute('aria-label', attention.aggregate
-      ? `${attention.top.label}: ${attention.top.factText || attention.top.text}, plus ${attention.extra} more — show all vitals`
-      : `${attention.top.label}: ${attention.top.factText || attention.top.text}`);
+    attn.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
     healthNodes.push(attn);
   }
   if (foldedWhenCollapsed > 0) {
@@ -3602,6 +3838,8 @@ function sessionWindowMetaFromSession(session) {
     relationship_kind: session.relationship_kind || session.relationship,
     thread_source: session.thread_source,
     agent_nickname: session.agent_nickname,
+    agenda: session.agenda,
+    boot: session.boot,
   };
   if (
     Object.prototype.hasOwnProperty.call(session, 'goal') ||
@@ -4352,8 +4590,17 @@ function sessionWindowTranscriptContentAliasesForRecord(record = {}) {
     seen.add(content);
     aliases.push(content);
   };
-  add(record.content || record.summary || record.message || '');
+  const raw = String(record.content || record.summary || record.message || '');
+  add(raw);
   add(sessionWindowTranscriptRenderedContentForRecord(record));
+  // A user row carrying the wrapper's supervision addendum also aliases
+  // the prompt net of it, so the wrapper-lane row (always net) and a
+  // backend-native transcript row (addendum-bearing when an older daemon
+  // serves the raw rollout) pair as one delivery instead of rendering
+  // twice. Turn metadata and the near-time bucket still have to agree —
+  // this only removes the appended-boilerplate content skew.
+  const markerAt = raw.indexOf(SESSION_SUPERVISION_ADDENDUM_MARKER);
+  if (markerAt > 0) add(raw.slice(0, markerAt).trimEnd());
   return aliases;
 }
 
@@ -4698,13 +4945,13 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   );
   const existing = new Set();
   for (const item of ensureSessionWindowHistory(win)) {
-    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
+    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true })) {
       existing.add(signature);
     }
   }
   const missing = [];
   for (const record of records) {
-    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
+    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, { includeUserNearTime: true });
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
     // The synthesized completed-terminal row (kind subagent_terminal,
     // served by the task-child hydration lane) and the live "Task

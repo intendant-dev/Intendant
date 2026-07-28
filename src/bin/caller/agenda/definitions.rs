@@ -159,13 +159,15 @@ impl DefinitionNode {
 #[derive(Debug, Clone)]
 pub(crate) struct AutomationDefinition {
     pub(crate) name: String,
-    // The four spec surfaces below are catalog copy: parsed and
-    // bounds-checked today, served by the slice-2 catalog lane (their
-    // reader). Allowed dead until that lane lands.
-    #[allow(dead_code)]
+    /// Spec description — served by the catalog.
     pub(crate) description: String,
     /// Display title: `metadata.title`, else the name.
     pub(crate) title: String,
+    // The three spec surfaces below are parsed and bounds-checked (spec
+    // conformance is the validator's law) but deliberately unserved in
+    // v1 — future catalog/sheet vocabulary, additive whenever a surface
+    // wants them (N4 reconcile: re-scoped from the closed slice-2
+    // reader note).
     #[allow(dead_code)]
     pub(crate) metadata: Vec<(String, String)>,
     #[allow(dead_code)]
@@ -193,10 +195,11 @@ impl AutomationDefinition {
     }
 
     /// `relies_on` flattened as (node, dependency) pairs, declaration
-    /// order — the registry's edge vocabulary. The parity/window tests
-    /// read it today; the slice-2 catalog serializes it (its non-test
-    /// reader). Allowed dead until that lane lands.
-    #[allow(dead_code)]
+    /// order — test vocabulary only: the wire serves per-node
+    /// `relies_on` (the same edge information in prefill shape), and
+    /// the registry parity tests that read this died at the cutover
+    /// (N4 reconcile: dropped to test scope).
+    #[cfg(test)]
     pub(crate) fn edges(&self) -> Vec<(String, String)> {
         self.nodes
             .iter()
@@ -310,6 +313,179 @@ pub(crate) fn resolve_definition(
          (automations/{selector}/SKILL.md under the state root) and the \
          materialized house set"
     ))
+}
+
+// ---- The served catalog (slice 2) ----
+
+/// One node's catalog surface — the Automate sheet's prefill material.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CatalogNode {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) relies_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) every_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suspend_after: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trigger_kind: Option<super::types::AgendaKind>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) trigger_tags: Vec<String>,
+}
+
+/// One catalog entry: a discovered definition with its validation state.
+/// Invalid entries list with their refusal reason instead of vanishing
+/// (the skills skip-don't-die posture, made visible); a shadowed house
+/// entry stays listed with `shadowed:true` so a shadow is never silent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DefinitionCatalogEntry {
+    pub(crate) name: String,
+    pub(crate) provenance: &'static str,
+    pub(crate) shadowed: bool,
+    pub(crate) valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) advisories: Vec<String>,
+    pub(crate) workflow: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) orientation: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) nodes: Vec<CatalogNode>,
+    /// The full definition text — what a stamp of this entry would seal
+    /// (read from the same path the stamp lane resolves).
+    pub(crate) text: String,
+    pub(crate) path: String,
+}
+
+/// Assemble the served catalog: the personal library plus the
+/// materialized house set, each parsed by the one validator. Reads the
+/// SAME paths the stamp lane resolves, so the catalog never describes a
+/// file a stamp would not seal. Discovery grants nothing — bindingness
+/// requires the stamp seal under an approval digest.
+pub(crate) fn definition_catalog(state_root: &Path) -> Vec<DefinitionCatalogEntry> {
+    let mut entries: Vec<DefinitionCatalogEntry> = Vec::new();
+    let mut personal_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Ok(dir) = std::fs::read_dir(automations_dir_in(state_root)) {
+        let mut dirs: Vec<PathBuf> = dir
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        for dir_path in dirs {
+            let Some(name) = dir_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            // Non-slug directories (`.house` among them) are not
+            // personal definitions.
+            if !valid_slug(&name) {
+                continue;
+            }
+            let skill = dir_path.join("SKILL.md");
+            if !skill.is_file() {
+                continue;
+            }
+            personal_names.insert(name.clone());
+            entries.push(catalog_entry(
+                &skill,
+                &name,
+                DefinitionProvenance::Personal,
+                false,
+            ));
+        }
+    }
+    for (name, _) in HOUSE_DEFINITIONS {
+        let path = house_dir_in(state_root).join(name).join("SKILL.md");
+        entries.push(catalog_entry(
+            &path,
+            name,
+            DefinitionProvenance::House,
+            personal_names.contains(*name),
+        ));
+    }
+    // Name order; the active entry before its shadowed house twin.
+    entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.shadowed.cmp(&b.shadowed)));
+    entries
+}
+
+fn catalog_entry(
+    path: &Path,
+    name: &str,
+    provenance: DefinitionProvenance,
+    shadowed: bool,
+) -> DefinitionCatalogEntry {
+    let invalid = |reason: String, text: String| DefinitionCatalogEntry {
+        name: name.to_string(),
+        provenance: provenance.as_str(),
+        shadowed,
+        valid: false,
+        reason: Some(reason),
+        title: None,
+        description: None,
+        advisories: Vec::new(),
+        workflow: false,
+        orientation: None,
+        nodes: Vec::new(),
+        text,
+        path: path.display().to_string(),
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => return invalid(format!("unreadable: {err}"), String::new()),
+    };
+    match parse_definition(&text, name) {
+        Ok(def) => DefinitionCatalogEntry {
+            name: def.name.clone(),
+            provenance: provenance.as_str(),
+            shadowed,
+            valid: true,
+            reason: None,
+            title: Some(def.title.clone()),
+            description: Some(def.description.clone()),
+            advisories: def.advisories.clone(),
+            workflow: def.is_workflow(),
+            orientation: (!def.orientation.is_empty()).then(|| def.orientation.clone()),
+            nodes: def
+                .nodes
+                .iter()
+                .map(|node| CatalogNode {
+                    id: node.id.clone(),
+                    title: node.title.clone(),
+                    agent: node.agent.clone(),
+                    model: node.model.clone(),
+                    effort: node.effort.clone(),
+                    relies_on: node.relies_on.clone(),
+                    every_ms: node.cadence.as_ref().map(|c| c.every_ms),
+                    suspend_after: node.cadence.as_ref().and_then(|c| c.suspend_after),
+                    trigger_kind: node.trigger.as_ref().map(|t| t.item_kind),
+                    trigger_tags: node
+                        .trigger
+                        .as_ref()
+                        .map(|t| t.tags.clone())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            text,
+            path: path.display().to_string(),
+        },
+        Err(reason) => invalid(reason, text),
+    }
 }
 
 // ---- Parsing + validation (one validator, every call site) ----
@@ -1099,6 +1275,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn definition_catalog_lists_house_personal_and_invalid_entries() {
+        let root = tempfile::tempdir().unwrap();
+        materialize_house_definitions(root.path()).unwrap();
+        // Baseline: the whole house set, valid, house-chipped.
+        let catalog = definition_catalog(root.path());
+        assert_eq!(catalog.len(), HOUSE_DEFINITIONS.len());
+        assert!(catalog
+            .iter()
+            .all(|e| e.valid && e.provenance == "house" && !e.shadowed));
+        let fix = catalog.iter().find(|e| e.name == "fix-task").unwrap();
+        assert!(fix.workflow);
+        assert_eq!(fix.nodes.len(), 4);
+        assert_eq!(fix.nodes[1].relies_on, vec!["investigate".to_string()]);
+        assert!(fix.orientation.is_some());
+        let triage = catalog.iter().find(|e| e.name == "triage").unwrap();
+        assert!(!triage.workflow);
+        assert_eq!(triage.nodes[0].every_ms, Some(7 * 24 * 60 * 60 * 1000));
+        let steward = catalog.iter().find(|e| e.name == "steward-gate").unwrap();
+        assert_eq!(
+            steward.nodes[0].trigger_kind,
+            Some(super::super::types::AgendaKind::Question)
+        );
+        assert_eq!(steward.nodes[0].trigger_tags, vec!["gate".to_string()]);
+        assert!(catalog.iter().all(|e| !e.text.is_empty()));
+
+        // A personal definition shadows its house twin VISIBLY: both
+        // list, the personal entry first, the house one flagged.
+        let personal = automations_dir_in(root.path()).join("triage");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(personal.join("SKILL.md"), HOUSE_DEFINITIONS[0].1).unwrap();
+        // An invalid personal definition lists with its reason instead of
+        // vanishing (skip-don't-die, visible).
+        let broken = automations_dir_in(root.path()).join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join("SKILL.md"),
+            "---\nname: broken\ndescription: d\nshape: action\n---\n\n## node: broken\n\n```toml\n```\n\nP.\n",
+        )
+        .unwrap();
+        let catalog = definition_catalog(root.path());
+        assert_eq!(catalog.len(), HOUSE_DEFINITIONS.len() + 2);
+        let triage_entries: Vec<_> = catalog.iter().filter(|e| e.name == "triage").collect();
+        assert_eq!(triage_entries.len(), 2);
+        assert_eq!(triage_entries[0].provenance, "personal");
+        assert!(!triage_entries[0].shadowed);
+        assert_eq!(triage_entries[1].provenance, "house");
+        assert!(triage_entries[1].shadowed);
+        let broken_entry = catalog.iter().find(|e| e.name == "broken").unwrap();
+        assert!(!broken_entry.valid);
+        assert!(
+            broken_entry
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("shape")),
+            "{:?}",
+            broken_entry.reason
+        );
     }
 
     #[test]

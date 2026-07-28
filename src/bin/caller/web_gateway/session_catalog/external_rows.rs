@@ -213,6 +213,11 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
         ("pi_model", "pi_model"),
         ("pi_thinking", "pi_thinking"),
         ("pi_allowed_tools", "pi_allowed_tools"),
+        // The grid envelope's serve-time blocks (agenda linkage + boot
+        // era) ride the wrapper row and must survive the collapse into
+        // the backend's native row.
+        ("agenda", "agenda"),
+        ("boot", "boot"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());

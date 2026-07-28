@@ -376,6 +376,9 @@ pub(crate) fn spawn_mode_web_gateway(
                     // request_occurrence) refuse while draining.
                     .with_handover(handover.clone()),
             );
+            // Read-side seam for lanes outside the state graph (the
+            // session catalog's grid-envelope join).
+            crate::agenda::publish_agenda_handle(handle.clone());
             // Detaches on drop like the mode listeners; one per daemon.
             let _scheduler =
                 crate::agenda::spawn_reminder_scheduler(handle.clone(), Some(handover.clone()));

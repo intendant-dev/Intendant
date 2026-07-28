@@ -974,6 +974,17 @@ body.context-focus-active {
     0 0 0 1px color-mix(in srgb, var(--session-badge-border, color-mix(in srgb, var(--blue) 62%, transparent)) 30%, transparent),
     0 0 18px color-mix(in srgb, var(--session-badge-fg, var(--blue)) 26%, transparent);
 }
+/* Grid envelope's ghost state (served bit: pre-boot + no live wrapper —
+   safe to close). Last in the border-modifier chain so a ghost reads as
+   a ghost even when other window states apply: dashed peach frame,
+   tinted wash, desaturated content — unmistakable, not screaming. */
+.session-window.session-window-ghost {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--peach) 65%, var(--surface1));
+  background: color-mix(in srgb, var(--peach) 5%, var(--session-window-bg));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--peach) 22%, transparent);
+  filter: saturate(0.65);
+}
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;

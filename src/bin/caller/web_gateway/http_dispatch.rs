@@ -1254,6 +1254,47 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaDefinitions => {
+                return handle_agenda_definitions(
+                    stream,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AgendaSealed => {
+                // The row's `{sha256}` capture.
+                let sha256 = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return handle_agenda_sealed(
+                    stream,
+                    sha256,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AgendaStamp => {
+                // The authenticated edge: the pre-dispatch IAM gate bound
+                // this principal; no token names a session on this lane.
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_agenda_stamp(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    crate::agenda::AgendaActor::from_binding(&actor),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::MemorySearch => {
                 return handle_memory_search(
                     stream,

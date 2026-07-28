@@ -268,6 +268,18 @@ pub enum AppEvent {
     ReloadBackendCredentials {
         session_id: Option<String>,
     },
+    /// A dashboard sign-in ceremony for an external backend completed:
+    /// the credential store now holds `account`'s credentials (`None`
+    /// when the provider's status probe stated no label). `source` is the
+    /// backend-kind vocabulary (`AgentBackend::as_short_str`). The vitals
+    /// hub consumes this to open a new credential era for the backend —
+    /// sessions spawned or credential-reloaded from here on report their
+    /// rate-limit windows under the new account instead of overwriting
+    /// the old one's.
+    BackendCredentialAccount {
+        source: String,
+        account: Option<String>,
+    },
     /// User requested that a managed session stop completely. External-agent
     /// loops listen for this and shut down their backend process.
     SessionStopRequested {
@@ -2940,6 +2952,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
         }),
         AppEvent::SessionStopRequested { .. } => None,
+        // Hub-internal era signal; frontends see the outcome through the
+        // ordinary SessionVitals emissions the fold re-mirrors.
+        AppEvent::BackendCredentialAccount { .. } => None,
         // Loop-internal respawn signal; frontends follow the reload through
         // LogEntry lines and session lifecycle events.
         AppEvent::ReloadBackendCredentials { .. } => None,

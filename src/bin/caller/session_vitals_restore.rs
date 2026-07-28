@@ -142,37 +142,42 @@ impl SessionVitalsHub {
             });
         }
         // Membership last, so the mirrored account-limit emission (if
-        // any) already carries the sections filled above.
+        // any) already carries the sections filled above. Restored
+        // sessions join the source's CURRENT era — the credential store
+        // survives a daemon restart unchanged, so the persisted era is
+        // the honest attribution for whatever these sessions report next.
         if let Some(source) = source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let canonical = self.resolve(session_id);
             if !canonical.is_empty() {
-                self.session_sources
-                    .lock()
-                    .expect("vitals source lock")
-                    .insert(canonical, source.to_string());
-                // An empty report mirrors the account's known windows into
+                self.record_membership(&canonical, source);
+                // An empty report re-mirrors the era's known windows into
                 // the newly joined member (the `link_identity` pattern).
                 self.apply_rate_limit_windows(session_id, Vec::new());
             }
         }
     }
 
-    /// Persist the account rate-limit window store to the hub's state
-    /// file, if one is configured. Serialization happens under the lock
-    /// (the store is a handful of windows); the write itself is handed to
-    /// the blocking pool when a runtime is present, falling back to an
-    /// inline write in plain-sync callers (tests).
+    /// Persist the account rate-limit window store — era-keyed windows
+    /// plus the current-era registry — to the hub's state file, if one is
+    /// configured. Serialization happens under the locks (the store is a
+    /// handful of windows); the write itself is handed to the blocking
+    /// pool when a runtime is present, falling back to an inline write in
+    /// plain-sync callers (tests).
     pub(crate) fn persist_account_limits(&self) {
         let Some(path) = self.limit_store.clone() else {
             return;
         };
-        let snapshot = self
+        let limits = self
             .account_limits
             .lock()
             .expect("vitals account lock")
             .clone();
+        let (current, era_seq) = {
+            let eras = self.backend_accounts.lock().expect("vitals era lock");
+            (eras.current.clone(), eras.seq)
+        };
         let write = move || {
-            if let Err(err) = persist_account_limit_store(&path, &snapshot) {
+            if let Err(err) = persist_account_limit_store(&path, &limits, &current, era_seq) {
                 eprintln!("Session vitals: account limit store write failed: {err}");
             }
         };
@@ -190,17 +195,42 @@ impl SessionVitalsHub {
 
 /// Store format version this daemon writes. Readers accept exactly this
 /// major shape; unknown FIELDS anywhere are ignored (additive evolution
-/// needs no bump), while a future breaking shape bumps the version and
-/// this reader fails closed to an empty store (windows re-learn on the
-/// next provider report — honest, never corrupting).
+/// needs no bump — the credential-era fields below rode in that way,
+/// and account-less files from before them load as the unattributed
+/// era), while a future breaking shape bumps the version and this
+/// reader fails closed to an empty store (windows re-learn on the next
+/// provider report — honest, never corrupting).
 const ACCOUNT_LIMIT_STORE_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AccountLimitStoreFile {
     version: u32,
-    /// Backend source → that account's windows (label-keyed map flattened
-    /// to a list on disk; labels re-key on load).
+    /// Backend source → its windows across every era (each window's
+    /// `account` stamp is its era; era-and-label re-key on load; the
+    /// label-keyed maps flatten to a list on disk).
     accounts: BTreeMap<String, Vec<SessionLimitWindow>>,
+    /// Backend source → the current era's account label. Absent entries
+    /// (and files from before this field) mean the unattributed era is
+    /// current.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    current_accounts: BTreeMap<String, String>,
+    /// Mint counter for label-less eras ("era-N") — persisted so a
+    /// restart can never re-mint a live era's name.
+    #[serde(default, skip_serializing_if = "era_seq_is_zero")]
+    era_seq: u64,
+}
+
+fn era_seq_is_zero(seq: &u64) -> bool {
+    *seq == 0
+}
+
+/// The persisted store, decoded: era-keyed windows plus the current-era
+/// registry, exactly the hub fields they hydrate.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct AccountLimitStoreState {
+    pub(crate) limits: HashMap<String, crate::session_vitals::SourceLimitEras>,
+    pub(crate) current: HashMap<String, crate::session_vitals::AccountEra>,
+    pub(crate) era_seq: u64,
 }
 
 /// Production location of the account rate-limit window store.
@@ -208,48 +238,108 @@ pub(crate) fn account_limit_store_path() -> PathBuf {
     crate::platform::intendant_home().join("account-rate-limits.json")
 }
 
+/// An era bucket whose EVERY window's provider-stated reset has passed
+/// is a corpse: nothing will refresh it (its reporters are gone or
+/// re-keyed), and each entry describes a window that no longer exists.
+/// Applied at load and persist so corpses never resurrect through the
+/// restore hydrator. Windows that never stated a reset keep the bucket
+/// alive — nothing proves them stale.
+pub(crate) fn era_bucket_lapsed(
+    store: &BTreeMap<String, SessionLimitWindow>,
+    now_epoch: u64,
+) -> bool {
+    !store.is_empty()
+        && store
+            .values()
+            .all(|window| matches!(window.resets_at_epoch, Some(resets) if resets <= now_epoch))
+}
+
+fn now_epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Load the persisted per-account window store. Missing file, parse
 /// failures, and future-versioned files all read as empty — the store is
-/// a warm-start convenience, never load-bearing state.
-pub(crate) fn load_account_limit_store(
-    path: &Path,
-) -> HashMap<String, BTreeMap<String, SessionLimitWindow>> {
+/// a warm-start convenience, never load-bearing state. Windows group
+/// into era buckets by their `account` stamp (absent = the unattributed
+/// era, which is how pre-era files load), and fully-lapsed era buckets
+/// expire here instead of rehydrating.
+pub(crate) fn load_account_limit_store(path: &Path) -> AccountLimitStoreState {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return HashMap::new();
+        return AccountLimitStoreState::default();
     };
     let Ok(file) = serde_json::from_str::<AccountLimitStoreFile>(&raw) else {
-        return HashMap::new();
+        return AccountLimitStoreState::default();
     };
     if file.version != ACCOUNT_LIMIT_STORE_VERSION {
-        return HashMap::new();
+        return AccountLimitStoreState::default();
     }
-    file.accounts
+    let now = now_epoch_seconds();
+    let limits: HashMap<String, crate::session_vitals::SourceLimitEras> = file
+        .accounts
         .into_iter()
         .map(|(source, windows)| {
-            let store: BTreeMap<String, SessionLimitWindow> = windows
-                .into_iter()
-                .filter(|window| !window.label.trim().is_empty())
-                .map(|window| (window.label.trim().to_string(), window))
-                .collect();
-            (source, store)
+            let mut eras = crate::session_vitals::SourceLimitEras::default();
+            for window in windows {
+                let label = window.label.trim().to_string();
+                if label.is_empty() {
+                    continue;
+                }
+                eras.entry(window.account.clone())
+                    .or_default()
+                    .insert(label, window);
+            }
+            eras.retain(|_, store| !era_bucket_lapsed(store, now));
+            (source, eras)
         })
-        .filter(|(source, store)| !source.trim().is_empty() && !store.is_empty())
-        .collect()
+        .filter(|(source, eras)| !source.trim().is_empty() && !eras.is_empty())
+        .collect();
+    AccountLimitStoreState {
+        limits,
+        current: file
+            .current_accounts
+            .into_iter()
+            .filter(|(source, label)| !source.trim().is_empty() && !label.trim().is_empty())
+            .map(|(source, label)| (source, Some(label)))
+            .collect(),
+        era_seq: file.era_seq,
+    }
 }
 
 /// Atomically write the account window store (temp file + rename via the
 /// shared helper). Windows persist exactly as reported — `used_pct`
-/// stays absent when the provider never stated one.
+/// stays absent when the provider never stated one — and fully-lapsed
+/// era buckets are dropped at the write, the persist half of
+/// [`era_bucket_lapsed`].
 pub(crate) fn persist_account_limit_store(
     path: &Path,
-    accounts: &HashMap<String, BTreeMap<String, SessionLimitWindow>>,
+    accounts: &HashMap<String, crate::session_vitals::SourceLimitEras>,
+    current: &HashMap<String, crate::session_vitals::AccountEra>,
+    era_seq: u64,
 ) -> Result<(), String> {
+    let now = now_epoch_seconds();
     let file = AccountLimitStoreFile {
         version: ACCOUNT_LIMIT_STORE_VERSION,
         accounts: accounts
             .iter()
-            .map(|(source, store)| (source.clone(), store.values().cloned().collect()))
+            .map(|(source, eras)| {
+                let windows: Vec<SessionLimitWindow> = eras
+                    .iter()
+                    .filter(|(_, store)| !era_bucket_lapsed(store, now))
+                    .flat_map(|(_, store)| store.values().cloned())
+                    .collect();
+                (source.clone(), windows)
+            })
+            .filter(|(_, windows)| !windows.is_empty())
             .collect(),
+        current_accounts: current
+            .iter()
+            .filter_map(|(source, era)| era.as_ref().map(|label| (source.clone(), label.clone())))
+            .collect(),
+        era_seq,
     };
     let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
@@ -1483,52 +1573,188 @@ mod tests {
         );
     }
 
-    /// The account limit store round-trips through its state file,
-    /// tolerates unknown fields (additive forward-compat), fails closed
-    /// on a future version, and never invents percentages.
+    /// A reset epoch safely in the future for fixtures that must survive
+    /// the load/persist lapsed-bucket reap (year 2096).
+    const FUTURE_RESET: u64 = 4_000_000_000;
+
+    fn era_window(
+        label: &str,
+        account: Option<&str>,
+        resets_at_epoch: Option<u64>,
+    ) -> SessionLimitWindow {
+        SessionLimitWindow {
+            label: label.into(),
+            used_pct: None,
+            resets_at_epoch,
+            status: Some("allowed_warning".into()),
+            observed_at_epoch: Some(1_784_499_000),
+            account: account.map(str::to_string),
+        }
+    }
+
+    /// The account limit store round-trips through its state file —
+    /// windows era-keyed by their `account` stamp, plus the current-era
+    /// registry and mint counter — tolerates unknown fields (additive
+    /// forward-compat), fails closed on a future version, and never
+    /// invents percentages.
     #[test]
     fn limit_store_round_trip_and_forward_compat() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("account-rate-limits.json");
-        let mut accounts: HashMap<String, BTreeMap<String, SessionLimitWindow>> = HashMap::new();
-        let mut store = BTreeMap::new();
-        store.insert(
-            "5h".to_string(),
-            SessionLimitWindow {
-                label: "5h".into(),
-                used_pct: None,
-                resets_at_epoch: Some(1_784_503_200),
-                status: Some("allowed_warning".into()),
-                observed_at_epoch: Some(1_784_499_000),
-            },
-        );
-        accounts.insert("claude-code".to_string(), store);
-        persist_account_limit_store(&path, &accounts).expect("persist");
+        let mut accounts: HashMap<String, crate::session_vitals::SourceLimitEras> = HashMap::new();
+        let mut eras = crate::session_vitals::SourceLimitEras::default();
+        let unattributed = era_window("5h", None, Some(FUTURE_RESET));
+        let labeled = era_window("5h", Some("owner@example.test"), Some(FUTURE_RESET + 60));
+        eras.entry(None)
+            .or_default()
+            .insert("5h".to_string(), unattributed.clone());
+        eras.entry(Some("owner@example.test".to_string()))
+            .or_default()
+            .insert("5h".to_string(), labeled.clone());
+        accounts.insert("claude-code".to_string(), eras);
+        let current: HashMap<String, crate::session_vitals::AccountEra> = HashMap::from([(
+            "claude-code".to_string(),
+            Some("owner@example.test".to_string()),
+        )]);
+        persist_account_limit_store(&path, &accounts, &current, 3).expect("persist");
 
         let loaded = load_account_limit_store(&path);
-        assert_eq!(loaded, accounts, "round-trip is lossless");
-        let window = &loaded["claude-code"]["5h"];
+        assert_eq!(loaded.limits, accounts, "round-trip is lossless");
+        assert_eq!(loaded.current, current, "current era registry survives");
+        assert_eq!(loaded.era_seq, 3, "era mint counter survives");
+        let window = &loaded.limits["claude-code"][&None]["5h"];
         assert_eq!(window.used_pct, None, "unreported percentage stays absent");
         assert_eq!(window.observed_at_epoch, Some(1_784_499_000));
+        assert_eq!(window.account, None);
+        assert_eq!(
+            loaded.limits["claude-code"][&Some("owner@example.test".to_string())]["5h"].account,
+            Some("owner@example.test".to_string()),
+            "same-label windows of two eras coexist on disk"
+        );
 
-        // Additive forward-compat: unknown fields anywhere are ignored.
+        // Additive forward-compat: unknown fields anywhere are ignored,
+        // and a pre-era file (no account stamps, no current_accounts)
+        // loads as the unattributed era.
         let raw = std::fs::read_to_string(&path).unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         value["future_top_level"] = serde_json::json!({"x": 1});
         value["accounts"]["claude-code"][0]["futureField"] = serde_json::json!(true);
         std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
         let loaded = load_account_limit_store(&path);
-        assert_eq!(loaded["claude-code"]["5h"].label, "5h");
+        assert_eq!(loaded.limits["claude-code"][&None]["5h"].label, "5h");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "accounts": {
+                "claude-code": [
+                    { "label": "5h", "resetsAtEpoch": FUTURE_RESET, "status": "allowed" }
+                ]
+            }
+        });
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let loaded = load_account_limit_store(&path);
+        assert_eq!(
+            loaded.limits["claude-code"][&None]["5h"].status.as_deref(),
+            Some("allowed"),
+            "account-less files load as the unattributed era"
+        );
+        assert!(loaded.current.is_empty());
 
         // A future breaking version fails closed to empty.
         value["version"] = serde_json::json!(2);
         std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
-        assert!(load_account_limit_store(&path).is_empty());
+        assert_eq!(
+            load_account_limit_store(&path),
+            AccountLimitStoreState::default()
+        );
 
         // Missing / corrupt files read as empty.
-        assert!(load_account_limit_store(&dir.path().join("gone.json")).is_empty());
+        assert_eq!(
+            load_account_limit_store(&dir.path().join("gone.json")),
+            AccountLimitStoreState::default()
+        );
         std::fs::write(&path, "{").unwrap();
-        assert!(load_account_limit_store(&path).is_empty());
+        assert_eq!(
+            load_account_limit_store(&path),
+            AccountLimitStoreState::default()
+        );
+    }
+
+    /// The commissioned lapsed-resets rule: an era bucket whose EVERY
+    /// window's provider-stated reset has passed expires at load AND at
+    /// persist, so a switched-out account's corpse can never resurrect
+    /// through the restore hydrator — while a bucket with any live (or
+    /// reset-less) window survives, legacy unattributed eras included.
+    #[test]
+    fn lapsed_resets_expire_at_load_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-rate-limits.json");
+        let mut accounts: HashMap<String, crate::session_vitals::SourceLimitEras> = HashMap::new();
+        let mut eras = crate::session_vitals::SourceLimitEras::default();
+        // Fully-lapsed labeled era: both resets in the past.
+        let mut lapsed = BTreeMap::new();
+        lapsed.insert(
+            "5h".to_string(),
+            era_window("5h", Some("old@x"), Some(1_000)),
+        );
+        lapsed.insert(
+            "7d".to_string(),
+            era_window("7d", Some("old@x"), Some(2_000)),
+        );
+        eras.insert(Some("old@x".to_string()), lapsed);
+        // Live era: one window lapsed, one in the future — survives whole.
+        let mut live = BTreeMap::new();
+        live.insert(
+            "5h".to_string(),
+            era_window("5h", Some("new@x"), Some(1_000)),
+        );
+        live.insert(
+            "7d".to_string(),
+            era_window("7d", Some("new@x"), Some(FUTURE_RESET)),
+        );
+        eras.insert(Some("new@x".to_string()), live.clone());
+        // Reset-less window: nothing proves it stale; the bucket stays.
+        let mut resetless = BTreeMap::new();
+        resetless.insert("req/min".to_string(), era_window("req/min", None, None));
+        eras.insert(None, resetless.clone());
+        accounts.insert("claude-code".to_string(), eras);
+
+        // Persist-side: the lapsed bucket never reaches the file.
+        persist_account_limit_store(&path, &accounts, &HashMap::new(), 0).expect("persist");
+        let loaded = load_account_limit_store(&path);
+        let eras = &loaded.limits["claude-code"];
+        assert!(
+            !eras.contains_key(&Some("old@x".to_string())),
+            "fully-lapsed era dropped at persist"
+        );
+        assert_eq!(eras[&Some("new@x".to_string())], live);
+        assert_eq!(eras[&None], resetless, "reset-less legacy windows survive");
+
+        // Load-side: a file that still carries a fully-lapsed era (written
+        // by an older daemon) drops it at read.
+        let stale = serde_json::json!({
+            "version": 1,
+            "accounts": {
+                "claude-code": [
+                    { "label": "5h", "resetsAtEpoch": 1_000, "status": "allowed", "account": "old@x" },
+                    { "label": "7d", "resetsAtEpoch": FUTURE_RESET, "status": "allowed", "account": "new@x" }
+                ],
+                "codex": [
+                    { "label": "5h", "resetsAtEpoch": 1_000, "status": "allowed" }
+                ]
+            }
+        });
+        std::fs::write(&path, stale.to_string()).unwrap();
+        let loaded = load_account_limit_store(&path);
+        let eras = &loaded.limits["claude-code"];
+        assert!(
+            !eras.contains_key(&Some("old@x".to_string())),
+            "lapsed era dropped at load"
+        );
+        assert!(eras.contains_key(&Some("new@x".to_string())));
+        assert!(
+            !loaded.limits.contains_key("codex"),
+            "a source whose every era lapsed drops entirely"
+        );
     }
 
     /// End-to-end persistence: a report through one hub lands in the
@@ -1552,9 +1778,12 @@ mod tests {
         let window = SessionLimitWindow {
             label: "7d".into(),
             used_pct: None,
-            resets_at_epoch: Some(1_784_900_000),
+            // In the future: a lapsed window would (correctly) be reaped
+            // by the persist/load rule this fixture is not about.
+            resets_at_epoch: Some(FUTURE_RESET),
             status: Some("allowed".into()),
             observed_at_epoch: Some(1_784_499_000),
+            account: None,
         };
         hub.apply_rate_limit_windows("cc-1", vec![window.clone()]);
         // The persist may ride the blocking pool: wait for the file.

@@ -1558,9 +1558,19 @@ function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLen
   return true;
 }
 
+// The window-history dedupe subsystem (the signature sets the append and
+// insert paths consult, and the membership check below) arms the same
+// user-near-time bridge the batch pass (deduplicateSessionWindowHistory)
+// arms: without it, a wrapper-lane and transcript-lane copy of one prompt
+// whose turn metadata disagrees deduped only when a later batch pass
+// happened to run, and a live-appended row rendered as a duplicate until
+// then. Near-time's distinct-repeated-prompts safety bar (<5s, see
+// sessionWindowTranscriptTimeBuckets) already governs the batch pass, so
+// arming appends widens no collapse envelope — it closes the timing hole.
 function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '', options = {}) {
   if (!set) return;
-  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, options)) {
+  const armed = { includeUserNearTime: true, ...options };
+  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, armed)) {
     set.add(signature);
   }
 }
@@ -1619,7 +1629,7 @@ function invalidateSessionWindowHistorySignatureCache(win) {
 
 function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSessionId = '') {
   if (!signatures) return false;
-  const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId);
+  const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true });
   return itemSignatures.length > 0 && itemSignatures.some(signature => signatures.has(signature));
 }
 
@@ -3102,6 +3112,7 @@ function sessionWindowStopAvailability(sessionId) {
   if (terminal) {
     return {
       ok: false,
+      terminal: true,
       reason: 'Session already ended — nothing to stop. Hide the card to dismiss it.',
       toast: 'Session already ended — nothing to stop',
     };
@@ -3122,6 +3133,15 @@ async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   const availability = sessionWindowStopAvailability(sid);
   if (!sid || !availability.ok) {
+    // A Stop aimed at a known-ended session is satisfied, not refused:
+    // the intent behind the click is "make this card go away", so hide
+    // the card here instead of erroring with instructions to hide it
+    // manually.
+    if (sid && availability.terminal) {
+      hideSessionWindowAction(sid);
+      showControlToast('info', 'Session already ended — card closed');
+      return;
+    }
     if (availability.toast) showControlToast('error', availability.toast);
     return;
   }

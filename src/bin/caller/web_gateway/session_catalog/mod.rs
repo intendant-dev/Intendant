@@ -16,6 +16,8 @@ pub(crate) use replay::*;
 mod replay_cache;
 pub(crate) use replay_cache::*;
 mod external_rows;
+
+mod grid_envelope;
 pub(crate) use external_rows::*;
 mod detail_search;
 pub(crate) use detail_search::*;
@@ -968,12 +970,16 @@ pub(crate) fn targeted_intendant_session_rows_from_home(
         }
     }
 
+    // The ids path serves the open grid windows' polls — the envelope
+    // joins attach here too, post row-cache (see `grid_envelope`).
+    let grid_joins = grid_envelope::GridEnvelopeJoins::resolve(home);
     for dir_key in seen_dirs {
         let dir = PathBuf::from(&dir_key);
         let Some(session_id) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
             continue;
         };
-        if let Some(row) = intendant_session_list_row_from_dir(&dir, &session_id) {
+        if let Some(mut row) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            grid_joins.attach(&mut row, &session_id, &dir);
             push_unique_session_row_for_ids(rows, seen, row, requested_ids);
         }
     }
@@ -2537,6 +2543,9 @@ pub(crate) fn list_sessions_from_home_impl(
         return serde_json::to_string(&external_sessions).unwrap_or_else(|_| "[]".to_string());
     }
     let external_context_by_id = external_session_context_by_id(&external_sessions);
+    // Serve-time envelope joins (agenda linkage + boot era), resolved
+    // once per build and attached post row-cache — see `grid_envelope`.
+    let grid_joins = grid_envelope::GridEnvelopeJoins::resolve(home_path);
 
     let mut sessions: Vec<serde_json::Value> = Vec::new();
 
@@ -2575,6 +2584,7 @@ pub(crate) fn list_sessions_from_home_impl(
             .unwrap_or_default();
 
         if let Some(mut wrapper_session) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            grid_joins.attach(&mut wrapper_session, &session_id, &dir);
             index_external_wrapper_session_row(home_path, &wrapper_session);
             apply_external_context_to_intendant_wrapper(
                 &mut wrapper_session,

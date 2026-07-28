@@ -391,6 +391,30 @@ impl LiveSessionRegistry {
         rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         rows
     }
+
+    /// Wrapper-liveness snapshot for the session catalog's boot-era
+    /// join: session ids whose registry entry still holds an open
+    /// follow-up channel — the `live_external_wrapper_for` doctrine
+    /// (`launch.rs`): membership plus the open channel is "this daemon
+    /// still drives it", never phase. Non-blocking because the catalog
+    /// build runs on blocking-pool threads and inside async handlers
+    /// alike: lock contention yields `None` and the caller omits the
+    /// join rather than serve a wrong liveness bit; a gone supervisor
+    /// truthfully reports no live sessions.
+    pub(crate) fn live_wrapper_ids(&self) -> Option<std::collections::HashSet<String>> {
+        let Some(state) = self.state.upgrade() else {
+            return Some(std::collections::HashSet::new());
+        };
+        let guard = state.try_lock().ok()?;
+        Some(
+            guard
+                .sessions
+                .values()
+                .filter(|session| !session.follow_up_tx.is_closed())
+                .map(|session| session.session_id.clone())
+                .collect(),
+        )
+    }
 }
 
 static PUBLISHED_LIVE_SESSION_REGISTRY: std::sync::OnceLock<LiveSessionRegistry> =

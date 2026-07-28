@@ -158,6 +158,10 @@ pub(crate) async fn run_daemon(
     // effective target the dirty chip probes (activity locus included),
     // so the chip and the tab can never state different checkouts.
     session_vitals::publish_git_vitals_targets(&vitals_git_targets);
+    // Sign-in ceremonies announce their outcome on the bus (the vitals
+    // hub's credential-era boundary); same publish-from-startup law as
+    // the registries above so tests' manager use stays silent.
+    crate::auth_ceremony::publish_ceremony_bus(bus.clone());
     // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
     // detection over bus declarations ∪ observed git status (the same
     // registry the vitals prober probes) ∪ open-PR file sets; publishes

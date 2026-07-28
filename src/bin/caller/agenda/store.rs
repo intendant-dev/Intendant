@@ -2288,11 +2288,9 @@ impl StampFields {
 }
 
 /// One stamped node: its parked item (post-propose fold state, carrying
-/// the effect) plus the digest the approval sheet binds. The identity
-/// fields beyond `item` are the wire response's material — the slice-2
-/// stamp route serializes them; the handle reads `item` today.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+/// the effect) plus the digest the approval sheet binds. Serialized by
+/// the `api_agenda_stamp` wire response.
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct StampedNode {
     pub(crate) node_id: String,
     pub(crate) title: String,
@@ -2302,11 +2300,9 @@ pub(crate) struct StampedNode {
 
 /// A whole stamped instance — what the stamp lane returns to the
 /// approval sheet: ordinary items and effects only (no workflow-level
-/// object exists; this is a response shape, not state). The handle
-/// consumes `title`/`hub`/`nodes` today; the rest is the slice-2 wire
-/// response's material.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+/// object exists; this is a response shape, not state). Serialized by
+/// the `api_agenda_stamp` wire response.
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct AgendaStampOutcome {
     pub(crate) definition: String,
     pub(crate) title: String,
@@ -5593,6 +5589,33 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&second_blob).unwrap(), edited);
         assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
+    }
+
+    /// Steward N1 (slice-1 gate): the deleted registry invariants used
+    /// to check at CI time that shipped defaults respect the intake
+    /// floors; under one-authority that check moved to stamp time — so
+    /// stamp EVERY house definition through the real intake here, and a
+    /// shipped default that the intake would refuse fails the suite
+    /// again instead of failing at the owner's first stamp.
+    #[test]
+    fn house_definitions_stamp_through_the_real_intake() {
+        for (name, _) in super::super::definitions::HOUSE_DEFINITIONS {
+            let (_root, mut store) = stamp_rig();
+            let outcome = store
+                .apply_stamp_command(stamp_cmd(name), owner(), 5000)
+                .unwrap_or_else(|err| panic!("house definition {name} refused at stamp: {err}"));
+            assert!(!outcome.nodes.is_empty(), "{name} stamped no nodes");
+            for node in &outcome.nodes {
+                assert!(
+                    node.item
+                        .effects
+                        .first()
+                        .is_some_and(|e| e.approval.is_none()),
+                    "{name}/{} must propose unapproved",
+                    node.node_id
+                );
+            }
+        }
     }
 
     #[test]

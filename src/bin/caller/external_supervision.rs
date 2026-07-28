@@ -1424,14 +1424,27 @@ pub(crate) enum DrainOutcome {
     },
     /// The turn ended rejected at a provider usage limit
     /// ([`external_agent::AgentEvent::TurnLimitRejected`]). The backend
-    /// process stays usable, but the round did no work: the caller must
-    /// consume no round budget and must NOT immediately re-fire —
-    /// instead it parks the pending follow-up until `resets_at_epoch`
-    /// (plus jitter; exponential backoff when absent) and queues user
-    /// input arriving meanwhile.
+    /// process stays usable; the caller must consume no round budget and
+    /// must NOT immediately re-fire — instead it parks the pending
+    /// follow-up until `resets_at_epoch` (plus jitter; exponential
+    /// backoff when absent) and queues user input arriving meanwhile.
+    ///
+    /// `turn_had_started` is the park's delivery awareness: `false` is
+    /// the classic instant-rejection shape (the round did no work; the
+    /// driving message never reached the model, so the park re-sends it
+    /// verbatim — true at-least-once). `true` means the drain observed
+    /// primary-turn work (assistant output, tool activity, a completed
+    /// turn) before the rejection: the backend consumed — and, for
+    /// backends with persistent rollouts, durably recorded — the driving
+    /// message, so re-sending it would put the goal in the conversation
+    /// twice ([`limit_park_pending`] parks a resume nudge instead;
+    /// observed live 2026-07-28, session 800e6f58: a five_hour rejection
+    /// ~90s into the first turn re-sent the whole goal at reset, and the
+    /// backend re-read its entire mandate).
     LimitRejected {
         resets_at_epoch: Option<u64>,
         message: Option<String>,
+        turn_had_started: bool,
     },
 }
 
@@ -1490,6 +1503,58 @@ pub(crate) fn limit_park_delay(
 pub(crate) struct LimitParkState {
     pub(crate) resume_at: tokio::time::Instant,
     pub(crate) pending: Option<FollowUpMessage>,
+}
+
+/// A continuation for a turn the backend had already STARTED when it was
+/// cut mid-flight. The turn's driving message is in the backend's
+/// conversation (Claude Code persists it to the rollout at delivery), so
+/// the safe continuation is a short nudge naming the cause — never a
+/// re-send of the original message, which would double it and make the
+/// backend re-read its whole mandate. `None` when the turn never started:
+/// the caller keeps its lane's never-delivered behavior (the rate-limit
+/// park re-sends the full rejected message; the credential-reload respawn
+/// queues nothing). Both mid-turn lanes ride this one constructor — the
+/// reload respawn's synthesized continuation
+/// (`external_mode::RELOAD_MIDTURN_CONTINUATION_TEXT`) and the limit
+/// park's resume nudge ([`LIMIT_MIDTURN_CONTINUATION_TEXT`]) — one seam
+/// for the delivery-aware decision, never two copies.
+pub(crate) fn midturn_continuation(text: &str, turn_had_started: bool) -> Option<FollowUpMessage> {
+    turn_had_started.then(|| FollowUpMessage::text(text.to_string()))
+}
+
+/// The resume nudge a rate-limit park re-sends when the provider limit
+/// rejected a turn the backend had already started (see
+/// [`limit_park_pending`]).
+pub(crate) const LIMIT_MIDTURN_CONTINUATION_TEXT: &str =
+    "A provider rate limit interrupted the previous turn mid-stream; the limit has reset — \
+     continue where you left off. Do not expect the interrupted message to be re-sent: it is \
+     already in this conversation.";
+
+/// The message a rate-limit park re-sends at reset — delivery-aware, and
+/// the one seam both park lanes (the supervised external-mode loop and
+/// the persistent daemon lane) construct their pending from. When the
+/// rejected round never started at the backend, the park pends `rejected`
+/// itself (the merged text with its original attachments — the message
+/// truly was never delivered). When the round HAD started, the park pends
+/// a [`midturn_continuation`] resume nudge instead, inheriting the
+/// rejected message's follow-up/steer ids so a user cancel during the
+/// park cancels the resume exactly like it cancels a full re-send; the
+/// nudge deliberately carries none of the rejected message's attachments
+/// or edit/rewind directives — those were already applied when the turn
+/// started, and re-playing an edit rollback would rewind the backend a
+/// second time.
+pub(crate) fn limit_park_pending(
+    rejected: FollowUpMessage,
+    turn_had_started: bool,
+) -> FollowUpMessage {
+    match midturn_continuation(LIMIT_MIDTURN_CONTINUATION_TEXT, turn_had_started) {
+        Some(mut nudge) => {
+            nudge.follow_up_id = rejected.follow_up_id;
+            nudge.steer_id = rejected.steer_id;
+            nudge
+        }
+        None => rejected,
+    }
 }
 
 /// The session-log/activity row announcing a park. One place so the two
@@ -1632,6 +1697,82 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rejected_park_message() -> FollowUpMessage {
+        let mut rejected = FollowUpMessage::text("the whole goal, re-merged".to_string());
+        rejected.follow_up_id = Some("f-goal".to_string());
+        rejected.steer_id = Some("s-goal".to_string());
+        rejected.edit_user_turn_index = Some(3);
+        rejected.edit_user_turn_revision = Some(1);
+        rejected.edit_original_text = Some("original".to_string());
+        rejected
+            .claude_inplace_rewind_targets
+            .push("uuid-1".to_string());
+        rejected
+    }
+
+    /// Pin `full_resend_only_when_never_delivered`: an instant rejection
+    /// (the backend never engaged the message) parks the rejected
+    /// message verbatim — text, ids, and edit/rewind directives intact —
+    /// because the delivery truly never happened.
+    #[test]
+    fn full_resend_only_when_never_delivered() {
+        let rejected = rejected_park_message();
+        let pending = limit_park_pending(rejected.clone(), false);
+        assert_eq!(pending.text, rejected.text);
+        assert_eq!(pending.follow_up_id, rejected.follow_up_id);
+        assert_eq!(pending.steer_id, rejected.steer_id);
+        assert_eq!(pending.edit_user_turn_index, Some(3));
+        assert_eq!(
+            pending.claude_inplace_rewind_targets,
+            vec!["uuid-1".to_string()]
+        );
+    }
+
+    /// Pin `resume_nudge_when_turn_had_started` (and
+    /// `park_resend_is_delivery_aware`): a rejection that cut a turn the
+    /// backend had already started parks a short resume nudge — the
+    /// delivered message is already in the backend's conversation, so
+    /// re-flushing it would double the goal (live specimen 2026-07-28,
+    /// session 800e6f58). The nudge inherits the rejected message's
+    /// follow-up/steer ids so the park-elapse cancel check still honors
+    /// a user cancel, and drops attachments and edit/rewind directives —
+    /// those were applied when the turn started.
+    #[test]
+    fn resume_nudge_when_turn_had_started() {
+        let rejected = rejected_park_message();
+        let pending = limit_park_pending(rejected, true);
+        assert_eq!(pending.text, LIMIT_MIDTURN_CONTINUATION_TEXT);
+        assert_eq!(pending.follow_up_id.as_deref(), Some("f-goal"));
+        assert_eq!(pending.steer_id.as_deref(), Some("s-goal"));
+        assert!(pending.attachments.items.is_empty());
+        assert_eq!(pending.edit_user_turn_index, None);
+        assert_eq!(pending.edit_user_turn_revision, None);
+        assert_eq!(pending.edit_original_text, None);
+        assert!(pending.claude_inplace_rewind_targets.is_empty());
+
+        // The park-elapse cancel gate matches the nudge through the
+        // inherited ids: cancelling the original message cancels the
+        // resume, exactly like it cancels a full re-send.
+        let mut cancelled: HashSet<String> = HashSet::from(["f-goal".to_string()]);
+        assert!(crate::external_events::follow_up_message_was_cancelled(
+            &mut cancelled,
+            &pending
+        ));
+    }
+
+    /// Both mid-turn continuation lanes ride [`midturn_continuation`]:
+    /// the started-turn decision ("nudge, never a re-send") has one home
+    /// for the rate-limit park and the credential-reload respawn alike.
+    #[test]
+    fn midturn_continuation_is_the_shared_started_turn_seam() {
+        assert!(midturn_continuation(LIMIT_MIDTURN_CONTINUATION_TEXT, false).is_none());
+        let nudge = midturn_continuation(LIMIT_MIDTURN_CONTINUATION_TEXT, true)
+            .expect("a started turn synthesizes a continuation");
+        assert_eq!(nudge.text, LIMIT_MIDTURN_CONTINUATION_TEXT);
+        assert!(nudge.follow_up_id.is_none());
+        assert!(nudge.steer_id.is_none());
+    }
 
     #[test]
     fn consumed_kimi_anchor_staging_is_not_a_durable_resume_pin() {

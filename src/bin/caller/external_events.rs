@@ -30,6 +30,50 @@ pub(crate) fn provider_request_item_count(raw: &serde_json::Value) -> Option<usi
 pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// Interrupt reason minted when a mid-turn `ReloadBackendCredentials`
+/// cuts the live turn (stop semantics). The loop's safe-point respawn
+/// matches on this exact reason to synthesize the continuation that
+/// re-drives the interrupted work — a user-requested interrupt keeps
+/// stop semantics even when a reload rides the same drain.
+pub(crate) const RELOAD_CREDENTIALS_INTERRUPT_REASON: &str = "reloading credentials";
+
+/// Whether an agent event proves the backend ENGAGED the round's driving
+/// message — assistant output, tool activity, plan/diff/file movement, an
+/// interaction request, or a completed turn. This is the rate-limit
+/// park's delivery awareness (`DrainOutcome::LimitRejected
+/// { turn_had_started }`): a rejection with none of these observed is the
+/// instant-rejection shape (the message never reached the model — safe to
+/// re-send verbatim), while a rejection after any of them cut a turn the
+/// backend already consumed the message for. Deliberately excluded:
+/// housekeeping that rides a rejected delivery too (`Log`, `Usage`,
+/// `RateLimitWindows`, `ActivityUpdate`, `ConfigFacts`, the park's own
+/// `GoalUpdated`/`GoalCleared`), identity/lifecycle announcements
+/// (`NativeSessionId`, `CwdAnnounced`, `Terminated`, `BackendError`), the
+/// rejection itself, and `UserMessage` echoes (adapters may surface
+/// queued/injected user rows before the model runs).
+pub(crate) fn agent_event_marks_round_started(event: &external_agent::AgentEvent) -> bool {
+    use external_agent::AgentEvent;
+    matches!(
+        event,
+        AgentEvent::MessageDelta { .. }
+            | AgentEvent::Message { .. }
+            | AgentEvent::Reasoning { .. }
+            | AgentEvent::PlanUpdate { .. }
+            | AgentEvent::SubAgentToolCall { .. }
+            | AgentEvent::ToolStarted { .. }
+            | AgentEvent::ToolOutputDelta { .. }
+            | AgentEvent::ToolCompleted { .. }
+            | AgentEvent::FileActivity { .. }
+            | AgentEvent::VcsActivity { .. }
+            | AgentEvent::CodeChangePublished { .. }
+            | AgentEvent::DiffUpdated { .. }
+            | AgentEvent::ApprovalRequest { .. }
+            | AgentEvent::FileApprovalRequest { .. }
+            | AgentEvent::UserQuestionRequest { .. }
+            | AgentEvent::TurnCompleted { .. }
+    )
+}
+
 /// Time-bounded `interrupt_turn()`. Every call inside the drain must go
 /// through this so an unresponsive backend can't wedge the drain loop itself.
 pub(crate) async fn interrupt_turn_bounded(
@@ -224,6 +268,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     managed_context_density_handoff_completed: bool,
 ) -> DrainOutcome {
     let mut turns_in_round = 0usize;
+    // Delivery awareness for a limit rejection: set once the primary
+    // thread demonstrably engaged this round's driving message (see
+    // `agent_event_marks_round_started`). Round-scoped, never reset
+    // within the drain — any primary work means the delivery was
+    // consumed, even when a later backend-continued turn is the one the
+    // limit rejects.
+    let mut primary_round_started = false;
     let local_session_id = config.session_id.clone();
     let alias_session_id = config.alias_session_id.clone();
     // Track whether we've been asked to interrupt this drain cycle. When the
@@ -504,7 +555,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 });
                                 if !interrupt_pending {
                                     interrupt_pending = true;
-                                    interrupt_reason = "reloading credentials".to_string();
+                                    interrupt_reason =
+                                        RELOAD_CREDENTIALS_INTERRUPT_REASON.to_string();
                                     forward_interrupt_to_backend(agent, config).await;
                                 }
                             }
@@ -1237,6 +1289,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
         } else {
             config
         };
+
+        if event_is_primary && agent_event_marks_round_started(&event) {
+            primary_round_started = true;
+        }
 
         match event {
             external_agent::AgentEvent::NativeSessionId { session_id } => {
@@ -2701,11 +2757,16 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         reason: interrupt_reason.clone(),
                     };
                 }
-                // Terminal immediately — a rejected turn ran nothing, so
-                // no trailing events justify the post-turn grace window.
+                // Terminal immediately — nothing runs after a rejection,
+                // so no trailing events justify the post-turn grace
+                // window. `turn_had_started` tells the park whether the
+                // rejection cut a turn mid-flight (re-send would double
+                // the delivered message) or refused it outright (re-send
+                // is safe).
                 return DrainOutcome::LimitRejected {
                     resets_at_epoch,
                     message,
+                    turn_had_started: primary_round_started,
                 };
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
@@ -3914,12 +3975,150 @@ mod tests {
             DrainOutcome::LimitRejected {
                 resets_at_epoch,
                 message,
+                turn_had_started,
             } => {
                 assert_eq!(resets_at_epoch, Some(1_783_990_800));
                 assert!(message.as_deref().is_some_and(|m| m.contains("limit")));
+                // Pin `full_resend_only_when_never_delivered`: an instant
+                // rejection saw no primary work, so the park may re-send
+                // the message verbatim.
+                assert!(!turn_had_started, "instant rejection did no work");
             }
             _ => panic!("expected LimitRejected, got a different outcome"),
         }
+    }
+
+    /// Pin `park_resend_is_delivery_aware`: a rejection that arrives
+    /// after the primary thread already streamed work (the mid-flight
+    /// shape — live specimen 800e6f58 did ~90s of tool calls before the
+    /// five_hour window cut the turn) reports `turn_had_started`, so the
+    /// park nudges instead of re-sending the delivered message.
+    #[tokio::test]
+    async fn drain_marks_limit_rejection_after_primary_work_as_started() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("native-thread".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("native-thread".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Claude Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+            reload_credentials: None,
+            coordination_declaration: None,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::Message {
+                text: "acknowledged — starting the mandate".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "tool-1".to_string(),
+                tool_name: "Bash".to_string(),
+                preview: "git status".to_string(),
+                message_uuid: None,
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnLimitRejected {
+                resets_at_epoch: Some(1_783_990_800),
+                message: Some("You've hit your session limit".to_string()),
+            })
+            .unwrap();
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        match outcome {
+            DrainOutcome::LimitRejected {
+                turn_had_started, ..
+            } => {
+                assert!(
+                    turn_had_started,
+                    "primary work before the rejection marks the turn started"
+                );
+            }
+            _ => panic!("expected LimitRejected, got a different outcome"),
+        }
+    }
+
+    /// The started-turn discriminator counts only events that prove the
+    /// model/tooling engaged the delivered message — housekeeping that
+    /// also rides an instantly-rejected delivery must not flip it.
+    #[test]
+    fn round_started_marker_ignores_rejection_housekeeping() {
+        use external_agent::AgentEvent;
+        for event in [
+            AgentEvent::Log {
+                level: "warn".to_string(),
+                message: "Rate-limited (five_hour window)".to_string(),
+            },
+            AgentEvent::NativeSessionId {
+                session_id: "800e6f58".to_string(),
+            },
+            AgentEvent::UserMessage {
+                text: "echoed queued prompt".to_string(),
+            },
+        ] {
+            assert!(
+                !agent_event_marks_round_started(&event),
+                "housekeeping event must not mark the round started: {event:?}"
+            );
+        }
+        assert!(agent_event_marks_round_started(&AgentEvent::Message {
+            text: "working".to_string()
+        }));
+        assert!(agent_event_marks_round_started(
+            &AgentEvent::TurnCompleted { message: None }
+        ));
     }
 
     /// Post-upgrade, frontends target the backend-native id; the drain's
