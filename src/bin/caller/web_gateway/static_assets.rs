@@ -777,11 +777,11 @@ mod tests {
         assert!(inspector.contains("Re-proposed since your last approval"));
     }
 
-    /// Track AW slice 3, the automate-sheet half of the emission-shape
-    /// law, retargeted to the generic served-catalog flow (the
-    /// mandate_templates.rs twin of this pin dies with the registry at
-    /// cutover; this copy carries the law forward): the sheet consumes
-    /// the served definition catalog and stamps through the daemon's
+    /// Track AW, the automate-sheet half of the emission-shape law,
+    /// retargeted to the generic served-catalog flow (its
+    /// registry-era twin died with mandate_templates.rs at the
+    /// cutover; this copy carries the law): the sheet consumes the
+    /// served definition catalog and stamps through the daemon's
     /// stamp op — it neither proposes nor approves client-side, so the
     /// owner's per-effect digest ceremony stays the only arming act.
     #[test]
@@ -811,17 +811,16 @@ mod tests {
         assert!(sheet.contains("shadowed by a personal definition of the same name"));
     }
 
-    /// Track AW slice 3, the workflow half of the emission-shape law,
-    /// retargeted to the generic flow (twin of
-    /// workflow_approval_sheet_approves_only_in_the_owner_confirm_lane
-    /// in mandate_templates.rs, which dies with the registry at
-    /// cutover): the workflow and triggered lanes stamp through the
-    /// daemon (no client-side graph assembly survives), the approval
-    /// sheet renders the sealed bytes from the content-addressed
-    /// serving lane, and the approval lane stays exactly one emitter —
-    /// one `approve_effect`, inside `agendaWorkflowEmitApprovals`,
-    /// iterating exactly the stamped node set, called once from the
-    /// owner-confirm handler.
+    /// Track AW, the workflow half of the emission-shape law,
+    /// retargeted to the generic flow (its registry-era twin,
+    /// workflow_approval_sheet_approves_only_in_the_owner_confirm_lane,
+    /// died with mandate_templates.rs at the cutover): the workflow and
+    /// triggered lanes stamp through the daemon (no client-side graph
+    /// assembly survives), the approval sheet renders the sealed bytes
+    /// from the content-addressed serving lane, and the approval lane
+    /// stays exactly one emitter — one `approve_effect`, inside
+    /// `agendaWorkflowEmitApprovals`, iterating exactly the stamped
+    /// node set, called once from the owner-confirm handler.
     #[test]
     fn workflow_surfaces_stamp_through_the_daemon_with_one_emitter() {
         let fragment = include_str!("../../../../static/app/ui2-agenda-workflows.js");
