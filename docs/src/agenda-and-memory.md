@@ -478,6 +478,20 @@ External occurrences complete like native ones: a clean round journals
 recovery exhausted — emitter-typed on the bus event, never inferred
 from reason prose) journals `failed`, counts the failure streak, and
 suspends the series at the threshold exactly as a native run would.
+An external session's *end*, though, is not yet a verdict: the owner's
+Restart-with-saved-config and edit-branch gestures supersede the wrapper
+while the work continues under a resume-lineage successor, so terminal
+classification walks the lineage first — from durable state only
+(session-dir identity facts, wrapper-index rows and retirement edges,
+via the one resolver shared with the agenda-answer delivery arm) — and
+terminals only when the lineage is quiet. An owner Stop tombstone is
+quiet by decree (`failed` immediately); an admitted successor re-keys
+the occurrence to the lineage tip (a fresh `started` journal row and
+item write-back name it, and later terminals attribute to it, at any
+chain depth); a wrapper-backed end with no successor visible yet holds
+for a bounded grace window (60 s) before journaling `failed` with the
+original reason. Native sessions have no wrapper lineage and classify
+immediately, as before.
 
 **Interactive is the default** (`interactive`, additive on the manifest):
 the spawned session opens with the goal as its first user message and then
