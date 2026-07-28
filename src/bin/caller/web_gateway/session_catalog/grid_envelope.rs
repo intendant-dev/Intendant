@@ -272,4 +272,40 @@ mod tests {
         joins(None, None, Some(HashMap::new())).attach(&mut row, "s2", &dir);
         assert!(row.get("agenda").is_none());
     }
+
+    /// Daemon↔SPA drift guard for the envelope blocks: the session
+    /// windows fragment consumes exactly these wire names, renders the
+    /// ghost class, and its sealed-inputs chip shares the one
+    /// short-digest formatter instead of minting a truncation.
+    #[test]
+    fn grid_envelope_wire_reaches_the_fragment() {
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        for needle in [
+            "item_id",
+            "item_title",
+            "occurrence",
+            "sealed_inputs",
+            "live_wrapper",
+            "ghost",
+            "preboot",
+            "agendaShortDigest(",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "session-windows fragment stopped consuming {needle} — the grid envelope drifted"
+            );
+        }
+        // The window-level ghost treatment lives in the actions fragment
+        // (class toggle) and the stylesheet (the dashed-frame rule).
+        let actions = include_str!("../../../../../static/app/41-session-window-actions.js");
+        assert!(
+            actions.contains("session-window-ghost"),
+            "the actions fragment stopped toggling the ghost window class"
+        );
+        let styles = include_str!("../../../../../static/app/12-styles-tasks-log.css");
+        assert!(
+            styles.contains(".session-window.session-window-ghost"),
+            "the stylesheet lost the ghost window treatment"
+        );
+    }
 }

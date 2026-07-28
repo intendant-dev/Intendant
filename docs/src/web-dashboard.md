@@ -294,6 +294,30 @@ cache, never after the fact. Sections appear as producers fill them; the
 chip hides in narrow windows. Station's agent focus panel shows the same
 vitals as git / cache / limits rows.
 
+The operational envelope extends with **grid-envelope chips**, served
+precomputed on the session-catalog row (`agenda` + `boot` blocks,
+`session_catalog/grid_envelope.rs` — one daemon payload, no SPA-side
+joins). Agenda-fired sessions show their **source item** (`⚡` + the
+item id's first 12 chars; hover reveals the full title, tap offers
+"Open the agenda card" and copy), the **occurrence** (`▶ started` /
+`✓ completed` / `✕ failed`… — the occurrence journal's reverse fold,
+lineage-following: a resume re-key's successors share the block, and
+the occurrence object is the extensible slot Track AO's attestation
+will land in), and the **sealed inputs** (`⛉ N sealed`; the explainer
+lists each digest-bound binding ref with its short digest via the one
+shared formatter, and per-ref actions copy the full sha256). Every
+window also states its **boot era** — `↻ this boot` vs `↻ pre-boot`,
+from HS1's presence substrate joined with live wrapper registry
+membership — and a session that predates the current daemon boot with
+no live wrapper renders unmistakably as a **ghost** (`👻` warn chip +
+dashed desaturated frame): the safe-to-close state, served as a
+precomputed bit. Fired sessions keep their derived names (the source
+item's title, or `workflow - node` for workflow nodes); an owner
+rename always wins, and the Track AW refinement — stamped definitions
+deriving `definition name - node id` — lands later at the same single
+derivation seam (`agenda/reminders.rs`, `derive_spawn_session_name`)
+without touching these chips.
+
 When a backend announces background commands (currently Claude Code's
 wire-reported task registry), the activity explainer inside that vitals panel
 adds a **Background tasks** list. A task with an announced output file gets a
