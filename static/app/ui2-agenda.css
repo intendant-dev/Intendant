@@ -681,6 +681,28 @@ html.ui-v2 .ag2-eff-line {
   overflow-wrap: anywhere;
 }
 
+/* The shared manifest-digest chip (ui2-agenda.js renders it on every
+   approval surface): short form inline, full digest on hover, click
+   copies. One appearance everywhere it shows. */
+html.ui-v2 .ag2-digest-chip {
+  display: inline-flex;
+  align-items: center;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-inset);
+  padding: 1px 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-digest-chip:hover {
+  border-color: var(--line-2);
+  color: var(--text);
+}
+
 /* ---- Automations lens rows (Track AU) ---- */
 
 html.ui-v2 .ag2-auto-meta {

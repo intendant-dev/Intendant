@@ -802,6 +802,43 @@ pub(crate) struct SpawnOccurrence {
     /// the dispatcher for the fire-time seal check and the fired task's
     /// per-ref data lines.
     pub(crate) binding_refs: Vec<BindingRef>,
+    /// Deterministic display name for the spawned session, derived from
+    /// the firing's source ([`derive_spawn_session_name`]) and assigned
+    /// through the existing session naming system at launch. `None` when
+    /// the source title normalizes to nothing — the spawn stays unnamed
+    /// (naming never blocks a firing).
+    pub(crate) session_name: Option<String>,
+}
+
+/// Deterministic display name for an agenda-fired session, derived from
+/// the firing's SOURCE — never model-generated. A workflow-node firing
+/// (an `on_unblock`-triggered manifest on an item placed under a parent)
+/// reads "<workflow title> - <node title>", the parent hub being the
+/// workflow instance (Track T's stamped shape); every other firing takes
+/// the item title alone, and an `on_unblock` node without a live parent
+/// degrades to the same. Normalized through the naming system's own
+/// rules so the launch path accepts the result verbatim; a title that
+/// normalizes to nothing yields `None` (an unnamed spawn, never a failed
+/// one). Titles are the only input, so the same item fires under the
+/// same name every occurrence — window disambiguation stays with the
+/// existing timestamps. Track AW seam: stamped definitions derive
+/// "<definition name> - <node id>" HERE once they land — this function
+/// is the single derivation point.
+fn derive_spawn_session_name(
+    item: &AgendaItem,
+    trigger: Option<&super::types::TriggerSpec>,
+    items: &[AgendaItem],
+) -> Option<String> {
+    let workflow_node = match trigger {
+        Some(super::types::TriggerSpec::OnUnblock) => item
+            .part_of
+            .as_ref()
+            .and_then(|placement| items.iter().find(|i| i.id == placement.parent_id))
+            .map(|workflow| format!("{} - {}", workflow.title, item.title)),
+        _ => None,
+    };
+    let raw = workflow_node.unwrap_or_else(|| item.title.clone());
+    crate::session_names::normalize_session_name(&raw).ok()
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
@@ -1161,6 +1198,8 @@ pub(crate) fn plan(
                     .as_ref()
                     .is_some_and(|run| run.state == "started")
                 || journal.started_unresolved_for_item(&item.id);
+            let session_name =
+                derive_spawn_session_name(item, effect.manifest.trigger.as_ref(), items);
             for (instant, identity_ms, recurring) in candidates {
                 let occurrence_id = session_occurrence_id(
                     &item.id,
@@ -1189,6 +1228,7 @@ pub(crate) fn plan(
                     provenance_session_id: item.provenance.session_id.clone(),
                     matched_item_ids: trigger_batch.clone(),
                     binding_refs: effect.manifest.binding_refs.clone(),
+                    session_name: session_name.clone(),
                 };
                 if progress.prepared {
                     // Crash between prepare and launch confirmation: fail
@@ -3294,6 +3334,84 @@ mod tests {
             due,
             Some(150_000 + TRIGGER_COOLDOWN_MS),
             "the cooldown floors the refire for on_unblock too"
+        );
+    }
+
+    /// A workflow-node firing — an `on_unblock`-triggered manifest on an
+    /// item placed under a parent — derives "<workflow title> - <node
+    /// title>", the parent hub being the workflow instance in Track T's
+    /// stamped shape. A node whose parent is gone degrades to its own
+    /// title instead of firing nameless. Titles are the only input, so
+    /// the same node fires under the same name every occurrence.
+    #[test]
+    fn workflow_node_names_carry_workflow_and_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        node.part_of = Some(super::super::types::AgendaPlacement {
+            parent_id: "wf-hub".into(),
+            added_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+        });
+        let now = 500_000;
+
+        let hub = item("wf-hub", AgendaStatus::Open, None);
+        let items = vec![hub, done_at("node-a", 100_000), node.clone()];
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(
+            planned.spawn[0].session_name.as_deref(),
+            Some("item wf-hub - item node-b"),
+            "a workflow-node spawn is named '<workflow title> - <node title>'"
+        );
+
+        let items = vec![done_at("node-a", 100_000), node.clone()];
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(
+            planned.spawn[0].session_name.as_deref(),
+            Some("item node-b"),
+            "an on_unblock node without a live parent takes its own title"
+        );
+    }
+
+    /// Naming never blocks a firing: derivation is total. A standalone
+    /// (non-triggered) item derives its plain title through the naming
+    /// system's normalize rules; a title that normalizes to nothing
+    /// derives no name at all — the spawn goes out unnamed rather than
+    /// failing the launch-side name validation.
+    #[test]
+    fn spawn_name_derivation_is_total_and_title_shaped() {
+        let plain = item("solo", AgendaStatus::Open, None);
+        assert_eq!(
+            derive_spawn_session_name(&plain, None, std::slice::from_ref(&plain)).as_deref(),
+            Some("item solo")
+        );
+        let mut blank = item("blank", AgendaStatus::Open, None);
+        blank.title = "   ".into();
+        assert_eq!(
+            derive_spawn_session_name(&blank, None, std::slice::from_ref(&blank)),
+            None
         );
     }
 

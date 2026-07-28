@@ -456,6 +456,29 @@ echoed exactly as a pane-created session's (the persisted launch overlay,
 the vitals Model chip's `model · effort`), so scheduled spawns are
 config-indistinguishable from composer spawns.
 
+**Fired sessions inherit a name from their source.** At fire time the
+scheduler derives a deterministic display name — never model-generated —
+and sends it on the spawn's `StartTask` (`session_name`), where the
+launch path assigns it through the ordinary session naming system
+(persisted session meta / external-overlay store + the live registry),
+exactly as a composer-named create: no parallel store, and every surface
+that already applies name overlays renders it. Derivation
+(`derive_spawn_session_name`, the single seam — Track AW's stamped
+definitions plug in there as `<definition name> - <node id>` once they
+land): a standalone item firing takes the **item title** through the
+naming system's own normalize rules; a workflow-node firing (an
+`on_unblock`-triggered manifest on an item placed under a parent) takes
+`<workflow title> - <node title>`, the parent hub being the workflow
+instance; a title that normalizes to nothing spawns unnamed (naming
+never blocks a firing). Names derive from titles only, so the same item
+fires under the same name every occurrence — windows disambiguate by
+their existing timestamps. Precedence laws, pinned by tests: a derived
+name only ever seeds a fresh spawn (an owner rename wins — redeliveries
+of the same delegation re-ack without re-applying it), and a
+derived-named session is *titled* in the naming system's own read from
+the moment it spawns, so any generated-naming lane for untitled
+sessions skips it by construction.
+
 **The standing lane expresses the executor too** (Track AU):
 `propose_effect` accepts the same `agent_config` block, and
 `ctl agenda schedule` takes the same launch flags as `start`
