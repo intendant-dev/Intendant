@@ -33,7 +33,6 @@ mod ask;
 mod blobs;
 mod definitions;
 mod handle;
-mod mandate_templates;
 mod reminders;
 mod scheduler;
 mod sealed_blobs;

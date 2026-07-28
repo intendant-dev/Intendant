@@ -159,13 +159,15 @@ impl DefinitionNode {
 #[derive(Debug, Clone)]
 pub(crate) struct AutomationDefinition {
     pub(crate) name: String,
-    // The four spec surfaces below are catalog copy: parsed and
-    // bounds-checked today, served by the slice-2 catalog lane (their
-    // reader). Allowed dead until that lane lands.
-    #[allow(dead_code)]
+    /// Spec description — served by the catalog.
     pub(crate) description: String,
     /// Display title: `metadata.title`, else the name.
     pub(crate) title: String,
+    // The three spec surfaces below are parsed and bounds-checked (spec
+    // conformance is the validator's law) but deliberately unserved in
+    // v1 — future catalog/sheet vocabulary, additive whenever a surface
+    // wants them (N4 reconcile: re-scoped from the closed slice-2
+    // reader note).
     #[allow(dead_code)]
     pub(crate) metadata: Vec<(String, String)>,
     #[allow(dead_code)]
@@ -193,10 +195,11 @@ impl AutomationDefinition {
     }
 
     /// `relies_on` flattened as (node, dependency) pairs, declaration
-    /// order — the registry's edge vocabulary. The parity/window tests
-    /// read it today; the slice-2 catalog serializes it (its non-test
-    /// reader). Allowed dead until that lane lands.
-    #[allow(dead_code)]
+    /// order — test vocabulary only: the wire serves per-node
+    /// `relies_on` (the same edge information in prefill shape), and
+    /// the registry parity tests that read this died at the cutover
+    /// (N4 reconcile: dropped to test scope).
+    #[cfg(test)]
     pub(crate) fn edges(&self) -> Vec<(String, String)> {
         self.nodes
             .iter()
