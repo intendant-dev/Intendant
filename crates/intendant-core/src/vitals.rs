@@ -118,6 +118,17 @@ pub struct SessionLimitWindow {
     /// predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at_epoch: Option<u64>,
+    /// Credential-era attribution. The provider wire carries no account
+    /// identity, so the daemon stamps the account label it knows the
+    /// reporting session runs under (the Vault sign-in ceremony's account,
+    /// or a minted era nonce when the ceremony learned no label). `None` =
+    /// the unattributed era: sessions whose credentials predate any
+    /// daemon-observed sign-in. Store- and wire-additive; on session
+    /// emissions the field is present only while more than one credential
+    /// era is live for the backend — the frontends' cue to label the
+    /// windows apart (a single-era steady state renders unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// What a session's model/backend is verifiably doing right now — the
@@ -481,10 +492,10 @@ mod tests {
         assert!(rewire.get("checkout").is_none());
     }
 
-    /// The limit window's `observed_at_epoch` is wire-additive: serialized
-    /// camelCase when known, absent otherwise, and legacy emissions
-    /// without it (or without `usedPct` — the no-synthesized-percentage
-    /// rule) deserialize losslessly.
+    /// The limit window's `observed_at_epoch` and `account` stamps are
+    /// wire-additive: serialized camelCase when known, absent otherwise,
+    /// and legacy emissions without them (or without `usedPct` — the
+    /// no-synthesized-percentage rule) deserialize losslessly.
     #[test]
     fn limit_window_observed_at_round_trips_and_stays_wire_additive() {
         let window = SessionLimitWindow {
@@ -493,11 +504,13 @@ mod tests {
             resets_at_epoch: Some(1_784_503_200),
             status: Some("allowed_warning".into()),
             observed_at_epoch: Some(1_784_499_000),
+            account: Some("owner@example.test".into()),
         };
         let wire = serde_json::to_value(&window).expect("serializes");
         assert_eq!(wire["observedAtEpoch"], 1_784_499_000u64);
         assert_eq!(wire["resetsAtEpoch"], 1_784_503_200u64);
         assert_eq!(wire["status"], "allowed_warning");
+        assert_eq!(wire["account"], "owner@example.test");
         assert!(
             wire.get("usedPct").is_none(),
             "an unreported percentage must not serialize as a number"
@@ -505,14 +518,19 @@ mod tests {
         let back: SessionLimitWindow = serde_json::from_value(wire).expect("deserializes");
         assert_eq!(back, window);
 
-        // Legacy wire without the stamp: defaults to None and never
+        // Legacy wire without the stamps: defaults to None and never
         // re-serializes as noise.
         let legacy: SessionLimitWindow =
             serde_json::from_str(r#"{"label":"7d","status":"allowed"}"#)
                 .expect("legacy deserializes");
         assert_eq!(legacy.observed_at_epoch, None);
+        assert_eq!(legacy.account, None);
         let rewire = serde_json::to_value(&legacy).expect("serializes");
         assert!(rewire.get("observedAtEpoch").is_none());
+        assert!(
+            rewire.get("account").is_none(),
+            "the unattributed era serializes as absence, not null"
+        );
     }
 
     /// The config section's wire shape: camelCase fields, absent when
