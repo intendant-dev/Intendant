@@ -713,7 +713,10 @@ fn active_wrapper_ids_by_group(
 /// before `state` existed), then the lexically-greatest wrapper session id
 /// as a deterministic tie-break. [`wrappers_for`] / [`wrappers_for_source`]
 /// sort with this, so their first record is the preferred one.
-fn wrapper_preference(a: &ExternalWrapperRecord, b: &ExternalWrapperRecord) -> std::cmp::Ordering {
+pub(crate) fn wrapper_preference(
+    a: &ExternalWrapperRecord,
+    b: &ExternalWrapperRecord,
+) -> std::cmp::Ordering {
     a.state
         .cmp(&b.state)
         .then_with(|| b.updated_at_secs.cmp(&a.updated_at_secs))

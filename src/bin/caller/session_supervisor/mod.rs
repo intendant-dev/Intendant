@@ -27,6 +27,7 @@ pub(crate) use claude_edit::{CLAUDE_EDIT_INPLACE_STOP_REASON, CLAUDE_EDIT_SUPERS
 mod dispatch;
 mod fork;
 mod registry;
+pub(crate) mod resume_lineage;
 
 #[derive(Clone)]
 pub struct SessionSupervisorConfig {

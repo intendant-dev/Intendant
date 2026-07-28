@@ -41,6 +41,16 @@ const SESSION_ALIAS_CAP: usize = 64;
 /// Re-send an un-receipted dispatch after this long (at-least-once
 /// delivery; the supervisor's delegation dedup makes duplicates safe).
 const DISPATCH_RETRY_AFTER_MS: u64 = 30_000;
+/// How long a wrapper-backed session's end may wait for its resume-lineage
+/// successor before the occurrence terminals `failed`. Every supersede lane
+/// (owner Restart with saved config, the edit-branch fork) emits
+/// `SessionEnded` on the OLD wrapper BEFORE the successor's durable trace
+/// lands (admission, then the eager resume identity writes the index row —
+/// seconds later), so terminal classification must out-wait that window or
+/// it fails occurrences whose work continues under the successor. Bounded:
+/// a genuinely dead session's `failed` write-back arrives at worst this
+/// much later, and nothing user-blocking hangs on it.
+const LINEAGE_QUIET_GRACE_MS: u64 = 60_000;
 /// Give up on an un-receipted dispatch after this long: journal the
 /// fail-closed `unknown` (never auto-retried past this point) and free
 /// the effect's in-flight slot.
@@ -60,6 +70,25 @@ struct EarlyOutcome {
     /// `Some(reason)` = the session ended without finishing.
     failed: Option<String>,
     note: String,
+}
+
+/// A running scheduled session whose `SessionEnded` arrived while its
+/// resume lineage may still continue elsewhere: the session has recorded
+/// external-wrapper history, no owner-stop tombstone, and no admitted
+/// successor visible in durable state YET (the supersede lanes stop the
+/// old wrapper before the successor registers). Held un-classified until
+/// the successor appears (re-key) or [`LINEAGE_QUIET_GRACE_MS`] expires
+/// with the lineage still quiet (`failed`, the honest terminal). The
+/// running entry stays in place meanwhile, so the no-overlap rule keeps
+/// counting the occurrence as in-flight.
+struct PendingLineageEnd {
+    /// The `running` map key at end time (the receipt id, or its aliased
+    /// upgrade — whatever `running_key` resolved).
+    session_key: String,
+    /// The id the end event named (a walk seed alongside the key).
+    ended_id: String,
+    reason: String,
+    ended_at_ms: u64,
 }
 
 /// A dispatched occurrence still waiting for its `TaskReceived` receipt,
@@ -107,6 +136,9 @@ struct SchedulerState {
     /// native id and the occurrence sat `started` forever). Both
     /// directions resolve; bounded, oldest evicted, newest pair wins.
     session_aliases: Vec<(String, String)>,
+    /// Ended-but-unclassified running sessions awaiting their resume
+    /// lineage (see [`PendingLineageEnd`]); swept on every wake.
+    lineage_pending: Vec<PendingLineageEnd>,
 }
 
 impl SchedulerState {
@@ -216,10 +248,11 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
             let next_wake_ms = run_pass(&handle, &mut journal, &mut state).await;
             let now = now_ms();
             let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
-            let next_wake_ms = match (next_wake_ms, retry_wake_ms) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (wake, None) | (None, wake) => wake,
-            };
+            let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
+            let next_wake_ms = [next_wake_ms, retry_wake_ms, lineage_wake_ms]
+                .into_iter()
+                .flatten()
+                .min();
             let sleep_for = next_wake_ms
                 .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
                 .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
@@ -387,6 +420,12 @@ fn resolve_lagged_occurrences(
             resolved += 1;
         }
     }
+    // Held lineage ends belong to running entries; drop the ones whose
+    // entry the fail-close just resolved.
+    let running = &state.running;
+    state
+        .lineage_pending
+        .retain(|entry| running.contains_key(&entry.session_key));
 
     resolved
 }
@@ -729,11 +768,19 @@ fn observe_event(
             // remembered outcome resolves the occurrence now, keeping the
             // journal arc in order (started, then the terminal). The
             // aliased lookup covers a terminal that arrived under an
-            // already-upgraded address.
+            // already-upgraded address. A remembered END goes through
+            // lineage classification like a live one: when a successor was
+            // admitted the occurrence follows it; with no successor it
+            // still fails.
             if let Some(early) = state.take_early_outcome_aliased(session_id) {
                 match early.failed {
                     None => complete_running(handle, journal, state, session_id, early.note),
-                    Some(reason) => fail_running(handle, journal, state, session_id, &reason),
+                    Some(reason) => {
+                        let now = now_ms();
+                        classify_ended_running_session(
+                            handle, journal, state, session_id, session_id, &reason, now, now,
+                        );
+                    }
                 }
             }
         }
@@ -801,12 +848,19 @@ fn observe_event(
         } => {
             // Normal completion removes the entry first (supervised
             // sessions park after done); a RUNNING session reaching here
-            // stopped or errored before finishing — and pre-receipt the
-            // same end is remembered as a failed outcome (first terminal
-            // per session wins, so a done session's later end never
-            // downgrades its completion).
+            // stopped or errored before finishing — but an end is not yet
+            // a verdict: the owner's Restart/edit supersede ends the
+            // wrapper while the work continues under a resume-lineage
+            // successor, so classification walks the lineage first
+            // (terminal only when it is quiet). Pre-receipt the same end
+            // is remembered as a failed outcome and classified by the
+            // receipt (first terminal per session wins, so a done
+            // session's later end never downgrades its completion).
             if let Some(key) = state.running_key(session_id) {
-                fail_running(handle, journal, state, &key, reason);
+                let now = now_ms();
+                classify_ended_running_session(
+                    handle, journal, state, &key, session_id, reason, now, now,
+                );
             } else {
                 state.remember_early_outcome(
                     session_id,
@@ -875,6 +929,179 @@ fn complete_running(
         Some(session_id.to_string()),
         Some(note),
     );
+}
+
+/// Terminal classification for a RUNNING scheduled session that ended:
+/// the resume lineage decides, from durable state only
+/// ([`crate::session_supervisor::resume_lineage`] — the walker shared
+/// with the agenda-answer delivery arm), and the occurrence terminals
+/// only when the lineage is quiet:
+///
+/// - an owner-stop tombstone anywhere in the chain is quiet BY DECREE
+///   (the Stop lane stamps it before emitting the end) — `failed` now;
+/// - an admitted successor (active wrapper past the ended ids) means the
+///   work continues — the occurrence re-keys to the lineage tip and no
+///   terminal fires;
+/// - no wrapper history at all (native sessions, mock e2e) classifies
+///   immediately — today's behavior, unchanged;
+/// - wrapper history but no successor visible YET defers up to
+///   [`LINEAGE_QUIET_GRACE_MS`] from the end instant (the supersede
+///   lanes end the old wrapper seconds before the successor's index row
+///   lands), then fails with the original reason.
+#[allow(clippy::too_many_arguments)] // internal classification core: the params are the event facts
+fn classify_ended_running_session(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    session_key: &str,
+    ended_id: &str,
+    reason: &str,
+    ended_at_ms: u64,
+    now: u64,
+) {
+    if !state.running.contains_key(session_key) {
+        return;
+    }
+    let mut ended_ids: Vec<String> = vec![session_key.to_string()];
+    if ended_id != session_key {
+        ended_ids.push(ended_id.to_string());
+    }
+    if let Some(counterpart) = state.alias_counterpart(session_key) {
+        if !ended_ids.iter().any(|id| id == counterpart) {
+            ended_ids.push(counterpart.to_string());
+        }
+    }
+    let seeds: Vec<&str> = ended_ids.iter().map(String::as_str).collect();
+    let lineage = crate::session_supervisor::resume_lineage::resolve_resume_lineage(
+        &handle.spawn_ctx().home,
+        &seeds,
+    );
+    if lineage.stopped_by_user {
+        fail_running(handle, journal, state, session_key, reason);
+        return;
+    }
+    if let Some(tip) = lineage.successor_tip(&seeds) {
+        let successor = tip.intendant_session_id.clone();
+        rekey_running_to_successor(handle, journal, state, session_key, &successor, reason, now);
+        return;
+    }
+    if !lineage.has_wrapper_history() {
+        fail_running(handle, journal, state, session_key, reason);
+        return;
+    }
+    if now.saturating_sub(ended_at_ms) >= LINEAGE_QUIET_GRACE_MS {
+        fail_running(handle, journal, state, session_key, reason);
+        return;
+    }
+    eprintln!(
+        "[agenda] scheduled session {session_key} ended (\"{reason}\") with wrapper lineage \
+         and no successor yet — holding the occurrence terminal for a resume-lineage \
+         successor (grace {}s)",
+        LINEAGE_QUIET_GRACE_MS / 1000
+    );
+    state.lineage_pending.push(PendingLineageEnd {
+        session_key: session_key.to_string(),
+        ended_id: ended_id.to_string(),
+        reason: reason.to_string(),
+        ended_at_ms,
+    });
+}
+
+/// The ended session's lineage continues under `successor`: move the
+/// running entry to the tip, journal a fresh `started` row naming it, and
+/// write the re-attribution back to the item — every later terminal then
+/// resolves (and attributes) through the tip. A terminal already
+/// remembered under the successor resolves right away: a completion
+/// applies, an end re-classifies (a successor that itself restarted
+/// chains again).
+fn rekey_running_to_successor(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    session_key: &str,
+    successor: &str,
+    reason: &str,
+    now: u64,
+) {
+    let Some(spawn) = state.running.remove(session_key) else {
+        return;
+    };
+    eprintln!(
+        "[agenda] occurrence {} follows its resume lineage: session {session_key} ended \
+         (\"{reason}\"), continuing under successor session {successor}",
+        spawn.occurrence_id
+    );
+    session_record(
+        journal,
+        &spawn,
+        now,
+        OccurrenceState::Started,
+        Some(successor.to_string()),
+    );
+    record_on_item(
+        handle,
+        &spawn,
+        "started",
+        Some(successor.to_string()),
+        Some(format!(
+            "continued under successor session {successor} \
+             (previous session ended: {reason})"
+        )),
+    );
+    state.running.insert(successor.to_string(), spawn);
+    if let Some(early) = state.take_early_outcome_aliased(successor) {
+        match early.failed {
+            None => complete_running(handle, journal, state, successor, early.note),
+            Some(end_reason) => classify_ended_running_session(
+                handle,
+                journal,
+                state,
+                successor,
+                successor,
+                &end_reason,
+                now,
+                now,
+            ),
+        }
+    }
+}
+
+/// Re-classify held lineage ends (see [`PendingLineageEnd`]) against
+/// durable state: runs on every scheduler wake — bus activity from the
+/// successor's own spawn re-checks promptly, and the returned instant
+/// bounds the sleep so a quiet bus still meets the grace deadline.
+/// Entries whose running entry vanished meanwhile (lag fail-close) are
+/// dropped.
+fn sweep_lineage_pending(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    now: u64,
+) -> Option<u64> {
+    if state.lineage_pending.is_empty() {
+        return None;
+    }
+    let pending = std::mem::take(&mut state.lineage_pending);
+    for entry in pending {
+        if !state.running.contains_key(&entry.session_key) {
+            continue;
+        }
+        classify_ended_running_session(
+            handle,
+            journal,
+            state,
+            &entry.session_key,
+            &entry.ended_id,
+            &entry.reason,
+            entry.ended_at_ms,
+            now,
+        );
+    }
+    state
+        .lineage_pending
+        .iter()
+        .map(|entry| entry.ended_at_ms + LINEAGE_QUIET_GRACE_MS)
+        .min()
 }
 
 /// Terminal resolution for occurrences that never spawned (missed window,
@@ -2421,6 +2648,434 @@ mod tests {
             "oldest entry evicted at the cap"
         );
         assert!(state.take_early_outcome("two-more").is_some());
+    }
+
+    /// Handle whose spawn context carries BOTH a hermetic lineage home
+    /// (wrapper logs + wrapper index resolve under it) and a default
+    /// project — the resume-lineage tests' baseline.
+    fn handle_with_home_and_project(
+        dir: &std::path::Path,
+        home: &std::path::Path,
+        default_project: &std::path::Path,
+    ) -> Arc<AgendaHandle> {
+        let bus = EventBus::new();
+        Arc::new(
+            AgendaHandle::new(AgendaStore::open(dir).unwrap(), bus, dir).with_spawn_context(
+                super::super::spawn_project::SessionSpawnContext {
+                    home: home.to_path_buf(),
+                    default_project_root: Some(default_project.to_path_buf()),
+                },
+            ),
+        )
+    }
+
+    /// A wrapper log dir announcing its backend conversation(s) under the
+    /// hermetic home — how live wrappers persist lineage (the identity
+    /// event also writes the wrapper-index row).
+    fn announce_wrapper(home: &std::path::Path, wrapper: &str, source: &str, backend_ids: &[&str]) {
+        let logs = crate::platform::intendant_home_in(home).join("logs");
+        let mut log = crate::session_log::SessionLog::open(logs.join(wrapper)).unwrap();
+        log.write_meta(None, None);
+        for backend_id in backend_ids {
+            log.session_identity(wrapper, source, backend_id);
+        }
+    }
+
+    /// StartNow the item and run one pass; returns `(item_id,
+    /// occurrence_id, delegation_id)` with the dispatch drained off the
+    /// bus.
+    async fn start_now_dispatch(
+        handle: &Arc<AgendaHandle>,
+        journal: &mut OccurrenceJournal,
+        state: &mut SchedulerState,
+        title: &str,
+    ) -> (String, String, String) {
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: title.into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::StartNow {
+                    id: item.id.clone(),
+                    goal: None,
+                    project_root: None,
+                    interactive: None,
+                    agent_config: None,
+                },
+                owner(),
+            )
+            .unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(handle, journal, state).await;
+        let mut delegation_id = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(id),
+                ..
+            }) = event
+            {
+                delegation_id = Some(id);
+            }
+        }
+        let delegation_id = delegation_id.expect("occurrence dispatched");
+        let occurrence_id = delegation_id
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+        (item.id, occurrence_id, delegation_id)
+    }
+
+    fn last_run_of(handle: &AgendaHandle, item_id: &str) -> super::super::types::AgendaRun {
+        let (items, _, _) = handle.snapshot();
+        items.iter().find(|i| i.id == item_id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap()
+    }
+
+    /// THE commission arc: the owner's account-switch flow (Restart with
+    /// saved config, then continue) ends the ORIGINAL wrapper session
+    /// seconds before the successor's durable trace lands. The occurrence
+    /// must hold instead of terminaling `failed`, re-key to the successor
+    /// once it registers, and complete from the successor's own terminal
+    /// — and a PARKED tip (no `SessionEnded` ever) keeps the lineage
+    /// non-quiet: no terminal, however long the sweep runs.
+    #[tokio::test]
+    async fn restart_with_saved_config_keeps_occurrence_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_home_and_project(dir.path(), home.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        announce_wrapper(home.path(), "wrapper-old", "claude-code", &["b-acct"]);
+        let (item_id, occurrence_id, delegation_id) =
+            start_now_dispatch(&handle, &mut journal, &mut state, "switch accounts").await;
+
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "wrapper-old".into(),
+            },
+        );
+        // The restart lane stops the old wrapper FIRST; no successor is
+        // visible anywhere durable yet.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "wrapper-old".into(),
+                reason: "restarting session".into(),
+                error_kind: None,
+            },
+        );
+        assert!(
+            journal.progress(&occurrence_id).terminal.is_none(),
+            "an end with live wrapper lineage must not terminal the occurrence"
+        );
+        assert_eq!(
+            state.lineage_pending.len(),
+            1,
+            "the end is held, not dropped"
+        );
+        assert!(
+            state.running.contains_key("wrapper-old"),
+            "the occurrence stays in-flight while held"
+        );
+
+        // The successor registers under the SAME backend conversation
+        // (the eager resume identity) — the next sweep follows it.
+        announce_wrapper(home.path(), "wrapper-new", "claude-code", &["b-acct"]);
+        sweep_lineage_pending(&handle, &mut journal, &mut state, now_ms());
+        assert!(state.lineage_pending.is_empty(), "the held end resolved");
+        assert!(
+            state.running.contains_key("wrapper-new") && !state.running.contains_key("wrapper-old"),
+            "the occurrence re-keyed to the successor"
+        );
+        assert!(journal.progress(&occurrence_id).terminal.is_none());
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "started");
+        assert_eq!(run.session_id.as_deref(), Some("wrapper-new"));
+
+        // Edge: a parked tip (done or rate-limited — emits no
+        // SessionEnded) means the lineage is NOT quiet: sweeps far past
+        // the grace window terminal nothing.
+        sweep_lineage_pending(
+            &handle,
+            &mut journal,
+            &mut state,
+            now_ms() + 10 * LINEAGE_QUIET_GRACE_MS,
+        );
+        assert!(journal.progress(&occurrence_id).terminal.is_none());
+
+        // The successor finishes the work: the occurrence completes,
+        // attributed to it.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("wrapper-new".into()),
+                message: Some("switched and finished".into()),
+            },
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.terminal, Some(OccurrenceState::Completed));
+        assert_eq!(progress.started.as_deref(), Some("wrapper-new"));
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.session_id.as_deref(), Some("wrapper-new"));
+        assert_eq!(run.note.as_deref(), Some("switched and finished"));
+    }
+
+    /// A wrapper-backed end with NO successor holds for the grace window
+    /// (the supersede lanes register the successor seconds after the
+    /// end), then terminals `failed` with the original reason once the
+    /// lineage is still quiet at expiry — never earlier.
+    #[tokio::test]
+    async fn terminal_fires_only_when_lineage_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_home_and_project(dir.path(), home.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        announce_wrapper(home.path(), "wrapper-solo", "claude-code", &["b-solo"]);
+        let (item_id, occurrence_id, delegation_id) =
+            start_now_dispatch(&handle, &mut journal, &mut state, "die quietly").await;
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "wrapper-solo".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "wrapper-solo".into(),
+                reason: "error: wrapper died".into(),
+                error_kind: None,
+            },
+        );
+        assert!(journal.progress(&occurrence_id).terminal.is_none());
+
+        // Inside the grace window the lineage may still grow a
+        // successor: no terminal.
+        sweep_lineage_pending(&handle, &mut journal, &mut state, now_ms());
+        assert!(journal.progress(&occurrence_id).terminal.is_none());
+        assert_eq!(state.lineage_pending.len(), 1);
+
+        // Grace expired with the lineage still quiet: the end classifies
+        // as the failure it is, original reason attributed.
+        sweep_lineage_pending(
+            &handle,
+            &mut journal,
+            &mut state,
+            now_ms() + LINEAGE_QUIET_GRACE_MS + 1_000,
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.terminal, Some(OccurrenceState::Failed));
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.session_id.as_deref(), Some("wrapper-solo"));
+        assert_eq!(run.note.as_deref(), Some("error: wrapper died"));
+        assert!(state.lineage_pending.is_empty());
+        assert!(state.running.is_empty());
+    }
+
+    /// A chain that hops twice (old wrapper → resumed successor that
+    /// upgraded to its own conversation → its successor) resolves to the
+    /// TIP, not the first hop — and the terminal attributes to the tip
+    /// in the journal and on the item.
+    #[tokio::test]
+    async fn occurrence_attributes_to_lineage_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_home_and_project(dir.path(), home.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        announce_wrapper(home.path(), "wrapper-old", "claude-code", &["b1-chain"]);
+        announce_wrapper(
+            home.path(),
+            "wrapper-mid",
+            "claude-code",
+            &["b1-chain", "b2-chain"],
+        );
+        announce_wrapper(home.path(), "wrapper-new", "claude-code", &["b2-chain"]);
+        let (item_id, occurrence_id, delegation_id) =
+            start_now_dispatch(&handle, &mut journal, &mut state, "chase the tip").await;
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "wrapper-old".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "wrapper-old".into(),
+                reason: "restarting session".into(),
+                error_kind: None,
+            },
+        );
+        // The whole chain is durable already: classification walks to
+        // the tip in one step — no depth-2 blindness, no hold.
+        assert!(state.lineage_pending.is_empty());
+        assert!(
+            state.running.contains_key("wrapper-new"),
+            "the occurrence follows the chain to its tip"
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).started.as_deref(),
+            Some("wrapper-new")
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::DoneSignal {
+                session_id: Some("wrapper-new".into()),
+                message: Some("tip finished".into()),
+            },
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.terminal, Some(OccurrenceState::Completed));
+        assert_eq!(progress.started.as_deref(), Some("wrapper-new"));
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.session_id.as_deref(), Some("wrapper-new"));
+    }
+
+    /// An owner Stop is quiet BY DECREE: the durable tombstone (written
+    /// before the end event) terminals the occurrence immediately — no
+    /// grace hold, nothing pending.
+    #[tokio::test]
+    async fn stop_tombstone_terminals_the_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_home_and_project(dir.path(), home.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        announce_wrapper(home.path(), "wrapper-stopme", "claude-code", &["b-stop"]);
+        let (item_id, occurrence_id, delegation_id) =
+            start_now_dispatch(&handle, &mut journal, &mut state, "stop me").await;
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "wrapper-stopme".into(),
+            },
+        );
+        crate::external_wrapper_index::record_user_stop(home.path(), "claude-code", "b-stop")
+            .unwrap();
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "wrapper-stopme".into(),
+                reason: "stopped by user".into(),
+                error_kind: None,
+            },
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.terminal, Some(OccurrenceState::Failed));
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.note.as_deref(), Some("stopped by user"));
+        assert!(state.lineage_pending.is_empty());
+        assert!(state.running.is_empty());
+    }
+
+    /// The pre-receipt end of a wrapper-backed session with NO admitted
+    /// successor still fails the occurrence: the receipt routes the
+    /// remembered end through lineage classification, which holds for
+    /// the grace window and then terminals `failed` — never strands the
+    /// occurrence and never completes it.
+    #[tokio::test]
+    async fn early_end_without_successor_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_home_and_project(dir.path(), home.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        announce_wrapper(home.path(), "wrapper-early", "claude-code", &["b-early"]);
+        let (item_id, occurrence_id, delegation_id) =
+            start_now_dispatch(&handle, &mut journal, &mut state, "die before receipt").await;
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "wrapper-early".into(),
+                reason: "error: died at boot".into(),
+                error_kind: None,
+            },
+        );
+        assert!(
+            journal.progress(&occurrence_id).started.is_none(),
+            "no receipt yet — nothing journaled"
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id,
+                session_id: "wrapper-early".into(),
+            },
+        );
+        // The receipt consumed the remembered end into a lineage hold
+        // (a successor may still register), keeping the journal arc in
+        // order: started, then the eventual terminal.
+        assert_eq!(
+            journal.progress(&occurrence_id).started.as_deref(),
+            Some("wrapper-early")
+        );
+        assert!(journal.progress(&occurrence_id).terminal.is_none());
+        assert_eq!(state.lineage_pending.len(), 1);
+
+        sweep_lineage_pending(
+            &handle,
+            &mut journal,
+            &mut state,
+            now_ms() + LINEAGE_QUIET_GRACE_MS + 1_000,
+        );
+        let progress = journal.progress(&occurrence_id);
+        assert_eq!(progress.terminal, Some(OccurrenceState::Failed));
+        let run = last_run_of(&handle, &item_id);
+        assert_eq!(run.state, "failed");
+        assert_eq!(run.note.as_deref(), Some("error: died at boot"));
     }
 
     /// A start-now carrying the confirm sheet's launch pins records them on

@@ -328,7 +328,15 @@ impl OccurrenceState {
 pub(crate) struct OccurrenceProgress {
     pub(crate) prepared: bool,
     /// Session id from a `started` record, while no terminal followed.
+    /// Last wins: a resume-lineage re-key journals a fresh `started` row
+    /// naming the successor, so recovery and attribution follow the tip.
     pub(crate) started: Option<String>,
+    /// EVERY session id a `started` row ever named, in order — the
+    /// loop-exclusion source: a lineage re-key must not drop the
+    /// original session from [`OccurrenceJournal::started_sessions_for_item`]
+    /// (items it parked before the supersede would otherwise re-fire the
+    /// effect that spawned it).
+    pub(crate) started_history: Vec<String>,
     pub(crate) terminal: Option<OccurrenceState>,
     /// The owning item, retained from the journal rows so boot recovery
     /// can write a fail-closed outcome back to the item even for
@@ -380,10 +388,12 @@ impl OccurrenceJournal {
     /// Session ids this item's occurrences have STARTED with, from the
     /// journal fold — the verified-attribution loop-exclusion key
     /// (Track T, T0 ruling 7 direct branch): an item parked by one of
-    /// these sessions never re-fires this item's effect. Durable across
-    /// restarts because the journal is; keyed on the gate-resolved
-    /// session id the write-back recorded, never on `--source` or any
-    /// text a mandate controls.
+    /// these sessions never re-fires this item's effect. Every session a
+    /// `started` row EVER named counts (a resume-lineage re-key appends
+    /// the successor without un-attributing the superseded original).
+    /// Durable across restarts because the journal is; keyed on the
+    /// gate-resolved session id the write-back recorded, never on
+    /// `--source` or any text a mandate controls.
     pub(crate) fn started_sessions_for_item(
         &self,
         item_id: &str,
@@ -391,7 +401,7 @@ impl OccurrenceJournal {
         self.state
             .values()
             .filter(|progress| progress.item_id.as_deref() == Some(item_id))
-            .filter_map(|progress| progress.started.clone())
+            .flat_map(|progress| progress.started_history.iter().cloned())
             .collect()
     }
 
@@ -626,6 +636,11 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
         OccurrenceState::Started => {
             entry.prepared = true;
             entry.started = record.session_id.clone();
+            if let Some(session_id) = record.session_id.as_ref() {
+                if !entry.started_history.contains(session_id) {
+                    entry.started_history.push(session_id.clone());
+                }
+            }
         }
         state => entry.terminal = Some(state),
     }
