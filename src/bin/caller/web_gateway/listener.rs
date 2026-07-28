@@ -2970,7 +2970,8 @@ impl BootstrapCacheMaintainer {
 
     /// Latest change-detected per-session state (`session_started` /
     /// `session_vitals` / `session_goal` / pending `approval_required` /
-    /// `user_question`), replayed to late joiners. Bounded at 256 sessions
+    /// `user_question` / raised `coordination_radar`), replayed to late
+    /// joiners. Bounded at 256 sessions
     /// against a runaway session-id source: `session_ended` is the normal
     /// prune; overflow evicts the lexicographically first key, which is
     /// arbitrary but keeps it finite.
@@ -3068,6 +3069,27 @@ impl BootstrapCacheMaintainer {
                 session_id: Some(session_id),
                 ..
             } => self.cache_session_state_line("user_question", session_id, event),
+            // A raised coordination-radar flag has no other daemon-side
+            // registry the bootstrap could read, so without this cache a WS
+            // flap or page reload silently dropped a still-raised flag from
+            // the attention set (the SPA clears on disconnect by design and
+            // rebuilds only from this replay). One flag per session — the
+            // tracker's invariant — so one line per session; `resolved`
+            // retracts it and `session_ended` prunes with the session.
+            E::CoordinationRadar {
+                session_id, state, ..
+            } => match state {
+                crate::types::CoordinationRadarState::Raised => {
+                    self.cache_session_state_line("coordination_radar", session_id, event)
+                }
+                crate::types::CoordinationRadarState::Resolved => {
+                    if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                        if let Some(kinds) = guard.get_mut(session_id) {
+                            kinds.remove("coordination_radar");
+                        }
+                    }
+                }
+            },
             E::ApprovalResolved {
                 session_id: Some(session_id),
                 id,
@@ -3289,6 +3311,37 @@ mod bootstrap_cache_tests {
         });
         assert!(
             !m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+    }
+
+    #[test]
+    fn radar_items_survive_ws_reconnect() {
+        // A raised radar flag is cached as a per-session state line, so the
+        // bootstrap replay rebuilds the SPA's `radar` attention item after a
+        // WS flap or reload instead of letting it silently vanish (the SPA
+        // clears its whole attention set on disconnect by design).
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::CoordinationRadar {
+            session_id: "s-9".to_string(),
+            id: "space-key".to_string(),
+            state: crate::types::CoordinationRadarState::Raised,
+        });
+        let line =
+            m.caches.session_state_lines.lock().unwrap()["s-9"]["coordination_radar"].clone();
+        assert!(
+            line.contains("\"coordination_radar\"") && line.contains("\"raised\""),
+            "cached line must be the raise wire event itself: {line}"
+        );
+
+        // Resolve retracts the cached raise — no ghost flag on the next
+        // bootstrap.
+        m.apply(&AppEvent::CoordinationRadar {
+            session_id: "s-9".to_string(),
+            id: "space-key".to_string(),
+            state: crate::types::CoordinationRadarState::Resolved,
+        });
+        assert!(
+            !m.caches.session_state_lines.lock().unwrap()["s-9"].contains_key("coordination_radar")
         );
     }
 

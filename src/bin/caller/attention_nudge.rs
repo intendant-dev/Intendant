@@ -1260,4 +1260,164 @@ mod tests {
         dashboard_disconnected();
         assert!(!dashboards_connected());
     }
+
+    // ── Attention-inbox pins (browser-side twin of this file's chain) ──
+    //
+    // The dashboard's attention center (57-attention-notifications.js) is
+    // the open-tab leg of the attention chain this module closes for
+    // closed tabs. These pins hold its load-bearing structure: the
+    // tab-title badge and the oversight-bar inbox render ONE set, every
+    // badged class has a named inbox surface, and escalated notifications
+    // retire by user act, not tab visibility. A refactor that breaks an
+    // extraction here should update the pin in the same change — the pin
+    // failing IS the review.
+
+    const ATTENTION_FRAGMENT: &str =
+        include_str!("../../../static/app/57-attention-notifications.js");
+
+    #[test]
+    fn badge_count_derives_from_inbox_items() {
+        // One repaint pass paints every surface…
+        let repaint = ATTENTION_FRAGMENT
+            .split("function attentionRepaint()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("attentionRepaint present");
+        for surface in [
+            "attentionItems.size",
+            "attentionPaintFavicon(count)",
+            "attentionPaintChip()",
+            "attentionRenderInbox()",
+        ] {
+            assert!(
+                repaint.contains(surface),
+                "attentionRepaint no longer drives {surface}"
+            );
+        }
+        // …the chip counts the same map…
+        let chip = ATTENTION_FRAGMENT
+            .split("function attentionPaintChip()")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("attentionPaintChip present");
+        assert!(
+            chip.contains("attentionItems.size"),
+            "the inbox chip must count attentionItems itself, not a mirror"
+        );
+        // …and attentionItems is the fragment's only Map — no second
+        // item store the two renderings could drift apart on.
+        assert_eq!(
+            ATTENTION_FRAGMENT.matches("new Map()").count(),
+            1,
+            "a second Map in 57-attention-notifications.js suggests a mirrored item set"
+        );
+    }
+
+    #[test]
+    fn every_badge_class_has_persistent_surface() {
+        // Every kind the badge can count (each attentionAdd call site)…
+        let mut kinds: Vec<&str> = ATTENTION_FRAGMENT
+            .match_indices("attentionAdd('")
+            .map(|(at, pat)| {
+                ATTENTION_FRAGMENT[at + pat.len()..]
+                    .split('\'')
+                    .next()
+                    .expect("unterminated attentionAdd kind literal")
+            })
+            .collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds,
+            ["approval", "display", "notify", "question", "radar"],
+            "badge taxonomy changed — update the inbox surfaces and this pin together"
+        );
+        // …must be named in the inbox's label map…
+        let labels = ATTENTION_FRAGMENT
+            .split("const ATTENTION_KIND_LABELS = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("ATTENTION_KIND_LABELS present");
+        for kind in kinds {
+            assert!(
+                labels.contains(&format!("{kind}:")),
+                "badge kind '{kind}' has no inbox label — a count with no findable target"
+            );
+        }
+        // …and the surface itself exists: chip + popover markup, and the
+        // renderer that fills it.
+        let shell = include_str!("../../../static/app/ui2-shell.html");
+        for id in [
+            "id=\"ui2-attention-btn\"",
+            "id=\"ui2-attention-pop\"",
+            "id=\"ui2-attention-list\"",
+        ] {
+            assert!(shell.contains(id), "ui2-shell.html lost inbox element {id}");
+        }
+        assert!(
+            ATTENTION_FRAGMENT.contains("getElementById('ui2-attention-list')"),
+            "inbox renderer no longer fills the popover list"
+        );
+    }
+
+    #[test]
+    fn notify_items_retire_on_click_not_visibility() {
+        // The old self-clear (visibilitychange retired every notify item
+        // before its cause was findable) must stay dead…
+        assert!(
+            !ATTENTION_FRAGMENT.contains("attentionClearNotifyKind"),
+            "visibility-driven notify clearing came back"
+        );
+        let visibility = ATTENTION_FRAGMENT
+            .split("addEventListener('visibilitychange'")
+            .nth(1)
+            .and_then(|rest| rest.split("});").next())
+            .expect("visibilitychange hook present");
+        assert!(
+            !visibility.contains("attentionItems.delete")
+                && !visibility.contains("attentionRetire"),
+            "visibilitychange must not retire attention items"
+        );
+        // …retirement is the inbox click or explicit dismiss…
+        for act in [
+            "attentionRetire(item, 'clicked')",
+            "attentionRetire(item, 'dismissed')",
+        ] {
+            assert!(
+                ATTENTION_FRAGMENT.contains(act),
+                "notify retirement lost its user act: {act}"
+            );
+        }
+        // …and the turn-return sweep spares notify like display/radar
+        // (session-less agenda reminders share the 'main' session key, so
+        // the sweep otherwise erases them on any main-session turn end).
+        assert!(
+            ATTENTION_FRAGMENT.contains(
+                "item.kind !== 'display' && item.kind !== 'radar' && item.kind !== 'notify'"
+            ),
+            "task_complete/interrupted sweep no longer spares notify items"
+        );
+    }
+
+    #[test]
+    fn recent_tail_explains_cleared_badge() {
+        // The bounded tail exists, retirements feed it, and the inbox
+        // renders it — a badge that just cleared stays explainable.
+        assert!(
+            ATTENTION_FRAGMENT.contains("const attentionRecent = []"),
+            "recent tail store missing"
+        );
+        assert!(
+            ATTENTION_FRAGMENT.contains("attentionRecent.length = ATTENTION_RECENT_MAX"),
+            "recent tail lost its bound"
+        );
+        assert!(
+            ATTENTION_FRAGMENT.contains("function attentionTailPush"),
+            "retirements no longer feed the recent tail"
+        );
+        assert!(
+            ATTENTION_FRAGMENT.contains("for (const entry of attentionRecent)"),
+            "inbox no longer renders the recent tail"
+        );
+    }
 }

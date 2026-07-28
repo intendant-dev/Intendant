@@ -96,6 +96,16 @@
     <span class="ui2-ctx-pct" id="ui2-ctx-pct">0%</span>
   </div>
   <div class="ui2-ovs-divider ui2-ovs-compact-hide"></div>
+  <!-- Attention inbox: the on-page twin of the tab-title/favicon count.
+       Chip and popover render the SAME attentionItems set the title badge
+       counts (57-attention-notifications.js owns both — derive, don't
+       mirror), so every badged count has a findable, named target here. -->
+  <button type="button" class="ui2-attention" id="ui2-attention-btn"
+          title="Attention inbox — everything waiting on you"
+          aria-haspopup="true" aria-expanded="false">
+    <span class="ui2-attention-icon" id="ui2-attention-icon" aria-hidden="true"></span>
+    <span class="ui2-attention-count" id="ui2-attention-count" hidden>0</span>
+  </button>
   <button type="button" class="ui2-conn" id="ui2-conn" title="Dashboard transport — opens Access → Diagnostics">
     <span class="ui2-conn-dot" id="ui2-conn-dot"></span>
     <span class="ui2-conn-label ui2-ovs-compact-hide" id="ui2-conn-label">connecting…</span>
@@ -113,6 +123,24 @@
     <span class="ui2-kbd" id="ui2-search-kbd">⌘K</span>
   </button>
 </header>
+
+<!-- Attention inbox popover (anchored under the oversight-bar chip).
+     Skeleton only: rows are built by attentionRenderInbox() in
+     57-attention-notifications.js from the live attentionItems map plus
+     the bounded recent tail (retired items, so a just-cleared badge stays
+     explainable). -->
+<div id="ui2-attention-pop" hidden role="dialog" aria-label="Attention inbox">
+  <div class="ui2-attn-head">
+    <span class="ui2-attn-eyebrow">Needs you</span>
+    <span class="ui2-attn-head-count" id="ui2-attention-pop-count" hidden></span>
+  </div>
+  <div id="ui2-attention-list"></div>
+  <div class="ui2-attn-head ui2-attn-recent-head" id="ui2-attention-recent-head" hidden>
+    <span class="ui2-attn-eyebrow">Recent</span>
+    <button type="button" class="ui2-attn-recent-clear" id="ui2-attention-recent-clear">Clear</button>
+  </div>
+  <div id="ui2-attention-recent" hidden></div>
+</div>
 
 <!-- ⌘K command palette (P1b). Backdrop blur is dropped while the Station
      pane is active — the blur-over-canvas discipline. -->
