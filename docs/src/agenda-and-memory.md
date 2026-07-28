@@ -624,6 +624,50 @@ jump link to that conversation row, keeps raw ids/principal/kind in the
 tooltip, and degrades to the raw truncated id whenever nothing resolves
 (index pruned, log dir gone) — a dangling recorded id is never an error.
 
+### Automation definitions: sealed SKILL.md files (Track AW)
+
+The shipped mandates and workflows below are **definitions** — one
+agentskills.io-conforming directory each, `automations/<name>/SKILL.md`,
+in this repo (the house set) or under `<state root>/automations/`
+(personal; shadows a house definition of the same name, visibly). The
+YAML `---` frontmatter carries spec fields only — `name` (must equal the
+directory name), `description`, and the optional
+`license`/`compatibility`/`metadata`/`allowed-tools`, with the display
+title riding `metadata.title` — and the markdown body declares one
+`## node: <id>` section per node. Each section opens with a fenced
+`toml` config block (the machine schema: `title`, executor prefills
+`agent`/`model`/`effort`, `relies_on` edges, and for single-node
+definitions a `[cadence]` or `[trigger]` default), parsed with
+deny-unknown rigor; the prose after the block is the node's mandate.
+Shape is **derived from arity** — one node is an *action*, 2..=8 nodes a
+*workflow* whose orientation prose above the first heading is the hub
+body. A definition directory is a valid Agent Skill, readable and
+shareable by any spec-conforming tool; optional `scripts/`,
+`references/`, `assets/` directories are context only in v1 — never
+sealed, never binding.
+
+**Stamping = sealing.** The `stamp` agenda command (wire `op: "stamp"`,
+daemon-side) resolves a definition by catalog name or explicit `file:`
+path, reads it once, validates it (spec frontmatter, the heading
+bijection — an undeclared or near-miss `## node:` heading refuses — and
+the Kahn DAG rule over `relies_on`), seals those bytes into the snapshot
+store, parks the instance graph (an action's single task, or a
+workflow's hub + placed nodes + edges), and proposes one manifest per
+node whose **goal is a machinery-minted execution preamble** and whose
+`binding_refs` pin the definition's `{locator, sha256}` — all N nodes
+share one whole-file seal. The parked item bodies carry display copies
+of their sections (board readability); the sealed file is the binding
+text a fired session re-verifies via its rider lines. Stamping **parks
+and proposes only** — per-effect approvals stay the owner's ordinary
+act, batched by the workflow approval sheet's single pinned emitter.
+Files DECLARE, the daemon ENFORCES: frontmatter and config values are
+prefills into the same manifest intake every hand-proposed manifest
+passes (cadence floors, trigger bounds, executor vocabulary, project
+pins) — never around it — and an unsealed file is context at best,
+never instruction. The embedded house set materializes into
+`<state root>/automations/.house/` at boot, so stamps have a real path
+to hash and seal on installs without a repo checkout.
+
 ### The housekeeping recipe
 
 A deliberate review pass over the whole agenda, built entirely from the
@@ -678,9 +722,9 @@ item, and zero disposals look like in the log.
 The recurring 1D sibling of the reconcile-backlog workflow below: the
 same survey-and-repair judgment scoped to drift since the last pass,
 cadence-able and run-now-able, repair-by-annotation throughout. It
-ships in the registry UNAPPROVED like every mandate — the owner
+ships as a house definition UNAPPROVED like every mandate — the owner
 decides if and when it stands, typically after seeing the backfill's
-result. Its text (byte-pinned to the registry):
+result. Its text (byte-pinned to the definition file):
 
 ```text
 Agenda reconciliation pass. Survey drift since the last pass —
@@ -839,10 +883,10 @@ first node fires on approval and each completion unblocks the next —
 the trigger machinery above, nothing workflow-specific. A failing node
 suspends its own lane (re-approve to re-arm); revoking one node's
 effect halts that lane while downstream simply stays blocked-derived;
-the diary shows ordinary ops only. The registry
-(`agenda/mandate_templates.rs`) is the source of truth for the shipped
-exemplar below; these blocks and the dashboard's copy are byte-pinned
-to it. The instance hub's orientation body:
+the diary shows ordinary ops only. The definition file
+(`automations/fix-task/SKILL.md`) is the source of truth for the
+shipped exemplar below; these blocks are byte-pinned to its prose. The
+instance hub's orientation body:
 
 ```text
 This hub is one instance of the fix-task workflow: investigate →
@@ -969,8 +1013,8 @@ briefing standard. Honestly stated, and binding in the template's own
 text: a Fable-5 steward session RULES within delegated bounds and
 FLAGS owner-decisions to the rail — it inherits the human steward's
 delegation, not the owner's authority. The canonical mandate text
-(byte-pinned to the registry, whose text is the T0 ruling's amended
-block):
+(byte-pinned to the definition file, whose text is the T0 ruling's
+amended block):
 
 ```text
 Steward-gate ruling pass. Gate questions tagged for the owner-plane
