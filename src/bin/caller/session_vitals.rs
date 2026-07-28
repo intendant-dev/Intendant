@@ -4087,6 +4087,12 @@ mod tests {
             "'cache-hit':",
             "'cache-ttl':",
             "limit:",
+            // Grid-envelope symbols (catalog-row `agenda` + `boot`
+            // blocks — grid_envelope.rs pins their wire fields).
+            "'agenda-source':",
+            "'agenda-occurrence':",
+            "'sealed-inputs':",
+            "boot:",
         ] {
             assert!(catalog.contains(key), "catalog lost symbol {key}");
         }

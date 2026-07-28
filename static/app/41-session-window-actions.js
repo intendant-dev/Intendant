@@ -681,6 +681,13 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.phase) {
     applySessionWindowPhase(win, sid, meta.phase);
   }
+  // Grid envelope: the served ghost bit (pre-boot AND no live wrapper)
+  // marks the whole window — the unmistakable safe-to-close treatment.
+  // Missing block ≠ cleared: only a present block moves the class.
+  const bootEra = (sessionMetadataById.get(sid) || {}).boot;
+  if (bootEra !== undefined) {
+    win.el.classList.toggle('session-window-ghost', !!(bootEra && bootEra.ghost));
+  }
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
