@@ -369,6 +369,20 @@ pub(crate) struct OccurrenceProgress {
     pub(crate) item_id: Option<String>,
 }
 
+/// One session's journal-derived source linkage — the grid envelope's
+/// agenda block ([`OccurrenceJournal::session_links`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOccurrenceLink {
+    pub(crate) occurrence_id: String,
+    pub(crate) item_id: String,
+    /// `Started` until a terminal row lands, then that terminal. The
+    /// occurrence's state speaks for every lineage member: a resume
+    /// re-key appends the successor's `started` row without
+    /// un-attributing the original, and the one terminal that follows
+    /// the lineage tip resolves the whole occurrence.
+    pub(crate) state: OccurrenceState,
+}
+
 /// The append-only delivery ledger. `prepare` records are fsync'd — the
 /// brief's "journal fsync'd before delivery" is load-bearing for the
 /// at-least-once contract.
@@ -450,6 +464,40 @@ impl OccurrenceJournal {
             .filter(|progress| progress.item_id.as_deref() == Some(item_id))
             .flat_map(|progress| progress.started_history.iter().cloned())
             .collect()
+    }
+
+    /// Reverse fold for the session catalog's grid envelope: every
+    /// session id any `started` row ever named → its occurrence, owning
+    /// item, and the occurrence's current state. The whole resume
+    /// lineage maps to one occurrence (see
+    /// [`Self::started_sessions_for_item`] on why history, not tip).
+    /// Rows that never retained an item id (boot-recovery unknowns) are
+    /// unattributable and skipped.
+    pub(crate) fn session_links(
+        &self,
+    ) -> std::collections::HashMap<String, SessionOccurrenceLink> {
+        let mut links = std::collections::HashMap::new();
+        for (occurrence_id, progress) in &self.state {
+            let Some(item_id) = progress
+                .item_id
+                .as_deref()
+                .filter(|item_id| !item_id.is_empty())
+            else {
+                continue;
+            };
+            let state = progress.terminal.unwrap_or(OccurrenceState::Started);
+            for session_id in &progress.started_history {
+                links.insert(
+                    session_id.clone(),
+                    SessionOccurrenceLink {
+                        occurrence_id: occurrence_id.clone(),
+                        item_id: item_id.to_string(),
+                        state,
+                    },
+                );
+            }
+        }
+        links
     }
 
     /// True while any session occurrence of this item is `started` with no
@@ -1606,6 +1654,72 @@ mod tests {
         );
         assert!(again.deliver.is_empty());
         assert_eq!(again.next_wake_ms, Some(5_000));
+    }
+
+    /// The grid envelope's reverse fold: every lineage member maps to
+    /// its occurrence, the occurrence's terminal speaks for the whole
+    /// lineage, and rows that never retained an item id stay
+    /// unattributable.
+    #[test]
+    fn session_links_follow_lineage_and_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OccurrenceJournal::open(dir.path()).unwrap();
+        let row = |occ: &str, item: &str, state: OccurrenceState, session: Option<&str>| {
+            OccurrenceRecord {
+                v: 1,
+                at_ms: 1_000,
+                occurrence_id: occ.to_string(),
+                item_id: item.to_string(),
+                due_ms: 1_000,
+                state,
+                urgency: None,
+                session_id: session.map(str::to_string),
+                generation: None,
+                boot_id: None,
+            }
+        };
+        // occ-1: started by s1, re-keyed to successor s2, then completed.
+        journal
+            .append(&row("occ-1", "item-a", OccurrenceState::Started, Some("s1")))
+            .unwrap();
+        journal
+            .append(&row("occ-1", "item-a", OccurrenceState::Started, Some("s2")))
+            .unwrap();
+        journal
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Completed,
+                Some("s2"),
+            ))
+            .unwrap();
+        // occ-2: still running.
+        journal
+            .append(&row("occ-2", "item-b", OccurrenceState::Started, Some("s3")))
+            .unwrap();
+        // occ-3: boot-recovery shape — no item id retained.
+        journal
+            .append(&row("occ-3", "", OccurrenceState::Started, Some("s4")))
+            .unwrap();
+
+        let links = journal.session_links();
+        for lineage_member in ["s1", "s2"] {
+            let link = links.get(lineage_member).expect("lineage member linked");
+            assert_eq!(link.occurrence_id, "occ-1");
+            assert_eq!(link.item_id, "item-a");
+            assert_eq!(
+                link.state,
+                OccurrenceState::Completed,
+                "the terminal follows the whole lineage"
+            );
+        }
+        let running = links.get("s3").expect("running session linked");
+        assert_eq!(running.item_id, "item-b");
+        assert_eq!(running.state, OccurrenceState::Started);
+        assert!(
+            !links.contains_key("s4"),
+            "itemless boot-recovery rows stay unattributable"
+        );
     }
 
     /// The A3 restart contract: a terminal record survives reopen (never

@@ -358,6 +358,9 @@ pub(crate) fn spawn_mode_web_gateway(
                         default_project_root: project_root.clone(),
                     }),
             );
+            // Read-side seam for lanes outside the state graph (the
+            // session catalog's grid-envelope join).
+            crate::agenda::publish_agenda_handle(handle.clone());
             // Detaches on drop like the mode listeners; one per daemon.
             let _scheduler =
                 crate::agenda::spawn_reminder_scheduler(handle.clone(), Some(handover.clone()));
