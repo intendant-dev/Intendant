@@ -533,7 +533,7 @@ impl SessionSupervisor {
                     turn,
                     "ok",
                     format!(
-                        "branched to {child_short} — the edited prompt runs there ({kept_lines} lines kept)"
+                        "branched to {child_short} — the edited prompt runs there ({kept_lines} lines kept; the parent's subagents stay resumable from the parent session only)"
                     ),
                 );
             }
