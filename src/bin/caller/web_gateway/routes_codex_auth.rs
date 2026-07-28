@@ -73,13 +73,15 @@ fn start_mode_from_body(body_text: &str) -> Result<String, String> {
 }
 
 /// GET /api/codex-auth/status + the tunnel's `api_codex_auth_status`.
-pub(crate) fn codex_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
+/// At `success` the payload carries the live registry's
+/// `reload_candidates` (see [`auth_status_payload`]).
+pub(crate) async fn codex_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
     if hosted_provenance {
         return hosted_refusal_response();
     }
     ApiResponse::json(
         200,
-        JsonBody::Value(auth_ceremony::manager().status_value_for(Provider::Codex)),
+        JsonBody::Value(auth_status_payload(Provider::Codex).await),
     )
 }
 
@@ -122,7 +124,7 @@ pub(crate) async fn handle_codex_auth_status(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = codex_auth_status_api_response(request_authority_is_hosted(access));
+    let response = codex_auth_status_api_response(request_authority_is_hosted(access)).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -150,11 +152,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hosted_provenance_is_refused_on_every_leaf() {
+    #[tokio::test]
+    async fn hosted_provenance_is_refused_on_every_leaf() {
         for response in [
             codex_auth_start_api_response(true, "", None),
-            codex_auth_status_api_response(true),
+            codex_auth_status_api_response(true).await,
             codex_auth_cancel_api_response(true),
         ] {
             let (status, body) = response_status_and_body(response);

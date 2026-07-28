@@ -1774,10 +1774,6 @@ pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint
 /// `idle`, `resident`, `external` — describes a session that may still be
 /// alive). The bare-dir `"abandoned"` classification applied in
 /// `intendant_session_list_row_from_dir` is terminal for consumers too.
-/// The dashboard's agent sign-in reload panels mirror this set
-/// (`AGENT_SIGNIN_TERMINAL_STATUSES` in `static/app/32-vault-custody.js`)
-/// — pinned by the parity test below, so a vocabulary change here fails
-/// the suite instead of shipping as drift.
 pub(crate) const SESSION_ENDED_STATUSES: [&str; 3] = ["completed", "failed", "interrupted"];
 
 fn summary_json_status(dir: &Path) -> Option<&'static str> {
@@ -2998,43 +2994,6 @@ mod tests {
         // No summary at all → the session has not ended.
         std::fs::remove_file(dir.path().join("summary.json")).unwrap();
         assert_eq!(summary_json_status(dir.path()), None);
-    }
-
-    /// The agent sign-in reload panels offer chips for ALIVE supervised
-    /// sessions by excluding this module's terminal statuses — a static
-    /// frontend mirror ("derive, don't mirror" fallback rule: the mirror
-    /// gets a daemon-side parity test). The fragment's set must equal
-    /// `SESSION_ENDED_STATUSES` plus the `"abandoned"` classification,
-    /// exactly — an addition or rename on either side fails here.
-    #[test]
-    fn agent_signin_terminal_status_mirror_matches_catalog_vocabulary() {
-        let app = include_str!("../../../../../static/app.html");
-        let start = "const AGENT_SIGNIN_TERMINAL_STATUSES = new Set([";
-        let from = app
-            .find(start)
-            .expect("AGENT_SIGNIN_TERMINAL_STATUSES not found in app.html")
-            + start.len();
-        let rest = &app[from..];
-        let to = rest
-            .find("])")
-            .expect("AGENT_SIGNIN_TERMINAL_STATUSES is unterminated");
-        let mirrored: std::collections::BTreeSet<String> = rest[..to]
-            .split('\'')
-            .skip(1)
-            .step_by(2)
-            .map(str::to_string)
-            .collect();
-
-        let mut expected: std::collections::BTreeSet<String> = SESSION_ENDED_STATUSES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        expected.insert("abandoned".to_string());
-        assert_eq!(
-            mirrored, expected,
-            "static/app/32-vault-custody.js AGENT_SIGNIN_TERMINAL_STATUSES \
-             must mirror the catalog's terminal vocabulary"
-        );
     }
 
     #[test]

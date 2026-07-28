@@ -56,6 +56,18 @@ impl Provider {
         }
     }
 
+    /// The supervised backend this ceremony signs in — the identity a
+    /// `ManagedSession::source` carries (`AgentBackend::as_short_str`
+    /// vocabulary), which keys the status payload's `reload_candidates`
+    /// to exactly the sessions the new account applies to.
+    pub(crate) fn agent_backend(self) -> crate::external_agent::AgentBackend {
+        match self {
+            Provider::Claude => crate::external_agent::AgentBackend::ClaudeCode,
+            Provider::Codex => crate::external_agent::AgentBackend::Codex,
+            Provider::Kimi => crate::external_agent::AgentBackend::Kimi,
+        }
+    }
+
     /// Hard ceiling on one ceremony, spawn to terminal state. Claude's
     /// paste-code exchange is quick; Codex's ceiling is the device
     /// code's own 15-minute expiry.
