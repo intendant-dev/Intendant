@@ -503,6 +503,7 @@ const MAX_BACKOFF_S: u64 = 60 * 60;
 pub(crate) fn spawn_scanner(
     agenda: std::sync::Arc<AgendaHandle>,
     settings_root: std::path::PathBuf,
+    handover: Option<std::sync::Arc<crate::handover::HandoverRuntime>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let runtime = super::status::global();
@@ -517,6 +518,18 @@ pub(crate) fn spawn_scanner(
             }
         };
         loop {
+            // Track HS2 (intake Q9): the scanner is a standing automation
+            // — a daemon-attributed mirror writer on a poll loop — so it
+            // runs on the scheduler-lease holder only; two daemons
+            // scanning race anchor parks against slightly stale folds.
+            // Secondaries idle at the same recheck cadence as the
+            // keystore-free state and follow the lease as it moves.
+            if let Some(runtime) = &handover {
+                if !runtime.is_holder() {
+                    tokio::time::sleep(std::time::Duration::from_secs(IDLE_RECHECK_S)).await;
+                    continue;
+                }
+            }
             let config = crate::project::Project::from_root(settings_root.clone())
                 .map(|proj| proj.config.integrations.github.clone())
                 .unwrap_or_default();

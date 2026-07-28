@@ -293,7 +293,18 @@ patching the due time creates a new occurrence.
 Notification delivery is at-least-once. The journal records `prepared` before
 delivery and a terminal result after it. A crash between those records can
 redeliver once. Two live daemons sharing the same home refold each other's
-journal writes, but there remains a narrow double-delivery window.
+journal writes for reads and dedup; firing itself is single-writer by
+construction — standing automations (the scheduler pass, reminder delivery,
+the PR scanner) run only on the daemon holding the **active-scheduler lease**
+(`scheduler-lease/holder.lock`, an advisory file lock held for the process
+lifetime; crash release is automatic). Co-homed secondaries plan nothing and
+poll the freed lock, so the population converges on a new holder within one
+poll interval after the holder exits. Journal rows carry the writer's
+`boot_id` and lease `generation`, and recovery only fail-closes occurrences
+whose writing daemon is provably gone (its per-boot presence lock under
+`daemons/` is takeable) — a live daemon's in-flight sessions are never
+clobbered by a co-homed boot. `intendant ctl status` shows the lease and
+every registered daemon under `scheduler_lease`.
 
 ### Scheduled sessions
 
