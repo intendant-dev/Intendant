@@ -525,33 +525,34 @@ pub(crate) async fn run_headless_mode(
     // session runs: parallel sessions are owned by the session supervisor
     // (the dispatcher deliberately ignores them).
     let foreground_supervisor_handle = if use_web {
-        Some(
-            session_supervisor::SessionSupervisor::new(
-                session_supervisor::SessionSupervisorConfig {
-                    bus: bus.clone(),
-                    project_root: Some(project.root.clone()),
-                    autonomy: autonomy.clone(),
-                    shared_external_agent: shared_external_agent.clone(),
-                    shared_codex_config: shared_codex_config.clone(),
-                    shared_claude_config: shared_claude_config.clone(),
-                    shared_kimi_config: shared_kimi_config.clone(),
-                    frame_registry: frame_registry.clone(),
-                    session_registry: Some(session_registry.clone()),
-                    peer_registry: headless_peer_registry.clone(),
-                    web_port: web_port_for_agent,
-                    flags_direct: flags.direct,
-                    shared_session: headless_shared_session.clone(),
-                    provider_factory: None,
-                    logs_home_override: None,
-                    git_vitals_targets: vitals_git_targets.clone(),
-                    hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
-                    launch_gate_for_tests: None,
-                    claude_rewind_capability_for_tests: None,
-                    agenda: headless_agenda.clone(),
-                },
-            )
-            .spawn_foreground_listener(session_id.clone()),
-        )
+        let supervisor = session_supervisor::SessionSupervisor::new(
+            session_supervisor::SessionSupervisorConfig {
+                bus: bus.clone(),
+                project_root: Some(project.root.clone()),
+                autonomy: autonomy.clone(),
+                shared_external_agent: shared_external_agent.clone(),
+                shared_codex_config: shared_codex_config.clone(),
+                shared_claude_config: shared_claude_config.clone(),
+                shared_kimi_config: shared_kimi_config.clone(),
+                frame_registry: frame_registry.clone(),
+                session_registry: Some(session_registry.clone()),
+                peer_registry: headless_peer_registry.clone(),
+                web_port: web_port_for_agent,
+                flags_direct: flags.direct,
+                shared_session: headless_shared_session.clone(),
+                provider_factory: None,
+                logs_home_override: None,
+                git_vitals_targets: vitals_git_targets.clone(),
+                hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
+                launch_gate_for_tests: None,
+                claude_rewind_capability_for_tests: None,
+                agenda: headless_agenda.clone(),
+            },
+        );
+        // Publish for read-side lanes (the sign-in ceremony status
+        // payloads' reload_candidates), mirroring daemon boot.
+        session_supervisor::publish_live_session_registry(supervisor.live_session_registry());
+        Some(supervisor.spawn_foreground_listener(session_id.clone()))
     } else {
         None
     };

@@ -1997,7 +1997,8 @@ pub(crate) async fn api_claude_auth_status_response(
         id,
         crate::web_gateway::claude_auth_status_api_response(control_grant_is_hosted(
             &runtime.grant,
-        )),
+        ))
+        .await,
         "claude auth status",
     )
 }
@@ -2054,7 +2055,8 @@ pub(crate) async fn api_codex_auth_status_response(
 ) -> serde_json::Value {
     frame_api_response(
         id,
-        crate::web_gateway::codex_auth_status_api_response(control_grant_is_hosted(&runtime.grant)),
+        crate::web_gateway::codex_auth_status_api_response(control_grant_is_hosted(&runtime.grant))
+            .await,
         "codex auth status",
     )
 }
@@ -2093,7 +2095,8 @@ pub(crate) async fn api_kimi_auth_status_response(
 ) -> serde_json::Value {
     frame_api_response(
         id,
-        crate::web_gateway::kimi_auth_status_api_response(control_grant_is_hosted(&runtime.grant)),
+        crate::web_gateway::kimi_auth_status_api_response(control_grant_is_hosted(&runtime.grant))
+            .await,
         "kimi auth status",
     )
 }
