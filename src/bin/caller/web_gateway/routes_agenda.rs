@@ -250,6 +250,164 @@ async fn agenda_handle(
     }
 }
 
+/// Transport-neutral core of `GET /api/agenda/definitions` (tunnel twin
+/// `api_agenda_definitions`): the automation-definition catalog — house
+/// and personal libraries, each validated, with provenance/shadowing
+/// visible and invalid entries listed with their refusal reason.
+/// Read-only; listing grants nothing (bindingness requires the stamp
+/// seal under an approval digest).
+pub(crate) async fn agenda_definitions_api_response(
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let catalog = agenda.definition_catalog();
+    match serde_json::to_value(&catalog) {
+        Ok(value) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "definitions": value })),
+        ),
+        Err(err) => ApiResponse::json_error(500, format!("encoding definition catalog: {err}")),
+    }
+}
+
+pub(crate) async fn handle_agenda_definitions(
+    stream: DemuxStream,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_definitions_api_response(mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Transport-neutral core of `GET /api/agenda/sealed/{sha256}` (tunnel
+/// twin `api_agenda_sealed`): one sealed binding-ref snapshot's bytes by
+/// pin — read-only and content-addressed (the served bytes re-hash to
+/// the requested pin or the request errors; a card visited after
+/// "Later" re-renders exactly what was sealed). Text serves as UTF-8;
+/// anything else rides base64 so the tunnel twin stays JSON.
+pub(crate) async fn agenda_sealed_api_response(
+    sha256: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    match agenda.sealed_content(sha256) {
+        Ok(Some(bytes)) => {
+            let body = match String::from_utf8(bytes) {
+                Ok(text) => serde_json::json!({
+                    "sha256": sha256.trim().to_ascii_lowercase(),
+                    "encoding": "utf8",
+                    "content": text,
+                }),
+                Err(err) => {
+                    use base64::Engine as _;
+                    serde_json::json!({
+                        "sha256": sha256.trim().to_ascii_lowercase(),
+                        "encoding": "base64",
+                        "content": base64::engine::general_purpose::STANDARD
+                            .encode(err.into_bytes()),
+                    })
+                }
+            };
+            ApiResponse::json(200, JsonBody::Value(body))
+        }
+        Ok(None) => ApiResponse::json_error(404, "no sealed snapshot under that pin"),
+        Err(err) => {
+            let status = if err.contains("64 hex") { 400 } else { 500 };
+            ApiResponse::json_error(status, err)
+        }
+    }
+}
+
+pub(crate) async fn handle_agenda_sealed(
+    stream: DemuxStream,
+    sha256: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_sealed_api_response(&sha256, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// The `POST /api/agenda/stamp` body (tunnel twin `api_agenda_stamp`):
+/// the stamp command's fields without the op tag. Deny-unknown so a
+/// misspelled override refuses instead of silently inheriting.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StampRequest {
+    definition: String,
+    #[serde(default)]
+    project_root: Option<String>,
+    #[serde(default)]
+    fire_at_ms: Option<u64>,
+    #[serde(default)]
+    every_ms: Option<u64>,
+    #[serde(default)]
+    suspend_after: Option<u32>,
+    #[serde(default)]
+    agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Transport-neutral core of `POST /api/agenda/stamp`: stamp one
+/// automation definition — the daemon reads/validates/seals the file,
+/// parks the instance graph, and proposes per node; the response is the
+/// whole stamped graph (hub, nodes, digests, the sealed pin) for the
+/// approval sheet. Parks + proposes ONLY — approval stays the owner's
+/// per-effect act. `actor` is gate-resolved at the authenticated edge,
+/// never parsed from the body.
+pub(crate) async fn agenda_stamp_api_response(
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+    actor: Option<crate::agenda::AgendaActor>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let request: StampRequest = match serde_json::from_str(body_text) {
+        Ok(request) => request,
+        Err(err) => {
+            return ApiResponse::json_error(400, format!("invalid stamp request: {err}"));
+        }
+    };
+    let cmd = crate::agenda::AgendaCommand::Stamp {
+        definition: request.definition,
+        project_root: request.project_root,
+        fire_at_ms: request.fire_at_ms,
+        every_ms: request.every_ms,
+        suspend_after: request.suspend_after,
+        agent_config: request.agent_config,
+        source: request.source,
+    };
+    match agenda.stamp(cmd, actor) {
+        Ok(outcome) => match serde_json::to_value(&outcome) {
+            Ok(value) => {
+                ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "stamp": value })))
+            }
+            Err(err) => ApiResponse::json_error(500, format!("encoding stamp outcome: {err}")),
+        },
+        Err(err) => ApiResponse::json_error(agenda_error_status(&err), err.to_string()),
+    }
+}
+
+pub(crate) async fn handle_agenda_stamp(
+    stream: DemuxStream,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    actor: Option<crate::agenda::AgendaActor>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_stamp_api_response(&body_text, mcp_server.as_ref(), actor).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 fn agenda_error_status(err: &crate::agenda::AgendaError) -> u16 {
     match err {
         crate::agenda::AgendaError::NotFound(_) => 404,

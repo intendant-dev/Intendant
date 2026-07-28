@@ -2310,6 +2310,64 @@ async fn run_agenda(
                 );
             }
         }
+        "stamp" => {
+            // Stamp = sealing (Track AW): one command, the whole instance
+            // graph — the daemon validates the definition, seals its
+            // bytes, parks, and proposes per node through the ordinary
+            // intake. Rides the agenda_op lane so every ctl context
+            // (owner shell, supervised session) can stamp; approval
+            // stays the owner's per-effect act.
+            let mut value_flags = vec![
+                "--project",
+                "--at",
+                "--every",
+                "--suspend-after",
+                "--source",
+            ];
+            value_flags.extend(AGENDA_LAUNCH_FLAGS);
+            let args = parse_command_args(&raw[1..], &value_flags, &[])?;
+            let definition = args
+                .positional
+                .first()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "agenda stamp requires a definition — a catalog name (e.g. fix-task) \
+                     or file:<absolute path>/SKILL.md"
+                        .to_string()
+                })?;
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("stamp".to_string()));
+            map.insert(
+                "definition".to_string(),
+                Value::String(definition.to_string()),
+            );
+            if let Some(at) = args.one("--at") {
+                map.insert("fire_at_ms".to_string(), Value::from(parse_due_ms(at)?));
+            }
+            if let Some(every) = args.one("--every") {
+                map.insert(
+                    "every_ms".to_string(),
+                    Value::from(parse_duration_ms(every)?),
+                );
+            }
+            if let Some(n) = args.one("--suspend-after") {
+                let n: u32 = n
+                    .parse()
+                    .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
+                map.insert("suspend_after".to_string(), Value::from(n));
+            }
+            insert_string(&mut map, "project_root", args.one("--project"));
+            insert_string(&mut map, "source", args.one("--source"));
+            insert_agenda_launch_config(&mut map, &args);
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+            println!(
+                "stamped — parked and proposed only; nothing runs until the owner approves \
+                 each manifest (dashboard Agenda tab; a workflow's approval sheet batches \
+                 the per-node approvals, `agenda approve <node-id>` covers one lane)"
+            );
+        }
         "approve" => {
             // Review-then-bind: without --digest this PRINTS the manifest
             // and its digest for review; approving requires echoing the
@@ -5204,6 +5262,14 @@ fn help_agenda() {
       # hashed here at propose time, covered by the approval digest, re-verified at every fire\n\
       [--project DIR]   # digest-bound project pin: where fired sessions run (absolute, must\n\
       # exist; omitted = the parking session's root, else the daemon default)\n\
+      [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
+      [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
+  intendant ctl agenda stamp NAME|file:PATH/SKILL.md [--project DIR] [--at WHEN]\n\
+      [--every INTERVAL] [--suspend-after N] [--source LABEL]   # stamp an automation\n\
+      # definition (automations/<name>/SKILL.md; personal shadows house): the daemon\n\
+      # validates + seals the file, parks the instance graph, and proposes one manifest\n\
+      # per node with the definition pinned as a binding ref — approves NOTHING; cadence/\n\
+      # executor overrides apply to single-node actions only\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
