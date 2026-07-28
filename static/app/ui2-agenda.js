@@ -65,6 +65,38 @@ function agendaSetDepth(depth) {
   agendaRenderTab();
   if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
 }
+// ---- Manifest-digest vocabulary (one formatter, one chip) ----
+// The digest is the approval ceremony's subject: an owner Approve binds
+// exactly these bytes, and every re-propose mints a NEW digest while
+// the item id stays. The one truncation length lives here — never
+// per-surface — and stays above the ledger search's 8-hex-char
+// digest-prefix floor, so the short form a surface shows always
+// resolves to its owning item when pasted into search.
+const AGENDA_DIGEST_SHORT_LEN = 10;
+
+function agendaShortDigest(digest) {
+  const d = String(digest || '');
+  return d.length > AGENDA_DIGEST_SHORT_LEN ? `${d.slice(0, AGENDA_DIGEST_SHORT_LEN)}…` : d;
+}
+
+// The interactive form every approval surface renders: hover reveals
+// the full digest, click copies it. Digest values are daemon-minted
+// lowercase hex; escaped like every interpolation anyway.
+function agendaDigestChipHtml(digest, tip) {
+  const d = String(digest || '');
+  if (!d) return '';
+  return `<button type="button" class="ag2-digest-chip" data-copy-digest="${escapeHtml(d)}"`
+    + ` title="${escapeHtml(`${tip ? `${tip} — ` : ''}sha256 ${d} — click to copy`)}">`
+    + `${escapeHtml(`digest ${agendaShortDigest(d)}`)}</button>`;
+}
+
+// One copy wire for every chip, wherever it renders (cards, inspector,
+// the workflow sheet on document.body) — document-level by design.
+document.addEventListener('click', (e) => {
+  const btn = e.target && e.target.closest && e.target.closest('[data-copy-digest]');
+  if (btn) agendaCopyText(btn.dataset.copyDigest, 'the manifest digest');
+});
+
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;

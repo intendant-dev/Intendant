@@ -430,7 +430,7 @@ function agendaInspEffectHtml(item) {
       acts.push(`<button type="button" class="ag2-btn ${cls || ''}" data-act="${act}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</button>`);
     if (st.kind === 'pending') {
       A('Approve this exact plan', 'eff-approve', 'prim',
-        `Binds digest ${String(e.digest || '').slice(0, 8)}… — any edit voids it`);
+        `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
       A('Edit schedule…', 'sched');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
@@ -450,14 +450,20 @@ function agendaInspEffectHtml(item) {
     } else {
       A('Schedule again…', 'sched');
     }
+    // The digest chip stays at every depth — it is what the Approve
+    // gesture signs (bound: what the recorded approval covers); a
+    // re-proposed revision visibly carries its NEW digest here.
+    const bound = !!(e.approval && e.approval.digest === e.digest);
     body = `<div class="ag2-effcard t-${tone}">
       <div class="ag2-effcard-head">
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
-        <span class="ag2-hint mono">${agendaDepthCalm()
-    ? (e.approval ? 'approved' : 'unapproved')
-    : `digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}`}</span>
+        ${agendaDigestChipHtml(bound ? e.approval.digest : e.digest,
+    bound ? 'Your recorded approval covers exactly this manifest revision'
+      : e.approval ? 'Re-proposed since your last approval — the NEW revision Approve would bind'
+        : 'The manifest revision Approve would bind')}
+        <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
       ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
@@ -690,7 +696,7 @@ function agendaInspRefsHtml(item) {
       target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`;
     } else {
       if (r.digest) hasFileDigest = true;
-      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest.slice(0, 16)}… recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
+      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest} recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
     }
     const must = r.must_read
       ? '<span class="ag2-ref-must" title="A pointer the reading agent weighs — not a standing order">must-read</span>'
@@ -1372,21 +1378,20 @@ async function agendaSchedConfirm(button) {
       return fail((resp.body && resp.body.error) || `propose failed (${resp.status})`);
     }
     agendaObserveServerMessage({ item: resp.body.item });
+    // The revision the daemon just minted from this sheet — its digest
+    // comes back on the proposed item and is what any approval binds.
+    const effect = (resp.body.item.effects || [])[0];
     let approved = false;
-    if (s.approveNow) {
-      // Approve exactly the revision the daemon just minted from this
-      // sheet — its digest comes back on the proposed item.
-      const effect = (resp.body.item.effects || [])[0];
-      if (effect && effect.digest) {
-        approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
-      }
+    if (s.approveNow && effect && effect.digest) {
+      approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
     }
     agendaSheetClose();
     agendaSheetRender();
     if (typeof showControlToast === 'function') {
+      const short = effect && effect.digest ? agendaShortDigest(effect.digest) : '';
       showControlToast(approved ? 'success' : 'info', approved
-        ? (params.recurrence ? 'Proposed and approved — one approval covers the series.' : `Proposed and approved — fires ${agendaAbsTime(fire)}.`)
-        : 'Proposed — waiting on an owner approval of this exact digest.');
+        ? (params.recurrence ? `Proposed and approved — one approval covers the series (digest ${short}).` : `Proposed and approved — fires ${agendaAbsTime(fire)} (digest ${short}).`)
+        : `Proposed — waiting on an owner approval of ${short ? `digest ${short}` : 'this exact digest'}.`);
     }
   } catch (e) {
     fail(String(e && e.message || e));

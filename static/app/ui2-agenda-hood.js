@@ -130,11 +130,8 @@ function agendaHoodClick(item, el) {
     case 'copy-id':
       agendaCopyText(item.id, 'the full item id');
       break;
-    case 'copy-digest': {
-      const effect = (item.effects || [])[0];
-      if (effect) agendaCopyText(effect.digest, 'the manifest digest');
-      break;
-    }
+    // digest copy rides the shared [data-copy-digest] wire in
+    // ui2-agenda.js — the hood button carries the attribute directly.
     case 'raw':
       agendaSheetState = { kind: 'raw', itemId: item.id };
       agendaSheetRender();
@@ -275,7 +272,7 @@ function agendaHoodManifestHtml(item) {
       <span class="ag2-spacer"></span>
       <span class="ag2-hood-effid">${escapeHtml(effect.effect_id)}</span>
     </div>
-    <button type="button" class="ag2-hood-idbtn digest" data-hood-act="copy-digest"
+    <button type="button" class="ag2-hood-idbtn digest" data-copy-digest="${escapeHtml(effect.digest)}"
       title="Click to copy the full digest — sha256 over item + effect identity and the manifest’s canonical bytes">${escapeHtml(digestGroups)}</button>
     <div class="ag2-hood-seal t-${sealTone}"><span class="ag2-hood-sealdot"></span>${escapeHtml(sealLine)}</div>
     <div class="ag2-hood-note mono">${escapeHtml(attribution)}</div>
