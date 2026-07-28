@@ -147,6 +147,17 @@ impl SchedulerLease {
     pub(crate) fn sidecar(&self) -> &LeaseSidecar {
         &self.sidecar
     }
+
+    /// Rewrite the sidecar as `draining` (§3.2 step 2) — the holder still
+    /// holds the flock, which keeps serializing sidecar writes; the flock
+    /// release itself is the caller's next step. Failure is non-fatal at
+    /// the call site: the sidecar is observability, and the release
+    /// proceeds regardless (a stale `active` label is display debt, not
+    /// authority).
+    pub(crate) fn mark_draining(&mut self, state_root: &Path) -> std::io::Result<()> {
+        self.sidecar.state = "draining".to_string();
+        write_lease_sidecar(&state_root.join(LEASE_DIR), &self.sidecar)
+    }
 }
 
 fn sidecar_path(state_root: &Path) -> PathBuf {

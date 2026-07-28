@@ -404,6 +404,37 @@ one-shot `ScheduleControllerRestart` (`event.rs` / `mcp/`) carries a goal and
 handoff across a controller restart; it is a continuity mechanism, not an
 Agenda session occurrence.
 
+## Graceful Daemon Handover (drain + takeover)
+
+Co-homed daemons coordinate through the **active-scheduler lease**
+(`scheduler-lease/holder.lock`, an advisory file lock; see the agenda
+chapter for the firing rules). A running holder can hand its role to a
+successor without kill-and-relaunch:
+
+- `intendant --takeover` boots a successor that asks the current holder to
+  **drain** (`POST /api/daemon/takeover` — owner-grade, loopback
+  admission-token trust class; `intendant ctl takeover` is the standalone
+  verb). Drain is one-way and idempotent.
+- The draining daemon stops all standing automations (its scheduler
+  performs the ordered entry between passes, so a firing pass never
+  straddles the release), flips `lease.json` to `draining`, frees the
+  flock, and keeps serving **in-flight work only**: follow-ups, steers,
+  interrupts, approvals, and ordinary agenda writes all serve;
+  session-creating intents (`create`, untargeted `start_task`, the resume
+  family) refuse with a structured `daemon_draining` error carrying the
+  successor's port, and the agenda immediacy verbs (`start_now`,
+  `request_occurrence`) refuse the same way. The classification lives in
+  one place (`ControlMsg::creates_session`) and every surface consults it.
+- When its last work-holding session finishes (sessions parked after
+  `done` do not hold; parked conversations resume on the successor), the
+  drainer records an `exited` presence state and the process exits. If the
+  successor dies while the drainer still drains, ONE loud notification
+  says standing automations are paused until someone relaunches or takes
+  over — the drainer never reclaims the lease.
+
+`intendant ctl status` shows the whole story under `scheduler_lease`
+(role, drain state, and every co-homed boot with probed liveness).
+
 ## Where to Go Next
 
 - [Architecture](./architecture.md) — the EventBus, the execution shapes, and

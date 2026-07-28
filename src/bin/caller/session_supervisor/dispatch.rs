@@ -364,6 +364,21 @@ impl SessionSupervisor {
         msg: event::ControlMsg,
         reserved: Option<ReservedSessionLaunch>,
     ) {
+        // Track HS3: the drain refusal gate — THE funnel every surface's
+        // session-creating intent passes through (bus emitters: HTTP
+        // routes, tunnel twins, MCP tools, peer delegation, the agenda
+        // scheduler). The classification is `ControlMsg::creates_session`
+        // (one declaration, Q5 derive pin); everything else — targeted
+        // StartTask, follow-ups, steers, interrupts, approvals, sub-agent
+        // spawns of running orchestrators — serves, because draining
+        // exists to protect in-flight work. Uniform across caller
+        // provenance (Q2 pin: local, peer, and hosted alike).
+        if msg.creates_session() {
+            if let Some(refusal) = self.drain_refusal_message() {
+                self.loop_error(refusal);
+                return;
+            }
+        }
         match msg {
             event::ControlMsg::CreateSession {
                 task,

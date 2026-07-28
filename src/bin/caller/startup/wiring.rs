@@ -209,6 +209,11 @@ pub(crate) struct GatewaySpawn {
     /// thread it into the session supervisor so the ask-delivery arm can
     /// record whether an answer reached a live session.
     pub(crate) agenda: Option<Arc<crate::agenda::AgendaHandle>>,
+    /// The daemon-handover runtime (Track HS): mode runners thread it
+    /// into the session supervisor so the drain refusal gate and the
+    /// exit-at-last-session condition act on the same state the
+    /// scheduler's lease lane does.
+    pub(crate) handover: Arc<crate::handover::HandoverRuntime>,
 }
 
 /// Build and spawn the web gateway the way every mode does: gateway
@@ -326,6 +331,16 @@ pub(crate) fn spawn_mode_web_gateway(
         crate::agenda::journal_generation_floor(&agenda_dir),
     ));
     mcp_http_state.handover = Some(handover.clone());
+    // --takeover (Track HS3): this boot is the intended successor — ask
+    // the current holder to drain, then fast-poll the freed lease.
+    // Detached; bounded; failure degrades to ordinary secondary polling.
+    if flags.takeover {
+        let takeover_runtime = handover.clone();
+        let takeover_root = crate::platform::intendant_home();
+        tokio::spawn(async move {
+            crate::handover::run_takeover_request(takeover_runtime, takeover_root).await;
+        });
+    }
     // House automation definitions materialize into the state root at
     // boot, BEFORE any stamp can resolve them (Track AW, ruling R1): v1
     // binding refs are `file:` only, so the embedded set needs real
@@ -356,7 +371,10 @@ pub(crate) fn spawn_mode_web_gateway(
                     .with_spawn_context(crate::agenda::SessionSpawnContext {
                         home: crate::platform::home_dir(),
                         default_project_root: project_root.clone(),
-                    }),
+                    })
+                    // Track HS3: the immediacy verbs (start_now,
+                    // request_occurrence) refuse while draining.
+                    .with_handover(handover.clone()),
             );
             // Detaches on drop like the mode listeners; one per daemon.
             let _scheduler =
@@ -529,5 +547,6 @@ pub(crate) fn spawn_mode_web_gateway(
         log_line: dashboard_log_line(web_tls_acceptor, web_port, web_bind_ip),
         peer_registry,
         agenda: agenda_for_supervisor,
+        handover,
     })
 }

@@ -1889,6 +1889,7 @@ response omits the header.
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke) |
+| POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/pr-state` | AgendaRead | own origin | none | Live PR state for one anchor (expand-time render join; cached daemon-side) |

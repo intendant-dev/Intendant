@@ -163,6 +163,12 @@ impl IntendantServer {
         self.state.read().await.agenda.clone()
     }
 
+    pub(crate) async fn handover_runtime(
+        &self,
+    ) -> Option<std::sync::Arc<crate::handover::HandoverRuntime>> {
+        self.state.read().await.handover.clone()
+    }
+
     async fn agenda_list_inner(
         &self,
         params: AgendaListParams,

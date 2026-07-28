@@ -40,6 +40,10 @@ pub(crate) struct AgendaHandle {
     /// writer instance; both converge on the same file exactly like
     /// co-homed daemons do.
     decoration_journal: Mutex<Option<OccurrenceJournal>>,
+    /// Track HS3 (wiring edge via [`Self::with_handover`]): drain state
+    /// for the immediacy-verb refusals. `None` = hermetic tests / shapes
+    /// without a gateway — no refusal, today's semantics.
+    handover: Option<std::sync::Arc<crate::handover::HandoverRuntime>>,
 }
 
 impl AgendaHandle {
@@ -58,6 +62,7 @@ impl AgendaHandle {
                 default_project_root: None,
             },
             decoration_journal: Mutex::new(None),
+            handover: None,
         }
     }
 
@@ -65,6 +70,18 @@ impl AgendaHandle {
     /// tempdir-scoped ones to exercise resolution).
     pub(crate) fn with_spawn_context(mut self, spawn_ctx: SessionSpawnContext) -> Self {
         self.spawn_ctx = spawn_ctx;
+        self
+    }
+
+    /// Install the daemon-handover runtime (wiring edge, Track HS3): the
+    /// immediacy verbs (`start_now`, `request_occurrence`) refuse while
+    /// draining — they promise a firing only the lease holder performs,
+    /// and an honest redirect beats a silent never (intake §3.3/Q5).
+    pub(crate) fn with_handover(
+        mut self,
+        handover: std::sync::Arc<crate::handover::HandoverRuntime>,
+    ) -> Self {
+        self.handover = Some(handover);
         self
     }
 
@@ -160,6 +177,29 @@ impl AgendaHandle {
                 .map(|outcome| outcome.primary().clone());
         }
         Self::authorize_command(&cmd, actor.as_ref())?;
+        // Track HS3: the immediacy verbs promise a firing only the lease
+        // holder performs — a draining daemon refuses them with the
+        // successor pointer instead of parking a request its scheduler
+        // will never pass over (intake §3.3: honest redirect beats a
+        // silent never). Ordinary agenda writes keep serving: the op log
+        // converges and the holder's next pass sees everything.
+        if matches!(
+            cmd,
+            AgendaCommand::StartNow { .. } | AgendaCommand::RequestOccurrence { .. }
+        ) {
+            if let Some(runtime) = self.handover.as_ref().filter(|rt| rt.is_draining()) {
+                return Err(AgendaError::Invalid(match runtime.successor_port() {
+                    Some(port) => format!(
+                        "daemon_draining: this daemon is draining and will not fire \
+                         new occurrences — use the successor daemon (:{port})"
+                    ),
+                    None => "daemon_draining: this daemon is draining and will not \
+                             fire new occurrences — the successor has not acquired \
+                             yet; retry shortly"
+                        .to_string(),
+                }));
+            }
+        }
         // Start-now resolves its project HERE, at the tenant edge where the
         // daemon context lives: explicit pick → the parking session's
         // recorded root → the daemon default — refused with a named error

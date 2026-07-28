@@ -404,6 +404,8 @@ pub(crate) enum RouteHandlerId {
     AgendaOccurrences,
     /// Apply one agenda command (add/ask/answer/patch/transitions/effects).
     AgendaOp,
+    /// Request drain of this daemon (Track HS3 takeover lane).
+    DaemonTakeover,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1008,6 +1010,20 @@ pub(crate) static ROUTES: &[Route] = &[
         "Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
+    // The daemon-handover takeover lane (Track HS3, Q2 pins): ask THIS
+    // daemon to drain — standing automations stop, the scheduler lease
+    // frees for a successor, in-flight sessions finish here and the
+    // daemon exits after the last one. Owner-grade like settings writes,
+    // riding the loopback + per-port admission-token same-user trust
+    // class; hosted `role:none` can never reach it. One-way, idempotent.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/takeover"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonTakeover,
+        "Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here",
+    ),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
     // dashboard consumes via authenticated fetch. HTTP-only for now — the
