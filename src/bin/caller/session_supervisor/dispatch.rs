@@ -539,6 +539,7 @@ impl SessionSupervisor {
                 attachments,
                 follow_up_id: _,
                 delegation_id,
+                session_name,
                 launch_config,
             } => {
                 // Peer-delegation dedup: the delegating daemon re-sends
@@ -584,7 +585,7 @@ impl SessionSupervisor {
                             let started = self
                                 .start_new_session(
                                     String::new(),
-                                    None,
+                                    session_name,
                                     project_root,
                                     codex_fast_launch(&launch_config, agent),
                                     orchestrate,
@@ -624,14 +625,18 @@ impl SessionSupervisor {
                     return;
                 }
                 // The create-shaped StartTask threads its launch config
-                // through the SAME path CreateSession uses — the agenda's
+                // — and its optional source-derived session name — through
+                // the SAME path CreateSession uses: the agenda's
                 // scheduled/start-now spawns, ctl task, and peer
                 // delegations all get the identical resolution chain and
-                // recorded launch provenance.
+                // recorded launch provenance. The name only ever seeds a
+                // FRESH session (a duplicate delegation re-acks above
+                // without re-launching), so an owner rename is never
+                // overwritten by a redelivery.
                 let started = self
                     .start_new_session(
                         task,
-                        None,
+                        session_name,
                         project_root,
                         launch_config,
                         orchestrate,
@@ -1558,6 +1563,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: Some(id.to_string()),
+            session_name: None,
             launch_config: Default::default(),
         };
         bus.send(AppEvent::ControlCommand(delegated("dg-mid-1")));
@@ -1629,6 +1635,142 @@ mod tests {
                 _ => break,
             }
         }
+    }
+
+    /// A create-shaped StartTask carrying a session name (the agenda's
+    /// derived-name lane rides this field).
+    fn delegated_named(id: &str, name: &str) -> event::ControlMsg {
+        event::ControlMsg::StartTask {
+            session_id: None,
+            task: "delegated: fired agenda goal".to_string(),
+            orchestrate: None,
+            direct: Some(true),
+            project_root: None,
+            reference_frame_ids: vec![],
+            display_target: None,
+            attachments: vec![],
+            follow_up_id: None,
+            delegation_id: Some(id.to_string()),
+            session_name: Some(name.to_string()),
+            launch_config: Default::default(),
+        }
+    }
+
+    /// Await the `TaskReceived` receipt for one delegation id; returns the
+    /// session it was dispatched as.
+    async fn await_delegation_receipt(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        delegation_id: &str,
+    ) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out awaiting receipt for {delegation_id}"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::TaskReceived {
+                    delegation_id: got,
+                    session_id,
+                })) if got == delegation_id => return session_id,
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                other => panic!("bus closed before the receipt: {other:?}"),
+            }
+        }
+    }
+
+    /// Precedence law (agenda session naming): a derived name only ever
+    /// SEEDS a fresh spawn — an owner rename afterwards wins, and the
+    /// at-least-once redelivery of the same delegation (the derived name
+    /// still riding it) re-acks the original session without re-applying
+    /// the name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn derived_name_never_clobbers_owner_rename() {
+        let bus = EventBus::new();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (supervisor, gate) =
+            test_supervisor_with_gated_launches(project_dir.path().to_path_buf(), bus.clone());
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
+        let mut bus_rx = bus.subscribe();
+        let _loop_handle = supervisor.clone().spawn();
+        let home = supervisor
+            .config
+            .logs_home_override
+            .clone()
+            .expect("test supervisor has a hermetic logs home");
+
+        bus.send(AppEvent::ControlCommand(delegated_named(
+            "dg-named-1",
+            "Agenda derived name",
+        )));
+        let session_id = await_delegation_receipt(&mut bus_rx, "dg-named-1").await;
+        assert_eq!(
+            crate::session_names::intendant_session_name(&home, &session_id),
+            Some(Some("Agenda derived name".to_string())),
+            "the derived name lands through the naming system at spawn"
+        );
+
+        supervisor
+            .rename_session(session_id.clone(), None, None, "Owner picked".to_string())
+            .await;
+        assert_eq!(
+            crate::session_names::intendant_session_name(&home, &session_id),
+            Some(Some("Owner picked".to_string()))
+        );
+
+        // At-least-once redelivery: same delegation id, derived name still
+        // riding the frame.
+        bus.send(AppEvent::ControlCommand(delegated_named(
+            "dg-named-1",
+            "Agenda derived name",
+        )));
+        let re_acked = await_delegation_receipt(&mut bus_rx, "dg-named-1").await;
+        assert_eq!(
+            re_acked, session_id,
+            "the duplicate re-acks the original session"
+        );
+        assert_eq!(
+            crate::session_names::intendant_session_name(&home, &session_id),
+            Some(Some("Owner picked".to_string())),
+            "a redelivered derived name never clobbers the owner's rename"
+        );
+    }
+
+    /// Suppression law (agenda session naming): a derived name makes the
+    /// session TITLED in the naming system's own read the moment it
+    /// spawns — the predicate any generated-naming lane for UNTITLED
+    /// sessions keys on — so such a lane skips derived-named sessions by
+    /// construction, and every surface that prefers `name` over
+    /// task-derived fallbacks renders the derived name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn derived_name_suppresses_generated_naming() {
+        let bus = EventBus::new();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (supervisor, gate) =
+            test_supervisor_with_gated_launches(project_dir.path().to_path_buf(), bus.clone());
+        gate.send(true)
+            .expect("launch body holds the gate receiver");
+        let mut bus_rx = bus.subscribe();
+        let _loop_handle = supervisor.clone().spawn();
+        let home = supervisor
+            .config
+            .logs_home_override
+            .clone()
+            .expect("test supervisor has a hermetic logs home");
+
+        bus.send(AppEvent::ControlCommand(delegated_named(
+            "dg-named-2",
+            "Agenda derived name",
+        )));
+        let session_id = await_delegation_receipt(&mut bus_rx, "dg-named-2").await;
+        assert_eq!(
+            crate::session_names::intendant_session_name(&home, &session_id),
+            Some(Some("Agenda derived name".to_string())),
+            "the session is titled at spawn — an untitled-keyed naming lane skips it"
+        );
     }
 
     #[tokio::test]
@@ -1929,6 +2071,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: Some(delegation_id.to_string()),
+            session_name: None,
             launch_config: Default::default(),
         }
     }
@@ -2053,6 +2196,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: Default::default(),
             })
             .await;
@@ -2209,6 +2353,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: launch,
             })
             .await;
@@ -2255,6 +2400,7 @@ mod tests {
                         attachments: vec![],
                         follow_up_id: None,
                         delegation_id: None,
+                        session_name: None,
                         launch_config: launch,
                     })
                     .await;
@@ -2300,6 +2446,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: codex_launch,
             })
             .await;

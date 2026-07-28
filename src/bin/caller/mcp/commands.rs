@@ -1527,6 +1527,7 @@ pub(crate) async fn handle_control_command_mcp(
                         attachments: vec![],
                         follow_up_id: None,
                         delegation_id: None,
+                        session_name: None,
                         launch_config: Default::default(),
                     }));
                     emit_control_result(

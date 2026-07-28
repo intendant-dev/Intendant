@@ -689,6 +689,11 @@ fn send_start_task(
             attachments: Vec::new(),
             follow_up_id: None,
             delegation_id: Some(format!("{DELEGATION_PREFIX}{}", spawn.occurrence_id)),
+            // Source-derived display name (item title / workflow-node
+            // composite), assigned through the existing naming system at
+            // launch. Stable across retries of this occurrence like the
+            // rest of the message.
+            session_name: spawn.session_name.clone(),
             // The manifest's owner-reviewed agent config, forwarded so the
             // spawn resolves launch settings through the same chain as a
             // pane-created session (explicit manifest pin → daemon default
@@ -2198,6 +2203,36 @@ mod tests {
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
     }
 
+    /// Agenda-fired sessions inherit a deterministic display name from
+    /// their source: a standalone item firing carries the ITEM TITLE on
+    /// the spawn's StartTask, assigned through the existing naming
+    /// system at launch — never model-generated, and stable across
+    /// firings of the same item (titles are the only input).
+    #[tokio::test]
+    async fn agenda_sessions_spawn_named_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+
+        let mut names = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { session_name, .. }) = event {
+                names.push(session_name);
+            }
+        }
+        assert_eq!(
+            names,
+            vec![Some("scheduled work".to_string())],
+            "the spawn carries the source item's title as its derived session name"
+        );
+    }
+
     /// The duplicate-orchestrator regression, live shape (2026-07-26): a
     /// firing is `started`; the manifest is re-proposed mid-flight (the
     /// fold swaps the effect object) and re-approved. The swap must not
@@ -3211,6 +3246,7 @@ mod tests {
             agent_config: None,
             provenance_session_id: None,
             matched_item_ids: vec![q1.id.clone(), q2.id.clone()],
+            session_name: None,
         };
         assert!(dispatch_session(
             &handle,
