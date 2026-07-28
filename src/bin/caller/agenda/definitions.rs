@@ -193,7 +193,10 @@ impl AutomationDefinition {
     }
 
     /// `relies_on` flattened as (node, dependency) pairs, declaration
-    /// order — the registry's edge vocabulary, for parity and display.
+    /// order — the registry's edge vocabulary. The parity/window tests
+    /// read it today; the slice-2 catalog serializes it (its non-test
+    /// reader). Allowed dead until that lane lands.
+    #[allow(dead_code)]
     pub(crate) fn edges(&self) -> Vec<(String, String)> {
         self.nodes
             .iter()
