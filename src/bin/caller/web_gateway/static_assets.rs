@@ -852,6 +852,12 @@ mod tests {
                 "ui2-agenda-workflows.js",
                 include_str!("../../../../static/app/ui2-agenda-workflows.js"),
             ),
+            // The session windows' sealed-inputs chip consumes digests
+            // too (the grid envelope) — same one-formatter law.
+            (
+                "39-session-windows.js",
+                include_str!("../../../../static/app/39-session-windows.js"),
+            ),
         ] {
             for (idx, line) in content.lines().enumerate() {
                 let lower = line.to_ascii_lowercase();
