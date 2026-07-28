@@ -129,16 +129,18 @@ impl DaemonPresence {
 /// errors report **live** — the fail-safe direction for every consumer
 /// (recovery must not clobber, GC must not sweep, on uncertainty).
 pub(crate) fn boot_id_is_live(state_root: &Path, boot_id: &str) -> bool {
-    let path = state_root
-        .join(DAEMONS_DIR)
-        .join(format!("{boot_id}.lock"));
+    let path = state_root.join(DAEMONS_DIR).join(format!("{boot_id}.lock"));
     probe_lock_is_held(&path).unwrap_or(true)
 }
 
 /// `Ok(true)` = held (live), `Ok(false)` = takeable or absent (dead),
 /// `Err` = cannot tell.
 fn probe_lock_is_held(path: &Path) -> std::io::Result<bool> {
-    let file = match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err),
@@ -187,10 +189,8 @@ fn sweep_dead_boots(dir: &Path) {
                     let _ = std::fs::remove_file(&path);
                 }
             }
-            Some("json") => {
-                if !path.with_extension("lock").exists() {
-                    let _ = std::fs::remove_file(&path);
-                }
+            Some("json") if !path.with_extension("lock").exists() => {
+                let _ = std::fs::remove_file(&path);
             }
             _ => {}
         }

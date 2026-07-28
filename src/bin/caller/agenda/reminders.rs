@@ -1665,7 +1665,9 @@ mod tests {
             generation: None,
             boot_id: None,
         };
-        writer.append(&record("occ-1", OccurrenceState::Prepared)).unwrap();
+        writer
+            .append(&record("occ-1", OccurrenceState::Prepared))
+            .unwrap();
         writer
             .append(&OccurrenceRecord {
                 generation: Some(9),

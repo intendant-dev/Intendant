@@ -56,14 +56,14 @@ impl HandoverRuntime {
     /// (HS1 is behavior-neutral — the daemon must run exactly as before).
     pub(crate) fn initialize(state_root: &Path, port: u16, journal_generation_floor: u64) -> Self {
         let boot_id = ulid::Ulid::new().to_string().to_lowercase();
-        let (presence, presence_error) =
-            match DaemonPresence::register(state_root, &boot_id, port) {
-                Ok(presence) => (Some(presence), None),
-                Err(err) => {
-                    eprintln!("[handover] presence registration failed: {err}");
-                    (None, Some(err.to_string()))
-                }
-            };
+        let (presence, presence_error) = match DaemonPresence::register(state_root, &boot_id, port)
+        {
+            Ok(presence) => (Some(presence), None),
+            Err(err) => {
+                eprintln!("[handover] presence registration failed: {err}");
+                (None, Some(err.to_string()))
+            }
+        };
         let (held, lease_error) =
             match SchedulerLease::try_acquire(state_root, &boot_id, port, journal_generation_floor)
             {

@@ -263,7 +263,12 @@ mod tests {
         let _held = acquire(dir.path(), "boot-a", 0);
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(sidecar_path(dir.path())).unwrap()).unwrap();
-        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = raw
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
