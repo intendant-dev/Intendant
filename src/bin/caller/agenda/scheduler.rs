@@ -2788,7 +2788,11 @@ mod tests {
             journal.progress(&occurrence_id).terminal.is_none(),
             "an end with live wrapper lineage must not terminal the occurrence"
         );
-        assert_eq!(state.lineage_pending.len(), 1, "the end is held, not dropped");
+        assert_eq!(
+            state.lineage_pending.len(),
+            1,
+            "the end is held, not dropped"
+        );
         assert!(
             state.running.contains_key("wrapper-old"),
             "the occurrence stays in-flight while held"

@@ -194,7 +194,12 @@ mod tests {
         // must reach wrapper-new from wrapper-old (depth 2, no
         // blindness).
         announce(home.path(), "wrapper-old", "claude-code", &["b1-old"]);
-        announce(home.path(), "wrapper-mid", "claude-code", &["b1-old", "b2-mid"]);
+        announce(
+            home.path(),
+            "wrapper-mid",
+            "claude-code",
+            &["b1-old", "b2-mid"],
+        );
         announce(home.path(), "wrapper-new", "claude-code", &["b2-mid"]);
 
         let lineage = resolve_resume_lineage(home.path(), &["wrapper-old"]);
@@ -235,8 +240,18 @@ mod tests {
         // itself; the child shares no wrapper row with the parent) also
         // chains: without it the child is unreachable.
         let edit_home = tempfile::tempdir().unwrap();
-        announce(edit_home.path(), "wrapper-parent", "claude-code", &["b1-parent"]);
-        announce(edit_home.path(), "wrapper-child", "claude-code", &["b2-child"]);
+        announce(
+            edit_home.path(),
+            "wrapper-parent",
+            "claude-code",
+            &["b1-parent"],
+        );
+        announce(
+            edit_home.path(),
+            "wrapper-child",
+            "claude-code",
+            &["b2-child"],
+        );
         crate::external_wrapper_index::record_lineage_retired(
             edit_home.path(),
             "claude-code",
