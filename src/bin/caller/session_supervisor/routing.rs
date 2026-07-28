@@ -1423,16 +1423,18 @@ impl SessionSupervisor {
     /// 2. the persisted-external re-resolution (`route_follow_up`'s second
     ///    pass): the asker's own dir names its backend conversation, whose
     ///    live wrapper re-registered under an alias;
-    /// 3. the resume lineage: every backend conversation the asker's OWN
-    ///    records tie it to ([`recorded_backend_conversations_in_home`]),
-    ///    resolved to the newest LIVE wrapper of that conversation via the
-    ///    wrapper index (preference order: active first, most recent
-    ///    first) — the successor pass that survives a daemon restart.
+    /// 3. the resume lineage: the TRANSITIVE successor walk over durable
+    ///    state ([`resume_lineage::resolve_resume_lineage`] — the ONE
+    ///    walker, shared with the agenda scheduler's occurrence terminal
+    ///    classification), probed against live supervisor state in
+    ///    candidate order — the successor pass that survives a daemon
+    ///    restart, at any chain depth.
     ///
     /// Never an unrelated session: every candidate derives from the
     /// asker's own aliases, its own session dir's identity facts, or
-    /// wrapper-index records of its backend conversation, and successor
-    /// candidates must match the recorded source and accept input.
+    /// wrapper-index records of its backend conversation's lineage, and
+    /// successor candidates must match the recorded source and accept
+    /// input.
     async fn resolve_ask_delivery_entry(
         &self,
         asker: &str,
@@ -1455,16 +1457,7 @@ impl SessionSupervisor {
             }
         }
         let home = self.logs_home();
-        // Candidate ids per conversation: the backend id itself (a live
-        // successor is aliased or keyed under it once it announces), then
-        // every indexed wrapper of the conversation, newest first.
-        let mut candidates: Vec<(String, String)> = Vec::new();
-        for (source, backend_id) in recorded_backend_conversations_in_home(&home, asker) {
-            candidates.push((source.clone(), backend_id.clone()));
-            for record in crate::external_wrapper_index::wrappers_for(&home, &source, &backend_id) {
-                candidates.push((source.clone(), record.intendant_session_id));
-            }
-        }
+        let candidates = resume_lineage::resolve_resume_lineage(&home, &[asker]).candidates;
         if candidates.is_empty() {
             return None;
         }
