@@ -373,8 +373,31 @@ async function agendaComposePark() {
 
 // ---- Lens group computation ----
 
+// Every digest an item owns: manifest digests (one per effect — the
+// bytes an Approve gesture signs), recorded approval digests, and
+// file-ref digests minted at attach. A citation by any of them must
+// resolve to this item.
+function agendaItemDigests(item) {
+  const out = [];
+  (item.effects || []).forEach((e) => {
+    if (e.digest) out.push(e.digest);
+    if (e.approval && e.approval.digest) out.push(e.approval.digest);
+  });
+  (item.refs || []).forEach((r) => { if (r.digest) out.push(r.digest); });
+  return out;
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
+  // lowercased) match any digest the item owns, resolving to the
+  // owning item exactly like an id search. The 8-char floor sits under
+  // AGENDA_DIGEST_SHORT_LEN, so every short digest a surface renders
+  // is findable by the characters it shows.
+  if (/^[0-9a-f]{8,64}$/.test(q)
+    && agendaItemDigests(item).some((d) => String(d).toLowerCase().startsWith(q))) {
+    return true;
+  }
   return String(item.title || '').toLowerCase().includes(q)
     || String(item.body || '').toLowerCase().includes(q)
     || (item.tags || []).some((t) => String(t).toLowerCase().includes(q))
@@ -840,11 +863,13 @@ function agendaCardEffectStrip(item) {
     line = `${proposer}: runs ${agendaAbsTime(st.manifest.fire_at_ms)}`
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + ' — needs your approval';
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else {
     tone = 'iris';
@@ -897,6 +922,15 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing') {
     meta.push('<span>series ended</span>');
   }
+  // The manifest digest, always visible where the gesture lives — the
+  // one thing depth never folds away, because it is what Approve signs
+  // (and what a recorded approval covers once bound).
+  meta.push(agendaDigestChipHtml(e.digest,
+    st.kind === 'pending' ? 'Approve binds exactly this manifest revision'
+      : st.kind === 'suspended' ? 'Re-arm re-approves exactly this unchanged manifest revision'
+        : e.approval && e.approval.digest === e.digest
+          ? 'Your recorded approval covers exactly this manifest revision'
+          : 'The manifest revision this row describes'));
   let actions = '';
   const digest = escapeHtml(e.digest || '');
   if (st.kind === 'pending') {

@@ -23999,6 +23999,28 @@ html.ui-v2 .ag2-eff-line {
   overflow-wrap: anywhere;
 }
 
+/* The shared manifest-digest chip (ui2-agenda.js renders it on every
+   approval surface): short form inline, full digest on hover, click
+   copies. One appearance everywhere it shows. */
+html.ui-v2 .ag2-digest-chip {
+  display: inline-flex;
+  align-items: center;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-inset);
+  padding: 1px 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-digest-chip:hover {
+  border-color: var(--line-2);
+  color: var(--text);
+}
+
 /* ---- Automations lens rows (Track AU) ---- */
 
 html.ui-v2 .ag2-auto-meta {
@@ -36882,7 +36904,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'd176cbd77cce5465';
+const INTENDANT_APP_BUILD = 'e982f49471c1842e';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -90052,6 +90074,38 @@ function agendaSetDepth(depth) {
   agendaRenderTab();
   if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
 }
+// ---- Manifest-digest vocabulary (one formatter, one chip) ----
+// The digest is the approval ceremony's subject: an owner Approve binds
+// exactly these bytes, and every re-propose mints a NEW digest while
+// the item id stays. The one truncation length lives here — never
+// per-surface — and stays above the ledger search's 8-hex-char
+// digest-prefix floor, so the short form a surface shows always
+// resolves to its owning item when pasted into search.
+const AGENDA_DIGEST_SHORT_LEN = 10;
+
+function agendaShortDigest(digest) {
+  const d = String(digest || '');
+  return d.length > AGENDA_DIGEST_SHORT_LEN ? `${d.slice(0, AGENDA_DIGEST_SHORT_LEN)}…` : d;
+}
+
+// The interactive form every approval surface renders: hover reveals
+// the full digest, click copies it. Digest values are daemon-minted
+// lowercase hex; escaped like every interpolation anyway.
+function agendaDigestChipHtml(digest, tip) {
+  const d = String(digest || '');
+  if (!d) return '';
+  return `<button type="button" class="ag2-digest-chip" data-copy-digest="${escapeHtml(d)}"`
+    + ` title="${escapeHtml(`${tip ? `${tip} — ` : ''}sha256 ${d} — click to copy`)}">`
+    + `${escapeHtml(`digest ${agendaShortDigest(d)}`)}</button>`;
+}
+
+// One copy wire for every chip, wherever it renders (cards, inspector,
+// the workflow sheet on document.body) — document-level by design.
+document.addEventListener('click', (e) => {
+  const btn = e.target && e.target.closest && e.target.closest('[data-copy-digest]');
+  if (btn) agendaCopyText(btn.dataset.copyDigest, 'the manifest digest');
+});
+
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;
@@ -92213,8 +92267,31 @@ async function agendaComposePark() {
 
 // ---- Lens group computation ----
 
+// Every digest an item owns: manifest digests (one per effect — the
+// bytes an Approve gesture signs), recorded approval digests, and
+// file-ref digests minted at attach. A citation by any of them must
+// resolve to this item.
+function agendaItemDigests(item) {
+  const out = [];
+  (item.effects || []).forEach((e) => {
+    if (e.digest) out.push(e.digest);
+    if (e.approval && e.approval.digest) out.push(e.approval.digest);
+  });
+  (item.refs || []).forEach((r) => { if (r.digest) out.push(r.digest); });
+  return out;
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
+  // lowercased) match any digest the item owns, resolving to the
+  // owning item exactly like an id search. The 8-char floor sits under
+  // AGENDA_DIGEST_SHORT_LEN, so every short digest a surface renders
+  // is findable by the characters it shows.
+  if (/^[0-9a-f]{8,64}$/.test(q)
+    && agendaItemDigests(item).some((d) => String(d).toLowerCase().startsWith(q))) {
+    return true;
+  }
   return String(item.title || '').toLowerCase().includes(q)
     || String(item.body || '').toLowerCase().includes(q)
     || (item.tags || []).some((t) => String(t).toLowerCase().includes(q))
@@ -92680,11 +92757,13 @@ function agendaCardEffectStrip(item) {
     line = `${proposer}: runs ${agendaAbsTime(st.manifest.fire_at_ms)}`
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + ' — needs your approval';
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else {
     tone = 'iris';
@@ -92737,6 +92816,15 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing') {
     meta.push('<span>series ended</span>');
   }
+  // The manifest digest, always visible where the gesture lives — the
+  // one thing depth never folds away, because it is what Approve signs
+  // (and what a recorded approval covers once bound).
+  meta.push(agendaDigestChipHtml(e.digest,
+    st.kind === 'pending' ? 'Approve binds exactly this manifest revision'
+      : st.kind === 'suspended' ? 'Re-arm re-approves exactly this unchanged manifest revision'
+        : e.approval && e.approval.digest === e.digest
+          ? 'Your recorded approval covers exactly this manifest revision'
+          : 'The manifest revision this row describes'));
   let actions = '';
   const digest = escapeHtml(e.digest || '');
   if (st.kind === 'pending') {
@@ -93797,7 +93885,7 @@ function agendaInspEffectHtml(item) {
       acts.push(`<button type="button" class="ag2-btn ${cls || ''}" data-act="${act}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</button>`);
     if (st.kind === 'pending') {
       A('Approve this exact plan', 'eff-approve', 'prim',
-        `Binds digest ${String(e.digest || '').slice(0, 8)}… — any edit voids it`);
+        `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
       A('Edit schedule…', 'sched');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
@@ -93817,14 +93905,20 @@ function agendaInspEffectHtml(item) {
     } else {
       A('Schedule again…', 'sched');
     }
+    // The digest chip stays at every depth — it is what the Approve
+    // gesture signs (bound: what the recorded approval covers); a
+    // re-proposed revision visibly carries its NEW digest here.
+    const bound = !!(e.approval && e.approval.digest === e.digest);
     body = `<div class="ag2-effcard t-${tone}">
       <div class="ag2-effcard-head">
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
-        <span class="ag2-hint mono">${agendaDepthCalm()
-    ? (e.approval ? 'approved' : 'unapproved')
-    : `digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}`}</span>
+        ${agendaDigestChipHtml(bound ? e.approval.digest : e.digest,
+    bound ? 'Your recorded approval covers exactly this manifest revision'
+      : e.approval ? 'Re-proposed since your last approval — the NEW revision Approve would bind'
+        : 'The manifest revision Approve would bind')}
+        <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
       ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
@@ -94057,7 +94151,7 @@ function agendaInspRefsHtml(item) {
       target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`;
     } else {
       if (r.digest) hasFileDigest = true;
-      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest.slice(0, 16)}… recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
+      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest} recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
     }
     const must = r.must_read
       ? '<span class="ag2-ref-must" title="A pointer the reading agent weighs — not a standing order">must-read</span>'
@@ -94739,21 +94833,20 @@ async function agendaSchedConfirm(button) {
       return fail((resp.body && resp.body.error) || `propose failed (${resp.status})`);
     }
     agendaObserveServerMessage({ item: resp.body.item });
+    // The revision the daemon just minted from this sheet — its digest
+    // comes back on the proposed item and is what any approval binds.
+    const effect = (resp.body.item.effects || [])[0];
     let approved = false;
-    if (s.approveNow) {
-      // Approve exactly the revision the daemon just minted from this
-      // sheet — its digest comes back on the proposed item.
-      const effect = (resp.body.item.effects || [])[0];
-      if (effect && effect.digest) {
-        approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
-      }
+    if (s.approveNow && effect && effect.digest) {
+      approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
     }
     agendaSheetClose();
     agendaSheetRender();
     if (typeof showControlToast === 'function') {
+      const short = effect && effect.digest ? agendaShortDigest(effect.digest) : '';
       showControlToast(approved ? 'success' : 'info', approved
-        ? (params.recurrence ? 'Proposed and approved — one approval covers the series.' : `Proposed and approved — fires ${agendaAbsTime(fire)}.`)
-        : 'Proposed — waiting on an owner approval of this exact digest.');
+        ? (params.recurrence ? `Proposed and approved — one approval covers the series (digest ${short}).` : `Proposed and approved — fires ${agendaAbsTime(fire)} (digest ${short}).`)
+        : `Proposed — waiting on an owner approval of ${short ? `digest ${short}` : 'this exact digest'}.`);
     }
   } catch (e) {
     fail(String(e && e.message || e));
@@ -95758,7 +95851,7 @@ function agendaPlanEvents() {
     }
     const st = agendaEffectState(item);
     if (!st) return;
-    const digest8 = String(st.effect.digest || '').slice(0, 8);
+    const digestShort = agendaShortDigest(st.effect.digest);
     if (st.kind === 'running') {
       events.push({
         at: now, item, what: 'session running now', tone: 'iris',
@@ -95769,8 +95862,8 @@ function agendaPlanEvents() {
         at: Math.max(st.manifest.fire_at_ms, now), item,
         what: 'proposed session — will not fire', tone: 'amber', pulse: 'slow',
         chips: [agendaChipHtml('needs approval', 'amber',
-          `Approval binds digest ${digest8}… exactly`)],
-        note: `waiting on your approval of digest ${digest8}… — proposing carries no authority`,
+          `Approval binds digest ${digestShort} exactly`)],
+        note: `waiting on your approval of digest ${digestShort} — proposing carries no authority`,
       });
     } else if (st.kind === 'suspended') {
       events.push({
@@ -96382,11 +96475,8 @@ function agendaHoodClick(item, el) {
     case 'copy-id':
       agendaCopyText(item.id, 'the full item id');
       break;
-    case 'copy-digest': {
-      const effect = (item.effects || [])[0];
-      if (effect) agendaCopyText(effect.digest, 'the manifest digest');
-      break;
-    }
+    // digest copy rides the shared [data-copy-digest] wire in
+    // ui2-agenda.js — the hood button carries the attribute directly.
     case 'raw':
       agendaSheetState = { kind: 'raw', itemId: item.id };
       agendaSheetRender();
@@ -96527,7 +96617,7 @@ function agendaHoodManifestHtml(item) {
       <span class="ag2-spacer"></span>
       <span class="ag2-hood-effid">${escapeHtml(effect.effect_id)}</span>
     </div>
-    <button type="button" class="ag2-hood-idbtn digest" data-hood-act="copy-digest"
+    <button type="button" class="ag2-hood-idbtn digest" data-copy-digest="${escapeHtml(effect.digest)}"
       title="Click to copy the full digest — sha256 over item + effect identity and the manifest’s canonical bytes">${escapeHtml(digestGroups)}</button>
     <div class="ag2-hood-seal t-${sealTone}"><span class="ag2-hood-sealdot"></span>${escapeHtml(sealLine)}</div>
     <div class="ag2-hood-note mono">${escapeHtml(attribution)}</div>
@@ -97113,8 +97203,12 @@ function agendaWorkflowOpenApprovalSheet(stamped) {
   for (const node of stamped.nodes) {
     const row = agendaStartSheetEl('div', 'ags-config-row');
     row.appendChild(agendaStartSheetEl('label', 'ags-label', node.title));
-    row.appendChild(agendaStartSheetEl('div', 'ags-hint',
-      `${node.executor} · digest ${String(node.digest).slice(0, 12)}`));
+    // Executor as text, digest as the shared chip: each row shows the
+    // exact revision "Approve all" would bind for that node.
+    const hint = agendaStartSheetEl('div', 'ags-hint');
+    hint.innerHTML = `${escapeHtml(node.executor)} · ${agendaDigestChipHtml(node.digest,
+      'Approve all binds this node to exactly this manifest revision')}`;
+    row.appendChild(hint);
     panel.appendChild(row);
     const goal = agendaStartSheetEl('pre', 'agsx-preview');
     goal.textContent = node.goal;
