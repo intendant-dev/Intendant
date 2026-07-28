@@ -198,7 +198,7 @@ pub(crate) async fn run_daemon(
     let _usage_rail = crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
 
     let startup_bus = bus.clone();
-    let supervisor_handle =
+    let supervisor =
         session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
             bus,
             project_root,
@@ -220,8 +220,12 @@ pub(crate) async fn run_daemon(
             launch_gate_for_tests: None,
             claude_rewind_capability_for_tests: None,
             agenda: gateway.agenda.clone(),
-        })
-        .spawn();
+        });
+    // Publish the live registry for read-side lanes (the sign-in
+    // ceremony status payloads' reload_candidates) — mirrors the
+    // vitals-targets publish above.
+    session_supervisor::publish_live_session_registry(supervisor.live_session_registry());
+    let supervisor_handle = supervisor.spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed
     // above, before this send) resumes the target session — attach only,
     // no task; follow-ups come from the dashboard/TUI like any session.

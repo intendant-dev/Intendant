@@ -97,14 +97,53 @@ fn start_mode_from_body(body_text: &str) -> Result<String, String> {
     }
 }
 
+/// Whether a status payload carries `reload_candidates`: exactly at
+/// `success`, the moment the Vault card offers the reload chips.
+pub(crate) fn status_wants_reload_candidates(status: &serde_json::Value) -> bool {
+    status.get("phase").and_then(|v| v.as_str()) == Some("success")
+}
+
+/// Merge the live registry's reload candidates into a status payload —
+/// one body, so the list arrives atomically with the polled `success`
+/// response (no separate fetch, no cache window, no truncation).
+pub(crate) fn status_with_reload_candidates(
+    mut status: serde_json::Value,
+    candidates: Vec<crate::session_supervisor::ReloadCandidate>,
+) -> serde_json::Value {
+    status["reload_candidates"] =
+        serde_json::to_value(candidates).unwrap_or_else(|_| serde_json::json!([]));
+    status
+}
+
+/// The provider's auth-status payload; at `success` it carries
+/// `reload_candidates` derived from the LIVE session registry — the
+/// exact candidate set `route_reload_credentials` accepts, replacing the
+/// disk-catalog filtering that listed dead pre-restart sessions as live
+/// and aged parked ones off. Shared by all three providers' status
+/// routes and their tunnel twins.
+pub(crate) async fn auth_status_payload(provider: Provider) -> serde_json::Value {
+    let status = auth_ceremony::manager().status_value_for(provider);
+    if !status_wants_reload_candidates(&status) {
+        return status;
+    }
+    let source = provider.agent_backend().as_short_str();
+    let candidates = match crate::session_supervisor::published_live_session_registry() {
+        Some(registry) => registry.reload_candidates_for_source(source).await,
+        // No supervisor ⇒ no supervised sessions ⇒ nothing reloadable:
+        // an empty list is the truthful answer, not an omission.
+        None => Vec::new(),
+    };
+    status_with_reload_candidates(status, candidates)
+}
+
 /// GET /api/claude-auth/status + the tunnel's `api_claude_auth_status`.
-pub(crate) fn claude_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
+pub(crate) async fn claude_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
     if hosted_provenance {
         return hosted_refusal_response();
     }
     ApiResponse::json(
         200,
-        JsonBody::Value(auth_ceremony::manager().status_value_for(Provider::Claude)),
+        JsonBody::Value(auth_status_payload(Provider::Claude).await),
     )
 }
 
@@ -175,7 +214,7 @@ pub(crate) async fn handle_claude_auth_status(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = claude_auth_status_api_response(request_authority_is_hosted(access));
+    let response = claude_auth_status_api_response(request_authority_is_hosted(access)).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -221,11 +260,11 @@ mod tests {
         principal
     }
 
-    #[test]
-    fn hosted_provenance_is_refused_on_every_leaf() {
+    #[tokio::test]
+    async fn hosted_provenance_is_refused_on_every_leaf() {
         for response in [
             claude_auth_start_api_response(true, "", None),
-            claude_auth_status_api_response(true),
+            claude_auth_status_api_response(true).await,
             claude_auth_code_api_response(true, "{\"code\":\"x\"}"),
             claude_auth_cancel_api_response(true),
         ] {
@@ -260,6 +299,88 @@ mod tests {
             )),
         };
         assert!(request_authority_is_hosted(&hosted_with_state));
+    }
+
+    /// The reload list rides INSIDE the status payload: the same JSON
+    /// body that announces `success` carries the candidates, so the
+    /// Vault card can never render success with a list fetched at a
+    /// different moment (the old separate `api_sessions` fetch could be
+    /// served a stale cache body, or be skipped entirely on a fast
+    /// "Sign in again"). Non-success phases carry no list at all.
+    #[test]
+    fn vault_list_arrives_atomically_with_success() {
+        let success = serde_json::json!({
+            "provider": "claude",
+            "phase": "success",
+        });
+        assert!(status_wants_reload_candidates(&success));
+        let merged = status_with_reload_candidates(
+            success,
+            vec![crate::session_supervisor::ReloadCandidate {
+                session_id: "wrapper-1".to_string(),
+                source: "claude-code".to_string(),
+                name: Some("steward pass".to_string()),
+                phase: "waiting_rate_limit".to_string(),
+            }],
+        );
+        assert_eq!(merged["phase"], "success");
+        assert_eq!(
+            merged["reload_candidates"],
+            serde_json::json!([{
+                "session_id": "wrapper-1",
+                "source": "claude-code",
+                "name": "steward pass",
+                "phase": "waiting_rate_limit",
+            }]),
+            "candidates and the success phase share one body"
+        );
+
+        // An alive daemon with nothing to reload states that explicitly.
+        let empty =
+            status_with_reload_candidates(serde_json::json!({ "phase": "success" }), Vec::new());
+        assert_eq!(empty["reload_candidates"], serde_json::json!([]));
+
+        for phase in ["idle", "starting", "awaiting_user", "verifying", "failed"] {
+            assert!(
+                !status_wants_reload_candidates(&serde_json::json!({ "phase": phase })),
+                "{phase} payloads never carry a reload list"
+            );
+        }
+    }
+
+    /// "Sign in again" (and every success render) can only show the
+    /// list the daemon just served: the vault fragment renders the
+    /// status payload's own `reload_candidates`, and the legacy
+    /// second-fetch lane — a truncated `api_sessions` snapshot behind
+    /// freshness guards, whose phase-transition force a fast re-sign-in
+    /// skipped (`lastPhase` never reset) — is gone. Sliced to the
+    /// fragment so other panes' legitimate `api_sessions` uses don't
+    /// blur the pin.
+    #[test]
+    fn sign_in_again_always_refreshes() {
+        let app = include_str!("../../../../static/app.html");
+        let banner = "/* ── static/app/32-vault-custody.js ── */";
+        let start = app
+            .find(banner)
+            .expect("vault fragment banner not found in app.html");
+        let rest = &app[start + banner.len()..];
+        let end = rest.find("/* ── static/app/").unwrap_or(rest.len());
+        let fragment = &rest[..end];
+
+        assert!(
+            fragment.contains("reload_candidates"),
+            "the success card must render the status payload's reload_candidates"
+        );
+        for legacy in [
+            "api_sessions",
+            "lastPhase",
+            "AGENT_SIGNIN_TERMINAL_STATUSES",
+        ] {
+            assert!(
+                !fragment.contains(legacy),
+                "the vault sign-in lane must not rebuild its own session list ({legacy} found)"
+            );
+        }
     }
 
     #[test]
