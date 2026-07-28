@@ -2560,8 +2560,12 @@ pub(crate) fn list_sessions_from_home_impl(
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
+    // Newest-first ALWAYS, not just under a cap: the wrapper-status
+    // merge's no-index fallback is first-visit-wins
+    // (`merged_wrapper_status_wins`), so visit order must be
+    // deterministic — raw read_dir order is not.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
     if let Some(cap) = row_cap {
-        dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
         let scan_limit = cap
             .saturating_add(SESSION_SOURCE_FLOOR * 4)
             .clamp(cap, SESSION_LIST_LIMIT);
@@ -2582,21 +2586,33 @@ pub(crate) fn list_sessions_from_home_impl(
             );
             let external_source = value_str(&wrapper_session, "backend_source");
             let external_resume_id = value_str(&wrapper_session, "backend_session_id");
-            let merged_into_external = external_source
+            let mut merged_into_external = false;
+            if let Some((source, external_id)) = external_source
                 .as_deref()
                 .zip(external_resume_id.as_deref())
                 .filter(|(source, external_id)| {
                     crate::external_agent::source_session_id_is_canonical(source, external_id)
                 })
-                .and_then(|(source, external_id)| {
-                    external_sessions
-                        .iter_mut()
-                        .find(|session| external_session_row_matches(session, source, external_id))
-                })
-                .map(|external| {
-                    merge_intendant_wrapper_into_external_session(external, &wrapper_session);
-                })
-                .is_some();
+            {
+                if let Some(external) = external_sessions
+                    .iter_mut()
+                    .find(|session| external_session_row_matches(session, source, external_id))
+                {
+                    let stamp_status = merged_wrapper_status_wins(
+                        home_path,
+                        source,
+                        external_id,
+                        &session_id,
+                        external,
+                    );
+                    merge_intendant_wrapper_into_external_session(
+                        external,
+                        &wrapper_session,
+                        stamp_status,
+                    );
+                    merged_into_external = true;
+                }
+            }
 
             if !merged_into_external {
                 sessions.push(wrapper_session);
@@ -3688,6 +3704,142 @@ mod tests {
         let capped = list_sessions_from_home_impl(home.path(), usize::MAX, Some(3));
         let sessions: Vec<serde_json::Value> = serde_json::from_str(&capped).unwrap();
         assert_eq!(sessions.len(), 3);
+    }
+
+    /// `intendant_status` on a merged external row comes from the
+    /// wrapper the index calls ACTIVE (asserted at identity-commit),
+    /// regardless of scan visit order. The pre-fix merge stamped it from
+    /// every visited group member, so the LAST-visited dir won — under
+    /// the newest-first scan that is the OLDEST dir: an old completed
+    /// wrapper presented a live resumed session as ended (dropping it
+    /// from the Vault reload list), and a crashed pre-restart dir
+    /// presented an ended thread as live. Same last-visited-wins class
+    /// fixed on the index side 2026-07-19.
+    #[test]
+    fn catalog_merge_never_clobbers_live_status() {
+        let write_wrapper = |logs_dir: &Path, wrapper_id: &str, backend_id: &str, completed| {
+            let log_dir = logs_dir.join(wrapper_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.session_started(wrapper_id, Some("external task"));
+            log.session_identity(wrapper_id, "codex", backend_id);
+            if completed {
+                log.write_summary("external task", "completed", 1);
+            }
+            log_dir
+        };
+        let set_transcript_age = |dir: &Path, age_ms: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("session.jsonl"))
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
+                )
+                .unwrap();
+        };
+        let merged_row = |home: &Path, backend_id: &str, cap: Option<usize>| {
+            let body = list_sessions_from_home_impl(home, usize::MAX, cap);
+            let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            sessions
+                .iter()
+                .find(|row| {
+                    row.get("session_id").and_then(|v| v.as_str()) == Some(backend_id)
+                        || row.get("backend_session_id").and_then(|v| v.as_str())
+                            == Some(backend_id)
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("merged codex row missing (cap {cap:?})"))
+        };
+        let write_rollout = |home: &Path, backend_id: &str| {
+            let sessions_dir = home.join(".codex").join("sessions");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            std::fs::write(
+                sessions_dir.join(format!("rollout-2026-07-01T10-00-00-{backend_id}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "timestamp": "2026-07-01T10:00:00.000Z",
+                        "type": "session_meta",
+                        "payload": {"id": backend_id, "cwd": "/repo"}
+                    })
+                ),
+            )
+            .unwrap();
+        };
+
+        // A LIVE resumed session (its wrapper is the index's active
+        // record) with an older completed wrapper in the group — the
+        // completed dir must never write the merged status, whichever
+        // transcript mtime is newer and with or without a scan cap.
+        for old_completed_is_newer in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let backend_id = "019e37b2-merge-status-live";
+            write_rollout(home.path(), backend_id);
+            let logs_dir = home.path().join(".intendant").join("logs");
+            let live_dir = write_wrapper(&logs_dir, "wrapper-live", backend_id, false);
+            let old_dir = write_wrapper(&logs_dir, "wrapper-old", backend_id, true);
+            crate::external_wrapper_index::upsert(
+                home.path(),
+                "codex",
+                backend_id,
+                "wrapper-live",
+                &live_dir,
+                None,
+            )
+            .unwrap();
+            let (newer, older) = if old_completed_is_newer {
+                (&old_dir, &live_dir)
+            } else {
+                (&live_dir, &old_dir)
+            };
+            set_transcript_age(newer, 1_000);
+            set_transcript_age(older, 60_000);
+
+            for cap in [Some(50), None] {
+                let merged = merged_row(home.path(), backend_id, cap);
+                assert_ne!(
+                    merged["intendant_status"], "completed",
+                    "old completed wrapper clobbered the live status \
+                     (old_completed_is_newer={old_completed_is_newer}, cap={cap:?})"
+                );
+                assert_eq!(
+                    merged["intendant_session_id"], "wrapper-live",
+                    "the merged row must point at the ACTIVE wrapper"
+                );
+            }
+        }
+
+        // The reverse direction: the thread genuinely ENDED under its
+        // active wrapper; a crashed pre-restart dir (no summary.json,
+        // reads live forever) with a newer transcript must not revive
+        // it.
+        {
+            let home = tempfile::tempdir().unwrap();
+            let backend_id = "019e37b2-merge-status-dead";
+            write_rollout(home.path(), backend_id);
+            let logs_dir = home.path().join(".intendant").join("logs");
+            let crashed_dir = write_wrapper(&logs_dir, "wrapper-crashed", backend_id, false);
+            let done_dir = write_wrapper(&logs_dir, "wrapper-done", backend_id, true);
+            crate::external_wrapper_index::upsert(
+                home.path(),
+                "codex",
+                backend_id,
+                "wrapper-done",
+                &done_dir,
+                None,
+            )
+            .unwrap();
+            set_transcript_age(&crashed_dir, 1_000);
+            set_transcript_age(&done_dir, 60_000);
+
+            for cap in [Some(50), None] {
+                let merged = merged_row(home.path(), backend_id, cap);
+                assert_eq!(
+                    merged["intendant_status"], "completed",
+                    "a crashed live-looking dir must not revive an ended thread (cap {cap:?})"
+                );
+            }
+        }
     }
 
     #[test]
