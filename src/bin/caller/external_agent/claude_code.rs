@@ -4673,6 +4673,56 @@ impl Drop for ClaudeCodeAgent {
 mod tests {
     use super::*;
 
+    /// Pin `render_lanes_pair_across_bootstrap_addendum`: the dashboard's
+    /// transcript dedupe aliases a user row's content net of the
+    /// supervision addendum so the wrapper-lane row (always net) and an
+    /// addendum-bearing backend-native row pair as one delivery. The SPA
+    /// can't derive the marker from this file, so its static mirror
+    /// (`SESSION_SUPERVISION_ADDENDUM_MARKER`) is pinned here
+    /// byte-for-byte, alongside the alias site that consumes it — a
+    /// marker change that forgets the dashboard fails the suite instead
+    /// of shipping as silent render-lane drift.
+    #[test]
+    fn render_lanes_pair_across_bootstrap_addendum() {
+        let app = include_str!("../../../../static/app.html");
+        let mirror = format!(
+            "const SESSION_SUPERVISION_ADDENDUM_MARKER = '{}';",
+            CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER
+        );
+        assert!(
+            app.contains(&mirror),
+            "static/app (31-init-identity-fleet.js) must mirror \
+             CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER verbatim: {mirror:?}"
+        );
+        assert!(
+            app.contains("raw.indexOf(SESSION_SUPERVISION_ADDENDUM_MARKER)"),
+            "the transcript content-alias site (39-session-windows.js) must \
+             consume the addendum marker"
+        );
+    }
+
+    /// Pin `appended_rows_arm_near_time_pairing`: the window-history
+    /// append/insert dedupe arms the same user-near-time bridge the batch
+    /// pass arms, so a wrapper-lane and transcript-lane copy of one
+    /// prompt pairs at append time instead of rendering twice until a
+    /// batch pass happens to run.
+    #[test]
+    fn appended_rows_arm_near_time_pairing() {
+        let app = include_str!("../../../../static/app.html");
+        assert!(
+            app.contains("const armed = { includeUserNearTime: true, ...options };"),
+            "addSessionWindowHistorySignatures (40-session-launch.js) must arm \
+             the user-near-time bridge for the append-path signature sets"
+        );
+        assert!(
+            app.contains(
+                "sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true })"
+            ),
+            "sessionWindowHistoryHasMatchingSignature (40-session-launch.js) must \
+             match with the user-near-time bridge armed"
+        );
+    }
+
     fn test_reader() -> CcReader {
         CcReader::new(
             Arc::new(CcShared::new(None)),

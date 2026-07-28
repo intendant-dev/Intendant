@@ -37044,7 +37044,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'f85a9667af33c785';
+const INTENDANT_APP_BUILD = '4a2747cd88d96af5';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -37796,6 +37796,15 @@ const SESSION_WINDOW_RESTORE_LIMIT = 6;
 const SESSION_WINDOW_RESTORE_LOG_LIMIT = 250;
 const SESSION_TEXT_SIGNATURE_CHAR_LIMIT = 8192;
 const SESSION_RENDERED_SIGNATURE_CHAR_LIMIT = 4096;
+// First heading of the supervision addendum the wrapper appends to an
+// external backend's first prompt. A backend-native transcript user row
+// can carry the prompt WITH this addendum while the wrapper's own user
+// row logs it net (older daemons serve the raw rollout text; current
+// ones strip at parse) — the transcript dedupe aliases the pre-marker
+// text so the two lanes pair across that skew. Static mirror of the
+// Rust source (CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER, claude_code.rs);
+// a daemon-side parity test pins the two byte-for-byte.
+const SESSION_SUPERVISION_ADDENDUM_MARKER = '### Intendant Supervision';
 const STATION_ACTIVITY_TEXT_CHAR_LIMIT = 1200;
 const STATION_ANCHOR_DETAIL_CHAR_LIMIT = 2000;
 // 0 = collapsed replay/hydration output rows NEVER carry their text in the
@@ -64291,8 +64300,17 @@ function sessionWindowTranscriptContentAliasesForRecord(record = {}) {
     seen.add(content);
     aliases.push(content);
   };
-  add(record.content || record.summary || record.message || '');
+  const raw = String(record.content || record.summary || record.message || '');
+  add(raw);
   add(sessionWindowTranscriptRenderedContentForRecord(record));
+  // A user row carrying the wrapper's supervision addendum also aliases
+  // the prompt net of it, so the wrapper-lane row (always net) and a
+  // backend-native transcript row (addendum-bearing when an older daemon
+  // serves the raw rollout) pair as one delivery instead of rendering
+  // twice. Turn metadata and the near-time bucket still have to agree —
+  // this only removes the appended-boilerplate content skew.
+  const markerAt = raw.indexOf(SESSION_SUPERVISION_ADDENDUM_MARKER);
+  if (markerAt > 0) add(raw.slice(0, markerAt).trimEnd());
   return aliases;
 }
 
@@ -64637,13 +64655,13 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   );
   const existing = new Set();
   for (const item of ensureSessionWindowHistory(win)) {
-    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
+    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true })) {
       existing.add(signature);
     }
   }
   const missing = [];
   for (const record of records) {
-    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
+    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, { includeUserNearTime: true });
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
     // The synthesized completed-terminal row (kind subagent_terminal,
     // served by the task-child hydration lane) and the live "Task
@@ -67402,9 +67420,19 @@ function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLen
   return true;
 }
 
+// The window-history dedupe subsystem (the signature sets the append and
+// insert paths consult, and the membership check below) arms the same
+// user-near-time bridge the batch pass (deduplicateSessionWindowHistory)
+// arms: without it, a wrapper-lane and transcript-lane copy of one prompt
+// whose turn metadata disagrees deduped only when a later batch pass
+// happened to run, and a live-appended row rendered as a duplicate until
+// then. Near-time's distinct-repeated-prompts safety bar (<5s, see
+// sessionWindowTranscriptTimeBuckets) already governs the batch pass, so
+// arming appends widens no collapse envelope — it closes the timing hole.
 function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '', options = {}) {
   if (!set) return;
-  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, options)) {
+  const armed = { includeUserNearTime: true, ...options };
+  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, armed)) {
     set.add(signature);
   }
 }
@@ -67463,7 +67491,7 @@ function invalidateSessionWindowHistorySignatureCache(win) {
 
 function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSessionId = '') {
   if (!signatures) return false;
-  const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId);
+  const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true });
   return itemSignatures.length > 0 && itemSignatures.some(signature => signatures.has(signature));
 }
 

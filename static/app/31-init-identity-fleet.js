@@ -765,6 +765,15 @@ const SESSION_WINDOW_RESTORE_LIMIT = 6;
 const SESSION_WINDOW_RESTORE_LOG_LIMIT = 250;
 const SESSION_TEXT_SIGNATURE_CHAR_LIMIT = 8192;
 const SESSION_RENDERED_SIGNATURE_CHAR_LIMIT = 4096;
+// First heading of the supervision addendum the wrapper appends to an
+// external backend's first prompt. A backend-native transcript user row
+// can carry the prompt WITH this addendum while the wrapper's own user
+// row logs it net (older daemons serve the raw rollout text; current
+// ones strip at parse) — the transcript dedupe aliases the pre-marker
+// text so the two lanes pair across that skew. Static mirror of the
+// Rust source (CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER, claude_code.rs);
+// a daemon-side parity test pins the two byte-for-byte.
+const SESSION_SUPERVISION_ADDENDUM_MARKER = '### Intendant Supervision';
 const STATION_ACTIVITY_TEXT_CHAR_LIMIT = 1200;
 const STATION_ANCHOR_DETAIL_CHAR_LIMIT = 2000;
 // 0 = collapsed replay/hydration output rows NEVER carry their text in the

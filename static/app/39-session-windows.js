@@ -4590,8 +4590,17 @@ function sessionWindowTranscriptContentAliasesForRecord(record = {}) {
     seen.add(content);
     aliases.push(content);
   };
-  add(record.content || record.summary || record.message || '');
+  const raw = String(record.content || record.summary || record.message || '');
+  add(raw);
   add(sessionWindowTranscriptRenderedContentForRecord(record));
+  // A user row carrying the wrapper's supervision addendum also aliases
+  // the prompt net of it, so the wrapper-lane row (always net) and a
+  // backend-native transcript row (addendum-bearing when an older daemon
+  // serves the raw rollout) pair as one delivery instead of rendering
+  // twice. Turn metadata and the near-time bucket still have to agree —
+  // this only removes the appended-boilerplate content skew.
+  const markerAt = raw.indexOf(SESSION_SUPERVISION_ADDENDUM_MARKER);
+  if (markerAt > 0) add(raw.slice(0, markerAt).trimEnd());
   return aliases;
 }
 
@@ -4936,13 +4945,13 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   );
   const existing = new Set();
   for (const item of ensureSessionWindowHistory(win)) {
-    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
+    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeUserNearTime: true })) {
       existing.add(signature);
     }
   }
   const missing = [];
   for (const record of records) {
-    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
+    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, { includeUserNearTime: true });
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
     // The synthesized completed-terminal row (kind subagent_terminal,
     // served by the task-child hydration lane) and the live "Task
