@@ -901,6 +901,19 @@ impl SessionSupervisor {
                     &requested_id,
                     "Session already ended — nothing to stop.",
                 );
+                // The ack is a log row, not state: a stale card that missed
+                // the original SessionEnded (WS reconnect gap, restored
+                // browser state) would keep offering Stop forever. Re-emit
+                // the terminal event a live stop emits — suffixed so the
+                // duplicate is honest about its provenance — and every
+                // connected dashboard retires the ghost through the one
+                // existing dismissal codepath. Consumers treat a repeated
+                // terminal for an unmanaged id as a phase no-op.
+                self.config.bus.send(AppEvent::SessionEnded {
+                    session_id: requested_id,
+                    reason: format!("{} (session had already ended)", reason),
+                    error_kind: None,
+                });
                 return None;
             };
             (state.remove_session(&target_id), target_id)
@@ -909,6 +922,13 @@ impl SessionSupervisor {
         let Some((canonical, session)) = removed else {
             self.warn("Stop session dropped: no matching managed session");
             self.ack_targeted_action_noop(&target_id, "Session already ended — nothing to stop.");
+            // Same ghost-card treatment as the unresolved-id branch above:
+            // the ack alone leaves a stale card offering Stop forever.
+            self.config.bus.send(AppEvent::SessionEnded {
+                session_id: target_id,
+                reason: format!("{} (session had already ended)", reason),
+                error_kind: None,
+            });
             return None;
         };
         // An owner stop is TERMINAL for the lineage: write the durable
@@ -2727,6 +2747,254 @@ mod tests {
         assert!(
             scoped_ack,
             "expected the session-scoped already-ended ack row"
+        );
+    }
+
+    /// The stop-vs-hide fix (2026-07-28): the scoped ack is a log row no
+    /// frontend consumes as state, so a ghost card that missed the original
+    /// SessionEnded (WS reconnect gap, restored browser state) kept offering
+    /// Stop forever. The already-ended noop sites re-emit the terminal event
+    /// a live stop emits — after the ack, suffixed so the duplicate is
+    /// honest about its provenance — and the ordinary explicit-stop
+    /// dismissal runs on every connected dashboard.
+    #[tokio::test]
+    async fn already_ended_stop_emits_session_ended() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+
+        let stopped = supervisor
+            .stop_managed_session(Some("65d2bd17-ghost".to_string()), "stopped by user")
+            .await;
+        assert!(stopped.is_none(), "nothing was managed to stop");
+
+        let mut ack_seen = false;
+        let mut ended_reason = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::LogEntry {
+                    session_id,
+                    level,
+                    source,
+                    content,
+                    ..
+                } if session_id.as_deref() == Some("65d2bd17-ghost") => {
+                    assert!(
+                        ended_reason.is_none(),
+                        "the scoped ack row must precede the terminal event"
+                    );
+                    assert_eq!(level, "warn");
+                    assert_eq!(source, "Intendant");
+                    assert_eq!(content, "Session already ended — nothing to stop.");
+                    ack_seen = true;
+                }
+                AppEvent::SessionEnded {
+                    session_id,
+                    reason,
+                    error_kind,
+                } if session_id == "65d2bd17-ghost" => {
+                    assert_eq!(error_kind, None);
+                    ended_reason = Some(reason);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            ack_seen,
+            "expected the session-scoped already-ended ack row"
+        );
+        assert_eq!(
+            ended_reason.as_deref(),
+            Some("stopped by user (session had already ended)")
+        );
+    }
+
+    /// Repeating a stop for the same id must change nothing the second
+    /// time: one suffixed duplicate terminal per repeat, no state
+    /// mutation, and the supervisor's own SessionEnded consumer
+    /// (`observe_lifecycle_event` → `update_session_phase`) resolves the
+    /// dead id to nothing instead of inserting or re-attributing.
+    #[tokio::test]
+    async fn duplicate_terminal_is_idempotent() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "parent-thread".to_string(),
+                managed_session("parent-thread", "codex"),
+            );
+        }
+        let first = supervisor
+            .stop_managed_session(Some("parent-thread".to_string()), "stopped by user")
+            .await;
+        assert!(first.is_some(), "first stop removes the live session");
+
+        let mut rx = bus.subscribe();
+        let second = supervisor
+            .stop_managed_session(Some("parent-thread".to_string()), "stopped by user")
+            .await;
+        assert!(second.is_none(), "second stop has nothing to remove");
+
+        let mut duplicate_terminals = 0usize;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionEnded {
+                session_id, reason, ..
+            } = event
+            {
+                assert_eq!(session_id, "parent-thread");
+                assert_eq!(reason, "stopped by user (session had already ended)");
+                duplicate_terminals += 1;
+            }
+        }
+        assert_eq!(
+            duplicate_terminals, 1,
+            "exactly one duplicate terminal per repeat stop"
+        );
+
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionEnded {
+                session_id: "parent-thread".to_string(),
+                reason: "stopped by user (session had already ended)".to_string(),
+                error_kind: None,
+            })
+            .await;
+        let state = supervisor.state.lock().await;
+        assert!(
+            !state.sessions.contains_key("parent-thread"),
+            "the duplicate terminal must not resurrect supervisor state"
+        );
+    }
+
+    /// Cross-layer pin: the duplicate-terminal reason the daemon actually
+    /// emits for a ghost stop must keep matching the dashboard's
+    /// explicit-stop needle (54-session-lifecycle.js), and that branch must
+    /// keep dismissing the card — SessionEnded is a bus broadcast, so every
+    /// connected dashboard retires the ghost through this one codepath.
+    #[tokio::test]
+    async fn ghost_card_dismisses_on_every_dashboard() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        supervisor
+            .stop_managed_session(Some("65d2bd17-ghost".to_string()), "stopped by user")
+            .await;
+        let mut emitted_reason = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionEnded {
+                session_id, reason, ..
+            } = event
+            {
+                if session_id == "65d2bd17-ghost" {
+                    emitted_reason = Some(reason);
+                }
+            }
+        }
+        let emitted_reason = emitted_reason.expect("ghost stop emits SessionEnded");
+
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/54-session-lifecycle.js"),
+        )
+        .expect("dashboard session-lifecycle fragment");
+        assert!(
+            fragment.contains("text.includes('stopped by user')"),
+            "dashboard explicit-stop needle moved"
+        );
+        assert!(
+            emitted_reason.to_lowercase().contains("stopped by user"),
+            "duplicate-terminal reason no longer matches the dashboard needle"
+        );
+        let branch_start = fragment
+            .find("} else if (explicitStop) {")
+            .expect("explicit-stop branch");
+        let branch_end = branch_start
+            + fragment[branch_start..]
+                .find("} else if (restarting)")
+                .expect("explicit-stop branch end");
+        assert!(
+            fragment[branch_start..branch_end].contains("removeSessionWindow(sid)"),
+            "explicit stop no longer dismisses the card"
+        );
+    }
+
+    /// The re-attach aggravator: any scoped log row used to clear a
+    /// detached card back to attached ("live output observed") — including
+    /// the daemon's own already-ended warn ack, which re-armed the very
+    /// Stop affordance it refuted. Pin that both dashboard re-attach sites
+    /// sit behind the backend-activity guard, and that the guard names the
+    /// daemon lane structurally (level + source), never by row content.
+    #[test]
+    fn warn_ack_rows_never_reattach() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/41-session-window-actions.js"),
+        )
+        .expect("dashboard session-window-actions fragment");
+        assert!(
+            fragment.contains("function logRowEvidencesBackendActivity"),
+            "backend-activity predicate missing"
+        );
+        let predicate_start = fragment
+            .find("function logRowEvidencesBackendActivity")
+            .expect("predicate start");
+        let predicate = &fragment[predicate_start..predicate_start + 400];
+        assert!(
+            predicate.contains("'warn'"),
+            "predicate lost the warn level"
+        );
+        assert!(
+            predicate.contains("'intendant'"),
+            "predicate lost the daemon source"
+        );
+        let mut sites = 0usize;
+        for (idx, _) in fragment
+            .match_indices("clearStaleSessionWindowDetached(targetSid, 'live output observed')")
+        {
+            sites += 1;
+            let guard_window = &fragment[idx.saturating_sub(400)..idx];
+            assert!(
+                guard_window.contains("EvidencesBackendActivity"),
+                "a re-attach site lost the backend-activity guard"
+            );
+        }
+        assert_eq!(sites, 2, "expected the two live re-attach sites");
+    }
+
+    /// A Stop aimed at a known-terminal card is satisfied, not refused:
+    /// the dashboard hides the card inline with one info toast instead of
+    /// erroring with instructions to hide it manually. The x affordance's
+    /// known-ended dialog copy ("Hide session card?") stays as shipped.
+    #[test]
+    fn known_terminal_x_hides_inline() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/40-session-launch.js"),
+        )
+        .expect("dashboard session-launch fragment");
+        assert!(
+            fragment.contains("terminal: true"),
+            "terminal availability discriminant missing"
+        );
+        let start = fragment
+            .find("async function stopSessionWindowAction")
+            .expect("stopSessionWindowAction");
+        let body = &fragment[start..start + 1200];
+        assert!(
+            body.contains("availability.terminal"),
+            "stop action lost the terminal branch"
+        );
+        assert!(
+            body.contains("hideSessionWindowAction(sid)"),
+            "terminal stop no longer hides the card inline"
+        );
+        assert!(
+            body.contains("showControlToast('info', 'Session already ended — card closed')"),
+            "terminal stop lost its info toast"
+        );
+        assert!(
+            fragment.contains("'Hide session card?'"),
+            "known-ended x dialog copy changed"
         );
     }
 
