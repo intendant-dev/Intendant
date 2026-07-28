@@ -3363,13 +3363,14 @@ pub(crate) async fn run_with_presence(
                     DrainOutcome::LimitRejected {
                         resets_at_epoch,
                         message: _,
+                        turn_had_started,
                     } => {
-                        // Park-until-reset: the round did no work — count
-                        // nothing, emit no DoneSignal/RoundComplete, and
-                        // arm the outer-select resume timer instead of
-                        // re-firing (the incident class burned rounds at
-                        // decaying intervals with the reset time on the
-                        // wire the whole time).
+                        // Park-until-reset: count nothing, emit no
+                        // DoneSignal/RoundComplete, and arm the
+                        // outer-select resume timer instead of re-firing
+                        // (the incident class burned rounds at decaying
+                        // intervals with the reset time on the wire the
+                        // whole time).
                         persistent_limit_park_streak =
                             persistent_limit_park_streak.saturating_add(1);
                         let now_epoch = crate::session_activity::epoch_seconds();
@@ -3397,16 +3398,34 @@ pub(crate) async fn run_with_presence(
                             format!("{} rate-limited; parked until the limit resets", backend),
                         )
                         .await;
-                        // Re-send exactly what the limit rejected: the
-                        // merged text (queued steers were already consumed
-                        // into it) with the original attachments. The
+                        // Delivery-aware pending (`limit_park_pending`):
+                        // an instant rejection parks exactly what the
+                        // limit rejected — the merged text (queued steers
+                        // were already consumed into it) with the
+                        // original attachments — while a turn the backend
+                        // had already started parks a resume nudge
+                        // instead of doubling the delivered message. The
                         // while-loop ends here; the outer select owns the
                         // timer and the parked-flush preamble re-sends.
+                        if turn_had_started {
+                            let line = format!(
+                                "The rejected turn had already started at {} — parking a resume nudge instead of re-sending the message",
+                                backend
+                            );
+                            slog(&session_log, |l| l.info(&line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: session_log_id(&session_log),
+                                level: "info".to_string(),
+                                source: "Intendant".to_string(),
+                                content: line,
+                                turn: None,
+                            });
+                        }
                         let mut pending = active_followup;
                         pending.text = merged_text.clone();
                         persistent_limit_park = Some(LimitParkState {
                             resume_at: tokio::time::Instant::now() + delay,
-                            pending: Some(pending),
+                            pending: Some(limit_park_pending(pending, turn_had_started)),
                         });
                     }
                     DrainOutcome::RecoveryRequired {

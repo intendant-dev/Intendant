@@ -1052,15 +1052,24 @@ full credential before tearing its lease down.
 
 Claude Code's `rate_limit_event` with status `rejected`, correlated with the
 turn's terminal result, becomes `AgentEvent::TurnLimitRejected` rather than an
-ordinary completed round. The backend process remains usable, but the rejected
-round did no work and consumes no round budget. Both the foreground
-external-mode lane and persistent-daemon lane apply the same
-`external_supervision.rs` policy:
+ordinary completed round. The backend process remains usable and the rejected
+round consumes no round budget. Both the foreground external-mode lane and
+persistent-daemon lane apply the same `external_supervision.rs` policy:
 
-- The rejected message remains pending. If the wire supplied `resetsAt`, it is
-  resent after that instant plus 30–90 seconds of jitter; any one sleep is
-  capped at six hours so long windows are rechecked. Without a reset time,
-  consecutive rejections back off from 5 to 30 minutes.
+- The park is delivery-aware (`limit_park_pending`). When the rejection
+  arrived before the backend did anything (the instant-rejection shape), the
+  rejected message itself remains pending and is resent verbatim. When the
+  drain had already observed primary-turn work — assistant output, tool
+  activity — the backend consumed (and, for Claude Code, durably recorded)
+  the message mid-flight, so the park pends a short resume nudge instead:
+  resending the original would put the goal in the conversation twice and
+  make the backend re-read its whole mandate. The nudge inherits the rejected
+  message's follow-up/steer ids, so cancelling it while parked works exactly
+  like cancelling a full resend.
+- If the wire supplied `resetsAt`, the pending message is resent after that
+  instant plus 30–90 seconds of jitter; any one sleep is capped at six hours
+  so long windows are rechecked. Without a reset time, consecutive rejections
+  back off from 5 to 30 minutes.
 - Follow-ups arriving while parked queue FIFO behind the pending resend instead
   of being burned against the exhausted backend. A cancelled follow-up is
   skipped when the queue drains.
