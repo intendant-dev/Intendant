@@ -36915,7 +36915,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'e24456a9d57bf779';
+const INTENDANT_APP_BUILD = 'e765b0ad6059d6d3';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -68765,6 +68765,7 @@ function sessionWindowStopAvailability(sessionId) {
   if (terminal) {
     return {
       ok: false,
+      terminal: true,
       reason: 'Session already ended — nothing to stop. Hide the card to dismiss it.',
       toast: 'Session already ended — nothing to stop',
     };
@@ -68785,6 +68786,15 @@ async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   const availability = sessionWindowStopAvailability(sid);
   if (!sid || !availability.ok) {
+    // A Stop aimed at a known-ended session is satisfied, not refused:
+    // the intent behind the click is "make this card go away", so hide
+    // the card here instead of erroring with instructions to hide it
+    // manually.
+    if (sid && availability.terminal) {
+      hideSessionWindowAction(sid);
+      showControlToast('info', 'Session already ended — card closed');
+      return;
+    }
     if (availability.toast) showControlToast('error', availability.toast);
     return;
   }
@@ -70260,6 +70270,23 @@ function sessionWindowRecordFromLogCommand(c) {
   };
 }
 
+// The daemon's own scoped warn rows (source "Intendant" — e.g. the
+// "Session already ended — nothing to stop." ack) are the daemon talking
+// ABOUT the session, not evidence its backend is alive: they must never
+// clear a detached card back to attached, or the ack itself re-arms the
+// very Stop affordance it just refuted. Only backend activity re-attaches.
+function logRowEvidencesBackendActivity(level, source) {
+  return !(String(level || '').toLowerCase() === 'warn'
+    && String(source || '').trim().toLowerCase() === 'intendant');
+}
+
+function logEntryEvidencesBackendActivity(entry) {
+  return logRowEvidencesBackendActivity(
+    entry?.dataset?.level,
+    entry?.classList?.contains('source-intendant') ? 'intendant' : '',
+  );
+}
+
 function appendSessionWindowRecord(record, batch = null) {
   const sid = String(record?.session_id || record?.sessionId || '').trim();
   if (!sid) return;
@@ -70267,7 +70294,8 @@ function appendSessionWindowRecord(record, batch = null) {
   if (!targetSid) return;
   const win = sessionWindows.get(targetSid) || (processingLogReplay ? null : ensureSessionWindow(targetSid));
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logRowEvidencesBackendActivity(record?.level, record?.source)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const normalized = { ...record, session_id: targetSid };
@@ -70295,7 +70323,8 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (!targetSid) return;
   const win = ensureSessionWindow(targetSid);
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logEntryEvidencesBackendActivity(entry)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const empty = win.log.querySelector('.session-window-empty');

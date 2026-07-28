@@ -6311,3 +6311,468 @@ async fn fresh_sessions_receive_zero_unrequested_memory() {
 
     daemon.child.kill().await.expect("stop the daemon");
 }
+
+// ---------------------------------------------------------------------------
+// Track HS2: the active-scheduler lease across two REAL co-homed daemons.
+// One state root (agenda, occurrence journal, lease, presence), two
+// controller processes on their own ports — the dual-run topology that used
+// to double-fire standing automations and clobber a live peer's in-flight
+// occurrences at boot.
+// ---------------------------------------------------------------------------
+
+/// A second daemon booted against ANOTHER rig's home. Kept separate from
+/// [`DaemonRig`] because the rig's tempdirs stay owned by the first
+/// daemon; the child still dies on drop (`kill_on_drop`).
+struct CoDaemon {
+    /// Held for `kill_on_drop` — dropping the rig kills the process.
+    _child: tokio::process::Child,
+    port: u16,
+}
+
+/// Boot a co-homed daemon on `rig` (same HOME, same mock script, own
+/// port), teeing its log to `<log_name>` so the port parse never reads
+/// the first daemon's line. `extra_env` carries per-test knobs
+/// (`INTENDANT_LEASE_POLL_MS` for takeover legs).
+async fn spawn_co_daemon(
+    client: &reqwest::Client,
+    rig: &TestRig,
+    log_name: &str,
+    extra_env: &[(&str, &str)],
+) -> CoDaemon {
+    let script_path = rig.home.path().join("mock_script.json");
+    let log_path = rig.home.path().join(log_name);
+    let log = std::fs::File::create(&log_path).expect("co-daemon log");
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script_path)
+        .stdout(log.try_clone().expect("clone co-daemon log"))
+        .stderr(log);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.arg("--web").arg("0").args([
+        "--bind",
+        "127.0.0.1",
+        "--no-tui",
+        "--autonomy",
+        "full",
+        "--no-tls",
+    ]);
+    let mut child = cmd.spawn().expect("spawn co-homed intendant daemon");
+
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    let port = loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(port) = dashboard_port(&contents) {
+            break port;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "co-daemon exited during startup ({status}):\n{}",
+                tail(&contents, 4000)
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "co-daemon did not print its Dashboard startup line within \
+             {DAEMON_START_TIMEOUT:?}:\n{}",
+            tail(&contents, 4000)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let probe_url = format!("http://127.0.0.1:{port}/.well-known/agent-card.json");
+    loop {
+        if http_get_json(client, &probe_url).await.is_some() {
+            return CoDaemon {
+                _child: child,
+                port,
+            };
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+            panic!(
+                "co-daemon on port {port} exited during startup ({status}):\n{}",
+                tail(&contents, 4000)
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "co-daemon on port {port} did not serve its agent card within \
+             {DAEMON_START_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The lease sidecar as it sits in the shared home (`None` until a holder
+/// writes it, or on a torn read — tolerant like every sidecar reader).
+fn lease_sidecar(rig: &TestRig) -> Option<serde_json::Value> {
+    let path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("scheduler-lease")
+        .join("lease.json");
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The shared occurrence journal's parsed rows.
+fn journal_rows(rig: &TestRig) -> Vec<serde_json::Value> {
+    let path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("agenda")
+        .join("occurrences.jsonl");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The journal's state sequence for one item's occurrences. Recovery
+/// `unknown` rows carry an empty `item_id` (the journal row retains only
+/// the occurrence id), so membership is by the occurrence-id set the
+/// item's attributed rows establish — never by `item_id` alone.
+fn journal_states_for_item(rig: &TestRig, item_id: &str) -> Vec<String> {
+    let rows = journal_rows(rig);
+    let occurrence_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|row| row["item_id"] == item_id)
+        .filter_map(|row| row["occurrence_id"].as_str())
+        .collect();
+    rows.iter()
+        .filter(|row| {
+            row["occurrence_id"]
+                .as_str()
+                .is_some_and(|occ| occurrence_ids.contains(occ))
+        })
+        .filter_map(|row| row["state"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Schedule + approve a one-shot manifest on a fresh item through owner
+/// ctl against `port`, due at `fire_at_ms`. Returns the item id.
+async fn approve_manifest_at(rig: &TestRig, port: u16, fire_at_ms: u64, title: &str) -> String {
+    let added = ctl_on_rig(rig, port, &["--json", "agenda", "add", title, "--task"]).await;
+    assert!(added.status.success(), "{}", text_of(&added));
+    let item_id = stdout_json(&added)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+    let scheduled = ctl_on_rig(
+        rig,
+        port,
+        &[
+            "agenda",
+            "schedule",
+            &item_id[..10],
+            "--goal",
+            "handover rig follow-through",
+            "--at",
+            &fire_at_ms.to_string(),
+        ],
+    )
+    .await;
+    assert!(scheduled.status.success(), "{}", text_of(&scheduled));
+    // Review-then-bind: approval requires echoing the exact digest the
+    // proposal minted (digestless `approve` only prints the manifest).
+    let listed = ctl_on_rig(rig, port, &["--json", "agenda", "list", "--all"]).await;
+    assert!(listed.status.success(), "{}", text_of(&listed));
+    let listed_json = stdout_json(&listed);
+    let items = listed_json
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .or_else(|| listed_json.as_array().cloned())
+        .expect("agenda list items");
+    let digest = items
+        .iter()
+        .find(|item| item["id"] == item_id.as_str())
+        .and_then(|item| item.pointer("/effects/0/digest"))
+        .and_then(serde_json::Value::as_str)
+        .expect("scheduled effect digest")
+        .to_string();
+    let approved = ctl_on_rig(
+        rig,
+        port,
+        &["agenda", "approve", &item_id[..10], "--digest", &digest],
+    )
+    .await;
+    assert!(approved.status.success(), "{}", text_of(&approved));
+    item_id
+}
+
+/// A mock script whose scheduled-session profile parks on `barrier` (the
+/// provider's race-free file barrier) before signalling done — the
+/// cross-platform way to hold an occurrence in `started` while the test
+/// acts. `None` = complete immediately.
+fn handover_script(barrier: Option<&std::path::Path>) -> serde_json::Value {
+    let mut steps = Vec::new();
+    if let Some(barrier) = barrier {
+        steps.push(serde_json::json!({
+            "content": "Working until released.",
+            "wait_for_file": barrier,
+        }));
+    }
+    steps.push(serde_json::json!({
+        "content": "All work finished.",
+        "tool_calls": [{ "name": "signal_done",
+                         "arguments": { "message": "handover fire complete" } }]
+    }));
+    serde_json::json!({
+        "profiles": [
+            { "match": "handover rig follow-through", "steps": steps },
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    })
+}
+
+/// Intake §4 rig pin: a due, owner-approved manifest under TWO live
+/// co-homed daemons fires EXACTLY once, and every journal row is stamped
+/// by the lease holder's boot. The secondary is provably alive (it
+/// answers agenda ops) yet never plans.
+#[tokio::test]
+async fn due_manifest_fires_exactly_once_across_two_live_daemons() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon_a = spawn_daemon(&client, &handover_script(None)).await;
+    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[]).await;
+
+    // A booted first: it holds the lease; B runs secondary.
+    let sidecar = lease_sidecar(&daemon_a.rig).expect("holder wrote the sidecar");
+    let holder_boot = sidecar["boot_id"].as_str().expect("boot id").to_string();
+
+    // The due manifest, minted through A; a nudge op through B proves B
+    // is live and writing the same ledger while never firing.
+    let fire_at = now_epoch_ms() + 4_000;
+    let item_id =
+        approve_manifest_at(&daemon_a.rig, daemon_a.port, fire_at, "exactly-once-item").await;
+    let nudge = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_b.port,
+        &["agenda", "add", "secondary-is-alive-nudge", "--note"],
+    )
+    .await;
+    assert!(nudge.status.success(), "{}", text_of(&nudge));
+
+    // The outcome writes back through the standard lane on the holder.
+    let client_a = daemon_a.authed_client();
+    let port_a = daemon_a.port;
+    poll_until(
+        "the exactly-once outcome write-back",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client_a, &format!("http://127.0.0.1:{port_a}/api/agenda")).await?;
+            let item = agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["id"] == item_id.as_str())?
+                .clone();
+            (item.pointer("/effects/0/last_run/state")? == "completed").then_some(())
+        },
+        || {
+            format!(
+                "--- journal ---\n{:?}\n--- daemon A tail ---\n{}",
+                journal_rows(&daemon_a.rig),
+                daemon_a.log_tail()
+            )
+        },
+    )
+    .await;
+
+    // Exactly one prepared→started→completed arc, all rows stamped by
+    // the holder's boot — the secondary wrote nothing.
+    assert_eq!(
+        journal_states_for_item(&daemon_a.rig, &item_id),
+        vec!["prepared", "started", "completed"],
+        "one clean arc under two live daemons:\n{:?}",
+        journal_rows(&daemon_a.rig)
+    );
+    for row in journal_rows(&daemon_a.rig)
+        .iter()
+        .filter(|row| row["item_id"] == item_id.as_str())
+    {
+        assert_eq!(
+            row["boot_id"].as_str(),
+            Some(holder_boot.as_str()),
+            "every row stamped by the lease holder:\n{row}"
+        );
+    }
+    drop(daemon_b);
+}
+
+/// Intake §4 rig pin: kill -9 the holder → the secondary poll-acquires
+/// (generation bumps in the shared sidecar) and the dead generation's
+/// in-flight row fail-closes `unknown` without any daemon restart.
+#[tokio::test]
+async fn holder_crash_secondary_poll_acquires_and_resolves_dead_rows() {
+    let rig = TestRig::new();
+    // A barrier file the test never creates: the holder's fired session
+    // parks in `started` (the provider's bounded 30s barrier outlives
+    // the few seconds until the kill).
+    let barrier = rig.home.path().join("never-released");
+    let script = handover_script(Some(&barrier));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let mut daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+    )
+    .await;
+    let first_generation = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["generation"]
+        .as_u64()
+        .expect("generation");
+
+    // Fire the parked session on A and wait for its `started` row.
+    let item_id = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "crash-recovery-item",
+    )
+    .await;
+    poll_until(
+        "the holder's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_id)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // SIGKILL the holder: the OS frees its lease flock and presence lock.
+    daemon_a.child.start_kill().expect("kill -9 the holder");
+    let _ = daemon_a.child.wait().await;
+
+    // The secondary converges: fresh holder, bumped generation…
+    poll_until(
+        "the secondary's poll-acquire",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["generation"].as_u64()? > first_generation).then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+    // …and the dead generation's row fail-closes without any restart.
+    poll_until(
+        "the dead holder's row resolving unknown",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_id)
+                .contains(&"unknown".to_string())
+                .then_some(())
+        },
+        || format!("journal: {:?}", journal_rows(&daemon_a.rig)),
+    )
+    .await;
+    drop(daemon_b);
+}
+
+/// THE §2.2 regression pin: a second daemon booting while the holder's
+/// scheduled session RUNS must spare the live row — the session then
+/// completes on the holder and its `completed` terminal stands; no
+/// `unknown` is ever written over it. (Pre-HS2, the booting daemon
+/// marked every started-without-terminal row unknown and polluted the
+/// item — the burn class that commissioned this track.)
+#[tokio::test]
+async fn handover_boot_spares_live_scheduled_session_and_completed_stands() {
+    let rig = TestRig::new();
+    let barrier = rig.home.path().join("release-the-session");
+    let script = handover_script(Some(&barrier));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+
+    // Fire on the holder and hold the session in-flight on the barrier.
+    let item_id = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "spare-live-row-item",
+    )
+    .await;
+    poll_until(
+        "the in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_id)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // A second daemon boots MID-SESSION: its boot recovery runs against
+    // the shared journal and must spare the live generation's row.
+    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[]).await;
+    assert!(
+        !journal_states_for_item(&daemon_a.rig, &item_id).contains(&"unknown".to_string()),
+        "the co-booting daemon must not clobber a live session's row:\n{:?}",
+        journal_rows(&daemon_a.rig)
+    );
+
+    // Release the barrier; the session completes ON THE HOLDER and the
+    // terminal stands.
+    std::fs::write(&barrier, b"go").expect("release the barrier");
+    let client_a = daemon_a.authed_client();
+    let port_a = daemon_a.port;
+    poll_until(
+        "the spared session's completed write-back",
+        RUN_TIMEOUT,
+        || async {
+            let agenda =
+                http_get_json(&client_a, &format!("http://127.0.0.1:{port_a}/api/agenda")).await?;
+            let item = agenda
+                .get("items")?
+                .as_array()?
+                .iter()
+                .find(|item| item["id"] == item_id.as_str())?
+                .clone();
+            (item.pointer("/effects/0/last_run/state")? == "completed").then_some(())
+        },
+        || {
+            format!(
+                "--- journal ---\n{:?}\n--- A tail ---\n{}",
+                journal_rows(&daemon_a.rig),
+                daemon_a.log_tail()
+            )
+        },
+    )
+    .await;
+    assert_eq!(
+        journal_states_for_item(&daemon_a.rig, &item_id),
+        vec!["prepared", "started", "completed"],
+        "the completed terminal stands; no unknown was ever written:\n{:?}",
+        journal_rows(&daemon_a.rig)
+    );
+    drop(daemon_b);
+}

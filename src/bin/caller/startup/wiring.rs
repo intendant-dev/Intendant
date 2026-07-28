@@ -371,12 +371,17 @@ pub(crate) fn spawn_mode_web_gateway(
             // The GitHub PR scanner (Track PR): mirrors watched repos'
             // PRs as thin anchors under the PRs hub. Natural on/off —
             // it idles keystore-free until credentials are sealed and a
-            // watch list exists. Detaches on drop like its siblings.
+            // watch list exists; under the scheduler lease (Track HS2)
+            // it runs on the holder only. Detaches on drop like its
+            // siblings.
             let scanner_settings_root = project_root
                 .clone()
                 .unwrap_or_else(crate::project::daemon_settings_config_root);
-            let _pr_scanner =
-                crate::github_pr::scanner::spawn_scanner(handle.clone(), scanner_settings_root);
+            let _pr_scanner = crate::github_pr::scanner::spawn_scanner(
+                handle.clone(),
+                scanner_settings_root,
+                Some(handover.clone()),
+            );
             Some(handle)
         }
         Err(err) => {

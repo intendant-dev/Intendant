@@ -29,9 +29,14 @@
 //! (one-shot semantics — only a new due re-arms).
 //!
 //! Co-homed daemons: like the op log, the journal refolds when its file
-//! grows (`refresh_if_stale`), which narrows but cannot eliminate the
-//! double-fire window between two live daemons sharing one home —
-//! at-least-once, honestly.
+//! grows (`refresh_if_stale`) — the read-convergence lane. The
+//! check-then-`prepared` double-fire window between two LIVE daemons,
+//! which refold could only narrow, is closed structurally by the
+//! active-scheduler lease (`crate::handover`, Track HS2): only the lease
+//! holder runs the firing pass at all, so two live planners never race
+//! one due occurrence. At-least-once remains the honest contract for
+//! crash windows (a `prepared` row without a terminal re-delivers on the
+//! next wake, whichever daemon holds the lease by then).
 
 use super::types::{AgendaEffect, AgendaItem, AgendaStatus, BindingRef, RecurrenceSpec};
 use serde::{Deserialize, Serialize};
@@ -367,6 +372,31 @@ pub(crate) struct OccurrenceProgress {
     /// occurrences that never got past `prepared` (a dispatch lost with
     /// the process — no `started` row, no `last_run` lineage to match).
     pub(crate) item_id: Option<String>,
+    /// The boot id stamped on the last non-terminal (`prepared`/`started`)
+    /// row — whose daemon was driving this occurrence. Recovery scoping
+    /// (Track HS2) probes its liveness before fail-closing the occurrence.
+    /// Last non-terminal row wins, `None` included: a stampless row from a
+    /// pre-stamping build downgrades the occurrence to legacy boot-time
+    /// semantics — the fail-closed direction for mixed-version homes.
+    pub(crate) writer_boot_id: Option<String>,
+}
+
+/// One row of [`OccurrenceJournal::started_unresolved`].
+pub(crate) struct StartedUnresolved {
+    pub(crate) occurrence_id: String,
+    /// The started session (the lineage tip under a resume re-key).
+    pub(crate) session_id: Option<String>,
+    /// See [`OccurrenceProgress::writer_boot_id`].
+    pub(crate) writer_boot_id: Option<String>,
+}
+
+/// One row of [`OccurrenceJournal::prepared_unresolved`].
+pub(crate) struct PreparedUnresolved {
+    pub(crate) occurrence_id: String,
+    /// The owning item, when the journal rows retained it.
+    pub(crate) item_id: Option<String>,
+    /// See [`OccurrenceProgress::writer_boot_id`].
+    pub(crate) writer_boot_id: Option<String>,
 }
 
 /// One session's journal-derived source linkage — the grid envelope's
@@ -435,9 +465,9 @@ impl OccurrenceJournal {
         self.stamp = stamp;
     }
 
-    /// See [`journal_generation_floor`]; live view of the same floor
-    /// (test/diagnostic seam, like [`Self::unresolved`]).
-    #[cfg(test)]
+    /// See [`journal_generation_floor`]; the live view of the same floor.
+    /// The secondary poll-acquire lane feeds this to lease acquisition
+    /// instead of re-folding the file (HS1 ruling note).
     pub(crate) fn max_generation(&self) -> u64 {
         self.max_generation
     }
@@ -526,28 +556,39 @@ impl OccurrenceJournal {
             .collect()
     }
 
-    /// `started` occurrences with no terminal record — sessions this
-    /// executor launched and (after a restart) lost sight of. The boot
-    /// pass resolves them to `Unknown`, fail-closed per RFC §7.5.
-    pub(crate) fn started_unresolved(&self) -> Vec<(String, Option<String>)> {
+    /// `started` occurrences with no terminal record — sessions some
+    /// executor launched and lost sight of. Recovery scoping (Track HS2)
+    /// decides per row, on `writer_boot_id` liveness, whether it may
+    /// fail-close the occurrence to `Unknown` (RFC §7.5) or must leave it
+    /// to the live daemon still driving it.
+    pub(crate) fn started_unresolved(&self) -> Vec<StartedUnresolved> {
         self.state
             .iter()
             .filter(|(_, progress)| progress.started.is_some() && progress.terminal.is_none())
-            .map(|(id, progress)| (id.clone(), progress.started.clone()))
+            .map(|(id, progress)| StartedUnresolved {
+                occurrence_id: id.clone(),
+                session_id: progress.started.clone(),
+                writer_boot_id: progress.writer_boot_id.clone(),
+            })
             .collect()
     }
 
-    /// Occurrences a previous process dispatched but never got a receipt
-    /// for: `prepared`, no `started`, no terminal — the lost-dispatch
-    /// shape (the StartTask died with the process). Paired with the
-    /// owning item id retained from the journal rows.
-    pub(crate) fn prepared_unresolved(&self) -> Vec<(String, Option<String>)> {
+    /// Occurrences a process dispatched but never got a receipt for:
+    /// `prepared`, no `started`, no terminal — the lost-dispatch shape
+    /// (the StartTask died with the process, or is still in the writer's
+    /// retry window). Paired with the owning item id retained from the
+    /// journal rows, and the writer's boot id for recovery scoping.
+    pub(crate) fn prepared_unresolved(&self) -> Vec<PreparedUnresolved> {
         self.state
             .iter()
             .filter(|(_, progress)| {
                 progress.prepared && progress.started.is_none() && progress.terminal.is_none()
             })
-            .map(|(id, progress)| (id.clone(), progress.item_id.clone()))
+            .map(|(id, progress)| PreparedUnresolved {
+                occurrence_id: id.clone(),
+                item_id: progress.item_id.clone(),
+                writer_boot_id: progress.writer_boot_id.clone(),
+            })
             .collect()
     }
 
@@ -746,10 +787,14 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
         entry.item_id = Some(record.item_id.clone());
     }
     match record.state {
-        OccurrenceState::Prepared => entry.prepared = true,
+        OccurrenceState::Prepared => {
+            entry.prepared = true;
+            entry.writer_boot_id = record.boot_id.clone();
+        }
         OccurrenceState::Started => {
             entry.prepared = true;
             entry.started = record.session_id.clone();
+            entry.writer_boot_id = record.boot_id.clone();
             if let Some(session_id) = record.session_id.as_ref() {
                 if !entry.started_history.contains(session_id) {
                     entry.started_history.push(session_id.clone());
@@ -1820,6 +1865,61 @@ mod tests {
             serde_json::to_string(&record).unwrap(),
             legacy_line,
             "stampless records stay byte-identical to the legacy shape"
+        );
+    }
+
+    /// Recovery scoping's fold input (Track HS2): the last non-terminal
+    /// row's boot id wins — `None` included, so a stampless row from a
+    /// pre-stamping build downgrades the occurrence to legacy boot-time
+    /// recovery, the fail-closed direction for mixed-version homes.
+    #[test]
+    fn writer_boot_id_follows_last_non_terminal_row() {
+        let mk = |state: OccurrenceState, boot: Option<&str>| OccurrenceRecord {
+            v: 1,
+            at_ms: 1_000,
+            occurrence_id: "occ-1".to_string(),
+            item_id: "a".to_string(),
+            due_ms: 1_000,
+            state,
+            urgency: None,
+            session_id: Some("sess-1".to_string()),
+            generation: None,
+            boot_id: boot.map(str::to_string),
+        };
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Prepared, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Started, Some("boot-b"))).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id.as_deref(),
+            Some("boot-b"),
+            "last non-terminal row wins"
+        );
+
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Prepared, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Started, None)).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id,
+            None,
+            "a stampless writer downgrades the occurrence to legacy semantics"
+        );
+
+        // Terminal rows never disturb the writer attribution.
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Started, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Completed, None)).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id.as_deref(),
+            Some("boot-a")
         );
     }
 

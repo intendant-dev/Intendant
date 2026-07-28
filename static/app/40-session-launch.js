@@ -3102,6 +3102,7 @@ function sessionWindowStopAvailability(sessionId) {
   if (terminal) {
     return {
       ok: false,
+      terminal: true,
       reason: 'Session already ended — nothing to stop. Hide the card to dismiss it.',
       toast: 'Session already ended — nothing to stop',
     };
@@ -3122,6 +3123,15 @@ async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   const availability = sessionWindowStopAvailability(sid);
   if (!sid || !availability.ok) {
+    // A Stop aimed at a known-ended session is satisfied, not refused:
+    // the intent behind the click is "make this card go away", so hide
+    // the card here instead of erroring with instructions to hide it
+    // manually.
+    if (sid && availability.terminal) {
+      hideSessionWindowAction(sid);
+      showControlToast('info', 'Session already ended — card closed');
+      return;
+    }
     if (availability.toast) showControlToast('error', availability.toast);
     return;
   }
