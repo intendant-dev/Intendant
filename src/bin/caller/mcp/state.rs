@@ -140,6 +140,10 @@ pub struct McpAppState {
     /// bootstrap ceremony failed — memory surfaces then answer
     /// "unavailable" instead of failing the daemon.
     pub memory: Option<std::sync::Arc<crate::memory::MemoryHandle>>,
+    /// The daemon-handover runtime (Track HS): this boot's identity and
+    /// scheduler-lease view, for the `scheduler_lease` status block.
+    /// `None` outside the gateway/daemon shapes.
+    pub handover: Option<std::sync::Arc<crate::handover::HandoverRuntime>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -327,6 +331,7 @@ impl McpAppState {
             peer_registry: None,
             agenda: None,
             memory: None,
+            handover: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

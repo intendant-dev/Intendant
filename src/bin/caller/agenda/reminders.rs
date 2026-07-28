@@ -291,6 +291,30 @@ pub(crate) struct OccurrenceRecord {
     /// The spawned session, on `started` records (A5 scheduled sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// Scheduler-lease generation held by the writing daemon (Track HS
+    /// stamping). Absent on legacy rows and rows written without the
+    /// lease. Journal-side only — the agenda op-log vocabulary must NOT
+    /// grow this field (its op enum is `deny_unknown_fields` under a
+    /// skip-don't-brick fold; ruled in the HS intake, Q3 guardrail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation: Option<u64>,
+    /// The writing daemon's boot id (Track HS stamping): what boot-
+    /// recovery scoping (HS2) probes for liveness before declaring a
+    /// foreign `started` row unknown. Absent on legacy rows, which keep
+    /// today's recover-at-boot semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+}
+
+/// Writer identity stamped onto journal rows (Track HS): set once per
+/// scheduler boot and refreshed when the lease role changes (HS2's
+/// poll-acquire). Additive JSON — older builds' folds ignore the fields
+/// by serde default, and the raw occurrences page serves them verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalStamp {
+    pub(crate) boot_id: String,
+    /// The held lease generation; `None` while writing without the lease.
+    pub(crate) generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +377,13 @@ pub(crate) struct OccurrenceJournal {
     file: std::fs::File,
     state: BTreeMap<String, OccurrenceProgress>,
     folded_len: u64,
+    /// Max lease generation observed across every folded row — the Q1
+    /// reseed floor ([`journal_generation_floor`]): lease acquisition
+    /// never mints a generation at or below what rows already record,
+    /// even with the sidecar deleted or corrupt.
+    max_generation: u64,
+    /// Writer identity stamped onto appended rows, when set (Track HS).
+    stamp: Option<JournalStamp>,
 }
 
 impl OccurrenceJournal {
@@ -364,7 +395,7 @@ impl OccurrenceJournal {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let (state, mut folded_len) = fold_journal(&bytes);
+        let (state, mut folded_len, max_generation) = fold_journal(&bytes);
         let mut file = std::fs::File::options()
             .create(true)
             .append(true)
@@ -378,7 +409,23 @@ impl OccurrenceJournal {
             file,
             state,
             folded_len,
+            max_generation,
+            stamp: None,
         })
+    }
+
+    /// Install (or refresh) the writer stamp: appends fill their
+    /// `generation`/`boot_id` from it when the record carries none. Set
+    /// at scheduler boot; refreshed when the lease role changes (HS2).
+    pub(crate) fn set_stamp(&mut self, stamp: Option<JournalStamp>) {
+        self.stamp = stamp;
+    }
+
+    /// See [`journal_generation_floor`]; live view of the same floor
+    /// (test/diagnostic seam, like [`Self::unresolved`]).
+    #[cfg(test)]
+    pub(crate) fn max_generation(&self) -> u64 {
+        self.max_generation
     }
 
     pub(crate) fn progress(&self, occurrence_id: &str) -> OccurrenceProgress {
@@ -461,7 +508,24 @@ impl OccurrenceJournal {
     /// Append one record. `prepared` records are fsync'd to disk before
     /// returning; terminal records flush (an unflushed terminal record
     /// costs at worst one duplicate delivery, which at-least-once allows).
+    /// A set writer stamp fills `generation`/`boot_id` where the record
+    /// carries none — construction sites stay stamp-agnostic.
     pub(crate) fn append(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        let stamped;
+        let record = match &self.stamp {
+            Some(stamp) if record.generation.is_none() || record.boot_id.is_none() => {
+                let mut filled = record.clone();
+                if filled.boot_id.is_none() {
+                    filled.boot_id = Some(stamp.boot_id.clone());
+                }
+                if filled.generation.is_none() {
+                    filled.generation = stamp.generation;
+                }
+                stamped = filled;
+                &stamped
+            }
+            _ => record,
+        };
         let mut line = serde_json::to_string(record)
             .map_err(|err| std::io::Error::other(format!("encode occurrence: {err}")))?;
         line.push('\n');
@@ -472,6 +536,9 @@ impl OccurrenceJournal {
             self.file.sync_data()?;
         }
         self.folded_len += line.len() as u64;
+        if let Some(generation) = record.generation {
+            self.max_generation = self.max_generation.max(generation);
+        }
         fold_record_into(
             self.state.entry(record.occurrence_id.clone()).or_default(),
             record,
@@ -491,9 +558,10 @@ impl OccurrenceJournal {
             return Ok(());
         }
         let bytes = std::fs::read(&self.path)?;
-        let (state, folded_len) = fold_journal(&bytes);
+        let (state, folded_len, max_generation) = fold_journal(&bytes);
         self.state = state;
         self.folded_len = folded_len;
+        self.max_generation = max_generation;
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
             self.file.write_all(b"\n")?;
             self.folded_len += 1;
@@ -646,9 +714,10 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
     }
 }
 
-fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
+fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64) {
     let text = String::from_utf8_lossy(bytes);
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
+    let mut max_generation = 0u64;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -656,6 +725,9 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
         }
         match serde_json::from_str::<OccurrenceRecord>(line) {
             Ok(record) => {
+                if let Some(generation) = record.generation {
+                    max_generation = max_generation.max(generation);
+                }
                 fold_record_into(
                     state.entry(record.occurrence_id.clone()).or_default(),
                     &record,
@@ -667,7 +739,18 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
             }
         }
     }
-    (state, bytes.len() as u64)
+    (state, bytes.len() as u64, max_generation)
+}
+
+/// Max lease generation stamped on journal rows under `dir` — the Q1
+/// reseed floor for lease acquisition. Static tolerant read: a missing
+/// journal (or one with no stamped rows yet) floors at 0.
+pub(crate) fn journal_generation_floor(dir: &Path) -> u64 {
+    let bytes = match std::fs::read(dir.join(JOURNAL_FILE)) {
+        Ok(bytes) => bytes,
+        Err(_) => return 0,
+    };
+    fold_journal(&bytes).2
 }
 
 /// One deliverable occurrence, resolved against policy.
@@ -1454,6 +1537,8 @@ mod tests {
                 state: OccurrenceState::Prepared,
                 urgency: None,
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         journal
@@ -1466,6 +1551,8 @@ mod tests {
                 state: OccurrenceState::Delivered,
                 urgency: Some(ReminderUrgency::Attention),
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         let again = plan(
@@ -1505,6 +1592,8 @@ mod tests {
                         state: OccurrenceState::Prepared,
                         urgency: None,
                         session_id: None,
+                        generation: None,
+                        boot_id: None,
                     })
                     .unwrap();
                 if terminal {
@@ -1518,6 +1607,8 @@ mod tests {
                             state: OccurrenceState::Delivered,
                             urgency: None,
                             session_id: None,
+                            generation: None,
+                            boot_id: None,
                         })
                         .unwrap();
                 }
@@ -1536,6 +1627,92 @@ mod tests {
         );
         assert_eq!(replanned.deliver.len(), 1);
         assert_eq!(replanned.deliver[0].item_id, "torn-one");
+    }
+
+    /// Track HS additive-compat pin: a legacy row (no `generation`, no
+    /// `boot_id`) folds exactly as before stamping existed, and a record
+    /// written without a stamp serializes byte-identical to the legacy
+    /// shape — old and new builds share one journal without drift.
+    #[test]
+    fn journal_row_without_generation_folds_identically() {
+        let legacy_line = r#"{"v":1,"at_ms":1000,"occurrence_id":"occ-legacy","item_id":"a","due_ms":1000,"state":"started","session_id":"sess-1"}"#;
+        let (state, folded_len, max_generation) = fold_journal(legacy_line.as_bytes());
+        assert_eq!(folded_len, legacy_line.len() as u64);
+        assert_eq!(max_generation, 0, "legacy rows carry no generation");
+        let progress = state.get("occ-legacy").expect("row folded");
+        assert!(progress.prepared);
+        assert_eq!(progress.started.as_deref(), Some("sess-1"));
+        assert_eq!(progress.terminal, None);
+        assert_eq!(progress.item_id.as_deref(), Some("a"));
+
+        // Serialization round-trip without a stamp: no new keys appear.
+        let record: OccurrenceRecord = serde_json::from_str(legacy_line).unwrap();
+        assert_eq!(record.generation, None);
+        assert_eq!(record.boot_id, None);
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            legacy_line,
+            "stampless records stay byte-identical to the legacy shape"
+        );
+    }
+
+    /// Track HS stamping: a set writer stamp fills appended rows, an
+    /// explicit field is never overwritten, and the max generation
+    /// converges to co-homed readers through the refold — the Q1 reseed
+    /// floor both live and via [`journal_generation_floor`].
+    #[test]
+    fn append_fills_writer_stamp_and_tracks_generation_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path());
+        writer.set_stamp(Some(JournalStamp {
+            boot_id: "boot-a".to_string(),
+            generation: Some(4),
+        }));
+        let record = |occ: &str, state: OccurrenceState| OccurrenceRecord {
+            v: 1,
+            at_ms: 1_000,
+            occurrence_id: occ.to_string(),
+            item_id: "a".to_string(),
+            due_ms: 1_000,
+            state,
+            urgency: None,
+            session_id: None,
+            generation: None,
+            boot_id: None,
+        };
+        writer
+            .append(&record("occ-1", OccurrenceState::Prepared))
+            .unwrap();
+        writer
+            .append(&OccurrenceRecord {
+                generation: Some(9),
+                boot_id: Some("boot-x".to_string()),
+                ..record("occ-2", OccurrenceState::Prepared)
+            })
+            .unwrap();
+        assert_eq!(writer.max_generation(), 9);
+
+        let raw = std::fs::read_to_string(dir.path().join(JOURNAL_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["boot_id"], "boot-a", "stamp fills empty fields");
+        assert_eq!(lines[0]["generation"], 4);
+        assert_eq!(lines[1]["boot_id"], "boot-x", "explicit fields survive");
+        assert_eq!(lines[1]["generation"], 9);
+
+        // A co-homed reader converges on the same floor via refold, and
+        // the static read (lease acquisition's input) agrees.
+        let mut reader = journal(dir.path());
+        reader.refresh_if_stale().unwrap();
+        assert_eq!(reader.max_generation(), 9);
+        assert_eq!(journal_generation_floor(dir.path()), 9);
+        assert_eq!(
+            journal_generation_floor(&dir.path().join("missing")),
+            0,
+            "no journal floors at zero"
+        );
     }
 
     #[test]
@@ -1665,6 +1842,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -1790,6 +1969,8 @@ mod tests {
                     state: s,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2030,6 +2211,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: Some("sess-live".into()),
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2077,6 +2260,8 @@ mod tests {
                 state: OccurrenceState::Completed,
                 urgency: None,
                 session_id: Some("sess-live".into()),
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         let released = plan(
@@ -2257,6 +2442,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2589,6 +2776,8 @@ mod tests {
                 state: OccurrenceState::Delivered,
                 urgency: None,
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         assert_eq!(
@@ -2681,6 +2870,8 @@ mod tests {
                     state,
                     urgency,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2699,6 +2890,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: session,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2845,6 +3038,8 @@ mod tests {
                             urgency: Some(ReminderUrgency::Info),
                             // Padding so a torn line would be visible.
                             session_id: Some("x".repeat(200)),
+                            generation: None,
+                            boot_id: None,
                         })
                         .unwrap();
                 }
@@ -3304,6 +3499,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: Some("sess-fired".into()),
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }

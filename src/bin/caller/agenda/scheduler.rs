@@ -10,8 +10,8 @@
 
 use super::handle::AgendaHandle;
 use super::reminders::{
-    plan, DueOccurrence, OccurrenceJournal, OccurrenceRecord, OccurrenceState, ReminderUrgency,
-    SpawnOccurrence,
+    plan, DueOccurrence, JournalStamp, OccurrenceJournal, OccurrenceRecord, OccurrenceState,
+    ReminderUrgency, SpawnOccurrence,
 };
 use super::store::OccurrenceWriteBack;
 use super::types::{AgendaActor, AgendaCommand};
@@ -229,7 +229,10 @@ impl SchedulerState {
     }
 }
 
-pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_reminder_scheduler(
+    handle: Arc<AgendaHandle>,
+    handover: Option<Arc<crate::handover::HandoverRuntime>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut journal = match OccurrenceJournal::open(handle.dir()) {
             Ok(journal) => journal,
@@ -241,6 +244,15 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
                 return;
             }
         };
+        // Track HS: rows this daemon writes carry its boot id, and — when
+        // it holds the scheduler lease — the held generation. HS1 stamps
+        // only; HS2 gates the firing pass on the same runtime.
+        if let Some(handover) = &handover {
+            journal.set_stamp(Some(JournalStamp {
+                boot_id: handover.boot_id().to_string(),
+                generation: handover.held_generation(),
+            }));
+        }
         let mut state = SchedulerState::default();
         let mut events = handle.bus().subscribe();
         resolve_lost_sessions(&handle, &mut journal);
@@ -301,6 +313,8 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             state: OccurrenceState::Unknown,
             urgency: None,
             session_id: session_id.clone(),
+            generation: None,
+            boot_id: None,
         });
         // The journal row carries no effect_id, so find the owning effect by
         // its last_run lineage and make the item's state honest too.
@@ -353,6 +367,8 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             state: OccurrenceState::Unknown,
             urgency: None,
             session_id: None,
+            generation: None,
+            boot_id: None,
         });
         if let Some(item) = item_id
             .as_deref()
@@ -1150,6 +1166,8 @@ fn session_record(
         state,
         urgency: None,
         session_id,
+        generation: None,
+        boot_id: None,
     });
     if let Err(err) = &result {
         eprintln!(
@@ -1292,6 +1310,8 @@ fn record(
         state,
         urgency,
         session_id: None,
+        generation: None,
+        boot_id: None,
     });
     if let Err(err) = &result {
         eprintln!(

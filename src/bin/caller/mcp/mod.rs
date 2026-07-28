@@ -1575,6 +1575,12 @@ impl IntendantServer {
                 "daemon_version".to_string(),
                 serde_json::Value::String(crate::build_info::version_line("intendant")),
             );
+            // The scheduler-lease view (Track HS): this daemon's boot id
+            // and lease role, plus the on-disk sidecar naming whoever
+            // holds — how `ctl status`/the dashboard see a handover.
+            if let Some(handover) = &s.handover {
+                obj.insert("scheduler_lease".to_string(), handover.status_json());
+            }
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
