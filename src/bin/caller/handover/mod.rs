@@ -36,15 +36,18 @@ use std::path::{Path, PathBuf};
 pub(crate) struct HandoverRuntime {
     state_root: PathBuf,
     boot_id: String,
+    port: u16,
     /// The held lease. `None` = secondary (another daemon holds it) or
     /// lease infrastructure failure (`lease_error` says which). Std
-    /// mutex — never held across an await; HS2's poll-acquire and HS3's
-    /// drain release mutate the slot.
+    /// mutex — never held across an await; the poll-acquire lane and
+    /// HS3's drain release mutate the slot.
     lease: std::sync::Mutex<Option<SchedulerLease>>,
-    /// A real I/O or lock-infrastructure failure at the boot attempt
-    /// ("held elsewhere" is NOT an error). Status surfaces carry it so a
-    /// lockless filesystem degrades loudly, not silently.
-    lease_error: Option<String>,
+    /// The most recent real I/O or lock-infrastructure failure ("held
+    /// elsewhere" is NOT an error) — from the boot attempt or a later
+    /// poll. Status surfaces carry it so a lockless filesystem degrades
+    /// loudly, not silently; poll failures log only on message change so
+    /// a broken filesystem cannot spam one line per poll.
+    lease_error: std::sync::Mutex<Option<String>>,
     _presence: Option<DaemonPresence>,
     presence_error: Option<String>,
 }
@@ -99,8 +102,9 @@ impl HandoverRuntime {
         HandoverRuntime {
             state_root: state_root.to_path_buf(),
             boot_id,
+            port,
             lease: std::sync::Mutex::new(held),
-            lease_error,
+            lease_error: std::sync::Mutex::new(lease_error),
             _presence: presence,
             presence_error,
         }
@@ -110,12 +114,74 @@ impl HandoverRuntime {
         &self.boot_id
     }
 
+    pub(crate) fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    /// Does this daemon hold the active-scheduler lease right now?
+    /// Standing automations (the scheduler firing pass, reminder
+    /// delivery, the PR scanner) run iff this is true.
+    pub(crate) fn is_holder(&self) -> bool {
+        self.held_generation().is_some()
+    }
+
     /// The held lease's generation; `None` while running as secondary.
     pub(crate) fn held_generation(&self) -> Option<u64> {
         self.lease
             .lock()
             .ok()
             .and_then(|slot| slot.as_ref().map(SchedulerLease::generation))
+    }
+
+    /// Secondary lane: one non-blocking attempt on the (possibly freed)
+    /// lease. `true` = acquired on THIS call — the caller refreshes its
+    /// journal stamp and turns standing automations on. Already-holding
+    /// and still-held-elsewhere both return `false` without noise; real
+    /// lock-infrastructure errors record on the status surface and log
+    /// once per distinct message.
+    pub(crate) fn poll_acquire(&self, journal_generation_floor: u64) -> bool {
+        {
+            let Ok(slot) = self.lease.lock() else {
+                return false;
+            };
+            if slot.is_some() {
+                return false;
+            }
+        }
+        // The attempt runs without the slot lock held (file I/O); the
+        // scheduler is the only poll caller, so the slot cannot race.
+        match SchedulerLease::try_acquire(
+            &self.state_root,
+            &self.boot_id,
+            self.port,
+            journal_generation_floor,
+        ) {
+            Ok(LeaseAttempt::Held(lease)) => {
+                println!(
+                    "[handover] scheduler lease acquired (generation {}) — \
+                     standing automations on",
+                    lease.generation()
+                );
+                if let Ok(mut slot) = self.lease.lock() {
+                    *slot = Some(lease);
+                }
+                if let Ok(mut last) = self.lease_error.lock() {
+                    *last = None;
+                }
+                true
+            }
+            Ok(LeaseAttempt::HeldElsewhere(_)) => false,
+            Err(err) => {
+                let message = err.to_string();
+                if let Ok(mut last) = self.lease_error.lock() {
+                    if last.as_deref() != Some(message.as_str()) {
+                        eprintln!("[handover] scheduler lease poll failed: {message}");
+                        *last = Some(message);
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// The `scheduler_lease` status block (`ctl status` / dashboard):
@@ -160,14 +226,34 @@ impl HandoverRuntime {
         if let Some(acquired_at_ms) = acquired_at_ms {
             obj.insert("acquired_at_ms".into(), acquired_at_ms.into());
         }
-        if let Some(err) = &self.lease_error {
-            obj.insert("error".into(), err.clone().into());
+        if let Ok(last) = self.lease_error.lock() {
+            if let Some(err) = last.as_ref() {
+                obj.insert("error".into(), err.clone().into());
+            }
         }
         if let Some(err) = &self.presence_error {
             obj.insert("presence_error".into(), err.clone().into());
         }
         block
     }
+}
+
+/// Secondary poll cadence for a freed lease (crash convergence: when the
+/// holder dies, the longest-standing daemon population converges on a new
+/// holder within one interval, no owner action). The scheduler bounds its
+/// idle sleep with this. `INTENDANT_LEASE_POLL_MS` overrides for rigs —
+/// a two-daemon e2e cannot wait a minute per takeover; read once at
+/// first use (a process-edge config read, like the memory kill switch).
+pub(crate) fn lease_poll_interval() -> std::time::Duration {
+    static INTERVAL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("INTENDANT_LEASE_POLL_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(60))
+    })
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -230,6 +316,28 @@ mod tests {
         // Both boots are live presences (the dual-run topology, visible).
         assert!(boot_id_is_live(dir.path(), holder.boot_id()));
         assert!(boot_id_is_live(dir.path(), secondary.boot_id()));
+    }
+
+    #[test]
+    fn poll_acquire_takes_a_freed_lease_and_noops_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = HandoverRuntime::initialize(dir.path(), 8765, 0);
+        let secondary = HandoverRuntime::initialize(dir.path(), 8766, 0);
+        assert!(!secondary.poll_acquire(0), "held elsewhere: no acquisition");
+        assert!(!holder.poll_acquire(0), "already holding: no-op");
+        assert!(holder.is_holder());
+        assert!(!secondary.is_holder());
+
+        // Holder dies (drop = crash semantics): one poll converges.
+        drop(holder);
+        assert!(secondary.poll_acquire(5));
+        assert!(secondary.is_holder());
+        assert_eq!(
+            secondary.held_generation(),
+            Some(6),
+            "the journal floor rule applies on the poll lane too"
+        );
+        assert!(!secondary.poll_acquire(0), "already holding after the poll");
     }
 
     #[test]

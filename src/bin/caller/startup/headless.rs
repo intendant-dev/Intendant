@@ -500,6 +500,10 @@ pub(crate) async fn run_headless_mode(
     if let Some(registry) = vitals_git_targets.as_ref() {
         session_vitals::publish_git_vitals_targets(registry);
     }
+    // Mirrors daemon boot: ceremony outcomes reach the vitals hub's
+    // credential-era fold here too (the dashboard-on headless shape
+    // serves the same Vault sign-in routes).
+    crate::auth_ceremony::publish_ceremony_bus(bus.clone());
     // Restored sessions, mirroring daemon boot: with the dashboard on,
     // the store's idle session windows keep their git/health chips here
     // too, and their vitals hydrate from disk (this shape falls through

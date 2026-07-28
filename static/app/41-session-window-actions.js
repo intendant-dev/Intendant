@@ -681,6 +681,13 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.phase) {
     applySessionWindowPhase(win, sid, meta.phase);
   }
+  // Grid envelope: the served ghost bit (pre-boot AND no live wrapper)
+  // marks the whole window — the unmistakable safe-to-close treatment.
+  // Missing block ≠ cleared: only a present block moves the class.
+  const bootEra = (sessionMetadataById.get(sid) || {}).boot;
+  if (bootEra !== undefined) {
+    win.el.classList.toggle('session-window-ghost', !!(bootEra && bootEra.ghost));
+  }
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
@@ -1361,6 +1368,23 @@ function sessionWindowRecordFromLogCommand(c) {
   };
 }
 
+// The daemon's own scoped warn rows (source "Intendant" — e.g. the
+// "Session already ended — nothing to stop." ack) are the daemon talking
+// ABOUT the session, not evidence its backend is alive: they must never
+// clear a detached card back to attached, or the ack itself re-arms the
+// very Stop affordance it just refuted. Only backend activity re-attaches.
+function logRowEvidencesBackendActivity(level, source) {
+  return !(String(level || '').toLowerCase() === 'warn'
+    && String(source || '').trim().toLowerCase() === 'intendant');
+}
+
+function logEntryEvidencesBackendActivity(entry) {
+  return logRowEvidencesBackendActivity(
+    entry?.dataset?.level,
+    entry?.classList?.contains('source-intendant') ? 'intendant' : '',
+  );
+}
+
 function appendSessionWindowRecord(record, batch = null) {
   const sid = String(record?.session_id || record?.sessionId || '').trim();
   if (!sid) return;
@@ -1368,7 +1392,8 @@ function appendSessionWindowRecord(record, batch = null) {
   if (!targetSid) return;
   const win = sessionWindows.get(targetSid) || (processingLogReplay ? null : ensureSessionWindow(targetSid));
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logRowEvidencesBackendActivity(record?.level, record?.source)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const normalized = { ...record, session_id: targetSid };
@@ -1396,7 +1421,8 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (!targetSid) return;
   const win = ensureSessionWindow(targetSid);
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logEntryEvidencesBackendActivity(entry)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const empty = win.log.querySelector('.session-window-empty');

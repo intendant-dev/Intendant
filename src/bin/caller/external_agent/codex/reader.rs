@@ -1216,6 +1216,9 @@ pub(crate) fn codex_rate_limit_windows(
                 .and_then(|v| v.as_u64()),
             status: None,
             observed_at_epoch: Some(now_epoch),
+            // The wire carries no account identity; the vitals hub stamps
+            // the reporting session's credential era at the fold.
+            account: None,
         });
     }
     windows
@@ -6162,6 +6165,7 @@ error: build failed
                 resets_at_epoch: Some(2000),
                 status: None,
                 observed_at_epoch: None,
+                account: None,
             },
             crate::types::SessionLimitWindow {
                 label: "7d".into(),
@@ -6169,6 +6173,7 @@ error: build failed
                 resets_at_epoch: Some(9000),
                 status: None,
                 observed_at_epoch: None,
+                account: None,
             },
         ];
         let none = serde_json::Value::Null;

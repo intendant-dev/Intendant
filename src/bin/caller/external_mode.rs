@@ -211,6 +211,30 @@ async fn apply_backend_credentials_reload(
     }
 }
 
+/// The follow-up text synthesized when a credential reload's own
+/// interrupt cut a live turn. Resume-attach keeps the conversation
+/// context, so a nudge — never a re-send of the original prompt, which
+/// would double-execute — is the safe shape (the same self-continuation
+/// pattern as the managed-context density interrupt).
+pub(crate) const RELOAD_MIDTURN_CONTINUATION_TEXT: &str =
+    "A credential reload interrupted the previous turn mid-stream — continue where you left off.";
+
+/// Synthesized continuation after a credential-reload respawn:
+/// `Some(..)` only when the reload's own interrupt cut a live turn (the
+/// turn drain returned `Interrupted` with
+/// [`RELOAD_CREDENTIALS_INTERRUPT_REASON`]). The interrupted turn's
+/// driving message was already consumed mid-delivery, so nothing else
+/// re-drives the work after the respawn — the session would idle on the
+/// fresh account with the task half-done. Idle and between-turn reloads
+/// pass `false` (idle in, idle out), as does a turn that completed
+/// normally despite the request, or one whose interrupt belonged to the
+/// user (their stop wins). The message carries no steer/follow-up id, so
+/// id-keyed cancel matching can never drop it.
+fn synthesized_reload_continuation(reload_interrupted_turn: bool) -> Option<FollowUpMessage> {
+    reload_interrupted_turn
+        .then(|| FollowUpMessage::text(RELOAD_MIDTURN_CONTINUATION_TEXT.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_external_agent_mode(
     backend: external_agent::AgentBackend,
@@ -566,6 +590,12 @@ pub(crate) async fn run_external_agent_mode(
     // the in-place respawn at the next safe point. Idle requests apply
     // immediately in the idle listener below.
     let backend_credentials_reload = std::sync::atomic::AtomicBool::new(false);
+    // Companion marker: the reload's own interrupt cut a live primary
+    // turn (the turn drain returned `Interrupted` with the reload
+    // reason), so the safe-point respawn must front-queue a synthesized
+    // continuation to re-drive the dropped work. Never set on the idle
+    // lane — idle in, idle out.
+    let mut reload_interrupted_turn = false;
     let mut drain_config = DrainConfig {
         bus: &bus,
         web_port,
@@ -618,8 +648,8 @@ pub(crate) async fn run_external_agent_mode(
         // the loop's safe point: the drain has already interrupted the
         // backend and returned; the respawn precedes any queued turn so
         // the next delivery runs on the fresh credential store.
-        if backend_credentials_reload.swap(false, std::sync::atomic::Ordering::SeqCst)
-            && !apply_backend_credentials_reload(
+        if backend_credentials_reload.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if !apply_backend_credentials_reload(
                 &backend,
                 &project,
                 web_port,
@@ -634,10 +664,32 @@ pub(crate) async fn run_external_agent_mode(
                 &mut drain_config,
             )
             .await
-        {
-            stats.terminal_outcome =
-                Some("credential reload could not respawn the backend".to_string());
-            break 'outer;
+            {
+                stats.terminal_outcome =
+                    Some("credential reload could not respawn the backend".to_string());
+                break 'outer;
+            }
+            // When the reload's own interrupt cut the live turn, the
+            // turn's driving message was consumed mid-delivery — nothing
+            // re-drives it after the respawn, so the session would idle
+            // on the fresh account with the work half-done. Mirror the
+            // rate-limit park's pending preservation: front-queue a
+            // synthesized continuation so the flush below re-drives the
+            // interrupted work ahead of anything queued behind it.
+            if let Some(continuation) =
+                synthesized_reload_continuation(std::mem::take(&mut reload_interrupted_turn))
+            {
+                parked_follow_ups.push_front(continuation);
+                let line = "Credential reload interrupted the previous turn — queued a continuation so the work resumes on the fresh account";
+                slog(&session_log, |l| l.info(line));
+                bus.send(AppEvent::LogEntry {
+                    session_id: drain_config.session_id.clone(),
+                    level: "info".to_string(),
+                    source: "Intendant".to_string(),
+                    content: line.to_string(),
+                    turn: None,
+                });
+            }
         }
         let followup = match next_turn.take() {
             Some(turn) => turn,
@@ -3678,8 +3730,14 @@ pub(crate) async fn run_external_agent_mode(
                 // so the supervisor must continue the loop itself with the
                 // density maintenance handoff (managed.md: density gating
                 // inserts a maintenance handoff) or a recovery kickstart if
-                // pressure escalated past the rewind-only threshold.
+                // pressure escalated past the rewind-only threshold. A
+                // credential-reload interrupt arms the safe-point respawn's
+                // synthesized continuation instead — the reload wants the
+                // interrupted work to continue on the fresh account.
                 stats.rounds = round;
+                if reason == RELOAD_CREDENTIALS_INTERRUPT_REASON {
+                    reload_interrupted_turn = true;
+                }
                 slog(&session_log, |l| {
                     l.info(&format!("External agent interrupted: {}", reason))
                 });
@@ -3988,5 +4046,154 @@ mod tests {
             idle_external_cwd_event(&None, &session_id, &alias_session_id, "  ".to_string(),)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn midturn_reload_pushes_continuation() {
+        // The drain interrupted a live turn with the reload's own reason:
+        // the safe-point respawn synthesizes a continuation and fronts
+        // the queue with it, ahead of everything queued behind the
+        // dropped turn.
+        let continuation = synthesized_reload_continuation(true)
+            .expect("a reload that cut a live turn synthesizes a continuation");
+        assert_eq!(continuation.text, RELOAD_MIDTURN_CONTINUATION_TEXT);
+        assert!(continuation.follow_up_id.is_none());
+        assert!(continuation.steer_id.is_none());
+
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(FollowUpMessage::text("queued while running".to_string()));
+        parked_follow_ups.push_front(continuation);
+        assert_eq!(parked_follow_ups.len(), 2);
+        assert_eq!(
+            parked_follow_ups.front().map(|m| m.text.as_str()),
+            Some(RELOAD_MIDTURN_CONTINUATION_TEXT)
+        );
+
+        // The discriminator is the exact reason the drain mints when the
+        // reload itself cut the turn (external_events.rs) — the string
+        // live-log greps key on.
+        assert_eq!(RELOAD_CREDENTIALS_INTERRUPT_REASON, "reloading credentials");
+    }
+
+    #[test]
+    fn reload_mirrors_park_pending_preservation() {
+        // Both reload lanes preserve interrupted work the same way: the
+        // rate-limit park's pending re-send and the mid-turn interrupt's
+        // synthesized continuation each ride the FRONT of
+        // `parked_follow_ups` and deliver through the same flush, ahead
+        // of messages queued behind them.
+        let mut cancelled = HashSet::new();
+
+        // Park lane: `apply_backend_credentials_reload` push_fronts
+        // `park.pending` when cancelling the park.
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(FollowUpMessage::text("queued during park".to_string()));
+        let pending = FollowUpMessage::text("pending re-send".to_string())
+            .with_follow_up_id(Some("f-pending".to_string()));
+        parked_follow_ups.push_front(pending);
+        let (first, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(first.map(|m| m.text), Some("pending re-send".to_string()));
+
+        // Mid-turn reload lane: the synthesized continuation takes the
+        // same front-of-queue slot through the same flush.
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(FollowUpMessage::text("queued mid-turn".to_string()));
+        parked_follow_ups.push_front(
+            synthesized_reload_continuation(true).expect("mid-turn interrupt continuation"),
+        );
+        let (first, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            first.map(|m| m.text),
+            Some(RELOAD_MIDTURN_CONTINUATION_TEXT.to_string())
+        );
+        assert_eq!(
+            parked_follow_ups.front().map(|m| m.text.as_str()),
+            Some("queued mid-turn")
+        );
+    }
+
+    #[test]
+    fn idle_sessions_get_no_synthesized_message() {
+        // Idle and between-turn reloads never arm the marker (the idle
+        // listener applies the respawn directly; no drain returned
+        // `Interrupted` with the reload reason): idle in, idle out.
+        assert!(synthesized_reload_continuation(false).is_none());
+
+        // Adjacent interrupt reasons must not collide with the
+        // discriminator: a user's stop keeps stop semantics even when a
+        // reload rides the same drain, and the density gate keeps its
+        // own self-continuation lane.
+        for reason in [
+            "user requested",
+            "user requested (backend reported no turn end)",
+            MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON,
+        ] {
+            assert_ne!(reason, RELOAD_CREDENTIALS_INTERRUPT_REASON);
+        }
+    }
+
+    #[test]
+    fn continuation_rides_existing_flush() {
+        // The continuation is delivered by the loop's existing
+        // post-respawn flush (`next_parked_follow_up`), first out, and —
+        // carrying no steer/follow-up id — it can never be dropped by
+        // id-keyed cancel matching, even with unrelated cancels pending.
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(
+            FollowUpMessage::text("user message".to_string())
+                .with_follow_up_id(Some("f-2".to_string())),
+        );
+        parked_follow_ups.push_front(
+            synthesized_reload_continuation(true).expect("mid-turn interrupt continuation"),
+        );
+
+        let mut cancelled: HashSet<String> = HashSet::from(["f-9".to_string()]);
+        assert!(!follow_up_message_was_cancelled(
+            &mut cancelled,
+            parked_follow_ups
+                .front()
+                .expect("front is the continuation"),
+        ));
+
+        let (first, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            first.map(|m| m.text),
+            Some(RELOAD_MIDTURN_CONTINUATION_TEXT.to_string())
+        );
+
+        let (second, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(second.map(|m| m.text), Some("user message".to_string()));
+        assert!(parked_follow_ups.is_empty());
+
+        // A cancel that names the queued user message still lands while
+        // the continuation flushes first: rebuild the queue and cancel
+        // "f-2" — the flush skips it and delivers the continuation.
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(
+            FollowUpMessage::text("user message".to_string())
+                .with_follow_up_id(Some("f-2".to_string())),
+        );
+        parked_follow_ups.push_front(
+            synthesized_reload_continuation(true).expect("mid-turn interrupt continuation"),
+        );
+        let mut cancelled: HashSet<String> = HashSet::from(["f-2".to_string()]);
+        let (first, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            first.map(|m| m.text),
+            Some(RELOAD_MIDTURN_CONTINUATION_TEXT.to_string())
+        );
+        let (second, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 1);
+        assert!(second.is_none());
     }
 }

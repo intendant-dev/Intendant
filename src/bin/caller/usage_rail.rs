@@ -281,6 +281,7 @@ mod tests {
             resets_at_epoch: None,
             status: None,
             observed_at_epoch: None,
+            account: None,
         }];
         let second = rail
             .on_event(&response(Some("s1"), with_limits))

@@ -243,6 +243,29 @@ pub(crate) fn manager() -> &'static CeremonyManager {
     MANAGER.get_or_init(CeremonyManager::default)
 }
 
+/// Daemon event bus for ceremony outcome announcements
+/// ([`AppEvent::BackendCredentialAccount`] on success — the vitals hub's
+/// credential-era boundary). Published by the startup sites that own a
+/// daemon-wide bus, mirroring `session_vitals::publish_git_vitals_targets`
+/// — never from tests, whose manager interactions must stay silent.
+static CEREMONY_BUS: OnceLock<crate::event::EventBus> = OnceLock::new();
+
+pub(crate) fn publish_ceremony_bus(bus: crate::event::EventBus) {
+    let _ = CEREMONY_BUS.set(bus);
+}
+
+/// Announce a completed sign-in: the backend's credential store now holds
+/// `account`'s credentials (`None` when the provider probe stated no
+/// label). No-op until a bus is published.
+fn announce_ceremony_success(provider: Provider, account: Option<&CeremonyAccount>) {
+    if let Some(bus) = CEREMONY_BUS.get() {
+        bus.send(crate::event::AppEvent::BackendCredentialAccount {
+            source: provider.agent_backend().as_short_str().to_string(),
+            account: account.and_then(|account| account.email.clone()),
+        });
+    }
+}
+
 fn now_unix_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
@@ -395,6 +418,7 @@ impl CeremonyManager {
         state.phase = CeremonyPhase::Success;
         state.account = Some(probe.account);
         state.finished_at_unix_ms = Some(now_unix_ms());
+        announce_ceremony_success(state.provider, state.account.as_ref());
         if let Some(runtime) = inner.runtime.as_mut() {
             runtime.transport.kill();
         }
@@ -511,6 +535,7 @@ impl CeremonyManager {
                     Some(probe) if probe.logged_in => {
                         state.phase = CeremonyPhase::Success;
                         state.account = Some(probe.account);
+                        announce_ceremony_success(state.provider, state.account.as_ref());
                     }
                     Some(_) => {
                         state.phase = CeremonyPhase::Failed;
@@ -523,6 +548,7 @@ impl CeremonyManager {
                         // parse: trust the exit code, report the gap.
                         state.phase = CeremonyPhase::Success;
                         state.account = None;
+                        announce_ceremony_success(state.provider, None);
                     }
                 }
             } else {

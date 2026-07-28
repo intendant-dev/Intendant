@@ -600,6 +600,7 @@ impl AppEventUpcaster {
             | AppEvent::FollowUpCancelRequested { .. }
             | AppEvent::SessionStopRequested { .. }
             | AppEvent::ReloadBackendCredentials { .. }
+            | AppEvent::BackendCredentialAccount { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }

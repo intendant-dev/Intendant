@@ -126,6 +126,9 @@ fn anthropic_rate_limit_windows_from_headers(
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             ),
+            // The wire carries no account identity; the vitals hub stamps
+            // the reporting session's credential era at the fold.
+            account: None,
         });
     }
     windows
