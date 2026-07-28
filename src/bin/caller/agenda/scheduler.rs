@@ -246,12 +246,15 @@ pub(crate) fn spawn_reminder_scheduler(
         };
         // Track HS: rows this daemon writes carry its boot id, and — when
         // it holds the scheduler lease — the held generation. HS1 stamps
-        // only; HS2 gates the firing pass on the same runtime.
+        // only; HS2 gates the firing pass on the same runtime; HS3 makes
+        // drain entry this task's between-passes duty (a firing pass can
+        // never straddle the flock release).
         if let Some(handover) = &handover {
             journal.set_stamp(Some(JournalStamp {
                 boot_id: handover.boot_id().to_string(),
                 generation: handover.held_generation(),
             }));
+            handover.attach_scheduler();
         }
         let mut state = SchedulerState::default();
         let mut events = handle.bus().subscribe();
@@ -280,6 +283,15 @@ pub(crate) fn spawn_reminder_scheduler(
             tokio::select! {
                 _ = handle.reminder_nudged() => {}
                 _ = tokio::time::sleep(sleep_for) => {}
+                // Drain/takeover wake (Track HS3): entry must not wait
+                // out a sleep — the requester's flock acquire is gated on
+                // it. Pends forever without a runtime.
+                _ = async {
+                    match &handover {
+                        Some(runtime) => runtime.drain_wake().await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 event = events.recv() => match event {
                     Ok(event) => observe_event(&handle, &mut journal, &mut state, &event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -568,6 +580,42 @@ async fn run_pass(
     // planners never both reach `plan`). `None` = no gateway runtime
     // (direct test drives, legacy shapes): ungated, today's semantics.
     if let Some(runtime) = handover {
+        // Track HS3: drain outranks everything — a draining daemon never
+        // plans, fires, or reclaims. Entry (sidecar → release) runs HERE,
+        // between passes, so a firing pass can never straddle it; after
+        // entry the lane becomes the Q4 successor watch. The observe/
+        // sweep arms outside this pass keep journaling the drainer's own
+        // in-flight write-backs — draining protects in-flight work.
+        if runtime.is_draining() {
+            if runtime.take_drain_entry_duty() {
+                runtime.perform_drain_entry();
+                // Owner-visible, and it lands on the supervisor's
+                // observation lane — which re-evaluates the drain exit
+                // condition, covering the zero-sessions-at-entry case.
+                handle.bus().send(AppEvent::UserNotification {
+                    session_id: None,
+                    id: "handover-draining".to_string(),
+                    title: Some("Daemon draining".to_string()),
+                    text: "standing automations handed off; in-flight sessions \
+                           finish here, then this daemon exits"
+                        .to_string(),
+                    urgency: crate::types::NotificationUrgency::Attention,
+                    ts: now_ms(),
+                });
+            }
+            if let Some(alert) = runtime.drain_watch() {
+                eprintln!("[handover] {alert}");
+                handle.bus().send(AppEvent::UserNotification {
+                    session_id: None,
+                    id: "handover-successor-gone".to_string(),
+                    title: Some("Handover successor gone".to_string()),
+                    text: alert,
+                    urgency: crate::types::NotificationUrgency::Urgent,
+                    ts: now_ms(),
+                });
+            }
+            return Some(now_ms() + crate::handover::lease_poll_interval().as_millis() as u64);
+        }
         if runtime.is_holder() {
             // Steady state: the recurring Q3 re-check — a co-homed
             // writer that died since its rows were spared resolves now,
@@ -4486,5 +4534,68 @@ mod tests {
             Some(OccurrenceState::Unknown),
             "resolved by the recurring re-check once the boot lock freed"
         );
+    }
+
+    /// Track HS3: with a scheduler attached, drain entry is performed by
+    /// the PASS (between planning cycles) — request marks the state, the
+    /// next pass flips the sidecar, releases the flock, and plans
+    /// NOTHING, even with overdue work sitting due. The one-way rule
+    /// holds: later passes never reclaim the freed lease.
+    #[tokio::test]
+    async fn draining_pass_enters_and_plans_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        runtime.attach_scheduler();
+        let (handle, _) = handle_with_item(dir.path(), 1_000); // overdue
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut rx = handle.bus().subscribe();
+
+        assert_eq!(
+            runtime.request_drain(Some("test".into())),
+            crate::handover::DrainRequest::Entered
+        );
+        assert!(
+            runtime.is_holder(),
+            "with a scheduler attached the flock holds until ITS next pass"
+        );
+        let wake = run_pass(
+            &handle,
+            &mut journal,
+            &mut SchedulerState::default(),
+            Some(&runtime),
+        )
+        .await;
+        assert!(!runtime.is_holder(), "the pass performed the entry");
+        assert_eq!(
+            crate::handover::read_lease_sidecar(home.path())
+                .expect("sidecar")
+                .state,
+            "draining"
+        );
+        assert!(
+            journal.unresolved().is_empty(),
+            "a draining pass never plans the overdue item"
+        );
+        let mut drain_notice = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::UserNotification { id, .. } = &event {
+                assert_eq!(id, "handover-draining", "only the drain notice fires");
+                drain_notice = true;
+            }
+        }
+        assert!(drain_notice, "drain entry is owner-visible");
+
+        // One-way: with the lease free again, the draining pass never
+        // reclaims — it keeps the watch cadence instead.
+        let wake_two = run_pass(
+            &handle,
+            &mut journal,
+            &mut SchedulerState::default(),
+            Some(&runtime),
+        )
+        .await;
+        assert!(!runtime.is_holder());
+        assert!(wake.is_some() && wake_two.is_some(), "watch cadence wakes");
     }
 }

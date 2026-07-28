@@ -405,6 +405,7 @@ pub(crate) async fn run_headless_mode(
     // live updates), but context_injection is still wired through.
     let mut headless_peer_registry: Option<peer::PeerRegistry> = None;
     let mut headless_agenda: Option<Arc<crate::agenda::AgendaHandle>> = None;
+    let mut headless_handover: Option<Arc<crate::handover::HandoverRuntime>> = None;
     let headless_shared_session: Option<web_gateway::SharedActiveSession> = if use_web {
         let (transcriber, transcriber_err) =
             startup::wiring::build_transcriber(&project.config.transcription);
@@ -446,6 +447,7 @@ pub(crate) async fn run_headless_mode(
         eprintln!("{}", gateway.log_line);
         headless_peer_registry = Some(gateway.peer_registry.clone());
         headless_agenda = gateway.agenda.clone();
+        headless_handover = Some(gateway.handover.clone());
         Some(gateway.shared_session)
     } else {
         None
@@ -551,6 +553,7 @@ pub(crate) async fn run_headless_mode(
                 launch_gate_for_tests: None,
                 claude_rewind_capability_for_tests: None,
                 agenda: headless_agenda.clone(),
+                handover: headless_handover.clone(),
             },
         );
         // Publish for read-side lanes (the sign-in ceremony status

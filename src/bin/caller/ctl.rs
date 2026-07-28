@@ -67,6 +67,36 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
                 call_tool(&client, &config, "get_status", Value::Object(Map::new())).await?;
             print_tool_response(response, &config, None)?;
         }
+        "takeover" => {
+            // Track HS3: ask the TARGET daemon to drain so a successor can
+            // acquire the scheduler lease. Local-daemon act (same-user
+            // loopback trust class) — peers cannot drain your daemon.
+            ensure_help(&command[1..], help_takeover)?;
+            if config.peer.is_some() {
+                return Err(
+                    "takeover targets the local daemon — it is not a peer operation".to_string(),
+                );
+            }
+            let mut url = reqwest::Url::parse(&config.base_url)
+                .map_err(|e| format!("invalid MCP URL '{}': {e}", config.base_url))?;
+            url.set_path("/api/daemon/takeover");
+            let mut request = client
+                .post(url)
+                .json(&serde_json::json!({ "requested_by": "ctl takeover" }));
+            if let Some(token) = &config.loopback_token {
+                request = request.header(crate::loopback_token::LOOPBACK_TOKEN_HEADER, token);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| format!("takeover request failed: {e}"))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            println!("{text}");
+            if !status.is_success() {
+                return Err(format!("takeover refused (HTTP {status})"));
+            }
+        }
         "whoami" => {
             ensure_help(&command[1..], help_whoami)?;
             let response = call_tool(&client, &config, "whoami", Value::Object(Map::new())).await?;
@@ -4897,6 +4927,18 @@ Run `intendant ctl <command> --help` for focused help."
 
 fn help_status() {
     println!("Usage: intendant ctl status [--json|--raw]");
+}
+
+fn help_takeover() {
+    println!(
+        "Usage: intendant ctl takeover\n\
+\n\
+Ask the target daemon to DRAIN (Track HS handover): standing automations\n\
+stop, the scheduler lease frees for a successor daemon, in-flight sessions\n\
+finish where they run, and the drained daemon exits after its last session\n\
+ends. One-way and idempotent. Local daemon only (loopback trust class);\n\
+usually paired with booting the successor: `intendant --takeover`."
+    );
 }
 
 fn help_whoami() {

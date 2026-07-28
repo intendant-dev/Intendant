@@ -301,6 +301,10 @@ struct CliFlags {
     /// --direct: Force single-agent mode (skip orchestrator/sub-agent delegation).
     /// Does NOT disable the UI — use --no-web for headless output.
     direct: bool,
+    /// --takeover: After boot, ask the current scheduler-lease holder to
+    /// drain and acquire the lease as its successor (Track HS handover).
+    /// No-op when this boot already acquired the lease.
+    takeover: bool,
     /// --no-presence: Disable the presence layer (direct agent interaction).
     no_presence: bool,
     /// --web [PORT]: Serve the web dashboard (on by default).
@@ -376,6 +380,7 @@ fn print_help() {
     println!("    --sandbox             Force the runtime write sandbox on (default: on macOS/Linux, off Windows)");
     println!("    --no-sandbox          Disable the runtime write sandbox (Landlock/Seatbelt/restricted token)");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
+    println!("    --takeover            Ask the current scheduler-lease holder to drain, then acquire the lease (daemon handover)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
@@ -491,6 +496,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         sandbox: false,
         no_sandbox: false,
         direct: false,
+        takeover: false,
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
@@ -636,6 +642,10 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
             }
             "--direct" => {
                 flags.direct = true;
+                i += 1;
+            }
+            "--takeover" => {
+                flags.takeover = true;
                 i += 1;
             }
             "--no-presence" => {
@@ -1773,6 +1783,7 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             no_sandbox: false,
             direct: false,
+            takeover: false,
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
@@ -2028,6 +2039,7 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             no_sandbox: false,
             direct: false,
+            takeover: false,
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
@@ -2085,6 +2097,7 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             no_sandbox: false,
             direct: false,
+            takeover: false,
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
@@ -2129,6 +2142,7 @@ Also: {"source": "bare"}"#;
             sandbox: false,
             no_sandbox: false,
             direct: false,
+            takeover: false,
             no_presence: false,
             web: true,
             web_port: 9000,

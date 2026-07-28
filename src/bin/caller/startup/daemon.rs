@@ -224,6 +224,7 @@ pub(crate) async fn run_daemon(
             launch_gate_for_tests: None,
             claude_rewind_capability_for_tests: None,
             agenda: gateway.agenda.clone(),
+            handover: Some(gateway.handover.clone()),
         });
     // Publish the live registry for read-side lanes (the sign-in
     // ceremony status payloads' reload_candidates) — mirrors the

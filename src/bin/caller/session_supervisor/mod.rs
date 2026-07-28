@@ -100,6 +100,12 @@ pub struct SessionSupervisorConfig {
     /// `None` (hermetic tests, shapes without an agenda) skips the marker
     /// write-back, never the delivery itself.
     pub agenda: Option<Arc<crate::agenda::AgendaHandle>>,
+    /// The daemon-handover runtime (Track HS3): the drain refusal gate
+    /// (`ControlMsg::creates_session` intents refuse while draining) and
+    /// the exit-at-last-session condition read it. `None` (hermetic
+    /// tests, shapes without a gateway) disables both — today's
+    /// semantics.
+    pub handover: Option<Arc<crate::handover::HandoverRuntime>>,
 }
 
 #[derive(Clone)]
@@ -783,7 +789,59 @@ impl SessionSupervisor {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
             }
+            // Track HS3 (§3.2 step 6): a DRAINING daemon whose last
+            // supervised session ended exits gracefully — this loop is
+            // the daemon's lifetime (`run_daemon` awaits it). Checked on
+            // every event; one atomic read when not draining. The settle
+            // beat lets concurrently-subscribed tasks (the scheduler's
+            // terminal write-backs for the very session that just ended)
+            // drain their queued events before the process goes away —
+            // a bounded courtesy, not a synchronization (v1; a handshake
+            // is a named follow-up if the window ever bites).
+            if self.drain_exit_ready().await {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if self.drain_exit_ready().await {
+                    break;
+                }
+            }
         }
+    }
+
+    /// The drain exit condition: draining, no supervised session still
+    /// HOLDING WORK, and no launch body executing (a create accepted
+    /// before drain-entry registers its session moments later — exiting
+    /// under it would orphan the launch). "Holding work" is any phase but
+    /// `done`: draining exists to protect in-flight work, and a session
+    /// parked after its DoneSignal has none — scheduled sessions park
+    /// after done as a matter of course, and a strict count would strand
+    /// every drain behind them forever. An `idle` session still holds
+    /// (it may be pre-first-turn, or mid-conversation awaiting the
+    /// owner — the intake's "steer or stop stragglers" lane); parked
+    /// conversations stay resumable on the successor. Mirrors the
+    /// holding count onto the presence record each check ("draining ·
+    /// N sessions"), and records the terminal `exited` presence state
+    /// when satisfied.
+    async fn drain_exit_ready(&self) -> bool {
+        let Some(runtime) = self.config.handover.as_ref() else {
+            return false;
+        };
+        if !runtime.is_draining() {
+            return false;
+        }
+        let holding = self
+            .state
+            .lock()
+            .await
+            .sessions
+            .values()
+            .filter(|session| session.phase != "done")
+            .count();
+        runtime.set_session_count(holding as u64);
+        if holding > 0 || self.exec.latest_pending_heavy_key().is_some() {
+            return false;
+        }
+        runtime.mark_exited();
+        true
     }
 
     pub fn spawn(self) -> JoinHandle<()> {
@@ -905,7 +963,17 @@ mod tests {
     }
 
     pub(crate) fn test_supervisor(project_root: PathBuf, bus: EventBus) -> SessionSupervisor {
-        SessionSupervisor::new(SessionSupervisorConfig {
+        SessionSupervisor::new(test_supervisor_config(project_root, bus))
+    }
+
+    /// The hermetic config behind [`test_supervisor`], exposed so tests
+    /// can override one field (a draining handover runtime, a provider
+    /// factory) without duplicating the literal.
+    pub(crate) fn test_supervisor_config(
+        project_root: PathBuf,
+        bus: EventBus,
+    ) -> SessionSupervisorConfig {
+        SessionSupervisorConfig {
             bus,
             project_root: Some(project_root),
             autonomy: crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
@@ -984,7 +1052,117 @@ mod tests {
             launch_gate_for_tests: None,
             claude_rewind_capability_for_tests: None,
             agenda: None,
-        })
+            handover: None,
+        }
+    }
+
+    /// Track HS3: the funnel gate — session-creating intents refuse with
+    /// the structured `daemon_draining` error; in-flight-work intents
+    /// pass the gate untouched (whatever their arms then say about
+    /// unknown test sessions, it is never a drain refusal).
+    #[tokio::test]
+    async fn drain_serves_in_flight_approvals_and_steers() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::handover::HandoverRuntime::initialize(
+            home.path(),
+            7001,
+            0,
+        ));
+        assert_eq!(
+            runtime.request_drain(None),
+            crate::handover::DrainRequest::Entered
+        );
+        let bus = EventBus::new();
+        let mut config = test_supervisor_config(project.path().to_path_buf(), bus.clone());
+        config.handover = Some(runtime);
+        let supervisor = SessionSupervisor::new(config);
+        let mut rx = bus.subscribe();
+
+        let creating = [
+            r#"{"action":"create_session","task":"t"}"#,
+            r#"{"action":"start_task","task":"t"}"#,
+            r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+        ];
+        for json in creating {
+            supervisor
+                .handle_control_msg(serde_json::from_str(json).unwrap())
+                .await;
+        }
+        let mut refusals = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::LoopError(message) = &event {
+                assert!(
+                    message.starts_with("daemon_draining"),
+                    "the only loop errors here are drain refusals: {message}"
+                );
+                refusals += 1;
+            }
+        }
+        assert_eq!(refusals, 3, "every creating intent refused, structured");
+
+        let serving = [
+            r#"{"action":"start_task","task":"t","session_id":"missing"}"#,
+            r#"{"action":"follow_up","session_id":"missing","text":"t"}"#,
+            r#"{"action":"steer","session_id":"missing","text":"t"}"#,
+            r#"{"action":"interrupt","session_id":"missing"}"#,
+            r#"{"action":"approve","id":7}"#,
+        ];
+        for json in serving {
+            supervisor
+                .handle_control_msg(serde_json::from_str(json).unwrap())
+                .await;
+        }
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::LoopError(message) = &event {
+                assert!(
+                    !message.starts_with("daemon_draining"),
+                    "in-flight-work intents must never hit the drain gate: {message}"
+                );
+            }
+        }
+    }
+
+    /// Track HS3: the exit condition — draining with zero live sessions
+    /// (and no launch body in flight) is ready; a live session holds the
+    /// daemon open and mirrors its count onto the presence record.
+    #[tokio::test]
+    async fn drain_exit_readiness_follows_live_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::handover::HandoverRuntime::initialize(
+            home.path(),
+            7001,
+            0,
+        ));
+        let bus = EventBus::new();
+        let mut config = test_supervisor_config(project.path().to_path_buf(), bus.clone());
+        config.handover = Some(runtime.clone());
+        let supervisor = SessionSupervisor::new(config);
+
+        assert!(
+            !supervisor.drain_exit_ready().await,
+            "not draining ⇒ never exit-ready"
+        );
+        assert_eq!(
+            runtime.request_drain(None),
+            crate::handover::DrainRequest::Entered
+        );
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .insert("s-1".to_string(), managed_session("s-1", "intendant"));
+        assert!(
+            !supervisor.drain_exit_ready().await,
+            "a live supervised session holds the drainer open"
+        );
+        supervisor.state.lock().await.sessions.remove("s-1");
+        assert!(
+            supervisor.drain_exit_ready().await,
+            "last session gone ⇒ graceful exit"
+        );
     }
 
     pub(crate) fn test_supervisor_with_mock_provider(

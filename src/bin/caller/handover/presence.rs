@@ -106,11 +106,27 @@ impl DaemonPresence {
         Ok(presence)
     }
 
-    /// This boot's own record (HS3 mutates it through the drain states;
-    /// until then a test/diagnostic seam).
+    /// This boot's own record.
     #[cfg(test)]
     pub(crate) fn record(&self) -> &PresenceRecord {
         &self.record
+    }
+
+    /// Rewrite this boot's record with a new lifecycle state
+    /// (`draining`/`exited`). Failure is display debt, never fatal — the
+    /// per-boot lock stays the liveness truth.
+    pub(crate) fn update_state(&mut self, state: &str) -> std::io::Result<()> {
+        self.record.state = state.to_string();
+        self.record.updated_ms = super::now_ms();
+        self.write_record()
+    }
+
+    /// Rewrite this boot's record with the live supervised-session count
+    /// (the drain views' "draining · N sessions" source).
+    pub(crate) fn update_session_count(&mut self, count: u64) -> std::io::Result<()> {
+        self.record.session_count = Some(count);
+        self.record.updated_ms = super::now_ms();
+        self.write_record()
     }
 
     fn write_record(&self) -> std::io::Result<()> {

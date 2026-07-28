@@ -1227,6 +1227,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::DaemonTakeover => {
+                return handle_daemon_takeover(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaOp => {
                 // The authenticated edge: the pre-dispatch IAM gate bound
                 // this principal; no token names a session on this lane.

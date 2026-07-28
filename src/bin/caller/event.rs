@@ -2654,6 +2654,39 @@ pub enum ControlMsg {
     },
 }
 
+impl ControlMsg {
+    /// Track HS3: THE single classification of session-CREATING intents —
+    /// what a draining daemon refuses with `daemon_draining` (intake §3.3,
+    /// Q5 derive pin). Every surface (the supervisor funnel, HTTP
+    /// dispatch, tunnel twins, MCP tools, peer delegation) consults this
+    /// function, never a per-surface list; the drain matrix test walks it.
+    ///
+    /// The line it draws (ratified): an intent that MINTS a new supervised
+    /// session — create, untargeted start, and the whole resume family
+    /// (resume, restart-with-config, fork-at-anchor: each spawns a fresh
+    /// supervised process for otherwise-parked work) — is refused while
+    /// draining. Intents that continue IN-FLIGHT work serve: a targeted
+    /// `StartTask` routes into a live session, and `SpawnSubAgent` is a
+    /// running orchestrator's own tool call — refusing it would strand the
+    /// parent mid-task, the exact thing draining exists to protect.
+    ///
+    /// When adding a session-creating variant, classify it here — a new
+    /// creator left on the wildcard arm silently leaks past drain.
+    pub(crate) fn creates_session(&self) -> bool {
+        matches!(
+            self,
+            ControlMsg::CreateSession { .. }
+                | ControlMsg::StartTask {
+                    session_id: None,
+                    ..
+                }
+                | ControlMsg::ResumeSession { .. }
+                | ControlMsg::RestartSession { .. }
+                | ControlMsg::ForkSessionAtAnchor { .. }
+        )
+    }
+}
+
 /// The event bus sender. Cloneable for use in multiple tasks.
 ///
 /// Backed by a bounded `broadcast::channel` so multiple consumers can
@@ -4990,6 +5023,52 @@ mod tests {
                 assert_eq!(id, 7);
             }
             _ => panic!("expected Deny"),
+        }
+    }
+
+    /// Track HS3, the Q5 derive pin: the drain refusal matrix is THE
+    /// single classification (`ControlMsg::creates_session`), walked here
+    /// over the wire intent table — session-creating intents refuse while
+    /// draining; in-flight-work intents (targeted starts, follow-ups,
+    /// steers, interrupts, approvals, a running orchestrator's sub-agent
+    /// spawns) serve. Every surface consults the same function; no
+    /// per-surface list exists to drift.
+    #[test]
+    fn drain_refusal_matrix_per_intent() {
+        let refused_wire = [
+            r#"{"action":"create_session","task":"t"}"#,
+            // Untargeted start mints a session.
+            r#"{"action":"start_task","task":"t"}"#,
+            // The whole resume family spawns a fresh supervised process
+            // for otherwise-parked work.
+            r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+            r#"{"action":"resume_session","source":"intendant","session_id":"s","fork":true}"#,
+            r#"{"action":"restart_session","source":"intendant","session_id":"s"}"#,
+            r#"{"action":"fork_session_at_anchor","source":"codex","session_id":"s","anchor":{"kind":"head"}}"#,
+        ];
+        let served_wire = [
+            // Targeted start routes INTO a live session.
+            r#"{"action":"start_task","task":"t","session_id":"s"}"#,
+            r#"{"action":"follow_up","session_id":"s","text":"t"}"#,
+            r#"{"action":"steer","session_id":"s","text":"t"}"#,
+            r#"{"action":"interrupt","session_id":"s"}"#,
+            r#"{"action":"edit_user_message","session_id":"s","user_turn_index":1,"text":"t"}"#,
+            r#"{"action":"approve","id":7}"#,
+            r#"{"action":"deny","id":7}"#,
+            r#"{"action":"approve_all","id":7}"#,
+            // A running orchestrator's own tool call — refusing it would
+            // strand the parent mid-task.
+            r#"{"action":"spawn_sub_agent","session_id":"s","task":"t"}"#,
+        ];
+        for json in refused_wire {
+            let msg: ControlMsg = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("wire shape must parse ({json}): {e}"));
+            assert!(msg.creates_session(), "must refuse while draining: {json}");
+        }
+        for json in served_wire {
+            let msg: ControlMsg = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("wire shape must parse ({json}): {e}"));
+            assert!(!msg.creates_session(), "must serve while draining: {json}");
         }
     }
 

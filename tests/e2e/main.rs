@@ -6338,6 +6338,7 @@ async fn spawn_co_daemon(
     rig: &TestRig,
     log_name: &str,
     extra_env: &[(&str, &str)],
+    extra_args: &[&str],
 ) -> CoDaemon {
     let script_path = rig.home.path().join("mock_script.json");
     let log_path = rig.home.path().join(log_name);
@@ -6357,6 +6358,7 @@ async fn spawn_co_daemon(
         "full",
         "--no-tls",
     ]);
+    cmd.args(extra_args);
     let mut child = cmd.spawn().expect("spawn co-homed intendant daemon");
 
     let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
@@ -6550,7 +6552,7 @@ async fn due_manifest_fires_exactly_once_across_two_live_daemons() {
         .build()
         .expect("http client");
     let daemon_a = spawn_daemon(&client, &handover_script(None)).await;
-    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[]).await;
+    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[], &[]).await;
 
     // A booted first: it holds the lease; B runs secondary.
     let sidecar = lease_sidecar(&daemon_a.rig).expect("holder wrote the sidecar");
@@ -6638,6 +6640,7 @@ async fn holder_crash_secondary_poll_acquires_and_resolves_dead_rows() {
         &daemon_a.rig,
         "daemon-b.log",
         &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &[],
     )
     .await;
     let first_generation = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["generation"]
@@ -6733,7 +6736,7 @@ async fn handover_boot_spares_live_scheduled_session_and_completed_stands() {
 
     // A second daemon boots MID-SESSION: its boot recovery runs against
     // the shared journal and must spare the live generation's row.
-    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[]).await;
+    let daemon_b = spawn_co_daemon(&client, &daemon_a.rig, "daemon-b.log", &[], &[]).await;
     assert!(
         !journal_states_for_item(&daemon_a.rig, &item_id).contains(&"unknown".to_string()),
         "the co-booting daemon must not clobber a live session's row:\n{:?}",
@@ -6774,5 +6777,170 @@ async fn handover_boot_spares_live_scheduled_session_and_completed_stands() {
         "the completed terminal stands; no unknown was ever written:\n{:?}",
         journal_rows(&daemon_a.rig)
     );
+    drop(daemon_b);
+}
+
+/// Track HS3, end to end (the conformance names `drainer_exits_at_last_
+/// session_end` + `takeover_request_drains_then_transfers_flock`'s rig
+/// twin + the HS2 ruling's N4 leg): a successor boots with `--takeover`
+/// while the holder's scheduled session RUNS. The holder drains — lease
+/// transfers, its live session is SPARED by the new holder (no `unknown`
+/// ever), session-creating work refuses with `daemon_draining` — the
+/// released session completes ON the drainer, and the drained daemon
+/// EXITS on its own after that last session ends. The successor carries
+/// on as the active daemon.
+#[tokio::test]
+async fn drainer_exits_at_last_session_end() {
+    let rig = TestRig::new();
+    let barrier = rig.home.path().join("release-the-drain-session");
+    let script = handover_script(Some(&barrier));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let mut daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let holder_boot = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // The holder fires a session and parks it on the barrier.
+    let item_id = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "drain-exit-item",
+    )
+    .await;
+    poll_until(
+        "the holder's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_id)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // The successor: boots co-homed with --takeover.
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &["--takeover"],
+    )
+    .await;
+    poll_until(
+        "the lease transferring to the successor",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] != holder_boot.as_str() && sidecar["state"] == "active")
+                .then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // The drainer's presence records the drain; its live session is
+    // SPARED by the new holder (N4: the drainer's in-flight rows carry a
+    // LIVE boot id — no unknown, ever).
+    let presence_path = daemon_a
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{holder_boot}.json"));
+    poll_until(
+        "the drainer's presence flipping to draining",
+        RUN_TIMEOUT,
+        || async {
+            let presence: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&presence_path).ok()?).ok()?;
+            (presence["state"] == "draining").then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+    assert!(
+        !journal_states_for_item(&daemon_a.rig, &item_id).contains(&"unknown".to_string()),
+        "the new holder must spare the draining daemon's live session:\n{:?}",
+        journal_rows(&daemon_a.rig)
+    );
+
+    // Session-creating work refuses on the drainer with the structured
+    // pointer (the agenda immediacy verb rides the same drain state).
+    let refused = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["--json", "agenda", "add", "refused-on-drainer", "--task"],
+    )
+    .await;
+    assert!(
+        refused.status.success(),
+        "ordinary agenda writes still serve while draining: {}",
+        text_of(&refused)
+    );
+    let refused_item_id = stdout_json(&refused)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+    let start_refused = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["agenda", "start", &refused_item_id[..10]],
+    )
+    .await;
+    let start_text = text_of(&start_refused);
+    assert!(
+        !start_refused.status.success() && start_text.contains("daemon_draining"),
+        "start_now must refuse on the drainer with the structured error: {start_text}"
+    );
+
+    // Release the barrier: the session completes ON the drainer…
+    std::fs::write(&barrier, b"go").expect("release the barrier");
+    poll_until(
+        "the drained session's completed row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_id)
+                .contains(&"completed".to_string())
+                .then_some(())
+        },
+        || {
+            format!(
+                "--- journal ---\n{:?}\n--- A tail ---\n{}",
+                journal_rows(&daemon_a.rig),
+                daemon_a.log_tail()
+            )
+        },
+    )
+    .await;
+
+    // …and the drainer EXITS on its own — no kill, no signal.
+    let exited = tokio::time::timeout(Duration::from_secs(60), daemon_a.child.wait())
+        .await
+        .expect("the drained daemon must exit after its last session ends")
+        .expect("collect drainer exit status");
+    assert!(
+        exited.success(),
+        "graceful drain exit, not a crash: {exited:?}\n{}",
+        daemon_a.log_tail()
+    );
+    let states = journal_states_for_item(&daemon_a.rig, &item_id);
+    assert_eq!(
+        states,
+        vec!["prepared", "started", "completed"],
+        "the completed terminal stands through the whole handover"
+    );
+    // The drainer recorded its terminal presence state on the way out.
+    let presence: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&presence_path).expect("presence file"))
+            .expect("presence json");
+    assert_eq!(presence["state"], "exited");
     drop(daemon_b);
 }
