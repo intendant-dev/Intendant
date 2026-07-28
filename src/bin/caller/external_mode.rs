@@ -229,10 +229,11 @@ pub(crate) const RELOAD_MIDTURN_CONTINUATION_TEXT: &str =
 /// pass `false` (idle in, idle out), as does a turn that completed
 /// normally despite the request, or one whose interrupt belonged to the
 /// user (their stop wins). The message carries no steer/follow-up id, so
-/// id-keyed cancel matching can never drop it.
+/// id-keyed cancel matching can never drop it. Rides the shared
+/// [`midturn_continuation`] seam with the rate-limit park's resume nudge
+/// ([`limit_park_pending`]) — the started-turn decision lives once.
 fn synthesized_reload_continuation(reload_interrupted_turn: bool) -> Option<FollowUpMessage> {
-    reload_interrupted_turn
-        .then(|| FollowUpMessage::text(RELOAD_MIDTURN_CONTINUATION_TEXT.to_string()))
+    midturn_continuation(RELOAD_MIDTURN_CONTINUATION_TEXT, reload_interrupted_turn)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3404,14 +3405,14 @@ pub(crate) async fn run_external_agent_mode(
             DrainOutcome::LimitRejected {
                 resets_at_epoch,
                 message: _,
+                turn_had_started,
             } => {
-                // The round did no work: hand its number back so the
-                // retried round reuses it, count no round (no DoneSignal /
-                // RoundComplete — those were the burn), and park instead
-                // of re-firing. The incident class burned follow-up
-                // rounds at decaying intervals until the budget silently
-                // exhausted, with the reset time on the wire the whole
-                // time.
+                // Hand the round number back so the retried round reuses
+                // it, count no round (no DoneSignal / RoundComplete —
+                // those were the burn), and park instead of re-firing.
+                // The incident class burned follow-up rounds at decaying
+                // intervals until the budget silently exhausted, with the
+                // reset time on the wire the whole time.
                 round = round.saturating_sub(1);
                 limit_park_streak = limit_park_streak.saturating_add(1);
                 let now_epoch = crate::session_activity::epoch_seconds();
@@ -3442,14 +3443,32 @@ pub(crate) async fn run_external_agent_mode(
                     ),
                 )
                 .await;
-                // Re-send exactly what the limit rejected: the merged
-                // text (queued steers were already consumed into it) with
-                // the original attachments.
+                // Delivery-aware pending (`limit_park_pending`): when the
+                // rejection arrived before the backend did anything, park
+                // exactly what it rejected — the merged text (queued
+                // steers were already consumed into it) with the original
+                // attachments. When the turn had already started, the
+                // backend holds that message; park a resume nudge instead
+                // of doubling it.
+                if turn_had_started {
+                    let line = format!(
+                        "The rejected turn had already started at {} — parking a resume nudge instead of re-sending the message",
+                        agent.name()
+                    );
+                    slog(&session_log, |l| l.info(&line));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "info".to_string(),
+                        source: "Intendant".to_string(),
+                        content: line,
+                        turn: None,
+                    });
+                }
                 let mut pending = active_followup_for_rewind_replay.clone();
                 pending.text = merged.clone();
                 limit_park = Some(LimitParkState {
                     resume_at: tokio::time::Instant::now() + delay,
-                    pending: Some(pending),
+                    pending: Some(limit_park_pending(pending, turn_had_started)),
                 });
             }
             DrainOutcome::ContextRewindRequested {
