@@ -69,9 +69,7 @@ impl ResumeLineage {
     pub(crate) fn successor_tip(&self, exclude: &[&str]) -> Option<&ExternalWrapperRecord> {
         self.wrapper_records.iter().find(|record| {
             record.state == WrapperState::Active
-                && !exclude
-                    .iter()
-                    .any(|id| *id == record.intendant_session_id.as_str())
+                && !exclude.contains(&record.intendant_session_id.as_str())
         })
     }
 }
