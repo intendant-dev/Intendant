@@ -710,6 +710,7 @@ pub(crate) fn claude_fork_points(
         notes: vec![
             "anchors chain-slice the transcript: a fork keeps the anchor's ancestor chain in a new session file".to_string(),
             "pre_compaction anchors fork with full pre-compaction history (the slice omits the compact boundary)".to_string(),
+            "a forked child cannot resume the parent's subagents — their transcripts stay with the parent session".to_string(),
         ],
         total: 0,
         offset: 0,

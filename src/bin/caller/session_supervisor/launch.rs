@@ -905,6 +905,22 @@ impl SessionSupervisor {
         // `as_wire_fields`); applied after the wire-vetted block so the
         // supervisor-minted kind (`anchor-fork`) can override it.
         overrides.apply_fork_lineage(session_agent_config.as_mut());
+        // Fork fidelity: whatever launch pins the wire and the child's own
+        // overlay left unset come from the PARENT's persisted config, not
+        // the project/global defaults — the 2026-07-27 incident's edit
+        // fork silently ran the daemon-global `fable` while its parent
+        // pinned `claude-fable-5`. Runs after the lineage fields land so
+        // `forked_from` names the parent; lineage/one-shot fields never
+        // travel.
+        if let (Some(backend), Some(config)) =
+            (external_backend.as_ref(), session_agent_config.as_mut())
+        {
+            crate::session_config::inherit_forked_parent_launch_pins(
+                &self.logs_home(),
+                backend.as_short_str(),
+                config,
+            );
+        }
         let project_root = if external_backend.is_some() {
             match resolve_external_resume_project_root(
                 project_root,

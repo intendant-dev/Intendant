@@ -169,6 +169,24 @@ impl SessionAgentConfig {
             && self.codex_fork_rollback_position.is_none()
     }
 
+    /// This config reduced to the launch pins a FORKED CHILD may
+    /// inherit: lineage and one-shot fork-staging fields are stripped —
+    /// they describe the parent's own ancestry and surgery, never the
+    /// child's (a parent that was itself a fork must not leak its
+    /// `fork_anchor` into a grandchild's record).
+    pub fn into_inheritable_launch_pins(mut self) -> SessionAgentConfig {
+        self.forked_from = None;
+        self.fork_relationship = None;
+        self.fork_anchor = None;
+        self.codex_fork_rollout_path = None;
+        self.codex_fork_rollback_turns = None;
+        self.codex_fork_rollback_item_id = None;
+        self.codex_fork_rollback_position = None;
+        self.kimi_fork_rollback_turns = None;
+        self.kimi_fork_expected_horizon = None;
+        self
+    }
+
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
         if self.source.is_none() {
             self.source = fallback.source;
@@ -1293,6 +1311,34 @@ pub fn lookup_external_overlay(
         .map(|config| normalize_session_agent_config(config, Some(&source)))
 }
 
+/// Fork fidelity: fill a forked child's still-missing launch pins from
+/// its parent's persisted config (`config.forked_from`), so a fork or
+/// edit branch runs on the parent's model/effort/permission pins instead
+/// of silently degrading to project/global defaults — the 2026-07-27
+/// incident's edit fork ran the daemon-global `fable` while its parent
+/// pinned `claude-fable-5`. Wire overrides and the child's own persisted
+/// overlay still win (this merges MISSING fields only), and lineage /
+/// one-shot staging fields never travel
+/// ([`SessionAgentConfig::into_inheritable_launch_pins`]).
+pub fn inherit_forked_parent_launch_pins(
+    home: &Path,
+    source: &str,
+    config: &mut SessionAgentConfig,
+) {
+    let Some(parent_token) = config
+        .forked_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if let Some(parent) = load_for_resume(home, source, &parent_token, Some(&parent_token)) {
+        config.merge_missing_from(parent.into_inheritable_launch_pins());
+    }
+}
+
 pub fn load_for_resume(
     home: &Path,
     source: &str,
@@ -1675,6 +1721,72 @@ fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commission's pin: a forked/branched child inherits the
+    /// parent's persisted launch pins (model + effort — the 2026-07-27
+    /// incident's edit fork ran the daemon-global `fable` instead of the
+    /// parent's `claude-fable-5`), while the child's own explicit pins
+    /// and lineage fields stay untouched and the parent's own lineage /
+    /// one-shot fork-staging fields never travel.
+    #[test]
+    fn fork_inherits_parent_model_pins() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_id = "7e000000-0000-4000-8000-000000000001";
+        let parent_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join(parent_id);
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let parent_config = SessionAgentConfig {
+            source: Some("claude-code".to_string()),
+            claude_model: Some("claude-fable-5".to_string()),
+            claude_effort: Some("high".to_string()),
+            claude_permission_mode: Some("acceptEdits".to_string()),
+            // The parent was itself a fork: its ancestry must not leak
+            // into the child's record.
+            forked_from: Some("00000000-dead-beef-0000-000000000000".to_string()),
+            fork_anchor: Some("{\"kind\":\"message\"}".to_string()),
+            ..Default::default()
+        };
+        write_log_dir_config(&parent_dir, &parent_config).unwrap();
+
+        let mut child = SessionAgentConfig {
+            source: Some("claude-code".to_string()),
+            forked_from: Some(parent_id.to_string()),
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: Some("{\"kind\":\"message\",\"message_uuid\":\"a1\"}".to_string()),
+            // An explicit wire pin outranks inheritance.
+            claude_permission_mode: Some("plan".to_string()),
+            ..Default::default()
+        };
+        inherit_forked_parent_launch_pins(home.path(), "claude-code", &mut child);
+
+        assert_eq!(child.claude_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(child.claude_effort.as_deref(), Some("high"));
+        assert_eq!(
+            child.claude_permission_mode.as_deref(),
+            Some("plan"),
+            "the child's own explicit pin must win"
+        );
+        assert_eq!(
+            child.forked_from.as_deref(),
+            Some(parent_id),
+            "the child's lineage must not be overwritten by the parent's own ancestry"
+        );
+        assert_eq!(
+            child.fork_anchor.as_deref(),
+            Some("{\"kind\":\"message\",\"message_uuid\":\"a1\"}"),
+            "the parent's fork anchor must never leak into the child"
+        );
+        assert_eq!(child.fork_relationship.as_deref(), Some("anchor-fork"));
+
+        // No parent config resolvable → a no-op, never a panic.
+        let mut orphan = SessionAgentConfig {
+            forked_from: Some("11111111-0000-4000-8000-000000000000".to_string()),
+            ..Default::default()
+        };
+        inherit_forked_parent_launch_pins(home.path(), "claude-code", &mut orphan);
+        assert!(orphan.claude_model.is_none());
+    }
 
     /// Pins the resume-scan ordering invariant exactly: configured stores
     /// newest-first, and a configless store sorts after EVERY configured
