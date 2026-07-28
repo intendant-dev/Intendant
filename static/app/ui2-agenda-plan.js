@@ -177,7 +177,7 @@ function agendaPlanEvents() {
     }
     const st = agendaEffectState(item);
     if (!st) return;
-    const digest8 = String(st.effect.digest || '').slice(0, 8);
+    const digestShort = agendaShortDigest(st.effect.digest);
     if (st.kind === 'running') {
       events.push({
         at: now, item, what: 'session running now', tone: 'iris',
@@ -188,8 +188,8 @@ function agendaPlanEvents() {
         at: Math.max(st.manifest.fire_at_ms, now), item,
         what: 'proposed session — will not fire', tone: 'amber', pulse: 'slow',
         chips: [agendaChipHtml('needs approval', 'amber',
-          `Approval binds digest ${digest8}… exactly`)],
-        note: `waiting on your approval of digest ${digest8}… — proposing carries no authority`,
+          `Approval binds digest ${digestShort} exactly`)],
+        note: `waiting on your approval of digest ${digestShort} — proposing carries no authority`,
       });
     } else if (st.kind === 'suspended') {
       events.push({

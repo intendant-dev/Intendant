@@ -718,6 +718,154 @@ mod tests {
         );
     }
 
+    /// The digest-visibility mandate: a manifest digest is what an owner
+    /// Approve gesture cryptographically covers — it changes on every
+    /// re-propose while the item id stays — so every surface carrying
+    /// the gesture renders it through the one shared chip (short form
+    /// inline, full digest on hover, click copies). If this fails, a
+    /// surface dropped the chip or forked the wire: restore the shared
+    /// one.
+    #[test]
+    fn approval_surfaces_show_the_digest_they_sign() {
+        let shared = include_str!("../../../../static/app/ui2-agenda.js");
+        // The formatter/chip pair and the single copy wire live in the
+        // shared fragment; the chip reveals + copies the full digest and
+        // truncates only through the formatter.
+        assert!(shared.contains("function agendaShortDigest"));
+        assert!(shared.contains("function agendaDigestChipHtml"));
+        assert!(shared.contains("data-copy-digest"));
+        assert!(shared.contains("sha256 ${d}"));
+        assert!(shared.contains("agendaShortDigest(d)"));
+        assert!(
+            include_str!("../../../../static/app/ui2-agenda.css").contains(".ag2-digest-chip"),
+            "the chip lost its one shared appearance"
+        );
+        // Every Approve-gesture surface renders it: the inline card
+        // strip (pending Approve + suspended Re-arm) and the Automations
+        // row; the inspector effect detail; the one-gesture workflow
+        // sheet's node rows.
+        for (name, fragment, chips) in [
+            (
+                "ui2-agenda-cards.js",
+                include_str!("../../../../static/app/ui2-agenda-cards.js"),
+                3usize,
+            ),
+            (
+                "ui2-agenda-inspector.js",
+                include_str!("../../../../static/app/ui2-agenda-inspector.js"),
+                1,
+            ),
+            (
+                "ui2-agenda-workflows.js",
+                include_str!("../../../../static/app/ui2-agenda-workflows.js"),
+                1,
+            ),
+        ] {
+            assert!(
+                fragment.matches("agendaDigestChipHtml(").count() >= chips,
+                "{name}: an approval surface stopped rendering the digest chip"
+            );
+            assert!(
+                !fragment.contains("function agendaDigestChipHtml"),
+                "{name}: the chip helper must have exactly one definition, in ui2-agenda.js"
+            );
+        }
+        // The approved state shows the digest the recorded approval
+        // covers, and a re-proposed effect visibly carries its NEW one.
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(inspector.contains("bound ? e.approval.digest : e.digest"));
+        assert!(inspector.contains("Re-proposed since your last approval"));
+    }
+
+    /// The ledger search executes SPA-side — `agendaSearchMatch` filters
+    /// the served item snapshot in the browser (the daemon serves items
+    /// unfiltered) — so the digest lane is pinned at the fragment:
+    /// prefixes of >=8 hex chars, case-insensitive, against every digest
+    /// the item owns, resolving to the owning item like an id search.
+    #[test]
+    fn ledger_search_matches_digest_prefixes() {
+        let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        let after = |marker: &str| {
+            let (_, rest) = cards
+                .split_once(marker)
+                .unwrap_or_else(|| panic!("{marker} must exist in ui2-agenda-cards.js"));
+            rest.split_once("\nfunction ")
+                .map(|(body, _)| body)
+                .unwrap_or(rest)
+        };
+        let matcher = after("function agendaSearchMatch");
+        assert!(
+            matcher.contains("[0-9a-f]{8,64}"),
+            "the digest lane lost its >=8-hex-char, case-insensitive floor"
+        );
+        assert!(matcher.contains("agendaItemDigests(item)"));
+        assert!(
+            matcher.contains(".startsWith(q)"),
+            "digest matching must be prefix matching, not substring"
+        );
+        let collector = after("function agendaItemDigests");
+        for family in ["e.digest", "e.approval.digest", "r.digest"] {
+            assert!(
+                collector.contains(family),
+                "the digest collector lost the {family} family"
+            );
+        }
+    }
+
+    /// One truncation, one place: outside the shared formatter no agenda
+    /// fragment slices a digest — the per-surface variants (8/10/12/16
+    /// chars once coexisted) are exactly how cited digests became
+    /// unfindable. Full reveals (the hood's grouped display, tooltips
+    /// carrying the whole sha256) are not truncations and stay free.
+    #[test]
+    fn one_short_digest_formatter_everywhere() {
+        for (name, content) in [
+            (
+                "ui2-agenda.js",
+                include_str!("../../../../static/app/ui2-agenda.js"),
+            ),
+            (
+                "ui2-agenda-cards.js",
+                include_str!("../../../../static/app/ui2-agenda-cards.js"),
+            ),
+            (
+                "ui2-agenda-inspector.js",
+                include_str!("../../../../static/app/ui2-agenda-inspector.js"),
+            ),
+            (
+                "ui2-agenda-graph.js",
+                include_str!("../../../../static/app/ui2-agenda-graph.js"),
+            ),
+            (
+                "ui2-agenda-plan.js",
+                include_str!("../../../../static/app/ui2-agenda-plan.js"),
+            ),
+            (
+                "ui2-agenda-diary.js",
+                include_str!("../../../../static/app/ui2-agenda-diary.js"),
+            ),
+            (
+                "ui2-agenda-hood.js",
+                include_str!("../../../../static/app/ui2-agenda-hood.js"),
+            ),
+            (
+                "ui2-agenda-workflows.js",
+                include_str!("../../../../static/app/ui2-agenda-workflows.js"),
+            ),
+        ] {
+            for (idx, line) in content.lines().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("digest") && lower.contains(".slice(") {
+                    assert!(
+                        name == "ui2-agenda.js" && line.contains("AGENDA_DIGEST_SHORT_LEN"),
+                        "{name}:{}: a digest is truncated outside agendaShortDigest: {line}",
+                        idx + 1
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_app_html_embedded() {
         assert!(!APP_HTML.is_empty());

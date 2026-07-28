@@ -262,8 +262,12 @@ function agendaWorkflowOpenApprovalSheet(stamped) {
   for (const node of stamped.nodes) {
     const row = agendaStartSheetEl('div', 'ags-config-row');
     row.appendChild(agendaStartSheetEl('label', 'ags-label', node.title));
-    row.appendChild(agendaStartSheetEl('div', 'ags-hint',
-      `${node.executor} · digest ${String(node.digest).slice(0, 12)}`));
+    // Executor as text, digest as the shared chip: each row shows the
+    // exact revision "Approve all" would bind for that node.
+    const hint = agendaStartSheetEl('div', 'ags-hint');
+    hint.innerHTML = `${escapeHtml(node.executor)} · ${agendaDigestChipHtml(node.digest,
+      'Approve all binds this node to exactly this manifest revision')}`;
+    row.appendChild(hint);
     panel.appendChild(row);
     const goal = agendaStartSheetEl('pre', 'agsx-preview');
     goal.textContent = node.goal;
