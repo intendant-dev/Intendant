@@ -363,6 +363,43 @@ impl AgendaHandle {
         Ok(outcome)
     }
 
+    /// The automation-definition catalog (Track AW slice 2): every
+    /// discovered definition under the state root's library, validated,
+    /// with provenance and shadowing visible. Read-only; discovery
+    /// grants nothing.
+    pub(crate) fn definition_catalog(&self) -> Vec<super::definitions::DefinitionCatalogEntry> {
+        match self.dir.parent() {
+            Some(state_root) => super::definitions::definition_catalog(state_root),
+            None => Vec::new(),
+        }
+    }
+
+    /// One sealed snapshot's bytes by its pin (Track AW slice 2): the
+    /// read lane behind sealed-content rendering. Read-only and
+    /// content-addressed — the served bytes are re-hashed against the
+    /// pin so a corrupt blob errors instead of serving silently;
+    /// `Ok(None)` is the honest 404.
+    pub(crate) fn sealed_content(&self, sha256: &str) -> Result<Option<Vec<u8>>, String> {
+        let sha = sha256.trim().to_ascii_lowercase();
+        if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("sha256 must be 64 hex characters".into());
+        }
+        let path = super::sealed_blobs::sealed_blob_path(&self.dir, &sha);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(format!("reading sealed blob: {err}")),
+        };
+        if super::sealed_blobs::digest_bytes(&bytes) != sha {
+            return Err(
+                "sealed blob corrupt (bytes no longer hash to the pin) — re-propose and \
+                 re-approve to reseal"
+                    .into(),
+            );
+        }
+        Ok(Some(bytes))
+    }
+
     /// Emit the rail announcement for an open ask-backed item. `session`
     /// attributes the question to the asking session while it lives; the
     /// panel copes with a gone session (answers match on the ask id
@@ -764,6 +801,72 @@ mod tests {
             )
             .is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// The sealed-serving pin (Track AW slice 2): the read lane serves
+    /// exactly the content-addressed bytes — re-hashed against the pin,
+    /// corrupt blobs refused, absence honest — and its route row is
+    /// read-only (GET, no body) under `agenda.read` with a tunnel twin.
+    #[test]
+    fn sealed_serving_lane_is_read_only_content_addressed() {
+        let root = tempfile::tempdir().unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(&agenda).unwrap(),
+            EventBus::new(),
+            &agenda,
+        );
+        // NIST vector: sha256("abc").
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        super::super::sealed_blobs::seal_content(&agenda, ABC, b"abc").unwrap();
+        assert_eq!(handle.sealed_content(ABC).unwrap().unwrap(), b"abc");
+        // Case-normalized pins serve the same blob.
+        assert_eq!(
+            handle
+                .sealed_content(&ABC.to_ascii_uppercase())
+                .unwrap()
+                .unwrap(),
+            b"abc"
+        );
+        // Absence is Ok(None) — the honest 404.
+        let missing = "0".repeat(64);
+        assert!(handle.sealed_content(&missing).unwrap().is_none());
+        // Junk pins refuse by shape.
+        assert!(handle
+            .sealed_content("not-a-pin")
+            .unwrap_err()
+            .contains("64 hex"));
+        // Corrupt bytes under a pin's name refuse instead of serving.
+        std::fs::write(
+            super::super::sealed_blobs::sealed_blob_path(&agenda, &missing),
+            b"corrupt",
+        )
+        .unwrap();
+        assert!(handle
+            .sealed_content(&missing)
+            .unwrap_err()
+            .contains("corrupt"));
+        // The route row: GET, no body, agenda.read, tunnel-twinned.
+        let route = crate::gateway_routes::ROUTES
+            .iter()
+            .find(|route| route.handler == crate::gateway_routes::RouteHandlerId::AgendaSealed)
+            .expect("the sealed-serving row exists");
+        assert_eq!(route.method, crate::gateway_routes::RouteMethod::Get);
+        assert!(matches!(
+            route.body,
+            crate::gateway_routes::BodyPolicy::None
+        ));
+        assert_eq!(
+            route.authz,
+            crate::gateway_routes::RouteAuthz::Operation(
+                crate::peer::access_policy::PeerOperation::AgendaRead
+            )
+        );
+        assert_eq!(
+            route.tunnel.as_ref().map(|t| t.name),
+            Some("api_agenda_sealed")
+        );
     }
 
     #[test]

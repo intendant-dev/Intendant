@@ -1889,6 +1889,9 @@ response omits the header.
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke) |
+| GET | `/api/agenda/definitions` | AgendaRead | own origin | none | Automation-definition catalog (house + personal, validation state, full text) |
+| GET | `/api/agenda/sealed/{sha256}` | AgendaRead | own origin | none | One sealed binding-ref snapshot by sha256 pin (read-only, content-addressed) |
+| POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/pr-state` | AgendaRead | own origin | none | Live PR state for one anchor (expand-time render join; cached daemon-side) |

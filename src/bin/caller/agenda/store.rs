@@ -2288,11 +2288,9 @@ impl StampFields {
 }
 
 /// One stamped node: its parked item (post-propose fold state, carrying
-/// the effect) plus the digest the approval sheet binds. The identity
-/// fields beyond `item` are the wire response's material — the slice-2
-/// stamp route serializes them; the handle reads `item` today.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+/// the effect) plus the digest the approval sheet binds. Serialized by
+/// the `api_agenda_stamp` wire response.
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct StampedNode {
     pub(crate) node_id: String,
     pub(crate) title: String,
@@ -2302,11 +2300,9 @@ pub(crate) struct StampedNode {
 
 /// A whole stamped instance — what the stamp lane returns to the
 /// approval sheet: ordinary items and effects only (no workflow-level
-/// object exists; this is a response shape, not state). The handle
-/// consumes `title`/`hub`/`nodes` today; the rest is the slice-2 wire
-/// response's material.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+/// object exists; this is a response shape, not state). Serialized by
+/// the `api_agenda_stamp` wire response.
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct AgendaStampOutcome {
     pub(crate) definition: String,
     pub(crate) title: String,

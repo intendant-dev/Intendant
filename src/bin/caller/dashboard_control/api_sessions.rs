@@ -256,6 +256,9 @@ pub(crate) async fn control_request_frame(
             api_agenda_occurrences_response(id, params.as_ref(), &runtime).await
         }
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_definitions" => api_agenda_definitions_response(id, &runtime).await,
+        "api_agenda_sealed" => api_agenda_sealed_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_stamp" => api_agenda_stamp_response(id, params.as_ref(), &runtime).await,
         "api_agenda_ref_drift" => {
             api_agenda_ref_drift_response(id, params.as_ref(), &runtime).await
         }
@@ -1471,6 +1474,59 @@ pub(crate) async fn api_agenda_op_response(
         )
         .await,
         "agenda op",
+    )
+}
+
+/// Tunnel twin of `GET /api/agenda/definitions` (Track AW).
+pub(crate) async fn api_agenda_definitions_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_definitions_api_response(runtime.mcp_server.as_ref()).await,
+        "agenda definitions",
+    )
+}
+
+/// Tunnel twin of `GET /api/agenda/sealed/{sha256}` — the pin rides
+/// `params.sha256`.
+pub(crate) async fn api_agenda_sealed_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let sha256 = params
+        .and_then(|p| p.get("sha256"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_sealed_api_response(&sha256, runtime.mcp_server.as_ref()).await,
+        "agenda sealed",
+    )
+}
+
+/// Tunnel twin of `POST /api/agenda/stamp` — the request rides `params`;
+/// attribution comes from the authenticated dashboard-control grant.
+pub(crate) async fn api_agenda_stamp_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_stamp_api_response(
+            &body_text,
+            runtime.mcp_server.as_ref(),
+            crate::agenda::AgendaActor::from_binding(&actor),
+        )
+        .await,
+        "agenda stamp",
     )
 }
 

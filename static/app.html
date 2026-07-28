@@ -36882,7 +36882,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'd176cbd77cce5465';
+const INTENDANT_APP_BUILD = 'bf2935f619239f05';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39494,6 +39494,9 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_codex_cloud_workers: { verb: 'GET', path: '/api/codex-cloud/workers', query: ['refresh'] },
   api_agenda_list: { verb: 'GET', path: '/api/agenda' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
+  api_agenda_definitions: { verb: 'GET', path: '/api/agenda/definitions' },
+  api_agenda_sealed: { verb: 'GET', path: '/api/agenda/sealed/{sha256}' },
+  api_agenda_stamp: { verb: 'POST', path: '/api/agenda/stamp' },
   api_agenda_ref_drift: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/drift' },
   api_agenda_reminder_policy: { verb: 'POST', path: '/api/agenda/reminders/policy' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
