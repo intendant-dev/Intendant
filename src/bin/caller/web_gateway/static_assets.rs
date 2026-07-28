@@ -777,6 +777,119 @@ mod tests {
         assert!(inspector.contains("Re-proposed since your last approval"));
     }
 
+    /// Track AW slice 3, the automate-sheet half of the emission-shape
+    /// law, retargeted to the generic served-catalog flow (the
+    /// mandate_templates.rs twin of this pin dies with the registry at
+    /// cutover; this copy carries the law forward): the sheet consumes
+    /// the served definition catalog and stamps through the daemon's
+    /// stamp op — it neither proposes nor approves client-side, so the
+    /// owner's per-effect digest ceremony stays the only arming act.
+    #[test]
+    fn automate_sheet_consumes_the_catalog_and_never_approves() {
+        let sheet = include_str!("../../../../static/app/ui2-agenda.js");
+        assert!(
+            sheet.contains("api_agenda_definitions"),
+            "the automate sheet must read the served definition catalog"
+        );
+        assert!(
+            sheet.contains("api_agenda_stamp"),
+            "the automate sheet must stamp through the daemon's stamp op"
+        );
+        assert_eq!(
+            sheet.matches("approve_effect").count(),
+            0,
+            "the automate sheet cannot approve — the ceremony stays the owner's"
+        );
+        assert_eq!(
+            sheet.matches("propose_effect").count(),
+            0,
+            "the sheet stamps through the daemon — client-side proposing was the registry era"
+        );
+        // Refusals stay visible: invalid and shadowed entries render
+        // disabled with their reason, never hidden.
+        assert!(sheet.contains("invalid definition"));
+        assert!(sheet.contains("shadowed by a personal definition of the same name"));
+    }
+
+    /// Track AW slice 3, the workflow half of the emission-shape law,
+    /// retargeted to the generic flow (twin of
+    /// workflow_approval_sheet_approves_only_in_the_owner_confirm_lane
+    /// in mandate_templates.rs, which dies with the registry at
+    /// cutover): the workflow and triggered lanes stamp through the
+    /// daemon (no client-side graph assembly survives), the approval
+    /// sheet renders the sealed bytes from the content-addressed
+    /// serving lane, and the approval lane stays exactly one emitter —
+    /// one `approve_effect`, inside `agendaWorkflowEmitApprovals`,
+    /// iterating exactly the stamped node set, called once from the
+    /// owner-confirm handler.
+    #[test]
+    fn workflow_surfaces_stamp_through_the_daemon_with_one_emitter() {
+        let fragment = include_str!("../../../../static/app/ui2-agenda-workflows.js");
+        assert!(
+            fragment.contains("api_agenda_stamp"),
+            "the workflow lanes must stamp through the daemon's stamp op"
+        );
+        assert!(
+            fragment.contains("api_agenda_sealed"),
+            "the approval sheet must render the sealed bytes from the serving lane"
+        );
+        // The daemon owns graph assembly now: no client-side parking,
+        // placing, edge-drawing, or proposing survives in this fragment.
+        for gone in [
+            "add_relies_on",
+            "propose_effect",
+            "op: 'place'",
+            "op: 'add'",
+        ] {
+            assert_eq!(
+                fragment.matches(gone).count(),
+                0,
+                "client-side graph assembly must not survive the stamp-op rewire: found {gone:?}"
+            );
+        }
+        // The emission shape, unweakened: exactly one approve_effect in
+        // the fragment, inside the single pinned emitter, iterating the
+        // stamped node set, with exactly one call site that lives in the
+        // owner-confirm handler.
+        assert_eq!(
+            fragment.matches("approve_effect").count(),
+            1,
+            "the fragment must contain exactly one approval emission site"
+        );
+        let (_, emitter) = fragment
+            .split_once("async function agendaWorkflowEmitApprovals(")
+            .expect("the pinned emitter must exist");
+        let body = emitter
+            .split_once("\n}")
+            .expect("the emitter body must close")
+            .0;
+        assert!(
+            body.contains("for (const node of batch.nodes)"),
+            "the emitter iterates exactly the stamped node set"
+        );
+        assert!(
+            body.contains("approve_effect"),
+            "the one emission lives inside the pinned emitter"
+        );
+        assert_eq!(
+            fragment
+                .matches("agendaWorkflowEmitApprovals(stamped)")
+                .count(),
+            1,
+            "exactly one call site invokes the emitter"
+        );
+        let confirm = fragment
+            .find("async function agendaWorkflowApproveConfirm(")
+            .expect("the owner-confirm handler must exist");
+        let call = fragment
+            .find("agendaWorkflowEmitApprovals(stamped)")
+            .expect("the emitter call site must exist");
+        assert!(
+            call > confirm,
+            "the emitter is called from the owner-confirm handler, nowhere earlier"
+        );
+    }
+
     /// The ledger search executes SPA-side — `agendaSearchMatch` filters
     /// the served item snapshot in the browser (the daemon serves items
     /// unfiltered) — so the digest lane is pinned at the fragment:
