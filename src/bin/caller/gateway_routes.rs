@@ -404,6 +404,15 @@ pub(crate) enum RouteHandlerId {
     AgendaOccurrences,
     /// Apply one agenda command (add/ask/answer/patch/transitions/effects).
     AgendaOp,
+    /// The automation-definition catalog (Track AW: house + personal
+    /// libraries, validation state, full text).
+    AgendaDefinitions,
+    /// One sealed binding-ref snapshot's bytes by sha256 pin (read-only,
+    /// content-addressed).
+    AgendaSealed,
+    /// Stamp one automation definition (park + propose the instance
+    /// graph; never approves).
+    AgendaStamp,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1008,6 +1017,43 @@ pub(crate) static ROUTES: &[Route] = &[
         "Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
+    // The automation-definition catalog (Track AW): read-only discovery
+    // of the house + personal libraries with validation state — listing
+    // grants nothing; bindingness requires the stamp seal under an
+    // approval digest.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/agenda/definitions"),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaDefinitions,
+        "Automation-definition catalog (house + personal, validation state, full text)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_definitions")),
+    // Sealed binding-ref snapshots (Track AW): the read lane behind
+    // sealed-content rendering — content-addressed and immutable; the
+    // served bytes re-hash to the requested pin or the request errors.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments("/api/agenda/sealed", &[SegmentSpec::Capture("sha256")]),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaSealed,
+        "One sealed binding-ref snapshot by sha256 pin (read-only, content-addressed)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_sealed")),
+    // Stamp = sealing (Track AW): park + propose one definition's
+    // instance graph through the ordinary intake. Never approves — the
+    // response is the stamped graph the approval sheet renders.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/agenda/stamp"),
+        PeerOperation::AgendaWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::AgendaStamp,
+        "Stamp an automation definition (park + propose the instance graph; never approves)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_stamp")),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
     // dashboard consumes via authenticated fetch. HTTP-only for now — the

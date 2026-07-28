@@ -679,6 +679,21 @@ never instruction. The embedded house set materializes into
 `<state root>/automations/.house/` at boot, so stamps have a real path
 to hash and seal on installs without a repo checkout.
 
+Surfaces: `GET /api/agenda/definitions` (tunnel twin
+`api_agenda_definitions`) serves the **catalog** — house + personal
+entries, per-name shadowing visible, validation state with
+invalid-with-reason entries and advisory chips, and each definition's
+full text; `POST /api/agenda/stamp` (`api_agenda_stamp`) runs the stamp
+and returns the whole stamped graph (hub, nodes, digests, the sealed
+pin) for the approval sheet; `GET /api/agenda/sealed/{sha256}`
+(`api_agenda_sealed`) serves one sealed snapshot's bytes,
+content-addressed and re-hashed against the pin, so a card revisited
+after "Later" renders exactly what was sealed. From the CLI,
+`ctl agenda stamp <name|file:…/SKILL.md> [--project DIR] [--at WHEN]
+[--every INTERVAL] [--suspend-after N] [--agent …]` rides the ordinary
+op lane (works from owner shells and supervised sessions alike);
+approval stays per-effect on the dashboard or `ctl agenda approve`.
+
 ### The housekeeping recipe
 
 A deliberate review pass over the whole agenda, built entirely from the
