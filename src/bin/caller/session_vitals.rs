@@ -644,21 +644,66 @@ pub(crate) struct SessionVitalsHub {
     /// wrapper). Chains are flattened at link time so `resolve` is one
     /// hop in practice; the hop cap is a cycle guard only.
     pub(crate) aliases: Mutex<HashMap<String, String>>,
-    /// canonical id → backend source ("claude-code", "codex"), fed by
-    /// `SessionIdentity`. Membership key for the account-scoped limits
-    /// fold; native sessions never appear here.
-    pub(crate) session_sources: Mutex<HashMap<String, String>>,
-    /// Per backend source: the account's latest known rate-limit windows,
-    /// by label, freshest report per window (`observed_at_epoch`). The
-    /// account outlives any one session, so a session starting mid-warning
-    /// inherits the known state instead of claiming ignorance.
-    pub(crate) account_limits:
-        Mutex<HashMap<String, std::collections::BTreeMap<String, SessionLimitWindow>>>,
+    /// canonical id → the (backend source, credential era) the session
+    /// was spawned or last credential-reloaded under, fed by
+    /// `SessionIdentity` (every backend process announce — spawns AND
+    /// reload respawns re-key here). Membership key for the era-scoped
+    /// limits fold; native sessions never appear here.
+    pub(crate) session_sources: Mutex<HashMap<String, SessionAccountMembership>>,
+    /// Per backend source, per credential era: the era's latest known
+    /// rate-limit windows, by label, freshest report per window
+    /// (`observed_at_epoch`). The provider wire carries no account
+    /// identity, so without the era key two accounts' same-label windows
+    /// overwrite each other into a chimera (proven live 2026-07-27: a 5h
+    /// reset anchor jumping backward between two interleaved accounts).
+    /// An era outlives any one session — a session starting mid-warning
+    /// inherits its era's known state instead of claiming ignorance.
+    pub(crate) account_limits: Mutex<HashMap<String, SourceLimitEras>>,
+    /// Per backend source: the era new members join (the credential
+    /// store's account as of the last observed sign-in ceremony), plus
+    /// the mint counter for label-less eras. Persisted with the window
+    /// store so restored sessions rejoin the right era after a restart.
+    pub(crate) backend_accounts: Mutex<BackendAccountEras>,
     /// Daemon state file the account window store persists to (see
     /// `session_vitals_restore::account_limit_store`) so a restart keeps
     /// the account's last known windows; `None` disables persistence
     /// (unit tests, embedded producers).
     pub(crate) limit_store: Option<PathBuf>,
+}
+
+/// Credential-era key inside one backend source: the account label a
+/// window or session belongs to. `None` is the unattributed era —
+/// credentials the daemon never observed a sign-in for (pre-ceremony
+/// spawns, legacy persisted stores). At most one unattributed era exists
+/// per source, so daemon-unmediated credential swaps still fold together
+/// — the irreducible limit of an identity-less wire.
+pub(crate) type AccountEra = Option<String>;
+
+/// One source's window stores, era-keyed. `BTreeMap` for deterministic
+/// persist order (unattributed first, then labels ascending).
+pub(crate) type SourceLimitEras =
+    std::collections::BTreeMap<AccountEra, std::collections::BTreeMap<String, SessionLimitWindow>>;
+
+/// A session's account-fold membership: the backend it reports for and
+/// the credential era it was handed at its last process announce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionAccountMembership {
+    pub(crate) source: String,
+    pub(crate) account: AccountEra,
+}
+
+/// The per-source current-era registry (see
+/// [`SessionVitalsHub::observe_backend_account`]).
+#[derive(Debug, Default)]
+pub(crate) struct BackendAccountEras {
+    /// source → the era new spawns/reloads join. An absent key means the
+    /// unattributed era is current (no sign-in observed yet).
+    pub(crate) current: HashMap<String, AccountEra>,
+    /// Monotonic mint counter for label-less eras ("era-N"): a sign-in
+    /// whose probe stated no account still changed the credential store,
+    /// and folding on as if nothing happened is the chimera this keying
+    /// exists to prevent.
+    pub(crate) seq: u64,
 }
 
 impl SessionVitalsHub {
@@ -676,7 +721,7 @@ impl SessionVitalsHub {
     /// `observed_at_epoch`, and the frontends' reset-rollover degradation
     /// already refuses to present a lapsed window as current.
     pub(crate) fn with_limit_store(bus: EventBus, limit_store: Option<PathBuf>) -> Arc<Self> {
-        let account_limits = limit_store
+        let restored = limit_store
             .as_deref()
             .map(crate::session_vitals_restore::load_account_limit_store)
             .unwrap_or_default();
@@ -685,7 +730,11 @@ impl SessionVitalsHub {
             sessions: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
             session_sources: Mutex::new(HashMap::new()),
-            account_limits: Mutex::new(account_limits),
+            account_limits: Mutex::new(restored.limits),
+            backend_accounts: Mutex::new(BackendAccountEras {
+                current: restored.current,
+                seq: restored.era_seq,
+            }),
             limit_store,
         })
     }
@@ -752,11 +801,15 @@ impl SessionVitalsHub {
         }
     }
 
-    /// Full `SessionIdentity` fold: alias linkage plus account-scope
-    /// membership. Recording the source seeds the account's known window
+    /// Full `SessionIdentity` fold: alias linkage plus era-scope
+    /// membership. Recording the membership seeds the era's known window
     /// state into the session (a session starting mid-warning must not
-    /// claim "ok"), and any windows the session accumulated before its
-    /// identity landed seed the account store in turn.
+    /// claim "ok"); on a FIRST join, any windows the session accumulated
+    /// before its identity landed seed the era store in turn. A re-link
+    /// (a respawn's re-announce — the credential-reload path) must NOT
+    /// re-seed: the session's limits are then the hub's own mirror of its
+    /// previous era, and folding them into the new era would relabel the
+    /// old account's numbers as the new one's.
     fn link_identity(&self, alias: &str, canonical: &str, source: &str) {
         self.link_alias(alias, canonical);
         let source = source.trim();
@@ -767,69 +820,229 @@ impl SessionVitalsHub {
         if canonical.is_empty() {
             return;
         }
-        self.session_sources
-            .lock()
-            .expect("vitals source lock")
-            .insert(canonical.clone(), source.to_string());
-        let pre_identity = self
-            .sessions
-            .lock()
-            .expect("vitals state lock")
-            .get(&canonical)
-            .map(|vitals| vitals.limits.clone())
-            .unwrap_or_default();
+        let previous = self.record_membership(&canonical, source);
+        let pre_identity = if previous.is_some() {
+            Vec::new()
+        } else {
+            self.sessions
+                .lock()
+                .expect("vitals state lock")
+                .get(&canonical)
+                .map(|vitals| vitals.limits.clone())
+                .unwrap_or_default()
+        };
         self.apply_rate_limit_windows(&canonical, pre_identity);
     }
 
+    /// The era a `source`'s new members join right now.
+    fn current_era(&self, source: &str) -> AccountEra {
+        self.backend_accounts
+            .lock()
+            .expect("vitals era lock")
+            .current
+            .get(source)
+            .cloned()
+            .unwrap_or(None)
+    }
+
+    /// Record `canonical` as a member of `source`'s CURRENT credential
+    /// era. Backends re-read the credential store only at process start,
+    /// and `SessionIdentity` fires exactly at process announces — so both
+    /// a fresh spawn and a credential-reload respawn stamp here, and a
+    /// reload re-keys the session out of its birth era. A re-key that
+    /// empties a non-current era retires that era's windows: the last
+    /// member carried them out. Returns the membership this stamp
+    /// replaced (`None` on a session's first join).
+    pub(crate) fn record_membership(
+        &self,
+        canonical: &str,
+        source: &str,
+    ) -> Option<SessionAccountMembership> {
+        let membership = SessionAccountMembership {
+            source: source.to_string(),
+            account: self.current_era(source),
+        };
+        let previous = self
+            .session_sources
+            .lock()
+            .expect("vitals source lock")
+            .insert(canonical.to_string(), membership.clone());
+        if let Some(rekeyed) = previous
+            .as_ref()
+            .filter(|previous| **previous != membership)
+        {
+            if self.retire_era_if_orphaned(&rekeyed.source, &rekeyed.account) {
+                self.persist_account_limits();
+            }
+            if rekeyed.source != membership.source {
+                self.remirror_source(&rekeyed.source);
+            }
+        }
+        previous
+    }
+
+    /// A sign-in ceremony completed for `source`: open the credential era
+    /// new spawns and reloads will join. `label` is the ceremony's
+    /// account when the provider probe stated one; a label-less success
+    /// mints an opaque era nonce — the credential store changed either
+    /// way. Re-signing into the SAME labeled account keeps its era (the
+    /// windows are account-anchored truth). Existing sessions keep their
+    /// birth era — they run on the credentials they were spawned with
+    /// until a reload respawns them — and the superseded era's bucket
+    /// retires immediately only when nothing references it (it survived
+    /// memberless purely as the then-active account's truth).
+    pub(crate) fn observe_backend_account(&self, source: &str, label: Option<String>) {
+        let source = source.trim();
+        if source.is_empty() {
+            return;
+        }
+        let previous = {
+            let mut eras = self.backend_accounts.lock().expect("vitals era lock");
+            let era = match label
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+            {
+                Some(label) => Some(label),
+                None => {
+                    eras.seq += 1;
+                    Some(format!("era-{}", eras.seq))
+                }
+            };
+            let previous = eras.current.insert(source.to_string(), era.clone());
+            if previous == Some(era) {
+                return;
+            }
+            previous.unwrap_or(None)
+        };
+        self.retire_era_if_orphaned(source, &previous);
+        // The current-era registry changed regardless of retirement.
+        self.persist_account_limits();
+    }
+
+    /// Drop `era`'s window bucket for `source` when it has no member
+    /// sessions left AND it is not the era new members would join — the
+    /// active account's windows deliberately survive memberless (account
+    /// truth the next session inherits), a switched-out account's die
+    /// with their last member. Returns whether a bucket was removed.
+    fn retire_era_if_orphaned(&self, source: &str, era: &AccountEra) -> bool {
+        if self.current_era(source) == *era {
+            return false;
+        }
+        let has_members = self
+            .session_sources
+            .lock()
+            .expect("vitals source lock")
+            .values()
+            .any(|member| member.source == source && member.account == *era);
+        if has_members {
+            return false;
+        }
+        let mut accounts = self.account_limits.lock().expect("vitals account lock");
+        let Some(eras) = accounts.get_mut(source) else {
+            return false;
+        };
+        let removed = eras.remove(era).is_some();
+        if removed && eras.is_empty() {
+            accounts.remove(source);
+        }
+        removed
+    }
+
+    /// Deliver every member session of `source` its own era's window
+    /// view. The `account` stamp on delivered windows is the multi-era
+    /// cue: present only while more than one era has live members, so the
+    /// frontends label ambiguous chips apart and a single-era steady
+    /// state renders exactly as before (the unattributed era never
+    /// stamps — the daemon has no truthful label to give it). A member
+    /// whose era holds no windows gets an EMPTY view: after a re-key the
+    /// alternative is the old era's chips lingering on a session that no
+    /// longer runs those credentials.
+    fn remirror_source(&self, source: &str) {
+        let members: Vec<(String, AccountEra)> = {
+            let sources = self.session_sources.lock().expect("vitals source lock");
+            sources
+                .iter()
+                .filter(|(_, member)| member.source == source)
+                .map(|(id, member)| (id.clone(), member.account.clone()))
+                .collect()
+        };
+        if members.is_empty() {
+            return;
+        }
+        let live_eras: std::collections::BTreeSet<&AccountEra> =
+            members.iter().map(|(_, era)| era).collect();
+        let multiple = live_eras.len() > 1;
+        for (member, era) in &members {
+            let view: Vec<SessionLimitWindow> = {
+                let accounts = self.account_limits.lock().expect("vitals account lock");
+                accounts
+                    .get(source)
+                    .and_then(|eras| eras.get(era))
+                    .map(|store| {
+                        store
+                            .values()
+                            .map(|window| {
+                                let mut window = window.clone();
+                                window.account = if multiple { era.clone() } else { None };
+                                window
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            self.apply(member, |vitals| vitals.limits = view);
+        }
+    }
+
     /// Fold a rate-limit report from `session_id` into the vitals limit
-    /// gauges. Sessions with a backend source share one ACCOUNT view: the
-    /// report merges into the source's window store (per label, freshest
-    /// `observed_at_epoch` wins) and the merged view mirrors into every
-    /// session of that source. Sourceless (native) sessions keep
-    /// per-session windows. An empty report still mirrors the account
-    /// view — that is how a newly linked session inherits known state.
+    /// gauges. Sessions with a backend source share one view PER
+    /// (source, credential era): the report — stamped with the reporting
+    /// session's era, since the wire itself carries no identity — merges
+    /// into that era's window store (per label, freshest
+    /// `observed_at_epoch` wins) and every member session of the source
+    /// then receives its own era's view. Sourceless (native) sessions
+    /// keep per-session windows. An empty report still re-mirrors — that
+    /// is how a newly linked session inherits known state.
     pub(crate) fn apply_rate_limit_windows(
         &self,
         session_id: &str,
         windows: Vec<SessionLimitWindow>,
     ) {
         let session_id = self.resolve(session_id);
-        let source = self
+        let membership = self
             .session_sources
             .lock()
             .expect("vitals source lock")
             .get(&session_id)
             .cloned();
-        let Some(source) = source else {
+        let Some(SessionAccountMembership { source, account }) = membership else {
             if !windows.is_empty() {
                 self.apply(&session_id, |vitals| vitals.limits = windows);
             }
             return;
         };
-        let (merged, store_changed): (Vec<SessionLimitWindow>, bool) = {
-            let mut accounts = self.account_limits.lock().expect("vitals account lock");
-            let store = accounts.entry(source.clone()).or_default();
-            let changed = fold_limit_windows(store, &windows);
-            (store.values().cloned().collect(), changed)
-        };
-        if store_changed {
-            self.persist_account_limits();
+        if !windows.is_empty() {
+            let stamped: Vec<SessionLimitWindow> = windows
+                .into_iter()
+                .map(|mut window| {
+                    window.account = account.clone();
+                    window
+                })
+                .collect();
+            let store_changed = {
+                let mut accounts = self.account_limits.lock().expect("vitals account lock");
+                let store = accounts
+                    .entry(source.clone())
+                    .or_default()
+                    .entry(account.clone())
+                    .or_default();
+                fold_limit_windows(store, &stamped)
+            };
+            if store_changed {
+                self.persist_account_limits();
+            }
         }
-        if merged.is_empty() {
-            return;
-        }
-        let members: Vec<String> = {
-            let sources = self.session_sources.lock().expect("vitals source lock");
-            sources
-                .iter()
-                .filter(|(_, member_source)| member_source.as_str() == source)
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-        for member in members {
-            let view = merged.clone();
-            self.apply(&member, |vitals| vitals.limits = view);
-        }
+        self.remirror_source(&source);
     }
 
     pub(crate) fn apply(&self, session_id: &str, update: impl FnOnce(&mut SessionVitals)) {
@@ -915,21 +1128,32 @@ impl SessionVitalsHub {
             sessions.remove(session_id.trim());
             sessions.remove(&canonical);
         }
-        {
+        let membership = {
             let mut sources = self.session_sources.lock().expect("vitals source lock");
-            sources.remove(session_id.trim());
-            sources.remove(&canonical);
-        }
+            let trimmed = sources.remove(session_id.trim());
+            sources.remove(&canonical).or(trimmed)
+        };
         // Drop the group's alias records too — an ended session's ids
         // never come back, and the map otherwise grows for daemon-life.
-        // The account window stores deliberately survive: they are account
-        // truth, and the next session of that backend inherits them.
+        // The ACTIVE era's window store deliberately survives: it is
+        // account truth, and the next session of that backend inherits
+        // it. A switched-out era's store dies with its last member —
+        // nothing will ever refresh it, and reviving it on a future
+        // session would present another account's numbers as current.
         self.aliases
             .lock()
             .expect("vitals alias lock")
             .retain(|alias, target| {
                 alias != session_id.trim() && target != &canonical && alias != &canonical
             });
+        if let Some(membership) = membership {
+            if self.retire_era_if_orphaned(&membership.source, &membership.account) {
+                self.persist_account_limits();
+            }
+            // The live-era set may have shrunk to one — the remaining
+            // members' chips drop their account suffixes.
+            self.remirror_source(&membership.source);
+        }
     }
 }
 
@@ -1119,6 +1343,12 @@ pub(crate) fn spawn_cache_vitals_listener(
                     backend_session_id,
                     source,
                 }) => hub.link_identity(&backend_session_id, &session_id, &source),
+                // A sign-in ceremony completed: open the backend's new
+                // credential era (spawns/reloads from here on report
+                // under it; running sessions keep their birth era).
+                Ok(AppEvent::BackendCredentialAccount { source, account }) => {
+                    hub.observe_backend_account(&source, account);
+                }
                 Ok(AppEvent::SessionEnded { session_id, .. }) => hub.remove(&session_id),
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -3182,6 +3412,7 @@ mod tests {
             resets_at_epoch: Some(1_783_807_200),
             status: None,
             observed_at_epoch: Some(1_783_800_000),
+            account: None,
         }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
@@ -3244,6 +3475,7 @@ mod tests {
             resets_at_epoch: Some(observed_at + 3_600),
             status: Some("allowed_warning".into()),
             observed_at_epoch: Some(observed_at),
+            account: None,
         }
     }
 
@@ -3386,6 +3618,258 @@ mod tests {
         })
         .await
         .expect("fresh recovery reaches the vitals");
+    }
+
+    /// A session's mirrored limit view, straight from the hub state.
+    fn limits_of(
+        hub: &SessionVitalsHub,
+        session_id: &str,
+    ) -> Vec<crate::types::SessionLimitWindow> {
+        hub.sessions
+            .lock()
+            .expect("vitals state lock")
+            .get(session_id)
+            .map(|vitals| vitals.limits.clone())
+            .unwrap_or_default()
+    }
+
+    /// THE COMMISSIONED KEYING PIN (2026-07-28): the limits fold is keyed
+    /// (backend, credential era), so same-label windows from different
+    /// accounts COEXIST — a fresher report from account B may never
+    /// overwrite account A's window (the live chimera of 2026-07-27: a 5h
+    /// reset anchor jumping backward within minutes as two accounts'
+    /// wrappers interleaved through one unkeyed bucket). Each session's
+    /// mirror carries exactly its own era's windows. A label-less sign-in
+    /// still opens a fresh era under a minted nonce.
+    #[test]
+    fn limit_windows_keyed_by_account_era() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.observe_backend_account("claude-code", Some("a@x".into()));
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows(
+            "native-a",
+            vec![crate::types::SessionLimitWindow {
+                resets_at_epoch: Some(5_000),
+                ..warn_window(1_000)
+            }],
+        );
+
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        hub.link_identity("native-b", "wrapper-b", "claude-code");
+        // Fresher observation, same label, different reset anchor: under
+        // the old (backend, label) keying this overwrote account A.
+        hub.apply_rate_limit_windows(
+            "native-b",
+            vec![crate::types::SessionLimitWindow {
+                resets_at_epoch: Some(9_000),
+                status: Some("allowed".into()),
+                ..warn_window(2_000)
+            }],
+        );
+
+        let a = limits_of(&hub, "wrapper-a");
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a[0].resets_at_epoch,
+            Some(5_000),
+            "account B's fresher report may not move account A's anchor"
+        );
+        assert_eq!(a[0].account.as_deref(), Some("a@x"));
+        let b = limits_of(&hub, "wrapper-b");
+        assert_eq!(b[0].resets_at_epoch, Some(9_000));
+        assert_eq!(b[0].account.as_deref(), Some("b@x"));
+
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            let eras = accounts.get("claude-code").expect("source store");
+            assert_eq!(eras.len(), 2, "both eras' buckets coexist");
+            assert_eq!(
+                eras[&Some("a@x".to_string())]["5h"].resets_at_epoch,
+                Some(5_000)
+            );
+            assert_eq!(
+                eras[&Some("b@x".to_string())]["5h"].resets_at_epoch,
+                Some(9_000)
+            );
+        }
+
+        // A sign-in whose probe stated no label mints an opaque era: the
+        // credential store changed, and pretending otherwise re-opens the
+        // chimera.
+        hub.observe_backend_account("claude-code", None);
+        assert_eq!(hub.current_era("claude-code").as_deref(), Some("era-1"));
+    }
+
+    /// THE COMMISSIONED EVICTION PIN (2026-07-28): when the last member
+    /// session of a NON-active era ends, the era's windows evict — nothing
+    /// will ever refresh them, and the next session would inherit another
+    /// account's numbers as current. The ACTIVE era's store deliberately
+    /// survives memberless: it is account truth for the next spawn.
+    #[test]
+    fn stale_era_windows_evict_on_last_member_end() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.observe_backend_account("claude-code", Some("a@x".into()));
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows("native-a", vec![warn_window(1_000)]);
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        hub.link_identity("native-b", "wrapper-b", "claude-code");
+        hub.apply_rate_limit_windows("native-b", vec![warn_window(2_000)]);
+
+        // Two live eras: B's view is era-labeled.
+        assert_eq!(
+            limits_of(&hub, "wrapper-b")[0].account.as_deref(),
+            Some("b@x")
+        );
+
+        hub.remove("wrapper-a");
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            let eras = accounts.get("claude-code").expect("source store");
+            assert!(
+                !eras.contains_key(&Some("a@x".to_string())),
+                "switched-out era dies with its last member"
+            );
+            assert!(eras.contains_key(&Some("b@x".to_string())));
+        }
+        // Back to a single era: the survivor's chips drop the suffix.
+        assert_eq!(limits_of(&hub, "wrapper-b")[0].account, None);
+
+        // The ACTIVE era survives its last member's end.
+        hub.remove("wrapper-b");
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            let eras = accounts.get("claude-code").expect("source store");
+            assert!(
+                eras.contains_key(&Some("b@x".to_string())),
+                "the active account's windows are the next session's inheritance"
+            );
+        }
+    }
+
+    /// THE COMMISSIONED RELOAD PIN (2026-07-28): a credential reload
+    /// respawns the backend process, which re-announces its identity —
+    /// re-keying the session into the CURRENT era. Until then the running
+    /// wrapper keeps reporting into its BIRTH era (it still runs on the
+    /// credentials it was spawned with); after the re-key the old era
+    /// retires when the session was its last member, and the session's
+    /// view stops showing the old account's windows at once.
+    #[test]
+    fn reload_rekeys_membership_and_retires_old_era() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.observe_backend_account("claude-code", Some("a@x".into()));
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows("native-a", vec![warn_window(1_000)]);
+
+        // Vault sign-in to B: the RUNNING wrapper still reports its birth
+        // account's windows — they must keep folding into era A.
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        hub.apply_rate_limit_windows(
+            "native-a",
+            vec![crate::types::SessionLimitWindow {
+                resets_at_epoch: Some(7_777),
+                ..warn_window(1_500)
+            }],
+        );
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            let eras = accounts.get("claude-code").expect("source store");
+            assert_eq!(
+                eras[&Some("a@x".to_string())]["5h"].resets_at_epoch,
+                Some(7_777),
+                "pre-reload reports stay in the birth era"
+            );
+            assert!(!eras.contains_key(&Some("b@x".to_string())));
+        }
+
+        // Reload: the respawned process re-announces identity (the same
+        // ids), which re-keys membership to the current era.
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        {
+            let sources = hub.session_sources.lock().expect("vitals source lock");
+            assert_eq!(
+                sources.get("wrapper-a").map(|m| m.account.clone()),
+                Some(Some("b@x".to_string()))
+            );
+        }
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            assert!(
+                !accounts
+                    .get("claude-code")
+                    .is_some_and(|eras| eras.contains_key(&Some("a@x".to_string()))),
+                "the re-key carried the old era's last member out — its windows retire"
+            );
+        }
+        assert!(
+            limits_of(&hub, "wrapper-a").is_empty(),
+            "the old account's chips stop rendering on the reloaded session"
+        );
+
+        // The next report lands in the new era.
+        hub.apply_rate_limit_windows("native-a", vec![warn_window(2_000)]);
+        {
+            let accounts = hub.account_limits.lock().expect("vitals account lock");
+            let eras = accounts.get("claude-code").expect("source store");
+            assert!(eras.contains_key(&Some("b@x".to_string())));
+        }
+        assert_eq!(limits_of(&hub, "wrapper-a")[0].account, None);
+    }
+
+    /// THE COMMISSIONED SUFFIX PIN (2026-07-28), daemon half: delivered
+    /// windows carry their era's account label ONLY while more than one
+    /// era has live members — the single-era steady state renders exactly
+    /// as before, and the unattributed era never stamps (the daemon has
+    /// no truthful label to give it; its chips stay plain and the LABELED
+    /// era's suffix is what tells them apart). The SPA half renders the
+    /// suffix whenever `account` is present — pinned against the fragment
+    /// beside the wire-parity test.
+    #[test]
+    fn chips_suffix_account_only_when_multiple_eras() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        // Pre-ceremony spawn: the unattributed era, alone — no stamp.
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows("native-a", vec![warn_window(1_000)]);
+        assert_eq!(limits_of(&hub, "wrapper-a")[0].account, None);
+
+        // A labeled era joins: the labeled member's windows stamp, the
+        // unattributed member's stay plain — and the existing member was
+        // re-mirrored without any report of its own.
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        hub.link_identity("native-b", "wrapper-b", "claude-code");
+        hub.apply_rate_limit_windows("native-b", vec![warn_window(2_000)]);
+        assert_eq!(limits_of(&hub, "wrapper-a")[0].account, None);
+        assert_eq!(
+            limits_of(&hub, "wrapper-b")[0].account.as_deref(),
+            Some("b@x")
+        );
+
+        // The unattributed member ends: single era again — the stamp
+        // drops from the survivor without a fresh report.
+        hub.remove("wrapper-a");
+        assert_eq!(limits_of(&hub, "wrapper-b")[0].account, None);
+
+        // SPA half: the vitals catalog consumes the account field and
+        // renders it as the chip suffix.
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        let begin = fragment.find("VITALS_SYMBOLS_BEGIN").expect("begin marker");
+        let end = fragment.find("VITALS_SYMBOLS_END").expect("end marker");
+        let catalog = &fragment[begin..end];
+        assert!(
+            catalog.contains("vitalsLimitAccountShort(v.account)"),
+            "the limit chip grammar renders the account suffix from the single map"
+        );
     }
 
     /// The pure fold: union by label, freshest wins, unstamped incumbents
@@ -3626,6 +4110,9 @@ mod tests {
             "status",
             "observedAtEpoch",
             "label",
+            // Credential-era attribution (present only under multi-era
+            // ambiguity — the chip-suffix cue).
+            "account",
             "state",
             "sinceEpoch",
             "lastStreamByteEpoch",
@@ -3701,5 +4188,99 @@ mod tests {
                 "fragment 41 lost the context-meter vitals fallback ({marker})"
             );
         }
+    }
+
+    /// The vitals-catalog slice of fragment 39 (VITALS_SYMBOLS_BEGIN..END).
+    fn vitals_catalog_slice() -> String {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        let begin = fragment
+            .find("VITALS_SYMBOLS_BEGIN")
+            .expect("catalog begin marker");
+        let end = fragment
+            .find("VITALS_SYMBOLS_END")
+            .expect("catalog end marker");
+        fragment[begin..end].to_string()
+    }
+
+    /// THE COMMISSIONED LABELING PIN (2026-07-28, Part 1 of the sealed
+    /// findings): the 7-day overage window is a DISTINCT provider window
+    /// — beside the base 7d chip, an identical prefix and pixel-identical
+    /// gauge icon made two real allowances read as one chip rendered
+    /// twice. Both distinctions live in the single label/symbol map
+    /// ("derive, don't mirror"): the short label says "7d extra", the
+    /// long name says "extra usage", and the icon resolver hands the
+    /// overage window its own glyph variant.
+    #[test]
+    fn overage_window_labeled_distinct_in_the_single_map() {
+        let catalog = vitals_catalog_slice();
+        assert!(
+            catalog.contains("'7d extra'"),
+            "vitalsLimitLabelShort lost the overage window's distinct short label"
+        );
+        assert!(
+            catalog.contains("'7-day extra usage'"),
+            "vitalsLimitLabelLong lost the overage window's product wording"
+        );
+        assert!(
+            catalog.contains("'gauge-plus' : 'gauge'"),
+            "the limit icon resolver stopped giving the overage window its own glyph"
+        );
+        // The variant glyph must actually exist in the icon set, outside
+        // the catalog slice.
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        assert!(
+            fragment.contains("'gauge-plus':"),
+            "VITALS_ICON_PATHS lost the gauge-plus glyph"
+        );
+    }
+
+    /// THE COMMISSIONED A11Y PIN (2026-07-28, Part 1 of the sealed
+    /// findings): the 1 Hz in-place ticker updates chip text and title —
+    /// and must update `aria-label` in the same pass (both the per-window
+    /// chips and the compact attention chip, through the one shared aria
+    /// grammar). The drift seen live: aria announcing ↻2:25:14 against a
+    /// visible ↻2:07:43 in a long-lived grid.
+    #[test]
+    fn aria_countdown_tracks_ticker() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        let tick_start = fragment
+            .find("win.vitals.dataset.vitSig === signature")
+            .expect("stable-DOM tick fast path");
+        let tick_end = fragment[tick_start..]
+            .find("return models.some((m) => m.ticking);")
+            .map(|offset| tick_start + offset)
+            .expect("tick fast path return");
+        let tick_path = &fragment[tick_start..tick_end];
+        assert!(
+            tick_path.contains("chip.setAttribute('aria-label'"),
+            "the in-place ticker stopped refreshing chip aria-labels"
+        );
+        assert!(
+            tick_path.contains(
+                "attnChip.setAttribute('aria-label', vitalsAttentionAriaLabel(attention))"
+            ),
+            "the in-place ticker stopped refreshing the attention chip's aria-label"
+        );
+        // One aria grammar, used by build AND tick — the announced text
+        // can never fork from the rendered text.
+        assert_eq!(
+            fragment
+                .matches("setAttribute('aria-label', vitalsAttentionAriaLabel(attention))")
+                .count(),
+            2,
+            "build and tick must share the single attention aria grammar"
+        );
     }
 }

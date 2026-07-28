@@ -966,10 +966,26 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
-  if (label === '7d-overage') return '7-day overage';
+  // Claude's own product wording: the overage window is the paid "extra
+  // usage" allowance, and naming it a variant of "7-day" is what made
+  // two distinct gauges read as one chip rendered twice.
+  if (label === '7d-overage') return '7-day extra usage';
   // Unknown window names arrive as raw provider vocabulary — keep every
   // word (the pane owns the full name), just soften the wire spelling.
   return String(label || '').replace(/_/g, ' ').trim();
+}
+
+// Compact chip form of a window's credential-era account label. The
+// daemon sends `account` only while MORE than one credential era is live
+// for the backend (single-account steady state stays suffix-free), so
+// presence alone means "label this chip apart". Emails compress to their
+// local part — the pane and tooltips keep the full label.
+function vitalsLimitAccountShort(account) {
+  const raw = String(account || '').trim();
+  if (!raw) return '';
+  const at = raw.indexOf('@');
+  const short = at > 0 ? raw.slice(0, at) : raw;
+  return short.length > 14 ? `${short.slice(0, 13)}…` : short;
 }
 
 // Compact chip form of a limit-window label. Known labels pass through;
@@ -980,6 +996,9 @@ function vitalsLimitLabelLong(label) {
 // the full name stays available in the pane (vitalsLimitLabelLong).
 function vitalsLimitLabelShort(label) {
   const raw = String(label || '').trim();
+  // The 7-day overage window: "extra", never "-overage" — beside the base
+  // "7d" chip the shared prefix + hyphen chain read as a duplicate.
+  if (raw === '7d-overage') return '7d extra';
   // Already-compact daemon labels ("5h", "7d", "30d", "1w").
   if (/^\d+\s*(mo|[smhdw])$/i.test(raw)) return raw.replace(/\s+/g, '');
   const NUMBER_WORDS = {
@@ -1195,6 +1214,10 @@ const VITALS_ICON_PATHS = {
   triangle: '<path d="M12 3 22 20H2Z"/><path d="M12 10v4.5"/><path d="M12 17.5v.5"/>',
   push: '<path d="M12 19V7"/><path d="M7.5 11.5 12 7l4.5 4.5"/><path d="M6 3.5h12"/>',
   gauge: '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/>',
+  // The gauge with a "+" riding its top-right shoulder: the 7-day
+  // overage ("extra usage") window — visibly a sibling of the base
+  // gauge, never its pixel-identical twin.
+  'gauge-plus': '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/><path d="M18.5 3.5v5"/><path d="M16 6h5"/>',
   branch: '<path d="M6 4v11"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M18 8.4v2.2a4 4 0 0 1-4 4H10"/>',
   folder: '<rect x="4" y="4" width="12" height="12" rx="2.5"/><path d="M20 9v8.5A2.5 2.5 0 0 1 17.5 20H9"/>',
   pencil: '<path d="M14.5 5.5l4 4"/><path d="M4 20l1-4.5L15.5 5a2.12 2.12 0 0 1 3 3L8 18.5Z"/>',
@@ -1556,24 +1579,31 @@ const VITALS_SYMBOLS = {
     // window) until the next report. Chips always speak the SHORT window
     // grammar ("▮95% 7d-overage · ↻6:12:03") — a full provider sentence
     // in a header chip is the failure mode; the pane keeps the full name.
-    icon: 'gauge',
+    // The overage ("extra usage") window gets its own glyph: beside the
+    // base 7d chip a pixel-identical gauge is what made two real windows
+    // read as a duplicate.
+    icon: (v) => (String(v.label || '').includes('overage') ? 'gauge-plus' : 'gauge'),
     chip: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}${suffix}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
-      return `${label} ${mark}${reset}`;
+      return `${label} ${mark}${reset}${suffix}`;
     },
     // Fact-line twin of the chip grammar: the gauge icon plus severity
     // color carry what the ⛔/⚠/▮ glyphs said, so the mark is always the
     // provider's word.
     factText: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}`;
-      return `${label} ${v.statusWord}${reset}`;
+      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}${suffix}`;
+      return `${label} ${v.statusWord}${reset}${suffix}`;
     },
     explain: (v) => {
       const lines = [];
@@ -1590,6 +1620,7 @@ const VITALS_SYMBOLS = {
       if (v.reset) lines.push(`The window resets in ${v.reset}${wall ? ` — at ${wall}` : ''}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
+      if (v.account) lines.push(`This window belongs to the “${v.account}” sign-in — sessions running under a different account track their own windows.`);
       if (v.observedAgo) lines.push(`Last provider report: ${v.observedAgo} ago. Windows are account-wide, so any session's report updates this.`);
       return lines;
     },
@@ -1887,6 +1918,10 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const observedAgoSecs = Number.isFinite(observedAt) && observedAt > 0
       ? Math.floor(Date.now() / 1000 - observedAt)
       : null;
+    // Credential-era attribution: present only while the daemon sees
+    // more than one live era for the backend — the cue to suffix the
+    // chip apart from another account's same-named window.
+    const account = String(w?.account || '').trim();
     push('limit', `limit:${label}`, {
       label,
       usedPct,
@@ -1894,6 +1929,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       reset,
       resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
       rolled,
+      account,
       observedAgo: observedAgoSecs !== null && observedAgoSecs > 120
         ? formatActivityElapsed(observedAgoSecs)
         : '',
@@ -1903,7 +1939,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // The countdown ticks in place (cache-ttl pattern): the sig excludes
       // it so the 1 Hz ticker hits the stable-DOM fast path.
       ticking: !!reset,
-      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}`,
+      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}|${account}`,
     });
   }
 
@@ -2027,6 +2063,16 @@ function vitalsAttentionSummary(models) {
   };
 }
 
+// One aria grammar for the attention chip, shared by the build and the
+// 1 Hz in-place ticker so the announced text can never lag the visible
+// countdown.
+function vitalsAttentionAriaLabel(attention) {
+  const top = `${attention.top.label}: ${attention.top.factText || attention.top.text}`;
+  return attention.aggregate
+    ? `${top}, plus ${attention.extra} more — show all vitals`
+    : top;
+}
+
 // Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 //
@@ -2078,15 +2124,19 @@ function renderSessionWindowVitals(win, vitals) {
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
     // Every ticking model updates in place by id — cache-ttl, activity,
-    // and each limit window's exact reset countdown.
+    // and each limit window's exact reset countdown. The aria-label
+    // carries the same countdown text, so it ticks too: a screen reader
+    // must never be read a staler countdown than the one on screen.
     const tickingById = new Map(models.filter((m) => m.ticking).map((m) => [m.id, m]));
     if (tickingById.size) {
       for (const chip of win.vitals.querySelectorAll('.vit-chip')) {
         const model = tickingById.get(chip.dataset.chip || '');
         if (!model) continue;
+        const factText = model.factText || model.text;
         const txt = chip.querySelector('.vit-txt');
-        if (txt) txt.textContent = model.factText || model.text;
+        if (txt) txt.textContent = factText;
         chip.title = model.explainLines[0] || model.label;
+        chip.setAttribute('aria-label', factText ? `${model.label}: ${factText}` : model.label);
       }
     }
     // The attention chip mirrors its top model's text (elapsed/quiet
@@ -2097,6 +2147,7 @@ function renderSessionWindowVitals(win, vitals) {
       const attnTxt = attnChip.querySelector('.vit-txt');
       if (attention && attnTxt && attnTxt.textContent !== attention.factText) {
         attnTxt.textContent = attention.factText;
+        attnChip.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
       }
     }
     return models.some((m) => m.ticking);
@@ -2149,9 +2200,7 @@ function renderSessionWindowVitals(win, vitals) {
     attn.title = attention.aggregate
       ? 'Needs attention — show all vitals'
       : (attention.top.explainLines[0] || attention.top.label);
-    attn.setAttribute('aria-label', attention.aggregate
-      ? `${attention.top.label}: ${attention.top.factText || attention.top.text}, plus ${attention.extra} more — show all vitals`
-      : `${attention.top.label}: ${attention.top.factText || attention.top.text}`);
+    attn.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
     healthNodes.push(attn);
   }
   if (foldedWhenCollapsed > 0) {
