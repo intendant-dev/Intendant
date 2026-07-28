@@ -693,6 +693,12 @@ after "Later" renders exactly what was sealed. From the CLI,
 [--every INTERVAL] [--suspend-after N] [--agent …]` rides the ordinary
 op lane (works from owner shells and supervised sessions alike);
 approval stays per-effect on the dashboard or `ctl agenda approve`.
+The dashboard's Automate sheet and its workflow/triggered pickers
+consume exactly these surfaces: the picker renders the served catalog
+(invalid and shadowed entries stay visible, disabled with their
+reason), the preview shows the full text a stamp would seal, and every
+stamp rides the stamp op — the sheet neither proposes nor approves
+client-side.
 
 ### The housekeeping recipe
 
@@ -892,19 +898,23 @@ Run now (`request_occurrence`), Revoke, and re-approve-to-re-arm.
 
 ### The fix-task workflow
 
-Workflow templates (Track T) generalize create-from-template from one
-item to a small item-graph. **Stamping** one instance — a workflow
-entry in the automate sheet's picker — parks, over the ordinary op
-lane, an instance **hub whose body is the workflow's living
-orientation document** (an ordinary G2 hub, never a workflow object),
-one task per node placed under it, the `relies_on` edges, and one
-`on_unblock`-triggered manifest per node. Stamping never approves —
-that pin stands. The flow then opens the **approval sheet**: the
-orientation, every node's full goal text and executor, and one
-committed recommendation; the owner's single confirm emits one
-ordinary `approve_effect` per node (the UI batches; the ops stay
-per-effect and attributed; nothing cascades; "Later" leaves everything
-parked with pending digests on the ordinary cards). Once armed, the
+Workflow definitions (Track T → AW) generalize create-from-definition
+from one item to a small item-graph. **Stamping** one instance — a
+workflow entry in the automate sheet's picker — is one daemon-side
+stamp op: the daemon reads, validates, and seals the definition, parks
+an instance **hub whose body is the workflow's living orientation
+document** (an ordinary G2 hub, never a workflow object), one task per
+node placed under it, the `relies_on` edges, and one
+`on_unblock`-triggered manifest per node, every manifest pinning the
+sealed definition as a binding ref. Stamping never approves — that pin
+stands. The flow then opens the **approval sheet**: the sealed
+definition rendered once in full (fetched from the content-addressed
+serving lane — exactly the bytes every node's manifest pins), each
+node's executor and digest chip, and one committed recommendation; the
+owner's single confirm emits one ordinary `approve_effect` per node
+(the UI batches; the ops stay per-effect and attributed; nothing
+cascades; "Later" leaves everything parked with pending digests on the
+ordinary cards). Once armed, the
 first node fires on approval and each completion unblocks the next —
 the trigger machinery above, nothing workflow-specific. A failing node
 suspends its own lane (re-approve to re-arm); revoking one node's
