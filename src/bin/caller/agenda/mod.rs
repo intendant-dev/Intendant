@@ -44,7 +44,8 @@ pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_re
 pub(crate) use blobs::find_blob;
 pub(crate) use handle::AgendaHandle;
 pub(crate) use reminders::{
-    AgendaOccurrencesPage, ReminderPolicyPatch, AGENDA_OCCURRENCES_DEFAULT_LIMIT,
+    journal_generation_floor, AgendaOccurrencesPage, ReminderPolicyPatch,
+    AGENDA_OCCURRENCES_DEFAULT_LIMIT,
 };
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};

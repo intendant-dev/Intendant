@@ -312,12 +312,25 @@ pub(crate) fn spawn_mode_web_gateway(
     // attach while an `ask_user` blocks, so asks wait instead of
     // auto-answering.
     mcp_http_state.interactive_frontends = true;
+    // The handover runtime (Track HS): mint this boot's identity,
+    // register its liveness presence, and try the active-scheduler lease
+    // once. HS1 is behavior-neutral — holding or not holding changes
+    // nothing yet (HS2 gates standing automations on it); the primitive,
+    // the presence files, the journal stamp, and the status surfaces land
+    // first so the protocol has ground truth to stand on. Every failure
+    // degrades to a named status field, never a refused boot.
+    let agenda_dir = crate::agenda::agenda_dir();
+    let handover = Arc::new(crate::handover::HandoverRuntime::initialize(
+        &crate::platform::intendant_home(),
+        web_port,
+        crate::agenda::journal_generation_floor(&agenda_dir),
+    ));
+    mcp_http_state.handover = Some(handover.clone());
     // The daemon's agenda ledger: one single-writer handle shared by the
     // MCP tools, the HTTP routes, and the dashboard tunnel twins, plus
     // the reminder scheduler that delivers due items through the
     // notification ladder. A store that fails to open degrades to
     // "agenda unavailable" instead of failing the gateway.
-    let agenda_dir = crate::agenda::agenda_dir();
     mcp_http_state.agenda = match crate::agenda::AgendaStore::open(&agenda_dir) {
         Ok(store) => {
             let handle = Arc::new(
@@ -333,7 +346,8 @@ pub(crate) fn spawn_mode_web_gateway(
                     }),
             );
             // Detaches on drop like the mode listeners; one per daemon.
-            let _scheduler = crate::agenda::spawn_reminder_scheduler(handle.clone());
+            let _scheduler =
+                crate::agenda::spawn_reminder_scheduler(handle.clone(), Some(handover.clone()));
             // Resolves rail answers/dismissals for parked (agenda-backed)
             // asks — nothing blocks on them, so the daemon records the
             // outcome. Detaches on drop like the scheduler.

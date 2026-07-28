@@ -1906,6 +1906,8 @@ mod tests {
                     state: super::super::reminders::OccurrenceState::Delivered,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
