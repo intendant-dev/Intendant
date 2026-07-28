@@ -1809,6 +1809,7 @@ mod tests {
             attachments: Vec::new(),
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         };
         let approval = ControlMsg::Approve {

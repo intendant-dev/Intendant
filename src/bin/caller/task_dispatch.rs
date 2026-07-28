@@ -142,9 +142,11 @@ impl Dispatcher {
                 // path exactly as against a pre-receipt build — see the
                 // compatibility matrix in peer::transport::intendant.
                 delegation_id: _,
-                // Launch config is create-time only; this dispatcher
-                // routes into an already-running loop whose config
-                // latched at spawn (same reasoning as project_root).
+                // Launch config and the create-time session name are
+                // create-time only; this dispatcher routes into an
+                // already-running loop whose config and name latched at
+                // spawn (same reasoning as project_root).
+                session_name: _,
                 launch_config: _,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
@@ -445,6 +447,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         }));
 
@@ -487,6 +490,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         }));
 
@@ -524,6 +528,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         }));
 
@@ -620,6 +625,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -663,6 +669,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: Default::default(),
             })
         };
@@ -716,6 +723,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: Default::default(),
             })
         };
@@ -766,6 +774,7 @@ mod tests {
             attachments: vec![],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         }));
 

@@ -414,6 +414,9 @@ pub fn hosted_control_msg_allowed(
             attachments,
             follow_up_id: _,
             delegation_id,
+            // A display name selects no capability — permitted exactly as
+            // CreateSession's `name` above.
+            session_name: _,
             launch_config,
         } => {
             preset >= HostedPreset::Tasks
