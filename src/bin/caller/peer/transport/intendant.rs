@@ -643,6 +643,7 @@ impl PeerTransport for IntendantWsTransport {
                     // the receipt wait lives on `PeerHandle::
                     // delegate_task`, not in the transport.
                     delegation_id: task.client_correlation_id.clone(),
+                    session_name: None,
                     // Peer delegations carry no launch pins: the receiving
                     // daemon's own defaults govern its spawns (its
                     // resolution chain fills every field).

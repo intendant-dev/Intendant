@@ -268,6 +268,18 @@ pub enum AppEvent {
     ReloadBackendCredentials {
         session_id: Option<String>,
     },
+    /// A dashboard sign-in ceremony for an external backend completed:
+    /// the credential store now holds `account`'s credentials (`None`
+    /// when the provider's status probe stated no label). `source` is the
+    /// backend-kind vocabulary (`AgentBackend::as_short_str`). The vitals
+    /// hub consumes this to open a new credential era for the backend —
+    /// sessions spawned or credential-reloaded from here on report their
+    /// rate-limit windows under the new account instead of overwriting
+    /// the old one's.
+    BackendCredentialAccount {
+        source: String,
+        account: Option<String>,
+    },
     /// User requested that a managed session stop completely. External-agent
     /// loops listen for this and shut down their backend process.
     SessionStopRequested {
@@ -2177,6 +2189,18 @@ pub enum ControlMsg {
         /// gateway is unchanged.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delegation_id: Option<String>,
+        /// Optional display name for the session this StartTask creates —
+        /// `CreateSession.name`'s twin, applied through the session naming
+        /// system at spawn (persisted meta/overlay + registry, exactly like
+        /// a composer-named create). The agenda's scheduled-session lane
+        /// derives it deterministically from the firing's source (item
+        /// title, or "<workflow title> - <node title>"). Create-time only:
+        /// ignored when `session_id` targets an existing session, and it
+        /// only ever seeds a fresh session's name — nothing re-applies it
+        /// later, so an owner rename always wins. Additive: absent frames
+        /// are byte-identical to pre-field builds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_name: Option<String>,
         /// Optional agent-launch configuration for the session this
         /// StartTask creates — the same one-shot vocabulary `CreateSession`
         /// carries, flattened so the wire fields read identically
@@ -2895,6 +2919,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
         }),
         AppEvent::SessionStopRequested { .. } => None,
+        // Hub-internal era signal; frontends see the outcome through the
+        // ordinary SessionVitals emissions the fold re-mirrors.
+        AppEvent::BackendCredentialAccount { .. } => None,
         // Loop-internal respawn signal; frontends follow the reload through
         // LogEntry lines and session lifecycle events.
         AppEvent::ReloadBackendCredentials { .. } => None,
@@ -5282,6 +5309,7 @@ mod tests {
                 attachments: vec![],
                 follow_up_id: None,
                 delegation_id: None,
+                session_name: None,
                 launch_config: Default::default(),
             },
             ControlMsg::FollowUp {
@@ -5970,6 +5998,7 @@ mod tests {
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
             follow_up_id: None,
             delegation_id: None,
+            session_name: None,
             launch_config: Default::default(),
         };
         let json = serde_json::to_string(&msg).unwrap();

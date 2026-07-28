@@ -47,6 +47,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     attachments: envelope.attachment_frame_ids.clone(),
                     follow_up_id: None,
                     delegation_id: None,
+                    session_name: None,
                     launch_config: Default::default(),
                 },
                 confirmation,
@@ -1111,6 +1112,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionAttached { .. }
         | AppEvent::SessionStopRequested { .. }
         | AppEvent::ReloadBackendCredentials { .. }
+        | AppEvent::BackendCredentialAccount { .. }
         | AppEvent::SessionEnded { .. }
         | AppEvent::DebugScreenReady { .. }
         | AppEvent::DebugScreenTornDown { .. }

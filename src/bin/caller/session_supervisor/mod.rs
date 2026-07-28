@@ -332,6 +332,102 @@ pub(crate) struct StoppedManagedSession {
     finished_rx: Option<oneshot::Receiver<()>>,
 }
 
+/// One row of the Vault sign-in cards' "live sessions to reload" list: a
+/// LIVE registry entry (`SupervisorState::sessions`) of the provider's
+/// backend — the exact candidate set
+/// [`SessionSupervisor::route_reload_credentials`] accepts. The list is
+/// served from the live registry, never the disk catalog: registry
+/// membership is liveness (the Stop-button doctrine at the source), so a
+/// parked or rate-limit-parked session stays listed and a session gone
+/// from the registry never does. Phase rides along as a chip, not a
+/// filter.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReloadCandidate {
+    pub(crate) session_id: String,
+    pub(crate) source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    pub(crate) phase: String,
+}
+
+/// Read-side view of the live managed-session registry for lanes outside
+/// the supervisor (the sign-in ceremony status payloads). Holds a `Weak`
+/// so the read side never extends the state's lifetime: a handle whose
+/// supervisor is gone truthfully reports no live sessions.
+#[derive(Clone)]
+pub(crate) struct LiveSessionRegistry {
+    state: std::sync::Weak<AsyncMutex<SupervisorState>>,
+}
+
+impl LiveSessionRegistry {
+    /// Live sessions whose backend is `source`
+    /// (`AgentBackend::as_short_str` vocabulary), sorted by session id for
+    /// stable rendering. Every registry entry of the source is a candidate
+    /// — parked, rate-limit-parked, and mid-turn alike — with no row cap:
+    /// the disk catalog's truncation and status heuristics never apply
+    /// here.
+    pub(crate) async fn reload_candidates_for_source(&self, source: &str) -> Vec<ReloadCandidate> {
+        let Some(state) = self.state.upgrade() else {
+            return Vec::new();
+        };
+        let state = state.lock().await;
+        let mut rows: Vec<ReloadCandidate> = state
+            .sessions
+            .values()
+            .filter(|session| session.source == source)
+            .map(|session| ReloadCandidate {
+                session_id: session.session_id.clone(),
+                source: session.source.clone(),
+                name: session.name.clone(),
+                phase: session.phase.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        rows
+    }
+
+    /// Wrapper-liveness snapshot for the session catalog's boot-era
+    /// join: session ids whose registry entry still holds an open
+    /// follow-up channel — the `live_external_wrapper_for` doctrine
+    /// (`launch.rs`): membership plus the open channel is "this daemon
+    /// still drives it", never phase. Non-blocking because the catalog
+    /// build runs on blocking-pool threads and inside async handlers
+    /// alike: lock contention yields `None` and the caller omits the
+    /// join rather than serve a wrong liveness bit; a gone supervisor
+    /// truthfully reports no live sessions.
+    pub(crate) fn live_wrapper_ids(&self) -> Option<std::collections::HashSet<String>> {
+        let Some(state) = self.state.upgrade() else {
+            return Some(std::collections::HashSet::new());
+        };
+        let guard = state.try_lock().ok()?;
+        Some(
+            guard
+                .sessions
+                .values()
+                .filter(|session| !session.follow_up_tx.is_closed())
+                .map(|session| session.session_id.clone())
+                .collect(),
+        )
+    }
+}
+
+static PUBLISHED_LIVE_SESSION_REGISTRY: std::sync::OnceLock<LiveSessionRegistry> =
+    std::sync::OnceLock::new();
+
+/// Publish the daemon's live-session registry for read-side lanes,
+/// mirroring `session_vitals::publish_git_vitals_targets`: called from
+/// the startup paths that construct a supervisor, never from tests
+/// (which read their own instance's [`SessionSupervisor::live_session_registry`]
+/// directly).
+pub(crate) fn publish_live_session_registry(registry: LiveSessionRegistry) {
+    let _ = PUBLISHED_LIVE_SESSION_REGISTRY.set(registry);
+}
+
+/// The published live registry, when a startup path wired one.
+pub(crate) fn published_live_session_registry() -> Option<&'static LiveSessionRegistry> {
+    PUBLISHED_LIVE_SESSION_REGISTRY.get()
+}
+
 #[derive(Clone)]
 pub(crate) struct EditRouteTarget {
     managed_id: String,
@@ -539,6 +635,15 @@ impl SessionSupervisor {
             config: Arc::new(config),
             state: Arc::new(AsyncMutex::new(SupervisorState::default())),
             exec: exec::IntakeExecutor::new(),
+        }
+    }
+
+    /// Read-side handle over this supervisor's live registry (see
+    /// [`LiveSessionRegistry`]); startup publishes it via
+    /// [`publish_live_session_registry`].
+    pub(crate) fn live_session_registry(&self) -> LiveSessionRegistry {
+        LiveSessionRegistry {
+            state: Arc::downgrade(&self.state),
         }
     }
 
@@ -892,6 +997,147 @@ mod tests {
                 as Box<dyn provider::ChatProvider>
         }));
         SessionSupervisor::new(config)
+    }
+
+    /// The Vault reload list's corpus is the LIVE registry, filtered by
+    /// backend source — id/source/name/phase ride verbatim, native
+    /// sessions and other backends never appear, and the order is
+    /// stable.
+    #[tokio::test]
+    async fn reload_candidates_derive_from_live_registry() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut claude = managed_session("claude-b", "claude-code");
+            claude.name = Some("steward pass".to_string());
+            claude.phase = "running".to_string();
+            state.sessions.insert("claude-b".to_string(), claude);
+            state.sessions.insert(
+                "claude-a".to_string(),
+                managed_session("claude-a", "claude-code"),
+            );
+            state
+                .sessions
+                .insert("codex-1".to_string(), managed_session("codex-1", "codex"));
+            state.sessions.insert(
+                "native-1".to_string(),
+                managed_session("native-1", "intendant"),
+            );
+        }
+        let registry = supervisor.live_session_registry();
+        let candidates = registry.reload_candidates_for_source("claude-code").await;
+        assert_eq!(
+            candidates,
+            vec![
+                ReloadCandidate {
+                    session_id: "claude-a".to_string(),
+                    source: "claude-code".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                },
+                ReloadCandidate {
+                    session_id: "claude-b".to_string(),
+                    source: "claude-code".to_string(),
+                    name: Some("steward pass".to_string()),
+                    phase: "running".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            registry.reload_candidates_for_source("codex").await.len(),
+            1,
+            "other backends filter by their own source"
+        );
+    }
+
+    /// Parked, rate-limit-parked, and mid-turn sessions are all reload
+    /// candidates (registry membership is liveness — phase is never a
+    /// filter), and no row cap applies: the disk catalog's limit:100
+    /// truncation that aged parked sessions off the Vault list has no
+    /// analogue here.
+    #[tokio::test]
+    async fn parked_sessions_remain_reload_candidates() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            for (id, phase) in [
+                ("parked", "idle"),
+                ("rate-limited", "waiting_rate_limit"),
+                ("mid-turn", "running"),
+                ("waiting", "waiting_approval"),
+            ] {
+                let mut session = managed_session(id, "codex");
+                session.phase = phase.to_string();
+                state.sessions.insert(id.to_string(), session);
+            }
+            for i in 0..150 {
+                let id = format!("bulk-{i:03}");
+                state
+                    .sessions
+                    .insert(id.clone(), managed_session(&id, "codex"));
+            }
+        }
+        let candidates = supervisor
+            .live_session_registry()
+            .reload_candidates_for_source("codex")
+            .await;
+        assert_eq!(
+            candidates.len(),
+            154,
+            "every live session of the source is a candidate — no truncation"
+        );
+        for id in ["parked", "rate-limited", "mid-turn", "waiting"] {
+            assert!(
+                candidates.iter().any(|c| c.session_id == id),
+                "{id} must stay a reload candidate"
+            );
+        }
+    }
+
+    /// Sessions absent from the live registry are never candidates: a
+    /// finished session drops off the moment the supervisor removes it,
+    /// and a dead read-handle (supervisor gone) reports none — the disk
+    /// catalog's summary-less "in_progress forever" dirs can't leak in.
+    #[tokio::test]
+    async fn dead_sessions_never_listed_as_live() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("live-1".to_string(), managed_session("live-1", "codex"));
+            state
+                .sessions
+                .insert("ends".to_string(), managed_session("ends", "codex"));
+        }
+        let registry = supervisor.live_session_registry();
+        assert_eq!(
+            registry.reload_candidates_for_source("codex").await.len(),
+            2
+        );
+
+        {
+            let mut state = supervisor.state.lock().await;
+            state.remove_session("ends");
+        }
+        let candidates = registry.reload_candidates_for_source("codex").await;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live-1"],
+            "a session removed from the registry is no longer a candidate"
+        );
+
+        drop(supervisor);
+        assert!(
+            registry
+                .reload_candidates_for_source("codex")
+                .await
+                .is_empty(),
+            "a dead registry handle truthfully reports no live sessions"
+        );
     }
 
     /// The delegation dedup ledger: first writer wins for a given id,

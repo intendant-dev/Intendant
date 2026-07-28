@@ -1575,6 +1575,12 @@ impl IntendantServer {
                 "daemon_version".to_string(),
                 serde_json::Value::String(crate::build_info::version_line("intendant")),
             );
+            // The scheduler-lease view (Track HS): this daemon's boot id
+            // and lease role, plus the on-disk sidecar naming whoever
+            // holds — how `ctl status`/the dashboard see a handover.
+            if let Some(handover) = &s.handover {
+                obj.insert("scheduler_lease".to_string(), handover.status_json());
+            }
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
@@ -2018,6 +2024,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    session_name: None,
                     launch_config: Default::default(),
                 }));
             if target_phase
@@ -2053,6 +2060,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    session_name: None,
                     launch_config: Default::default(),
                 }));
             return "ok (CU task dispatched)".to_string();
@@ -2075,6 +2083,7 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                     delegation_id: None,
+                    session_name: None,
                     launch_config: Default::default(),
                 }));
             return "ok (new session dispatched)".to_string();
@@ -3855,6 +3864,7 @@ pub(crate) mod tests {
                     attachments,
                     follow_up_id,
                     delegation_id,
+                    session_name,
                     launch_config,
                 }))) => {
                     assert!(project_root.is_none());
@@ -3867,6 +3877,7 @@ pub(crate) mod tests {
                     assert!(attachments.is_empty());
                     assert!(follow_up_id.is_none());
                     assert!(delegation_id.is_none());
+                    assert!(session_name.is_none());
                     assert!(launch_config.is_empty());
                 }
                 other => panic!("expected targeted StartTask control event, got {other:?}"),

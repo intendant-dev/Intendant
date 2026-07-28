@@ -30,6 +30,13 @@ pub(crate) fn provider_request_item_count(raw: &serde_json::Value) -> Option<usi
 pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// Interrupt reason minted when a mid-turn `ReloadBackendCredentials`
+/// cuts the live turn (stop semantics). The loop's safe-point respawn
+/// matches on this exact reason to synthesize the continuation that
+/// re-drives the interrupted work — a user-requested interrupt keeps
+/// stop semantics even when a reload rides the same drain.
+pub(crate) const RELOAD_CREDENTIALS_INTERRUPT_REASON: &str = "reloading credentials";
+
 /// Time-bounded `interrupt_turn()`. Every call inside the drain must go
 /// through this so an unresponsive backend can't wedge the drain loop itself.
 pub(crate) async fn interrupt_turn_bounded(
@@ -504,7 +511,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                 });
                                 if !interrupt_pending {
                                     interrupt_pending = true;
-                                    interrupt_reason = "reloading credentials".to_string();
+                                    interrupt_reason =
+                                        RELOAD_CREDENTIALS_INTERRUPT_REASON.to_string();
                                     forward_interrupt_to_backend(agent, config).await;
                                 }
                             }

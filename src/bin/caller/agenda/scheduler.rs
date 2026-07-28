@@ -10,8 +10,8 @@
 
 use super::handle::AgendaHandle;
 use super::reminders::{
-    plan, DueOccurrence, OccurrenceJournal, OccurrenceRecord, OccurrenceState, ReminderUrgency,
-    SpawnOccurrence,
+    plan, DueOccurrence, JournalStamp, OccurrenceJournal, OccurrenceRecord, OccurrenceState,
+    ReminderUrgency, SpawnOccurrence,
 };
 use super::store::OccurrenceWriteBack;
 use super::types::{AgendaActor, AgendaCommand};
@@ -229,7 +229,10 @@ impl SchedulerState {
     }
 }
 
-pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_reminder_scheduler(
+    handle: Arc<AgendaHandle>,
+    handover: Option<Arc<crate::handover::HandoverRuntime>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut journal = match OccurrenceJournal::open(handle.dir()) {
             Ok(journal) => journal,
@@ -241,11 +244,29 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
                 return;
             }
         };
+        // Track HS: rows this daemon writes carry its boot id, and — when
+        // it holds the scheduler lease — the held generation. HS1 stamps
+        // only; HS2 gates the firing pass on the same runtime.
+        if let Some(handover) = &handover {
+            journal.set_stamp(Some(JournalStamp {
+                boot_id: handover.boot_id().to_string(),
+                generation: handover.held_generation(),
+            }));
+        }
         let mut state = SchedulerState::default();
         let mut events = handle.bus().subscribe();
-        resolve_lost_sessions(&handle, &mut journal);
+        // Boot recovery, scoped (Track HS2): a live co-homed daemon's
+        // in-flight rows are spared; legacy rows and provably dead
+        // writers fail-close exactly as before.
+        match handover.as_deref() {
+            Some(runtime) => {
+                resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Boot(runtime))
+            }
+            None => resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Unscoped),
+        }
         loop {
-            let next_wake_ms = run_pass(&handle, &mut journal, &mut state).await;
+            let next_wake_ms =
+                run_pass(&handle, &mut journal, &mut state, handover.as_deref()).await;
             let now = now_ms();
             let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
             let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
@@ -280,18 +301,92 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
     })
 }
 
-/// Boot pass: `started`-without-terminal occurrences belong to a previous
-/// process — this executor lost sight of them. Fail-closed `Unknown`,
-/// never auto-retried (RFC §7.5); the sessions themselves, if alive, are
-/// still visible in the Sessions tab.
-fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal) {
-    let unresolved = journal.started_unresolved();
-    let lost_dispatches = journal.prepared_unresolved();
+/// Which unresolved journal rows this daemon may fail-close (Track HS2,
+/// intake §3.5 + the Q3 recurring amendment). The pre-HS2 rule — every
+/// unresolved row is mine to declare unknown at boot — clobbered a live
+/// co-homed daemon's in-flight occurrences (the intake's one BROKEN
+/// edge). Scoping keys on the row's stamped writer boot id and that
+/// boot's provable liveness: its `daemons/<boot_id>.lock` is takeable
+/// iff the process is gone (crash included — the OS freed it).
+#[derive(Clone, Copy)]
+enum RecoveryScope<'a> {
+    /// No handover runtime (non-gateway shapes, direct test drives):
+    /// single-daemon semantics — every unresolved row is recoverable.
+    Unscoped,
+    /// Scheduler boot: legacy (pre-stamping) rows keep today's
+    /// resolve-at-boot semantics; stamped rows only when provably dead.
+    /// (Our own fresh boot id cannot be on any row yet.)
+    Boot(&'a crate::handover::HandoverRuntime),
+    /// The holder's steady-state re-check: stamped rows whose writer died
+    /// SINCE some boot pass spared them resolve without waiting for any
+    /// daemon restart — until resolved, a `started` row holds its
+    /// effect's no-overlap gate shut and would suppress every future
+    /// fire. Never touches our own rows (boot-id inequality) or legacy
+    /// rows (the boot pass owned those).
+    Recurring(&'a crate::handover::HandoverRuntime),
+}
+
+impl RecoveryScope<'_> {
+    fn may_resolve(&self, writer_boot_id: Option<&str>) -> bool {
+        let (runtime, legacy_recoverable) = match self {
+            RecoveryScope::Unscoped => return true,
+            RecoveryScope::Boot(runtime) => (runtime, true),
+            RecoveryScope::Recurring(runtime) => (runtime, false),
+        };
+        match writer_boot_id {
+            None => legacy_recoverable,
+            Some(boot) => {
+                boot != runtime.boot_id()
+                    && !crate::handover::boot_id_is_live(runtime.state_root(), boot)
+            }
+        }
+    }
+}
+
+/// Fail-close unresolved occurrences within `scope`: `started`-without-
+/// terminal rows whose driving daemon is gone resolve `Unknown`, never
+/// auto-retried (RFC §7.5); the sessions themselves, if alive, are
+/// still visible in the Sessions tab. Runs at scheduler boot
+/// ([`RecoveryScope::Boot`]/[`RecoveryScope::Unscoped`]) and on every
+/// holder pass ([`RecoveryScope::Recurring`]).
+fn resolve_lost_sessions(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    scope: RecoveryScope<'_>,
+) {
+    let unresolved: Vec<_> = journal
+        .started_unresolved()
+        .into_iter()
+        .filter(|row| scope.may_resolve(row.writer_boot_id.as_deref()))
+        .collect();
+    let lost_dispatches: Vec<_> = journal
+        .prepared_unresolved()
+        .into_iter()
+        .filter(|row| scope.may_resolve(row.writer_boot_id.as_deref()))
+        .collect();
     if unresolved.is_empty() && lost_dispatches.is_empty() {
         return;
     }
+    // Why the writer died shapes the owner-facing note: a boot pass means
+    // *this* executor restarted; the recurring pass means a co-homed
+    // writer (a drainer, a crashed holder) went away under a daemon that
+    // kept running.
+    let (started_note, prepared_note) = match scope {
+        RecoveryScope::Recurring(_) => (
+            "the daemon driving this session exited without a terminal \
+             record — outcome unknown; check the session log",
+            "the daemon that dispatched this occurrence exited before a \
+             receipt — outcome unknown",
+        ),
+        _ => (
+            "daemon restarted while the session ran — outcome unknown; \
+             check the session log",
+            "daemon restarted before the session dispatched — outcome unknown",
+        ),
+    };
     let (items, _, _) = handle.snapshot();
-    for (occurrence_id, session_id) in unresolved {
+    for row in unresolved {
+        let (occurrence_id, session_id) = (row.occurrence_id, row.session_id);
         let _ = journal.append(&OccurrenceRecord {
             v: 1,
             at_ms: now_ms(),
@@ -301,6 +396,8 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             state: OccurrenceState::Unknown,
             urgency: None,
             session_id: session_id.clone(),
+            generation: None,
+            boot_id: None,
         });
         // The journal row carries no effect_id, so find the owning effect by
         // its last_run lineage and make the item's state honest too.
@@ -317,11 +414,7 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
                         occurrence_id: &occurrence_id,
                         state: "unknown",
                         session_id: session_id.clone(),
-                        note: Some(
-                            "daemon restarted while the session ran — outcome \
-                             unknown; check the session log"
-                                .to_string(),
-                        ),
+                        note: Some(started_note.to_string()),
                     }) {
                         eprintln!(
                             "[agenda] occurrence write-back failed (unknown on {}): {err}",
@@ -333,17 +426,18 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
         }
         eprintln!(
             "[agenda] occurrence {occurrence_id} resolved to unknown \
-             (daemon restarted while session {} ran)",
+             (writer daemon gone while session {} ran)",
             session_id.as_deref().unwrap_or("?")
         );
     }
     // The lost-dispatch shape: `prepared` with no receipt and no terminal
-    // belongs to a previous process whose StartTask died with it. Same
+    // belongs to a gone process whose StartTask died with it. Same
     // fail-closed `unknown`, written back via the item id the journal
     // rows retained (there is no `last_run` lineage to match — the
     // occurrence never started); v1's one-effect-per-item names the
     // effect. Never auto-retried; the owner sees `unknown` and decides.
-    for (occurrence_id, item_id) in lost_dispatches {
+    for row in lost_dispatches {
+        let (occurrence_id, item_id) = (row.occurrence_id, row.item_id);
         let _ = journal.append(&OccurrenceRecord {
             v: 1,
             at_ms: now_ms(),
@@ -353,6 +447,8 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             state: OccurrenceState::Unknown,
             urgency: None,
             session_id: None,
+            generation: None,
+            boot_id: None,
         });
         if let Some(item) = item_id
             .as_deref()
@@ -365,11 +461,7 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
                     occurrence_id: &occurrence_id,
                     state: "unknown",
                     session_id: None,
-                    note: Some(
-                        "daemon restarted before the session dispatched — outcome \
-                         unknown"
-                            .to_string(),
-                    ),
+                    note: Some(prepared_note.to_string()),
                 }) {
                     eprintln!(
                         "[agenda] occurrence write-back failed (unknown on {}): {err}",
@@ -380,7 +472,7 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
         }
         eprintln!(
             "[agenda] occurrence {occurrence_id} resolved to unknown \
-             (daemon restarted before its session dispatched)"
+             (writer daemon gone before its session dispatched)"
         );
     }
 }
@@ -465,9 +557,39 @@ async fn run_pass(
     handle: &AgendaHandle,
     journal: &mut OccurrenceJournal,
     state: &mut SchedulerState,
+    handover: Option<&crate::handover::HandoverRuntime>,
 ) -> Option<u64> {
     if let Err(err) = journal.refresh_if_stale() {
         eprintln!("[agenda] occurrence journal refresh failed: {err}");
+    }
+    // Track HS2: the firing pass is holder-only — this is what turns the
+    // co-homed check-then-`prepared` double-fire window from a
+    // probabilistic race into a structural impossibility (two live
+    // planners never both reach `plan`). `None` = no gateway runtime
+    // (direct test drives, legacy shapes): ungated, today's semantics.
+    if let Some(runtime) = handover {
+        if runtime.is_holder() {
+            // Steady state: the recurring Q3 re-check — a co-homed
+            // writer that died since its rows were spared resolves now,
+            // not at some future daemon restart (an unresolved `started`
+            // row holds its effect's no-overlap gate shut).
+            resolve_lost_sessions(handle, journal, RecoveryScope::Recurring(runtime));
+        } else if runtime.poll_acquire(journal.max_generation()) {
+            // Freed lease taken over (the previous holder exited or
+            // crashed): stamp rows with the new generation, fail-close
+            // what the dead generation left behind, then fire normally
+            // this same pass.
+            journal.set_stamp(Some(JournalStamp {
+                boot_id: runtime.boot_id().to_string(),
+                generation: runtime.held_generation(),
+            }));
+            resolve_lost_sessions(handle, journal, RecoveryScope::Recurring(runtime));
+        } else {
+            // Secondary: standing automations off — plan nothing, fire
+            // nothing, deliver nothing. Wake at the poll cadence so a
+            // freed lease converges without owner action.
+            return Some(now_ms() + crate::handover::lease_poll_interval().as_millis() as u64);
+        }
     }
     let (items, _, _) = handle.snapshot();
     let policy = handle.reminder_policy();
@@ -673,6 +795,11 @@ fn send_start_task(
             attachments: Vec::new(),
             follow_up_id: None,
             delegation_id: Some(format!("{DELEGATION_PREFIX}{}", spawn.occurrence_id)),
+            // Source-derived display name (item title / workflow-node
+            // composite), assigned through the existing naming system at
+            // launch. Stable across retries of this occurrence like the
+            // rest of the message.
+            session_name: spawn.session_name.clone(),
             // The manifest's owner-reviewed agent config, forwarded so the
             // spawn resolves launch settings through the same chain as a
             // pane-created session (explicit manifest pin → daemon default
@@ -1150,6 +1277,8 @@ fn session_record(
         state,
         urgency: None,
         session_id,
+        generation: None,
+        boot_id: None,
     });
     if let Err(err) = &result {
         eprintln!(
@@ -1292,6 +1421,8 @@ fn record(
         state,
         urgency,
         session_id: None,
+        generation: None,
+        boot_id: None,
     });
     if let Err(err) = &result {
         eprintln!(
@@ -1395,7 +1526,7 @@ mod tests {
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         let mut reminder_seen = false;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::UserNotification { id, urgency, .. } = event {
@@ -1407,7 +1538,7 @@ mod tests {
         assert!(reminder_seen, "overdue item must deliver");
 
         // Second pass: spent occurrence, no re-delivery.
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::UserNotification { .. }),
@@ -1450,7 +1581,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let wake = run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        let wake = run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         assert_eq!(wake, None, "no open due items ⇒ nothing scheduled");
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
@@ -1466,7 +1597,7 @@ mod tests {
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         let mut digest_seen = false;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::UserNotification { id, title, .. } = event {
@@ -1477,7 +1608,7 @@ mod tests {
         }
         assert!(digest_seen);
         // Spent: a second pass is silent.
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
         }
@@ -1498,7 +1629,7 @@ mod tests {
             .unwrap();
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::UserNotification { .. }),
@@ -1514,7 +1645,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default(), None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
         }
@@ -1674,7 +1805,7 @@ mod tests {
         );
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut dispatched = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -1746,7 +1877,7 @@ mod tests {
         std::fs::remove_file(&vanishing).unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut tasks = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
@@ -1862,7 +1993,7 @@ mod tests {
         std::fs::write(&unreconstructable, b"amended after approval\n").unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(
@@ -1936,7 +2067,7 @@ mod tests {
         std::fs::remove_file(&sealed_path).unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut spawned = 0;
         while let Ok(event) = rx.try_recv() {
             if matches!(
@@ -2002,7 +2133,7 @@ mod tests {
             .unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
 
         let mut dispatched = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -2088,7 +2219,7 @@ mod tests {
 
         // Spent: another pass dispatches nothing.
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(
@@ -2135,7 +2266,7 @@ mod tests {
             )
             .unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut second = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2178,6 +2309,36 @@ mod tests {
         assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
     }
 
+    /// Agenda-fired sessions inherit a deterministic display name from
+    /// their source: a standalone item firing carries the ITEM TITLE on
+    /// the spawn's StartTask, assigned through the existing naming
+    /// system at launch — never model-generated, and stable across
+    /// firings of the same item (titles are the only input).
+    #[tokio::test]
+    async fn agenda_sessions_spawn_named_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+
+        let mut names = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { session_name, .. }) = event {
+                names.push(session_name);
+            }
+        }
+        assert_eq!(
+            names,
+            vec![Some("scheduled work".to_string())],
+            "the spawn carries the source item's title as its derived session name"
+        );
+    }
+
     /// The duplicate-orchestrator regression, live shape (2026-07-26): a
     /// firing is `started`; the manifest is re-proposed mid-flight (the
     /// fold swaps the effect object) and re-approved. The swap must not
@@ -2196,7 +2357,7 @@ mod tests {
 
         // Fire + receipt: the run is live.
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut first = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2257,7 +2418,7 @@ mod tests {
         // The pass after swap + re-approval plans NOTHING for the item —
         // the defect dispatched a duplicate orchestrator right here.
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(
@@ -2279,7 +2440,7 @@ mod tests {
             },
         );
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut second = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2337,7 +2498,7 @@ mod tests {
             .unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut dispatched = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2404,7 +2565,7 @@ mod tests {
 
         // Spent: another pass dispatches nothing.
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(
@@ -2458,7 +2619,7 @@ mod tests {
             )
             .unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut delegation_id = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2567,7 +2728,7 @@ mod tests {
             )
             .unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut delegation_id = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -2717,7 +2878,7 @@ mod tests {
             )
             .unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(handle, journal, state).await;
+        run_pass(handle, journal, state, None).await;
         let mut delegation_id = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -3128,7 +3289,7 @@ mod tests {
         );
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut dispatched = 0;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -3191,6 +3352,7 @@ mod tests {
             agent_config: None,
             provenance_session_id: None,
             matched_item_ids: vec![q1.id.clone(), q2.id.clone()],
+            session_name: None,
         };
         assert!(dispatch_session(
             &handle,
@@ -3324,7 +3486,7 @@ mod tests {
             config: &crate::event::AgentLaunchConfig,
         ) -> Option<String> {
             let mut rx = handle.bus().subscribe();
-            run_pass(handle, journal, state).await;
+            run_pass(handle, journal, state, None).await;
             let mut delegation = None;
             while let Ok(event) = rx.try_recv() {
                 if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -3595,7 +3757,7 @@ mod tests {
             )
             .unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut first = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask {
@@ -3694,12 +3856,12 @@ mod tests {
             .unwrap();
         // Dispatch journals `prepared`; the process "dies" before any
         // receipt (we simply drop the in-memory state).
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         drop(state);
 
         // Next boot: a fresh journal fold sees prepared-without-started.
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
-        resolve_lost_sessions(&handle, &mut journal);
+        resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Unscoped);
         let (items, _, _) = handle.snapshot();
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
@@ -3726,7 +3888,7 @@ mod tests {
         approved_effect_item(&handle, now_ms() - 60_000);
         approved_effect_item(&handle, now_ms() - 60_000);
 
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         assert_eq!(state.awaiting.len(), 2);
         let running_occurrence = state.awaiting.keys().next().unwrap().clone();
         let running_item = state.awaiting[&running_occurrence].spawn.item_id.clone();
@@ -3785,7 +3947,7 @@ mod tests {
             .is_none());
 
         let mut events = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = events.try_recv() {
             assert!(
                 !matches!(
@@ -3809,7 +3971,7 @@ mod tests {
         let mut state = SchedulerState::default();
         let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
 
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let occurrence_id = state.awaiting.keys().next().unwrap().clone();
         observe_event(
             &handle,
@@ -3841,7 +4003,7 @@ mod tests {
         // Missed window: approved 25h ago (past the 12h staleness default).
         let (missed_item, _, _) = approved_effect_item(&handle, now_ms() - 25 * 3_600_000);
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut saw_start = false;
         let mut saw_missed_note = false;
         while let Ok(event) = rx.try_recv() {
@@ -3940,7 +4102,7 @@ mod tests {
             .unwrap();
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut spawned_root = None;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(ControlMsg::StartTask { project_root, .. }) = event {
@@ -3973,7 +4135,7 @@ mod tests {
         let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
 
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         let mut saw_start = false;
         let mut refusal_note = None;
         while let Ok(event) = rx.try_recv() {
@@ -4004,7 +4166,7 @@ mod tests {
 
         // Terminal: the next pass does not retry the spent occurrence.
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal, &mut state).await;
+        run_pass(&handle, &mut journal, &mut state, None).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(
@@ -4015,5 +4177,314 @@ mod tests {
                 "a failed occurrence must not re-fire or re-notify"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Track HS2: firing gated on the active-scheduler lease + scoped
+    // recovery. Conformance pins named by the sealed intake's checklist.
+    // ------------------------------------------------------------------
+
+    fn stamped_started_rows(journal: &mut OccurrenceJournal, occ: &str, item: &str) {
+        for state in [OccurrenceState::Prepared, OccurrenceState::Started] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 1_000,
+                    occurrence_id: occ.to_string(),
+                    item_id: item.to_string(),
+                    due_ms: 1_000,
+                    state,
+                    urgency: None,
+                    session_id: matches!(state, OccurrenceState::Started)
+                        .then(|| format!("sess-{occ}")),
+                    generation: None,
+                    boot_id: None,
+                })
+                .unwrap();
+        }
+    }
+
+    /// A secondary's pass never reaches the planner: no deliveries, no
+    /// spawns, no journal rows — and it wakes at the poll cadence, not at
+    /// any item's due instant.
+    #[tokio::test]
+    async fn non_holder_pass_plans_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _holder = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let secondary = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        assert!(!secondary.is_holder());
+
+        // An overdue item that an ungated pass would deliver immediately.
+        let (handle, _) = handle_with_item(dir.path(), 1_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut rx = handle.bus().subscribe();
+        let now = now_ms();
+        let wake = run_pass(
+            &handle,
+            &mut journal,
+            &mut SchedulerState::default(),
+            Some(&secondary),
+        )
+        .await;
+
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AppEvent::UserNotification { .. }
+                        | AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
+                "a non-holder pass must fire nothing"
+            );
+        }
+        assert!(
+            journal.unresolved().is_empty() && journal.started_unresolved().is_empty(),
+            "a non-holder pass must journal nothing"
+        );
+        let wake = wake.expect("secondaries wake at the poll cadence");
+        assert!(
+            wake >= now + 30_000,
+            "the wake is the lease poll interval, never the overdue instant: {wake} vs {now}"
+        );
+    }
+
+    /// The commissioned race pin. (a) With lease coordination absent, two
+    /// planners over one home read the same pre-append state — the
+    /// check-then-`prepared` window — and BOTH dispatch the one due
+    /// occurrence: the journal ends with two started sessions on one
+    /// occurrence id. (b) With the lease, the secondary's pass returns
+    /// before the planner ever runs, so exactly one prepared row and one
+    /// dispatch exist — the lease closes the window structurally, not by
+    /// refold luck.
+    #[tokio::test]
+    async fn double_fire_demonstrated_without_lease_and_closed_with_it() {
+        // ---- leg (a): the window, demonstrated ----
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), project.path());
+        let now = now_ms();
+        // A due, owner-approved standing manifest — the intake's exact
+        // race subject.
+        approved_effect_item(&handle, now - 1_000);
+        let (items, _, _) = handle.snapshot();
+        let policy = handle.reminder_policy();
+        // Two daemons' journals over one file, both still empty: both
+        // planners pass the check before either appends `prepared`.
+        let mut journal_a = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut journal_b = OccurrenceJournal::open(handle.dir()).unwrap();
+        let planned_a = plan(
+            &items,
+            &journal_a,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        let planned_b = plan(
+            &items,
+            &journal_b,
+            &policy,
+            now,
+            None,
+            &Default::default(),
+            &Default::default(),
+        );
+        let spawn_a = planned_a
+            .spawn
+            .first()
+            .expect("due occurrence planned")
+            .clone();
+        let spawn_b = planned_b
+            .spawn
+            .first()
+            .expect("same occurrence planned")
+            .clone();
+        assert_eq!(spawn_a.occurrence_id, spawn_b.occurrence_id);
+        // Both dispatch: prepared + started through each daemon's journal.
+        assert!(session_record(
+            &mut journal_a,
+            &spawn_a,
+            now,
+            OccurrenceState::Prepared,
+            None
+        ));
+        assert!(session_record(
+            &mut journal_a,
+            &spawn_a,
+            now,
+            OccurrenceState::Started,
+            Some("sess-a".into())
+        ));
+        assert!(session_record(
+            &mut journal_b,
+            &spawn_b,
+            now,
+            OccurrenceState::Prepared,
+            None
+        ));
+        assert!(session_record(
+            &mut journal_b,
+            &spawn_b,
+            now,
+            OccurrenceState::Started,
+            Some("sess-b".into())
+        ));
+        let folded = OccurrenceJournal::open(handle.dir()).unwrap();
+        let progress = folded.progress(&spawn_a.occurrence_id);
+        assert_eq!(
+            progress.started_history,
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "the double-fire, on disk: two sessions for one occurrence"
+        );
+
+        // ---- leg (b): the lease closes it ----
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let holder = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let secondary = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        let handle = handle_with_default_project(dir.path(), project.path());
+        approved_effect_item(&handle, now_ms() - 1_000);
+        let mut journal_a = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut journal_b = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut rx = handle.bus().subscribe();
+        // The secondary looks first — the racing order that used to
+        // double-fire — and never reaches the planner at all.
+        run_pass(
+            &handle,
+            &mut journal_b,
+            &mut SchedulerState::default(),
+            Some(&secondary),
+        )
+        .await;
+        run_pass(
+            &handle,
+            &mut journal_a,
+            &mut SchedulerState::default(),
+            Some(&holder),
+        )
+        .await;
+        let mut dispatches = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+            ) {
+                dispatches += 1;
+            }
+        }
+        assert_eq!(dispatches, 1, "exactly one dispatch under the lease");
+        let raw = std::fs::read_to_string(handle.dir().join("occurrences.jsonl")).unwrap();
+        let prepared_rows = raw
+            .lines()
+            .filter(|line| line.contains("\"prepared\""))
+            .count();
+        assert_eq!(
+            prepared_rows, 1,
+            "exactly one prepared row — the secondary appended nothing:\n{raw}"
+        );
+    }
+
+    /// Boot recovery spares rows whose stamped writer is provably alive
+    /// (its presence lock is held), while legacy stampless rows keep
+    /// today's resolve-at-boot semantics.
+    #[test]
+    fn boot_recovery_spares_live_generation_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let live_writer = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let booting = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        let (handle, _) = handle_with_item(dir.path(), now_ms() + 3_600_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+
+        // A live co-homed daemon's in-flight occurrence…
+        journal.set_stamp(Some(JournalStamp {
+            boot_id: live_writer.boot_id().to_string(),
+            generation: Some(1),
+        }));
+        stamped_started_rows(&mut journal, "occ-live", "it-live");
+        // …and a legacy (pre-stamping) row.
+        journal.set_stamp(None);
+        stamped_started_rows(&mut journal, "occ-legacy", "it-legacy");
+
+        resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Boot(&booting));
+        assert_eq!(
+            journal.progress("occ-live").terminal,
+            None,
+            "a live writer's row is spared — the intake's BROKEN edge, fixed"
+        );
+        assert_eq!(
+            journal.progress("occ-legacy").terminal,
+            Some(OccurrenceState::Unknown),
+            "legacy rows keep today's boot semantics"
+        );
+        drop(live_writer);
+    }
+
+    /// Once the writer is provably dead, its rows fail-close `Unknown`.
+    #[test]
+    fn dead_generation_rows_resolve_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let writer = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let survivor = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        let (handle, _) = handle_with_item(dir.path(), now_ms() + 3_600_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        journal.set_stamp(Some(JournalStamp {
+            boot_id: writer.boot_id().to_string(),
+            generation: Some(1),
+        }));
+        stamped_started_rows(&mut journal, "occ-doomed", "it-doomed");
+
+        // Crash the writer (drop = the OS frees its presence lock).
+        drop(writer);
+        resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Boot(&survivor));
+        assert_eq!(
+            journal.progress("occ-doomed").terminal,
+            Some(OccurrenceState::Unknown),
+            "a provably dead writer's rows fail-close"
+        );
+    }
+
+    /// The Q3 recurring amendment: rows a pass spared (writer alive)
+    /// resolve on a LATER holder pass the moment the writer's boot lock
+    /// frees — no daemon restart required. Until resolved, a `started`
+    /// row holds its effect's no-overlap gate shut.
+    #[tokio::test]
+    async fn foreign_started_rows_resolve_without_restart_once_boot_lock_frees() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // The holder boots first; the foreign writer is a live secondary.
+        let holder = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let foreign = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        assert!(holder.is_holder());
+        let (handle, _) = handle_with_item(dir.path(), now_ms() + 3_600_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        journal.set_stamp(Some(JournalStamp {
+            boot_id: foreign.boot_id().to_string(),
+            generation: None,
+        }));
+        stamped_started_rows(&mut journal, "occ-foreign", "it-foreign");
+        journal.set_stamp(None);
+
+        let mut state = SchedulerState::default();
+        run_pass(&handle, &mut journal, &mut state, Some(&holder)).await;
+        assert_eq!(
+            journal.progress("occ-foreign").terminal,
+            None,
+            "spared while the foreign writer lives"
+        );
+
+        // The foreign writer dies; the NEXT ordinary holder pass — not a
+        // restart — fail-closes its row.
+        drop(foreign);
+        run_pass(&handle, &mut journal, &mut state, Some(&holder)).await;
+        assert_eq!(
+            journal.progress("occ-foreign").terminal,
+            Some(OccurrenceState::Unknown),
+            "resolved by the recurring re-check once the boot lock freed"
+        );
     }
 }

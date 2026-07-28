@@ -63,13 +63,16 @@ fn start_mode_from_body(body_text: &str) -> Result<String, String> {
     }
 }
 
-pub(crate) fn kimi_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
+/// GET /api/kimi-auth/status + the tunnel's `api_kimi_auth_status`. At
+/// `success` the payload carries the live registry's `reload_candidates`
+/// (see [`auth_status_payload`]).
+pub(crate) async fn kimi_auth_status_api_response(hosted_provenance: bool) -> ApiResponse {
     if hosted_provenance {
         return hosted_refusal_response();
     }
     ApiResponse::json(
         200,
-        JsonBody::Value(auth_ceremony::manager().status_value_for(Provider::Kimi)),
+        JsonBody::Value(auth_status_payload(Provider::Kimi).await),
     )
 }
 
@@ -111,7 +114,7 @@ pub(crate) async fn handle_kimi_auth_status(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = kimi_auth_status_api_response(request_authority_is_hosted(access));
+    let response = kimi_auth_status_api_response(request_authority_is_hosted(access)).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -138,11 +141,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hosted_provenance_is_refused_on_every_leaf() {
+    #[tokio::test]
+    async fn hosted_provenance_is_refused_on_every_leaf() {
         for response in [
             kimi_auth_start_api_response(true, "", None),
-            kimi_auth_status_api_response(true),
+            kimi_auth_status_api_response(true).await,
             kimi_auth_cancel_api_response(true),
         ] {
             let (status, body) = response_status_and_body(response);

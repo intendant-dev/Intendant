@@ -312,12 +312,38 @@ pub(crate) fn spawn_mode_web_gateway(
     // attach while an `ask_user` blocks, so asks wait instead of
     // auto-answering.
     mcp_http_state.interactive_frontends = true;
+    // The handover runtime (Track HS): mint this boot's identity,
+    // register its liveness presence, and try the active-scheduler lease
+    // once. HS1 is behavior-neutral — holding or not holding changes
+    // nothing yet (HS2 gates standing automations on it); the primitive,
+    // the presence files, the journal stamp, and the status surfaces land
+    // first so the protocol has ground truth to stand on. Every failure
+    // degrades to a named status field, never a refused boot.
+    let agenda_dir = crate::agenda::agenda_dir();
+    let handover = Arc::new(crate::handover::HandoverRuntime::initialize(
+        &crate::platform::intendant_home(),
+        web_port,
+        crate::agenda::journal_generation_floor(&agenda_dir),
+    ));
+    mcp_http_state.handover = Some(handover.clone());
+    // House automation definitions materialize into the state root at
+    // boot, BEFORE any stamp can resolve them (Track AW, ruling R1): v1
+    // binding refs are `file:` only, so the embedded set needs real
+    // paths to hash and seal — a packaged install has no repo checkout.
+    // The parent derivation is the stamp lane's own (state root =
+    // the agenda dir's parent), so resolution and materialization can
+    // never disagree. Failure degrades to named stamp-time refusals,
+    // never a refused boot.
+    if let Some(state_root) = agenda_dir.parent() {
+        if let Err(err) = crate::agenda::materialize_house_definitions(state_root) {
+            eprintln!("[agenda] materializing house definitions: {err}");
+        }
+    }
     // The daemon's agenda ledger: one single-writer handle shared by the
     // MCP tools, the HTTP routes, and the dashboard tunnel twins, plus
     // the reminder scheduler that delivers due items through the
     // notification ladder. A store that fails to open degrades to
     // "agenda unavailable" instead of failing the gateway.
-    let agenda_dir = crate::agenda::agenda_dir();
     mcp_http_state.agenda = match crate::agenda::AgendaStore::open(&agenda_dir) {
         Ok(store) => {
             let handle = Arc::new(
@@ -332,8 +358,12 @@ pub(crate) fn spawn_mode_web_gateway(
                         default_project_root: project_root.clone(),
                     }),
             );
+            // Read-side seam for lanes outside the state graph (the
+            // session catalog's grid-envelope join).
+            crate::agenda::publish_agenda_handle(handle.clone());
             // Detaches on drop like the mode listeners; one per daemon.
-            let _scheduler = crate::agenda::spawn_reminder_scheduler(handle.clone());
+            let _scheduler =
+                crate::agenda::spawn_reminder_scheduler(handle.clone(), Some(handover.clone()));
             // Resolves rail answers/dismissals for parked (agenda-backed)
             // asks — nothing blocks on them, so the daemon records the
             // outcome. Detaches on drop like the scheduler.
@@ -341,12 +371,17 @@ pub(crate) fn spawn_mode_web_gateway(
             // The GitHub PR scanner (Track PR): mirrors watched repos'
             // PRs as thin anchors under the PRs hub. Natural on/off —
             // it idles keystore-free until credentials are sealed and a
-            // watch list exists. Detaches on drop like its siblings.
+            // watch list exists; under the scheduler lease (Track HS2)
+            // it runs on the holder only. Detaches on drop like its
+            // siblings.
             let scanner_settings_root = project_root
                 .clone()
                 .unwrap_or_else(crate::project::daemon_settings_config_root);
-            let _pr_scanner =
-                crate::github_pr::scanner::spawn_scanner(handle.clone(), scanner_settings_root);
+            let _pr_scanner = crate::github_pr::scanner::spawn_scanner(
+                handle.clone(),
+                scanner_settings_root,
+                Some(handover.clone()),
+            );
             Some(handle)
         }
         Err(err) => {

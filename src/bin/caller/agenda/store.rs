@@ -368,6 +368,16 @@ impl AgendaStore {
                 now_ms,
             );
         }
+        // Stamp (Track AW): one command, one whole instance graph —
+        // its own arm because it maps to many ordinary ops and returns
+        // a graph-shaped outcome (the single-item return here is the
+        // primary item; `apply_stamp_command` is the graph entry).
+        if let AgendaCommand::Stamp { .. } = cmd {
+            let stamp = StampFields::from_command(cmd)?;
+            return self
+                .apply_stamp(stamp, actor, source, now_ms)
+                .map(|outcome| outcome.primary().clone());
+        }
         let deletes_blobs = matches!(&cmd, AgendaCommand::Retire { .. });
         let op = self.command_to_op(cmd, now_ms)?;
         let item = self.append_op(op, actor, source, now_ms)?;
@@ -829,6 +839,264 @@ impl AgendaStore {
         Ok(item)
     }
 
+    /// The graph-shaped stamp entry (Track AW): apply one `stamp`
+    /// command and return the whole stamped instance — hub, nodes,
+    /// digests, and the sealed pin — for the approval sheet. Runs the
+    /// same prologue as [`Self::apply_command`], whose own `Stamp` arm
+    /// shares [`Self::apply_stamp`] and returns just the primary item.
+    pub(crate) fn apply_stamp_command(
+        &mut self,
+        mut cmd: AgendaCommand,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaStampOutcome, AgendaError> {
+        self.refresh_if_stale()?;
+        let source = validate_source(cmd.take_source())?;
+        let stamp = StampFields::from_command(cmd)?;
+        self.apply_stamp(stamp, actor, source, now_ms)
+    }
+
+    /// Stamp = sealing (Track AW §2.3): read the definition ONCE,
+    /// validate it, seal the validated bytes, park the instance graph,
+    /// and propose one manifest per node through the ordinary command
+    /// intake — every floor, exclusivity, executor, project, and
+    /// binding-ref rule runs exactly where it always runs. Approves
+    /// NOTHING. Mid-stamp failure leaves the parked prefix visible
+    /// (append-only history; nothing rolls back silently — today's
+    /// client-side semantics, kept).
+    fn apply_stamp(
+        &mut self,
+        stamp: StampFields,
+        actor: Option<AgendaActor>,
+        source: Option<String>,
+        now_ms: u64,
+    ) -> Result<AgendaStampOutcome, AgendaError> {
+        // The agenda dir lives at `<state root>/agenda` (mod.rs), so the
+        // library roots hang off its parent.
+        let state_root =
+            self.dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+                AgendaError::Invalid("agenda dir has no parent state root".into())
+            })?;
+        let (path, provenance) =
+            super::definitions::resolve_definition(&state_root, &stamp.definition)
+                .map_err(AgendaError::Invalid)?;
+        // ONE read: the bytes validated here are the bytes hashed and
+        // sealed. Each node's propose below re-verifies this pin against
+        // the daemon's own fresh read (the standing intake property), so
+        // a file mutated mid-stamp is a named refusal — never a seal of
+        // bytes nobody validated.
+        let content = std::fs::read_to_string(&path).map_err(|err| {
+            AgendaError::Invalid(format!("cannot read definition {}: {err}", path.display()))
+        })?;
+        let dir_name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let def = super::definitions::parse_definition(&content, &dir_name)
+            .map_err(|err| AgendaError::Invalid(format!("definition {dir_name}: {err}")))?;
+        for advisory in &def.advisories {
+            eprintln!("[agenda] stamp advisory ({}): {advisory}", def.name);
+        }
+        let sha256 = super::sealed_blobs::digest_bytes(content.as_bytes());
+        super::sealed_blobs::seal_content(&self.dir, &sha256, content.as_bytes()).map_err(
+            |err| {
+                AgendaError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("sealing definition {}: {err}", path.display()),
+                ))
+            },
+        )?;
+        let locator = format!(
+            "{}{}",
+            super::types::BINDING_REF_FILE_SCHEME,
+            path.display()
+        );
+
+        // Override knobs are arity-gated: a workflow's per-node executors
+        // and structural on_unblock cadence live in the definition.
+        if def.is_workflow()
+            && (stamp.every_ms.is_some()
+                || stamp.suspend_after.is_some()
+                || stamp.agent_config.as_ref().is_some_and(|c| !c.is_empty()))
+        {
+            return Err(AgendaError::Invalid(
+                "workflow stamps take no cadence or executor overrides — per-node \
+                 executors and edges are declared in the definition (v1)"
+                    .into(),
+            ));
+        }
+        if !def.is_workflow()
+            && def.nodes[0].trigger.is_some()
+            && (stamp.every_ms.is_some() || stamp.suspend_after.is_some())
+        {
+            return Err(AgendaError::Invalid(
+                "this action is event-triggered — cadence overrides do not apply \
+                 (a manifest is cadenced OR triggered)"
+                    .into(),
+            ));
+        }
+        let fire_at_ms = stamp.fire_at_ms.unwrap_or(now_ms);
+
+        // Park the instance graph (today's stamp topologies, verbatim):
+        // hub iff workflow; node bodies carry the display copy of their
+        // section (ruled Q6 — the sealed file stays the binding text).
+        let hub = if def.is_workflow() {
+            Some(self.apply_add(
+                super::types::AgendaKind::Note,
+                def.title.clone(),
+                def.orientation.clone(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                actor.clone(),
+                source.clone(),
+                now_ms,
+            )?)
+        } else {
+            None
+        };
+        let mut parked: Vec<(String, String, String)> = Vec::new(); // (node id, title, item id)
+        for node in &def.nodes {
+            let title = if def.is_workflow() {
+                node.title.clone()
+            } else {
+                def.title.clone()
+            };
+            let item = self.apply_add(
+                super::types::AgendaKind::Task,
+                title.clone(),
+                node.goal.clone(),
+                Vec::new(),
+                None,
+                Vec::new(),
+                actor.clone(),
+                source.clone(),
+                now_ms,
+            )?;
+            if let Some(hub) = &hub {
+                self.apply_place(&item.id, &hub.id, actor.clone(), source.clone(), now_ms)?;
+            }
+            parked.push((node.id.clone(), title, item.id));
+        }
+        let item_of = |parked: &[(String, String, String)], node_id: &str| -> String {
+            parked
+                .iter()
+                .find(|(id, ..)| id == node_id)
+                .map(|(_, _, item_id)| item_id.clone())
+                .expect("every node was parked")
+        };
+        for node in &def.nodes {
+            for dep in &node.relies_on {
+                let op = self.command_to_op(
+                    AgendaCommand::AddReliesOn {
+                        id: item_of(&parked, &node.id),
+                        target_id: item_of(&parked, dep),
+                        source: None,
+                    },
+                    now_ms,
+                )?;
+                self.append_op(op, actor.clone(), source.clone(), now_ms)?;
+            }
+        }
+
+        // Propose per node through the ordinary intake — the same
+        // authority every hand-proposed manifest passes (ruling R4).
+        let mut nodes: Vec<StampedNode> = Vec::new();
+        for node in &def.nodes {
+            let (recurrence, trigger) = if def.is_workflow() {
+                (None, Some(super::types::TriggerSpec::OnUnblock))
+            } else if let Some(t) = &node.trigger {
+                (
+                    None,
+                    Some(super::types::TriggerSpec::OnItemMatch {
+                        item_kind: t.item_kind,
+                        tags: t.tags.clone(),
+                    }),
+                )
+            } else if node.cadence.is_some() || stamp.every_ms.is_some() {
+                let prefill = node.cadence.as_ref();
+                let every_ms = stamp
+                    .every_ms
+                    .or(prefill.map(|c| c.every_ms))
+                    .expect("cadence present on this branch");
+                (
+                    Some(super::types::RecurrenceSpec {
+                        every_ms,
+                        until_ms: None,
+                        max_occurrences: None,
+                        suspend_after_failures: stamp
+                            .suspend_after
+                            .or(prefill.and_then(|c| c.suspend_after)),
+                    }),
+                    None,
+                )
+            } else {
+                (None, None) // one-shot
+            };
+            let agent_config = if def.is_workflow() {
+                node.launch_config().map(Box::new)
+            } else {
+                stamp
+                    .agent_config
+                    .clone()
+                    .filter(|c| !c.is_empty())
+                    .or_else(|| node.launch_config().map(Box::new))
+            };
+            let item_id = item_of(&parked, &node.id);
+            let op = self.command_to_op(
+                AgendaCommand::ProposeEffect {
+                    id: item_id,
+                    goal: super::definitions::node_preamble(&def.name, &node.id),
+                    fire_at_ms,
+                    orchestrate: false,
+                    recurrence,
+                    agent_config,
+                    trigger,
+                    project_root: stamp
+                        .project_root
+                        .clone()
+                        .or_else(|| node.project_root.clone()),
+                    binding_refs: vec![super::types::BindingRef {
+                        locator: locator.clone(),
+                        sha256: sha256.clone(),
+                    }],
+                    source: None,
+                },
+                now_ms,
+            )?;
+            let item = self.append_op(op, actor.clone(), source.clone(), now_ms)?;
+            let digest = item
+                .effects
+                .first()
+                .map(|effect| effect.digest.clone())
+                .unwrap_or_default();
+            let (node_id, title, _) = parked
+                .iter()
+                .find(|(id, ..)| id == &node.id)
+                .cloned()
+                .expect("every node was parked");
+            nodes.push(StampedNode {
+                node_id,
+                title,
+                digest,
+                item,
+            });
+        }
+        // The hub's final fold state (children/placement accrued above).
+        let hub = hub.and_then(|h| self.item(&h.id));
+        Ok(AgendaStampOutcome {
+            definition: def.name.clone(),
+            title: def.title.clone(),
+            provenance: provenance.as_str(),
+            locator,
+            sha256,
+            hub,
+            nodes,
+        })
+    }
+
     /// Park one validated rich ask: build the questions through the same
     /// validator the blocking `ask_user` uses, mint the item id, commit
     /// preview blobs into the agenda blob store (rolling back every blob
@@ -1287,6 +1555,13 @@ impl AgendaStore {
                 // shares it; reaching here is a daemon bug.
                 Err(AgendaError::Invalid(format!(
                     "internal: request_occurrence for {id} must route through apply_command"
+                )))
+            }
+            AgendaCommand::Stamp { definition, .. } => {
+                // One command, many ops: the dedicated arm
+                // (`apply_stamp`) owns it; reaching here is a daemon bug.
+                Err(AgendaError::Invalid(format!(
+                    "internal: stamp of {definition} must route through apply_command"
                 )))
             }
             AgendaCommand::Annotate {
@@ -1971,6 +2246,82 @@ fn validate_trigger(trigger: &super::types::TriggerSpec) -> Result<(), AgendaErr
             }
             Ok(())
         }
+    }
+}
+
+/// The `stamp` command's fields, destructured once for the two entry
+/// points (`apply_command`'s arm and `apply_stamp_command`).
+struct StampFields {
+    definition: String,
+    project_root: Option<String>,
+    fire_at_ms: Option<u64>,
+    every_ms: Option<u64>,
+    suspend_after: Option<u32>,
+    agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+}
+
+impl StampFields {
+    fn from_command(cmd: AgendaCommand) -> Result<Self, AgendaError> {
+        let AgendaCommand::Stamp {
+            definition,
+            project_root,
+            fire_at_ms,
+            every_ms,
+            suspend_after,
+            agent_config,
+            source: _,
+        } = cmd
+        else {
+            return Err(AgendaError::Invalid(
+                "internal: stamp entry requires a stamp command".into(),
+            ));
+        };
+        Ok(Self {
+            definition,
+            project_root,
+            fire_at_ms,
+            every_ms,
+            suspend_after,
+            agent_config,
+        })
+    }
+}
+
+/// One stamped node: its parked item (post-propose fold state, carrying
+/// the effect) plus the digest the approval sheet binds. The identity
+/// fields beyond `item` are the wire response's material — the slice-2
+/// stamp route serializes them; the handle reads `item` today.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct StampedNode {
+    pub(crate) node_id: String,
+    pub(crate) title: String,
+    pub(crate) digest: String,
+    pub(crate) item: AgendaItem,
+}
+
+/// A whole stamped instance — what the stamp lane returns to the
+/// approval sheet: ordinary items and effects only (no workflow-level
+/// object exists; this is a response shape, not state). The handle
+/// consumes `title`/`hub`/`nodes` today; the rest is the slice-2 wire
+/// response's material.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct AgendaStampOutcome {
+    pub(crate) definition: String,
+    pub(crate) title: String,
+    pub(crate) provenance: &'static str,
+    pub(crate) locator: String,
+    pub(crate) sha256: String,
+    pub(crate) hub: Option<AgendaItem>,
+    pub(crate) nodes: Vec<StampedNode>,
+}
+
+impl AgendaStampOutcome {
+    /// The single-item face of the graph: the hub for workflows, the
+    /// action's one item otherwise (`apply_command`'s return shape).
+    pub(crate) fn primary(&self) -> &AgendaItem {
+        self.hub.as_ref().unwrap_or_else(|| &self.nodes[0].item)
     }
 }
 
@@ -5061,6 +5412,341 @@ mod tests {
         assert_ne!(
             pinned.effects[0].digest, unpinned_digest,
             "the pin revises the digest"
+        );
+    }
+
+    // ---- Track AW: the stamp lane ----
+
+    /// A state root with the house set materialized and the agenda under
+    /// `<root>/agenda` — the deployed layout, hermetic in a tempdir.
+    fn stamp_rig() -> (tempfile::TempDir, AgendaStore) {
+        let root = tempfile::tempdir().unwrap();
+        super::super::definitions::materialize_house_definitions(root.path()).unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let store = AgendaStore::open(&agenda).unwrap();
+        (root, store)
+    }
+
+    fn stamp_cmd(definition: &str) -> AgendaCommand {
+        AgendaCommand::Stamp {
+            definition: definition.to_string(),
+            project_root: None,
+            fire_at_ms: None,
+            every_ms: None,
+            suspend_after: None,
+            agent_config: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn stamp_parks_and_proposes_but_never_approves() {
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("fix-task"), owner(), 5000)
+            .unwrap();
+        // Today's workflow topology, verbatim: hub note + placed node
+        // tasks + relies_on edges + one on_unblock manifest per node.
+        let hub = outcome.hub.as_ref().expect("workflow stamps a hub");
+        assert_eq!(hub.title, "Fix-task workflow");
+        assert!(hub.body.starts_with("This hub is one instance"));
+        assert_eq!(outcome.nodes.len(), 4);
+        let by_node = |id: &str| {
+            outcome
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .expect("stamped node")
+        };
+        for node in &outcome.nodes {
+            let item = &node.item;
+            assert_eq!(
+                item.part_of.as_ref().map(|p| p.parent_id.as_str()),
+                Some(hub.id.as_str())
+            );
+            let effect = item.effects.first().expect("proposed manifest");
+            assert_eq!(
+                effect.manifest.trigger,
+                Some(super::super::types::TriggerSpec::OnUnblock)
+            );
+            assert!(effect.manifest.recurrence.is_none());
+            assert!(
+                effect.manifest.goal.starts_with(&format!(
+                    "Execute node \"{}\" of the sealed automation definition \"fix-task\"",
+                    node.node_id
+                )),
+                "{}",
+                effect.manifest.goal
+            );
+            assert_eq!(effect.manifest.binding_refs.len(), 1);
+            assert_eq!(effect.manifest.binding_refs[0].sha256, outcome.sha256);
+            assert_eq!(effect.manifest.binding_refs[0].locator, outcome.locator);
+            // Parks + proposes, NEVER approves.
+            assert!(effect.approval.is_none(), "stamp must not approve");
+            assert_eq!(node.digest, effect.digest);
+        }
+        // Edges: implement→investigate, verify→implement, land→verify.
+        let dep_of = |id: &str| -> Vec<String> {
+            by_node(id)
+                .item
+                .relies_on
+                .iter()
+                .map(|d| d.target_id.clone())
+                .collect()
+        };
+        assert_eq!(dep_of("investigate"), Vec::<String>::new());
+        assert_eq!(
+            dep_of("implement"),
+            vec![by_node("investigate").item.id.clone()]
+        );
+        assert_eq!(dep_of("verify"), vec![by_node("implement").item.id.clone()]);
+        assert_eq!(dep_of("land"), vec![by_node("verify").item.id.clone()]);
+        // Node executor prefills rode the manifests (investigate pinned,
+        // implement inherits).
+        let investigate = by_node("investigate").item.effects[0]
+            .manifest
+            .agent_config
+            .as_deref()
+            .expect("pinned executor");
+        assert_eq!(investigate.agent.as_deref(), Some("claude-code"));
+        assert_eq!(investigate.claude_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(investigate.claude_effort.as_deref(), Some("max"));
+        assert!(by_node("implement").item.effects[0]
+            .manifest
+            .agent_config
+            .is_none());
+        // The durable log carries ordinary ops only — and no approval op
+        // of any kind.
+        let log = std::fs::read_to_string(store.log_path()).unwrap();
+        assert!(
+            !log.contains("\"approve_effect\""),
+            "stamp wrote an approval op"
+        );
+        assert!(log.contains("\"add_relies_on\""));
+        // The generic single-item lane returns the hub.
+        let (_root2, mut store2) = stamp_rig();
+        let primary = store2
+            .apply_command(stamp_cmd("fix-task"), owner(), 5000)
+            .unwrap();
+        assert_eq!(primary.title, "Fix-task workflow");
+        assert_eq!(primary.kind, AgendaKind::Note);
+    }
+
+    #[test]
+    fn stamp_seals_the_bytes_it_validated() {
+        let (root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("triage"), owner(), 5000)
+            .unwrap();
+        // The action topology: one task, body = the node's display copy.
+        assert!(outcome.hub.is_none());
+        assert_eq!(outcome.nodes.len(), 1);
+        let item = &outcome.nodes[0].item;
+        assert_eq!(item.title, "Agenda triage");
+        assert!(item.body.starts_with("Agenda triage pass."));
+        // The sealed blob is byte-identical to the embedded house file —
+        // the bytes validated are the bytes sealed, and the manifest pin
+        // names them.
+        let embedded = super::super::definitions::HOUSE_DEFINITIONS
+            .iter()
+            .find(|(name, _)| *name == "triage")
+            .unwrap()
+            .1;
+        assert_eq!(
+            outcome.sha256,
+            super::super::sealed_blobs::digest_bytes(embedded.as_bytes())
+        );
+        let blob = super::super::sealed_blobs::sealed_blob_path(
+            &root.path().join("agenda"),
+            &outcome.sha256,
+        );
+        assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
+        let effect = &item.effects[0];
+        assert_eq!(effect.manifest.binding_refs[0].sha256, outcome.sha256);
+        assert!(effect.manifest.binding_refs[0]
+            .locator
+            .ends_with(".house/triage/SKILL.md"));
+        // The cadence prefill rode the manifest through the ordinary
+        // intake: weekly, suspend after 3.
+        let recurrence = effect.manifest.recurrence.expect("cadenced action");
+        assert_eq!(recurrence.every_ms, 7 * 24 * 60 * 60 * 1000);
+        assert_eq!(recurrence.suspend_after_failures, Some(3));
+        assert!(effect.manifest.trigger.is_none());
+        assert!(effect.approval.is_none());
+
+        // A personal definition shadows the house one; editing it and
+        // re-stamping seals the NEW revision under a distinct hash while
+        // the first seal survives (content-addressed, no deletion path).
+        let personal = super::super::definitions::automations_dir_in(root.path()).join("triage");
+        std::fs::create_dir_all(&personal).unwrap();
+        let edited = embedded.replace("Agenda triage pass.", "Agenda triage pass (edited).");
+        std::fs::write(personal.join("SKILL.md"), &edited).unwrap();
+        let second = store
+            .apply_stamp_command(stamp_cmd("triage"), owner(), 6000)
+            .unwrap();
+        assert_eq!(second.provenance, "personal");
+        assert_ne!(second.sha256, outcome.sha256);
+        let second_blob = super::super::sealed_blobs::sealed_blob_path(
+            &root.path().join("agenda"),
+            &second.sha256,
+        );
+        assert_eq!(std::fs::read_to_string(&second_blob).unwrap(), edited);
+        assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
+    }
+
+    #[test]
+    fn frontmatter_prefills_pass_the_same_manifest_intake() {
+        // The steward-gate trigger prefill lands as the ordinary
+        // on_item_match manifest with the executor pins.
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("steward-gate"), owner(), 5000)
+            .unwrap();
+        let effect = &outcome.nodes[0].item.effects[0];
+        assert_eq!(
+            effect.manifest.trigger,
+            Some(super::super::types::TriggerSpec::OnItemMatch {
+                item_kind: AgendaKind::Question,
+                tags: vec!["gate".to_string()],
+            })
+        );
+        let config = effect.manifest.agent_config.as_deref().unwrap();
+        assert_eq!(config.agent.as_deref(), Some("claude-code"));
+        assert_eq!(config.claude_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(config.claude_effort.as_deref(), Some("max"));
+
+        // Overrides are prefills INTO the intake, never around it: the
+        // refusals below are the intake's own, verbatim wording.
+        let (_root, mut store) = stamp_rig();
+        let err = store
+            .apply_stamp_command(
+                AgendaCommand::Stamp {
+                    definition: "housekeeping".into(),
+                    project_root: None,
+                    fire_at_ms: None,
+                    every_ms: Some(60_000),
+                    suspend_after: None,
+                    agent_config: None,
+                    source: None,
+                },
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("recurrence cadence floors at 15 minutes"),
+            "{err}"
+        );
+        let (_root, mut store) = stamp_rig();
+        let err = store
+            .apply_stamp_command(
+                AgendaCommand::Stamp {
+                    definition: "triage".into(),
+                    project_root: Some("/definitely/not/a/dir".into()),
+                    fire_at_ms: None,
+                    every_ms: None,
+                    suspend_after: None,
+                    agent_config: None,
+                    source: None,
+                },
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not an existing directory"),
+            "{err}"
+        );
+        // A mid-stamp intake refusal leaves the parked prefix visible —
+        // append-only history, nothing rolls back silently.
+        let (_root3, store3) = {
+            let (r, mut s) = stamp_rig();
+            let _ = s
+                .apply_stamp_command(
+                    AgendaCommand::Stamp {
+                        definition: "triage".into(),
+                        project_root: Some("/definitely/not/a/dir".into()),
+                        fire_at_ms: None,
+                        every_ms: None,
+                        suspend_after: None,
+                        agent_config: None,
+                        source: None,
+                    },
+                    owner(),
+                    5000,
+                )
+                .unwrap_err();
+            (r, s)
+        };
+        let parked = store3.snapshot();
+        assert_eq!(parked.len(), 1, "the parked task stays visible");
+        assert!(parked[0].effects.is_empty(), "no manifest was proposed");
+
+        // Workflow stamps take no cadence/executor overrides (arity-gated
+        // knobs, named refusal).
+        let (_root, mut store) = stamp_rig();
+        let err = store
+            .apply_stamp_command(
+                AgendaCommand::Stamp {
+                    definition: "fix-task".into(),
+                    project_root: None,
+                    fire_at_ms: None,
+                    every_ms: Some(3_600_000),
+                    suspend_after: None,
+                    agent_config: None,
+                    source: None,
+                },
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("workflow stamps take no cadence"),
+            "{err}"
+        );
+
+        // An action's executor override replaces the definition prefill
+        // wholesale, and a triggerless/cadenceless personal action stamps
+        // as a one-shot.
+        let (root, mut store) = stamp_rig();
+        let personal = super::super::definitions::automations_dir_in(root.path()).join("ping");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(
+            personal.join("SKILL.md"),
+            "---\nname: ping\ndescription: One-shot ping.\n---\n\n## node: ping\n\n```toml\nagent = \"claude-code\"\nmodel = \"claude-fable-5\"\neffort = \"max\"\n```\n\nPing the owner with a status line.\n",
+        )
+        .unwrap();
+        let over = crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".to_string()),
+            claude_model: Some("claude-opus-5".to_string()),
+            ..Default::default()
+        };
+        let outcome = store
+            .apply_stamp_command(
+                AgendaCommand::Stamp {
+                    definition: "ping".into(),
+                    project_root: None,
+                    fire_at_ms: Some(9000),
+                    every_ms: None,
+                    suspend_after: None,
+                    agent_config: Some(Box::new(over)),
+                    source: None,
+                },
+                owner(),
+                5000,
+            )
+            .unwrap();
+        let effect = &outcome.nodes[0].item.effects[0];
+        assert!(effect.manifest.recurrence.is_none());
+        assert!(effect.manifest.trigger.is_none());
+        assert_eq!(effect.manifest.fire_at_ms, 9000);
+        let config = effect.manifest.agent_config.as_deref().unwrap();
+        assert_eq!(config.claude_model.as_deref(), Some("claude-opus-5"));
+        assert!(
+            config.claude_effort.is_none(),
+            "override replaces wholesale"
         );
     }
 }

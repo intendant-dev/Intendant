@@ -143,9 +143,38 @@ pub(crate) fn external_session_row_matches(
         || row_backend_source.as_deref() == Some(source.as_str())
 }
 
+/// Whether this wrapper dir's `status` speaks for the merged row. The
+/// list pass merges EVERY wrapper dir of a `(source, backend)` group
+/// into the same external row, but only one wrapper is the live
+/// thread's current one — the index's ACTIVE record, asserted at
+/// identity-commit (the wrapper-index doctrine: scan-shaped passes
+/// record history and never assert liveness). Letting every visited dir
+/// overwrite `intendant_status` made the LAST-visited group member win
+/// — under the scan cap that is the OLDEST dir, so an old completed
+/// wrapper presented a live resumed session as ended (and a crashed old
+/// dir presented an ended thread as live): the same last-visited-wins
+/// class fixed on the index side 2026-07-19
+/// (`external_wrapper_index::backfill`). When the index knows no active
+/// wrapper for the group, the FIRST-visited dir wins — the scan visits
+/// newest-first, so that is the newest dir, deterministically.
+pub(crate) fn merged_wrapper_status_wins(
+    home: &Path,
+    source: &str,
+    backend_session_id: &str,
+    wrapper_session_id: &str,
+    external: &serde_json::Value,
+) -> bool {
+    let wrappers = crate::external_wrapper_index::wrappers_for(home, source, backend_session_id);
+    match crate::external_wrapper_index::active_wrapper_in(&wrappers) {
+        Some(active) => active.intendant_session_id == wrapper_session_id,
+        None => external.get("intendant_status").is_none(),
+    }
+}
+
 pub(crate) fn merge_intendant_wrapper_into_external_session(
     external: &mut serde_json::Value,
     wrapper: &serde_json::Value,
+    stamp_status: bool,
 ) {
     let Some(obj) = external.as_object_mut() else {
         return;
@@ -184,6 +213,11 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
         ("pi_model", "pi_model"),
         ("pi_thinking", "pi_thinking"),
         ("pi_allowed_tools", "pi_allowed_tools"),
+        // The grid envelope's serve-time blocks (agenda linkage + boot
+        // era) ride the wrapper row and must survive the collapse into
+        // the backend's native row.
+        ("agenda", "agenda"),
+        ("boot", "boot"),
     ] {
         if let Some(value) = wrapper_obj.get(wrapper_key) {
             obj.insert(target_key.to_string(), value.clone());
@@ -217,8 +251,13 @@ pub(crate) fn merge_intendant_wrapper_into_external_session(
             obj.insert(format!("intendant_{key}"), value.clone());
         }
     }
-    if let Some(value) = wrapper_obj.get("status") {
-        obj.insert("intendant_status".to_string(), value.clone());
+    // `intendant_status` only from the wrapper whose status speaks for
+    // the row (`merged_wrapper_status_wins`) — an unconditional stamp
+    // here let the last-visited group member clobber the live one's.
+    if stamp_status {
+        if let Some(value) = wrapper_obj.get("status") {
+            obj.insert("intendant_status".to_string(), value.clone());
+        }
     }
     obj.insert(
         "can_delete_intendant_log".to_string(),
@@ -2108,7 +2147,7 @@ mod tests {
             }],
         });
 
-        merge_intendant_wrapper_into_external_session(&mut external, &wrapper);
+        merge_intendant_wrapper_into_external_session(&mut external, &wrapper, true);
 
         let relationships = external["relationships"].as_array().unwrap();
         assert_eq!(relationships.len(), 1);
@@ -2136,7 +2175,7 @@ mod tests {
             "kimi_home": "/isolated/kimi-home",
         });
 
-        merge_intendant_wrapper_into_external_session(&mut external, &wrapper);
+        merge_intendant_wrapper_into_external_session(&mut external, &wrapper, true);
 
         for key in [
             "kimi_model",

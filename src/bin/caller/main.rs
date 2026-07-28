@@ -57,6 +57,7 @@ pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
 mod global_store;
+mod handover;
 mod hosted_verify;
 mod key_custody;
 mod lease_transcript_staging;

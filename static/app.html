@@ -4696,6 +4696,17 @@ body.context-focus-active {
     0 0 0 1px color-mix(in srgb, var(--session-badge-border, color-mix(in srgb, var(--blue) 62%, transparent)) 30%, transparent),
     0 0 18px color-mix(in srgb, var(--session-badge-fg, var(--blue)) 26%, transparent);
 }
+/* Grid envelope's ghost state (served bit: pre-boot + no live wrapper —
+   safe to close). Last in the border-modifier chain so a ghost reads as
+   a ghost even when other window states apply: dashed peach frame,
+   tinted wash, desaturated content — unmistakable, not screaming. */
+.session-window.session-window-ghost {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--peach) 65%, var(--surface1));
+  background: color-mix(in srgb, var(--peach) 5%, var(--session-window-bg));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--peach) 22%, transparent);
+  filter: saturate(0.65);
+}
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;
@@ -24100,6 +24111,28 @@ html.ui-v2 .ag2-eff-line {
   overflow-wrap: anywhere;
 }
 
+/* The shared manifest-digest chip (ui2-agenda.js renders it on every
+   approval surface): short form inline, full digest on hover, click
+   copies. One appearance everywhere it shows. */
+html.ui-v2 .ag2-digest-chip {
+  display: inline-flex;
+  align-items: center;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-inset);
+  padding: 1px 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-digest-chip:hover {
+  border-color: var(--line-2);
+  color: var(--text);
+}
+
 /* ---- Automations lens rows (Track AU) ---- */
 
 html.ui-v2 .ag2-auto-meta {
@@ -37011,7 +37044,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '100bedf65b13e190';
+const INTENDANT_APP_BUILD = '709efc42df3676c1';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -42352,7 +42385,6 @@ const AGENT_SIGNIN_PROVIDERS = {
     checkNote: 'Check that your browser shows claude.com before signing in.',
     unsupportedNote:
       'This daemon predates the Claude sign-in ceremony — upgrade it to sign in from here.',
-    backendMatch: backend => backend.includes('claude'),
     sessionsTitle: 'Live Claude Code sessions',
     noSessionsNote: 'No live Claude Code sessions — new sessions start on the new account.',
     sessionKind: 'claude-code',
@@ -42381,7 +42413,6 @@ const AGENT_SIGNIN_PROVIDERS = {
     devicePageName: 'OpenAI',
     unsupportedNote:
       'This daemon predates the Codex sign-in ceremony — upgrade it to sign in from here.',
-    backendMatch: backend => backend.includes('codex'),
     sessionsTitle: 'Live Codex sessions',
     noSessionsNote: 'No live Codex sessions — new sessions start on the new account.',
     sessionKind: 'codex',
@@ -42414,7 +42445,6 @@ const AGENT_SIGNIN_PROVIDERS = {
     devicePageName: 'Kimi',
     unsupportedNote:
       'This daemon predates the Kimi sign-in ceremony — upgrade it to sign in from here.',
-    backendMatch: backend => backend.includes('kimi'),
     sessionsTitle: 'Live Kimi sessions',
     noSessionsNote: 'No live Kimi sessions — new sessions start on the new account.',
     sessionKind: 'kimi',
@@ -42433,14 +42463,14 @@ const AGENT_SIGNIN_PROVIDERS = {
 
 function agentSigninProviderState() {
   return {
-    status: null, // last daemon status payload ({phase, url?, user_code?, account?, error?…})
+    // Last daemon status payload ({phase, url?, user_code?, account?,
+    // error?…}; at success it carries reload_candidates — the daemon's
+    // LIVE session registry, riding the same body as the phase).
+    status: null,
     fetchedAt: 0,
     busy: false,
     lastError: '',
     pollTimer: null,
-    sessions: [], // live sessions of this provider's backend for the reload panel
-    sessionsFetchedAt: 0,
-    lastPhase: '', // transition detector: entering success forces a fresh fetch
     reloadRequested: new Set(),
   };
 }
@@ -42484,16 +42514,12 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
     state.lastError = String(err?.message || err);
   }
   agentSigninEnsurePoll(provider);
+  // The reload chips render straight from the fetched status payload:
+  // at success the daemon serves reload_candidates (its live session
+  // registry) in the SAME body as the phase, so the list is exactly as
+  // fresh as the success it arrives with — no second fetch to force,
+  // cache, or skip.
   renderAgentSigninSection();
-  const phaseNow = agentSigninPhase(provider);
-  const phaseChanged = phaseNow !== state.lastPhase;
-  state.lastPhase = phaseNow;
-  // Entering success forces the fetch past the freshness window: the
-  // reload chips must reflect live sessions at the exact moment the user
-  // needs them (a cached pre-success list here hid a parked session).
-  if (phaseNow === 'success') {
-    agentSigninRefreshSessions(provider, { force: phaseChanged }).catch(() => {});
-  }
 }
 
 /* 2s poll while a ceremony is in flight and the page is looking at it;
@@ -42618,92 +42644,34 @@ async function agentSigninCancel(provider) {
   renderAgentSigninSection();
 }
 
-/* Catalog statuses that mean a session row has ENDED — a mirror of the
-   daemon's session-catalog terminal vocabulary (SESSION_ENDED_STATUSES
-   plus the bare-dir "abandoned" classification). A daemon-side parity
-   test pins this set to the source
-   (agent_signin_terminal_status_mirror_matches_catalog_vocabulary), so
-   keep the one-status-per-quote shape scrapable. */
-const AGENT_SIGNIN_TERMINAL_STATUSES = new Set([
-  'completed', 'failed', 'interrupted', 'abandoned',
-]);
-
-/* Reload candidates are ALIVE supervised sessions of the provider's
-   backend: wrapper evidence (a supervised session always has an
-   Intendant wrapper row — merged rows carry intendant_status /
-   intendant_session_id, unmerged wrapper rows have source "intendant")
-   and a non-terminal status. The old `status === 'running'` filter
-   excluded exactly the sessions whose reload matters most — limit-parked
-   and between-turn sessions read idle/external on the row, never running
-   (live incident 2026-07-17). Raw transcript rows with no wrapper are
-   history, not reload targets. */
-function agentSigninSessionIsReloadCandidate(spec, row) {
-  const backend = String(row?.backend_source || row?.source || '').toLowerCase();
-  if (!spec.backendMatch(backend)) return false;
-  const wrapperStatus = String(row?.intendant_status || '').trim();
-  const supervised =
-    String(row?.source || '') === 'intendant' ||
-    !!wrapperStatus ||
-    !!String(row?.intendant_session_id || '').trim();
-  if (!supervised) return false;
-  const effective = (wrapperStatus || String(row?.status || '').trim()).toLowerCase();
-  return !AGENT_SIGNIN_TERMINAL_STATUSES.has(effective);
+/* The reload panel's corpus is the daemon's LIVE session registry,
+   served as `reload_candidates` inside the success status payload — the
+   exact candidate set the daemon's reload_credentials route accepts.
+   Registry membership is liveness (the Stop-button doctrine): parked and
+   rate-limit-parked sessions stay listed, sessions gone from the
+   registry never appear, and no row cap or disk-status heuristic
+   applies. The old lane filtered a truncated disk catalog here and got
+   both directions wrong (live resumed sessions dropped by a stale
+   terminal status, dead pre-restart dirs listed as live). */
+function agentSigninReloadCandidates(provider) {
+  const status = agentSigninState[provider].status;
+  const rows = status?.reload_candidates;
+  return Array.isArray(rows) ? rows : [];
 }
 
-/* Chip copy for a reload candidate: live phase (open session windows,
-   recent status events) beats the catalog row's disk-derived status — a
-   limit-parked session reads idle on disk but waiting_rate_limit live.
-   Lookups are guarded: the live maps are declared in later fragments. */
-function agentSigninSessionStateChip(row) {
-  const ids = [row?.session_id, row?.backend_session_id, row?.intendant_session_id]
-    .map(v => String(v || '').trim())
-    .filter(Boolean);
-  let phase = '';
-  try {
-    for (const id of ids) {
-      if (typeof sessionWindows !== 'undefined' && sessionWindows.get(id)?.phase) {
-        phase = String(sessionWindows.get(id).phase);
-      }
-      if (!phase && typeof recentSessionStatusPhase === 'function') {
-        phase = String(recentSessionStatusPhase(id) || '');
-      }
-      if (phase) break;
-    }
-  } catch (_) {
-    /* live maps unavailable: fall back to the row's status below */
-  }
-  const key = phase.toLowerCase().replace(/-/g, '_');
+/* Chip copy for a reload candidate: the candidate's phase IS the live
+   registry phase (the same source the session windows show), so a
+   limit-parked session reads rate-limited here even though its disk row
+   says idle. */
+function agentSigninSessionStateChip(candidate) {
+  const key = String(candidate?.phase || '').toLowerCase().replace(/-/g, '_');
   if (key === 'waiting_rate_limit') return { label: 'rate-limited', cls: 'warn' };
   if (key === 'interrupting' || key.startsWith('waiting')) return { label: 'waiting', cls: 'warn' };
   if (key.startsWith('running') || key === 'thinking' || key === 'orchestrating') {
     return { label: 'running', cls: 'ok' };
   }
-  if (key === 'idle') return { label: 'parked', cls: '' };
-  const status = String(row?.intendant_status || row?.status || '').trim().toLowerCase();
-  if (status === 'running' || status === 'in_progress') return { label: 'running', cls: 'ok' };
-  if (status === 'idle' || status === 'external') return { label: 'parked', cls: '' };
-  return { label: status || 'live', cls: '' };
-}
-
-/* The reload panel's corpus: this provider's live sessions on this
-   daemon. The daemon is the authority on reloadability — this list only
-   decides which chips to offer. */
-async function agentSigninRefreshSessions(provider, { force = false } = {}) {
-  const spec = AGENT_SIGNIN_PROVIDERS[provider];
-  const state = agentSigninState[provider];
-  /* 2.5s freshness (was 10s): right after sign-in success a stale empty
-     list is the worst answer; the ceremony/render cadence bounds the
-     request rate while the pane is watched. */
-  if (!force && Date.now() - state.sessionsFetchedAt < 2500) return;
-  state.sessionsFetchedAt = Date.now();
-  try {
-    const resp = await daemonApi.request('api_sessions', { limit: 100 });
-    if (!resp.ok || !Array.isArray(resp.body)) return;
-    state.sessions = resp.body.filter(row => agentSigninSessionIsReloadCandidate(spec, row));
-    renderAgentSigninSection();
-  } catch (_) {
-    /* the next poll or manual refresh recovers */
-  }
+  if (key === 'idle' || key === 'done') return { label: 'parked', cls: '' };
+  return { label: key || 'live', cls: '' };
 }
 
 function agentSigninReloadSession(provider, sessionId) {
@@ -43012,8 +42980,10 @@ function agentSigninProviderCard(provider) {
     // rate-limit-parked — keep the OLD account until their backend
     // process restarts. Offer the per-session reload (graceful in-place
     // respawn, resume-attached); parked sessions are the ones pinned to
-    // the old account longest, so they matter most here.
-    agentSigninRefreshSessions(provider).catch(() => {});
+    // the old account longest, so they matter most here. The list is the
+    // status payload's reload_candidates — the daemon's live registry,
+    // exactly as fresh as the success phase it arrived with.
+    const reloadCandidates = agentSigninReloadCandidates(provider);
     const reloadHead = document.createElement('div');
     reloadHead.className = 'vault-status-line';
     const reloadTitle = document.createElement('span');
@@ -43022,13 +42992,13 @@ function agentSigninProviderCard(provider) {
     reloadTitle.textContent = spec.sessionsTitle;
     reloadHead.appendChild(reloadTitle);
     card.appendChild(reloadHead);
-    if (!state.sessions.length) {
+    if (!reloadCandidates.length) {
       note(spec.noSessionsNote);
     } else {
       note('Live sessions — including parked and rate-limited ones — keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
       const list = document.createElement('div');
       list.className = 'vault-entry-list';
-      for (const session of state.sessions) {
+      for (const session of reloadCandidates) {
         const sessionId = String(session.session_id || '');
         const row = document.createElement('div');
         row.className = 'vault-entry-row';
@@ -60203,8 +60173,53 @@ function sessionGoalSignature(goal) {
   ].join('\u001f');
 }
 
+// Grid-envelope blocks (catalog-row `agenda` + `boot`, grid_envelope.rs):
+// served precomputed in the one daemon payload — the SPA validates shape
+// and renders, never joins.
+function normalizeSessionAgendaEnvelope(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const itemId = compactSessionText(raw.item_id || raw.itemId);
+  if (!itemId) return null;
+  const out = { itemId };
+  const itemTitle = compactSessionText(raw.item_title || raw.itemTitle);
+  if (itemTitle) out.itemTitle = itemTitle;
+  const occ = raw.occurrence;
+  if (occ && typeof occ === 'object') {
+    const id = compactSessionText(occ.id);
+    if (id) {
+      out.occurrence = { id };
+      const state = compactSessionText(occ.state);
+      if (state) out.occurrence.state = state.toLowerCase();
+    }
+  }
+  const rawRefs = raw.sealed_inputs ?? raw.sealedInputs;
+  const sealed = (Array.isArray(rawRefs) ? rawRefs : [])
+    .map((ref) => ({
+      locator: String(ref?.locator || ''),
+      sha256: String(ref?.sha256 || ''),
+    }))
+    .filter((ref) => ref.sha256);
+  if (sealed.length) out.sealedInputs = sealed;
+  return out;
+}
+
+function normalizeSessionBootEra(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const era = String(raw.era || '').toLowerCase();
+  if (era !== 'current' && era !== 'preboot') return null;
+  return {
+    era,
+    liveWrapper: raw.live_wrapper === true || raw.liveWrapper === true,
+    ghost: raw.ghost === true,
+  };
+}
+
 function normalizeSessionWindowMeta(meta = {}) {
   const out = {};
+  const agendaEnvelope = normalizeSessionAgendaEnvelope(meta.agenda);
+  if (agendaEnvelope) out.agenda = agendaEnvelope;
+  const bootEra = normalizeSessionBootEra(meta.boot);
+  if (bootEra) out.boot = bootEra;
   const name = compactSessionText(meta.name || meta.display_name || meta.displayName || meta.thread_name || meta.threadName || meta.title);
   if (name) out.name = name;
   const task = compactSessionText(meta.initial_message || meta.initialMessage || meta.task);
@@ -60321,6 +60336,18 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.relationshipEphemeral === undefined ? '' : (meta.relationshipEphemeral ? '1' : '0'),
     meta.phase || '',
     meta.ended === undefined ? '' : (meta.ended ? '1' : '0'),
+    meta.agenda
+      ? [
+        meta.agenda.itemId,
+        meta.agenda.itemTitle || '',
+        meta.agenda.occurrence?.id || '',
+        meta.agenda.occurrence?.state || '',
+        (meta.agenda.sealedInputs || []).map((ref) => ref.sha256).join(','),
+      ].join('|')
+      : '',
+    meta.boot
+      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}`
+      : '',
   ].join('\u001f');
 }
 
@@ -60694,10 +60721,26 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
-  if (label === '7d-overage') return '7-day overage';
+  // Claude's own product wording: the overage window is the paid "extra
+  // usage" allowance, and naming it a variant of "7-day" is what made
+  // two distinct gauges read as one chip rendered twice.
+  if (label === '7d-overage') return '7-day extra usage';
   // Unknown window names arrive as raw provider vocabulary — keep every
   // word (the pane owns the full name), just soften the wire spelling.
   return String(label || '').replace(/_/g, ' ').trim();
+}
+
+// Compact chip form of a window's credential-era account label. The
+// daemon sends `account` only while MORE than one credential era is live
+// for the backend (single-account steady state stays suffix-free), so
+// presence alone means "label this chip apart". Emails compress to their
+// local part — the pane and tooltips keep the full label.
+function vitalsLimitAccountShort(account) {
+  const raw = String(account || '').trim();
+  if (!raw) return '';
+  const at = raw.indexOf('@');
+  const short = at > 0 ? raw.slice(0, at) : raw;
+  return short.length > 14 ? `${short.slice(0, 13)}…` : short;
 }
 
 // Compact chip form of a limit-window label. Known labels pass through;
@@ -60708,6 +60751,9 @@ function vitalsLimitLabelLong(label) {
 // the full name stays available in the pane (vitalsLimitLabelLong).
 function vitalsLimitLabelShort(label) {
   const raw = String(label || '').trim();
+  // The 7-day overage window: "extra", never "-overage" — beside the base
+  // "7d" chip the shared prefix + hyphen chain read as a duplicate.
+  if (raw === '7d-overage') return '7d extra';
   // Already-compact daemon labels ("5h", "7d", "30d", "1w").
   if (/^\d+\s*(mo|[smhdw])$/i.test(raw)) return raw.replace(/\s+/g, '');
   const NUMBER_WORDS = {
@@ -60923,6 +60969,10 @@ const VITALS_ICON_PATHS = {
   triangle: '<path d="M12 3 22 20H2Z"/><path d="M12 10v4.5"/><path d="M12 17.5v.5"/>',
   push: '<path d="M12 19V7"/><path d="M7.5 11.5 12 7l4.5 4.5"/><path d="M6 3.5h12"/>',
   gauge: '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/>',
+  // The gauge with a "+" riding its top-right shoulder: the 7-day
+  // overage ("extra usage") window — visibly a sibling of the base
+  // gauge, never its pixel-identical twin.
+  'gauge-plus': '<path d="M4.5 15.5a8 8 0 1 1 15 0"/><path d="M12 15l4-4.4"/><path d="M18.5 3.5v5"/><path d="M16 6h5"/>',
   branch: '<path d="M6 4v11"/><circle cx="6" cy="19" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M18 8.4v2.2a4 4 0 0 1-4 4H10"/>',
   folder: '<rect x="4" y="4" width="12" height="12" rx="2.5"/><path d="M20 9v8.5A2.5 2.5 0 0 1 17.5 20H9"/>',
   pencil: '<path d="M14.5 5.5l4 4"/><path d="M4 20l1-4.5L15.5 5a2.12 2.12 0 0 1 3 3L8 18.5Z"/>',
@@ -61284,24 +61334,31 @@ const VITALS_SYMBOLS = {
     // window) until the next report. Chips always speak the SHORT window
     // grammar ("▮95% 7d-overage · ↻6:12:03") — a full provider sentence
     // in a header chip is the failure mode; the pane keeps the full name.
-    icon: 'gauge',
+    // The overage ("extra usage") window gets its own glyph: beside the
+    // base 7d chip a pixel-identical gauge is what made two real windows
+    // read as a duplicate.
+    icon: (v) => (String(v.label || '').includes('overage') ? 'gauge-plus' : 'gauge'),
     chip: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}${suffix}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
-      return `${label} ${mark}${reset}`;
+      return `${label} ${mark}${reset}${suffix}`;
     },
     // Fact-line twin of the chip grammar: the gauge icon plus severity
     // color carry what the ⛔/⚠/▮ glyphs said, so the mark is always the
     // provider's word.
     factText: (v) => {
       const label = vitalsLimitLabelShort(v.label);
-      if (v.rolled) return `${label} reset`;
+      const acct = vitalsLimitAccountShort(v.account);
+      const suffix = acct ? ` · ${acct}` : '';
+      if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}`;
-      return `${label} ${v.statusWord}${reset}`;
+      if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}${suffix}`;
+      return `${label} ${v.statusWord}${reset}${suffix}`;
     },
     explain: (v) => {
       const lines = [];
@@ -61318,6 +61375,7 @@ const VITALS_SYMBOLS = {
       if (v.reset) lines.push(`The window resets in ${v.reset}${wall ? ` — at ${wall}` : ''}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
+      if (v.account) lines.push(`This window belongs to the “${v.account}” sign-in — sessions running under a different account track their own windows.`);
       if (v.observedAgo) lines.push(`Last provider report: ${v.observedAgo} ago. Windows are account-wide, so any session's report updates this.`);
       return lines;
     },
@@ -61330,6 +61388,91 @@ const VITALS_SYMBOLS = {
       return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ${v.reset}` : ''}`;
     },
   },
+  // ── Grid envelope (catalog-row `agenda` + `boot` blocks, served
+  // precomputed by grid_envelope.rs — one daemon payload, no SPA
+  // joins). Quiet session-facts chips like model/permissions; only a
+  // ghost elevates.
+  'agenda-source': {
+    label: 'Source item',
+    priority: 27,
+    icon: 'bolt',
+    chip: (v) => `⚡ ${v.shortId}`,
+    // Hover = explain[0], so the full title rides the chip tooltip.
+    explain: (v) => [
+      v.title
+        ? `Fired from agenda item “${v.title}”.`
+        : 'Fired from an agenda item (title unavailable — the item may be gone).',
+      `Item id: ${v.itemId}`,
+    ],
+    action: (v) => {
+      const actions = [];
+      if (typeof agendaOpenInspector === 'function') {
+        actions.push({
+          label: 'Open the agenda card',
+          run: () => {
+            if (typeof switchTab === 'function') switchTab('agenda');
+            agendaOpenInspector(v.itemId);
+          },
+        });
+      }
+      actions.push({ label: 'Copy item id', run: () => vitalsCopyText(v.itemId) });
+      return actions;
+    },
+  },
+  'agenda-occurrence': {
+    label: 'Occurrence',
+    priority: 26,
+    icon: (v) => (v.state === 'started' ? 'dots' : v.state === 'completed' ? 'check' : 'triangle'),
+    chip: (v) => `${v.glyph} ${v.state}`,
+    // The occurrence object is the extensible slot: Track AO's
+    // attestation lands beside `state` on the same wire.
+    explain: (v) => [
+      v.state === 'started'
+        ? 'This firing is still running — no terminal record yet.'
+        : `This firing resolved: ${v.state}.`,
+      `Occurrence id: ${v.occurrenceId}`,
+    ],
+    action: (v) => [
+      { label: 'Copy occurrence id', run: () => vitalsCopyText(v.occurrenceId) },
+    ],
+  },
+  'sealed-inputs': {
+    label: 'Sealed inputs',
+    priority: 25,
+    icon: 'shield',
+    chip: (v) => `⛉ ${v.count} sealed`,
+    explain: (v) => [
+      `${v.count} sealed input${v.count === 1 ? '' : 's'} rode this firing — digest-bound copies of what the approval covered.`,
+      ...v.refs.map((ref) => `${ref.name} — sha256 ${ref.shortDigest}`),
+    ],
+    action: (v) => v.refs.map((ref) => ({
+      label: `Copy full sha256 — ${ref.name} (${ref.shortDigest})`,
+      run: () => vitalsCopyText(ref.sha256),
+    })),
+  },
+  boot: {
+    label: 'Boot era',
+    priority: 24,
+    icon: (v) => (v.ghost ? 'slash' : 'clock'),
+    chip: (v) => (v.ghost ? '👻 ghost' : v.era === 'preboot' ? '↻ pre-boot' : '↻ this boot'),
+    explain: (v) => {
+      if (v.ghost) {
+        return [
+          'This session predates the current daemon boot and no live wrapper backs it — a ghost window.',
+          'Closing it is safe; nothing is running behind it.',
+        ];
+      }
+      return [
+        v.era === 'preboot'
+          ? 'This session predates the current daemon boot.'
+          : 'This session belongs to the current daemon boot.',
+        v.liveWrapper
+          ? 'A live wrapper backs it right now.'
+          : 'No live wrapper backs it right now.',
+      ];
+    },
+    brief: (v) => (v.ghost ? 'Ghost — pre-boot, nothing behind it; safe to close' : ''),
+  },
 };
 
 // Fixed display order for chips and the glossary (semantic, not priority:
@@ -61337,7 +61480,8 @@ const VITALS_SYMBOLS = {
 // model + permissions form the session-facts group, right after the live
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
-  'health', 'activity', 'model', 'permissions', 'worktree', 'branch', 'dirty',
+  'health', 'activity', 'model', 'permissions', 'agenda-source',
+  'agenda-occurrence', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -61535,6 +61679,50 @@ function vitalsChipModels(vitals, meta, sessionId) {
     });
   }
 
+  // Grid envelope (the catalog-row `agenda` + `boot` blocks).
+  const agendaMeta = meta?.agenda && typeof meta.agenda === 'object' ? meta.agenda : null;
+  if (agendaMeta?.itemId) {
+    push('agenda-source', 'agenda-source', {
+      itemId: agendaMeta.itemId,
+      shortId: agendaMeta.itemId.length > 12 ? agendaMeta.itemId.slice(0, 12) : agendaMeta.itemId,
+      title: agendaMeta.itemTitle || '',
+    });
+    const occurrence = agendaMeta.occurrence;
+    if (occurrence?.id) {
+      const state = occurrence.state || 'started';
+      push('agenda-occurrence', 'agenda-occurrence', {
+        occurrenceId: occurrence.id,
+        state,
+        glyph: ({ started: '▶', completed: '✓', failed: '✕', missed: '⌀', unknown: '?' })[state] || '▸',
+      }, {
+        tone: state === 'failed' || state === 'unknown' || state === 'missed' ? 'warn' : '',
+      });
+    }
+    const sealedRefs = Array.isArray(agendaMeta.sealedInputs) ? agendaMeta.sealedInputs : [];
+    if (sealedRefs.length) {
+      push('sealed-inputs', 'sealed-inputs', {
+        count: sealedRefs.length,
+        refs: sealedRefs.map((ref) => ({
+          name: String(ref.locator || '').split('/').pop() || 'input',
+          sha256: ref.sha256,
+          // The one short-digest formatter (ui2-agenda.js) — shared,
+          // never re-minted here.
+          shortDigest: agendaShortDigest(ref.sha256),
+        })),
+      });
+    }
+  }
+  const bootMeta = meta?.boot && typeof meta.boot === 'object' ? meta.boot : null;
+  if (bootMeta?.era) {
+    push('boot', 'boot', {
+      era: bootMeta.era,
+      liveWrapper: bootMeta.liveWrapper === true,
+      ghost: bootMeta.ghost === true,
+    }, {
+      severity: bootMeta.ghost ? 'warn' : '',
+    });
+  }
+
   const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
   if (git) {
     const branch = String(git.branch || '').trim();
@@ -61615,6 +61803,10 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const observedAgoSecs = Number.isFinite(observedAt) && observedAt > 0
       ? Math.floor(Date.now() / 1000 - observedAt)
       : null;
+    // Credential-era attribution: present only while the daemon sees
+    // more than one live era for the backend — the cue to suffix the
+    // chip apart from another account's same-named window.
+    const account = String(w?.account || '').trim();
     push('limit', `limit:${label}`, {
       label,
       usedPct,
@@ -61622,6 +61814,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       reset,
       resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
       rolled,
+      account,
       observedAgo: observedAgoSecs !== null && observedAgoSecs > 120
         ? formatActivityElapsed(observedAgoSecs)
         : '',
@@ -61631,7 +61824,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // The countdown ticks in place (cache-ttl pattern): the sig excludes
       // it so the 1 Hz ticker hits the stable-DOM fast path.
       ticking: !!reset,
-      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}`,
+      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}|${account}`,
     });
   }
 
@@ -61755,6 +61948,16 @@ function vitalsAttentionSummary(models) {
   };
 }
 
+// One aria grammar for the attention chip, shared by the build and the
+// 1 Hz in-place ticker so the announced text can never lag the visible
+// countdown.
+function vitalsAttentionAriaLabel(attention) {
+  const top = `${attention.top.label}: ${attention.top.factText || attention.top.text}`;
+  return attention.aggregate
+    ? `${top}, plus ${attention.extra} more — show all vitals`
+    : top;
+}
+
 // Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 //
@@ -61806,15 +62009,19 @@ function renderSessionWindowVitals(win, vitals) {
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
     // Every ticking model updates in place by id — cache-ttl, activity,
-    // and each limit window's exact reset countdown.
+    // and each limit window's exact reset countdown. The aria-label
+    // carries the same countdown text, so it ticks too: a screen reader
+    // must never be read a staler countdown than the one on screen.
     const tickingById = new Map(models.filter((m) => m.ticking).map((m) => [m.id, m]));
     if (tickingById.size) {
       for (const chip of win.vitals.querySelectorAll('.vit-chip')) {
         const model = tickingById.get(chip.dataset.chip || '');
         if (!model) continue;
+        const factText = model.factText || model.text;
         const txt = chip.querySelector('.vit-txt');
-        if (txt) txt.textContent = model.factText || model.text;
+        if (txt) txt.textContent = factText;
         chip.title = model.explainLines[0] || model.label;
+        chip.setAttribute('aria-label', factText ? `${model.label}: ${factText}` : model.label);
       }
     }
     // The attention chip mirrors its top model's text (elapsed/quiet
@@ -61825,6 +62032,7 @@ function renderSessionWindowVitals(win, vitals) {
       const attnTxt = attnChip.querySelector('.vit-txt');
       if (attention && attnTxt && attnTxt.textContent !== attention.factText) {
         attnTxt.textContent = attention.factText;
+        attnChip.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
       }
     }
     return models.some((m) => m.ticking);
@@ -61877,9 +62085,7 @@ function renderSessionWindowVitals(win, vitals) {
     attn.title = attention.aggregate
       ? 'Needs attention — show all vitals'
       : (attention.top.explainLines[0] || attention.top.label);
-    attn.setAttribute('aria-label', attention.aggregate
-      ? `${attention.top.label}: ${attention.top.factText || attention.top.text}, plus ${attention.extra} more — show all vitals`
-      : `${attention.top.label}: ${attention.top.factText || attention.top.text}`);
+    attn.setAttribute('aria-label', vitalsAttentionAriaLabel(attention));
     healthNodes.push(attn);
   }
   if (foldedWhenCollapsed > 0) {
@@ -63330,6 +63536,8 @@ function sessionWindowMetaFromSession(session) {
     relationship_kind: session.relationship_kind || session.relationship,
     thread_source: session.thread_source,
     agent_nickname: session.agent_nickname,
+    agenda: session.agenda,
+    boot: session.boot,
   };
   if (
     Object.prototype.hasOwnProperty.call(session, 'goal') ||
@@ -68735,6 +68943,7 @@ function sessionWindowStopAvailability(sessionId) {
   if (terminal) {
     return {
       ok: false,
+      terminal: true,
       reason: 'Session already ended — nothing to stop. Hide the card to dismiss it.',
       toast: 'Session already ended — nothing to stop',
     };
@@ -68755,6 +68964,15 @@ async function stopSessionWindowAction(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   const availability = sessionWindowStopAvailability(sid);
   if (!sid || !availability.ok) {
+    // A Stop aimed at a known-ended session is satisfied, not refused:
+    // the intent behind the click is "make this card go away", so hide
+    // the card here instead of erroring with instructions to hide it
+    // manually.
+    if (sid && availability.terminal) {
+      hideSessionWindowAction(sid);
+      showControlToast('info', 'Session already ended — card closed');
+      return;
+    }
     if (availability.toast) showControlToast('error', availability.toast);
     return;
   }
@@ -69543,6 +69761,13 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (meta.phase) {
     applySessionWindowPhase(win, sid, meta.phase);
   }
+  // Grid envelope: the served ghost bit (pre-boot AND no live wrapper)
+  // marks the whole window — the unmistakable safe-to-close treatment.
+  // Missing block ≠ cleared: only a present block moves the class.
+  const bootEra = (sessionMetadataById.get(sid) || {}).boot;
+  if (bootEra !== undefined) {
+    win.el.classList.toggle('session-window-ghost', !!(bootEra && bootEra.ghost));
+  }
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
@@ -70223,6 +70448,23 @@ function sessionWindowRecordFromLogCommand(c) {
   };
 }
 
+// The daemon's own scoped warn rows (source "Intendant" — e.g. the
+// "Session already ended — nothing to stop." ack) are the daemon talking
+// ABOUT the session, not evidence its backend is alive: they must never
+// clear a detached card back to attached, or the ack itself re-arms the
+// very Stop affordance it just refuted. Only backend activity re-attaches.
+function logRowEvidencesBackendActivity(level, source) {
+  return !(String(level || '').toLowerCase() === 'warn'
+    && String(source || '').trim().toLowerCase() === 'intendant');
+}
+
+function logEntryEvidencesBackendActivity(entry) {
+  return logRowEvidencesBackendActivity(
+    entry?.dataset?.level,
+    entry?.classList?.contains('source-intendant') ? 'intendant' : '',
+  );
+}
+
 function appendSessionWindowRecord(record, batch = null) {
   const sid = String(record?.session_id || record?.sessionId || '').trim();
   if (!sid) return;
@@ -70230,7 +70472,8 @@ function appendSessionWindowRecord(record, batch = null) {
   if (!targetSid) return;
   const win = sessionWindows.get(targetSid) || (processingLogReplay ? null : ensureSessionWindow(targetSid));
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logRowEvidencesBackendActivity(record?.level, record?.source)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const normalized = { ...record, session_id: targetSid };
@@ -70258,7 +70501,8 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (!targetSid) return;
   const win = ensureSessionWindow(targetSid);
   if (!win) return;
-  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)
+      && logEntryEvidencesBackendActivity(entry)) {
     clearStaleSessionWindowDetached(targetSid, 'live output observed');
   }
   const empty = win.log.querySelector('.session-window-empty');
@@ -90181,6 +90425,38 @@ function agendaSetDepth(depth) {
   agendaRenderTab();
   if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
 }
+// ---- Manifest-digest vocabulary (one formatter, one chip) ----
+// The digest is the approval ceremony's subject: an owner Approve binds
+// exactly these bytes, and every re-propose mints a NEW digest while
+// the item id stays. The one truncation length lives here — never
+// per-surface — and stays above the ledger search's 8-hex-char
+// digest-prefix floor, so the short form a surface shows always
+// resolves to its owning item when pasted into search.
+const AGENDA_DIGEST_SHORT_LEN = 10;
+
+function agendaShortDigest(digest) {
+  const d = String(digest || '');
+  return d.length > AGENDA_DIGEST_SHORT_LEN ? `${d.slice(0, AGENDA_DIGEST_SHORT_LEN)}…` : d;
+}
+
+// The interactive form every approval surface renders: hover reveals
+// the full digest, click copies it. Digest values are daemon-minted
+// lowercase hex; escaped like every interpolation anyway.
+function agendaDigestChipHtml(digest, tip) {
+  const d = String(digest || '');
+  if (!d) return '';
+  return `<button type="button" class="ag2-digest-chip" data-copy-digest="${escapeHtml(d)}"`
+    + ` title="${escapeHtml(`${tip ? `${tip} — ` : ''}sha256 ${d} — click to copy`)}">`
+    + `${escapeHtml(`digest ${agendaShortDigest(d)}`)}</button>`;
+}
+
+// One copy wire for every chip, wherever it renders (cards, inspector,
+// the workflow sheet on document.body) — document-level by design.
+document.addEventListener('click', (e) => {
+  const btn = e.target && e.target.closest && e.target.closest('[data-copy-digest]');
+  if (btn) agendaCopyText(btn.dataset.copyDigest, 'the manifest digest');
+});
+
 let agendaSearch = '';
 let agendaFilterBlocked = false;
 let agendaFilterFrontier = false;
@@ -92342,8 +92618,31 @@ async function agendaComposePark() {
 
 // ---- Lens group computation ----
 
+// Every digest an item owns: manifest digests (one per effect — the
+// bytes an Approve gesture signs), recorded approval digests, and
+// file-ref digests minted at attach. A citation by any of them must
+// resolve to this item.
+function agendaItemDigests(item) {
+  const out = [];
+  (item.effects || []).forEach((e) => {
+    if (e.digest) out.push(e.digest);
+    if (e.approval && e.approval.digest) out.push(e.approval.digest);
+  });
+  (item.refs || []).forEach((r) => { if (r.digest) out.push(r.digest); });
+  return out;
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
+  // lowercased) match any digest the item owns, resolving to the
+  // owning item exactly like an id search. The 8-char floor sits under
+  // AGENDA_DIGEST_SHORT_LEN, so every short digest a surface renders
+  // is findable by the characters it shows.
+  if (/^[0-9a-f]{8,64}$/.test(q)
+    && agendaItemDigests(item).some((d) => String(d).toLowerCase().startsWith(q))) {
+    return true;
+  }
   return String(item.title || '').toLowerCase().includes(q)
     || String(item.body || '').toLowerCase().includes(q)
     || (item.tags || []).some((t) => String(t).toLowerCase().includes(q))
@@ -92809,11 +93108,13 @@ function agendaCardEffectStrip(item) {
     line = `${proposer}: runs ${agendaAbsTime(st.manifest.fire_at_ms)}`
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + ' — needs your approval';
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
+    actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
+      + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else {
     tone = 'iris';
@@ -92866,6 +93167,15 @@ function agendaAutomationStripHtml(item) {
   } else if (st.kind === 'standing') {
     meta.push('<span>series ended</span>');
   }
+  // The manifest digest, always visible where the gesture lives — the
+  // one thing depth never folds away, because it is what Approve signs
+  // (and what a recorded approval covers once bound).
+  meta.push(agendaDigestChipHtml(e.digest,
+    st.kind === 'pending' ? 'Approve binds exactly this manifest revision'
+      : st.kind === 'suspended' ? 'Re-arm re-approves exactly this unchanged manifest revision'
+        : e.approval && e.approval.digest === e.digest
+          ? 'Your recorded approval covers exactly this manifest revision'
+          : 'The manifest revision this row describes'));
   let actions = '';
   const digest = escapeHtml(e.digest || '');
   if (st.kind === 'pending') {
@@ -93926,7 +94236,7 @@ function agendaInspEffectHtml(item) {
       acts.push(`<button type="button" class="ag2-btn ${cls || ''}" data-act="${act}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</button>`);
     if (st.kind === 'pending') {
       A('Approve this exact plan', 'eff-approve', 'prim',
-        `Binds digest ${String(e.digest || '').slice(0, 8)}… — any edit voids it`);
+        `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
       A('Edit schedule…', 'sched');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
@@ -93946,14 +94256,20 @@ function agendaInspEffectHtml(item) {
     } else {
       A('Schedule again…', 'sched');
     }
+    // The digest chip stays at every depth — it is what the Approve
+    // gesture signs (bound: what the recorded approval covers); a
+    // re-proposed revision visibly carries its NEW digest here.
+    const bound = !!(e.approval && e.approval.digest === e.digest);
     body = `<div class="ag2-effcard t-${tone}">
       <div class="ag2-effcard-head">
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
-        <span class="ag2-hint mono">${agendaDepthCalm()
-    ? (e.approval ? 'approved' : 'unapproved')
-    : `digest ${escapeHtml(String(e.digest || '').slice(0, 10))}…${e.approval ? ' · approved' : ' · unapproved'}`}</span>
+        ${agendaDigestChipHtml(bound ? e.approval.digest : e.digest,
+    bound ? 'Your recorded approval covers exactly this manifest revision'
+      : e.approval ? 'Re-proposed since your last approval — the NEW revision Approve would bind'
+        : 'The manifest revision Approve would bind')}
+        <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
       ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
@@ -94186,7 +94502,7 @@ function agendaInspRefsHtml(item) {
       target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`;
     } else {
       if (r.digest) hasFileDigest = true;
-      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest.slice(0, 16)}… recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
+      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest} recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
     }
     const must = r.must_read
       ? '<span class="ag2-ref-must" title="A pointer the reading agent weighs — not a standing order">must-read</span>'
@@ -94868,21 +95184,20 @@ async function agendaSchedConfirm(button) {
       return fail((resp.body && resp.body.error) || `propose failed (${resp.status})`);
     }
     agendaObserveServerMessage({ item: resp.body.item });
+    // The revision the daemon just minted from this sheet — its digest
+    // comes back on the proposed item and is what any approval binds.
+    const effect = (resp.body.item.effects || [])[0];
     let approved = false;
-    if (s.approveNow) {
-      // Approve exactly the revision the daemon just minted from this
-      // sheet — its digest comes back on the proposed item.
-      const effect = (resp.body.item.effects || [])[0];
-      if (effect && effect.digest) {
-        approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
-      }
+    if (s.approveNow && effect && effect.digest) {
+      approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
     }
     agendaSheetClose();
     agendaSheetRender();
     if (typeof showControlToast === 'function') {
+      const short = effect && effect.digest ? agendaShortDigest(effect.digest) : '';
       showControlToast(approved ? 'success' : 'info', approved
-        ? (params.recurrence ? 'Proposed and approved — one approval covers the series.' : `Proposed and approved — fires ${agendaAbsTime(fire)}.`)
-        : 'Proposed — waiting on an owner approval of this exact digest.');
+        ? (params.recurrence ? `Proposed and approved — one approval covers the series (digest ${short}).` : `Proposed and approved — fires ${agendaAbsTime(fire)} (digest ${short}).`)
+        : `Proposed — waiting on an owner approval of ${short ? `digest ${short}` : 'this exact digest'}.`);
     }
   } catch (e) {
     fail(String(e && e.message || e));
@@ -95887,7 +96202,7 @@ function agendaPlanEvents() {
     }
     const st = agendaEffectState(item);
     if (!st) return;
-    const digest8 = String(st.effect.digest || '').slice(0, 8);
+    const digestShort = agendaShortDigest(st.effect.digest);
     if (st.kind === 'running') {
       events.push({
         at: now, item, what: 'session running now', tone: 'iris',
@@ -95898,8 +96213,8 @@ function agendaPlanEvents() {
         at: Math.max(st.manifest.fire_at_ms, now), item,
         what: 'proposed session — will not fire', tone: 'amber', pulse: 'slow',
         chips: [agendaChipHtml('needs approval', 'amber',
-          `Approval binds digest ${digest8}… exactly`)],
-        note: `waiting on your approval of digest ${digest8}… — proposing carries no authority`,
+          `Approval binds digest ${digestShort} exactly`)],
+        note: `waiting on your approval of digest ${digestShort} — proposing carries no authority`,
       });
     } else if (st.kind === 'suspended') {
       events.push({
@@ -96511,11 +96826,8 @@ function agendaHoodClick(item, el) {
     case 'copy-id':
       agendaCopyText(item.id, 'the full item id');
       break;
-    case 'copy-digest': {
-      const effect = (item.effects || [])[0];
-      if (effect) agendaCopyText(effect.digest, 'the manifest digest');
-      break;
-    }
+    // digest copy rides the shared [data-copy-digest] wire in
+    // ui2-agenda.js — the hood button carries the attribute directly.
     case 'raw':
       agendaSheetState = { kind: 'raw', itemId: item.id };
       agendaSheetRender();
@@ -96656,7 +96968,7 @@ function agendaHoodManifestHtml(item) {
       <span class="ag2-spacer"></span>
       <span class="ag2-hood-effid">${escapeHtml(effect.effect_id)}</span>
     </div>
-    <button type="button" class="ag2-hood-idbtn digest" data-hood-act="copy-digest"
+    <button type="button" class="ag2-hood-idbtn digest" data-copy-digest="${escapeHtml(effect.digest)}"
       title="Click to copy the full digest — sha256 over item + effect identity and the manifest’s canonical bytes">${escapeHtml(digestGroups)}</button>
     <div class="ag2-hood-seal t-${sealTone}"><span class="ag2-hood-sealdot"></span>${escapeHtml(sealLine)}</div>
     <div class="ag2-hood-note mono">${escapeHtml(attribution)}</div>
@@ -97242,8 +97554,12 @@ function agendaWorkflowOpenApprovalSheet(stamped) {
   for (const node of stamped.nodes) {
     const row = agendaStartSheetEl('div', 'ags-config-row');
     row.appendChild(agendaStartSheetEl('label', 'ags-label', node.title));
-    row.appendChild(agendaStartSheetEl('div', 'ags-hint',
-      `${node.executor} · digest ${String(node.digest).slice(0, 12)}`));
+    // Executor as text, digest as the shared chip: each row shows the
+    // exact revision "Approve all" would bind for that node.
+    const hint = agendaStartSheetEl('div', 'ags-hint');
+    hint.innerHTML = `${escapeHtml(node.executor)} · ${agendaDigestChipHtml(node.digest,
+      'Approve all binds this node to exactly this manifest revision')}`;
+    row.appendChild(hint);
     panel.appendChild(row);
     const goal = agendaStartSheetEl('pre', 'agsx-preview');
     goal.textContent = node.goal;

@@ -158,6 +158,10 @@ pub(crate) async fn run_daemon(
     // effective target the dirty chip probes (activity locus included),
     // so the chip and the tab can never state different checkouts.
     session_vitals::publish_git_vitals_targets(&vitals_git_targets);
+    // Sign-in ceremonies announce their outcome on the bus (the vitals
+    // hub's credential-era boundary); same publish-from-startup law as
+    // the registries above so tests' manager use stays silent.
+    crate::auth_ceremony::publish_ceremony_bus(bus.clone());
     // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
     // detection over bus declarations ∪ observed git status (the same
     // registry the vitals prober probes) ∪ open-PR file sets; publishes
@@ -198,7 +202,7 @@ pub(crate) async fn run_daemon(
     let _usage_rail = crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
 
     let startup_bus = bus.clone();
-    let supervisor_handle =
+    let supervisor =
         session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
             bus,
             project_root,
@@ -220,8 +224,12 @@ pub(crate) async fn run_daemon(
             launch_gate_for_tests: None,
             claude_rewind_capability_for_tests: None,
             agenda: gateway.agenda.clone(),
-        })
-        .spawn();
+        });
+    // Publish the live registry for read-side lanes (the sign-in
+    // ceremony status payloads' reload_candidates) — mirrors the
+    // vitals-targets publish above.
+    session_supervisor::publish_live_session_registry(supervisor.live_session_registry());
+    let supervisor_handle = supervisor.spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed
     // above, before this send) resumes the target session — attach only,
     // no task; follow-ups come from the dashboard/TUI like any session.

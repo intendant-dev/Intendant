@@ -11,6 +11,26 @@
 //! could not resolve git — or a hypothetical build where the directives are
 //! absent — still compiles and reports `unknown` instead of failing.
 
+/// Package version (`unknown` only in a hypothetical directive-less build).
+pub(crate) fn pkg_version() -> &'static str {
+    option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
+}
+
+/// Git commit short SHA, with `-dirty` marker when built from a dirty tree.
+pub(crate) fn git_sha() -> &'static str {
+    option_env!("INTENDANT_GIT_SHA").unwrap_or("unknown")
+}
+
+/// Build timestamp as `build.rs` stamped it.
+pub(crate) fn build_timestamp() -> &'static str {
+    option_env!("INTENDANT_BUILD_TIMESTAMP").unwrap_or("unknown")
+}
+
+/// Target triple the binary was compiled for.
+pub(crate) fn target_triple() -> &'static str {
+    option_env!("INTENDANT_TARGET_TRIPLE").unwrap_or("unknown")
+}
+
 /// One-line version + provenance string: package version, git commit short
 /// SHA (with `-dirty` marker), build timestamp, and target triple. Contains
 /// no credentials, hostnames, usernames, or filesystem paths — safe to print
@@ -19,10 +39,10 @@ pub(crate) fn version_line(binary: &str) -> String {
     format!(
         "{} {} (commit {}, built {}, {})",
         binary,
-        option_env!("CARGO_PKG_VERSION").unwrap_or("unknown"),
-        option_env!("INTENDANT_GIT_SHA").unwrap_or("unknown"),
-        option_env!("INTENDANT_BUILD_TIMESTAMP").unwrap_or("unknown"),
-        option_env!("INTENDANT_TARGET_TRIPLE").unwrap_or("unknown"),
+        pkg_version(),
+        git_sha(),
+        build_timestamp(),
+        target_triple(),
     )
 }
 

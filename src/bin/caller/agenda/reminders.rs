@@ -29,9 +29,14 @@
 //! (one-shot semantics — only a new due re-arms).
 //!
 //! Co-homed daemons: like the op log, the journal refolds when its file
-//! grows (`refresh_if_stale`), which narrows but cannot eliminate the
-//! double-fire window between two live daemons sharing one home —
-//! at-least-once, honestly.
+//! grows (`refresh_if_stale`) — the read-convergence lane. The
+//! check-then-`prepared` double-fire window between two LIVE daemons,
+//! which refold could only narrow, is closed structurally by the
+//! active-scheduler lease (`crate::handover`, Track HS2): only the lease
+//! holder runs the firing pass at all, so two live planners never race
+//! one due occurrence. At-least-once remains the honest contract for
+//! crash windows (a `prepared` row without a terminal re-delivers on the
+//! next wake, whichever daemon holds the lease by then).
 
 use super::types::{AgendaEffect, AgendaItem, AgendaStatus, BindingRef, RecurrenceSpec};
 use serde::{Deserialize, Serialize};
@@ -291,6 +296,30 @@ pub(crate) struct OccurrenceRecord {
     /// The spawned session, on `started` records (A5 scheduled sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// Scheduler-lease generation held by the writing daemon (Track HS
+    /// stamping). Absent on legacy rows and rows written without the
+    /// lease. Journal-side only — the agenda op-log vocabulary must NOT
+    /// grow this field (its op enum is `deny_unknown_fields` under a
+    /// skip-don't-brick fold; ruled in the HS intake, Q3 guardrail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation: Option<u64>,
+    /// The writing daemon's boot id (Track HS stamping): what boot-
+    /// recovery scoping (HS2) probes for liveness before declaring a
+    /// foreign `started` row unknown. Absent on legacy rows, which keep
+    /// today's recover-at-boot semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+}
+
+/// Writer identity stamped onto journal rows (Track HS): set once per
+/// scheduler boot and refreshed when the lease role changes (HS2's
+/// poll-acquire). Additive JSON — older builds' folds ignore the fields
+/// by serde default, and the raw occurrences page serves them verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalStamp {
+    pub(crate) boot_id: String,
+    /// The held lease generation; `None` while writing without the lease.
+    pub(crate) generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +372,45 @@ pub(crate) struct OccurrenceProgress {
     /// occurrences that never got past `prepared` (a dispatch lost with
     /// the process — no `started` row, no `last_run` lineage to match).
     pub(crate) item_id: Option<String>,
+    /// The boot id stamped on the last non-terminal (`prepared`/`started`)
+    /// row — whose daemon was driving this occurrence. Recovery scoping
+    /// (Track HS2) probes its liveness before fail-closing the occurrence.
+    /// Last non-terminal row wins, `None` included: a stampless row from a
+    /// pre-stamping build downgrades the occurrence to legacy boot-time
+    /// semantics — the fail-closed direction for mixed-version homes.
+    pub(crate) writer_boot_id: Option<String>,
+}
+
+/// One row of [`OccurrenceJournal::started_unresolved`].
+pub(crate) struct StartedUnresolved {
+    pub(crate) occurrence_id: String,
+    /// The started session (the lineage tip under a resume re-key).
+    pub(crate) session_id: Option<String>,
+    /// See [`OccurrenceProgress::writer_boot_id`].
+    pub(crate) writer_boot_id: Option<String>,
+}
+
+/// One row of [`OccurrenceJournal::prepared_unresolved`].
+pub(crate) struct PreparedUnresolved {
+    pub(crate) occurrence_id: String,
+    /// The owning item, when the journal rows retained it.
+    pub(crate) item_id: Option<String>,
+    /// See [`OccurrenceProgress::writer_boot_id`].
+    pub(crate) writer_boot_id: Option<String>,
+}
+
+/// One session's journal-derived source linkage — the grid envelope's
+/// agenda block ([`OccurrenceJournal::session_links`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOccurrenceLink {
+    pub(crate) occurrence_id: String,
+    pub(crate) item_id: String,
+    /// `Started` until a terminal row lands, then that terminal. The
+    /// occurrence's state speaks for every lineage member: a resume
+    /// re-key appends the successor's `started` row without
+    /// un-attributing the original, and the one terminal that follows
+    /// the lineage tip resolves the whole occurrence.
+    pub(crate) state: OccurrenceState,
 }
 
 /// The append-only delivery ledger. `prepare` records are fsync'd — the
@@ -353,6 +421,13 @@ pub(crate) struct OccurrenceJournal {
     file: std::fs::File,
     state: BTreeMap<String, OccurrenceProgress>,
     folded_len: u64,
+    /// Max lease generation observed across every folded row — the Q1
+    /// reseed floor ([`journal_generation_floor`]): lease acquisition
+    /// never mints a generation at or below what rows already record,
+    /// even with the sidecar deleted or corrupt.
+    max_generation: u64,
+    /// Writer identity stamped onto appended rows, when set (Track HS).
+    stamp: Option<JournalStamp>,
 }
 
 impl OccurrenceJournal {
@@ -364,7 +439,7 @@ impl OccurrenceJournal {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let (state, mut folded_len) = fold_journal(&bytes);
+        let (state, mut folded_len, max_generation) = fold_journal(&bytes);
         let mut file = std::fs::File::options()
             .create(true)
             .append(true)
@@ -378,7 +453,23 @@ impl OccurrenceJournal {
             file,
             state,
             folded_len,
+            max_generation,
+            stamp: None,
         })
+    }
+
+    /// Install (or refresh) the writer stamp: appends fill their
+    /// `generation`/`boot_id` from it when the record carries none. Set
+    /// at scheduler boot; refreshed when the lease role changes (HS2).
+    pub(crate) fn set_stamp(&mut self, stamp: Option<JournalStamp>) {
+        self.stamp = stamp;
+    }
+
+    /// See [`journal_generation_floor`]; the live view of the same floor.
+    /// The secondary poll-acquire lane feeds this to lease acquisition
+    /// instead of re-folding the file (HS1 ruling note).
+    pub(crate) fn max_generation(&self) -> u64 {
+        self.max_generation
     }
 
     pub(crate) fn progress(&self, occurrence_id: &str) -> OccurrenceProgress {
@@ -403,6 +494,38 @@ impl OccurrenceJournal {
             .filter(|progress| progress.item_id.as_deref() == Some(item_id))
             .flat_map(|progress| progress.started_history.iter().cloned())
             .collect()
+    }
+
+    /// Reverse fold for the session catalog's grid envelope: every
+    /// session id any `started` row ever named → its occurrence, owning
+    /// item, and the occurrence's current state. The whole resume
+    /// lineage maps to one occurrence (see
+    /// [`Self::started_sessions_for_item`] on why history, not tip).
+    /// Rows that never retained an item id (boot-recovery unknowns) are
+    /// unattributable and skipped.
+    pub(crate) fn session_links(&self) -> std::collections::HashMap<String, SessionOccurrenceLink> {
+        let mut links = std::collections::HashMap::new();
+        for (occurrence_id, progress) in &self.state {
+            let Some(item_id) = progress
+                .item_id
+                .as_deref()
+                .filter(|item_id| !item_id.is_empty())
+            else {
+                continue;
+            };
+            let state = progress.terminal.unwrap_or(OccurrenceState::Started);
+            for session_id in &progress.started_history {
+                links.insert(
+                    session_id.clone(),
+                    SessionOccurrenceLink {
+                        occurrence_id: occurrence_id.clone(),
+                        item_id: item_id.to_string(),
+                        state,
+                    },
+                );
+            }
+        }
+        links
     }
 
     /// True while any session occurrence of this item is `started` with no
@@ -433,35 +556,63 @@ impl OccurrenceJournal {
             .collect()
     }
 
-    /// `started` occurrences with no terminal record — sessions this
-    /// executor launched and (after a restart) lost sight of. The boot
-    /// pass resolves them to `Unknown`, fail-closed per RFC §7.5.
-    pub(crate) fn started_unresolved(&self) -> Vec<(String, Option<String>)> {
+    /// `started` occurrences with no terminal record — sessions some
+    /// executor launched and lost sight of. Recovery scoping (Track HS2)
+    /// decides per row, on `writer_boot_id` liveness, whether it may
+    /// fail-close the occurrence to `Unknown` (RFC §7.5) or must leave it
+    /// to the live daemon still driving it.
+    pub(crate) fn started_unresolved(&self) -> Vec<StartedUnresolved> {
         self.state
             .iter()
             .filter(|(_, progress)| progress.started.is_some() && progress.terminal.is_none())
-            .map(|(id, progress)| (id.clone(), progress.started.clone()))
+            .map(|(id, progress)| StartedUnresolved {
+                occurrence_id: id.clone(),
+                session_id: progress.started.clone(),
+                writer_boot_id: progress.writer_boot_id.clone(),
+            })
             .collect()
     }
 
-    /// Occurrences a previous process dispatched but never got a receipt
-    /// for: `prepared`, no `started`, no terminal — the lost-dispatch
-    /// shape (the StartTask died with the process). Paired with the
-    /// owning item id retained from the journal rows.
-    pub(crate) fn prepared_unresolved(&self) -> Vec<(String, Option<String>)> {
+    /// Occurrences a process dispatched but never got a receipt for:
+    /// `prepared`, no `started`, no terminal — the lost-dispatch shape
+    /// (the StartTask died with the process, or is still in the writer's
+    /// retry window). Paired with the owning item id retained from the
+    /// journal rows, and the writer's boot id for recovery scoping.
+    pub(crate) fn prepared_unresolved(&self) -> Vec<PreparedUnresolved> {
         self.state
             .iter()
             .filter(|(_, progress)| {
                 progress.prepared && progress.started.is_none() && progress.terminal.is_none()
             })
-            .map(|(id, progress)| (id.clone(), progress.item_id.clone()))
+            .map(|(id, progress)| PreparedUnresolved {
+                occurrence_id: id.clone(),
+                item_id: progress.item_id.clone(),
+                writer_boot_id: progress.writer_boot_id.clone(),
+            })
             .collect()
     }
 
     /// Append one record. `prepared` records are fsync'd to disk before
     /// returning; terminal records flush (an unflushed terminal record
     /// costs at worst one duplicate delivery, which at-least-once allows).
+    /// A set writer stamp fills `generation`/`boot_id` where the record
+    /// carries none — construction sites stay stamp-agnostic.
     pub(crate) fn append(&mut self, record: &OccurrenceRecord) -> std::io::Result<()> {
+        let stamped;
+        let record = match &self.stamp {
+            Some(stamp) if record.generation.is_none() || record.boot_id.is_none() => {
+                let mut filled = record.clone();
+                if filled.boot_id.is_none() {
+                    filled.boot_id = Some(stamp.boot_id.clone());
+                }
+                if filled.generation.is_none() {
+                    filled.generation = stamp.generation;
+                }
+                stamped = filled;
+                &stamped
+            }
+            _ => record,
+        };
         let mut line = serde_json::to_string(record)
             .map_err(|err| std::io::Error::other(format!("encode occurrence: {err}")))?;
         line.push('\n');
@@ -472,6 +623,9 @@ impl OccurrenceJournal {
             self.file.sync_data()?;
         }
         self.folded_len += line.len() as u64;
+        if let Some(generation) = record.generation {
+            self.max_generation = self.max_generation.max(generation);
+        }
         fold_record_into(
             self.state.entry(record.occurrence_id.clone()).or_default(),
             record,
@@ -491,9 +645,10 @@ impl OccurrenceJournal {
             return Ok(());
         }
         let bytes = std::fs::read(&self.path)?;
-        let (state, folded_len) = fold_journal(&bytes);
+        let (state, folded_len, max_generation) = fold_journal(&bytes);
         self.state = state;
         self.folded_len = folded_len;
+        self.max_generation = max_generation;
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
             self.file.write_all(b"\n")?;
             self.folded_len += 1;
@@ -632,10 +787,14 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
         entry.item_id = Some(record.item_id.clone());
     }
     match record.state {
-        OccurrenceState::Prepared => entry.prepared = true,
+        OccurrenceState::Prepared => {
+            entry.prepared = true;
+            entry.writer_boot_id = record.boot_id.clone();
+        }
         OccurrenceState::Started => {
             entry.prepared = true;
             entry.started = record.session_id.clone();
+            entry.writer_boot_id = record.boot_id.clone();
             if let Some(session_id) = record.session_id.as_ref() {
                 if !entry.started_history.contains(session_id) {
                     entry.started_history.push(session_id.clone());
@@ -646,9 +805,10 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
     }
 }
 
-fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
+fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64, u64) {
     let text = String::from_utf8_lossy(bytes);
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
+    let mut max_generation = 0u64;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -656,6 +816,9 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
         }
         match serde_json::from_str::<OccurrenceRecord>(line) {
             Ok(record) => {
+                if let Some(generation) = record.generation {
+                    max_generation = max_generation.max(generation);
+                }
                 fold_record_into(
                     state.entry(record.occurrence_id.clone()).or_default(),
                     &record,
@@ -667,7 +830,18 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
             }
         }
     }
-    (state, bytes.len() as u64)
+    (state, bytes.len() as u64, max_generation)
+}
+
+/// Max lease generation stamped on journal rows under `dir` — the Q1
+/// reseed floor for lease acquisition. Static tolerant read: a missing
+/// journal (or one with no stamped rows yet) floors at 0.
+pub(crate) fn journal_generation_floor(dir: &Path) -> u64 {
+    let bytes = match std::fs::read(dir.join(JOURNAL_FILE)) {
+        Ok(bytes) => bytes,
+        Err(_) => return 0,
+    };
+    fold_journal(&bytes).2
 }
 
 /// One deliverable occurrence, resolved against policy.
@@ -719,6 +893,43 @@ pub(crate) struct SpawnOccurrence {
     /// the dispatcher for the fire-time seal check and the fired task's
     /// per-ref data lines.
     pub(crate) binding_refs: Vec<BindingRef>,
+    /// Deterministic display name for the spawned session, derived from
+    /// the firing's source ([`derive_spawn_session_name`]) and assigned
+    /// through the existing session naming system at launch. `None` when
+    /// the source title normalizes to nothing — the spawn stays unnamed
+    /// (naming never blocks a firing).
+    pub(crate) session_name: Option<String>,
+}
+
+/// Deterministic display name for an agenda-fired session, derived from
+/// the firing's SOURCE — never model-generated. A workflow-node firing
+/// (an `on_unblock`-triggered manifest on an item placed under a parent)
+/// reads "<workflow title> - <node title>", the parent hub being the
+/// workflow instance (Track T's stamped shape); every other firing takes
+/// the item title alone, and an `on_unblock` node without a live parent
+/// degrades to the same. Normalized through the naming system's own
+/// rules so the launch path accepts the result verbatim; a title that
+/// normalizes to nothing yields `None` (an unnamed spawn, never a failed
+/// one). Titles are the only input, so the same item fires under the
+/// same name every occurrence — window disambiguation stays with the
+/// existing timestamps. Track AW seam: stamped definitions derive
+/// "<definition name> - <node id>" HERE once they land — this function
+/// is the single derivation point.
+fn derive_spawn_session_name(
+    item: &AgendaItem,
+    trigger: Option<&super::types::TriggerSpec>,
+    items: &[AgendaItem],
+) -> Option<String> {
+    let workflow_node = match trigger {
+        Some(super::types::TriggerSpec::OnUnblock) => item
+            .part_of
+            .as_ref()
+            .and_then(|placement| items.iter().find(|i| i.id == placement.parent_id))
+            .map(|workflow| format!("{} - {}", workflow.title, item.title)),
+        _ => None,
+    };
+    let raw = workflow_node.unwrap_or_else(|| item.title.clone());
+    crate::session_names::normalize_session_name(&raw).ok()
 }
 
 /// Occurrence identity for a scheduled session: entry + effect + the
@@ -1078,6 +1289,8 @@ pub(crate) fn plan(
                     .as_ref()
                     .is_some_and(|run| run.state == "started")
                 || journal.started_unresolved_for_item(&item.id);
+            let session_name =
+                derive_spawn_session_name(item, effect.manifest.trigger.as_ref(), items);
             for (instant, identity_ms, recurring) in candidates {
                 let occurrence_id = session_occurrence_id(
                     &item.id,
@@ -1106,6 +1319,7 @@ pub(crate) fn plan(
                     provenance_session_id: item.provenance.session_id.clone(),
                     matched_item_ids: trigger_batch.clone(),
                     binding_refs: effect.manifest.binding_refs.clone(),
+                    session_name: session_name.clone(),
                 };
                 if progress.prepared {
                     // Crash between prepare and launch confirmation: fail
@@ -1454,6 +1668,8 @@ mod tests {
                 state: OccurrenceState::Prepared,
                 urgency: None,
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         journal
@@ -1466,6 +1682,8 @@ mod tests {
                 state: OccurrenceState::Delivered,
                 urgency: Some(ReminderUrgency::Attention),
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         let again = plan(
@@ -1479,6 +1697,87 @@ mod tests {
         );
         assert!(again.deliver.is_empty());
         assert_eq!(again.next_wake_ms, Some(5_000));
+    }
+
+    /// The grid envelope's reverse fold: every lineage member maps to
+    /// its occurrence, the occurrence's terminal speaks for the whole
+    /// lineage, and rows that never retained an item id stay
+    /// unattributable.
+    #[test]
+    fn session_links_follow_lineage_and_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OccurrenceJournal::open(dir.path()).unwrap();
+        let row = |occ: &str, item: &str, state: OccurrenceState, session: Option<&str>| {
+            OccurrenceRecord {
+                v: 1,
+                at_ms: 1_000,
+                occurrence_id: occ.to_string(),
+                item_id: item.to_string(),
+                due_ms: 1_000,
+                state,
+                urgency: None,
+                session_id: session.map(str::to_string),
+                generation: None,
+                boot_id: None,
+            }
+        };
+        // occ-1: started by s1, re-keyed to successor s2, then completed.
+        journal
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Started,
+                Some("s1"),
+            ))
+            .unwrap();
+        journal
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Started,
+                Some("s2"),
+            ))
+            .unwrap();
+        journal
+            .append(&row(
+                "occ-1",
+                "item-a",
+                OccurrenceState::Completed,
+                Some("s2"),
+            ))
+            .unwrap();
+        // occ-2: still running.
+        journal
+            .append(&row(
+                "occ-2",
+                "item-b",
+                OccurrenceState::Started,
+                Some("s3"),
+            ))
+            .unwrap();
+        // occ-3: boot-recovery shape — no item id retained.
+        journal
+            .append(&row("occ-3", "", OccurrenceState::Started, Some("s4")))
+            .unwrap();
+
+        let links = journal.session_links();
+        for lineage_member in ["s1", "s2"] {
+            let link = links.get(lineage_member).expect("lineage member linked");
+            assert_eq!(link.occurrence_id, "occ-1");
+            assert_eq!(link.item_id, "item-a");
+            assert_eq!(
+                link.state,
+                OccurrenceState::Completed,
+                "the terminal follows the whole lineage"
+            );
+        }
+        let running = links.get("s3").expect("running session linked");
+        assert_eq!(running.item_id, "item-b");
+        assert_eq!(running.state, OccurrenceState::Started);
+        assert!(
+            !links.contains_key("s4"),
+            "itemless boot-recovery rows stay unattributable"
+        );
     }
 
     /// The A3 restart contract: a terminal record survives reopen (never
@@ -1505,6 +1804,8 @@ mod tests {
                         state: OccurrenceState::Prepared,
                         urgency: None,
                         session_id: None,
+                        generation: None,
+                        boot_id: None,
                     })
                     .unwrap();
                 if terminal {
@@ -1518,6 +1819,8 @@ mod tests {
                             state: OccurrenceState::Delivered,
                             urgency: None,
                             session_id: None,
+                            generation: None,
+                            boot_id: None,
                         })
                         .unwrap();
                 }
@@ -1536,6 +1839,147 @@ mod tests {
         );
         assert_eq!(replanned.deliver.len(), 1);
         assert_eq!(replanned.deliver[0].item_id, "torn-one");
+    }
+
+    /// Track HS additive-compat pin: a legacy row (no `generation`, no
+    /// `boot_id`) folds exactly as before stamping existed, and a record
+    /// written without a stamp serializes byte-identical to the legacy
+    /// shape — old and new builds share one journal without drift.
+    #[test]
+    fn journal_row_without_generation_folds_identically() {
+        let legacy_line = r#"{"v":1,"at_ms":1000,"occurrence_id":"occ-legacy","item_id":"a","due_ms":1000,"state":"started","session_id":"sess-1"}"#;
+        let (state, folded_len, max_generation) = fold_journal(legacy_line.as_bytes());
+        assert_eq!(folded_len, legacy_line.len() as u64);
+        assert_eq!(max_generation, 0, "legacy rows carry no generation");
+        let progress = state.get("occ-legacy").expect("row folded");
+        assert!(progress.prepared);
+        assert_eq!(progress.started.as_deref(), Some("sess-1"));
+        assert_eq!(progress.terminal, None);
+        assert_eq!(progress.item_id.as_deref(), Some("a"));
+
+        // Serialization round-trip without a stamp: no new keys appear.
+        let record: OccurrenceRecord = serde_json::from_str(legacy_line).unwrap();
+        assert_eq!(record.generation, None);
+        assert_eq!(record.boot_id, None);
+        assert_eq!(
+            serde_json::to_string(&record).unwrap(),
+            legacy_line,
+            "stampless records stay byte-identical to the legacy shape"
+        );
+    }
+
+    /// Recovery scoping's fold input (Track HS2): the last non-terminal
+    /// row's boot id wins — `None` included, so a stampless row from a
+    /// pre-stamping build downgrades the occurrence to legacy boot-time
+    /// recovery, the fail-closed direction for mixed-version homes.
+    #[test]
+    fn writer_boot_id_follows_last_non_terminal_row() {
+        let mk = |state: OccurrenceState, boot: Option<&str>| OccurrenceRecord {
+            v: 1,
+            at_ms: 1_000,
+            occurrence_id: "occ-1".to_string(),
+            item_id: "a".to_string(),
+            due_ms: 1_000,
+            state,
+            urgency: None,
+            session_id: Some("sess-1".to_string()),
+            generation: None,
+            boot_id: boot.map(str::to_string),
+        };
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Prepared, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Started, Some("boot-b"))).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id.as_deref(),
+            Some("boot-b"),
+            "last non-terminal row wins"
+        );
+
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Prepared, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Started, None)).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id,
+            None,
+            "a stampless writer downgrades the occurrence to legacy semantics"
+        );
+
+        // Terminal rows never disturb the writer attribution.
+        let lines = [
+            serde_json::to_string(&mk(OccurrenceState::Started, Some("boot-a"))).unwrap(),
+            serde_json::to_string(&mk(OccurrenceState::Completed, None)).unwrap(),
+        ]
+        .join("\n");
+        let (state, _, _) = fold_journal(lines.as_bytes());
+        assert_eq!(
+            state.get("occ-1").unwrap().writer_boot_id.as_deref(),
+            Some("boot-a")
+        );
+    }
+
+    /// Track HS stamping: a set writer stamp fills appended rows, an
+    /// explicit field is never overwritten, and the max generation
+    /// converges to co-homed readers through the refold — the Q1 reseed
+    /// floor both live and via [`journal_generation_floor`].
+    #[test]
+    fn append_fills_writer_stamp_and_tracks_generation_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = journal(dir.path());
+        writer.set_stamp(Some(JournalStamp {
+            boot_id: "boot-a".to_string(),
+            generation: Some(4),
+        }));
+        let record = |occ: &str, state: OccurrenceState| OccurrenceRecord {
+            v: 1,
+            at_ms: 1_000,
+            occurrence_id: occ.to_string(),
+            item_id: "a".to_string(),
+            due_ms: 1_000,
+            state,
+            urgency: None,
+            session_id: None,
+            generation: None,
+            boot_id: None,
+        };
+        writer
+            .append(&record("occ-1", OccurrenceState::Prepared))
+            .unwrap();
+        writer
+            .append(&OccurrenceRecord {
+                generation: Some(9),
+                boot_id: Some("boot-x".to_string()),
+                ..record("occ-2", OccurrenceState::Prepared)
+            })
+            .unwrap();
+        assert_eq!(writer.max_generation(), 9);
+
+        let raw = std::fs::read_to_string(dir.path().join(JOURNAL_FILE)).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["boot_id"], "boot-a", "stamp fills empty fields");
+        assert_eq!(lines[0]["generation"], 4);
+        assert_eq!(lines[1]["boot_id"], "boot-x", "explicit fields survive");
+        assert_eq!(lines[1]["generation"], 9);
+
+        // A co-homed reader converges on the same floor via refold, and
+        // the static read (lease acquisition's input) agrees.
+        let mut reader = journal(dir.path());
+        reader.refresh_if_stale().unwrap();
+        assert_eq!(reader.max_generation(), 9);
+        assert_eq!(journal_generation_floor(dir.path()), 9);
+        assert_eq!(
+            journal_generation_floor(&dir.path().join("missing")),
+            0,
+            "no journal floors at zero"
+        );
     }
 
     #[test]
@@ -1665,6 +2109,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -1790,6 +2236,8 @@ mod tests {
                     state: s,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2030,6 +2478,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: Some("sess-live".into()),
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2077,6 +2527,8 @@ mod tests {
                 state: OccurrenceState::Completed,
                 urgency: None,
                 session_id: Some("sess-live".into()),
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         let released = plan(
@@ -2257,6 +2709,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2589,6 +3043,8 @@ mod tests {
                 state: OccurrenceState::Delivered,
                 urgency: None,
                 session_id: None,
+                generation: None,
+                boot_id: None,
             })
             .unwrap();
         assert_eq!(
@@ -2681,6 +3137,8 @@ mod tests {
                     state,
                     urgency,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2699,6 +3157,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: session,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
@@ -2845,6 +3305,8 @@ mod tests {
                             urgency: Some(ReminderUrgency::Info),
                             // Padding so a torn line would be visible.
                             session_id: Some("x".repeat(200)),
+                            generation: None,
+                            boot_id: None,
                         })
                         .unwrap();
                 }
@@ -3102,6 +3564,84 @@ mod tests {
         );
     }
 
+    /// A workflow-node firing — an `on_unblock`-triggered manifest on an
+    /// item placed under a parent — derives "<workflow title> - <node
+    /// title>", the parent hub being the workflow instance in Track T's
+    /// stamped shape. A node whose parent is gone degrades to its own
+    /// title instead of firing nameless. Titles are the only input, so
+    /// the same node fires under the same name every occurrence.
+    #[test]
+    fn workflow_node_names_carry_workflow_and_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        node.part_of = Some(super::super::types::AgendaPlacement {
+            parent_id: "wf-hub".into(),
+            added_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+        });
+        let now = 500_000;
+
+        let hub = item("wf-hub", AgendaStatus::Open, None);
+        let items = vec![hub, done_at("node-a", 100_000), node.clone()];
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(
+            planned.spawn[0].session_name.as_deref(),
+            Some("item wf-hub - item node-b"),
+            "a workflow-node spawn is named '<workflow title> - <node title>'"
+        );
+
+        let items = vec![done_at("node-a", 100_000), node.clone()];
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(
+            planned.spawn[0].session_name.as_deref(),
+            Some("item node-b"),
+            "an on_unblock node without a live parent takes its own title"
+        );
+    }
+
+    /// Naming never blocks a firing: derivation is total. A standalone
+    /// (non-triggered) item derives its plain title through the naming
+    /// system's normalize rules; a title that normalizes to nothing
+    /// derives no name at all — the spawn goes out unnamed rather than
+    /// failing the launch-side name validation.
+    #[test]
+    fn spawn_name_derivation_is_total_and_title_shaped() {
+        let plain = item("solo", AgendaStatus::Open, None);
+        assert_eq!(
+            derive_spawn_session_name(&plain, None, std::slice::from_ref(&plain)).as_deref(),
+            Some("item solo")
+        );
+        let mut blank = item("blank", AgendaStatus::Open, None);
+        blank.title = "   ".into();
+        assert_eq!(
+            derive_spawn_session_name(&blank, None, std::slice::from_ref(&blank)),
+            None
+        );
+    }
+
     /// The live 2026-07-26 echo shape, closed: a terminal LATER than the
     /// unchanged cause advances the cooldown floor, and the planner must
     /// mint NOTHING at `terminal + cooldown` — occurrence identity
@@ -3304,6 +3844,8 @@ mod tests {
                     state,
                     urgency: None,
                     session_id: Some("sess-fired".into()),
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }

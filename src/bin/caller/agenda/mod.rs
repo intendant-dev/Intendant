@@ -31,6 +31,7 @@
 
 mod ask;
 mod blobs;
+mod definitions;
 mod handle;
 mod mandate_templates;
 mod reminders;
@@ -42,9 +43,11 @@ mod types;
 
 pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;
-pub(crate) use handle::AgendaHandle;
+pub(crate) use definitions::materialize_house_definitions;
+pub(crate) use handle::{AgendaHandle, SessionAgendaEnvelope};
 pub(crate) use reminders::{
-    AgendaOccurrencesPage, ReminderPolicyPatch, AGENDA_OCCURRENCES_DEFAULT_LIMIT,
+    journal_generation_floor, AgendaOccurrencesPage, ReminderPolicyPatch,
+    AGENDA_OCCURRENCES_DEFAULT_LIMIT,
 };
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};
@@ -56,9 +59,12 @@ pub(crate) use types::{
     AgendaRefType, AgendaStatus,
 };
 // Test-support seam: cross-module tests (supervisor delivery, blocking
-// waiter) drive real handle-side resolutions with structured content.
+// waiter, the grid-envelope attach) drive real handle-side resolutions
+// with structured content.
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
+#[cfg(test)]
+pub(crate) use reminders::OccurrenceState;
 #[cfg(test)]
 pub(crate) use types::AgendaAskResolution;
 
@@ -75,4 +81,20 @@ pub(crate) fn agenda_dir_in(state_root: &Path) -> PathBuf {
 /// under [`AgendaStore`] takes explicit paths.
 pub(crate) fn agenda_dir() -> PathBuf {
     agenda_dir_in(&intendant_core::state_paths::intendant_home())
+}
+
+/// The daemon's published agenda handle — the read-side seam for lanes
+/// outside the state graph (the session catalog's grid-envelope join),
+/// mirroring `session_supervisor::publish_live_session_registry`. Set once
+/// at the wiring edge; tests construct their own handles and never publish.
+static PUBLISHED_AGENDA_HANDLE: std::sync::OnceLock<std::sync::Arc<AgendaHandle>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn publish_agenda_handle(handle: std::sync::Arc<AgendaHandle>) {
+    let _ = PUBLISHED_AGENDA_HANDLE.set(handle);
+}
+
+/// The published agenda handle, when a startup path wired one.
+pub(crate) fn published_agenda_handle() -> Option<std::sync::Arc<AgendaHandle>> {
+    PUBLISHED_AGENDA_HANDLE.get().cloned()
 }

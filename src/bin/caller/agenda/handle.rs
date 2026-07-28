@@ -9,7 +9,7 @@
 //! request/response surfaces already provide.
 
 use super::reminders::{
-    OccurrenceJournal, ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore,
+    OccurrenceJournal, OccurrenceState, ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore,
 };
 use super::spawn_project::{resolve_spawn_project, SessionSpawnContext};
 use super::store::{AgendaError, AgendaStore, OccurrenceWriteBack};
@@ -152,6 +152,13 @@ impl AgendaHandle {
         cmd: AgendaCommand,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
+        // Stamp (Track AW) has a graph-shaped twin; the generic op lane
+        // gets the primary item (the hub, or an action's single item).
+        if matches!(cmd, AgendaCommand::Stamp { .. }) {
+            return self
+                .stamp(cmd, actor)
+                .map(|outcome| outcome.primary().clone());
+        }
         Self::authorize_command(&cmd, actor.as_ref())?;
         // Start-now resolves its project HERE, at the tenant edge where the
         // daemon context lives: explicit pick → the parking session's
@@ -304,6 +311,56 @@ impl AgendaHandle {
         }
         self.reminder_nudge.notify_waiters();
         Ok(item)
+    }
+
+    /// Stamp an automation definition (Track AW): the graph-shaped twin
+    /// of [`Self::apply`] for the `stamp` command. Parks and proposes
+    /// only — approval stays the owner's per-effect act (the workflow
+    /// approval sheet batches the clicks through its single pinned
+    /// emitter; an action lands on the ordinary card). Broadcasts every
+    /// touched item and badges the attention rail ONCE for the whole
+    /// instance instead of once per node.
+    pub(crate) fn stamp(
+        &self,
+        cmd: AgendaCommand,
+        actor: Option<AgendaActor>,
+    ) -> Result<super::store::AgendaStampOutcome, AgendaError> {
+        Self::authorize_command(&cmd, actor.as_ref())?;
+        let (mut outcome, counts) = {
+            let mut store = self.lock();
+            let outcome = store.apply_stamp_command(cmd, actor, now_ms())?;
+            let counts = store.counts();
+            (outcome, counts)
+        };
+        if let Some(hub) = outcome.hub.as_mut() {
+            self.decorate_item(hub);
+            self.bus.send(AppEvent::AgendaChanged {
+                item: hub.clone(),
+                counts,
+            });
+        }
+        for node in outcome.nodes.iter_mut() {
+            self.decorate_item(&mut node.item);
+            self.bus.send(AppEvent::AgendaChanged {
+                item: node.item.clone(),
+                counts,
+            });
+        }
+        let manifests = outcome.nodes.len();
+        self.bus.send(AppEvent::UserNotification {
+            session_id: None,
+            id: format!("agenda-effect-{}", outcome.primary().id),
+            title: Some("Stamped automation awaits your approval".to_string()),
+            text: format!(
+                "{} — {manifests} manifest{} proposed; nothing runs unapproved.",
+                outcome.title,
+                if manifests == 1 { "" } else { "s" }
+            ),
+            urgency: crate::types::NotificationUrgency::Attention,
+            ts: now_ms(),
+        });
+        self.reminder_nudge.notify_waiters();
+        Ok(outcome)
     }
 
     /// Emit the rail announcement for an open ask-backed item. `session`
@@ -635,6 +692,80 @@ impl AgendaHandle {
                 ))
             })
     }
+
+    /// Per-session source linkage for the session catalog's grid
+    /// envelope, composed here so the catalog never touches the store:
+    /// the journal's reverse fold names the occurrence and owning item
+    /// (every resume-lineage member resolves to the same occurrence,
+    /// whose current state speaks for the lineage), and the item store
+    /// contributes the title plus the digest-bound sealed inputs of the
+    /// effect whose `last_run` recorded that occurrence.
+    /// Derive-don't-mirror: computed per read, nothing persisted. A
+    /// deleted item degrades to the id-only block; an effect
+    /// re-proposed since the fire loses its ref match (`last_run` is
+    /// the durable occurrence↔effect link, and the manifest is the only
+    /// record of the refs). `None` when the journal cannot be opened.
+    /// Journal mutex and store lock are taken sequentially, never
+    /// nested — the [`Self::decorate_items`] discipline.
+    pub(crate) fn session_agenda_envelopes(
+        &self,
+    ) -> Option<std::collections::HashMap<String, SessionAgendaEnvelope>> {
+        let links = self.with_journal(|journal| {
+            if let Err(err) = journal.refresh_if_stale() {
+                eprintln!("[agenda] journal refresh for session links failed: {err}");
+            }
+            journal.session_links()
+        })?;
+        let mut items: std::collections::HashMap<String, Option<AgendaItem>> =
+            std::collections::HashMap::new();
+        for link in links.values() {
+            if !items.contains_key(&link.item_id) {
+                items.insert(link.item_id.clone(), self.item_by_id(&link.item_id));
+            }
+        }
+        Some(
+            links
+                .into_iter()
+                .map(|(session_id, link)| {
+                    let item = items.get(&link.item_id).and_then(|item| item.as_ref());
+                    let sealed_inputs = item
+                        .and_then(|item| {
+                            item.effects.iter().find(|effect| {
+                                effect
+                                    .last_run
+                                    .as_ref()
+                                    .is_some_and(|run| run.occurrence_id == link.occurrence_id)
+                            })
+                        })
+                        .map(|effect| effect.manifest.binding_refs.clone())
+                        .unwrap_or_default();
+                    let envelope = SessionAgendaEnvelope {
+                        item_id: link.item_id,
+                        item_title: item.map(|item| item.title.clone()),
+                        occurrence_id: link.occurrence_id,
+                        occurrence_state: link.state,
+                        sealed_inputs,
+                    };
+                    (session_id, envelope)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// One fired session's derived source linkage — the grid envelope's
+/// agenda block ([`AgendaHandle::session_agenda_envelopes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionAgendaEnvelope {
+    pub(crate) item_id: String,
+    /// `None` when the item no longer exists (the linkage outlives it).
+    pub(crate) item_title: Option<String>,
+    pub(crate) occurrence_id: String,
+    pub(crate) occurrence_state: OccurrenceState,
+    /// The digest-bound binding refs of the manifest that ran this
+    /// occurrence; empty when unmatched (item gone, or re-proposed
+    /// since the fire).
+    pub(crate) sealed_inputs: Vec<super::types::BindingRef>,
 }
 
 fn now_ms() -> u64 {
@@ -656,8 +787,139 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::AgendaKind;
+    use super::super::types::{AgendaKind, BindingRef};
     use super::*;
+
+    /// The grid-envelope composition: a fired session resolves to its
+    /// source item, occurrence state, title, and the sealed inputs of
+    /// the manifest that ran it; every resume-lineage member shares the
+    /// block; linkage outliving its item degrades to the id-only shape.
+    #[test]
+    fn session_agenda_envelopes_compose_journal_store_and_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+
+        // A sealed input the proposer really read (intake re-hashes it).
+        let sealed_src = dir.path().join("inputs.md");
+        std::fs::write(&sealed_src, b"binding ref bytes").unwrap();
+        let sha256 = super::super::store::digest_file(&sealed_src).unwrap();
+
+        let owner = Some(AgendaActor {
+            principal: Some("principal:root:dashboard".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "envelope source".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: "run it".into(),
+                    fire_at_ms: 1_000,
+                    orchestrate: false,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: vec![BindingRef {
+                        locator: format!("file:{}", sealed_src.display()),
+                        sha256: sha256.clone(),
+                    }],
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        let digest = proposed.effects[0].digest.clone();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest,
+                },
+                owner,
+            )
+            .unwrap();
+
+        // The scheduler's post-dispatch write-back: `last_run` is the
+        // durable occurrence↔effect link.
+        let occ = "occ-under-test";
+        handle
+            .record_occurrence(OccurrenceWriteBack {
+                item_id: &item.id,
+                effect_id: &effect_id,
+                occurrence_id: occ,
+                state: "started",
+                session_id: Some("sess-fired".into()),
+                note: None,
+            })
+            .unwrap();
+        // Journal rows: the fired session, then its resume-lineage
+        // successor, plus an occurrence whose item is gone.
+        {
+            let mut journal = OccurrenceJournal::open(dir.path()).unwrap();
+            let row = |occurrence: &str, item_id: &str, session: &str| {
+                super::super::reminders::OccurrenceRecord {
+                    v: 1,
+                    at_ms: 1,
+                    occurrence_id: occurrence.to_string(),
+                    item_id: item_id.to_string(),
+                    due_ms: 1_000,
+                    state: OccurrenceState::Started,
+                    urgency: None,
+                    session_id: Some(session.to_string()),
+                    generation: None,
+                    boot_id: None,
+                }
+            };
+            journal.append(&row(occ, &item.id, "sess-fired")).unwrap();
+            journal
+                .append(&row(occ, &item.id, "sess-successor"))
+                .unwrap();
+            journal
+                .append(&row("occ-orphaned", "01GONE", "sess-orphan"))
+                .unwrap();
+        }
+
+        let envelopes = handle.session_agenda_envelopes().unwrap();
+        for lineage_member in ["sess-fired", "sess-successor"] {
+            let envelope = envelopes
+                .get(lineage_member)
+                .expect("lineage member enveloped");
+            assert_eq!(envelope.item_id, item.id);
+            assert_eq!(envelope.item_title.as_deref(), Some("envelope source"));
+            assert_eq!(envelope.occurrence_id, occ);
+            assert_eq!(envelope.occurrence_state, OccurrenceState::Started);
+            assert_eq!(
+                envelope.sealed_inputs.len(),
+                1,
+                "the fired manifest's binding refs ride the envelope"
+            );
+            assert_eq!(envelope.sealed_inputs[0].sha256, sha256);
+        }
+        let orphan = envelopes.get("sess-orphan").expect("orphan linked");
+        assert_eq!(orphan.item_id, "01GONE");
+        assert_eq!(
+            orphan.item_title, None,
+            "a deleted item degrades to id-only"
+        );
+        assert!(orphan.sealed_inputs.is_empty());
+    }
 
     #[test]
     fn apply_broadcasts_agenda_changed() {
@@ -707,6 +969,55 @@ mod tests {
             )
             .is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stamp_broadcasts_each_item_and_badges_once() {
+        let root = tempfile::tempdir().unwrap();
+        super::super::definitions::materialize_house_definitions(root.path()).unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda);
+        // Stamping parks + proposes, so agent sessions may do it —
+        // approval stays the owner-surface act the existing gate tests
+        // pin.
+        let outcome = handle
+            .stamp(
+                AgendaCommand::Stamp {
+                    definition: "fix-task".into(),
+                    project_root: None,
+                    fire_at_ms: None,
+                    every_ms: None,
+                    suspend_after: None,
+                    agent_config: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-1")),
+            )
+            .unwrap();
+        assert_eq!(outcome.nodes.len(), 4);
+        assert!(outcome.hub.is_some());
+        // Every touched item broadcasts (hub + four nodes); the
+        // attention rail badges ONCE for the whole instance.
+        let mut changed = 0;
+        let mut notified = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::AgendaChanged { .. } => changed += 1,
+                AppEvent::UserNotification { title, .. } => {
+                    notified += 1;
+                    assert_eq!(
+                        title.as_deref(),
+                        Some("Stamped automation awaits your approval")
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(changed, 5);
+        assert_eq!(notified, 1);
     }
 
     fn actor(kind: &str, session: Option<&str>) -> Option<AgendaActor> {
@@ -1906,6 +2217,8 @@ mod tests {
                     state: super::super::reminders::OccurrenceState::Delivered,
                     urgency: None,
                     session_id: None,
+                    generation: None,
+                    boot_id: None,
                 })
                 .unwrap();
         }
