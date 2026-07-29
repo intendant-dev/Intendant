@@ -127,8 +127,11 @@ pub struct SessionLimitParkMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_epoch: Option<u64>,
     /// Whether the park holds a pending re-send/nudge — work still owed
-    /// at the reset (parks always do today; the field keeps the marker
-    /// honest if a pending-less park shape returns).
+    /// at the reset. `false` on a pending-less park (a backend-started
+    /// round whose rejection arrived before any observed work): the
+    /// timer still wakes the lane and queued messages flush at reset,
+    /// but no work is owed, so boot auto-readopt's "limit-parked
+    /// mid-work" class rightly skips it.
     #[serde(default)]
     pub has_pending: bool,
 }
