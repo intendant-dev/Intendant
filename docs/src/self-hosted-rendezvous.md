@@ -4,7 +4,8 @@
 — is an open, first-class deployable, not a chokepoint. It introduces
 browsers to daemon route and presence records, carries account/route metadata,
 delivers optional encrypted Web Push notifications, serves the discovery
-client and installers, stores client-signed fleet metadata, and can carry
+client (the install scripts are release-pinned GitHub assets it at most
+redirects to), stores client-signed fleet metadata, and can carry
 daemon-terminated TLS through its optional reachability relay. It does not
 serve the daemon dashboard SPA or its WASM/static assets. A claim creates no
 daemon IAM principal or grant. The daemon stamps ambient hosted provenance
@@ -20,8 +21,10 @@ That is a precise boundary, not an absolute "zero-authority" claim. Connect
 is trusted for availability, its account and route metadata, push delivery,
 relay delivery, and the code it serves. Push payloads are encrypted to the browser
 subscription, but a malicious Connect-served page can lie about or exfiltrate
-anything exposed in the Connect UI, and a malicious installer can compromise
-what it installs.
+anything exposed in the Connect UI. The install scripts sit outside its
+serving surface: they ship as release-pinned, transparency-logged GitHub
+assets, and `/install.sh` / `/install.ps1` answer with at most a redirect
+whose target the out-of-band verifier pins.
 What it cannot do is turn any claim, account assertion, browser-key grant, or
 generic configuration edit into daemon authority. Its signed navigation hint
 also grants nothing: lease approval and enforcement terminate at the daemon.
@@ -546,10 +549,12 @@ The log also commits **what the service serves**, not just what it says
 ([Trust Tiers](./trust-tiers.md), first-contact rung three: the hosted
 origin's residual power is serving a different bundle). At startup the
 service hashes every embedded artifact it can serve, exactly as this
-instance renders it (`/`, `/connect`, `/access`, `/trust`, the
-origin-injected `/install.sh` and `/install.ps1`, `/logo.svg`,
+instance renders it (`/`, `/connect`, `/access`, `/trust`, `/logo.svg`,
 `/favicon.png`, the embedded `/sw.js` push worker, and the landing
-screenshots) — and appends an
+screenshots; the install scripts are deliberately absent — they are
+release assets committed to this same log as `release_manifest` entries,
+and the installer routes serve only a redirect the verifier checks
+against its pinned targets) — and appends an
 `artifact_manifest` entry when the result or its canonical serving origin
 differs from the latest logged one. The entry carries `artifact_origin`
 (the configured public origin serving those bytes), `artifacts` (a path-sorted list of
@@ -587,9 +592,15 @@ the rendezvous URL, and the first new leaf upgrades the companion pin. The
 verifier then downloads every listed artifact from the signed canonical
 origin exactly as a browser would and compares hashes — nonzero exit and a
 per-artifact diff on divergence.
+When the manifest omits the installer routes (every redirect-era
+deployment), the verifier additionally requires `/install.sh` and
+`/install.ps1` to answer with a redirect to exactly the pinned GitHub
+release-asset URLs — a quietly re-aimed convenience redirect is a loud
+failure. Manifests that still list installer bodies (pre-redirect
+deployments) get them hash-verified like any other listed artifact.
 Metadata bodies, proof arrays, artifact lists, and their strings are all
 bounded before verification work. Manifests must have unique, strictly sorted
-paths and cover the stable Connect pages, installers, service worker, and brand
+paths and cover the stable Connect pages, service worker, and brand
 routes; those minimum routes cannot be removed and an empty declaration cannot
 pass. Each artifact is capped at 64 MiB; one manifest run is additionally
 capped at 256 MiB and five minutes, with bytes consumed by an over-limit stream
@@ -639,8 +650,10 @@ binary cannot serve them.
 The same log commits **what the project releases**, closing the update
 channel's side of the story ([Trust Tiers](./trust-tiers.md)): after
 publishing to GitHub Releases, the tag-triggered release pipeline
-(`.github/workflows/release.yml`) hashes every uploaded artifact and
-submits a `release_manifest` entry — `tag`, `version`, `platforms`, and
+(`.github/workflows/release.yml`) hashes every uploaded artifact — the
+app bundle and the stamped `install.sh` / `install.ps1` release assets
+alike, so the canonical install one-liner's bytes are themselves logged —
+and submits a `release_manifest` entry — `tag`, `version`, `platforms`, and
 a name-sorted `artifacts` list of `{name, sha256, size}` (lowercase-hex
 hashes, comparable to `sha256sum` output), plus `manifest_hash`: sha256
 over the canonical byte string `intendant-release-manifest-v1\n{tag}\n`

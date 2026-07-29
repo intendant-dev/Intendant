@@ -7,26 +7,63 @@ reference.
 ## Fresh box in one command
 
 Standing up a **new machine** end to end (clone, dependencies, build, launch,
-and a Connect discovery link) is one served command — see
+and a Connect discovery link) is one command — see
 [Credential Custody](./credential-custody.md#the-bootstrap-this-unlocks) for
-the trust story behind it:
+the trust story behind it. The canonical installer is a **release asset**:
+every `v*` release attaches `install.sh` / `install.ps1` stamped with the
+release's tag and commit, with their sha256 hashes committed to the public
+[transparency log](./self-hosted-rendezvous.md#release-transparency)
+alongside the binaries' — immutable once published, and outside any hosted
+serving path:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://intendant.dev/install.sh | sh
+curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
+& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))
 ```
 
-Add `--service` / `-Service` on an unattended box: `intendant service install`
+To link the daemon to a rendezvous for discovery, say so explicitly —
+`… | sh -s -- --connect https://intendant.dev` (or your
+[self-hosted rendezvous](./self-hosted-rendezvous.md)); the installer no
+longer learns a default from wherever it was fetched. Add `--service` /
+`-Service` on an unattended box: `intendant service install`
 registers the daemon with the platform's native supervisor (systemd where
 present, launchd on macOS, Task Scheduler on Windows, cron `@reboot` plus a
 built-in restart supervisor on systemd-less Linux — no init system is a
 dependency) and prints where the one-time claim code lands. `intendant service
 uninstall|status` manage it afterwards.
+
+For reproducibility, pin the tag instead of `latest`:
+`…/releases/download/v0.1.0/install.sh`. Release assets are immutable, and a
+stamped installer double-checks itself: it prints its release identity
+(`tag @ commit`) before doing anything else, installs exactly that released
+tree, and fails closed with `RELEASE_PIN_MISMATCH` when the checkout doesn't
+match the commit its release recorded. Everything else it executes comes from
+that verified tree, and `cargo build --locked` extends the pinning to
+dependency hashes.
+
+Pick your rung of the trust ladder honestly:
+
+1. **The one-liner** is the convenience rung: you are trusting GitHub's
+   release storage and the transparency log's public evidence, sight unseen.
+2. **Download, read, then run** the same asset — it is a short script.
+   Check it against the release's `install.sh.sha256` and the logged release
+   manifest first.
+3. **A signed native app** outranks both once published. No Developer
+   ID-signed/notarized release exists for this alpha, and an `-unsigned-dev`
+   artifact never qualifies as an anchor.
+
+`https://intendant.dev/install.sh` survives only as a **non-canonical**
+convenience: it answers with a redirect (HTTP 302) to the release asset and
+never a script body — script against the GitHub URL, not the pretty one.
+While no `v*` release has been published yet (the current state of this
+alpha), the asset URL 404s; until the first release, clone and build from
+source — the [prerequisites and build steps below](#prerequisites) are
+exactly what the installer automates.
 
 What happens next is the whole story in four steps:
 

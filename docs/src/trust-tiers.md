@@ -233,7 +233,8 @@ Three rungs, ordered by what betrayal costs the attacker:
    DNS browser-key origins as fleet provenance until repaired.
 3. **Directory and navigation only — the hosted tab.** The rendezvous origin
    controls its served bundle, account/route/presence metadata, page-visible
-   or unlocked vault UI state, navigation, and installer distribution. It
+   or unlocked vault UI state, navigation, and the installer-route redirect
+   (the scripts themselves are release-pinned GitHub assets). It
    receives no daemon authority: claims, passkeys, and hosted provenance
    remain immutably `role:none`. A daemon-signed hint may make its card
    navigate to the daemon's fleet-origin lease doorbell, but Connect neither
