@@ -1299,9 +1299,12 @@ pub enum OutboundEvent {
     /// `OutboundEvent`'s serde tag is also `"event"`, and a struct
     /// field with the same name would collide with the variant
     /// discriminator at the same JSON nesting level.
+    /// Boxed like [`crate::peer::RegistryEvent::PeerEventForwarded`]'s
+    /// payload — the enum's largest field on some targets (serde is
+    /// transparent to the box).
     PeerEventForwarded {
         peer_id: String,
-        payload: crate::peer::PeerEvent,
+        payload: Box<crate::peer::PeerEvent>,
     },
     /// One leg of a federation-driven WebRTC signaling exchange,
     /// emitted *by* this daemon back toward a connector. Carries the
@@ -1339,8 +1342,11 @@ pub enum OutboundEvent {
         signal: crate::peer::WebRtcSignal,
     },
     /// The agenda ledger changed; frontends refresh their agenda views.
+    /// Boxed: the decorated item DTO is the enum's largest payload by a
+    /// margin Clippy flags on some targets (serde is transparent to the
+    /// box — the wire shape is unchanged).
     AgendaChanged {
-        item: crate::agenda::AgendaItem,
+        item: Box<crate::agenda::AgendaItem>,
         counts: crate::agenda::AgendaCounts,
     },
     /// The Memory plane admitted a claim; frontends refresh their
