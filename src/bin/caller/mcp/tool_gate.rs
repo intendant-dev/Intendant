@@ -1493,6 +1493,7 @@ mod tests {
                     "answer",
                     "approve_effect",
                     "ask",
+                    "attest",
                     "clear_blocker",
                     "complete",
                     "patch",

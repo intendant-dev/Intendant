@@ -311,7 +311,11 @@ from HS1's presence substrate joined with live wrapper registry
 membership — and a session that predates the current daemon boot with
 no live wrapper renders unmistakably as a **ghost** (`👻` warn chip +
 dashed desaturated frame): the safe-to-close state, served as a
-precomputed bit. Fired sessions keep their derived names (the source
+precomputed bit. A backend resumed across a restart is two wrapper rows
+aliasing one card — the dead pre-restart twin and the live
+resume-attached twin; the live wrapper's block wins that fold
+(`resolveSessionWindowBootMeta`), so the dead lineage never re-labels a
+live card as a ghost. Fired sessions keep their derived names (the source
 item's title, or `workflow - node` for workflow nodes); an owner
 rename always wins, and the Track AW refinement — stamped definitions
 deriving `definition name - node id` — lands later at the same single

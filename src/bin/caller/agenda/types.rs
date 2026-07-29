@@ -343,6 +343,39 @@ pub(crate) const MAX_BINDING_REFS_PER_MANIFEST: usize = 16;
 /// The `file:` locator scheme prefix (v1's only binding-ref scheme).
 pub(crate) const BINDING_REF_FILE_SCHEME: &str = "file:";
 
+/// Attestation-ref count rail per attest op (Track AO, Q2/Q3 ruling:
+/// refs ≤ 8 in `BindingRef`'s v1 grammar, hash-verified at intake,
+/// VERIFY-ONLY — pointer + pin, never sealed; OPEN-3).
+pub(crate) const MAX_ATTESTATION_REFS: usize = 8;
+/// Attestation note bound (Track AO, Q2 ruling: short prose, ≤ 4 KiB —
+/// the handoff itself belongs in a durable file behind a ref).
+pub(crate) const MAX_ATTESTATION_NOTE_BYTES: usize = 4096;
+
+/// The fired session's self-reported goal outcome (Track AO §2.1 — the
+/// meanings are binding). A second axis BESIDE the transport vocabulary
+/// (`started/completed/failed/missed/unknown`), never a
+/// reclassification: self-report, never verified, labeled so wherever
+/// it renders. The derived absence state — unattested — is fold-`None`,
+/// rendered distinctly, never equal to achieved, never synthesized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationOutcome {
+    /// The goal, as stated, was accomplished. Self-report, never
+    /// verified.
+    Achieved,
+    /// Real progress; the goal is not met; a future run (or the
+    /// standing cadence) can continue productively.
+    Partial,
+    /// Cannot proceed without something outside the session's power (an
+    /// owner decision, missing access, an external dependency). The
+    /// note should say what; an agenda-shaped blocker is what
+    /// `on_unblock` is for.
+    Blocked,
+    /// Deliberately stopped: wrong premise, obsolete goal, safety
+    /// refusal. Terminal by intent; nothing should retry it.
+    Abandoned,
+}
+
 /// A scheduled-session manifest (slice A5): the complete statement of
 /// what firing does — reviewed by the owner at approval time. Immutable
 /// per revision: [`manifest_digest`] binds the approval, and any edit
@@ -1095,6 +1128,30 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
+    /// The fired session's self-report on its occurrence (Track AO): a
+    /// second axis beside the transport verdict, accepted only from a
+    /// session in the occurrence's started lineage (Rider A —
+    /// superseded originals and admitted successors both attest;
+    /// last-wins within the lineage). Non-session actors are refused by
+    /// name: an owner statement about a run is a verification lane, not
+    /// self-report. Refs are pointer + pin in `BindingRef`'s v1
+    /// grammar, hash-verified at intake against the daemon's own read
+    /// and never sealed (OPEN-3: verify-only). Accepted while the
+    /// occurrence is `started` and after a terminal alike (late attests
+    /// are display-only downstream).
+    Attest {
+        id: String,
+        /// The occurrence being attested — the fired task's rider names
+        /// it, so self-reference resolves mechanically.
+        occurrence: String,
+        outcome: AttestationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<BindingRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// State a blocking criterion on an open item. Plain text about the
     /// world — NO watcher, poller, or condition language ever evaluates
     /// it. The daemon mints the blocker id at intake.
@@ -1280,6 +1337,7 @@ impl AgendaCommand {
             | AgendaCommand::Answer { source, .. }
             | AgendaCommand::ProposeEffect { source, .. }
             | AgendaCommand::Annotate { source, .. }
+            | AgendaCommand::Attest { source, .. }
             | AgendaCommand::SetBlocker { source, .. }
             | AgendaCommand::ClearBlocker { source, .. }
             | AgendaCommand::AddReliesOn { source, .. }
@@ -1463,6 +1521,26 @@ pub(crate) enum AgendaOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// The fired session's self-report (Track AO §2.3): an act by an
+    /// attributed principal, so it is an op — attribution rides the
+    /// envelope like every act, and the op log is the attestation
+    /// history. Older builds skip exactly this line (unknown variant —
+    /// whole-line, the `KNOWN_OPS` posture) while keeping full
+    /// transport fidelity; old daemons refuse the wire command
+    /// fail-closed (`deny_unknown_fields`). Intake verified:
+    /// occurrence-belongs-to-item, actor in the occurrence's started
+    /// lineage, closed outcome set, bounded note, refs hash-verified
+    /// (verify-only — never sealed).
+    Attest {
+        id: String,
+        effect_id: String,
+        occurrence_id: String,
+        outcome: AttestationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<BindingRef>,
+    },
     /// Daemon-authored ask-delivery write-back (the session supervisor's
     /// delivery arm only — no command twin, like `record_occurrence`):
     /// whether the recorded answer reached a live asking session (or its
@@ -1505,6 +1583,7 @@ impl AgendaOp {
             | AgendaOp::RevokeEffect { id, .. }
             | AgendaOp::RequestOccurrence { id, .. }
             | AgendaOp::RecordOccurrence { id, .. }
+            | AgendaOp::Attest { id, .. }
             | AgendaOp::RecordAskDelivery { id, .. } => id,
         }
     }
@@ -2066,6 +2145,15 @@ pub(crate) fn apply_op(
                 _ => {}
             }
             item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::Attest { .. } => {
+            // History-only in this slice (Track AO): the op log IS the
+            // attestation history (`/api/agenda/ops` serves it). The
+            // run-view attach (`AgendaRun.attestation` — last-wins on
+            // the same occurrence, carried through the terminal
+            // write-back, warn-skip on mismatch) and the ruled streak
+            // weights land with the AO fold slice.
             None
         }
         AgendaOp::Answer {

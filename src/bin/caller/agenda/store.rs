@@ -6,12 +6,13 @@
 use super::types::{
     apply_op, counts, AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaOp,
     AgendaOpRecord, AgendaPatch, AgendaRefType, AgendaStatus, BindingRef, AGENDA_LOG_VERSION,
-    BINDING_REF_FILE_SCHEME, MAX_ANNOTATIONS_PER_ITEM, MAX_BINDING_REFS_PER_MANIFEST,
-    MAX_BODY_BYTES, MAX_CHILDREN_PER_HUB, MAX_CRITERION_CHARS, MAX_PART_OF_DEPTH,
-    MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES, MAX_REF_FILE_LOCATOR_CHARS,
-    MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS, MAX_REF_URL_LOCATOR_CHARS,
-    MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS, MAX_TAGS, MAX_TAG_CHARS,
-    MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM, TRIGGER_MATCH_TAGS_MAX,
+    BINDING_REF_FILE_SCHEME, MAX_ANNOTATIONS_PER_ITEM, MAX_ATTESTATION_NOTE_BYTES,
+    MAX_ATTESTATION_REFS, MAX_BINDING_REFS_PER_MANIFEST, MAX_BODY_BYTES, MAX_CHILDREN_PER_HUB,
+    MAX_CRITERION_CHARS, MAX_PART_OF_DEPTH, MAX_REFS_PER_ITEM, MAX_REF_FILE_HASH_BYTES,
+    MAX_REF_FILE_LOCATOR_CHARS, MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS,
+    MAX_REF_URL_LOCATOR_CHARS, MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS,
+    MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
+    TRIGGER_MATCH_TAGS_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -43,7 +44,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 24] = [
+const KNOWN_OPS: [&str; 25] = [
     "add",
     "patch",
     "complete",
@@ -68,6 +69,7 @@ const KNOWN_OPS: [&str; 24] = [
     "request_occurrence",
     "record_occurrence",
     "record_ask_delivery",
+    "attest",
 ];
 
 const LOG_FILE: &str = "agenda.jsonl";
@@ -1592,6 +1594,50 @@ impl AgendaStore {
                     text: text.to_string(),
                 })
             }
+            AgendaCommand::Attest {
+                id,
+                occurrence,
+                outcome,
+                note,
+                refs,
+                source: _,
+            } => {
+                // The journal-side checks (occurrence-belongs-to-item,
+                // actor in the started lineage) ran at the tenant edge
+                // (`AgendaHandle::verify_attest_binding`) — the handle
+                // holds the journal; this store validates the rest.
+                let item = self.require(&id)?;
+                // v1: one session effect per item names the effect.
+                let Some(effect) = item.effects.first() else {
+                    return Err(AgendaError::Invalid(format!(
+                        "attest: {id} has no scheduled-session effect — only fired \
+                         occurrences can be attested"
+                    )));
+                };
+                let effect_id = effect.effect_id.clone();
+                let note = match note {
+                    Some(note) => {
+                        let trimmed = note.trim();
+                        if trimmed.len() > MAX_ATTESTATION_NOTE_BYTES {
+                            return Err(AgendaError::Invalid(format!(
+                                "attest note exceeds {MAX_ATTESTATION_NOTE_BYTES} bytes — \
+                                 write the handoff into a durable file and ref it"
+                            )));
+                        }
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    }
+                    None => None,
+                };
+                let refs = validate_attestation_refs(refs)?;
+                Ok(AgendaOp::Attest {
+                    id,
+                    effect_id,
+                    occurrence_id: occurrence,
+                    outcome,
+                    note,
+                    refs,
+                })
+            }
             AgendaCommand::SetBlocker {
                 id,
                 criterion,
@@ -2521,52 +2567,97 @@ fn validate_binding_refs(
     }
     let mut validated: Vec<BindingRef> = Vec::with_capacity(refs.len());
     for BindingRef { locator, sha256 } in refs {
-        let path = binding_ref_path(&locator).map_err(AgendaError::Invalid)?;
-        let sha256 = sha256.to_ascii_lowercase();
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(AgendaError::Invalid(format!(
-                "binding ref {locator}: sha256 must be 64 hex characters"
-            )));
-        }
         if validated.iter().any(|seen| seen.locator == locator) {
             return Err(AgendaError::Invalid(format!(
                 "binding ref {locator} is listed twice"
             )));
         }
-        let meta = std::fs::metadata(path).map_err(|err| {
-            AgendaError::Invalid(format!("binding ref {locator} is not readable ({err})"))
-        })?;
-        if !meta.is_file() {
-            return Err(AgendaError::Invalid(format!(
-                "binding ref {locator} is not a regular file"
-            )));
-        }
-        if meta.len() > MAX_REF_FILE_HASH_BYTES {
-            return Err(AgendaError::Invalid(format!(
-                "binding ref {locator} exceeds {MAX_REF_FILE_HASH_BYTES} bytes — \
-                 binding refs seal working artifacts, not archives"
-            )));
-        }
-        let bytes = std::fs::read(path).map_err(|err| {
-            AgendaError::Invalid(format!("cannot read binding ref {locator}: {err}"))
-        })?;
-        let live = super::sealed_blobs::digest_bytes(&bytes);
-        if live != sha256 {
-            return Err(AgendaError::Invalid(format!(
-                "binding ref {locator}: the proposed pin {sha256} does not match the \
-                 live content ({live}) — re-read the file and re-propose"
-            )));
-        }
+        let (binding_ref, bytes) = verify_stated_ref(locator, sha256, "binding ref")?;
         // Seal failure refuses the propose: a manifest whose snapshot
         // never existed would refuse every firing — fail closed at the
         // ceremony, not at 3am.
-        super::sealed_blobs::seal_content(agenda_dir, &sha256, &bytes).map_err(|err| {
-            AgendaError::Io(std::io::Error::new(
-                err.kind(),
-                format!("sealing binding ref {locator}: {err}"),
-            ))
-        })?;
-        validated.push(BindingRef { locator, sha256 });
+        super::sealed_blobs::seal_content(agenda_dir, &binding_ref.sha256, &bytes).map_err(
+            |err| {
+                AgendaError::Io(std::io::Error::new(
+                    err.kind(),
+                    format!("sealing binding ref {}: {err}", binding_ref.locator),
+                ))
+            },
+        )?;
+        validated.push(binding_ref);
+    }
+    Ok(validated)
+}
+
+/// One caller-stated `{locator, sha256}` pin verified against the
+/// daemon's OWN read: v1 grammar (`file:` + 64-hex, normalized
+/// lowercase), a regular file under the hash rail, live bytes hashing
+/// exactly to the stated pin. Returns the normalized ref WITH the bytes
+/// this read hashed — the propose lane seals exactly those bytes
+/// (single read: the bytes hashed ARE the bytes preserved, no re-read
+/// window); verify-only lanes (attest — Track AO OPEN-3) drop them.
+/// `what` names the lane in refusals ("binding ref" / "attestation
+/// ref"), which R5 requires named, never silent.
+fn verify_stated_ref(
+    locator: String,
+    sha256: String,
+    what: &str,
+) -> Result<(BindingRef, Vec<u8>), AgendaError> {
+    let path = binding_ref_path(&locator).map_err(AgendaError::Invalid)?;
+    let sha256 = sha256.to_ascii_lowercase();
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(AgendaError::Invalid(format!(
+            "{what} {locator}: sha256 must be 64 hex characters"
+        )));
+    }
+    let meta = std::fs::metadata(path)
+        .map_err(|err| AgendaError::Invalid(format!("{what} {locator} is not readable ({err})")))?;
+    if !meta.is_file() {
+        return Err(AgendaError::Invalid(format!(
+            "{what} {locator} is not a regular file"
+        )));
+    }
+    if meta.len() > MAX_REF_FILE_HASH_BYTES {
+        return Err(AgendaError::Invalid(format!(
+            "{what} {locator} exceeds {MAX_REF_FILE_HASH_BYTES} bytes — \
+             refs point at working artifacts, not archives"
+        )));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|err| AgendaError::Invalid(format!("cannot read {what} {locator}: {err}")))?;
+    let live = super::sealed_blobs::digest_bytes(&bytes);
+    if live != sha256 {
+        return Err(AgendaError::Invalid(format!(
+            "{what} {locator}: the stated pin {sha256} does not match the \
+             live content ({live}) — re-read the file and restate the pin"
+        )));
+    }
+    Ok((BindingRef { locator, sha256 }, bytes))
+}
+
+/// Attestation refs (Track AO, Q2 check 3 + OPEN-3): the ≤
+/// [`MAX_ATTESTATION_REFS`] rail, `BindingRef`'s v1 grammar, and the
+/// stated pin verified against the daemon's own read — an attestation
+/// citing bytes that do not hash as claimed is refused as malformed.
+/// VERIFY-ONLY: pointer + pin, nothing sealed — the sealed store stays
+/// the ceremony for owner-approved binding content, and render-time
+/// drift chips tell the truth later.
+fn validate_attestation_refs(refs: Vec<BindingRef>) -> Result<Vec<BindingRef>, AgendaError> {
+    if refs.len() > MAX_ATTESTATION_REFS {
+        return Err(AgendaError::Invalid(format!(
+            "an attest carries at most {MAX_ATTESTATION_REFS} refs — write the handoff \
+             into one durable file and ref that"
+        )));
+    }
+    let mut validated: Vec<BindingRef> = Vec::with_capacity(refs.len());
+    for BindingRef { locator, sha256 } in refs {
+        if validated.iter().any(|seen| seen.locator == locator) {
+            return Err(AgendaError::Invalid(format!(
+                "attestation ref {locator} is listed twice"
+            )));
+        }
+        let (verified, _bytes) = verify_stated_ref(locator, sha256, "attestation ref")?;
+        validated.push(verified);
     }
     Ok(validated)
 }
@@ -5121,6 +5212,46 @@ mod tests {
         // The foreign line survives on disk verbatim.
         let text = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
         assert!(text.contains("sigil"));
+    }
+
+    /// Track AO pin `attest_op_skips_whole_line_on_old_builds`: the
+    /// KNOWN_OPS posture. THIS build folds `attest` (a member — the
+    /// line costs nothing and serves `known:true`); a build without the
+    /// vocabulary treats an attest line exactly as this build treats
+    /// the future `attest_v2` fixture — the WHOLE line skipped at load,
+    /// preserved on disk, served verbatim `known:false` — while every
+    /// transport op beside it still folds. The failure mode is "an old
+    /// build doesn't see attestations", never "an old build goes blind
+    /// to outcomes".
+    #[test]
+    fn attest_op_skips_whole_line_on_old_builds() {
+        assert!(
+            KNOWN_OPS.contains(&"attest"),
+            "this build folds attest; only OLDER vocabularies skip it"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let lines = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"kind\":\"task\",\"title\":\"host\"}}\n",
+            "{\"v\":1,\"at_ms\":2,\"actor\":{\"session_id\":\"sess-fired\",\"kind\":\"agent_session\"},\"op\":{\"type\":\"attest\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"effect_id\":\"ef-1\",\"occurrence_id\":\"occ-1\",\"outcome\":\"blocked\",\"note\":\"waiting on the vendor\"}}\n",
+            "{\"v\":1,\"at_ms\":3,\"op\":{\"type\":\"attest_v2\",\"id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"outcome\":\"transcended\"}}\n",
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join(LOG_FILE), lines).unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.skipped_lines(),
+            1,
+            "the attest line folds on this build; only the future vocabulary skips"
+        );
+        assert!(store.item("01ARZ3NDEKTSV4RRFFQ69G5FAV").is_some());
+        let page = store.read_ops(0, None, 10).unwrap();
+        assert_eq!(page.ops[1]["known"], serde_json::Value::Bool(true));
+        assert_eq!(page.ops[1]["op"]["op"]["outcome"], "blocked");
+        assert_eq!(page.ops[2]["known"], serde_json::Value::Bool(false));
+        // Both survive on disk verbatim — preservation is the compat
+        // promise either direction.
+        let text = std::fs::read_to_string(dir.path().join(LOG_FILE)).unwrap();
+        assert!(text.contains("\"attest\"") && text.contains("attest_v2"));
     }
 
     /// Seed the read_ops fixture through the real command path (two
