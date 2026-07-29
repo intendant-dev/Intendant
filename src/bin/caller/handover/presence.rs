@@ -309,7 +309,8 @@ mod tests {
         presence.update_session_count(1).unwrap();
         presence.update_state("exited").unwrap();
         assert_eq!(
-            read()["sentinel"], true,
+            read()["sentinel"],
+            true,
             "unchanged lifecycle values never rewrite the file"
         );
     }
