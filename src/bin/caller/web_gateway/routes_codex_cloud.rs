@@ -256,10 +256,10 @@ mod tests {
         assert!(parse_codex_cloud_submit_body("not json").is_err());
         assert!(parse_codex_cloud_submit_body(r#"{"environment_id":"","prompt":"p"}"#).is_err());
         assert!(parse_codex_cloud_submit_body(r#"{"environment_id":"e","prompt":"  "}"#).is_err());
-        assert!(
-            parse_codex_cloud_submit_body(r#"{"environment_id":"e","prompt":"p","attempts":0}"#)
-                .is_err()
-        );
+        assert!(parse_codex_cloud_submit_body(
+            r#"{"environment_id":"e","prompt":"p","attempts":0}"#
+        )
+        .is_err());
         // Whitespace-only optionals normalize to absent, not empty flags.
         let request = parse_codex_cloud_submit_body(
             r#"{"environment_id":"e","prompt":"p","branch":"  ","title":""}"#,
