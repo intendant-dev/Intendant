@@ -690,20 +690,11 @@ async fn run_pass(
         // in-flight write-backs — draining protects in-flight work.
         if runtime.is_draining() {
             if runtime.take_drain_entry_duty() {
+                // The owner-visible "Daemon draining" notification (and
+                // its supervisor-lane exit re-evaluation side effect) is
+                // emitted by `perform_drain_entry` itself, so the
+                // storeless inline entry path carries it too (HS3-N4).
                 runtime.perform_drain_entry();
-                // Owner-visible, and it lands on the supervisor's
-                // observation lane — which re-evaluates the drain exit
-                // condition, covering the zero-sessions-at-entry case.
-                handle.bus().send(AppEvent::UserNotification {
-                    session_id: None,
-                    id: "handover-draining".to_string(),
-                    title: Some("Daemon draining".to_string()),
-                    text: "standing automations handed off; in-flight sessions \
-                           finish here, then this daemon exits"
-                        .to_string(),
-                    urgency: crate::types::NotificationUrgency::Attention,
-                    ts: now_ms(),
-                });
             }
             if let Some(alert) = runtime.drain_watch() {
                 eprintln!("[handover] {alert}");

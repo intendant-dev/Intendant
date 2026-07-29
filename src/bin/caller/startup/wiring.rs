@@ -330,7 +330,20 @@ pub(crate) fn spawn_mode_web_gateway(
         web_port,
         crate::agenda::journal_generation_floor(&agenda_dir),
     ));
+    // Notifications (drain entry on EVERY path — HS3-N4 — and the HS6
+    // update surface) ride the daemon bus.
+    handover.set_bus(bus.clone());
     mcp_http_state.handover = Some(handover.clone());
+    // Every config lane carries this process's boot id, so a tab that
+    // hears a NEW daemon answering on the same origin can offer
+    // "daemon updated — reload" (HS6; the same chokepoint as the
+    // bundle-stamp nudge).
+    config.boot_id = handover.boot_id().to_string();
+    // HS6: the update-available surface — stat the running image on a
+    // slow cadence, probe changes with a bounded `--version`, chip on
+    // the handover status payload + ONE deduped notification per
+    // distinct on-disk sha.
+    crate::handover::spawn_update_watch(handover.clone());
     // --takeover (Track HS3): this boot is the intended successor — ask
     // the current holder to drain, then fast-poll the freed lease.
     // Detached; bounded; failure degrades to ordinary secondary polling.

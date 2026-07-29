@@ -258,6 +258,13 @@ pub struct WebGatewayConfig {
     /// constant and nudges stale tabs to reload after a daemon upgrade.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app_build: String,
+    /// This daemon process's boot id (the handover runtime identity),
+    /// set at wiring. Every config lane carries it so a tab that hears
+    /// a NEW process answering on the same origin — a handover
+    /// successor or a plain restart — can offer "daemon updated —
+    /// reload" (HS6), one level up from the bundle stamp above.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
     /// Public peer access-request hardening. This is gateway runtime state,
     /// not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
@@ -292,6 +299,7 @@ impl Default for WebGatewayConfig {
             ice_servers: Vec::new(),
             federation_allow_h264: false,
             app_build: String::new(),
+            boot_id: String::new(),
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
             connect: crate::project::ConnectConfig::default(),
             hosted_control_identity_path: None,

@@ -48,6 +48,46 @@ function maybeNudgeStaleBuild(serverBuild) {
   });
 }
 
+// ── Daemon boot identity / "daemon updated — reload" nudge (HS6) ──
+//
+// The config payload carries the daemon process's boot_id, and every
+// config lane lands on the applyGatewayConfig chokepoint (boot fetch,
+// tunnel config RPC, reconnect hydration) — plus the handover status
+// poll feeds it independently. A tab that hears a DIFFERENT boot_id
+// than it first recorded is talking to a NEW daemon process on the same
+// origin (a handover successor, or a plain restart after an update):
+// state the fact and offer the reload instead of letting the tab lie —
+// the same stale-photograph class as the bundle stamp, one level up.
+let daemonBootId = '';
+let daemonBootNudged = false;
+function maybeNudgeDaemonBoot(bootId) {
+  const boot = String(bootId || '').trim();
+  if (!boot) return;
+  if (!daemonBootId) { daemonBootId = boot; return; }
+  if (boot === daemonBootId || daemonBootNudged) return;
+  daemonBootNudged = true;
+  console.info(`[dashboard] daemon boot ${boot} is answering; this tab attached to ${daemonBootId} — reload to reattach`);
+  const reloadSafe = () =>
+    !(document.getElementById('new-session-input')?.value || '').trim();
+  if (document.hidden && reloadSafe()) {
+    location.reload();
+    return;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'ui-daemon-boot-banner';
+  const text = document.createElement('span');
+  text.textContent = 'The daemon updated — a new process is serving this dashboard.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reload';
+  btn.addEventListener('click', () => location.reload());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && reloadSafe()) location.reload();
+  });
+}
+
 // ── Per-tab identity ──
 //
 // A random id minted once per browser tab (sessionStorage is per-tab and
@@ -77,8 +117,10 @@ const INTENDANT_TAB_ID = (() => {
 // lane-verify harness drive it with a synthetic server stamp instead.
 window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  bootInfo: () => ({ bootId: daemonBootId, nudged: daemonBootNudged }),
   tabId: () => INTENDANT_TAB_ID,
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
+  __testNudgeDaemonBoot: (v) => maybeNudgeDaemonBoot(v),
 });
 
 // ── Legacy federation auth compatibility ──

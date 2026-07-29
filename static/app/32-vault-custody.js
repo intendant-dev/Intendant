@@ -4071,8 +4071,10 @@ function applyGatewayConfig(config) {
   }
   // Every lane's config lands here (boot fetch, tunnel config RPC,
   // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
-  // a stale tab learns the daemon now serves a newer bundle.
+  // a stale tab learns the daemon now serves a newer bundle, or that a
+  // NEW daemon process answers on this origin (HS6 boot-id nudge).
   if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
+  if (typeof maybeNudgeDaemonBoot === 'function') maybeNudgeDaemonBoot(cfg.boot_id);
   applyMainBackendStatus();
 }
 
