@@ -5583,7 +5583,8 @@ mod tests {
     /// descriptor meta port comes next, and the historical 8765 default
     /// is only the last resort. Composed with
     /// `cli_descriptor::meta_port`'s tolerant parse (pinned in its own
-    /// module), this is the whole resolution ladder.
+    /// module by `meta_port_tolerates_absent_and_corrupt_sidecars`),
+    /// this is the whole resolution ladder.
     #[test]
     fn ctl_meta_port_fallback_before_default() {
         assert_eq!(resolve_local_port(Some(9001), Some(9002)), 9001);

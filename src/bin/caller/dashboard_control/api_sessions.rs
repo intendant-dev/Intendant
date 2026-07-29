@@ -267,6 +267,7 @@ pub(crate) async fn control_request_frame(
         "api_agenda_reminder_policy" => {
             api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
         }
+        "api_daemon_handover" => api_daemon_handover_response(id, &runtime).await,
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
@@ -373,6 +374,8 @@ pub(crate) async fn control_request_frame(
         "api_github_integration_status" => {
             api_github_integration_status_response(id, &runtime).await
         }
+        "api_github_installations" => api_github_installations_response(id).await,
+        "api_github_repositories" => api_github_repositories_response(id).await,
         "api_github_integration_remove" => {
             api_github_integration_remove_response(
                 id,
@@ -1546,6 +1549,22 @@ pub(crate) async fn api_agenda_stamp_response(
     )
 }
 
+/// Tunnel twin of `GET /api/daemon/handover` — wraps the same
+/// transport-neutral core the HTTP route serves, so the drain banner and
+/// predecessor chip render on tunnel-primary surfaces (the packaged
+/// macOS app, Connect-mode dashboards, WebKit's mTLS fallback, peer
+/// dashboards) exactly as they do over plain HTTP.
+pub(crate) async fn api_daemon_handover_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::daemon_handover_status_api_response(runtime.mcp_server.as_ref()).await,
+        "daemon handover",
+    )
+}
+
 /// Tunnel twin of `GET /api/memory/search` — args ride `params`.
 pub(crate) async fn api_memory_search_response(
     id: String,
@@ -1905,6 +1924,35 @@ pub(crate) async fn api_sessions_search_response(
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::runtime;
+
+    /// F2 (the HS5 ruling): the declared `api_daemon_handover` tunnel
+    /// twin BINDS in the spawned request lane. An authorizer-admitted
+    /// method with no dispatch arm answers `unknown method` as a
+    /// DELIVERED response — the SPA facade's HTTP fallback never fires
+    /// (transport errors only) while `availability()` keeps saying ok,
+    /// so the handover chrome would be dead exactly where the tunnel is
+    /// the primary lane.
+    #[tokio::test]
+    async fn handover_state_reaches_tunneled_dashboards() {
+        let response = control_request_response(
+            "hs".to_string(),
+            "api_daemon_handover".to_string(),
+            None,
+            runtime(),
+            CancellationToken::new(),
+        )
+        .await;
+        let frame = &response.frame;
+        assert_eq!(
+            frame["ok"], true,
+            "the handover twin must bind, never answer unknown-method: {frame}"
+        );
+        // The storeless test runtime carries no handover runtime: the
+        // core's honest degrade shape, delivered through the tunnel
+        // envelope with the facade's status metadata.
+        assert_eq!(frame["result"]["_httpStatus"], 200);
+        assert_eq!(frame["result"]["available"], false);
+    }
 
     /// A cancelled stream must signal its producer immediately, yet must NOT
     /// free its live-work slot while a running `spawn_blocking` producer is

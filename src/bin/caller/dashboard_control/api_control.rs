@@ -1955,6 +1955,43 @@ pub(crate) async fn api_github_integration_remove_response(
     )
 }
 
+/// Tunnel twin of `GET /api/integrations/github/installations` — wraps
+/// the same transport-neutral core as the HTTP route (App-JWT
+/// discovery), with the edge resolving the ambient custody backend and
+/// global integration runtime exactly like the HTTP wrapper. Status-
+/// carrying envelope (`frame_api_response`): the core answers named
+/// refusals — no App, custody deny, upstream failure — that the
+/// installation picker must distinguish from success. Bound by the F2
+/// class walk (`every_declared_method_binds_in_a_dispatch_lane`): the
+/// twin was declared but unbound, so the picker was dead on
+/// tunnel-primary surfaces.
+pub(crate) async fn api_github_installations_response(id: String) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::github_installations_api_response(
+            &crate::web_gateway::DaemonGithubAppCustody,
+            crate::github_pr::status::global(),
+        )
+        .await,
+        "github installations",
+    )
+}
+
+/// Tunnel twin of `GET /api/integrations/github/repositories` — the
+/// installation-token repo listing behind the repo picker; same edge
+/// resolution and envelope rationale as the installations twin above.
+pub(crate) async fn api_github_repositories_response(id: String) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::github_repositories_api_response(
+            &crate::web_gateway::DaemonGithubAppCustody,
+            crate::github_pr::status::global(),
+        )
+        .await,
+        "github repositories",
+    )
+}
+
 /// Hosted-provenance fact for the Claude sign-in twins, from the grant
 /// that opened this control session: the trusted-local surface and peer
 /// daemons are direct by construction; user clients go through the
