@@ -169,6 +169,18 @@ impl IntendantServer {
         self.state.read().await.handover.clone()
     }
 
+    /// Sync best-effort read for boot-time wiring in non-async spawn
+    /// paths (uncontended at boot; `None` on contention is the safe
+    /// degrade — the consumer treats it as "no handover shape").
+    pub(crate) fn handover_runtime_now(
+        &self,
+    ) -> Option<std::sync::Arc<crate::handover::HandoverRuntime>> {
+        self.state
+            .try_read()
+            .ok()
+            .and_then(|state| state.handover.clone())
+    }
+
     async fn agenda_list_inner(
         &self,
         params: AgendaListParams,

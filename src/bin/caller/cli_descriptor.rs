@@ -13,12 +13,17 @@
 //!   version, write time. **No secrets, ever** — this file is world-open
 //!   discovery data, and tokens/keys must never ride it.
 //!
-//! Written on **daemon boot only** (a gateway-serving controller start) —
-//! never by ctl or other transient invocations — atomically
-//! (temp + rename). Multi-daemon homes get last-booted-wins by design:
-//! the descriptor resolves a *CLI binary*, and any controller binary can
-//! ctl any daemon at the standard endpoints; the sidecar records the
-//! writing daemon so misroutes are debuggable.
+//! Written at **scheduler-lease acquisition** (Track HS5, Q7 —
+//! `handover::write_holder_descriptor`): the holder, the one daemon
+//! running standing automations, owns the descriptor, so multi-daemon
+//! homes get holder-wins (strictly more stable than the old
+//! last-booted-wins — secondaries no longer clobber it at boot, and a
+//! handover flips the meta port to the successor at its acquisition).
+//! Never written by ctl or other transient invocations; atomic
+//! (temp + rename). The descriptor resolves a *CLI binary* — any
+//! controller binary can ctl any daemon at the standard endpoints — and
+//! since HS5 the sidecar's `port` also names the ACTIVE daemon: bare
+//! `ctl` (no env, no flags) reads it before falling back to 8765.
 
 use std::path::Path;
 
@@ -54,6 +59,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+/// The meta sidecar's `port` — the ACTIVE daemon's port since HS5
+/// (holder-wins descriptor). Tolerant: absent or unparseable is `None`
+/// (discovery data, never authority).
+pub(crate) fn meta_port(state_root: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(state_root.join(CLI_META_FILE)).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    u16::try_from(meta.get("port")?.as_u64()?).ok()
 }
 
 #[cfg(test)]

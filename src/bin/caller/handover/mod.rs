@@ -144,6 +144,7 @@ impl HandoverRuntime {
                         "[handover] holding the scheduler lease (generation {})",
                         lease.generation()
                     );
+                    write_holder_descriptor(state_root, port);
                     (Some(lease), None)
                 }
                 Ok(LeaseAttempt::HeldElsewhere(sidecar)) => {
@@ -250,6 +251,7 @@ impl HandoverRuntime {
                      standing automations on",
                     lease.generation()
                 );
+                write_holder_descriptor(&self.state_root, self.port);
                 if let Ok(mut slot) = self.lease.lock() {
                     *slot = Some(lease);
                 }
@@ -647,6 +649,17 @@ pub(crate) async fn run_takeover_request(
     );
 }
 
+/// Track HS5 (Q7): the CLI discovery descriptor follows the LEASE, not
+/// the boot — the holder (re)writes it at every acquisition (boot
+/// try-acquire, poll-acquire, takeover), so `cli-path.meta.json`'s port
+/// always names the daemon running standing automations and secondaries
+/// stop clobbering it. Failure only degrades discovery.
+fn write_holder_descriptor(state_root: &Path, port: u16) {
+    if let Err(err) = crate::cli_descriptor::write_boot_descriptor(state_root, port) {
+        eprintln!("[cli-descriptor] not written at lease acquisition: {err}");
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -707,6 +720,36 @@ mod tests {
         // Both boots are live presences (the dual-run topology, visible).
         assert!(boot_id_is_live(dir.path(), holder.boot_id()));
         assert!(boot_id_is_live(dir.path(), secondary.boot_id()));
+    }
+
+    /// Q7 (Track HS5): the CLI discovery descriptor follows the LEASE.
+    /// A holder's acquisition writes it; a secondary's boot does NOT
+    /// clobber it; a later acquisition (crash convergence or takeover)
+    /// flips the meta port to the new holder.
+    #[test]
+    fn descriptor_rewrites_at_lease_acquisition_not_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = HandoverRuntime::initialize(dir.path(), 7001, 0);
+        assert_eq!(
+            crate::cli_descriptor::meta_port(dir.path()),
+            Some(7001),
+            "the boot-acquiring holder writes the descriptor"
+        );
+
+        let secondary = HandoverRuntime::initialize(dir.path(), 7002, 0);
+        assert_eq!(
+            crate::cli_descriptor::meta_port(dir.path()),
+            Some(7001),
+            "a secondary boot never clobbers the holder's descriptor"
+        );
+
+        drop(holder);
+        assert!(secondary.poll_acquire(0));
+        assert_eq!(
+            crate::cli_descriptor::meta_port(dir.path()),
+            Some(7002),
+            "acquisition flips the meta port to the new holder"
+        );
     }
 
     #[test]

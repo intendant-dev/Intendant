@@ -29,6 +29,7 @@ ui2-activity-panes.css
 ui2-agenda.css
 ui2-agenda-inspector.css
 ui2-memory.css
+ui2-handover.css
 ui2-grid.css
 ui2-live.css
 ui2-usage.css
@@ -108,6 +109,7 @@ ui2-agenda-workflows.js
 # router's eval-time boot call memoryOnTabShown(), which reads this fragment's
 # module-level lets. Top level declares only lets/functions.
 ui2-memory.js
+ui2-handover.js
 # Cloud workers: same deep-link TDZ rule — a #sessions/cloud deep link makes
 # the router's eval-time boot call cloudWorkersOnShown(), which reads this
 # fragment's module-level lets. Top level declares only lets/consts/functions.

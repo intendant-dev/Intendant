@@ -21,13 +21,19 @@ pub(crate) async fn memory_search_api_response(
         return ApiResponse::json_error(503, "memory service unavailable on this daemon");
     };
     let results = memory.search(args);
-    ApiResponse::json(
-        200,
-        JsonBody::Value(serde_json::json!({
-            "results": results,
-            "durability": memory.durability_label(),
-        })),
-    )
+    let mut body = serde_json::json!({
+        "results": results,
+        "durability": memory.durability_label(),
+    });
+    // HS5 (HS4-N3): when the plane is not open here, say WHERE memory
+    // lives on the same payload the label rides — not only the error
+    // lanes.
+    if let Some(notice) = memory.plane_notice() {
+        body.as_object_mut()
+            .expect("object body")
+            .insert("plane_notice".to_string(), notice.into());
+    }
+    ApiResponse::json(200, JsonBody::Value(body))
 }
 
 /// Transport-neutral core of `GET /api/memory/claim` (tunnel twin

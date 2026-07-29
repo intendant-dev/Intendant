@@ -133,10 +133,11 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
 
 fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), String> {
     let mut base_url = std::env::var("INTENDANT_MCP_URL").unwrap_or_default();
-    let mut port = std::env::var("INTENDANT_PORT")
+    // Explicit port only (flag or env); the bare-ctl default resolves
+    // through the holder-written descriptor meta first (Q7, Track HS5).
+    let mut port: Option<u16> = std::env::var("INTENDANT_PORT")
         .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
+        .and_then(|v| v.parse::<u16>().ok());
     let mut session_id = std::env::var("INTENDANT_SESSION_ID").ok();
     let mut managed_context = std::env::var("INTENDANT_MANAGED_CONTEXT").ok();
     let mut raw_output = false;
@@ -169,9 +170,11 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
                 let value = raw
                     .get(i)
                     .ok_or_else(|| "--port requires a value".to_string())?;
-                port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid --port value '{value}'"))?;
+                port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid --port value '{value}'"))?,
+                );
             }
             "--session" | "--session-id" => {
                 i += 1;
@@ -200,9 +203,11 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
             }
             arg if arg.starts_with("--port=") => {
                 let value = arg.trim_start_matches("--port=");
-                port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid --port value '{value}'"))?;
+                port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid --port value '{value}'"))?,
+                );
             }
             arg if arg.starts_with("--session=") => {
                 session_id = Some(arg.trim_start_matches("--session=").to_string());
@@ -237,6 +242,14 @@ fn parse_global_args(mut raw: Vec<String>) -> Result<(Config, Vec<String>), Stri
     };
     let from_session_env = !url_flag_given && !base_url.trim().is_empty();
     let base_url = if base_url.trim().is_empty() {
+        // Q7 (Track HS5): bare owner ctl follows the ACTIVE daemon —
+        // explicit port (flag/env) wins; then the holder-written
+        // descriptor meta port (which a handover flips to the
+        // successor); the historical 8765 only as the last resort.
+        let port = resolve_local_port(
+            port,
+            crate::cli_descriptor::meta_port(&crate::platform::intendant_home()),
+        );
         format!("http://localhost:{port}/mcp")
     } else {
         base_url
@@ -4929,6 +4942,12 @@ fn help_status() {
     println!("Usage: intendant ctl status [--json|--raw]");
 }
 
+/// The Q7 resolution order, pure: explicit (flag/env) → descriptor meta
+/// → the historical default.
+fn resolve_local_port(explicit: Option<u16>, meta: Option<u16>) -> u16 {
+    explicit.or(meta).unwrap_or(DEFAULT_PORT)
+}
+
 fn help_takeover() {
     println!(
         "Usage: intendant ctl takeover\n\
@@ -5500,6 +5519,19 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// Q7 (Track HS5): bare owner ctl follows the ACTIVE daemon — an
+    /// explicit port (flag or env) always wins, the holder-written
+    /// descriptor meta port comes next, and the historical 8765 default
+    /// is only the last resort. Composed with
+    /// `cli_descriptor::meta_port`'s tolerant parse (pinned in its own
+    /// module), this is the whole resolution ladder.
+    #[test]
+    fn ctl_meta_port_fallback_before_default() {
+        assert_eq!(resolve_local_port(Some(9001), Some(9002)), 9001);
+        assert_eq!(resolve_local_port(None, Some(9002)), 9002);
+        assert_eq!(resolve_local_port(None, None), DEFAULT_PORT);
     }
 
     /// Sealed refs, pin (d): `--binding-ref` hashes at propose time — the

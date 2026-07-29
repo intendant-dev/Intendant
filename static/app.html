@@ -26513,6 +26513,33 @@ html.ui-v2 .memory-judge-strip input[type="text"] {
 html.ui-v2 .memory-judge-strip select {
   max-width: 340px;
 }
+/* ── static/app/ui2-handover.css ── */
+/* ── ui2-handover — drain banner + predecessor chip (Track HS5) ────── */
+html.ui-v2 .handover-banner {
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 240;
+  max-width: min(720px, calc(100vw - 32px));
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text, #e6e6e6);
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--warning, #e5a50a);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+html.ui-v2 .handover-banner[data-kind='predecessor'] {
+  border-color: var(--accent, #62a0ea);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+html.ui-v2 .handover-banner a {
+  color: var(--accent, #62a0ea);
+  font-weight: 600;
+}
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
    All scoped html.ui-v2. Grid layout (ratified 2026-07-21, candidate B
@@ -37044,7 +37071,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4a2747cd88d96af5';
+const INTENDANT_APP_BUILD = '2e25844c8e73b41d';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39670,6 +39697,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_agenda_stamp: { verb: 'POST', path: '/api/agenda/stamp' },
   api_agenda_ref_drift: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/drift' },
   api_agenda_reminder_policy: { verb: 'POST', path: '/api/agenda/reminders/policy' },
+  api_daemon_handover: { verb: 'GET', path: '/api/daemon/handover' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
   api_agenda_occurrences: { verb: 'GET', path: '/api/agenda/occurrences', query: ['since', 'item', 'limit'] },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },
@@ -97627,6 +97655,7 @@ let memoryLoadError = '';
 let memoryQuery = '';
 let memoryExpandedId = '';
 let memoryDurability = 'ephemeral';
+let memoryPlaneNotice = '';
 // Full view of the expanded claim (api_memory_claim read — search rows
 // are lean by §6.5, so judgment HISTORY only exists on the read view).
 let memoryDetail = null; // { id, claim } | null
@@ -97655,6 +97684,7 @@ async function memoryRefresh() {
       if (resp.ok && resp.body && Array.isArray(resp.body.results)) {
         memoryClaims = resp.body.results;
         memoryDurability = resp.body.durability || 'ephemeral';
+        memoryPlaneNotice = resp.body.plane_notice || '';
         memoryLoadError = '';
       } else {
         memoryLoadError = (resp.body && resp.body.error) || `memory unavailable (${resp.status})`;
@@ -97934,9 +97964,14 @@ function memoryRenderTab() {
   if (!list) return;
   const note = document.getElementById('memory-durability-note');
   if (note) {
-    note.textContent = memoryDurability === 'durable'
-      ? 'Durable plane — claims survive daemon restarts on this machine. Sync across machines arrives in a later phase.'
-      : 'Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage runs on the primary-OS daemon.';
+    // HS5 (HS4-N3): when the plane is not open on THIS daemon (it
+    // follows the scheduler-lease holder, or was handed to a handover
+    // successor), say where memory lives instead of the generic modes.
+    note.textContent = memoryPlaneNotice
+      ? `Memory is not served by this daemon right now — ${memoryPlaneNotice}.`
+      : memoryDurability === 'durable'
+        ? 'Durable plane — claims survive daemon restarts on this machine. Sync across machines arrives in a later phase.'
+        : 'Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage runs on the primary-OS daemon.';
   }
   const counts = document.getElementById('memory-tab-counts');
   if (counts) {
@@ -98090,6 +98125,93 @@ async function memoryProposeFromForm(button) {
   if (document.readyState === 'complete') wire();
   else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
+/* ── static/app/ui2-handover.js ── */
+// ── ui2-handover — drain banner + successor chip (Track HS5) ─────────────
+// Polls GET /api/daemon/handover (tunnel twin api_daemon_handover): the
+// scheduler-lease status block. Two renders, one element:
+//   - THIS daemon draining: a persistent banner — in-flight sessions
+//     finish here; new work continues on the successor (linked once the
+//     lease sidecar names it).
+//   - another co-homed daemon draining: a compact predecessor chip with
+//     its remaining session count.
+// Removed when neither applies; transient poll failures keep the last
+// honest render rather than flapping.
+(() => {
+  const HANDOVER_POLL_MS = 30000;
+  let bannerEl = null;
+
+  function handoverBanner() {
+    if (!bannerEl) {
+      bannerEl = document.createElement('div');
+      bannerEl.id = 'handover-banner';
+      bannerEl.className = 'handover-banner';
+      document.body.appendChild(bannerEl);
+    }
+    return bannerEl;
+  }
+
+  function handoverClear() {
+    if (bannerEl) { bannerEl.remove(); bannerEl = null; }
+  }
+
+  function handoverSuccessorPort(body) {
+    const sidecar = body && body.sidecar;
+    if (!sidecar || !body.boot_id || sidecar.boot_id === body.boot_id) return null;
+    const port = Number(sidecar.port);
+    return Number.isFinite(port) && port > 0 ? port : null;
+  }
+
+  function handoverRender(body) {
+    if (!body || body.available === false) { handoverClear(); return; }
+    if (body.draining) {
+      const port = handoverSuccessorPort(body);
+      const link = port
+        ? `<a href="${location.protocol}//${location.hostname}:${port}/" target="_blank" rel="noopener">:${port}</a>`
+        : null;
+      const el = handoverBanner();
+      el.dataset.kind = 'draining';
+      el.innerHTML = link
+        ? `<strong>This daemon is draining.</strong> In-flight sessions finish here — continue new work on the successor at ${link}.`
+        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — the successor has not acquired yet (retry shortly, or start a daemon with --takeover).';
+      return;
+    }
+    const others = Array.isArray(body.daemons)
+      ? body.daemons.filter((d) => d && d.live && d.state === 'draining' && d.boot_id !== body.boot_id)
+      : [];
+    if (others.length) {
+      const d = others[0];
+      const port = Number(d.port);
+      const count = Number(d.session_count);
+      const sessions = Number.isFinite(count)
+        ? ` · ${count} session${count === 1 ? '' : 's'} left`
+        : '';
+      const el = handoverBanner();
+      el.dataset.kind = 'predecessor';
+      el.innerHTML = `Predecessor daemon draining${Number.isFinite(port) ? ` on :${port}` : ''}${sessions} — it exits when its last in-flight session ends.`;
+      return;
+    }
+    handoverClear();
+  }
+
+  async function handoverPoll() {
+    try {
+      if (typeof daemonApi === 'undefined') return;
+      if (!daemonApi.availability('api_daemon_handover').ok) return;
+      const resp = await daemonApi.request('api_daemon_handover', {});
+      if (resp && resp.ok) handoverRender(resp.body);
+    } catch (_) { /* transient — keep the last render */ }
+  }
+
+  function handoverStart() {
+    handoverPoll();
+    setInterval(handoverPoll, HANDOVER_POLL_MS);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', handoverStart);
+  } else {
+    handoverStart();
+  }
+})();
 /* ── static/app/ui2-cloud-workers.js ── */
 // ── Codex Cloud workers (Sessions → Cloud) ─────────────────────────────
 //

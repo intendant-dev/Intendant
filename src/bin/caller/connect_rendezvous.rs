@@ -528,7 +528,11 @@ pub fn spawn_connect_rendezvous_client(
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     fleet_zone_observed: Arc<std::sync::atomic::AtomicBool>,
     relay_lifecycle: tokio::sync::watch::Sender<bool>,
+    handover: Option<Arc<crate::handover::HandoverRuntime>>,
 ) {
+    if let Ok(mut slot) = handover_slot().lock() {
+        *slot = handover;
+    }
     with_client_reconfiguration(|| {
         let relay_rendezvous_key = rendezvous_endpoint_key(config.rendezvous_url.as_deref());
         {
@@ -659,6 +663,30 @@ fn apply_config_locked(config: ConnectConfig) -> Result<bool, String> {
 
 /// Shared by boot (`spawn_connect_rendezvous_client`) and the runtime
 /// toggle (`apply_config`).
+/// Track HS5 (the Q9 addition): rendezvous publication is HOLDER-only.
+/// Co-homed daemons republishing one per-installation identity with
+/// different ports is route-metadata flapping; a drainer must stop
+/// refreshing so the successor's registration stands; and claim-event
+/// consumption belongs to the daemon that actually speaks for the
+/// installation. Set once at boot spawn; `None` (no handover shape —
+/// tests, legacy paths) keeps today's behavior. Persists across live
+/// reconfigurations (the runtime is per-process).
+fn handover_slot() -> &'static std::sync::Mutex<Option<Arc<crate::handover::HandoverRuntime>>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<Option<Arc<crate::handover::HandoverRuntime>>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// True when this daemon must not publish (secondary, or draining).
+fn publication_gated() -> bool {
+    handover_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .is_some_and(|runtime| !runtime.is_holder() || runtime.is_draining())
+}
+
 fn start_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
@@ -835,6 +863,15 @@ async fn run_connect_rendezvous_client(
     });
 
     loop {
+        // Track HS5 (Q9): only the lease holder speaks for this
+        // installation on Connect — secondaries and drainers idle here
+        // (the role can change; the loop stays alive) and publish
+        // nothing. The successor's own registration overwrites the
+        // record at its claim.
+        if publication_gated() {
+            tokio::time::sleep(crate::handover::lease_poll_interval()).await;
+            continue;
+        }
         match register(
             &client,
             &base_url,
@@ -873,6 +910,11 @@ async fn run_connect_rendezvous_client(
 
         let mut last_register = Instant::now();
         loop {
+            // Drain/role change mid-service: stop refreshing and fall
+            // back to the gated outer loop (Track HS5, Q9).
+            if publication_gated() {
+                break;
+            }
             // A nudge (post-unclaim) may cancel an in-flight `/next` poll;
             // a popped-but-undelivered event is lost. Acceptable: nudges
             // are rare and owner-initiated, and events addressed to a

@@ -1,0 +1,26 @@
+/* ── ui2-handover — drain banner + predecessor chip (Track HS5) ────── */
+html.ui-v2 .handover-banner {
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 240;
+  max-width: min(720px, calc(100vw - 32px));
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text, #e6e6e6);
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--warning, #e5a50a);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+html.ui-v2 .handover-banner[data-kind='predecessor'] {
+  border-color: var(--accent, #62a0ea);
+  font-size: 12px;
+  padding: 6px 12px;
+}
+html.ui-v2 .handover-banner a {
+  color: var(--accent, #62a0ea);
+  font-weight: 600;
+}
