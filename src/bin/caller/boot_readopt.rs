@@ -94,12 +94,17 @@ pub(crate) struct AgendaReadoptSeed {
 /// The boot classification handoff slot: the scheduler's boot slot
 /// publishes exactly once per process; the readopt pass consumes it.
 /// (A channel in disguise — the scheduler task is spawned long before
-/// the readopt task exists, so a published slot is the simplest safe
-/// handoff, mirroring `publish_agenda_handle`.)
+/// the readopt task exists, so a published slot plus a wake is the
+/// simplest safe handoff, mirroring `publish_agenda_handle`.)
 static AGENDA_SEEDS: OnceLock<Mutex<Option<Vec<AgendaReadoptSeed>>>> = OnceLock::new();
+static AGENDA_SEEDS_READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
 fn agenda_seed_slot() -> &'static Mutex<Option<Vec<AgendaReadoptSeed>>> {
     AGENDA_SEEDS.get_or_init(|| Mutex::new(None))
+}
+
+fn agenda_seeds_ready() -> &'static tokio::sync::Notify {
+    AGENDA_SEEDS_READY.get_or_init(tokio::sync::Notify::new)
 }
 
 /// Publish the boot recovery classification (agenda scheduler boot slot
@@ -109,11 +114,15 @@ pub(crate) fn publish_agenda_readopt_seeds(seeds: Vec<AgendaReadoptSeed>) {
     *agenda_seed_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(seeds);
+    agenda_seeds_ready().notify_waiters();
 }
 
 async fn await_agenda_readopt_seeds(timeout: std::time::Duration) -> Vec<AgendaReadoptSeed> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        // Register the waiter BEFORE checking the slot: a publish landing
+        // between the check and the await still wakes us.
+        let notified = agenda_seeds_ready().notified();
         if let Some(seeds) = agenda_seed_slot()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -121,10 +130,9 @@ async fn await_agenda_readopt_seeds(timeout: std::time::Duration) -> Vec<AgendaR
         {
             return seeds;
         }
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
             return Vec::new();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
