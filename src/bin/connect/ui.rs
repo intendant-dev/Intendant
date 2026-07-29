@@ -7,68 +7,68 @@ pub(crate) async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
-/// The hosted installer, embedded
-/// at build time so the service — hosted or self-hosted — serves the
-/// installer that matches its own version:
-///   curl -fsSL <origin>/install.sh | sh -s --
-///
-/// Served with this rendezvous' public origin injected as the default
-/// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
-/// and a fresh VPS has no other way to learn where to register — without
-/// it the daemon comes up unregistered and hosted claiming dead-ends.
-/// (A compiled-in default in the daemon would instead make every install
-/// phone home to intendant.dev; serve-time injection keeps self-hosting
-/// exact.) Explicit `--connect` / `-Connect` still wins over the default.
-pub(crate) const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
-pub(crate) const INSTALL_SH_CONNECT_DEFAULT: &str =
-    r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
+/// The install scripts are release artifacts, not hosted content: the
+/// canonical fetch is the immutable GitHub release asset, stamped with
+/// its release identity and sha256-committed to the transparency log by
+/// release.yml (docs/src/getting-started.md, "Fresh box in one command").
+/// These routes survive only as a NON-canonical convenience — at most a
+/// redirect, never a script body — so this deployment cannot quietly
+/// serve different installer bytes than the release recorded. The
+/// residual power left here is re-aiming the redirect itself; `intendant
+/// hosted-verify` pins these exact targets out of band (REPLICATED in
+/// bin/caller/hosted_verify.rs — the two binaries never link each
+/// other), and the documented install path never depends on this origin.
+/// Rendezvous linking, which serve-time origin injection used to provide,
+/// is an explicit `--connect <origin>` argument in every command this
+/// service displays.
+pub(crate) const INSTALL_SH_ASSET_URL: &str =
+    "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh";
+pub(crate) const INSTALL_PS1_ASSET_URL: &str =
+    "https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1";
 
-/// Only a plain URL charset may be spliced into the scripts — anything
-/// else (quotes, spaces, `$`) could change what the shell parses. A
-/// misconfigured origin falls back to serving the script verbatim.
-pub(crate) fn connect_default_injectable(origin: &str) -> bool {
-    !origin.is_empty()
-        && origin
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '/' | '.' | '-' | '_'))
-}
-
-pub(crate) fn install_sh_body(public_origin: &str) -> String {
-    if !connect_default_injectable(public_origin) {
-        return INSTALL_SH.to_string();
-    }
-    INSTALL_SH.replacen(
-        INSTALL_SH_CONNECT_DEFAULT,
-        &format!(r#"CONNECT_URL="${{INTENDANT_CONNECT_RENDEZVOUS_URL:-{public_origin}}}""#),
-        1,
+/// The redirect body doubles as the fail-safe for a pipe that does not
+/// follow redirects (`curl` without `-L` piped straight to `sh`): it is
+/// itself a tiny script that prints the canonical URL and exits nonzero,
+/// so such a pipe reports instead of half-executing prose.
+pub(crate) fn install_sh_redirect_body() -> String {
+    format!(
+        "#!/bin/sh\n\
+         echo 'intendant: /install.sh is a redirect; fetch the release-pinned installer:' >&2\n\
+         echo '  curl -fsSL {INSTALL_SH_ASSET_URL} | sh' >&2\n\
+         exit 1\n"
     )
 }
 
-pub(crate) async fn install_sh(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    state.static_pages.install_sh.respond(&headers)
-}
-
-/// The Windows counterpart, for PowerShell:
-///   & ([scriptblock]::Create((irm <origin>/install.ps1)))
-pub(crate) const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
-pub(crate) const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
-
-pub(crate) fn install_ps1_body(public_origin: &str) -> String {
-    if !connect_default_injectable(public_origin) {
-        return INSTALL_PS1.to_string();
-    }
-    INSTALL_PS1.replacen(
-        INSTALL_PS1_CONNECT_DEFAULT,
-        &format!("    [string]$Connect = \"{public_origin}\","),
-        1,
+pub(crate) fn install_ps1_redirect_body() -> String {
+    format!(
+        "Write-Host 'intendant: /install.ps1 is a redirect; fetch the release-pinned installer:'\n\
+         Write-Host '  & ([scriptblock]::Create((irm {INSTALL_PS1_ASSET_URL})))'\n\
+         exit 1\n"
     )
 }
 
-pub(crate) async fn install_ps1(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    state.static_pages.install_ps1.respond(&headers)
+fn installer_redirect(asset_url: &'static str, body: String) -> Response {
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, HeaderValue::from_static(asset_url)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub(crate) async fn install_sh() -> Response {
+    installer_redirect(INSTALL_SH_ASSET_URL, install_sh_redirect_body())
+}
+
+pub(crate) async fn install_ps1() -> Response {
+    installer_redirect(INSTALL_PS1_ASSET_URL, install_ps1_redirect_body())
 }
 
 /// The canonical Intendant mark, embedded so every page this binary serves
@@ -208,14 +208,6 @@ impl StaticPage {
         )
     }
 
-    fn script(body: String) -> Self {
-        Self::new(
-            body,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-            false,
-        )
-    }
-
     fn new(body: String, content_type: HeaderValue, deny_framing: bool) -> Self {
         let etag = HeaderValue::from_str(&format!("\"{}\"", &sha256_hex(body.as_bytes())[..32]))
             .expect("hex etag is a valid header value");
@@ -266,8 +258,6 @@ pub(crate) struct StaticPages {
     connect: StaticPage,
     access: StaticPage,
     trust: StaticPage,
-    install_sh: StaticPage,
-    install_ps1: StaticPage,
 }
 
 impl StaticPages {
@@ -278,8 +268,6 @@ impl StaticPages {
             connect: StaticPage::html(connect_page_html(origin)),
             access: StaticPage::html(access_page_html(origin)),
             trust: StaticPage::html(trust_ui_html(origin)),
-            install_sh: StaticPage::script(install_sh_body(origin)),
-            install_ps1: StaticPage::script(install_ps1_body(origin)),
         }
     }
 }
@@ -378,10 +366,10 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
   <header><div class="topbar"><img class="brand-mark" src="/logo.svg" alt=""><a href="/connect">Intendant Connect</a></div></header>
   <main>
     <h1>How trust works here</h1>
-    <p class="lede">The short version: this service handles accounts, routes, availability, hosted code, installers, and optional encrypted push delivery. A daemon grant can only be minted by that daemon's local IAM.</p>
+    <p class="lede">The short version: this service handles accounts, routes, availability, hosted code, and optional encrypted push delivery. The install scripts are release-pinned GitHub assets it only redirects to. A daemon grant can only be minted by that daemon's local IAM.</p>
 
     <h2>What this service actually does</h2>
-    <p>Connect <em>serves</em> this discovery client and its installers, <em>publishes</em> daemon routes and presence, <em>stores</em> client-signed fleet records, and <em>remembers</em> which routes an account linked. A link creates no daemon principal or grant. This hosted build and its fleet WebPKI names are discovery-only and cannot open a daemon control session; use a trusted local or independently verified direct-mTLS surface for access. No signed/notarized native release exists for this alpha.</p>
+    <p>Connect <em>serves</em> this discovery client, <em>publishes</em> daemon routes and presence, <em>stores</em> client-signed fleet records, and <em>remembers</em> which routes an account linked. The install scripts are not served here: they ship as release assets on GitHub, stamped with their release and hash-committed to the transparency log below, and <code>/install.sh</code> at most redirects there. A link creates no daemon principal or grant. This hosted build and its fleet WebPKI names are discovery-only and cannot open a daemon control session; use a trusted local or independently verified direct-mTLS surface for access. No signed/notarized native release exists for this alpha.</p>
 
     <h2>"But I sign in with a passkey&hellip;"</h2>
     <p>A fair question: doesn&rsquo;t signing in give the server something it could use?</p>
@@ -391,11 +379,11 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
     <ol>
       <li><strong>It could lie in introductions.</strong><span>It can alter account and routing metadata, substitute the daemon key at first introduction, or deny a route. A daemon signature checked by this page proves consistency with the key Connect linked; it is not an independent key pin, because this service supplies both the first key record and the browser code doing the check. Account assertions never authenticate to a daemon, and this hosted build has an immutable <code>role:none</code> ceiling: it cannot open a control session even if local state is edited to grant its browser key.</span></li>
       <li><strong>It could deny service.</strong><span>Connect controls availability for its account, route, presence, and push services. Denial does not add daemon authority, but it can hide or delay those updates.</span></li>
-      <li><strong>It could serve malicious code or installers.</strong><span>Hosted code can misuse Connect account state and any decrypted vault or fleet data made available after a user gesture; a replaced installer can compromise what it installs. There is no hosted or fleet-name daemon-control session in the default product. Use a trusted local or independently verified direct-mTLS root surface; self-host or verify artifacts out of band if you do not trust this deployment. The current native artifact is unsigned development-only.</span></li>
+      <li><strong>It could serve malicious code.</strong><span>Hosted code can misuse Connect account state and any decrypted vault or fleet data made available after a user gesture. The installer left this exposure: the documented install path fetches a release-pinned, transparency-logged asset from GitHub, and this service can at most redirect to it — a re-aimed redirect is detectable out of band and the documented path never uses this origin. There is no hosted or fleet-name daemon-control session in the default product. Use a trusted local or independently verified direct-mTLS root surface; self-host or verify artifacts out of band if you do not trust this deployment. The current native artifact is unsigned development-only.</span></li>
     </ol>
 
     <div class="card good">
-      <strong>The rule the protocol follows:</strong> authority records are minted and enforced only by the target daemon's local access control; the rendezvous API cannot mint one. Connect is still trusted for availability, account and route metadata, and the code and installers it serves. A malicious installer can compromise what it installs, so those are real limits rather than a claim that the service is powerless.
+      <strong>The rule the protocol follows:</strong> authority records are minted and enforced only by the target daemon's local access control; the rendezvous API cannot mint one. Connect is still trusted for availability, account and route metadata, and the code it serves — real limits rather than a claim that the service is powerless. The install scripts left that boundary: they are release-pinned, transparency-logged GitHub assets this service at most redirects to.
     </div>
 
     <h2>Notifications</h2>
@@ -423,14 +411,17 @@ pub(crate) const REPO_URL: &str = "https://github.com/intendant-dev/Intendant";
 /// The deployment advisor — the lead of the landing install section: four
 /// questions -> one command per platform (sh or PowerShell, `--service` where it belongs)
 /// plus an honest credential-setup plan for after the claim. A separate const so
-/// its CSS/JS braces stay out of the page-level `format!`; it derives
-/// the command from `location.origin` at runtime, so a self-hosted
-/// rendezvous advertises its own installer here too. The default answers'
-/// command is server-rendered into the terminal (via the
-/// `__ADVISOR_DEFAULT_CMD__` placeholder) so the page works without JS
-/// and the one-command story is visible before any click. Every question
-/// is about the agent's machine. A browser needs no separate app install,
-/// but daemon control still requires trusted certificate/profile enrollment.
+/// its CSS/JS braces stay out of the page-level `format!`. Every command
+/// fetches the canonical release-pinned installer asset; the serving
+/// origin rides along as a visible `--connect`/`-Connect` argument
+/// (derived from `location.origin` at runtime), so a self-hosted
+/// rendezvous still links installs to itself without ever being in the
+/// script's serving path. The default answers' command is
+/// server-rendered into the terminal (via the `__ADVISOR_DEFAULT_CMD__`
+/// placeholder) so the page works without JS and the one-command story
+/// is visible before any click. Every question is about the agent's
+/// machine. A browser needs no separate app install, but daemon control
+/// still requires trusted certificate/profile enrollment.
 pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
         <style>
           .advisor { border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
@@ -492,8 +483,8 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
             // script (the page-level invariant the tests pin).
             var svc = pick.box !== 'laptop';
             var cmd = pick.os === 'windows'
-              ? '& ([scriptblock]::Create((irm ' + location.origin + '/install.ps1)))' + (svc ? ' -Service' : '')
-              : 'curl -fsSL ' + location.origin + '/install.sh | sh -s --' + (svc ? ' --service' : '');
+              ? '& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1))) -Connect ' + location.origin + (svc ? ' -Service' : '')
+              : 'curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh -s -- --connect ' + location.origin + (svc ? ' --service' : '');
             document.getElementById('advps').textContent = pick.os === 'windows' ? 'PS> ' : '$ ';
             document.getElementById('advtitle').textContent = pick.os === 'windows' ? 'fresh box — PowerShell' : 'fresh box — sh';
             document.getElementById('advcmd').textContent = cmd;
@@ -538,10 +529,12 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
       </div>"##;
 
 /// The public landing page at `/`. Deliberately static and dependency-free;
-/// the install one-liner is origin-aware so a self-hosted rendezvous
-/// advertises its own installer.
+/// the install one-liner fetches the canonical release-pinned asset and
+/// carries this origin as an explicit `--connect` argument, so a
+/// self-hosted rendezvous links installs to itself while staying out of
+/// the script's serving path.
 pub(crate) fn landing_ui_html(origin: &str) -> String {
-    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s --");
+    let install_cmd = format!("curl -fsSL {INSTALL_SH_ASSET_URL} | sh -s -- --connect {origin}");
     // r## because the page contains fragment links (`href="#install"`),
     // whose `"#` would terminate a plain r#-string.
     format!(
@@ -803,7 +796,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
         <div>
           <div class="steps">
             <div class="step"><b><span class="n">1</span>Install</b>
-              One command installs the daemon. Code served here is part of the installer trust boundary.</div>
+              One command installs the daemon. The script is a release-pinned GitHub asset with its hash in a public transparency log — this service only points at it.</div>
             <div class="step"><b><span class="n">2</span>Link</b>
               Enter its twelve-word one-time claim code to add the route to your account. This grants no access.</div>
             <div class="step"><b><span class="n">3</span>Establish owner</b>
@@ -994,10 +987,11 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <div class="grid">
         <div class="card">
           <h3>The daemon is the authority mint</h3>
-          <p>Connect is trusted for the code and installers it serves,
+          <p>Connect is trusted for the code it serves,
           availability, accounts, routes, fleet metadata, and optional push delivery. Its rendezvous
-          protocol cannot mint a daemon grant, but a replaced installer can
-          compromise what it installs, and malicious hosted code can misuse
+          protocol cannot mint a daemon grant, and the install scripts are
+          release-pinned GitHub assets with their hashes in a public
+          transparency log — this service at most redirects to them. Malicious hosted code can still misuse
           Connect account or decrypted browser state available after a gesture. You can
           <a href="/trust">read exactly what it can and cannot do</a>,
           or run your own.</p>
@@ -1017,7 +1011,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <div>Intendant — open source, self-hostable, provider-agnostic.</div>
       <nav>
         <a href="/trust">Trust</a>
-        <a href="/install.sh">install.sh</a>
+        <a href="{INSTALL_SH_ASSET_URL}">install.sh</a>
         <a href="{DOCS_URL}">Docs</a>
         <a href="{REPO_URL}">GitHub</a>
       </nav>
@@ -2275,6 +2269,14 @@ refreshAll().catch(() => renderAuth());
 mod tests {
     use super::*;
 
+    /// The install scripts are no longer embedded in this binary — the
+    /// serving routes only redirect — but this crate keeps pinning their
+    /// source in the merge queue: release.yml packages exactly these
+    /// files as the canonical release assets, and the release pipeline
+    /// runs far too rarely to be the first line of defense.
+    const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
+    const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
+
     fn assert_framing_denied(response: &Response) {
         assert_eq!(
             response
@@ -2352,17 +2354,6 @@ mod tests {
         let mut any = HeaderMap::new();
         any.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
         assert_eq!(page.respond(&any).status(), StatusCode::NOT_MODIFIED);
-
-        // Installers keep their plain-text identity and skip CSP framing.
-        let script = StaticPage::script("#!/bin/sh\n".to_string()).respond(&HeaderMap::new());
-        assert_eq!(
-            script
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/plain; charset=utf-8")
-        );
-        assert!(script.headers().get("x-frame-options").is_none());
     }
 
     #[tokio::test]
@@ -2568,9 +2559,12 @@ mod tests {
     fn landing_page_states_the_product_and_reuses_the_origin() {
         let html = landing_ui_html("https://rendezvous.example");
         assert!(html.contains("<title>Intendant — an operating environment"));
-        // The install one-liner advertises the serving origin, but the
-        // hosted installer never accepts or mints an owner key.
-        assert!(html.contains("curl -fsSL https://rendezvous.example/install.sh"));
+        // The install one-liner fetches the canonical release asset and
+        // carries the serving origin only as a visible --connect argument;
+        // the installer never accepts or mints an owner key.
+        assert!(html.contains(&format!(
+            "curl -fsSL {INSTALL_SH_ASSET_URL} | sh -s -- --connect https://rendezvous.example"
+        )));
         assert!(!html.contains("--owner"));
         assert!(!html.contains("-Owner"));
         // Beginner path and depth are both one click away.
@@ -2629,10 +2623,10 @@ mod tests {
         // The deployment advisor LEADS the install section — no fold to
         // find, four questions all about the agent's machine (the browser
         // needs no separate app install, while trusted enrollment is handled
-        // on the daemon/client access path), and
-        // runtime-origin commands so self-hosted rendezvous advertise their
-        // own installers there too — the sh one-liner AND the PowerShell
-        // one (Windows is first-class).
+        // on the daemon/client access path), and release-asset commands
+        // carrying the runtime origin as an explicit --connect flag so
+        // self-hosted rendezvous still link installs to themselves — the
+        // sh one-liner AND the PowerShell one (Windows is first-class).
         assert!(!html.contains("<details class=\"advisor\""));
         for question in [
             "OS on the agent's machine?",
@@ -2644,14 +2638,20 @@ mod tests {
         }
         // The default answers' command is server-rendered, so the page
         // shows a working one-liner (Linux VPS ⇒ --service) without JS.
-        assert!(
-            html.contains("curl -fsSL https://rendezvous.example/install.sh | sh -s -- --service")
-        );
+        assert!(html.contains(&format!(
+            "curl -fsSL {INSTALL_SH_ASSET_URL} | sh -s -- --connect https://rendezvous.example --service"
+        )));
         assert!(!html.contains("__ADVISOR_DEFAULT_CMD__"));
-        assert!(html.contains("location.origin + '/install.sh"));
-        assert!(html.contains("/install.ps1"));
+        // The advisor JS builds both platform commands on the canonical
+        // release assets, with the origin as an explicit connect flag.
+        assert!(html.contains(INSTALL_SH_ASSET_URL));
+        assert!(html.contains(INSTALL_PS1_ASSET_URL));
+        assert!(html.contains("--connect ' + location.origin"));
+        assert!(html.contains("-Connect ' + location.origin"));
         assert!(html.contains("--service"));
         assert!(html.contains("-Service"));
+        // The serving origin never appears as a script host.
+        assert!(!html.contains("rendezvous.example/install.sh"));
         // No init system is asserted as a given — the note speaks in
         // native-supervisor terms, not systemd.
         assert!(!html.contains("journalctl"));
@@ -2762,7 +2762,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_installer_never_accepts_hosted_owner_bootstrap() {
+    fn install_scripts_never_accept_hosted_owner_bootstrap() {
         assert!(
             INSTALL_SH.starts_with("#!/bin/sh"),
             "installer must be a sh script"
@@ -2803,40 +2803,93 @@ mod tests {
     }
 
     #[test]
-    fn served_installers_default_connect_to_the_serving_rendezvous() {
-        // The embedded scripts must keep the sentinel lines the handlers
-        // splice — if either drifts, injection silently stops and a fresh
-        // VPS comes up unregistered (hosted claiming dead-ends).
-        assert!(
-            INSTALL_SH.contains(INSTALL_SH_CONNECT_DEFAULT),
-            "install.sh connect-default sentinel drifted"
+    fn install_scripts_carry_release_stamp_sentinels() {
+        // release.yml's "Stamp and stage release installers" step replaces
+        // these exact assignment lines on tag builds and fails closed when
+        // one is not found exactly once — this merge-queue pin catches a
+        // drifted sentinel long before the rarely-run release pipeline
+        // would.
+        assert_eq!(
+            INSTALL_SH.matches("INSTALLER_RELEASE_TAG=\"\"").count(),
+            1,
+            "install.sh tag stamp sentinel drifted"
         );
-        assert!(
-            INSTALL_PS1.contains(INSTALL_PS1_CONNECT_DEFAULT),
-            "install.ps1 connect-default sentinel drifted"
+        assert_eq!(
+            INSTALL_SH.matches("INSTALLER_RELEASE_COMMIT=\"\"").count(),
+            1,
+            "install.sh commit stamp sentinel drifted"
         );
+        assert_eq!(
+            INSTALL_PS1.matches("$InstallerReleaseTag = \"\"").count(),
+            1,
+            "install.ps1 tag stamp sentinel drifted"
+        );
+        assert_eq!(
+            INSTALL_PS1
+                .matches("$InstallerReleaseCommit = \"\"")
+                .count(),
+            1,
+            "install.ps1 commit stamp sentinel drifted"
+        );
+        // The fail-closed named error is part of the stamped contract: a
+        // checkout that doesn't match the stamped commit must die by name.
+        assert!(INSTALL_SH.contains("RELEASE_PIN_MISMATCH"));
+        assert!(INSTALL_PS1.contains("RELEASE_PIN_MISMATCH"));
+        // And both scripts anchor on the canonical asset URLs this binary
+        // redirects to.
+        assert!(INSTALL_SH.contains(INSTALL_SH_ASSET_URL));
+        assert!(INSTALL_SH.contains(INSTALL_PS1_ASSET_URL));
+        assert!(INSTALL_PS1.contains(INSTALL_PS1_ASSET_URL));
+    }
 
-        let sh = install_sh_body("https://rendezvous.example");
-        assert!(sh.contains(
-            r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-https://rendezvous.example}""#
-        ));
-        assert!(!sh.contains(INSTALL_SH_CONNECT_DEFAULT));
+    #[test]
+    fn install_routes_redirect_to_the_release_assets() {
+        // The canonical anchors live under the project repo on GitHub —
+        // never under a serving origin. Golden twin of
+        // `bin/caller/hosted_verify.rs::INSTALLER_REDIRECT_TARGETS` (the
+        // two binaries never link each other): each side pins the
+        // identical literals, so a change to either fails its own suite
+        // until both move together.
+        assert_eq!(
+            INSTALL_SH_ASSET_URL,
+            "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh"
+        );
+        assert_eq!(
+            INSTALL_PS1_ASSET_URL,
+            "https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1"
+        );
+        assert!(INSTALL_SH_ASSET_URL.starts_with(REPO_URL));
+        assert!(INSTALL_PS1_ASSET_URL.starts_with(REPO_URL));
 
-        let ps1 = install_ps1_body("https://rendezvous.example");
-        assert!(ps1.contains(r#"[string]$Connect = "https://rendezvous.example","#));
-        assert!(!ps1.contains(INSTALL_PS1_CONNECT_DEFAULT));
-        // The ANSI-decode trap applies to the served body, not just the
-        // embedded file — the injected origin must not break the pin.
-        assert!(ps1.is_ascii(), "served install.ps1 must stay pure ASCII");
+        for (url, body) in [
+            (INSTALL_SH_ASSET_URL, install_sh_redirect_body()),
+            (INSTALL_PS1_ASSET_URL, install_ps1_redirect_body()),
+        ] {
+            let response = installer_redirect(url, body);
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(url)
+            );
+        }
 
-        // Splice guard: only a plain URL charset reaches the scripts.
-        assert!(connect_default_injectable("https://intendant.dev"));
-        assert!(connect_default_injectable("http://localhost:9891"));
-        assert!(!connect_default_injectable(r#"https://x"; rm -rf ~"#));
-        assert!(!connect_default_injectable("https://x y"));
-        assert!(!connect_default_injectable(""));
-        let verbatim = install_sh_body(r#"https://x" y"#);
-        assert_eq!(verbatim, INSTALL_SH, "unsafe origin must serve verbatim");
+        // The no-`-L` pipe fail-safe: the body a non-following `curl | sh`
+        // executes must be a script that reports and exits nonzero, never
+        // prose half-parsed as shell.
+        let sh_body = install_sh_redirect_body();
+        assert!(sh_body.starts_with("#!/bin/sh"));
+        assert!(sh_body.contains(INSTALL_SH_ASSET_URL));
+        assert!(sh_body.trim_end().ends_with("exit 1"));
+        let ps1_body = install_ps1_redirect_body();
+        assert!(ps1_body.contains(INSTALL_PS1_ASSET_URL));
+        assert!(ps1_body.trim_end().ends_with("exit 1"));
+        assert!(
+            ps1_body.is_ascii(),
+            "ps1 redirect body must stay pure ASCII"
+        );
     }
 
     /// Windows PowerShell 5.1 executes setup-windows.ps1 straight from the
@@ -2854,7 +2907,7 @@ mod tests {
     /// that ships PowerShell — a macOS/Linux dev box cannot tokenize it.
     #[cfg(windows)]
     #[test]
-    fn embedded_ps1_installer_parses() {
+    fn ps1_installer_parses() {
         let dir = std::env::temp_dir().join(format!("intendant-ps1-parse-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("install.ps1");

@@ -393,16 +393,39 @@ struct ManifestArtifact {
 /// Stable executable entrypoints that every Connect bundle manifest must
 /// cover. Additional embedded assets may evolve, but omitting one of these
 /// paths can never turn a smaller declaration into a successful check.
+/// `/install.sh` and `/install.ps1` are deliberately NOT required: current
+/// deployments serve them as redirects to the pinned release assets
+/// (`INSTALLER_REDIRECT_TARGETS` below) and omit them from the manifest,
+/// while pre-redirect manifests that still list them get their bodies
+/// verified like any other listed artifact.
 const REQUIRED_BUNDLE_PATHS: &[&str] = &[
     "/",
     "/access",
     "/connect",
     "/favicon.png",
-    "/install.ps1",
-    "/install.sh",
     "/logo.svg",
     "/sw.js",
     "/trust",
+];
+
+/// The exact release-asset URLs the installer routes must redirect to
+/// when a deployment declares redirect-only installer serving (its
+/// artifact manifest omits those paths). REPLICATES
+/// `bin/connect/ui.rs::INSTALL_SH_ASSET_URL` / `INSTALL_PS1_ASSET_URL`
+/// (the two binaries never link each other); a golden test below pins
+/// the literals. The manifest's omission is what selects the check, so a
+/// compromised deployment can neither serve unlogged installer bytes (a
+/// listed path must hash-match) nor quietly re-aim the convenience
+/// redirect (an omitted path must point at exactly these targets).
+const INSTALLER_REDIRECT_TARGETS: &[(&str, &str)] = &[
+    (
+        "/install.sh",
+        "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh",
+    ),
+    (
+        "/install.ps1",
+        "https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1",
+    ),
 ];
 
 /// The parsed `artifact_manifest` leaf, self-integrity verified (the
@@ -1319,6 +1342,52 @@ async fn compare_live_artifacts(
         })?
 }
 
+/// Check the redirect-only installer routes on a deployment whose
+/// manifest omits them (`INSTALLER_REDIRECT_TARGETS`): each must answer
+/// with a redirect whose Location is exactly the pinned release asset.
+/// Paths the manifest still lists (pre-redirect deployments) were already
+/// verified byte-for-byte by `compare_live_artifacts` and are skipped
+/// here. The verification client never follows redirects, so the
+/// Location header is first-class evidence.
+async fn compare_installer_redirects(
+    client: &reqwest::Client,
+    base: &Url,
+    artifacts: &[ManifestArtifact],
+) -> Result<Vec<String>, VerifyFailure> {
+    use VerifyFailure::Unavailable;
+    let mut mismatches = Vec::new();
+    for (path, target) in INSTALLER_REDIRECT_TARGETS {
+        if artifacts.iter().any(|artifact| artifact.path == *path) {
+            continue;
+        }
+        let url = crate::connect_rendezvous::join_url(base, path).map_err(Unavailable)?;
+        let response =
+            tokio::time::timeout(ARTIFACT_RESPONSE_TIMEOUT, client.get(url.clone()).send())
+                .await
+                .map_err(|_| Unavailable(format!("GET {url}: response headers timed out")))?
+                .map_err(|e| Unavailable(format!("GET {url}: {e}")))?;
+        let status = response.status();
+        if !status.is_redirection() {
+            mismatches.push(format!(
+                "{path}: expected a redirect to {target}, got HTTP {}",
+                status.as_u16()
+            ));
+            continue;
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<missing>");
+        if location != *target {
+            mismatches.push(format!(
+                "{path}: redirects to {location} instead of the pinned release asset {target}"
+            ));
+        }
+    }
+    Ok(mismatches)
+}
+
 /// A log-endpoint response carried through the shared first half of the
 /// ritual: the tree head stands on its signature, the leaf is IN the
 /// tree the head signs, and the head extends the pinned one. The caller
@@ -1610,6 +1679,17 @@ pub(crate) async fn verify_hosted_bundle(
                 leaf.artifacts.len()
             ),
             mismatches,
+        });
+    }
+    let redirect_mismatches =
+        compare_installer_redirects(artifact_client, &artifact_base, &leaf.artifacts).await?;
+    if !redirect_mismatches.is_empty() {
+        return Err(Verification {
+            summary: format!(
+                "{} installer route(s) diverge from the pinned release-asset redirect",
+                redirect_mismatches.len()
+            ),
+            mismatches: redirect_mismatches,
         });
     }
 
@@ -2510,6 +2590,88 @@ mod tests {
                 .collect::<Vec<_>>(),
         })
         .to_string()
+    }
+
+    #[test]
+    fn installer_redirect_targets_twin_the_service_constants() {
+        // Golden twin of `bin/connect/ui.rs::INSTALL_SH_ASSET_URL` /
+        // `INSTALL_PS1_ASSET_URL` — the two binaries never link each
+        // other, so each side pins the identical literals and a change to
+        // either fails its own suite until both move together.
+        assert_eq!(
+            INSTALLER_REDIRECT_TARGETS,
+            &[
+                (
+                    "/install.sh",
+                    "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh",
+                ),
+                (
+                    "/install.ps1",
+                    "https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1",
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_redirects_verify_only_when_manifest_omits_them() {
+        let router = axum::Router::new()
+            .route(
+                "/install.sh",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(
+                            axum::http::header::LOCATION,
+                            "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh",
+                        )],
+                        "",
+                    )
+                }),
+            )
+            .route(
+                "/install.ps1",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(
+                            axum::http::header::LOCATION,
+                            "https://evil.example/install.ps1",
+                        )],
+                        "",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let base = Url::parse(&format!("http://{address}/")).unwrap();
+        let client = http_client().unwrap();
+
+        // A pre-redirect manifest still lists the installer paths: their
+        // bodies were verified with every other listed artifact, and the
+        // redirect check stays out of the way.
+        let listed: Vec<ManifestArtifact> = INSTALLER_REDIRECT_TARGETS
+            .iter()
+            .map(|(path, _)| ManifestArtifact {
+                path: (*path).to_string(),
+                sha256: sha256_hex(b"body"),
+            })
+            .collect();
+        assert!(compare_installer_redirects(&client, &base, &listed)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Omitted from the manifest: /install.sh matches its pin, while
+        // the re-aimed /install.ps1 must be reported by name and target.
+        let mismatches = compare_installer_redirects(&client, &base, &[])
+            .await
+            .unwrap();
+        assert_eq!(mismatches.len(), 1, "{mismatches:?}");
+        assert!(mismatches[0].contains("/install.ps1"), "{mismatches:?}");
+        assert!(mismatches[0].contains("evil.example"), "{mismatches:?}");
+        server.abort();
     }
 
     #[tokio::test(start_paused = true)]
