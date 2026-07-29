@@ -1577,6 +1577,44 @@ pub(crate) fn limit_park_log_line(
     )
 }
 
+/// The park a BACKEND-STARTED round arms when a provider limit rejects
+/// it — the observed-from-idle lane in the supervised external-mode loop
+/// and the spontaneous-round lane in the persistent daemon lane. No
+/// driving message from this side exists to re-send (the backend woke
+/// itself: its own background task, a native timer), so the pending is
+/// the delivery-aware resume nudge when the turn had started and nothing
+/// when the rejection arrived before any work; either way the armed
+/// timer wakes the lane at reset and messages arriving meanwhile queue
+/// instead of burning against the rejected backend.
+///
+/// Returning the armed state TOGETHER with its announcement line is the
+/// point: these arms used to log "parked" while arming nothing (live
+/// 2026-07-29, sessions 379864df/a43b7f32 — the reset never woke them,
+/// the credential reload's park-cancel found nothing to resume, and
+/// their interrupted work was silently lost). A caller of this
+/// constructor cannot log the line without holding the park it
+/// announces, and the line's `has_pending` flavor is derived from the
+/// pending it ships with, so the two can never diverge.
+pub(crate) fn backend_started_limit_park(
+    resets_at_epoch: Option<u64>,
+    now: tokio::time::Instant,
+    now_epoch: u64,
+    streak: u32,
+    jitter_secs: u64,
+    turn_had_started: bool,
+) -> (LimitParkState, String) {
+    let delay = limit_park_delay(resets_at_epoch, now_epoch, streak, jitter_secs);
+    let pending = midturn_continuation(LIMIT_MIDTURN_CONTINUATION_TEXT, turn_had_started);
+    let park_line = limit_park_log_line(resets_at_epoch, now_epoch, pending.is_some());
+    (
+        LimitParkState {
+            resume_at: now + delay,
+            pending,
+        },
+        park_line,
+    )
+}
+
 /// The queued-while-parked row for a user follow-up held during a park.
 pub(crate) const LIMIT_PARK_QUEUED_MESSAGE_LOG: &str =
     "Message queued — delivers when the limit resets";
@@ -1772,6 +1810,129 @@ mod tests {
         assert_eq!(nudge.text, LIMIT_MIDTURN_CONTINUATION_TEXT);
         assert!(nudge.follow_up_id.is_none());
         assert!(nudge.steer_id.is_none());
+    }
+
+    /// Pin `backend_started_limit_arms_real_park`: a backend-started
+    /// round rejected at the provider limit arms a REAL
+    /// [`LimitParkState`] — resume-nudge pending when the turn had
+    /// started, a pending-less park (timer and queueing still armed)
+    /// when it never did. The 2026-07-29 incident class logged "parked"
+    /// from this lane while arming nothing, so neither the reset timer
+    /// nor the credential reload could ever resume the session.
+    #[tokio::test]
+    async fn backend_started_limit_arms_real_park() {
+        let now = tokio::time::Instant::now();
+        let now_epoch = 1_000;
+        let resets_at = Some(now_epoch + 3_600);
+
+        let (park, _line) = backend_started_limit_park(resets_at, now, now_epoch, 1, 30, true);
+        let pending = park.pending.as_ref().expect("started turn parks a nudge");
+        assert_eq!(pending.text, LIMIT_MIDTURN_CONTINUATION_TEXT);
+        assert!(pending.follow_up_id.is_none());
+        assert!(pending.steer_id.is_none());
+        assert_eq!(
+            park.resume_at,
+            now + limit_park_delay(resets_at, now_epoch, 1, 30)
+        );
+
+        // A rejection observed before any work still arms the park — no
+        // work is owed at reset, but the timer wakes the lane and
+        // messages arriving meanwhile queue instead of burning.
+        let (park, _line) = backend_started_limit_park(resets_at, now, now_epoch, 1, 30, false);
+        assert!(park.pending.is_none());
+        assert_eq!(
+            park.resume_at,
+            now + limit_park_delay(resets_at, now_epoch, 1, 30)
+        );
+    }
+
+    /// Pin `parked_log_line_implies_armed_state`: the constructor is the
+    /// unity seam — the "parked" announcement exists only as the second
+    /// half of a `(park, line)` pair, and the line's `has_pending`
+    /// flavor is derived from the pending the park actually ships with.
+    /// A log row claiming "parked" with nothing armed (the silent-loss
+    /// bug class) cannot be constructed through this seam.
+    #[tokio::test]
+    async fn parked_log_line_implies_armed_state() {
+        let now = tokio::time::Instant::now();
+        let now_epoch = 1_000;
+        let resets_at = Some(now_epoch + 3_600);
+
+        for turn_had_started in [true, false] {
+            let (park, line) =
+                backend_started_limit_park(resets_at, now, now_epoch, 1, 30, turn_had_started);
+            assert_eq!(
+                line,
+                limit_park_log_line(resets_at, now_epoch, park.pending.is_some()),
+                "the announced flavor must match the armed pending"
+            );
+            assert!(line.starts_with("Rate-limited — parked"), "line: {line}");
+        }
+        let (_park, line) = backend_started_limit_park(resets_at, now, now_epoch, 1, 30, true);
+        assert!(
+            line.contains("will auto-resume and re-send the pending message"),
+            "a nudge-armed park announces the re-send: {line}"
+        );
+        let (_park, line) = backend_started_limit_park(resets_at, now, now_epoch, 1, 30, false);
+        assert!(
+            line.contains("messages arriving meanwhile queue until the limit resets"),
+            "a pending-less park announces queue-until-reset: {line}"
+        );
+    }
+
+    /// Pin `limit_reset_wakes_backend_started_parks`: the armed pending
+    /// is exactly what the idle select's park-elapse branch re-sends —
+    /// the nudge carries no follow-up/steer ids, so an unrelated cancel
+    /// recorded during the park cannot drop it, and the interrupted
+    /// work is re-driven at reset.
+    #[tokio::test]
+    async fn limit_reset_wakes_backend_started_parks() {
+        let now = tokio::time::Instant::now();
+        let (park, _line) = backend_started_limit_park(Some(4_600), now, 1_000, 1, 30, true);
+
+        // The park-elapse branch: deliver pending unless cancelled.
+        let mut cancelled: HashSet<String> = HashSet::from(["f-unrelated".to_string()]);
+        let pending = park.pending.expect("started turn parks a nudge");
+        assert!(!crate::external_events::follow_up_message_was_cancelled(
+            &mut cancelled,
+            &pending
+        ));
+        assert_eq!(pending.text, LIMIT_MIDTURN_CONTINUATION_TEXT);
+    }
+
+    /// Pin `reload_resumes_backend_started_parks`: the credential
+    /// reload's cancel-and-preserve push_fronts the armed pending, so a
+    /// backend-started session parked at the limit resumes its
+    /// interrupted work immediately after the respawn — ahead of
+    /// messages queued during the park — exactly like the follow-up
+    /// lane's parks behaved in the 2026-07-29 event (523c5c23/39dffb58
+    /// resumed; the unparked 379864df idled forever).
+    #[tokio::test]
+    async fn reload_resumes_backend_started_parks() {
+        let now = tokio::time::Instant::now();
+        let (park, _line) = backend_started_limit_park(Some(4_600), now, 1_000, 1, 30, true);
+
+        let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        parked_follow_ups.push_back(FollowUpMessage::text("queued during park".to_string()));
+        // `apply_backend_credentials_reload` (external_mode): take the
+        // park, front-queue its pending, respawn; the flush preamble
+        // then delivers FIFO.
+        if let Some(pending) = park.pending {
+            parked_follow_ups.push_front(pending);
+        }
+        let mut cancelled = HashSet::new();
+        let (first, skipped) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            first.map(|m| m.text),
+            Some(LIMIT_MIDTURN_CONTINUATION_TEXT.to_string())
+        );
+        let (second, _) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
+        assert_eq!(
+            second.map(|m| m.text),
+            Some("queued during park".to_string())
+        );
     }
 
     #[test]

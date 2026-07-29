@@ -1227,22 +1227,48 @@ pub(crate) async fn run_external_agent_mode(
                                                 });
                                             }
                                             DrainOutcome::LimitRejected {
-                                                resets_at_epoch, ..
+                                                resets_at_epoch,
+                                                message: _,
+                                                turn_had_started,
                                             } => {
                                                 // A backend-started round
                                                 // ended limit-rejected:
-                                                // nothing to re-send and no
-                                                // round to count — log and
-                                                // return to idle. (A later
-                                                // user message that gets
-                                                // rejected parks properly
-                                                // with itself as pending.)
+                                                // hand the round number
+                                                // back and arm a REAL park.
+                                                // This arm used to log
+                                                // "parked" while arming
+                                                // nothing (2026-07-29,
+                                                // sessions 379864df/
+                                                // a43b7f32): the reset
+                                                // never woke them, the
+                                                // credential reload's
+                                                // park-cancel found nothing
+                                                // to resume, and their
+                                                // interrupted work was
+                                                // silently lost. No driving
+                                                // message exists to re-send
+                                                // — the pending is the
+                                                // resume nudge when the
+                                                // backend had started the
+                                                // turn — and both the reset
+                                                // timer and the reload's
+                                                // cancel-and-preserve now
+                                                // resume this lane through
+                                                // the same paths as the
+                                                // follow-up lane's parks.
                                                 round = round.saturating_sub(1);
-                                                let park_line = limit_park_log_line(
-                                                    resets_at_epoch,
-                                                    crate::session_activity::epoch_seconds(),
-                                                    false,
-                                                );
+                                                limit_park_streak =
+                                                    limit_park_streak.saturating_add(1);
+                                                let (park, park_line) =
+                                                    backend_started_limit_park(
+                                                        resets_at_epoch,
+                                                        tokio::time::Instant::now(),
+                                                        crate::session_activity::epoch_seconds(),
+                                                        limit_park_streak,
+                                                        limit_park_jitter_secs(),
+                                                        turn_had_started,
+                                                    );
+                                                let has_pending = park.pending.is_some();
                                                 slog(&session_log, |l| l.warn(&park_line));
                                                 bus.send(AppEvent::LogEntry {
                                                     session_id: live_session_id.clone(),
@@ -1250,6 +1276,32 @@ pub(crate) async fn run_external_agent_mode(
                                                     source: "Intendant".to_string(),
                                                     content: park_line,
                                                     turn: None,
+                                                });
+                                                emit_external_turn_status(
+                                                    &bus,
+                                                    &autonomy,
+                                                    live_session_id.as_deref(),
+                                                    round.saturating_add(1),
+                                                    "waiting-rate-limit",
+                                                    format!(
+                                                        "{} rate-limited; parked until the limit resets",
+                                                        agent.name()
+                                                    ),
+                                                )
+                                                .await;
+                                                limit_park = Some(park);
+                                                // Durable marker: mirrors
+                                                // the follow-up arm, so a
+                                                // daemon death mid-park
+                                                // leaves the boot
+                                                // auto-readopt trace.
+                                                slog(&session_log, |l| {
+                                                    l.set_limit_park(Some(
+                                                        crate::session_log::SessionLimitParkMeta {
+                                                            resets_at_epoch,
+                                                            has_pending,
+                                                        },
+                                                    ))
                                                 });
                                             }
                                             DrainOutcome::ContextRewindRequested {
@@ -2679,18 +2731,28 @@ pub(crate) async fn run_external_agent_mode(
                             // The in-flight turn ended rejected at the
                             // provider limit; no round to record. The turn
                             // is over, so the user's edit rollback below
-                            // proceeds like any completed turn.
-                            let park_line = limit_park_log_line(
-                                resets_at_epoch,
-                                crate::session_activity::epoch_seconds(),
-                                false,
+                            // proceeds like any completed turn — and
+                            // deliberately WITHOUT a park: the edit rewinds
+                            // past the rejected turn, so a resume nudge
+                            // would re-drive work the user just superseded.
+                            // The edited message delivers next and parks
+                            // properly through the primary arm if the limit
+                            // still holds. The line must not claim "parked"
+                            // (a parked claim with nothing armed is the
+                            // silent-loss bug class).
+                            let line = format!(
+                                "Rate-limited — the in-flight turn was rejected; {}; proceeding with the edit rollback",
+                                external_agent::limit_reset_phrase(
+                                    resets_at_epoch,
+                                    crate::session_activity::epoch_seconds(),
+                                ),
                             );
-                            slog(&session_log, |l| l.warn(&park_line));
+                            slog(&session_log, |l| l.warn(&line));
                             bus.send(AppEvent::LogEntry {
                                 session_id: live_session_id.clone(),
                                 level: "warn".to_string(),
                                 source: "Intendant".to_string(),
-                                content: park_line,
+                                content: line,
                                 turn: None,
                             });
                         }

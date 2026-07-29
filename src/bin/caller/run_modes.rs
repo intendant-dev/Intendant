@@ -2137,18 +2137,33 @@ pub(crate) async fn run_with_presence(
                                     cumulative_stats.rounds = round;
                                 }
                                 DrainOutcome::LimitRejected {
-                                    resets_at_epoch, ..
+                                    resets_at_epoch,
+                                    message: _,
+                                    turn_had_started,
                                 } => {
                                     // A backend-started round ended
-                                    // limit-rejected: nothing to re-send
-                                    // and no round to count — log and
-                                    // return to idle. (A later task that
-                                    // gets rejected parks properly with
-                                    // itself as pending.)
-                                    let park_line = limit_park_log_line(
+                                    // limit-rejected: no round to count,
+                                    // and the park is REAL — this arm is
+                                    // the persistent-lane twin of the
+                                    // observed-from-idle arm that logged
+                                    // "parked" while arming nothing
+                                    // (2026-07-29), so the reset never
+                                    // woke the lane and interrupted work
+                                    // was silently lost. No driving
+                                    // message exists to re-send; the
+                                    // pending is the resume nudge when
+                                    // the backend had started the turn,
+                                    // and the outer-select timer re-drives
+                                    // it at reset.
+                                    persistent_limit_park_streak =
+                                        persistent_limit_park_streak.saturating_add(1);
+                                    let (park, park_line) = backend_started_limit_park(
                                         resets_at_epoch,
+                                        tokio::time::Instant::now(),
                                         crate::session_activity::epoch_seconds(),
-                                        false,
+                                        persistent_limit_park_streak,
+                                        limit_park_jitter_secs(),
+                                        turn_had_started,
                                     );
                                     slog(&session_log, |l| l.warn(&park_line));
                                     bus.send(AppEvent::LogEntry {
@@ -2158,6 +2173,19 @@ pub(crate) async fn run_with_presence(
                                         content: park_line,
                                         turn: None,
                                     });
+                                    emit_external_turn_status(
+                                        &bus,
+                                        &autonomy,
+                                        session_log_id(&session_log).as_deref(),
+                                        round,
+                                        "waiting-rate-limit",
+                                        format!(
+                                            "{} rate-limited; parked until the limit resets",
+                                            agent.name()
+                                        ),
+                                    )
+                                    .await;
+                                    persistent_limit_park = Some(park);
                                 }
                                 DrainOutcome::RecoveryRequired {
                                     message,

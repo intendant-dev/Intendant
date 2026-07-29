@@ -1066,6 +1066,17 @@ persistent-daemon lane apply the same `external_supervision.rs` policy:
   make the backend re-read its whole mandate. The nudge inherits the rejected
   message's follow-up/steer ids, so cancelling it while parked works exactly
   like cancelling a full resend.
+- Backend-started rounds — a turn the backend opened itself while the lane
+  sat idle (its own background task completing, a native wake) — park through
+  the same policy (`backend_started_limit_park`). There is no driving message
+  on the supervisor's side to resend, so the park pends the resume nudge when
+  the turn had started and nothing when the rejection arrived before any
+  work; the reset timer and queue-while-parked behavior arm either way. The
+  constructor returns the armed park and its announcement line as one value,
+  so a session-log row claiming "parked" always has a live park behind it
+  (before 2026-07-29 this lane logged the line and armed nothing — the
+  session idled forever with its interrupted work lost, and a credential
+  reload found nothing to resume).
 - If the wire supplied `resetsAt`, the pending message is resent after that
   instant plus 30–90 seconds of jitter; any one sleep is capped at six hours
   so long windows are rechecked. Without a reset time, consecutive rejections
@@ -1081,8 +1092,11 @@ persistent-daemon lane apply the same `external_supervision.rs` policy:
 - An out-of-band `compact` action is refused with the reset-time explanation
   while a park is armed; request it again after the reset.
 
-The park is an in-memory session-lane state, not a durable scheduler. Activity
-and session-log rows make the pause, queued messages, cancellation, and resend
+The park timer is in-memory session-lane state, not a durable scheduler; the
+supervised external-mode lane additionally stamps a durable `limit_park`
+marker on the session meta (cleared on release/cancel) so boot auto-readopt
+can tell a daemon died mid-park with work still owed. Activity and
+session-log rows make the pause, queued messages, cancellation, and resend
 visible.
 
 ## Dashboard and Station parity
