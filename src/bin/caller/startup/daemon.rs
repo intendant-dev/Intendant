@@ -261,6 +261,24 @@ pub(crate) async fn run_daemon(
             codex_context_archive: None,
         }));
     }
+    // Boot auto-readopt: resume the dead boot's mid-work sessions
+    // (started-without-terminal occurrences, mid-turn interruptions,
+    // limit-parked wrappers) under fresh wrappers with a continuation
+    // nudge. Spawned AFTER the supervisor subscribes (same ordering law
+    // as the resume block above); the pass itself waits for the agenda
+    // scheduler's boot recovery classification and gates on lease
+    // holdership, so a secondary daemon never readopts.
+    {
+        let readopt_enabled = crate::boot_readopt::readopt_enabled(project.config.readopt.enabled);
+        let readopt_bus = startup_bus.clone();
+        let readopt_handover = gateway.handover.clone();
+        tokio::spawn(crate::boot_readopt::run_boot_readopt_pass(
+            crate::platform::home_dir(),
+            readopt_bus,
+            readopt_handover,
+            readopt_enabled,
+        ));
+    }
     let _ = supervisor_handle.await;
     Ok(())
 }

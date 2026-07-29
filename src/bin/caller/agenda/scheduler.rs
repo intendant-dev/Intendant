@@ -139,6 +139,10 @@ struct SchedulerState {
     /// Ended-but-unclassified running sessions awaiting their resume
     /// lineage (see [`PendingLineageEnd`]); swept on every wake.
     lineage_pending: Vec<PendingLineageEnd>,
+    /// Boot-recovery fail-closed occurrences whose dead session may yet
+    /// be readopted (see [`ReadoptWatch`]); swept on every wake, expire
+    /// after [`READOPT_WATCH_WINDOW_MS`].
+    readopt_watch: Vec<ReadoptWatch>,
 }
 
 impl SchedulerState {
@@ -260,20 +264,26 @@ pub(crate) fn spawn_reminder_scheduler(
         let mut events = handle.bus().subscribe();
         // Boot recovery, scoped (Track HS2): a live co-homed daemon's
         // in-flight rows are spared; legacy rows and provably dead
-        // writers fail-close exactly as before.
-        match handover.as_deref() {
+        // writers fail-close exactly as before. The classification
+        // output feeds the boot auto-readopt pass — seeds go to the
+        // published handoff slot (the pass sequences on it), watches
+        // stay here so an admitted successor re-keys its occurrence.
+        let classification = match handover.as_deref() {
             Some(runtime) => {
                 resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Boot(runtime))
             }
             None => resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Unscoped),
-        }
+        };
+        state.readopt_watch = classification.watches;
+        crate::boot_readopt::publish_agenda_readopt_seeds(classification.seeds);
         loop {
             let next_wake_ms =
                 run_pass(&handle, &mut journal, &mut state, handover.as_deref()).await;
             let now = now_ms();
             let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
             let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
-            let next_wake_ms = [next_wake_ms, retry_wake_ms, lineage_wake_ms]
+            let readopt_wake_ms = sweep_readopt_watch(&handle, &mut journal, &mut state, now);
+            let next_wake_ms = [next_wake_ms, retry_wake_ms, lineage_wake_ms, readopt_wake_ms]
                 .into_iter()
                 .flatten()
                 .min();
@@ -355,17 +365,46 @@ impl RecoveryScope<'_> {
     }
 }
 
+/// A dead session whose occurrence the boot recovery pass fail-closed,
+/// held so the scheduler can watch its durable resume lineage: when the
+/// boot auto-readopt pass (or the owner) resume-attaches the session
+/// within the window, the occurrence re-keys onto the successor — the
+/// same follow-the-lineage shape [`rekey_running_to_successor`] gives a
+/// live daemon — instead of staying an orphaned `Unknown` while its
+/// work continues.
+struct ReadoptWatch {
+    spawn: SpawnOccurrence,
+    dead_session_id: String,
+    parked_at_ms: u64,
+}
+
+/// What boot recovery classified (Track HS2 scope) — the readopt
+/// handoff: seeds go to the boot auto-readopt pass, watches stay here.
+#[derive(Default)]
+struct LostSessionClassification {
+    seeds: Vec<crate::boot_readopt::AgendaReadoptSeed>,
+    watches: Vec<ReadoptWatch>,
+}
+
 /// Fail-close unresolved occurrences within `scope`: `started`-without-
 /// terminal rows whose driving daemon is gone resolve `Unknown`, never
 /// auto-retried (RFC §7.5); the sessions themselves, if alive, are
 /// still visible in the Sessions tab. Runs at scheduler boot
 /// ([`RecoveryScope::Boot`]/[`RecoveryScope::Unscoped`]) and on every
 /// holder pass ([`RecoveryScope::Recurring`]).
+///
+/// The RFC rule governs the occurrence — no automatic RE-FIRE of the
+/// goal. Resuming the interrupted SESSION is a different act: the
+/// returned classification hands each fail-closed row's session to the
+/// boot auto-readopt pass, and the boot caller parks the watches that
+/// re-key an occurrence onto an admitted successor. Recovery itself
+/// stays fail-closed either way — a readopt that never materializes
+/// leaves exactly today's `Unknown`.
 fn resolve_lost_sessions(
     handle: &AgendaHandle,
     journal: &mut OccurrenceJournal,
     scope: RecoveryScope<'_>,
-) {
+) -> LostSessionClassification {
     let unresolved: Vec<_> = journal
         .started_unresolved()
         .into_iter()
@@ -376,8 +415,9 @@ fn resolve_lost_sessions(
         .into_iter()
         .filter(|row| scope.may_resolve(row.writer_boot_id.as_deref()))
         .collect();
+    let mut classification = LostSessionClassification::default();
     if unresolved.is_empty() && lost_dispatches.is_empty() {
-        return;
+        return classification;
     }
     // Why the writer died shapes the owner-facing note: a boot pass means
     // *this* executor restarted; the recurring pass means a co-homed
@@ -413,6 +453,7 @@ fn resolve_lost_sessions(
         });
         // The journal row carries no effect_id, so find the owning effect by
         // its last_run lineage and make the item's state honest too.
+        let mut matched_suspended: Option<bool> = None;
         for item in &items {
             for effect in &item.effects {
                 if effect
@@ -433,8 +474,48 @@ fn resolve_lost_sessions(
                             item.id
                         );
                     }
+                    // Readopt handoff: the fail-closed row's session is a
+                    // mid-work seed, and — unless the series is suspended
+                    // (the streak law is the crash-loop brake) — a watch
+                    // that re-keys the occurrence onto the successor the
+                    // readopt pass admits.
+                    if matched_suspended.is_none() {
+                        let suspended = effect.suspended();
+                        matched_suspended = Some(suspended);
+                        if let Some(dead_session_id) = session_id.clone().filter(|_| !suspended) {
+                            classification.watches.push(ReadoptWatch {
+                                spawn: SpawnOccurrence {
+                                    occurrence_id: occurrence_id.clone(),
+                                    item_id: item.id.clone(),
+                                    effect_id: effect.effect_id.clone(),
+                                    goal: effect.manifest.goal.clone(),
+                                    orchestrate: effect.manifest.orchestrate,
+                                    fire_at_ms: 0,
+                                    recurring: effect.manifest.recurrence.is_some(),
+                                    interactive: effect.manifest.interactive,
+                                    project_root: effect.manifest.project_root.clone(),
+                                    agent_config: effect.manifest.agent_config.clone(),
+                                    provenance_session_id: item.provenance.session_id.clone(),
+                                    matched_item_ids: Vec::new(),
+                                    binding_refs: Vec::new(),
+                                    session_name: None,
+                                },
+                                dead_session_id,
+                                parked_at_ms: now_ms(),
+                            });
+                        }
+                    }
                 }
             }
+        }
+        if let Some(dead_session_id) = session_id.clone() {
+            classification
+                .seeds
+                .push(crate::boot_readopt::AgendaReadoptSeed {
+                    occurrence_id: occurrence_id.clone(),
+                    session_id: dead_session_id,
+                    suspended: matched_suspended.unwrap_or(false),
+                });
         }
         eprintln!(
             "[agenda] occurrence {occurrence_id} resolved to unknown \
@@ -487,6 +568,7 @@ fn resolve_lost_sessions(
              (writer daemon gone before its session dispatched)"
         );
     }
+    classification
 }
 
 /// A broadcast lag means one or more launch receipts or terminal events may
@@ -1277,6 +1359,121 @@ fn sweep_lineage_pending(
         .iter()
         .map(|entry| entry.ended_at_ms + LINEAGE_QUIET_GRACE_MS)
         .min()
+}
+
+/// How long a boot-recovery [`ReadoptWatch`] waits for a successor to
+/// appear in durable lineage. Generous next to
+/// [`LINEAGE_QUIET_GRACE_MS`]: the readopt pass itself lands within
+/// seconds, but the window also re-links a MANUAL post-crash resume
+/// (the owner's "proceed" minutes after a restart) — after it closes,
+/// a late resume still runs, it just no longer re-keys the occurrence.
+const READOPT_WATCH_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+/// Re-check boot-recovery readopt watches against durable lineage: runs
+/// on every scheduler wake, exactly like [`sweep_lineage_pending`], and
+/// through the same shared resolver — never a private walk. An
+/// owner-stop tombstone ends the watch (quiet by decree); an admitted
+/// successor re-keys the occurrence; everything else waits out the
+/// window and expires silently (the occurrence stays the fail-closed
+/// `Unknown` recovery wrote).
+fn sweep_readopt_watch(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    now: u64,
+) -> Option<u64> {
+    if state.readopt_watch.is_empty() {
+        return None;
+    }
+    let entries = std::mem::take(&mut state.readopt_watch);
+    for entry in entries {
+        let lineage = crate::session_supervisor::resume_lineage::resolve_resume_lineage(
+            &handle.spawn_ctx().home,
+            &[entry.dead_session_id.as_str()],
+        );
+        if lineage.stopped_by_user {
+            continue;
+        }
+        let excluded = [entry.dead_session_id.as_str()];
+        if let Some(tip) = lineage.successor_tip(&excluded) {
+            let successor = tip.intendant_session_id.clone();
+            readopt_rekey_to_successor(handle, journal, state, entry.spawn, &successor, now);
+            continue;
+        }
+        if now.saturating_sub(entry.parked_at_ms) < READOPT_WATCH_WINDOW_MS {
+            state.readopt_watch.push(entry);
+        }
+    }
+    state
+        .readopt_watch
+        .iter()
+        .map(|entry| entry.parked_at_ms + READOPT_WATCH_WINDOW_MS)
+        .min()
+}
+
+/// A watched occurrence's lineage grew an admitted successor: re-open
+/// tracking under it — [`rekey_running_to_successor`]'s shape, minus
+/// the `running` entry a live daemon would have had. The fresh
+/// `started` row re-opens the fail-closed occurrence (the journal fold
+/// law), re-stamps it to THIS boot, re-arms the item's no-overlap
+/// hold, and puts the successor in `running` so its eventual terminal
+/// classifies normally. `started` is streak-neutral: a crash cycle
+/// keeps its one `unknown` streak point until a completion resets —
+/// repeated crash-without-completion still suspends the series, which
+/// is the crash-loop brake the readopt pass respects.
+fn readopt_rekey_to_successor(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    spawn: SpawnOccurrence,
+    successor: &str,
+    now: u64,
+) {
+    if state.running.contains_key(successor)
+        || state
+            .running
+            .values()
+            .any(|running| running.occurrence_id == spawn.occurrence_id)
+    {
+        return;
+    }
+    eprintln!(
+        "[agenda] occurrence {} readopted after daemon restart: continuing under \
+         successor session {successor}",
+        spawn.occurrence_id
+    );
+    session_record(
+        journal,
+        &spawn,
+        now,
+        OccurrenceState::Started,
+        Some(successor.to_string()),
+    );
+    record_on_item(
+        handle,
+        &spawn,
+        "started",
+        Some(successor.to_string()),
+        Some(format!(
+            "readopted after daemon restart — continuing under successor session {successor}"
+        )),
+    );
+    state.running.insert(successor.to_string(), spawn);
+    if let Some(early) = state.take_early_outcome_aliased(successor) {
+        match early.failed {
+            None => complete_running(handle, journal, state, successor, early.note),
+            Some(end_reason) => classify_ended_running_session(
+                handle,
+                journal,
+                state,
+                successor,
+                successor,
+                &end_reason,
+                now,
+                now,
+            ),
+        }
+    }
 }
 
 /// Terminal resolution for occurrences that never spawned (missed window,
@@ -4493,6 +4690,224 @@ mod tests {
             journal.progress("occ-doomed").terminal,
             Some(OccurrenceState::Unknown),
             "a provably dead writer's rows fail-close"
+        );
+    }
+
+    /// Boot recovery's classification output is the readopt handoff:
+    /// each fail-closed started row yields a seed naming its dead
+    /// session, and — when the owning effect matches by `last_run`
+    /// lineage — a lineage watch carrying the reconstructed spawn
+    /// facts. The journal side stays exactly as fail-closed as before.
+    #[test]
+    fn boot_recovery_hands_readopt_seeds_and_watches() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let writer = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
+        let survivor = crate::handover::HandoverRuntime::initialize(home.path(), 7002, 0);
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let (item_id, effect_id, _digest) = approved_effect_item(&handle, now_ms() - 60_000);
+        let occurrence_id = "occ-readopt".to_string();
+        handle
+            .record_occurrence(OccurrenceWriteBack {
+                item_id: &item_id,
+                effect_id: &effect_id,
+                occurrence_id: &occurrence_id,
+                state: "started",
+                session_id: Some("sess-occ-readopt".to_string()),
+                note: None,
+            })
+            .unwrap();
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        journal.set_stamp(Some(JournalStamp {
+            boot_id: writer.boot_id().to_string(),
+            generation: Some(1),
+        }));
+        stamped_started_rows(&mut journal, "occ-readopt", &item_id);
+
+        drop(writer);
+        let classification =
+            resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Boot(&survivor));
+        assert_eq!(
+            journal.progress("occ-readopt").terminal,
+            Some(OccurrenceState::Unknown),
+            "the journal side stays fail-closed (RFC §7.5) — readopt is a separate act"
+        );
+        assert_eq!(classification.seeds.len(), 1);
+        assert_eq!(classification.seeds[0].occurrence_id, "occ-readopt");
+        assert_eq!(classification.seeds[0].session_id, "sess-occ-readopt");
+        assert!(
+            !classification.seeds[0].suspended,
+            "a healthy effect's seed is not suspended"
+        );
+        assert_eq!(classification.watches.len(), 1);
+        let watch = &classification.watches[0];
+        assert_eq!(watch.dead_session_id, "sess-occ-readopt");
+        assert_eq!(watch.spawn.item_id, item_id);
+        assert_eq!(watch.spawn.effect_id, effect_id);
+        assert_eq!(watch.spawn.occurrence_id, "occ-readopt");
+    }
+
+    /// The readopt watch re-keys a fail-closed occurrence onto the
+    /// successor the resume lane admitted: fresh `started` row naming
+    /// the successor (re-opening the occurrence — the fold law), item
+    /// write-back, and a `running` entry so the successor's terminal
+    /// classifies normally.
+    #[test]
+    fn readopt_watch_rekeys_to_admitted_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let (item_id, effect_id, _digest) = approved_effect_item(&handle, now_ms() - 60_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        // The fail-closed shape recovery left behind: started(dead) + unknown.
+        stamped_started_rows(&mut journal, "occ-watch", &item_id);
+        journal
+            .append(&OccurrenceRecord {
+                v: 1,
+                at_ms: 2_000,
+                occurrence_id: "occ-watch".to_string(),
+                item_id: String::new(),
+                due_ms: 0,
+                state: OccurrenceState::Unknown,
+                urgency: None,
+                session_id: Some("sess-occ-watch".to_string()),
+                generation: None,
+                boot_id: None,
+            })
+            .unwrap();
+        assert!(journal.started_unresolved().is_empty(), "fail-closed");
+
+        // The dead wrapper and its admitted successor, in durable state
+        // (the handle's spawn-context home is `dir`).
+        let logs = crate::platform::intendant_home_in(dir.path()).join("logs");
+        for wrapper in ["sess-occ-watch", "sess-successor"] {
+            let mut log = crate::session_log::SessionLog::open(logs.join(wrapper)).unwrap();
+            log.write_meta(None, None);
+            log.session_identity(wrapper, "claude-code", "b-watch-conv");
+        }
+
+        let mut state = SchedulerState::default();
+        state.readopt_watch.push(ReadoptWatch {
+            spawn: SpawnOccurrence {
+                occurrence_id: "occ-watch".to_string(),
+                item_id: item_id.clone(),
+                effect_id: effect_id.clone(),
+                goal: "run the nightly sweep".to_string(),
+                orchestrate: false,
+                fire_at_ms: 0,
+                recurring: false,
+                interactive: false,
+                project_root: None,
+                agent_config: None,
+                provenance_session_id: None,
+                matched_item_ids: Vec::new(),
+                binding_refs: Vec::new(),
+                session_name: None,
+            },
+            dead_session_id: "sess-occ-watch".to_string(),
+            parked_at_ms: now_ms(),
+        });
+        let wake = sweep_readopt_watch(&handle, &mut journal, &mut state, now_ms());
+        assert!(state.readopt_watch.is_empty(), "the watch resolved");
+        assert_eq!(wake, None, "nothing left to wake for");
+        let progress = journal.progress("occ-watch");
+        assert_eq!(
+            progress.started.as_deref(),
+            Some("sess-successor"),
+            "the occurrence follows the admitted successor"
+        );
+        assert_eq!(
+            progress.terminal, None,
+            "the fresh started row re-opens the fail-closed occurrence"
+        );
+        assert!(
+            state.running.contains_key("sess-successor"),
+            "the successor's terminal will classify normally"
+        );
+        assert!(
+            journal.started_unresolved_for_item(&item_id),
+            "the item's no-overlap hold re-arms while the successor runs"
+        );
+        let (items, _, _) = handle.snapshot();
+        let item = items.iter().find(|item| item.id == item_id).unwrap();
+        let run = item.effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "started");
+        assert_eq!(run.session_id.as_deref(), Some("sess-successor"));
+    }
+
+    /// A watch with no successor expires quietly at the window (the
+    /// occurrence stays the fail-closed `Unknown`), and an owner-stop
+    /// tombstone anywhere in the lineage ends the watch immediately.
+    #[test]
+    fn readopt_watch_expires_and_respects_owner_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let (item_id, effect_id, _digest) = approved_effect_item(&handle, now_ms() - 60_000);
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let watch_entry = |dead: &str, parked_at_ms: u64| ReadoptWatch {
+            spawn: SpawnOccurrence {
+                occurrence_id: format!("occ-{dead}"),
+                item_id: item_id.clone(),
+                effect_id: effect_id.clone(),
+                goal: "run the nightly sweep".to_string(),
+                orchestrate: false,
+                fire_at_ms: 0,
+                recurring: false,
+                interactive: false,
+                project_root: None,
+                agent_config: None,
+                provenance_session_id: None,
+                matched_item_ids: Vec::new(),
+                binding_refs: Vec::new(),
+                session_name: None,
+            },
+            dead_session_id: dead.to_string(),
+            parked_at_ms,
+        };
+
+        // No successor, window still open: the watch stays parked and
+        // bounds the wake.
+        let mut state = SchedulerState::default();
+        state
+            .readopt_watch
+            .push(watch_entry("sess-quiet", now_ms()));
+        let wake = sweep_readopt_watch(&handle, &mut journal, &mut state, now_ms());
+        assert_eq!(state.readopt_watch.len(), 1, "still watching");
+        assert!(wake.is_some(), "the window bounds the sleep");
+
+        // Window elapsed: the watch expires without journal writes.
+        let mut state = SchedulerState::default();
+        state.readopt_watch.push(watch_entry(
+            "sess-expired",
+            now_ms().saturating_sub(READOPT_WATCH_WINDOW_MS + 1),
+        ));
+        sweep_readopt_watch(&handle, &mut journal, &mut state, now_ms());
+        assert!(state.readopt_watch.is_empty(), "expired quietly");
+        assert_eq!(journal.progress("occ-sess-expired").started, None);
+
+        // Owner stop: the lineage is done by decree — watch dropped.
+        let logs = crate::platform::intendant_home_in(dir.path()).join("logs");
+        let mut log = crate::session_log::SessionLog::open(logs.join("sess-stopped")).unwrap();
+        log.write_meta(None, None);
+        log.session_identity("sess-stopped", "claude-code", "b-stopped-conv");
+        crate::external_wrapper_index::record_user_stop(
+            dir.path(),
+            "claude-code",
+            "b-stopped-conv",
+        )
+        .unwrap();
+        let mut state = SchedulerState::default();
+        state
+            .readopt_watch
+            .push(watch_entry("sess-stopped", now_ms()));
+        sweep_readopt_watch(&handle, &mut journal, &mut state, now_ms());
+        assert!(state.readopt_watch.is_empty(), "stopped lineage: watch ends");
+        assert_eq!(
+            journal.progress("occ-sess-stopped").started,
+            None,
+            "no re-key for an owner-stopped lineage"
         );
     }
 

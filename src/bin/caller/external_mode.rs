@@ -156,6 +156,7 @@ async fn apply_backend_credentials_reload(
     };
     if let Some(park) = limit_park.take() {
         *limit_park_streak = 0;
+        slog(session_log, |l| l.set_limit_park(None));
         if let Some(pending) = park.pending {
             // Front of the queue: the parked re-send delivers first, then
             // everything queued while parked, oldest first.
@@ -794,6 +795,7 @@ pub(crate) async fn run_external_agent_mode(
                             .unwrap_or_else(tokio::time::Instant::now)
                     ), if limit_park.is_some() => {
                         let park = limit_park.take().expect("branch guarded by is_some");
+                        slog(&session_log, |l| l.set_limit_park(None));
                         match park.pending {
                             Some(pending)
                                 if !follow_up_message_was_cancelled(
@@ -1757,6 +1759,7 @@ pub(crate) async fn run_external_agent_mode(
                                 // park stay queued and flush normally).
                                 if let Some(park) = limit_park.take() {
                                     limit_park_streak = 0;
+                                    slog(&session_log, |l| l.set_limit_park(None));
                                     let line = if park.pending.is_some() {
                                         "Rate-limit park cancelled by interrupt — dropped the pending re-send"
                                     } else {
@@ -3469,6 +3472,15 @@ pub(crate) async fn run_external_agent_mode(
                 limit_park = Some(LimitParkState {
                     resume_at: tokio::time::Instant::now() + delay,
                     pending: Some(limit_park_pending(pending, turn_had_started)),
+                });
+                // Durable park marker: the in-memory park dies with the
+                // daemon, and the boot auto-readopt pass needs to know a
+                // dead boot's wrapper still owed its parked re-send.
+                slog(&session_log, |l| {
+                    l.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
+                        resets_at_epoch,
+                        has_pending: true,
+                    }))
                 });
             }
             DrainOutcome::ContextRewindRequested {

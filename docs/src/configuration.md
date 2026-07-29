@@ -314,6 +314,20 @@ production behavior must not depend on them.
 |-----|------|---------|-------------|
 | `cu_first_routing` | bool | `false` | Intercept every non-direct task with a fast CU model that completes it on the display or escalates to the main agent (vaulted 2026-07-04: adds a model hop to every task and, under subscription-based external agents, an API-key model dependency) |
 
+### `[readopt]`
+
+The boot auto-readopt pass: at daemon boot, the dead boot's mid-work
+sessions (started-without-terminal agenda occurrences, mid-turn
+interruptions, limit-parked wrappers with pending work) are
+resume-attached under fresh wrappers with a continuation nudge, under the
+existing admission guards (see
+[Agenda & Memory](./agenda-and-memory.md#reminders)). Idle or completed
+sessions stay down.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
+
 ### `[agent]` and external backends
 
 Routes coding tasks to an external CLI agent instead of the native loop (see

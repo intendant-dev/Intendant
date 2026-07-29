@@ -93,6 +93,32 @@ pub struct ExperimentalConfig {
     pub cu_first_routing: bool,
 }
 
+/// `[readopt]` in intendant.toml: the boot auto-readopt pass — at
+/// daemon boot, the dead boot's mid-work sessions (started-without-
+/// terminal agenda occurrences, mid-turn interruptions, limit-parked
+/// wrappers with pending work) are resume-attached under fresh wrappers
+/// with a continuation nudge. See `boot_readopt`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadoptConfig {
+    /// Default ON — crash recovery is the daemon's job. `enabled =
+    /// false` (or `INTENDANT_BOOT_READOPT=0`) leaves dead-boot sessions
+    /// down for the owner to resume by hand.
+    #[serde(default = "default_readopt_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for ReadoptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_readopt_enabled(),
+        }
+    }
+}
+
+fn default_readopt_enabled() -> bool {
+    true
+}
+
 /// `[integrations]` in intendant.toml — non-secret configuration for
 /// external service integrations. Credentials never live here: the
 /// GitHub App key and ids are sealed in OS-keystore custody
@@ -887,6 +913,10 @@ pub struct ProjectConfig {
     /// configuration (watch lists, cadences). See [`IntegrationsConfig`].
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// `[readopt]` section — the boot auto-readopt pass (default ON).
+    /// See [`ReadoptConfig`].
+    #[serde(default)]
+    pub readopt: ReadoptConfig,
     /// `[server]` section in intendant.toml — daemon-level settings
     /// for what this Intendant advertises to peers. See [`ServerConfig`].
     #[serde(default)]
