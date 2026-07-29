@@ -29,10 +29,17 @@ name: macOS app release
 # (exporting the p12, minting the notary key): docs/src/getting-started.md,
 # "Signed releases".
 #
+# The cross-platform install scripts (scripts/install.sh, install.ps1)
+# also ship as release assets: tag builds stamp them with the release
+# identity (tag + commit) so each published installer prints what it is
+# and fail-closes unless the tree it checks out matches — the canonical
+# documented install one-liner fetches install.sh from the release, not
+# from a hosted service.
+#
 # Release transparency (docs/src/self-hosted-rendezvous.md, "Release
 # transparency"): after publishing, tag builds commit the released
-# artifacts' hashes to the rendezvous's public transparency log. One more
-# repo secret, exactly:
+# artifacts' hashes — the app bundle and the install scripts alike — to
+# the rendezvous's public transparency log. One more repo secret, exactly:
 #
 #   CONNECT_RELEASE_TOKEN    bearer token the rendezvous was started with
 #                            (--release-token / INTENDANT_CONNECT_RELEASE_TOKEN
@@ -250,6 +257,55 @@ jobs:
             security delete-keychain "$RUNNER_TEMP/intendant-release.keychain-db" || true
           fi
 
+      # The install scripts ship as release assets beside the app bundle:
+      # staged into dist/ so the publish and transparency-log steps below
+      # cover them exactly like the binaries (name + sha256 + size in the
+      # logged release manifest). Tag builds stamp the release identity
+      # into the scripts first — the stamped installer prints what it is
+      # at start and fail-closes (RELEASE_PIN_MISMATCH) unless the tree it
+      # checks out matches the stamped commit — and the stamping itself
+      # fails closed when a sentinel line drifted (ui.rs pins the
+      # sentinels in the merge queue; this is the release-time backstop).
+      # Dispatch dry-runs stage the unstamped copies, exercising the same
+      # staging without minting a release identity.
+      - name: Stamp and stage release installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp scripts/install.sh scripts/install.ps1 dist/
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            python3 - "$GITHUB_REF_NAME" "$(git rev-parse HEAD)" <<'PY'
+          import sys
+          tag, commit = sys.argv[1], sys.argv[2]
+          # install.sh is UTF-8 (section markers, em-dashes); install.ps1
+          # must stay pure ASCII (the Windows PowerShell 5.1 BOM-less
+          # ANSI-decode pin in ui.rs) and the strict decode enforces that
+          # here too.
+          stamps = {
+              "dist/install.sh": ("utf-8", [
+                  ('INSTALLER_RELEASE_TAG=""', f'INSTALLER_RELEASE_TAG="{tag}"'),
+                  ('INSTALLER_RELEASE_COMMIT=""', f'INSTALLER_RELEASE_COMMIT="{commit}"'),
+              ]),
+              "dist/install.ps1": ("ascii", [
+                  ('$InstallerReleaseTag = ""', f'$InstallerReleaseTag = "{tag}"'),
+                  ('$InstallerReleaseCommit = ""', f'$InstallerReleaseCommit = "{commit}"'),
+              ]),
+          }
+          for path, (encoding, pairs) in stamps.items():
+              text = open(path, "rb").read().decode(encoding, errors="strict")
+              for needle, replacement in pairs:
+                  if text.count(needle) != 1:
+                      sys.exit(f"stamp sentinel {needle!r} not found exactly once in {path}")
+                  text = text.replace(needle, replacement)
+              open(path, "wb").write(text.encode(encoding))
+          PY
+            echo "stamped installers with $GITHUB_REF_NAME @ $(git rev-parse HEAD)"
+          fi
+          (cd dist && shasum -a 256 install.sh > install.sh.sha256)
+          (cd dist && shasum -a 256 install.ps1 > install.ps1.sha256)
+          ls -l dist
+
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         shell: bash
@@ -277,6 +333,11 @@ jobs:
             echo "$signing_note"
             echo
             echo "**Install:** unzip, drag \`Intendant.app\` to /Applications, launch. The app spawns its own daemon and serves the dashboard; grant Screen Recording / Accessibility / Microphone when prompted."
+            echo
+            echo "**Install from source (macOS / Linux / Windows):** the release-pinned installer ships as the \`install.sh\` / \`install.ps1\` assets — stamped with this release's tag and commit, self-verifying (fails closed on a checkout that doesn't match), and hash-committed to the public transparency log:"
+            echo '```'
+            echo "curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install.sh | sh"
+            echo '```'
             echo
             echo "**Verify the download:**"
             echo '```'
