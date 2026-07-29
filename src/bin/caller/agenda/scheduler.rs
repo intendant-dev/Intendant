@@ -29,6 +29,20 @@ const SAFETY_TICK: std::time::Duration = std::time::Duration::from_secs(300);
 /// is exactly the RFC's "session creation is idempotent by occurrence id".
 const DELEGATION_PREFIX: &str = "agenda-occ-";
 
+/// The universal epistemic teaching line (AO rider ruling R7, shipped
+/// pre-AO per OPEN-8): a fired session's closing message dead-letters —
+/// the transport write-back keeps one last-wins note nobody is pointed
+/// at, and transcripts are mined only after the fact — so every fired
+/// task names the durable end-channels instead. Lives beside the
+/// source-ids line in the ONE task builder (`send_start_task`), so
+/// dispatch and the resweep both carry it; the exact bytes are pinned
+/// by `epistemic_line_rides_every_fired_task`. The AO teaching pass
+/// AMENDS this line in place — never a second line.
+const EPISTEMIC_RIDER_LINE: &str =
+    "Your closing message reaches nobody by default — fired sessions end into a dead-letter \
+     channel. Durable channels are item annotations, refs, and durable files: write your \
+     handoff there before your last token.";
+
 /// Cap on remembered pre-receipt session outcomes. Terminal events are
 /// rare (one per session end), and most remembered entries belong to
 /// non-scheduled sessions whose receipts never come — the cap simply
@@ -813,11 +827,13 @@ fn send_start_task(
     // snapshot path the session reads as the binding content (sealed
     // refs: what a verified seal serves is what the owner reviewed and
     // may carry instructions; the line itself is a pointer); an
-    // on_item_match batch adds its matched ids (Track T). All rider
-    // lines are data to act on under the approved goal, never
-    // instructions themselves.
+    // on_item_match batch adds its matched ids (Track T). The epistemic
+    // teaching line rides directly under the source ids (rider ruling
+    // R7): a fired session's closing message dead-letters, so the task
+    // itself names the durable end-channels. All rider lines are data
+    // to act on under the approved goal, never instructions themselves.
     let mut task = format!(
-        "{}\n\nFired from agenda item {} (occurrence {})",
+        "{}\n\nFired from agenda item {} (occurrence {})\n{EPISTEMIC_RIDER_LINE}",
         spawn.goal, spawn.item_id, spawn.occurrence_id
     );
     for line in binding_ref_lines {
@@ -1872,11 +1888,79 @@ mod tests {
             dispatched[0].0,
             format!(
                 "act on the sealed brief\n\nFired from agenda item {item_id} \
-                 (occurrence {occurrence_id})\nBinding ref {locator} sha256 {pin} \
-                 — sealed copy {}, verified at fire",
+                 (occurrence {occurrence_id})\n{EPISTEMIC_RIDER_LINE}\nBinding ref \
+                 {locator} sha256 {pin} — sealed copy {}, verified at fire",
                 sealed_path.display()
             ),
             "each binding ref rides the fired task as one data line naming the sealed copy"
+        );
+    }
+
+    /// AO rider ruling R7 (OPEN-8: shipped pre-AO): the epistemic
+    /// teaching line rides EVERY fired task — the exact bytes are pinned
+    /// here, and the resweep's re-send is byte-identical to the first
+    /// send (the single-builder property: both send sites call
+    /// `send_start_task`). The AO teaching pass amends THIS pin when it
+    /// adds the attest verb — one block, never two.
+    #[tokio::test]
+    async fn epistemic_line_rides_every_fired_task() {
+        assert_eq!(
+            EPISTEMIC_RIDER_LINE,
+            "Your closing message reaches nobody by default — fired sessions end into a \
+             dead-letter channel. Durable channels are item annotations, refs, and durable \
+             files: write your handoff there before your last token.",
+            "the taught bytes are law (amended only by the AO teaching pass)"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let (item_id, _effect_id, _digest) = approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        let mut first = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
+                first = Some(task);
+            }
+        }
+        let first = first.expect("the approved manifest dispatches");
+        let occurrence_id = state
+            .awaiting
+            .keys()
+            .next()
+            .cloned()
+            .expect("dispatch pends a receipt");
+        assert_eq!(
+            first,
+            format!(
+                "run the nightly sweep\n\nFired from agenda item {item_id} \
+                 (occurrence {occurrence_id})\n{EPISTEMIC_RIDER_LINE}"
+            ),
+            "the teaching line rides beside the source-ids line"
+        );
+
+        // The resweep goes through the same builder: age the pending
+        // dispatch past the retry bound and sweep.
+        for pending in state.awaiting.values_mut() {
+            pending.last_attempt_ms = pending
+                .last_attempt_ms
+                .saturating_sub(DISPATCH_RETRY_AFTER_MS + 1);
+        }
+        let mut rx = handle.bus().subscribe();
+        sweep_pending_dispatches(&handle, &mut journal, &mut state, now_ms());
+        let mut resent = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
+                resent = Some(task);
+            }
+        }
+        assert_eq!(
+            resent.as_deref(),
+            Some(first.as_str()),
+            "the resweep re-send is byte-identical — the single builder covers both sites"
         );
     }
 
@@ -2218,7 +2302,8 @@ mod tests {
         assert_eq!(
             dispatched[0].0,
             format!(
-                "run the nightly sweep\n\nFired from agenda item {item_id} (occurrence {occurrence_id})"
+                "run the nightly sweep\n\nFired from agenda item {item_id} \
+                 (occurrence {occurrence_id})\n{EPISTEMIC_RIDER_LINE}"
             ),
             "every fired task names its source item + occurrence as one data line"
         );
@@ -3445,7 +3530,8 @@ mod tests {
             task,
             format!(
                 "rule the parked gates\n\nFired from agenda item standing-item \
-                 (occurrence occ-batch)\nMatched agenda items (this firing's batch): {} {}",
+                 (occurrence occ-batch)\n{EPISTEMIC_RIDER_LINE}\nMatched agenda items \
+                 (this firing's batch): {} {}",
                 q1.id, q2.id
             ),
             "the source line + batch ride the goal as a data prologue: {task}"

@@ -114,6 +114,16 @@ dashboard, attributed to your session.
   only annotates the firing as drifted; to make edits count, re-run
   `schedule` so the owner re-approves the new revision.
 
+- **Before your last token (any agenda-fired session): your closing
+  message reaches nobody by default.** A fired session ends into a
+  dead-letter channel — the run write-back keeps one last-wins note
+  nobody is pointed at, and transcripts are only mined after the fact.
+  Durable channels are the verbs above: `annotate` your source item with
+  what happened and what comes next, `ref` a handoff file you wrote (a
+  durable path, not /tmp — the digest makes drift visible), and park
+  follow-ups as their own items. Write your handoff there before your
+  last token.
+
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.
   **A due date delivers a reminder** to the owner at that instant (their
