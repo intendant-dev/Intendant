@@ -1736,6 +1736,60 @@ mod tests {
     use super::super::types::{AgendaKind, AgendaProvenance};
     use super::*;
 
+    /// Track AO pin `occurrence_state_vocabulary_is_frozen` (ruling
+    /// R1): this track adds NO `OccurrenceState` variant and no new
+    /// write-back string — the fold catch-all (`fold_record_into`'s
+    /// not-Prepared/Started ⇒ terminal) makes any new row kind a
+    /// terminal-clobber on new builds and a whole-row skip on old ones,
+    /// and the string-matching consumers (the cooldown floor, the
+    /// no-overlap hold, dashboard chips, hood hues) would silently miss
+    /// it. The exhaustive match fails COMPILATION when a variant is
+    /// added; the serialization list fails when a wire string changes.
+    /// Adding either is a deliberate re-gate, never a drive-by.
+    #[test]
+    fn occurrence_state_vocabulary_is_frozen() {
+        let all = [
+            OccurrenceState::Prepared,
+            OccurrenceState::Delivered,
+            OccurrenceState::Suppressed,
+            OccurrenceState::Missed,
+            OccurrenceState::Started,
+            OccurrenceState::Completed,
+            OccurrenceState::Failed,
+            OccurrenceState::Unknown,
+        ];
+        for state in all {
+            // No wildcard: a ninth variant refuses to compile here.
+            match state {
+                OccurrenceState::Prepared
+                | OccurrenceState::Delivered
+                | OccurrenceState::Suppressed
+                | OccurrenceState::Missed
+                | OccurrenceState::Started
+                | OccurrenceState::Completed
+                | OccurrenceState::Failed
+                | OccurrenceState::Unknown => {}
+            }
+        }
+        let serialized: Vec<String> = all
+            .iter()
+            .map(|state| serde_json::to_string(state).unwrap())
+            .collect();
+        assert_eq!(
+            serialized,
+            [
+                "\"prepared\"",
+                "\"delivered\"",
+                "\"suppressed\"",
+                "\"missed\"",
+                "\"started\"",
+                "\"completed\"",
+                "\"failed\"",
+                "\"unknown\"",
+            ]
+        );
+    }
+
     fn item(id: &str, status: AgendaStatus, due_ms: Option<u64>) -> AgendaItem {
         AgendaItem {
             id: id.to_string(),
@@ -2590,6 +2644,7 @@ mod tests {
             session_id: Some("sess-live".into()),
             at_ms: 1,
             note: None,
+            attestation: None,
         });
         let dir2 = tempfile::tempdir().unwrap();
         let empty_journal = journal_at(dir2.path());
@@ -3727,6 +3782,7 @@ mod tests {
             session_id: None,
             at_ms: 150_000,
             note: None,
+            attestation: None,
         });
         let items2 = vec![done_at("node-a", 200_000), node2];
         let due = assert_agreement(&items2, &items2[1], &journal, &policy, now);
@@ -3859,6 +3915,7 @@ mod tests {
             session_id: None,
             at_ms: 150_000,
             note: None,
+            attestation: None,
         });
         let items = vec![done_at("node-a", 100_000), node];
 
@@ -3917,6 +3974,7 @@ mod tests {
             session_id: None,
             at_ms: close + 5_000,
             note: None,
+            attestation: None,
         });
         let items = vec![standing, matching_question("q1", 20_000, None)];
         let floor = close + 5_000 + TRIGGER_COOLDOWN_MS;
