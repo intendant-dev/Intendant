@@ -1,20 +1,36 @@
 #!/bin/sh
-# Intendant hosted installer.
-# Served by every Intendant Connect rendezvous at /install.sh.
+# Intendant installer.
+# The canonical copy of this script is a per-tag GitHub RELEASE ASSET —
+# stamped with the release it belongs to, sha256-committed to the public
+# transparency log alongside the binaries, and immutable once published:
+#   curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh
+# The copy in scripts/ is the unstamped source; a Connect rendezvous
+# serves at most a redirect to the release asset, never the script body.
 #
 # Stands up a daemon and optionally links its route to Connect. The
 # one-time claim code grants no daemon access and changes no IAM. Establish
 # root separately through the machine's local console or direct mTLS. The
-# packaged macOS app only bridges its own bundled local daemon; this hosted
+# packaged macOS app only bridges its own bundled local daemon; this
 # installer never accepts an owner key.
 
 set -eu
 
+# ── Release identity ──
+# Stamped by release.yml when this script is packaged as a release asset
+# (empty in the repository copy). A stamped installer announces the
+# release it belongs to and installs exactly that released tree: the
+# checkout is verified against the stamped commit below and the install
+# fails closed on mismatch. Its own bytes are covered by the release
+# manifest committed to the transparency log, so the custody chain is
+# log -> installer bytes -> pinned commit -> the tree that gets built.
+INSTALLER_RELEASE_TAG=""
+INSTALLER_RELEASE_COMMIT=""
+
 usage() {
   cat <<'EOF'
-Intendant hosted installer
+Intendant installer
 
-  curl -fsSL https://intendant.dev/install.sh | sh -s -- \
+  curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh -s -- \
     [--service] [--connect <rendezvous-url>] \
     [--daemon-id <id>] [--no-run]
 
@@ -24,19 +40,24 @@ Options:
                   where present, launchd on macOS, cron @reboot + the
                   built-in supervisor elsewhere) so it survives this SSH
                   session and restarts on failure.
-  --connect <url> Rendezvous to register with. Default: the environment's
-                  INTENDANT_CONNECT_RENDEZVOUS_URL, else the rendezvous
-                  this script was fetched from (injected when served).
+  --connect <url> Rendezvous to register with for discovery. Default: the
+                  environment's INTENDANT_CONNECT_RENDEZVOUS_URL, else
+                  none (the daemon publishes no discovery route; its
+                  local dashboard still works).
   --daemon-id <id>Stable daemon id at the rendezvous.
   --ref <ref>     Pin the fresh clone to a tag, branch, or commit.
-                  Default: the newest published release tag (vX.Y.Z);
-                  only when no release exists yet, the default branch head.
+                  Default: the release this installer was stamped with
+                  (when fetched as a release asset); an unstamped copy
+                  falls back to the newest published release tag (vX.Y.Z),
+                  and to the default branch head only while no release
+                  exists. An explicit ref you choose skips the
+                  release-pin verification.
   --no-run        Build and link only; print how to start it.
 
 Environment overrides:
   INTENDANT_REPO         git URL   (default: https://github.com/intendant-dev/Intendant)
   INTENDANT_INSTALL_DIR  checkout  (default: ~/intendant)
-  INTENDANT_REF          same as --ref (lets a serving rendezvous pin a release)
+  INTENDANT_REF          same as --ref
 EOF
 }
 
@@ -74,13 +95,21 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# ── Identity banner ──
+# Say what this copy IS before doing anything else.
+if [ -n "$INSTALLER_RELEASE_COMMIT" ]; then
+  say "release-pinned installer: $INSTALLER_RELEASE_TAG @ $INSTALLER_RELEASE_COMMIT"
+else
+  say "unstamped source copy (no release pin) — the canonical, verified installer is the GitHub release asset"
+fi
+
 # ── Platform ──
 PLATFORM="$(uname -s)"
 case "$PLATFORM" in
   Linux|Darwin) ;;
   MINGW*|MSYS*|CYGWIN*)
     die "this installer targets macOS/Linux. On Windows use install.ps1 from PowerShell:
-    & ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))" ;;
+    & ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))" ;;
   *)
     say "note: unrecognized platform $PLATFORM — continuing, but dependency setup is on you." ;;
 esac
@@ -97,21 +126,32 @@ command -v git >/dev/null 2>&1 || die "git is required (install it and re-run)"
 if [ -d "$INSTALL_DIR/.git" ]; then
   [ -z "$REF" ] || die "--ref pins fresh clones only; $INSTALL_DIR already exists — check out the ref there yourself"
   say "using existing checkout at $INSTALL_DIR (leaving it exactly as-is)"
+  [ -z "$INSTALLER_RELEASE_COMMIT" ] || say "note: the stamped release pin ($INSTALLER_RELEASE_TAG) is not enforced on a checkout you already had"
 else
   if [ -z "$REF" ]; then
-    # Default fresh installs to the newest published release tag (vX.Y.Z
-    # only — pre-releases and peeled refs are filtered) so the served
-    # installer delivers an immutable, released tree. Falling back to the
-    # mutable default-branch head happens only while no release exists,
-    # and says so out loud. --ref / INTENDANT_REF override either way.
-    REF="$(git ls-remote --tags "$REPO" 'v*' 2>/dev/null \
-      | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9.]*\)$|\1|p' \
-      | sort -V | tail -n 1 || true)"
-    if [ -n "$REF" ]; then
-      say "pinning to the latest release tag: $REF (override with --ref)"
+    if [ -n "$INSTALLER_RELEASE_COMMIT" ]; then
+      # A stamped release asset installs exactly its own release; the
+      # tree is verified against the stamped commit after checkout.
+      REF="$INSTALLER_RELEASE_TAG"
+      say "installing the stamped release: $REF"
     else
-      say "note: no release tags published yet — installing the default branch head (mutable; pin with --ref once releases exist)."
+      # Unstamped copy: default fresh installs to the newest published
+      # release tag (vX.Y.Z only — pre-releases and peeled refs are
+      # filtered) so even this path delivers an immutable, released tree.
+      # Falling back to the mutable default-branch head happens only while
+      # no release exists, and says so out loud. --ref / INTENDANT_REF
+      # override either way.
+      REF="$(git ls-remote --tags "$REPO" 'v*' 2>/dev/null \
+        | sed -n 's|.*refs/tags/\(v[0-9][0-9]*\.[0-9][0-9.]*\)$|\1|p' \
+        | sort -V | tail -n 1 || true)"
+      if [ -n "$REF" ]; then
+        say "pinning to the latest release tag: $REF (override with --ref)"
+      else
+        say "note: no release tags published yet — installing the default branch head (mutable; pin with --ref once releases exist)."
+      fi
     fi
+  elif [ -n "$INSTALLER_RELEASE_COMMIT" ] && [ "$REF" != "$INSTALLER_RELEASE_TAG" ]; then
+    say "note: explicit ref $REF overrides the stamped release ($INSTALLER_RELEASE_TAG) — release-pin verification is skipped for a ref you chose"
   fi
   say "cloning $REPO -> $INSTALL_DIR"
   git clone --depth 1 "$REPO" "$INSTALL_DIR"
@@ -122,6 +162,21 @@ else
   fi
 fi
 cd "$INSTALL_DIR"
+
+# ── Release-pin verification ──
+# A stamped installer fails closed unless the tree it just checked out is
+# the exact commit its release recorded — a moved tag, a substituted
+# remote, or a tampered mirror all land here, BEFORE anything from the
+# tree is executed. Everything the installer runs from here on (the
+# setup scripts, the build) comes from the verified tree, and
+# `cargo build --locked` extends the pinning to dependency hashes.
+if [ -n "$INSTALLER_RELEASE_COMMIT" ] && [ "$REF" = "$INSTALLER_RELEASE_TAG" ]; then
+  ACTUAL_COMMIT="$(git rev-parse HEAD)"
+  if [ "$ACTUAL_COMMIT" != "$INSTALLER_RELEASE_COMMIT" ]; then
+    die "RELEASE_PIN_MISMATCH: $INSTALLER_RELEASE_TAG checked out commit $ACTUAL_COMMIT, but this installer was published for $INSTALLER_RELEASE_COMMIT. Refusing to continue. Re-download the installer from the release page and compare the repository's tags before trusting either."
+  fi
+  say "release pin verified: $REF is commit $ACTUAL_COMMIT"
+fi
 
 # ── System dependencies ──
 if [ "$PLATFORM" = "Linux" ] && command -v apt-get >/dev/null 2>&1 && [ -x scripts/setup-linux.sh ]; then

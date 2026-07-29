@@ -1,33 +1,45 @@
 <#
 .SYNOPSIS
-    Intendant hosted installer for Windows -- the install.sh counterpart.
-    Served by every Intendant Connect rendezvous at /install.ps1.
+    Intendant installer for Windows -- the install.sh counterpart.
+    The canonical copy is a per-tag GitHub release asset; a Connect
+    rendezvous serves at most a redirect to it, never the script body.
 
 .DESCRIPTION
     Stands up a daemon and optionally links its route to Connect. The
     one-time claim code grants no daemon access and changes no IAM. Establish
     root separately through the machine's local console or direct mTLS. The
-    packaged macOS app only bridges its own bundled local daemon; this hosted
+    packaged macOS app only bridges its own bundled local daemon; this
     installer never accepts an owner key.
 
     One-liner (PowerShell):
-      & ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
+      & ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))
+
+    Release assets are stamped with the release they belong to (tag +
+    commit) and sha256-committed to the public transparency log; a stamped
+    copy installs exactly that released tree and fails closed
+    (RELEASE_PIN_MISMATCH) when the checkout does not match. The copy in
+    scripts/ is the unstamped source.
 
     Dependencies (git, rustup, VS Build Tools, NASM) are handled by
     scripts/setup-windows.ps1 from the cloned repo -- run automatically
     when this shell is elevated, otherwise checked and reported.
 
 .PARAMETER Connect
-    Rendezvous URL to register with. Defaults to the rendezvous this
-    script was fetched from (injected when served).
+    Rendezvous URL to register with for discovery. Default: the
+    INTENDANT_CONNECT_RENDEZVOUS_URL environment variable, else none
+    (the daemon publishes no discovery route; its local dashboard still
+    works).
 
 .PARAMETER DaemonId
     Stable daemon id at the rendezvous.
 
 .PARAMETER Ref
-    Pin the fresh clone to a tag, branch, or commit. Default: the newest
-    published release tag (vX.Y.Z); only when no release exists yet, the
-    default branch head.
+    Pin the fresh clone to a tag, branch, or commit. Default: the release
+    this installer was stamped with (when fetched as a release asset); an
+    unstamped copy falls back to the newest published release tag
+    (vX.Y.Z), and to the default branch head only while no release
+    exists. An explicit ref you choose skips the release-pin
+    verification.
 
 .PARAMETER Service
     Keep the daemon running unattended: installs a Task Scheduler entry
@@ -46,7 +58,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Connect = "",
+    [string]$Connect = $env:INTENDANT_CONNECT_RENDEZVOUS_URL,
     [string]$DaemonId = "",
     [string]$Ref = "",
     [switch]$Service,
@@ -57,8 +69,25 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# -- Release identity --
+# Stamped by release.yml when this script is packaged as a release asset
+# (empty in the repository copy). A stamped installer announces the
+# release it belongs to, installs exactly that released tree, and fails
+# closed on mismatch; its own bytes are covered by the release manifest
+# committed to the transparency log.
+$InstallerReleaseTag = ""
+$InstallerReleaseCommit = ""
+
 function Say([string]$Message) { Write-Host "[intendant install] $Message" -ForegroundColor White }
 function Fail([string]$Message) { Write-Host "[intendant install] $Message" -ForegroundColor Red; exit 1 }
+
+# -- Identity banner --
+# Say what this copy IS before doing anything else.
+if ($InstallerReleaseCommit) {
+    Say "release-pinned installer: $InstallerReleaseTag @ $InstallerReleaseCommit"
+} else {
+    Say "unstamped source copy (no release pin) -- the canonical, verified installer is the GitHub release asset"
+}
 
 $elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -72,25 +101,38 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 if (Test-Path (Join-Path $InstallDir ".git")) {
     if ($Ref) { Fail "-Ref pins fresh clones only; $InstallDir already exists -- check out the ref there yourself." }
     Say "using existing checkout at $InstallDir (leaving it exactly as-is)"
+    if ($InstallerReleaseCommit) {
+        Say "note: the stamped release pin ($InstallerReleaseTag) is not enforced on a checkout you already had"
+    }
 } else {
     if (-not $Ref) {
-        # Default fresh installs to the newest published release tag
-        # (vX.Y.Z only -- pre-releases and peeled refs are filtered) so the
-        # served installer delivers an immutable, released tree. Falling
-        # back to the mutable default-branch head happens only while no
-        # release exists, and says so out loud. -Ref overrides either way.
-        $tagLines = git ls-remote --tags $Repo "v*"
-        if ($LASTEXITCODE -eq 0 -and $tagLines) {
-            $Ref = @($tagLines) |
-                ForEach-Object { if ($_ -match 'refs/tags/(v\d+\.\d+(\.\d+){0,2})$') { $Matches[1] } } |
-                Sort-Object { [version]$_.Substring(1) } |
-                Select-Object -Last 1
-        }
-        if ($Ref) {
-            Say "pinning to the latest release tag: $Ref (override with -Ref)"
+        if ($InstallerReleaseCommit) {
+            # A stamped release asset installs exactly its own release; the
+            # tree is verified against the stamped commit after checkout.
+            $Ref = $InstallerReleaseTag
+            Say "installing the stamped release: $Ref"
         } else {
-            Say "note: no release tags published yet -- installing the default branch head (mutable; pin with -Ref once releases exist)."
+            # Unstamped copy: default fresh installs to the newest published
+            # release tag (vX.Y.Z only -- pre-releases and peeled refs are
+            # filtered) so even this path delivers an immutable, released
+            # tree. Falling back to the mutable default-branch head happens
+            # only while no release exists, and says so out loud. -Ref
+            # overrides either way.
+            $tagLines = git ls-remote --tags $Repo "v*"
+            if ($LASTEXITCODE -eq 0 -and $tagLines) {
+                $Ref = @($tagLines) |
+                    ForEach-Object { if ($_ -match 'refs/tags/(v\d+\.\d+(\.\d+){0,2})$') { $Matches[1] } } |
+                    Sort-Object { [version]$_.Substring(1) } |
+                    Select-Object -Last 1
+            }
+            if ($Ref) {
+                Say "pinning to the latest release tag: $Ref (override with -Ref)"
+            } else {
+                Say "note: no release tags published yet -- installing the default branch head (mutable; pin with -Ref once releases exist)."
+            }
         }
+    } elseif ($InstallerReleaseCommit -and $Ref -ne $InstallerReleaseTag) {
+        Say "note: explicit ref $Ref overrides the stamped release ($InstallerReleaseTag) -- release-pin verification is skipped for a ref you chose"
     }
     Say "cloning $Repo -> $InstallDir"
     git clone --depth 1 $Repo $InstallDir
@@ -104,6 +146,23 @@ if (Test-Path (Join-Path $InstallDir ".git")) {
     }
 }
 Set-Location $InstallDir
+
+# -- Release-pin verification --
+# A stamped installer fails closed unless the tree it just checked out is
+# the exact commit its release recorded -- a moved tag, a substituted
+# remote, or a tampered mirror all land here, BEFORE anything from the
+# tree is executed. Everything the installer runs from here on
+# (setup-windows.ps1, the build) comes from the verified tree, and
+# `cargo build --locked` extends the pinning to dependency hashes.
+if ($InstallerReleaseCommit -and $Ref -eq $InstallerReleaseTag) {
+    $actualCommit = git rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or -not $actualCommit) { Fail "git rev-parse HEAD failed" }
+    $actualCommit = "$actualCommit".Trim()
+    if ($actualCommit -ne $InstallerReleaseCommit) {
+        Fail "RELEASE_PIN_MISMATCH: $InstallerReleaseTag checked out commit $actualCommit, but this installer was published for $InstallerReleaseCommit. Refusing to continue. Re-download the installer from the release page and compare the repository's tags before trusting either."
+    }
+    Say "release pin verified: $Ref is commit $actualCommit"
+}
 
 # -- System dependencies --
 # setup-windows.ps1 is the dependency authority (rustup, VS Build Tools

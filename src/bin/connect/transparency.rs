@@ -544,8 +544,12 @@ pub(crate) async fn log_find(
 // malicious code"). These entries commit what the service SERVES to the
 // same append-only log that commits what it SAYS: at startup the service
 // hashes every embedded artifact it can serve — the Connect pages exactly
-// as this instance renders them (origin-injected installers included) — and appends an
-// `artifact_manifest` entry when the manifest changed. Out-of-band
+// as this instance renders them — and appends an
+// `artifact_manifest` entry when the manifest changed. The install
+// scripts are deliberately absent: they are release assets committed to
+// this log as `release_manifest` entries by the release pipeline, and
+// `/install.sh` + `/install.ps1` serve at most a redirect whose pinned
+// target the out-of-band monitor checks instead of body bytes. Out-of-band
 // monitors (`intendant hosted-verify`, the daemon tripwire in
 // bin/caller/hosted_verify.rs) fetch the live artifacts and compare;
 // page JS can never honestly self-verify, so nothing here is
@@ -570,8 +574,8 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// The routes served from compiled-in bytes, rendered exactly as this
-/// instance serves them (the pages and installers are deterministic
-/// functions of the public origin). The `/connect` page matters most:
+/// instance serves them (the pages are deterministic functions of the
+/// public origin). The `/connect` page matters most:
 /// it carries the passkey and log-verification JS — the code a hosted
 /// betrayal would most want to swap.
 pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> {
@@ -592,14 +596,6 @@ pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> 
         (
             "/trust".to_string(),
             sha256_hex(trust_ui_html(origin).as_bytes()),
-        ),
-        (
-            "/install.sh".to_string(),
-            sha256_hex(install_sh_body(origin).as_bytes()),
-        ),
-        (
-            "/install.ps1".to_string(),
-            sha256_hex(install_ps1_body(origin).as_bytes()),
         ),
         ("/logo.svg".to_string(), sha256_hex(LOGO_SVG.as_bytes())),
         ("/favicon.png".to_string(), sha256_hex(BRAND_ICON_PNG)),
@@ -1666,8 +1662,6 @@ mod tests {
             "/connect",
             "/access",
             "/trust",
-            "/install.sh",
-            "/install.ps1",
             "/logo.svg",
             "/favicon.png",
             "/sw.js",
@@ -1675,7 +1669,16 @@ mod tests {
         ] {
             assert!(paths.contains(&expected), "manifest must cover {expected}");
         }
-        for forbidden in ["/app.html", "/wasm-web/presence_web.js", "/vault-kernel.js"] {
+        // The installer routes serve redirects, not bytes: a manifest that
+        // OMITS them is what tells the out-of-band monitor to verify the
+        // pinned redirect target instead of a body hash.
+        for forbidden in [
+            "/app.html",
+            "/wasm-web/presence_web.js",
+            "/vault-kernel.js",
+            "/install.sh",
+            "/install.ps1",
+        ] {
             assert!(
                 !paths.contains(&forbidden),
                 "manifest must exclude {forbidden}"
@@ -1717,6 +1720,34 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{}", artifact.path);
             let bytes = response.bytes().await.unwrap();
             assert_eq!(sha256_hex(&bytes), artifact.sha256, "{}", artifact.path);
+        }
+
+        // The installer routes are outside the manifest because they serve
+        // no bytes of consequence: a redirect to the pinned release asset
+        // is the whole contract (hosted-verify checks the same invariant
+        // out of band against the live deployment).
+        let no_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for (path, target) in [
+            ("/install.sh", INSTALL_SH_ASSET_URL),
+            ("/install.ps1", INSTALL_PS1_ASSET_URL),
+        ] {
+            let response = no_redirect
+                .get(format!("http://{address}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(target),
+                "{path}"
+            );
         }
         server.abort();
     }

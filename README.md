@@ -26,19 +26,19 @@ And it doesn't stop at one box. Daemons federate into fleets, and people and org
 
 ## A daemon in ninety seconds
 
-Stand up a keyless daemon on a fresh box with one command (registration on the hosted rendezvous is invite-only during the alpha; self-hosting is never gated):
+Stand up a keyless daemon on a fresh box with one command (registration on the hosted rendezvous is invite-only during the alpha; self-hosting is never gated). The installer is a release-pinned GitHub asset — stamped with the release it installs, sha256-committed to a public transparency log, and self-verifying: it announces its release identity at start and fails closed if the tree it fetches doesn't match. Prefer reading before running? Download the same asset, check it against the release's `.sha256`, then run it. (Until the first `v*` release is published, the asset URL 404s — clone and build from a checkout below.)
 
 ```bash
 # macOS / Linux
-curl -fsSL https://intendant.dev/install.sh | sh
+curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh
 ```
 
 ```powershell
 # Windows
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
+& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))
 ```
 
-Add `--service` / `-Service` on an unattended box to register the daemon with the platform's native supervisor (systemd, launchd, Task Scheduler — no init system is a dependency) so it outlives the SSH session and restarts on failure. Then:
+Add `--connect https://intendant.dev` (`-Connect …` — or your self-hosted rendezvous) to link the daemon for discovery, and `--service` / `-Service` on an unattended box to register the daemon with the platform's native supervisor (systemd, launchd, Task Scheduler — no init system is a dependency) so it outlives the SSH session and restarts on failure. Then:
 
 1. **Link** — the daemon prints a single-use twelve-word claim code. Enter it in Connect to add the route to your account for discovery. Linking changes no IAM state and grants no access.
 2. **Anchor** — establish root from the machine's console/SSH session with `intendant access setup` or from an independently reached direct mTLS connection. Hosted and fleet-name origin code cannot mint or exercise root in the default build. No signed/notarized native release exists for this alpha; unsigned development app bundles are not anchors.
@@ -69,7 +69,7 @@ A deliberately keyless daemon outside an active full-credential OAuth lease can 
 
 ## A network of agentic networks
 
-Every daemon is its own authority island. Access — human or agent — is enforced by that machine's local IAM: authenticated local/mTLS principals, peer daemons, grants, and roles over a fine-grained permission catalog. Browser identity-key records exist for fleet signatures, attribution, and future identity work, but are not an active alpha login credential. Connect cannot authenticate a hosted control session, and claiming grants nothing. It is nevertheless trusted for availability, account and route metadata, optional encrypted push delivery, and the browser code and installers it serves; malicious hosted code can lie about or exfiltrate anything the Connect page itself can see, and a malicious installer can compromise what it installs. Fleet records are client-signed, the component is [self-hostable](https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html), and an append-only transparency log makes later name-directory rewriting tamper-evident.
+Every daemon is its own authority island. Access — human or agent — is enforced by that machine's local IAM: authenticated local/mTLS principals, peer daemons, grants, and roles over a fine-grained permission catalog. Browser identity-key records exist for fleet signatures, attribution, and future identity work, but are not an active alpha login credential. Connect cannot authenticate a hosted control session, and claiming grants nothing. It is nevertheless trusted for availability, account and route metadata, optional encrypted push delivery, and the browser code it serves; malicious hosted code can lie about or exfiltrate anything the Connect page itself can see. The install scripts sit outside that boundary: they ship as release-pinned GitHub assets with their hashes in the transparency log, and Connect at most redirects to them. Fleet records are client-signed, the component is [self-hostable](https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html), and an append-only transparency log makes later name-directory rewriting tamper-evident.
 
 Organizations are a root keypair, not a row in someone's database. The org signs grant documents; daemons that trust the org key verify them locally, cap them, expire them, and honor signed revocation lists. Peer-daemon subjects are usable through peer mTLS today. Human browser-key documents currently materialize record state only: peer offers can verify a key for attribution, but no alpha ingress admits it as the controlling IAM principal, so it does not create a usable browser session. Those human and daemon lanes remain separate, separately auditable decisions. [The full trust model →](https://intendant-dev.github.io/Intendant/trust-architecture.html)
 

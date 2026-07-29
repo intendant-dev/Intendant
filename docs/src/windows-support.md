@@ -31,21 +31,25 @@ supported.
 
 ## Quickstart
 
-The fastest path is the served installer — the Windows counterpart of the
-`curl | sh` one-liner, from an elevated PowerShell on a fresh box:
+The fastest path is the release-pinned installer — the Windows counterpart of
+the `curl | sh` one-liner, from an elevated PowerShell on a fresh box:
 
 ```powershell
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
+& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))
 
 # Keep it running unattended (Task Scheduler entry — at boot when elevated,
 # at logon otherwise — supervised by the built-in restart loop; the one-time
 # claim code lands in the service log the installer prints):
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Service
+& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1))) -Service
 ```
 
 It clones the repo, runs the dependency setup below (elevated shells only),
-builds, and launches; every rendezvous — hosted or self-run — serves its own
-version-matched copy at `/install.ps1`. `intendant service
+builds, and launches. The script is a per-release GitHub asset — stamped
+with the release it installs, hash-committed to the public transparency
+log, and fail-closed (`RELEASE_PIN_MISMATCH`) when the checkout doesn't
+match its release; a rendezvous serves at most a redirect to it. Add
+`-Connect https://intendant.dev` (or your self-hosted rendezvous) to link
+the daemon for discovery. `intendant service
 install|uninstall|status` manages the scheduled task directly once built.
 The claim code links discovery metadata only and grants no daemon access.
 Establish control from a trusted local or independently reached daemon-served

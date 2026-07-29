@@ -727,11 +727,16 @@ With custody and leases in place, standing up a new daemon copies no
 provider secrets. Connect discovery remains a roughly ninety-second browser
 flow, while ownership deliberately requires a trusted anchor:
 
-1. **Install**: `curl -fsSL https://intendant.dev/install.sh | sh` on the
-   fresh box (every rendezvous — hosted or self-run — serves its own
-   version-matched installer at `/install.sh`). On Windows the same step is
-   `& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))` from
-   PowerShell. On an unattended box add `--service` (`-Service`):
+1. **Install**:
+   `curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh`
+   on the fresh box — the installer is a release-pinned GitHub asset
+   (stamped with its release, hash-committed to the transparency log,
+   fail-closed on a mismatched checkout); a rendezvous no longer serves the
+   script body, at most a redirect to that asset. On Windows the same step
+   is
+   `& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1)))`
+   from PowerShell. Add `--connect` (`-Connect`) with the rendezvous URL to
+   link discovery. On an unattended box add `--service` (`-Service`):
    `intendant service install` picks the platform's native supervisor —
    systemd **where present**, launchd on macOS, Task Scheduler on
    Windows, cron `@reboot` plus the built-in restart supervisor on
@@ -793,7 +798,7 @@ create the missing cross-origin delivery bridge.
 5. ✅ Client-egress mechanism for Anthropic/Gemini on an authorized control
    channel (host-allowlisted browser relay, credit-windowed streaming, probe);
    **not reachable from the Connect account vault until a trusted bridge ships**.
-6. ✅ Hosted installers leave route linking authority-free by default;
+6. ✅ Installers leave route linking authority-free by default;
    legacy `--owner <browser-key>` bootstrap is retired/rejected rather than
    shipping an incomplete certless key-auth protocol.
 7. ⏳ Independently trusted client bridge for transferring or spending a
