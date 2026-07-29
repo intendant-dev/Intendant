@@ -1859,14 +1859,8 @@ mod tests {
         let resets_at = Some(now_epoch + 3_600);
 
         for turn_had_started in [true, false] {
-            let (park, line) = backend_started_limit_park(
-                resets_at,
-                now,
-                now_epoch,
-                1,
-                30,
-                turn_had_started,
-            );
+            let (park, line) =
+                backend_started_limit_park(resets_at, now, now_epoch, 1, 30, turn_had_started);
             assert_eq!(
                 line,
                 limit_park_log_line(resets_at, now_epoch, park.pending.is_some()),
@@ -1935,7 +1929,10 @@ mod tests {
             Some(LIMIT_MIDTURN_CONTINUATION_TEXT.to_string())
         );
         let (second, _) = next_parked_follow_up(&mut parked_follow_ups, &mut cancelled);
-        assert_eq!(second.map(|m| m.text), Some("queued during park".to_string()));
+        assert_eq!(
+            second.map(|m| m.text),
+            Some("queued during park".to_string())
+        );
     }
 
     #[test]
