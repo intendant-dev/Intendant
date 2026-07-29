@@ -38,7 +38,9 @@
 //! crash windows (a `prepared` row without a terminal re-delivers on the
 //! next wake, whichever daemon holds the lease by then).
 
-use super::types::{AgendaEffect, AgendaItem, AgendaStatus, BindingRef, RecurrenceSpec};
+use super::types::{
+    AgendaEffect, AgendaItem, AgendaStatus, AgendaWatchedBy, BindingRef, RecurrenceSpec,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -985,7 +987,7 @@ pub(crate) struct TriggerDue {
 
 /// The trigger derivation, pure over the fold + journal-derived
 /// exclusion set. ONE implementation shared by [`plan`] and
-/// [`effect_next_fire_ms`] (the differential pin covers the trigger
+/// [`effect_planner_view`] (the differential pin covers the trigger
 /// cases), mirroring the [`series_instants`] discipline.
 ///
 /// Floors, in force for BOTH kinds: the ARM floor
@@ -1094,7 +1096,8 @@ pub(crate) fn trigger_due(
 /// from the daemon marks the item spent for this effect. Attribution-
 /// checked — the text prefix alone gates nothing (a non-daemon writer
 /// echoing the marker changes nothing, per the unverified-label
-/// doctrine).
+/// doctrine). The candidate-walk hot path; the full parse of the same
+/// marker format lives in [`trigger_consumed_markers`].
 fn trigger_consumed(item: &AgendaItem, effect_id: &str) -> bool {
     let marker = format!(
         "{}effect={effect_id} ",
@@ -1107,10 +1110,35 @@ fn trigger_consumed(item: &AgendaItem, effect_id: &str) -> bool {
     })
 }
 
+/// Every attribution-checked consumed-marker on the item, parsed to
+/// `(effect_id, occurrence_id)` — the `watched_by` decoration's join key
+/// into the occurrence journal (the marker text names the exact firing
+/// that took the item, written by the dispatcher). Same attribution and
+/// text shape [`trigger_consumed`] gates on; a marker that does not
+/// parse claims nothing.
+fn trigger_consumed_markers(item: &AgendaItem) -> Vec<(String, String)> {
+    item.annotations
+        .iter()
+        .filter(|note| {
+            note.kind.as_deref() == Some("daemon")
+                && note.source.as_deref() == Some(super::types::TRIGGER_CONSUMED_SOURCE)
+        })
+        .filter_map(|note| {
+            let rest = note
+                .text
+                .strip_prefix(super::types::TRIGGER_CONSUMED_PREFIX)?;
+            let mut tokens = rest.split_whitespace();
+            let effect_id = tokens.next()?.strip_prefix("effect=")?;
+            let occurrence_id = tokens.next()?.strip_prefix("occurrence=")?;
+            Some((effect_id.to_string(), occurrence_id.to_string()))
+        })
+        .collect()
+}
+
 /// A standing series' planner-relevant instants at one moment, from
 /// [`series_instants`] — the single implementation of the recurrence
 /// k-index math (G3-pre), shared by [`plan`] and the display-only
-/// [`effect_next_fire_ms`] derivation so the two can never drift.
+/// [`effect_planner_view`] derivation so the two can never drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SeriesInstants {
     /// The latest due series instant — the one catch-up the planner
@@ -1387,39 +1415,55 @@ pub(crate) fn plan(
     plan
 }
 
-/// The next instant `effect` would actually fire, by [`plan`]'s own rules
-/// — the dashboard's display-only derivation (decorated onto the DTO at
-/// the serving seam, never stored, never folded from ops). `None` means
-/// nothing will fire: unapproved (an approval binds the current digest or
-/// does not exist), suspended, a spent or in-flight one-shot, an
-/// exhausted series.
-///
-/// Mirrors `plan` exactly, candidate for candidate: the same
-/// [`series_instants`] math, the same journal dedup (a `prepared`,
-/// `started`, or terminal occurrence never re-fires — `prepared` resolves
-/// through the crashed lane, fail-closed), the same staleness
-/// classification (a due instant past the window is `missed`, not a
-/// fire), and the same requested-instant handling (every pending request
-/// is a candidate; spent ones are journal-deduped). The one deliberate
-/// difference: transient execution state — the scheduler's private
-/// in-flight set, and the no-overlap hold while a run of this effect is
-/// still `started` (per the effect object or any started-without-terminal
-/// journal row of the item) — only DELAYS a fire, so a due instant held
-/// by either keeps showing here (it fires when the run settles;
-/// mid-dispatch, the write-back settles the display). The
-/// `next_fire_agrees_with_the_planner` differential test pins this mirror
-/// to `plan` itself.
-pub(crate) fn effect_next_fire_ms(
+/// One effect's planner-derived display state at one moment: the next
+/// fire instant plus, for an armed healthy trigger, the [`TriggerDue`]
+/// behind it — kept instead of dropped so the `watched_by` decoration
+/// can invert `matched_item_ids` from the SAME call the next-fire
+/// derivation already makes.
+#[derive(Debug, Default)]
+pub(crate) struct EffectPlannerView {
+    /// The next instant `effect` would actually fire, by [`plan`]'s own
+    /// rules — the dashboard's display-only derivation (decorated onto
+    /// the DTO at the serving seam, never stored, never folded from
+    /// ops). `None` means nothing will fire: unapproved (an approval
+    /// binds the current digest or does not exist), suspended, a spent
+    /// or in-flight one-shot, an exhausted series.
+    pub(crate) next_fire_ms: Option<u64>,
+    /// The trigger derivation's answer, present only while the watcher
+    /// can deliver: approval bound, not suspended, a cause exists. The
+    /// journal dedup never clears it — a spent cause with the
+    /// occurrence still running is covered machinery, not silence.
+    pub(crate) trigger: Option<TriggerDue>,
+}
+
+/// The planner mirrored for display ([`EffectPlannerView`]), candidate
+/// for candidate: the same [`series_instants`] math, the same journal
+/// dedup (a `prepared`, `started`, or terminal occurrence never
+/// re-fires — `prepared` resolves through the crashed lane,
+/// fail-closed), the same staleness classification (a due instant past
+/// the window is `missed`, not a fire), and the same requested-instant
+/// handling (every pending request is a candidate; spent ones are
+/// journal-deduped). The one deliberate difference: transient execution
+/// state — the scheduler's private in-flight set, and the no-overlap
+/// hold while a run of this effect is still `started` (per the effect
+/// object or any started-without-terminal journal row of the item) —
+/// only DELAYS a fire, so a due instant held by either keeps showing
+/// here (it fires when the run settles; mid-dispatch, the write-back
+/// settles the display). The `next_fire_agrees_with_the_planner`
+/// differential test pins this mirror to `plan` itself.
+pub(crate) fn effect_planner_view(
     items: &[AgendaItem],
     item: &AgendaItem,
     effect: &AgendaEffect,
     journal: &OccurrenceJournal,
     staleness_ms: u64,
     now_ms: u64,
-) -> Option<u64> {
-    let approval = effect.approval.as_ref()?;
+) -> EffectPlannerView {
+    let Some(approval) = effect.approval.as_ref() else {
+        return EffectPlannerView::default();
+    };
     if effect.suspended() {
-        return None;
+        return EffectPlannerView::default();
     }
     // Candidate instants as (fire, identity), exactly as `plan` assembles
     // them — including the trigger lane (Track T), which shares
@@ -1432,10 +1476,12 @@ pub(crate) fn effect_next_fire_ms(
         *upcoming = Some(upcoming.map_or(instant, |cur: u64| cur.min(instant)));
     }
     let triggered = effect.manifest.trigger.is_some();
+    let mut trigger: Option<TriggerDue> = None;
     if let Some(trig) = &effect.manifest.trigger {
         let started = journal.started_sessions_for_item(&item.id);
         if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started) {
             candidates.push((due.due_ms, due.cause_ms));
+            trigger = Some(due);
         }
         for req in &effect.requested {
             candidates.push((req.at_ms, req.at_ms));
@@ -1477,7 +1523,10 @@ pub(crate) fn effect_next_fire_ms(
             fires_next_pass = Some(fires_next_pass.map_or(instant, |cur| cur.min(instant)));
         }
     }
-    fires_next_pass.or(upcoming)
+    EffectPlannerView {
+        next_fire_ms: fires_next_pass.or(upcoming),
+        trigger,
+    }
 }
 
 /// When quiet hours would defer this item's pending reminder, the instant
@@ -1520,11 +1569,19 @@ pub(crate) fn reminder_deferred_until(
 }
 
 /// Stamp the DTO's display-only planner fields onto `items` in place:
-/// [`effect_next_fire_ms`] on every open item's effects and
-/// [`reminder_deferred_until`] on every item. The serving seam
-/// (`AgendaHandle`) calls this on freshly folded clones with the clock
-/// of the read — the fold product itself always carries `None`.
+/// [`effect_planner_view`]'s next fire on every open item's effects,
+/// [`reminder_deferred_until`] and the `watched_by` classification on
+/// every item. The serving seam (`AgendaHandle`) calls this on freshly
+/// folded clones with the clock of the read — the fold product itself
+/// always carries `None`.
+///
+/// `context` is the full folded set when `items` is only a slice of it
+/// (the single-item `agenda_changed` broadcast path): the trigger lane
+/// reads ACROSS items — dependency statuses, match candidates, watcher
+/// effects — so a lone item decorated against itself starves every
+/// cross-item derivation. `None` means `items` IS the full set.
 pub(crate) fn decorate_planner_fields(
+    context: Option<&[AgendaItem]>,
     items: &mut [AgendaItem],
     journal: &OccurrenceJournal,
     policy: &ReminderPolicy,
@@ -1533,29 +1590,140 @@ pub(crate) fn decorate_planner_fields(
 ) {
     let staleness_ms = policy.staleness_ms();
     // The trigger lane (Track T) reads ACROSS items — dependency
-    // statuses, match candidates — so next-fire values are computed in
+    // statuses, match candidates — so planner views are computed in
     // an immutable pass and stamped in a second. Same values, no
     // aliasing; non-open items keep the fold's `None` (the planner
     // considers open items only — nothing fires).
-    let next_fires: Vec<Vec<Option<u64>>> = items
+    let universe: &[AgendaItem] = context.unwrap_or(items);
+    let views: Vec<Vec<Option<EffectPlannerView>>> = items
         .iter()
         .map(|item| {
             item.effects
                 .iter()
                 .map(|effect| {
-                    (item.status == AgendaStatus::Open)
-                        .then(|| {
-                            effect_next_fire_ms(items, item, effect, journal, staleness_ms, now_ms)
-                        })
-                        .flatten()
+                    (item.status == AgendaStatus::Open).then(|| {
+                        effect_planner_view(universe, item, effect, journal, staleness_ms, now_ms)
+                    })
                 })
                 .collect()
         })
         .collect();
-    for (item, fires) in items.iter_mut().zip(next_fires) {
+    // The watched_by inversion — needs-you is the unwatched complement,
+    // so the claim source is the planner's own match derivation: every
+    // open watcher whose armed, non-suspended matcher currently covers
+    // an item claims it. Watchers in the stamped slice reuse the views
+    // computed above (one [`trigger_due`] call per effect per pass);
+    // watchers only in the context get their own call.
+    let mut watched: BTreeMap<String, AgendaWatchedBy> = BTreeMap::new();
+    for (item, item_views) in items.iter().zip(&views) {
+        for (effect, view) in item.effects.iter().zip(item_views) {
+            if let Some(due) = view.as_ref().and_then(|view| view.trigger.as_ref()) {
+                claim_watched(&mut watched, item, effect, due);
+            }
+        }
+    }
+    if context.is_some() {
+        let stamped: std::collections::BTreeSet<&str> =
+            items.iter().map(|item| item.id.as_str()).collect();
+        for watcher in universe {
+            if watcher.status != AgendaStatus::Open || stamped.contains(watcher.id.as_str()) {
+                continue;
+            }
+            for effect in &watcher.effects {
+                let Some(approval) = &effect.approval else {
+                    continue;
+                };
+                if effect.suspended() {
+                    continue;
+                }
+                let Some(trig) = &effect.manifest.trigger else {
+                    continue;
+                };
+                let started = journal.started_sessions_for_item(&watcher.id);
+                if let Some(due) =
+                    trigger_due(universe, watcher, effect, trig, approval.at_ms, &started)
+                {
+                    claim_watched(&mut watched, watcher, effect, &due);
+                }
+            }
+        }
+    }
+    // The consumed lane: an open item a firing already took (the
+    // dispatch-time marker names the exact occurrence) stays watched
+    // while that occurrence is still running — and re-joins needs-you
+    // the moment it settles without closing the item (completed-but-
+    // still-open, crashed, retry-walk-abandoned: every terminal that
+    // leaves the item open means machinery could not deliver).
+    let consumed: Vec<Option<AgendaWatchedBy>> = items
+        .iter()
+        .map(|item| {
+            if item.status != AgendaStatus::Open {
+                return None;
+            }
+            trigger_consumed_markers(item)
+                .into_iter()
+                .find_map(|(effect_id, occurrence_id)| {
+                    let progress = journal.progress(&occurrence_id);
+                    let running = progress.terminal.is_none()
+                        && (progress.prepared || progress.started.is_some());
+                    if !running {
+                        return None;
+                    }
+                    // The claim needs a live name — the watcher item
+                    // owning the effect (`effect_id` is stable across
+                    // re-proposes). A vanished automation claims
+                    // nothing: the item stays needs-you.
+                    universe.iter().find_map(|watcher| {
+                        watcher
+                            .effects
+                            .iter()
+                            .any(|effect| effect.effect_id == effect_id)
+                            .then(|| AgendaWatchedBy {
+                                watcher_item_id: watcher.id.clone(),
+                                watcher_title: watcher.title.clone(),
+                                effect_id: effect_id.clone(),
+                                due_ms: None,
+                            })
+                    })
+                })
+        })
+        .collect();
+    for ((item, item_views), consumed) in items.iter_mut().zip(views).zip(consumed) {
         item.deferred_until = reminder_deferred_until(item, journal, policy, now_ms, minute_of_day);
-        for (effect, fire) in item.effects.iter_mut().zip(fires) {
-            effect.next_fire_ms = fire;
+        // A running consuming occurrence outranks a pending matcher
+        // claim: it is the more concrete promise of delivery.
+        item.watched_by = consumed.or_else(|| watched.remove(&item.id));
+        for (effect, view) in item.effects.iter_mut().zip(item_views) {
+            effect.next_fire_ms = view.and_then(|view| view.next_fire_ms);
+        }
+    }
+}
+
+/// One watcher's claim over each item its trigger derivation matched.
+/// Earliest pickup wins when several automations watch the same item;
+/// ties keep the first claim (walk order — deterministic because the
+/// fold is).
+fn claim_watched(
+    watched: &mut BTreeMap<String, AgendaWatchedBy>,
+    watcher: &AgendaItem,
+    effect: &AgendaEffect,
+    due: &TriggerDue,
+) {
+    for matched_id in &due.matched_item_ids {
+        let replace = match watched.get(matched_id) {
+            None => true,
+            Some(cur) => cur.due_ms.is_some_and(|cur_due| due.due_ms < cur_due),
+        };
+        if replace {
+            watched.insert(
+                matched_id.clone(),
+                AgendaWatchedBy {
+                    watcher_item_id: watcher.id.clone(),
+                    watcher_title: watcher.title.clone(),
+                    effect_id: effect.effect_id.clone(),
+                    due_ms: Some(due.due_ms),
+                },
+            );
         }
     }
 }
@@ -1594,6 +1762,7 @@ mod tests {
             part_of: None,
             relates_to: Vec::new(),
             deferred_until: None,
+            watched_by: None,
         }
     }
 
@@ -2716,7 +2885,7 @@ mod tests {
         }
     }
 
-    /// The differential pin: whatever `effect_next_fire_ms` claims must
+    /// The differential pin: whatever `effect_planner_view` claims must
     /// be exactly what `plan` does with the same inputs — a due claim is
     /// a spawn on the next pass, a future claim is the wake instant, and
     /// `None` plans no spawn and no wake (single-effect, no-reminder
@@ -2741,7 +2910,8 @@ mod tests {
         now_ms: u64,
     ) -> Option<u64> {
         let effect = &item.effects[0];
-        let next = effect_next_fire_ms(items, item, effect, journal, policy.staleness_ms(), now_ms);
+        let next = effect_planner_view(items, item, effect, journal, policy.staleness_ms(), now_ms)
+            .next_fire_ms;
         let planned = plan(
             items,
             journal,
@@ -3091,7 +3261,7 @@ mod tests {
         let mut items = vec![plain];
         items[0].due_ms = Some(now - 1_000);
         let at_23 = |_: u64| 23 * 60;
-        decorate_planner_fields(&mut items, &journal, &policy, now, &at_23);
+        decorate_planner_fields(None, &mut items, &journal, &policy, now, &at_23);
         let json = serde_json::to_value(&items[0]).unwrap();
         assert_eq!(
             json["deferred_until"].as_u64(),
@@ -3106,7 +3276,7 @@ mod tests {
         let mut done = vec![one_shot_item("ser-done", now + 5_000)];
         done[0].status = AgendaStatus::Done;
         done[0].due_ms = Some(now - 1_000);
-        decorate_planner_fields(&mut done, &journal, &policy, now, &at_23);
+        decorate_planner_fields(None, &mut done, &journal, &policy, now, &at_23);
         assert_eq!(done[0].deferred_until, None);
         assert_eq!(done[0].effects[0].next_fire_ms, None);
     }
@@ -3932,5 +4102,180 @@ mod tests {
         );
         assert!(planned.missed_sessions.is_empty(), "never missed");
         assert_eq!(planned.spawn.len(), 1, "fires on wake regardless of gap");
+    }
+
+    // ---- watched_by: the needs-you complement ----
+
+    fn decorate(items: &mut [AgendaItem], journal: &OccurrenceJournal, now: u64) {
+        let noon = |_: u64| 12 * 60;
+        decorate_planner_fields(None, items, journal, &ReminderPolicy::default(), now, &noon);
+    }
+
+    /// needs-you is the unwatched complement: exactly the items the
+    /// armed matcher's own derivation reports carry `watched_by`; every
+    /// exclusion the planner applies — wrong tags, parked before the arm
+    /// floor, parked by a session the effect's firings started, done —
+    /// leaves the item unwatched (only the owner can handle it). The
+    /// watcher never claims itself.
+    #[test]
+    fn needs_you_is_the_unwatched_complement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        // A prior firing started sess-fired for the watcher item — the
+        // loop-exclusion input.
+        for state in [OccurrenceState::Prepared, OccurrenceState::Started] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 15_000,
+                    occurrence_id: "occ-prior".into(),
+                    item_id: "steward".into(),
+                    due_ms: 15_000,
+                    state,
+                    urgency: None,
+                    session_id: matches!(state, OccurrenceState::Started)
+                        .then(|| "sess-fired".to_string()),
+                    generation: None,
+                    boot_id: None,
+                })
+                .unwrap();
+        }
+        let watcher = triggered_item("steward", gate_trigger(), 10_000, 10_000);
+        let covered = matching_question("q-covered", 20_000, None);
+        let mut wrong_tags = matching_question("q-tags", 20_000, None);
+        wrong_tags.tags = vec!["other".into()];
+        let pre_arm = matching_question("q-backlog", 9_000, None);
+        let self_parked = matching_question("q-loop", 21_000, Some("sess-fired"));
+        let mut done = matching_question("q-done", 21_500, None);
+        done.status = AgendaStatus::Done;
+        let mut items = vec![watcher, covered, wrong_tags, pre_arm, self_parked, done];
+        decorate(&mut items, &journal, 30_000);
+
+        let by_id = |id: &str| items.iter().find(|item| item.id == id).unwrap();
+        let watched = by_id("q-covered").watched_by.as_ref().expect("covered");
+        assert_eq!(watched.watcher_item_id, "steward");
+        assert_eq!(watched.watcher_title, "item steward");
+        assert_eq!(watched.effect_id, "ef-1");
+        assert_eq!(
+            watched.due_ms,
+            Some(20_000 + TRIGGER_BATCH_WINDOW_MS),
+            "pickup = the batching window after the covered arrival \
+             (excluded items never move the window)"
+        );
+        for unwatched in ["steward", "q-tags", "q-backlog", "q-loop", "q-done"] {
+            assert_eq!(
+                by_id(unwatched).watched_by,
+                None,
+                "{unwatched} is the owner's — no healthy matcher covers it"
+            );
+        }
+        // The stamped watcher also carries the trigger-lane next fire —
+        // the shared derivation, one call.
+        assert_eq!(
+            by_id("steward").effects[0].next_fire_ms,
+            Some(20_000 + TRIGGER_BATCH_WINDOW_MS)
+        );
+    }
+
+    /// A sick watcher returns its items to needs-you: suspension and a
+    /// lost approval clear the pending claim, and a consumed question
+    /// stays watched only while the consuming occurrence is running —
+    /// crash residue (terminal `unknown`), abandonment, or a completed
+    /// firing that left the question open all hand it back to the owner.
+    #[test]
+    fn sick_watcher_returns_item_to_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let noon = |_: u64| 12 * 60;
+
+        // Suspended: the failure streak reached the threshold.
+        let mut suspended = triggered_item("steward", gate_trigger(), 10_000, 10_000);
+        suspended.effects[0].consecutive_failures = 3;
+        let mut items = vec![suspended, matching_question("q1", 20_000, None)];
+        decorate_planner_fields(None, &mut items, &journal, &policy, 30_000, &noon);
+        assert_eq!(items[1].watched_by, None, "suspension escalates");
+
+        // Unapproved: a re-propose voided the approval.
+        let mut unapproved = triggered_item("steward", gate_trigger(), 10_000, 10_000);
+        unapproved.effects[0].approval = None;
+        let mut items = vec![unapproved, matching_question("q1", 20_000, None)];
+        decorate_planner_fields(None, &mut items, &journal, &policy, 30_000, &noon);
+        assert_eq!(items[1].watched_by, None, "no approval, no watcher");
+
+        // Consumed questions: the marker names the occurrence; its
+        // journal progress decides. Running (prepared, and started)
+        // keeps the claim with no pending instant; a crashed or
+        // completed-but-unresolved firing does not.
+        let consumed_by = |id: &str, occurrence: &str| {
+            let mut question = matching_question(id, 20_000, None);
+            question.annotations.push(AgendaAnnotation {
+                text: format!("trigger-consumed effect=ef-1 occurrence={occurrence}"),
+                at_ms: 20_500,
+                principal: None,
+                session_id: None,
+                kind: Some("daemon".into()),
+                source: Some("trigger-evaluator".into()),
+            });
+            question
+        };
+        let record = |occurrence: &str, state: OccurrenceState, session: Option<&str>| {
+            OccurrenceRecord {
+                v: 1,
+                at_ms: 21_000,
+                occurrence_id: occurrence.into(),
+                item_id: "steward".into(),
+                due_ms: 21_000,
+                state,
+                urgency: None,
+                session_id: session.map(Into::into),
+                generation: None,
+                boot_id: None,
+            }
+        };
+        journal
+            .append(&record("occ-dispatching", OccurrenceState::Prepared, None))
+            .unwrap();
+        for row in [
+            record("occ-live", OccurrenceState::Prepared, None),
+            record("occ-live", OccurrenceState::Started, Some("sess-live")),
+            record("occ-crash", OccurrenceState::Prepared, None),
+            record("occ-crash", OccurrenceState::Unknown, None),
+            record("occ-shrug", OccurrenceState::Prepared, None),
+            record("occ-shrug", OccurrenceState::Started, Some("sess-done")),
+            record("occ-shrug", OccurrenceState::Completed, Some("sess-done")),
+        ] {
+            journal.append(&row).unwrap();
+        }
+        let mut items = vec![
+            triggered_item("steward", gate_trigger(), 10_000, 10_000),
+            consumed_by("q-dispatching", "occ-dispatching"),
+            consumed_by("q-live", "occ-live"),
+            consumed_by("q-crash", "occ-crash"),
+            consumed_by("q-open-after-run", "occ-shrug"),
+        ];
+        decorate_planner_fields(None, &mut items, &journal, &policy, 30_000, &noon);
+        let by_id = |id: &str| items.iter().find(|item| item.id == id).unwrap();
+        for running in ["q-dispatching", "q-live"] {
+            let watched = by_id(running)
+                .watched_by
+                .as_ref()
+                .unwrap_or_else(|| panic!("{running}: a running firing is covered machinery"));
+            assert_eq!(watched.watcher_title, "item steward");
+            assert_eq!(
+                watched.due_ms, None,
+                "{running}: no pending instant — the occurrence is already running"
+            );
+        }
+        assert_eq!(
+            by_id("q-crash").watched_by,
+            None,
+            "crash residue over a spent cause is the owner's again"
+        );
+        assert_eq!(
+            by_id("q-open-after-run").watched_by,
+            None,
+            "machinery fired and did not resolve it — needs the owner"
+        );
     }
 }
