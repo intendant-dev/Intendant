@@ -65,6 +65,8 @@ pub(crate) use ask::resolution_from_wire;
 #[cfg(test)]
 pub(crate) use reminders::OccurrenceState;
 #[cfg(test)]
+pub(crate) use types::session_manifest_schema_fields;
+#[cfg(test)]
 pub(crate) use types::AgendaAskResolution;
 
 use std::path::{Path, PathBuf};
