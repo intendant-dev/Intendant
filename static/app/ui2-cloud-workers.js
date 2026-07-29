@@ -84,18 +84,131 @@ function renderCloudWorkers() {
   const list = document.getElementById('cloud-workers-list');
   if (!list) return;
   list.textContent = '';
+  cloudSubmitSyncOptions();
   if (!cloudWorkersRows.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
     empty.textContent = cloudWorkersError
       ? 'Cloud workers unavailable'
-      : 'No Codex Cloud tasks tracked yet — submit one with `intendant codex-cloud exec`, then Sync.';
+      : 'No Codex Cloud tasks tracked yet — submit one above, or Sync with provider to pull the task list.';
     list.appendChild(empty);
     return;
   }
   for (const lease of cloudWorkersRows) {
     list.appendChild(cloudWorkerRow(lease));
   }
+}
+
+// ── Submit affordance ──────────────────────────────────────────────────
+//
+// The dashboard's own submit lane: POST /api/codex-cloud/submit (tunnel
+// twin api_codex_cloud_submit) rides the same daemon-side submission path
+// as `intendant codex-cloud exec` and the submit_codex_cloud_task MCP
+// tool — one path, three frontends. A successful submit records the lease
+// in the store before the response returns, so the immediate re-sync
+// lists the task even when the provider window lags.
+
+let cloudSubmitInFlight = false;
+
+const CLOUD_SUBMIT_ENV_STORE = 'intendant.ui2.cloudSubmitEnv';
+
+function cloudSubmitStatus(text, isError) {
+  const el = document.getElementById('cloud-submit-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.toggle('cloud-submit-status-error', Boolean(isError));
+}
+
+// Environment suggestions derive from the daemon's tracked leases — there
+// is no provider env-list verb, so environments the daemon has seen (plus
+// the last one submitted from this browser) are the honest vocabulary.
+function cloudSubmitSyncOptions() {
+  const datalist = document.getElementById('cloud-submit-env-options');
+  if (datalist) {
+    const seen = new Map();
+    for (const lease of cloudWorkersRows) {
+      const id = String(lease.environment_id || '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.set(id, String(lease.environment_label || '').trim());
+    }
+    datalist.replaceChildren();
+    for (const [id, label] of seen) {
+      const option = document.createElement('option');
+      option.value = id;
+      if (label) option.label = label;
+      datalist.appendChild(option);
+    }
+  }
+  const env = document.getElementById('cloud-submit-env');
+  if (env && !env.value) {
+    let remembered = '';
+    try { remembered = localStorage.getItem(CLOUD_SUBMIT_ENV_STORE) || ''; } catch (e) { /* private mode */ }
+    const fromRows = cloudWorkersRows
+      .map((lease) => String(lease.environment_id || '').trim())
+      .find(Boolean) || '';
+    env.value = remembered || fromRows;
+  }
+}
+
+async function submitCloudTask(ev) {
+  if (ev && ev.preventDefault) ev.preventDefault();
+  if (cloudSubmitInFlight) return false;
+  const promptEl = document.getElementById('cloud-submit-prompt');
+  const envEl = document.getElementById('cloud-submit-env');
+  const prompt = ((promptEl && promptEl.value) || '').trim();
+  const environment = ((envEl && envEl.value) || '').trim();
+  if (!prompt) {
+    cloudSubmitStatus('A task prompt is required.', true);
+    if (promptEl) promptEl.focus();
+    return false;
+  }
+  if (!environment) {
+    cloudSubmitStatus('A Codex Cloud environment id is required.', true);
+    if (envEl) envEl.focus();
+    return false;
+  }
+  const params = { environment_id: environment, prompt };
+  const branchEl = document.getElementById('cloud-submit-branch');
+  const branch = ((branchEl && branchEl.value) || '').trim();
+  if (branch) params.branch = branch;
+  const attemptsEl = document.getElementById('cloud-submit-attempts');
+  const attempts = parseInt((attemptsEl && attemptsEl.value) || '', 10);
+  if (Number.isFinite(attempts) && attempts >= 1) params.attempts = attempts;
+  const titleEl = document.getElementById('cloud-submit-title');
+  const title = ((titleEl && titleEl.value) || '').trim();
+  if (title) params.title = title;
+
+  cloudSubmitInFlight = true;
+  const go = document.getElementById('cloud-submit-go');
+  if (go) { go.disabled = true; go.textContent = 'Submitting…'; }
+  cloudSubmitStatus('Submitting to Codex Cloud…');
+  try {
+    const resp = await daemonApi.request('api_codex_cloud_submit', params);
+    if (resp.ok && resp.body && resp.body.task_id) {
+      try { localStorage.setItem(CLOUD_SUBMIT_ENV_STORE, environment); } catch (e) { /* private mode */ }
+      if (promptEl) promptEl.value = '';
+      if (titleEl) titleEl.value = '';
+      cloudSubmitStatus(`Task ${resp.body.task_id} submitted — tracked below; syncing with the provider…`);
+      await loadCloudWorkers(true);
+      cloudSubmitStatus(`Task ${resp.body.task_id} submitted.`);
+    } else if (resp.ok) {
+      // The submission went through but the Codex CLI output carried no
+      // task id — the provider sync is how the lease store finds it.
+      cloudSubmitStatus('Submitted, but the Codex CLI did not report a task id — syncing to find it…');
+      await loadCloudWorkers(true);
+    } else {
+      cloudSubmitStatus(
+        (resp.body && resp.body.error) || `Submit failed (${resp.status}).`,
+        true,
+      );
+    }
+  } catch (e) {
+    cloudSubmitStatus(String((e && e.message) || e), true);
+  } finally {
+    cloudSubmitInFlight = false;
+    if (go) { go.disabled = false; go.textContent = 'Submit task'; }
+  }
+  return false;
 }
 
 function cloudWorkerRow(lease) {
@@ -459,3 +572,4 @@ window.loadCloudWorkers = loadCloudWorkers;
 window.cloudWorkersOnShown = cloudWorkersOnShown;
 window.openCloudWorkerDisplay = openCloudWorkerDisplay;
 window.closeCloudWorkerDisplay = closeCloudWorkerDisplay;
+window.submitCloudTask = submitCloudTask;

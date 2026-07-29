@@ -65,6 +65,87 @@ pub(crate) async fn handle_codex_cloud_workers(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Body of `POST /api/codex-cloud/submit`, mirroring the
+/// `submit_codex_cloud_task` MCP tool's parameter names (and the
+/// `codex-cloud exec` flags they wrap).
+fn parse_codex_cloud_submit_body(
+    body: &str,
+) -> Result<crate::codex_cloud::SubmitTaskRequest, String> {
+    #[derive(serde::Deserialize)]
+    struct SubmitBody {
+        environment_id: String,
+        prompt: String,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        attempts: Option<u16>,
+        #[serde(default)]
+        title: Option<String>,
+    }
+    let parsed: SubmitBody =
+        serde_json::from_str(body).map_err(|error| format!("invalid submit request: {error}"))?;
+    let environment = parsed.environment_id.trim().to_string();
+    if environment.is_empty() {
+        return Err("environment_id cannot be empty".to_string());
+    }
+    let prompt = parsed.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("prompt cannot be empty".to_string());
+    }
+    let attempts = parsed.attempts.unwrap_or(1);
+    if attempts == 0 {
+        return Err("attempts must be a positive integer".to_string());
+    }
+    Ok(crate::codex_cloud::SubmitTaskRequest {
+        environment,
+        branch: parsed
+            .branch
+            .map(|branch| branch.trim().to_string())
+            .filter(|branch| !branch.is_empty()),
+        attempts,
+        title: parsed
+            .title
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty()),
+        prompt,
+        probe: false,
+    })
+}
+
+/// Transport-neutral core of `POST /api/codex-cloud/submit` (tunnel twin
+/// `api_codex_cloud_submit`): the dashboard's submit affordance, riding
+/// the same submission lane as `intendant codex-cloud exec` and the
+/// `submit_codex_cloud_task` MCP tool — `codex_cloud::submit_task`
+/// through the daemon host's authenticated Codex CLI. A successful
+/// submit records the worker lease in the store before responding, so
+/// the next workers read lists the task without waiting for a provider
+/// sync. Request problems are 400s; a Codex CLI failure (missing binary,
+/// not authenticated, provider rejection) is a 502 carrying the lane's
+/// error string verbatim.
+pub(crate) async fn codex_cloud_submit_api_response(body: &str) -> ApiResponse {
+    let request = match parse_codex_cloud_submit_body(body) {
+        Ok(request) => request,
+        Err(error) => return ApiResponse::json_error(400, error),
+    };
+    match crate::codex_cloud::submit_task(&crate::codex_cloud::state_path(), request).await {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
+            Err(error) => ApiResponse::json_error(500, format!("serialize submit result: {error}")),
+        },
+        Err(error) => ApiResponse::json_error(502, &error),
+    }
+}
+
+pub(crate) async fn handle_codex_cloud_submit(
+    stream: DemuxStream,
+    body: String,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = codex_cloud_submit_api_response(&body).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 /// Method-exact membership test for the certless carve-out
 /// ([`super::access_gates::allows_remote_certless_http`]): a Codex Cloud
 /// worker redeeming its enrollment token has no client certificate yet —
@@ -138,5 +219,53 @@ async fn codex_cloud_enroll_response(
             ApiResponse::json_error(403, &error)
         }
         Err(error) => ApiResponse::json_error(500, format!("enrollment task: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_codex_cloud_submit_body;
+
+    #[test]
+    fn submit_body_defaults_mirror_the_exec_verb() {
+        let request = parse_codex_cloud_submit_body(
+            r#"{"environment_id":" env-1 ","prompt":"  do the thing  "}"#,
+        )
+        .expect("minimal body parses");
+        assert_eq!(request.environment, "env-1");
+        assert_eq!(request.prompt, "do the thing");
+        assert_eq!(request.attempts, 1);
+        assert_eq!(request.branch, None);
+        assert_eq!(request.title, None);
+        assert!(!request.probe);
+    }
+
+    #[test]
+    fn submit_body_carries_the_optional_exec_flags() {
+        let request = parse_codex_cloud_submit_body(
+            r#"{"environment_id":"env-1","prompt":"p","branch":" main ","attempts":3,"title":" T "}"#,
+        )
+        .expect("full body parses");
+        assert_eq!(request.branch.as_deref(), Some("main"));
+        assert_eq!(request.attempts, 3);
+        assert_eq!(request.title.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn submit_body_rejections_are_request_problems() {
+        assert!(parse_codex_cloud_submit_body("not json").is_err());
+        assert!(parse_codex_cloud_submit_body(r#"{"environment_id":"","prompt":"p"}"#).is_err());
+        assert!(parse_codex_cloud_submit_body(r#"{"environment_id":"e","prompt":"  "}"#).is_err());
+        assert!(parse_codex_cloud_submit_body(
+            r#"{"environment_id":"e","prompt":"p","attempts":0}"#
+        )
+        .is_err());
+        // Whitespace-only optionals normalize to absent, not empty flags.
+        let request = parse_codex_cloud_submit_body(
+            r#"{"environment_id":"e","prompt":"p","branch":"  ","title":""}"#,
+        )
+        .expect("blank optionals parse");
+        assert_eq!(request.branch, None);
+        assert_eq!(request.title, None);
     }
 }

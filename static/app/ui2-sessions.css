@@ -1769,6 +1769,46 @@ html.ui-v2 #tab-sessions .session-card .sc-id { font-family: var(--mono); }
   margin-top: 4px;
 }
 .cloud-workers-hint code { font-family: var(--mono); font-size: 11px; }
+/* The submit affordance: the dashboard's own `codex-cloud exec` lane. */
+.cloud-submit { margin-top: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.cloud-submit-prompt {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 64px;
+  resize: vertical;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+.cloud-submit-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.cloud-submit-field {
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-ctl);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  flex: 1;
+  min-width: 12ch;
+  transition: border-color var(--t-med), box-shadow var(--t-med);
+}
+.cloud-submit-env { font-family: var(--mono); font-size: 11px; flex: 1.4; }
+.cloud-submit-attempts { flex: 0 0 auto; width: 9ch; min-width: 9ch; }
+.cloud-submit-prompt::placeholder, .cloud-submit-field::placeholder { color: var(--text-3); }
+.cloud-submit-prompt:focus, .cloud-submit-field:focus {
+  outline: none;
+  border-color: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
+}
+.cloud-submit-go { flex: 0 0 auto; }
+.cloud-submit-status { color: var(--text-3); font-size: 12px; min-height: 14px; }
+.cloud-submit-status-error { color: var(--yellow, #f9e2af); }
 .cloud-workers-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
 .cloud-workers-status-error { color: var(--yellow, #f9e2af); }
 .cloud-worker-row { padding: 10px 12px; }

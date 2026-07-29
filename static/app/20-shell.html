@@ -1674,8 +1674,20 @@
                 <span class="sessions-title">Cloud Workers</span>
                 <button class="ui-btn sessions-refresh" id="cloud-workers-refresh" onclick="loadCloudWorkers(true)" title="Re-sync the lease store through the Codex CLI">Sync with provider</button>
               </div>
-              <div class="cloud-workers-hint">Codex Cloud tasks tracked as ephemeral worker leases — provider state and live-attachment state are independent. Submit with <code>intendant codex-cloud exec</code>; bring results home with <code>intendant codex-cloud pull</code>.</div>
+              <div class="cloud-workers-hint">Codex Cloud tasks tracked as ephemeral worker leases — provider state and live-attachment state are independent.</div>
             </div>
+            <form class="cloud-submit ui-card" id="cloud-submit-form" onsubmit="return submitCloudTask(event)">
+              <textarea class="cloud-submit-prompt" id="cloud-submit-prompt" rows="3" placeholder="Task for a fresh Codex Cloud worker…"></textarea>
+              <div class="cloud-submit-row">
+                <input class="cloud-submit-field cloud-submit-env" id="cloud-submit-env" list="cloud-submit-env-options" placeholder="Environment id" autocomplete="off" title="Codex Cloud environment id (--env); recent environments are suggested from tracked tasks">
+                <datalist id="cloud-submit-env-options"></datalist>
+                <input class="cloud-submit-field" id="cloud-submit-branch" placeholder="Branch (optional)" autocomplete="off" title="Base branch for the worker (--branch)">
+                <input class="cloud-submit-field cloud-submit-attempts" id="cloud-submit-attempts" type="number" min="1" step="1" value="1" title="Best-of-N attempts (--attempts); pull picks among them">
+                <input class="cloud-submit-field" id="cloud-submit-title" placeholder="Title (optional)" autocomplete="off" title="Local label for the tracked lease">
+                <button type="submit" class="ui-btn cloud-submit-go" id="cloud-submit-go">Submit task</button>
+              </div>
+              <div class="cloud-submit-status" id="cloud-submit-status"></div>
+            </form>
             <div class="sessions-search-status" id="cloud-workers-status"></div>
             <div class="cloud-worker-display" id="cloud-worker-display" hidden></div>
             <div class="cloud-workers-list" id="cloud-workers-list">

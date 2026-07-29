@@ -5609,6 +5609,116 @@ mod tests {
         ));
     }
 
+    /// The dispatch half of derive-don't-mirror (F2, the HS5 ruling's
+    /// class-closing walk): every method the effective table declares
+    /// must BIND in a dispatch lane. The authorizer admits declared
+    /// names and `availability()` advertises them, but the
+    /// method→handler bindings are literal match arms in `dispatch.rs`
+    /// (inline + upload-lane arms) and `api_sessions.rs` (the spawned
+    /// request lane) — a declared name bound in neither answers
+    /// `unknown method` as a DELIVERED response, which the SPA facade
+    /// never falls back from, so the surface dies silently exactly
+    /// where the tunnel is the primary transport (the shipped F2 bug).
+    /// Source-scanned because the arms are `match` literals: a name
+    /// counts as bound when it appears as an arm shape — `"name" =>`,
+    /// `"name" |`, or `"name" if` — outside `//` comments.
+    #[test]
+    fn every_declared_method_binds_in_a_dispatch_lane() {
+        fn collect_match_arm_literals(
+            source: &str,
+            bound: &mut std::collections::BTreeSet<String>,
+        ) {
+            // Strip `//` comments per line (a `//` inside a string
+            // literal is body, not comment), then scan the joined text
+            // so a multi-line or-pattern's first alternative — a lone
+            // `"name"` at end of line, `| "next"` on the following one
+            // (the rustfmt shape) — still reads as an arm.
+            let mut code = String::new();
+            for line in source.lines() {
+                let mut in_string = false;
+                let mut escaped = false;
+                let mut chars = line.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if in_string {
+                        code.push(c);
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            in_string = false;
+                        }
+                    } else if c == '/' && chars.peek() == Some(&'/') {
+                        break;
+                    } else {
+                        code.push(c);
+                        if c == '"' {
+                            in_string = true;
+                        }
+                    }
+                }
+                code.push('\n');
+            }
+            // Quoted literals whose next token is an arm shape.
+            let mut rest = code.as_str();
+            while let Some(open) = rest.find('"') {
+                let tail = &rest[open + 1..];
+                let mut end = None;
+                let mut escaped = false;
+                for (i, c) in tail.char_indices() {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' {
+                        escaped = true;
+                    } else if c == '"' {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                let Some(end) = end else { break };
+                let literal = &tail[..end];
+                let follower = tail[end + 1..].trim_start();
+                if follower.starts_with("=>")
+                    || follower.starts_with('|')
+                    || follower.starts_with("if ")
+                {
+                    bound.insert(literal.to_string());
+                }
+                rest = &tail[end + 1..];
+            }
+        }
+
+        let mut bound = std::collections::BTreeSet::new();
+        // Extractor semantics pinned on a fixture: comment-stripped,
+        // tuple entries excluded, or-patterns (single- and multi-line)
+        // and guards included.
+        collect_match_arm_literals(
+            "\"a\" => x, // \"c1\" =>\n(\"t\", 1)\n\"d\" | \"e\" => y\n\"g\" if z => w\n\"h\"\n| \"i\" => j",
+            &mut bound,
+        );
+        assert_eq!(
+            bound.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["a", "d", "e", "g", "h", "i"],
+            "the arm extractor drifted"
+        );
+        bound.clear();
+
+        for source in [include_str!("dispatch.rs"), include_str!("api_sessions.rs")] {
+            collect_match_arm_literals(source, &mut bound);
+        }
+        let missing: Vec<&str> = all_control_methods()
+            .iter()
+            .filter(|spec| !bound.contains(spec.name))
+            .map(|spec| spec.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared tunnel methods with no dispatch-lane binding — each \
+             would answer `unknown method` as a delivered response (the F2 \
+             dead-surface class): {missing:?}"
+        );
+    }
+
     /// Transport-unification S3 differential pin (design §8, risks
     /// R2/R4): the complete tunnel-method partition — every wire method
     /// name, the declaration source that carries it (`Row` = a `tunnel:`
@@ -5836,6 +5946,7 @@ mod tests {
             ("api_session_current_history", Row, Some(Op::SessionManage)),
             ("api_session_current_rollback", Row, Some(Op::SessionManage)),
             ("api_codex_cloud_workers", Row, Some(Op::StatsRead)),
+            ("api_codex_cloud_submit", Row, Some(Op::Task)),
             ("api_agenda_list", Row, Some(Op::AgendaRead)),
             ("api_agenda_ops", Row, Some(Op::AgendaRead)),
             ("api_agenda_occurrences", Row, Some(Op::AgendaRead)),
@@ -6190,6 +6301,7 @@ mod tests {
             "api_session_current_history",
             "api_session_current_rollback",
             "api_codex_cloud_workers",
+            "api_codex_cloud_submit",
             "api_agenda_list",
             "api_agenda_op",
             "api_agenda_definitions",
