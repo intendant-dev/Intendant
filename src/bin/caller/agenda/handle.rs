@@ -2471,10 +2471,7 @@ mod tests {
         assert_eq!(watched.watcher_title, "Steward gate");
         assert_eq!(
             watched.due_ms,
-            Some(
-                question.provenance.created_ms
-                    + super::super::types::TRIGGER_BATCH_WINDOW_MS
-            ),
+            Some(question.provenance.created_ms + super::super::types::TRIGGER_BATCH_WINDOW_MS),
             "pickup = the planner's batching-window instant"
         );
         // …snapshot reads carry the same derivation…

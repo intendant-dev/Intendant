@@ -4219,8 +4219,8 @@ mod tests {
             });
             question
         };
-        let record = |occurrence: &str, state: OccurrenceState, session: Option<&str>| {
-            OccurrenceRecord {
+        let record =
+            |occurrence: &str, state: OccurrenceState, session: Option<&str>| OccurrenceRecord {
                 v: 1,
                 at_ms: 21_000,
                 occurrence_id: occurrence.into(),
@@ -4231,8 +4231,7 @@ mod tests {
                 session_id: session.map(Into::into),
                 generation: None,
                 boot_id: None,
-            }
-        };
+            };
         journal
             .append(&record("occ-dispatching", OccurrenceState::Prepared, None))
             .unwrap();
