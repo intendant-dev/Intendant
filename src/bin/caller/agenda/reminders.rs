@@ -395,6 +395,12 @@ pub(crate) struct OccurrenceProgress {
     /// pre-stamping build downgrades the occurrence to legacy boot-time
     /// semantics — the fail-closed direction for mixed-version homes.
     pub(crate) writer_boot_id: Option<String>,
+    /// Track AO regeneration ordinal, retained from the last row that
+    /// carried one — DISPLAY-ONLY (the run-line/grid "attempt N" copy):
+    /// identity lives in the occurrence id's retry segment, and no
+    /// planner or recovery decision reads this. Recovery rows carry no
+    /// stamp and never clear it.
+    pub(crate) attempt: Option<u32>,
 }
 
 /// One row of [`OccurrenceJournal::started_unresolved`].
@@ -801,6 +807,9 @@ pub(crate) struct AgendaOccurrencesPage {
 fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
     if !record.item_id.is_empty() && entry.item_id.is_none() {
         entry.item_id = Some(record.item_id.clone());
+    }
+    if record.attempt.is_some() {
+        entry.attempt = record.attempt;
     }
     match record.state {
         OccurrenceState::Prepared => {
@@ -1940,6 +1949,10 @@ pub(crate) fn decorate_planner_fields(
         item.watched_by = consumed.or_else(|| watched.remove(&item.id));
         for (effect, view) in item.effects.iter_mut().zip(item_views) {
             effect.next_fire_ms = view.and_then(|view| view.next_fire_ms);
+            effect.last_run_attempt = effect
+                .last_run
+                .as_ref()
+                .and_then(|run| journal.progress(&run.occurrence_id).attempt);
         }
     }
 }
@@ -2755,6 +2768,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }
@@ -3179,6 +3193,7 @@ mod tests {
                 consecutive_failures: 0,
                 requested: Vec::new(),
                 next_fire_ms: None,
+                last_run_attempt: None,
             });
             base
         };
@@ -3197,6 +3212,69 @@ mod tests {
     }
 
     // ---- Display-only planner derivations (next_fire_ms / deferred_until) ----
+
+    /// Track AO: `last_run_attempt` is a serving-seam decoration from
+    /// the journal fold's display-only `attempt` retention — present
+    /// exactly when the last run's occurrence carries a retry ordinal,
+    /// absent from the wire otherwise (the additive-DTO discipline).
+    /// Retention is last-Some-wins: a stampless recovery row never
+    /// clears the ordinal.
+    #[test]
+    fn last_run_attempt_is_decorated_from_the_journal_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = self::journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let noon = |_: u64| 12 * 60;
+        let mut solo = one_shot_item("solo", 50_000);
+        solo.effects[0].last_run = Some(AgendaRun {
+            occurrence_id: "occ-retry".into(),
+            state: "failed".into(),
+            session_id: None,
+            at_ms: 60_000,
+            note: None,
+            attestation: None,
+        });
+        for (state, attempt) in [
+            (OccurrenceState::Prepared, Some(2)),
+            (OccurrenceState::Started, Some(2)),
+            (OccurrenceState::Unknown, None),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 60_000,
+                    occurrence_id: "occ-retry".into(),
+                    item_id: "solo".into(),
+                    due_ms: 60_000,
+                    state,
+                    urgency: None,
+                    session_id: None,
+                    generation: None,
+                    boot_id: None,
+                    attempt,
+                })
+                .unwrap();
+        }
+        let mut items = vec![solo];
+        decorate_planner_fields(None, &mut items, &journal, &policy, 70_000, &noon);
+        assert_eq!(items[0].effects[0].last_run_attempt, Some(2));
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["effects"][0]["last_run_attempt"], serde_json::json!(2));
+
+        // Attempt-0 (and every legacy) run: no ordinal, no wire field.
+        items[0].effects[0].last_run = Some(AgendaRun {
+            occurrence_id: "occ-plain".into(),
+            state: "completed".into(),
+            session_id: None,
+            at_ms: 61_000,
+            note: None,
+            attestation: None,
+        });
+        decorate_planner_fields(None, &mut items, &journal, &policy, 70_000, &noon);
+        assert_eq!(items[0].effects[0].last_run_attempt, None);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert!(json["effects"][0].get("last_run_attempt").is_none());
+    }
 
     /// An approved one-shot item (no recurrence), effect id `ef-1`.
     fn one_shot_item(id: &str, fire_at: u64) -> AgendaItem {
@@ -3231,6 +3309,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }
@@ -3931,6 +4010,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }

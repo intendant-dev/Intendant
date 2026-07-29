@@ -211,6 +211,12 @@ function agendaHoodOccurrenceLine(item, effect) {
   if (!run) return '';
   let state = run.state;
   let source = 'journal synced before dispatch';
+  // Track AO decorations: the regeneration ordinal (journal display
+  // field, fold-decorated fallback) and the run's self-report — always
+  // labeled as such, never blended into the transport state word.
+  let attempt = effect.last_run_attempt || 0;
+  const attest = run.attestation
+    ? ` · self-reported ${run.attestation.outcome} (the session’s own report — not verified)` : '';
   if (agendaHoodOcc && agendaHoodOcc.itemId !== item.id) {
     // Cache from a previous selection (only reachable when this item's
     // fetch is gated): claim nothing from it.
@@ -221,7 +227,9 @@ function agendaHoodOccurrenceLine(item, effect) {
       .filter((entry) => entry && entry.record
         && entry.record.occurrence_id === run.occurrence_id);
     if (records.length) {
-      state = records[records.length - 1].record.state || state;
+      const last = records[records.length - 1].record;
+      state = last.state || state;
+      attempt = records.reduce((n, entry) => entry.record.attempt || n, attempt);
     } else {
       source = 'fold view — the journal page holds no record for it';
     }
@@ -230,9 +238,10 @@ function agendaHoodOccurrenceLine(item, effect) {
   } else if (agendaHoodOcc && agendaHoodOcc.error) {
     source = 'fold view — journal read unavailable';
   }
+  const attemptPart = attempt > 0 ? ` · attempt ${attempt} (auto-retry)` : '';
   const requested = (effect.requested || []).length;
   const tail = requested ? ` · ${requested} owner run-request${requested > 1 ? 's' : ''}` : '';
-  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state} · ${source}${tail}`)}</div>`;
+  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state}${attemptPart} · ${source}${tail}${attest}`)}</div>`;
 }
 
 function agendaHoodManifestHtml(item) {
@@ -361,6 +370,7 @@ function agendaHoodOpVerb(op, envelope) {
     case 'revoke_effect': return 'approval revoked';
     case 'request_occurrence': return 'run requested';
     case 'record_occurrence': return `run ${op.state || '—'}`;
+    case 'attest': return `attested ${op.outcome || '—'} — self-report`;
     case 'record_ask_delivery':
       return op.delivered === false ? 'delivery pending — no live asker' : 'answer delivered';
     default: return `op · ${type || '—'}`;
@@ -379,6 +389,11 @@ function agendaHoodOpDot(op, known) {
       return op.state === 'completed' || op.state === 'delivered' ? 'green'
         : op.state === 'failed' ? 'rose'
           : op.state === 'started' ? 'iris' : 'amber';
+    // Self-report hues (Q8): achieved is sky — never the transport
+    // green; blocked/abandoned/partial are amber — never rose, which
+    // stays transport-failure.
+    case 'attest':
+      return op.outcome === 'achieved' ? 'sky' : 'amber';
     default: return 'neutral';
   }
 }

@@ -576,6 +576,14 @@ pub struct AgendaEffect {
     /// `None` in the fold product, never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) next_fire_ms: Option<u64>,
+    /// Display-only serving-seam decoration (Track AO, the
+    /// `next_fire_ms` pattern): `last_run`'s regeneration ordinal from
+    /// the occurrence journal fold — present exactly when the run is a
+    /// bounded auto-retry (attempt k>0), so the run line can say
+    /// "attempt 2 (auto-retry)". Always `None` in the fold product,
+    /// never folded from ops, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run_attempt: Option<u32>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -2077,6 +2085,7 @@ pub(crate) fn apply_op(
                 consecutive_failures: 0,
                 requested: Vec::new(),
                 next_fire_ms: None,
+                last_run_attempt: None,
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
                 Some(existing) => {
