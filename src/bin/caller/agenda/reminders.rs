@@ -800,6 +800,15 @@ fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
             entry.prepared = true;
             entry.started = record.session_id.clone();
             entry.writer_boot_id = record.boot_id.clone();
+            // A later `started` re-opens the occurrence: the work
+            // continues under a successor session (the boot-readopt
+            // watch re-keying past recovery's fail-closed `Unknown`),
+            // so the newest state wins — the row is unresolved again,
+            // holds its item's no-overlap gate, and its successor's
+            // terminal will close it. Ordered folds make this safe:
+            // every pre-readopt writer only ever appended `started`
+            // before a terminal.
+            entry.terminal = None;
             if let Some(session_id) = record.session_id.as_ref() {
                 if !entry.started_history.contains(session_id) {
                     entry.started_history.push(session_id.clone());
@@ -1853,6 +1862,64 @@ mod tests {
             end_min: 300,
         };
         assert!(!empty.contains(300));
+    }
+
+    /// The re-open law: a later `started` row supersedes a terminal —
+    /// the occurrence is unresolved again (it re-arms its item's
+    /// no-overlap hold and its successor's terminal closes it), which
+    /// is how the boot-readopt watch re-keys past recovery's
+    /// fail-closed `Unknown`. Ordered folds make it safe: pre-readopt
+    /// writers only ever appended `started` before a terminal.
+    #[test]
+    fn started_reopens_a_terminaled_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let record = |state: OccurrenceState, session: Option<&str>| OccurrenceRecord {
+            v: 1,
+            at_ms: 1_000,
+            occurrence_id: "occ-reopen".to_string(),
+            item_id: "it-reopen".to_string(),
+            due_ms: 1_000,
+            state,
+            urgency: None,
+            session_id: session.map(str::to_string),
+            generation: None,
+            boot_id: None,
+        };
+        journal
+            .append(&record(OccurrenceState::Started, Some("sess-dead")))
+            .unwrap();
+        journal
+            .append(&record(OccurrenceState::Unknown, Some("sess-dead")))
+            .unwrap();
+        assert!(journal.started_unresolved().is_empty(), "fail-closed");
+
+        journal
+            .append(&record(OccurrenceState::Started, Some("sess-successor")))
+            .unwrap();
+        let progress = journal.progress("occ-reopen");
+        assert_eq!(progress.terminal, None, "the later started re-opens it");
+        assert_eq!(progress.started.as_deref(), Some("sess-successor"));
+        assert_eq!(
+            progress.started_history,
+            vec!["sess-dead".to_string(), "sess-successor".to_string()],
+            "both incarnations stay attributed"
+        );
+        assert!(
+            journal.started_unresolved_for_item("it-reopen"),
+            "the no-overlap hold re-arms"
+        );
+
+        // A terminal after the re-open closes it again — the successor's
+        // completion ends the story.
+        journal
+            .append(&record(OccurrenceState::Completed, Some("sess-successor")))
+            .unwrap();
+        assert_eq!(
+            journal.progress("occ-reopen").terminal,
+            Some(OccurrenceState::Completed)
+        );
+        assert!(!journal.started_unresolved_for_item("it-reopen"));
     }
 
     #[test]

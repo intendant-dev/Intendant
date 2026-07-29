@@ -306,6 +306,26 @@ whose writing daemon is provably gone (its per-boot presence lock under
 clobbered by a co-homed boot. `intendant ctl status` shows the lease and
 every registered daemon under `scheduler_lease`.
 
+Recovery fail-closes a dead boot's `started`-without-terminal occurrences to
+`unknown` (never an automatic re-fire of the goal — RFC §7.5), but the
+**boot auto-readopt pass** (`[readopt]`, default on) separately
+resume-attaches the dead boot's mid-work *sessions* — started-without-
+terminal occurrences, mid-turn interruptions, and limit-parked wrappers
+with pending work — under fresh wrappers with a continuation nudge, on the
+automatic resume lane (owner-stopped and retired lineages refuse; a live
+successor is never doubled; suspended series stay down; only the lease
+holder readopts). The scheduler watches each fail-closed occurrence's
+durable resume lineage for a bounded window: when a successor is admitted
+(the readopt pass's, or a manual post-crash resume), it journals a fresh
+`started` row naming the successor — a later `started` **re-opens** a
+terminaled occurrence in the fold — re-arming the item's no-overlap hold
+and letting the successor's terminal close the occurrence normally. Each
+crash cycle still costs one `unknown` on the effect's failure streak until
+a completion resets it, so a crash-looping series suspends and the readopt
+pass respects the suspension — the existing streak law is the crash-loop
+brake. The pass is visible: one summary notification per boot with
+anything mid-work, naming what was resumed and what was left dead and why.
+
 ### Scheduled sessions
 
 Scheduled work is a separate effect object that references an agenda item.

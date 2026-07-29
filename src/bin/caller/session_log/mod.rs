@@ -107,6 +107,30 @@ pub struct SessionMeta {
     /// session-end finish card, and the merge endpoint all derive from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<SessionWorktreeMeta>,
+    /// Durable trace of a live rate-limit park: written when the wrapper
+    /// parks on a provider limit, cleared when the park releases or is
+    /// cancelled. The in-memory park state dies with the daemon, so a
+    /// session still wearing this marker after a boot was limit-parked
+    /// with work owed when its daemon died — the boot auto-readopt
+    /// pass's "limit-parked mid-work" class. Additive: metas written
+    /// before 2026-07 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_park: Option<SessionLimitParkMeta>,
+}
+
+/// A parked rate-limit wait recorded durably (see
+/// [`SessionMeta::limit_park`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionLimitParkMeta {
+    /// The provider-stated reset instant the park targets, when the
+    /// rejection carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_epoch: Option<u64>,
+    /// Whether the park holds a pending re-send/nudge — work still owed
+    /// at the reset (parks always do today; the field keeps the marker
+    /// honest if a pending-less park shape returns).
+    #[serde(default)]
+    pub has_pending: bool,
 }
 
 /// Worktree linkage recorded on a session (see [`SessionMeta::worktree`]).
@@ -617,9 +641,9 @@ impl SessionLog {
         let existing = fs::read_to_string(self.dir.join("session_meta.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok());
-        let (existing_name, existing_worktree) = existing
-            .map(|meta| (meta.name, meta.worktree))
-            .unwrap_or((None, None));
+        let (existing_name, existing_worktree, existing_limit_park) = existing
+            .map(|meta| (meta.name, meta.worktree, meta.limit_park))
+            .unwrap_or((None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -634,6 +658,10 @@ impl SessionLog {
             // Worktree linkage is written once at launch and survives every
             // later meta rewrite (resume, rename), like the session name.
             worktree: existing_worktree,
+            // Park transitions alone touch the marker; a meta rewrite
+            // mid-park (a credential-reload respawn's write_meta) must
+            // not silently release it.
+            limit_park: existing_limit_park,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -657,6 +685,29 @@ impl SessionLog {
             return;
         };
         meta.worktree = Some(worktree.clone());
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record (or clear) the durable rate-limit-park marker in
+    /// `session_meta.json` (see [`SessionMeta::limit_park`]). Missing or
+    /// unreadable meta is a quiet no-op: the marker is best-effort
+    /// recovery evidence, never worth failing a park transition over.
+    pub fn set_limit_park(&self, park: Option<SessionLimitParkMeta>) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta.limit_park == park {
+            return;
+        }
+        meta.limit_park = park;
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
@@ -1750,6 +1801,7 @@ mod tests {
             role: None,
             rounds: None,
             worktree: None,
+            limit_park: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -1859,6 +1911,7 @@ mod tests {
             role: None,
             rounds: None,
             worktree: None,
+            limit_park: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -1880,6 +1933,7 @@ mod tests {
             role: None,
             rounds: None,
             worktree: None,
+            limit_park: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -1942,6 +1996,7 @@ mod tests {
             role: None,
             rounds: None,
             worktree: None,
+            limit_park: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
