@@ -3161,6 +3161,11 @@ mod tests {
             policy("POST", "/api/diagnostics/visual-freshness"),
             BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
         );
+        // The takeover request carries only a display label (HS3).
+        assert_eq!(
+            policy("POST", "/api/daemon/takeover"),
+            BodyPolicy::Capped(4 * 1024)
+        );
         // The agenda command lane accepts the rich-ask park payload: the
         // ≤8 MB preview budget as base64 JSON needs more than Default.
         assert_eq!(

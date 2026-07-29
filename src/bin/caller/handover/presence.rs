@@ -39,13 +39,20 @@ pub(crate) struct PresenceRecord {
     pub(crate) pid: u32,
     pub(crate) port: u16,
     pub(crate) version: BuildVersion,
-    /// `"running"` now; HS3 adds `"draining"`/`"exited"`. Readers must
-    /// tolerate future states.
+    /// `"running"` / `"draining"` / `"exited"`. Readers must tolerate
+    /// future states.
     pub(crate) state: String,
-    /// Supervised-session count, once a reporter exists (HS3 wires the
-    /// drain-exit condition); absent = not reported, never "zero".
+    /// Supervised-session count while draining ("draining · N sessions");
+    /// absent = not reported, never "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_count: Option<u64>,
+    /// The REGISTRATION instant — the era watershed
+    /// (`grid_envelope::resolve_current_boot` reads it as boot-start to
+    /// split current-boot sessions from outage residue, the #638 class).
+    /// Lifecycle rewrites (drain states, session counts) must NEVER
+    /// advance it — a drainer whose watershed kept moving to "now" would
+    /// relabel its own live sessions `preboot` (the HS3 ruling's F1
+    /// amendment). Freshness, if ever wanted, is a NEW field.
     pub(crate) updated_ms: u64,
 }
 
@@ -114,18 +121,27 @@ impl DaemonPresence {
 
     /// Rewrite this boot's record with a new lifecycle state
     /// (`draining`/`exited`). Failure is display debt, never fatal — the
-    /// per-boot lock stays the liveness truth.
+    /// per-boot lock stays the liveness truth. `updated_ms` is the era
+    /// watershed and deliberately NOT advanced (see the field doc; the
+    /// HS3 ruling's F1 amendment).
     pub(crate) fn update_state(&mut self, state: &str) -> std::io::Result<()> {
+        if self.record.state == state {
+            return Ok(());
+        }
         self.record.state = state.to_string();
-        self.record.updated_ms = super::now_ms();
         self.write_record()
     }
 
     /// Rewrite this boot's record with the live supervised-session count
-    /// (the drain views' "draining · N sessions" source).
+    /// (the drain views' "draining · N sessions" source). Write-on-change
+    /// only — the drain exit check runs per supervisor event, and an
+    /// unchanged count must not churn the file. Never advances the era
+    /// watershed (F1).
     pub(crate) fn update_session_count(&mut self, count: u64) -> std::io::Result<()> {
+        if self.record.session_count == Some(count) {
+            return Ok(());
+        }
         self.record.session_count = Some(count);
-        self.record.updated_ms = super::now_ms();
         self.write_record()
     }
 
@@ -258,6 +274,44 @@ mod tests {
         // even though the files are still on disk.
         drop(presence);
         assert!(!boot_id_is_live(dir.path(), "boot-a"));
+    }
+
+    /// The HS3 ruling's F1 amendment: `updated_ms` is the era watershed
+    /// (`grid_envelope::resolve_current_boot`'s boot-start split) —
+    /// drain-lifecycle rewrites and count mirrors must never advance it,
+    /// and unchanged values must not rewrite the file at all.
+    #[test]
+    fn drain_rewrites_preserve_the_era_watershed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut presence = DaemonPresence::register(dir.path(), "boot-a", 8765).expect("register");
+        let json_path = dir.path().join(DAEMONS_DIR).join("boot-a.json");
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap()
+        };
+        let watershed = read()["updated_ms"].as_u64().expect("registration instant");
+
+        presence.update_state("draining").unwrap();
+        presence.update_session_count(3).unwrap();
+        presence.update_session_count(1).unwrap();
+        presence.update_state("exited").unwrap();
+        let after = read();
+        assert_eq!(
+            after["updated_ms"].as_u64(),
+            Some(watershed),
+            "lifecycle rewrites never advance the watershed"
+        );
+        assert_eq!(after["state"], "exited");
+        assert_eq!(after["session_count"], 1);
+
+        // Write-on-change: unchanged values are no-ops. Scribble the file
+        // externally; same-value updates must not clobber the scribble.
+        std::fs::write(&json_path, b"{\"sentinel\":true}").unwrap();
+        presence.update_session_count(1).unwrap();
+        presence.update_state("exited").unwrap();
+        assert_eq!(
+            read()["sentinel"], true,
+            "unchanged lifecycle values never rewrite the file"
+        );
     }
 
     #[test]
