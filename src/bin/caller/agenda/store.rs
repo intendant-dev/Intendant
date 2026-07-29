@@ -2480,7 +2480,21 @@ fn validate_ref(
 /// Presentation only: never stored, never a DTO field; callers invoke it
 /// on detail expand, never on list render.
 pub(crate) fn file_ref_drift(locator: &str, attach_digest: &str) -> &'static str {
-    let path = Path::new(locator);
+    path_ref_drift(Path::new(locator), attach_digest)
+}
+
+/// Track AO attestation-ref drift: the same expand-time honesty check
+/// as [`file_ref_drift`], for `BindingRef`-grammar locators
+/// (`file:<absolute path>`). Verify-only — the pin is re-hashed on
+/// demand; nothing is sealed and nothing is stored (Q3/OPEN-3).
+pub(crate) fn attestation_ref_drift(locator: &str, attest_sha256: &str) -> &'static str {
+    match binding_ref_path(locator) {
+        Ok(path) => path_ref_drift(path, attest_sha256),
+        Err(_) => "missing",
+    }
+}
+
+fn path_ref_drift(path: &Path, attach_digest: &str) -> &'static str {
     let Ok(meta) = std::fs::metadata(path) else {
         return "missing";
     };
@@ -4146,6 +4160,29 @@ mod tests {
         assert_eq!(file_ref_drift(&loc, &attach), "changed");
         std::fs::remove_file(&path).unwrap();
         assert_eq!(file_ref_drift(&loc, &attach), "missing");
+    }
+
+    /// Track AO: attestation refs ride the same expand-time judgment
+    /// through their `file:` BindingRef grammar — resolved, re-hashed
+    /// against the attest-time pin, and fail-closed to `missing` for a
+    /// locator outside the v1 scheme (never touching the filesystem).
+    #[test]
+    fn attestation_ref_drift_resolves_the_binding_ref_scheme() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("handoff.md");
+        std::fs::write(&path, b"findings v1").unwrap();
+        let sha = digest_file(&path).unwrap();
+        let locator = format!("file:{}", path.display());
+
+        assert_eq!(attestation_ref_drift(&locator, &sha), "unchanged");
+        std::fs::write(&path, b"findings v2 - drifted").unwrap();
+        assert_eq!(attestation_ref_drift(&locator, &sha), "changed");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(attestation_ref_drift(&locator, &sha), "missing");
+        assert_eq!(
+            attestation_ref_drift("url:https://example.com", &sha),
+            "missing"
+        );
     }
 
     /// The G2 intake omnibus: placement strictness (cycle, self, depth,

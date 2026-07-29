@@ -24007,6 +24007,7 @@ html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
 }
+html.ui-v2 .ag2-chip.t-neutral.dashed { border-color: var(--line-2); }
 html.ui-v2 .ag2-chip.t-green.dashed { border-color: rgba(var(--green-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-amber.dashed { border-color: rgba(var(--amber-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-rose.dashed { border-color: rgba(var(--rose-rgb), 0.45); }
@@ -24202,6 +24203,15 @@ html.ui-v2 .ag2-auto-last.st-unknown,
 html.ui-v2 .ag2-auto-streak { color: var(--rose); font-weight: 600; }
 html.ui-v2 .ag2-auto-last.st-completed { color: var(--green); }
 html.ui-v2 .ag2-auto-run { cursor: pointer; text-decoration: underline; }
+/* Attestation (Track AO) — the self-report axis, never the transport
+   palette: achieved sky (never transport-success green), the rest
+   amber-class (never rose = transport failure); unattested is neutral
+   absence, no anomaly styling. */
+html.ui-v2 .ag2-auto-attest.att-achieved { color: var(--sky); }
+html.ui-v2 .ag2-auto-attest.att-partial,
+html.ui-v2 .ag2-auto-attest.att-blocked,
+html.ui-v2 .ag2-auto-attest.att-abandoned { color: var(--amber); }
+html.ui-v2 .ag2-auto-attest.att-none { color: var(--text-2); opacity: 0.85; }
 
 /* ---- Inline question answering ---- */
 
@@ -25473,6 +25483,33 @@ html.ui-v2 .ag2-eff-note {
   overflow-wrap: anywhere;
   border-left: 2px solid var(--line);
   padding-left: 9px;
+}
+/* The self-report block (Track AO): its own labeled lane under the
+   transport row — amber-edged so the axis never blends into the
+   transport note above it. */
+html.ui-v2 .ag2-eff-attest {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .ag2-eff-attest-note {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid rgba(var(--amber-rgb), 0.45);
+  padding-left: 9px;
+}
+html.ui-v2 .ag2-attest-ref {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+html.ui-v2 .ag2-attest-ref-loc {
+  font-family: var(--mono);
+  color: var(--text-2);
+  overflow-wrap: anywhere;
 }
 html.ui-v2 .ag2-insp-noeff {
   display: flex;
@@ -37154,7 +37191,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'f385bb8f65d8b0e8';
+const INTENDANT_APP_BUILD = '1d91b406c7b2a74b';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -93160,6 +93197,39 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
+// The self-report axis renders BESIDE the transport verdict, never as
+// it: every attestation surface says "self-reported" and carries the
+// not-verified hover; the ◆ self-report mark is the axis's own glyph,
+// never the transport palette's meaning (attested-achieved is sky —
+// never the transport-success green or its chip), and
+// blocked/abandoned/partial wear amber-class warning hues — never
+// rose, which stays transport-failure. Unattested is the DERIVED
+// absence state: a hollow neutral ◇ chip, "no self-report" — absence,
+// never anomaly styling, never synthesized into achieved.
+function agendaAttestTone(outcome) {
+  return outcome === 'achieved' ? 'sky' : 'amber';
+}
+
+function agendaAttestHover(att) {
+  const base = 'The session’s own report — not verified.';
+  if (!att || !att.note) return base;
+  const note = att.note.length > 200 ? `${att.note.slice(0, 200)}…` : att.note;
+  return `${base} “${note}”`;
+}
+
+function agendaAttestChipHtml(att) {
+  return agendaChipHtml(`◆ self-reported: ${att.outcome}`, agendaAttestTone(att.outcome),
+    agendaAttestHover(att));
+}
+
+const AGENDA_UNATTESTED_HOVER =
+  'No self-report exists for this run — the session ended without attesting. Absence, not failure.';
+
+function agendaUnattestedChipHtml() {
+  return agendaChipHtml('◇ no self-report', 'neutral', AGENDA_UNATTESTED_HOVER, true);
+}
+
 function agendaCardChips(item) {
   const chips = [];
   const st = agendaEffectState(item);
@@ -93337,6 +93407,14 @@ function agendaCardEffectStrip(item) {
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
+    // The last self-reported reason, when one exists (Track AO): the
+    // owner sees WHY it kept failing, not just that it did.
+    const rep = e.last_run && e.last_run.attestation;
+    if (rep && (rep.outcome === 'blocked' || rep.outcome === 'abandoned')) {
+      const repNote = rep.note
+        ? ` — ${rep.note.length > 140 ? `${rep.note.slice(0, 140)}…` : rep.note}` : '';
+      line += ` · last self-report: ${rep.outcome}${repNote}`;
+    }
     actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
       + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
@@ -93375,11 +93453,21 @@ function agendaAutomationStripHtml(item) {
     : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
+    // The transport tip stays the transport's own line — state + last
+    // words — never labeled or styled as a self-report (R6).
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
     const sess = last.session_id && agendaSessionInfo(last.session_id);
     const jump = sess && sess.key
       ? ` <a class="ag2-auto-run" data-jump-session="${escapeHtml(sess.key)}">open run</a>` : '';
     meta.push(`<span class="ag2-auto-last st-${escapeHtml(last.state)}" title="${escapeHtml(tip)}">last: ${escapeHtml(last.state)} ${escapeHtml(agendaRelTime(last.at_ms))}${jump}</span>`);
+    if (last.attestation) {
+      meta.push(`<span class="ag2-auto-attest att-${escapeHtml(last.attestation.outcome)}" title="${escapeHtml(agendaAttestHover(last.attestation))}">◆ self-reported: ${escapeHtml(last.attestation.outcome)}</span>`);
+    } else if (last.state !== 'started') {
+      meta.push(`<span class="ag2-auto-attest att-none" title="${escapeHtml(AGENDA_UNATTESTED_HOVER)}">◇ no self-report</span>`);
+    }
+    if ((e.last_run_attempt || 0) > 0) {
+      meta.push(`<span title="A bounded auto-retry of the same spent cause — the cooldown floor spaces attempts, the failure streak suspends the series">attempt ${e.last_run_attempt} (auto-retry)</span>`);
+    }
   }
   if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);
@@ -94446,13 +94534,39 @@ function agendaInspEffectHtml(item) {
       const sessionLink = s && s.key
         ? ` <a class="ag2-linkbtn" data-jump-session="${escapeHtml(s.key)}">view session ›</a>`
         : '';
+      const attempt = (e.last_run_attempt || 0) > 0
+        ? ` · attempt ${e.last_run_attempt} (auto-retry after failure)` : '';
+      // The self-report axis (Track AO): rendered as its own labeled
+      // block BESIDE the transport verdict — never sharing its glyph
+      // or palette. The transport note above it stays the transport's
+      // last-words line (R6), tooltip included.
+      const att = run.attestation || null;
+      let attestHtml = '';
+      if (att) {
+        const refs = (att.refs || []).map((r) => `<div class="ag2-attest-ref">
+            <span class="ag2-attest-ref-loc">${escapeHtml(r.locator)}</span>
+            <span class="ag2-hint" title="The pin the session stated at attest time — hash-verified at intake, re-checked on demand; a pointer, never inlined content">pin ${escapeHtml((r.sha256 || '').slice(0, 8))}</span>
+            <span class="agenda-ref-drift" data-item="${escapeHtml(item.id)}" data-locator="${escapeHtml(r.locator)}"></span>
+          </div>`).join('');
+        attestHtml = `<div class="ag2-eff-attest">
+          <div class="ag2-eff-lastrun-head">
+            ${agendaAttestChipHtml(att)}
+            <span class="ag2-hint">${escapeHtml(agendaRelTime(att.at_ms))}</span>
+          </div>
+          ${att.note ? `<div class="ag2-eff-attest-note">${escapeHtml(att.note)}</div>` : ''}
+          ${refs}
+        </div>`;
+      } else if (run.state !== 'started') {
+        attestHtml = `<div class="ag2-eff-attest">${agendaUnattestedChipHtml()}</div>`;
+      }
       lastRun = `<div class="ag2-eff-lastrun">
         <div class="ag2-eff-lastrun-head">
           ${agendaChipHtml(`last run · ${run.state}`, runTone)}
-          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
+          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}${attempt}`)}</span>
           ${sessionLink}
         </div>
-        ${run.note ? `<div class="ag2-eff-note">${escapeHtml(run.note)}</div>` : ''}
+        ${run.note ? `<div class="ag2-eff-note" title="The session’s final message as the run ended — the transport record, not a self-report">${escapeHtml(run.note)}</div>` : ''}
+        ${attestHtml}
       </div>`;
     }
     const acts = [];
@@ -97131,6 +97245,12 @@ function agendaHoodOccurrenceLine(item, effect) {
   if (!run) return '';
   let state = run.state;
   let source = 'journal synced before dispatch';
+  // Track AO decorations: the regeneration ordinal (journal display
+  // field, fold-decorated fallback) and the run's self-report — always
+  // labeled as such, never blended into the transport state word.
+  let attempt = effect.last_run_attempt || 0;
+  const attest = run.attestation
+    ? ` · self-reported ${run.attestation.outcome} (the session’s own report — not verified)` : '';
   if (agendaHoodOcc && agendaHoodOcc.itemId !== item.id) {
     // Cache from a previous selection (only reachable when this item's
     // fetch is gated): claim nothing from it.
@@ -97141,7 +97261,9 @@ function agendaHoodOccurrenceLine(item, effect) {
       .filter((entry) => entry && entry.record
         && entry.record.occurrence_id === run.occurrence_id);
     if (records.length) {
-      state = records[records.length - 1].record.state || state;
+      const last = records[records.length - 1].record;
+      state = last.state || state;
+      attempt = records.reduce((n, entry) => entry.record.attempt || n, attempt);
     } else {
       source = 'fold view — the journal page holds no record for it';
     }
@@ -97150,9 +97272,10 @@ function agendaHoodOccurrenceLine(item, effect) {
   } else if (agendaHoodOcc && agendaHoodOcc.error) {
     source = 'fold view — journal read unavailable';
   }
+  const attemptPart = attempt > 0 ? ` · attempt ${attempt} (auto-retry)` : '';
   const requested = (effect.requested || []).length;
   const tail = requested ? ` · ${requested} owner run-request${requested > 1 ? 's' : ''}` : '';
-  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state} · ${source}${tail}`)}</div>`;
+  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state}${attemptPart} · ${source}${tail}${attest}`)}</div>`;
 }
 
 function agendaHoodManifestHtml(item) {
@@ -97281,6 +97404,7 @@ function agendaHoodOpVerb(op, envelope) {
     case 'revoke_effect': return 'approval revoked';
     case 'request_occurrence': return 'run requested';
     case 'record_occurrence': return `run ${op.state || '—'}`;
+    case 'attest': return `attested ${op.outcome || '—'} — self-report`;
     case 'record_ask_delivery':
       return op.delivered === false ? 'delivery pending — no live asker' : 'answer delivered';
     default: return `op · ${type || '—'}`;
@@ -97299,6 +97423,11 @@ function agendaHoodOpDot(op, known) {
       return op.state === 'completed' || op.state === 'delivered' ? 'green'
         : op.state === 'failed' ? 'rose'
           : op.state === 'started' ? 'iris' : 'amber';
+    // Self-report hues (Q8): achieved is sky — never the transport
+    // green; blocked/abandoned/partial are amber — never rose, which
+    // stays transport-failure.
+    case 'attest':
+      return op.outcome === 'achieved' ? 'sky' : 'amber';
     default: return 'neutral';
   }
 }

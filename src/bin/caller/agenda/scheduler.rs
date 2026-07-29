@@ -67,8 +67,10 @@ const DISPATCH_RETRY_AFTER_MS: u64 = 30_000;
 /// much later, and nothing user-blocking hangs on it.
 const LINEAGE_QUIET_GRACE_MS: u64 = 60_000;
 /// Give up on an un-receipted dispatch after this long: journal the
-/// fail-closed `unknown` (never auto-retried past this point) and free
-/// the effect's in-flight slot.
+/// fail-closed `unknown` and free the effect's in-flight slot. The time
+/// lane never auto-retries past this point; a TRIGGERED cause
+/// regenerates a bounded successor attempt (Track AO §2.5 — the
+/// deliberate amendment of RFC §7.5's blanket rule).
 const DISPATCH_ABANDON_AFTER_MS: u64 = 10 * 60_000;
 
 /// A session's terminal event observed BEFORE its `TaskReceived` receipt
@@ -407,8 +409,10 @@ struct LostSessionClassification {
 }
 
 /// Fail-close unresolved occurrences within `scope`: `started`-without-
-/// terminal rows whose driving daemon is gone resolve `Unknown`, never
-/// auto-retried (RFC §7.5); the sessions themselves, if alive, are
+/// terminal rows whose driving daemon is gone resolve `Unknown`. The
+/// time lane never auto-retries them (RFC §7.5); a TRIGGERED cause
+/// regenerates a bounded successor attempt (Track AO §2.5). The
+/// sessions themselves, if alive, are
 /// still visible in the Sessions tab. Runs at scheduler boot
 /// ([`RecoveryScope::Boot`]/[`RecoveryScope::Unscoped`]) and on every
 /// holder pass ([`RecoveryScope::Recurring`]).
@@ -470,6 +474,7 @@ fn resolve_lost_sessions(
             session_id: session_id.clone(),
             generation: None,
             boot_id: None,
+            attempt: None,
         });
         // The journal row carries no effect_id, so find the owning effect by
         // its last_run lineage and make the item's state honest too.
@@ -519,6 +524,10 @@ fn resolve_lost_sessions(
                                     matched_item_ids: Vec::new(),
                                     binding_refs: Vec::new(),
                                     session_name: None,
+                                    // Recovery re-keys the SAME occurrence; its
+                                    // rows are recovery rows, not regeneration
+                                    // rows — no attempt stamp (Track AO).
+                                    attempt: 0,
                                 },
                                 dead_session_id,
                                 parked_at_ms: now_ms(),
@@ -548,7 +557,9 @@ fn resolve_lost_sessions(
     // fail-closed `unknown`, written back via the item id the journal
     // rows retained (there is no `last_run` lineage to match — the
     // occurrence never started); v1's one-effect-per-item names the
-    // effect. Never auto-retried; the owner sees `unknown` and decides.
+    // effect. The time lane never auto-retries — the owner sees
+    // `unknown` and decides; a triggered cause's walk mints its bounded
+    // successor attempt (Track AO).
     for row in lost_dispatches {
         let (occurrence_id, item_id) = (row.occurrence_id, row.item_id);
         let _ = journal.append(&OccurrenceRecord {
@@ -562,6 +573,7 @@ fn resolve_lost_sessions(
             session_id: None,
             generation: None,
             boot_id: None,
+            attempt: None,
         });
         if let Some(item) = item_id
             .as_deref()
@@ -772,13 +784,23 @@ async fn run_pass(
         resolve_spawnless(handle, journal, &missed, OccurrenceState::Missed, now, why);
     }
     for crashed in planned.crashed {
+        // The one-shot keeps the re-approve ceremony (OPEN-6: the owner
+        // scheduled a MOMENT); standing machinery states its own next
+        // step — a series continues, a triggered cause auto-retries
+        // bounded (Track AO §2.5).
+        let why = if crashed.recurring {
+            "crashed before launch confirmation — resolved unknown; the standing \
+             machinery continues (a triggered cause auto-retries, bounded)"
+        } else {
+            "crashed before launch confirmation — not retried; re-approve to reschedule"
+        };
         resolve_spawnless(
             handle,
             journal,
             &crashed,
             OccurrenceState::Unknown,
             now,
-            "crashed before launch confirmation — not retried; re-approve to reschedule",
+            why,
         );
     }
     planned.next_wake_ms
@@ -1537,6 +1559,7 @@ fn session_record(
         session_id,
         generation: None,
         boot_id: None,
+        attempt: (spawn.attempt > 0).then_some(spawn.attempt),
     });
     if let Err(err) = &result {
         eprintln!(
@@ -1681,6 +1704,7 @@ fn record(
         session_id: None,
         generation: None,
         boot_id: None,
+        attempt: None,
     });
     if let Err(err) = &result {
         eprintln!(
@@ -3682,6 +3706,7 @@ mod tests {
             provenance_session_id: None,
             matched_item_ids: vec![q1.id.clone(), q2.id.clone()],
             session_name: None,
+            attempt: 0,
         };
         assert!(dispatch_session(
             &handle,
@@ -4529,6 +4554,7 @@ mod tests {
                         .then(|| format!("sess-{occ}")),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -4859,6 +4885,7 @@ mod tests {
                 session_id: Some("sess-occ-watch".to_string()),
                 generation: None,
                 boot_id: None,
+                attempt: None,
             })
             .unwrap();
         assert!(journal.started_unresolved().is_empty(), "fail-closed");
@@ -4889,6 +4916,7 @@ mod tests {
                 matched_item_ids: Vec::new(),
                 binding_refs: Vec::new(),
                 session_name: None,
+                attempt: 0,
             },
             dead_session_id: "sess-occ-watch".to_string(),
             parked_at_ms: now_ms(),
@@ -4947,6 +4975,7 @@ mod tests {
                 matched_item_ids: Vec::new(),
                 binding_refs: Vec::new(),
                 session_name: None,
+                attempt: 0,
             },
             dead_session_id: dead.to_string(),
             parked_at_ms,

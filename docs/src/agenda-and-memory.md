@@ -587,10 +587,12 @@ orchestration).
 Quiet hours do not delay scheduled sessions: approving a 03:00 run is an
 explicit decision distinct from reminder loudness. A launch that misses its
 window while the daemon is down, or is interrupted before launch
-confirmation, fails closed and is not automatically retried. The outcome is
-written back to `effects[].last_run`.
+confirmation, fails closed. The time lane never auto-retries it (the owner
+re-approves to reschedule); a **triggered** cause regenerates a bounded
+successor attempt (Track AO, below). The outcome is written back to
+`effects[].last_run`.
 
-Three display-only fields ride the served item DTO so frontends never
+Four display-only fields ride the served item DTO so frontends never
 reimplement planner math — each computed at read time by the planner's own
 functions, never stored, never folded from operations. `effects[].next_fire_ms`
 is the next instant the effect would actually fire (approval-gated,
@@ -609,7 +611,10 @@ abandoned, or completed without resolving the item) drops the claim, so the
 item re-joins the needs-you complement on the next read. The parked-question
 notification, the Agenda tab's Needs-you lens and badge, and the watched
 chip all branch on it; delivery and urgency never change — only the
-classification. All three are stamped at the serving seam — list snapshots,
+classification. `effects[].last_run_attempt` is the last run's Track AO
+regeneration ordinal from the occurrence journal fold, present exactly when
+that run is a bounded auto-retry (attempt k>0) so the run line can say
+"attempt 2 (auto-retry)". All four are stamped at the serving seam — list snapshots,
 command responses, `agenda_changed` broadcasts, the MCP tool — with the
 clock of that read (single-item broadcast copies are decorated against the
 full fold, so they carry the same cross-item derivations as snapshots), and
@@ -621,6 +626,67 @@ bounded broadcast EventBus. A lagged receiver is logged but not reconciled
 in-process; under extreme event pressure an occurrence can remain
 `awaiting_receipt` or `running` until daemon restart resolves it fail-closed
 (normally to `unknown`).
+
+### Attested outcomes and cause regeneration (Track AO)
+
+The machinery's run vocabulary is **two axes that compose, never one**:
+
+- **Transport** — `started/completed/failed/missed/unknown`, written back
+  by the scheduler alone. It says only how the session *ended*:
+  `completed` means "stopped normally" (denials, approval walls, and
+  interrupts ride it), and absence of a report is not success.
+- **Self-report** — the fired session's own verdict on the GOAL, written
+  by the `attest` command (`ctl agenda attest <item> --occurrence <id>
+  --outcome … [--note …] [--ref file:PATH]…`, the same one command
+  vocabulary over MCP `agenda_op` and `POST /api/agenda/op`). Closed set:
+  `achieved` (the goal, as stated, was accomplished), `partial` (real
+  progress, not done — deliberately inert machine-side, so there is no
+  reason to inflate), `blocked` (cannot proceed without something outside
+  the session's power), `abandoned` (deliberately stopped; nothing should
+  retry it). Only sessions in the occurrence's own started lineage can
+  attest (superseded originals and admitted successors both; last wins);
+  refs are pointer + sha256 pin, hash-verified at intake, never sealed,
+  drift-checked on expand. **Unattested** is the derived absence state —
+  fold-`None`, never synthesized into anything.
+
+Renderings compose the axes ("completed · self-reported blocked";
+"failed · no self-report") under a binding labeling law: every
+self-report surface says **self-reported** and hovers "the session's own
+report — not verified"; the transport verdict and the self-report never
+share a glyph (attested-achieved gets its own ◆ mark and hue, never the
+transport-success chip); `blocked`/`abandoned` render amber-class, never
+rose (rose stays transport-failure); unattested is a hollow neutral ◇
+"no self-report" — absence, never anomaly styling. The transport note
+(`last_run.note`) stays the transport's last-words line and is never
+rendered as, beside, or styled like a self-report. Machinery never
+fabricates an attestation from transport signals — a wrapper death seeds
+nothing, and closing-message harvesting is backstop, never the channel.
+
+Attestations feed the suspend streak (one fold arm): `failed`/`unknown`
++1 as ever; `completed` self-reported `blocked`/`abandoned` now +1 (the
+silent-defeat fix); `partial` neutral; attested-`achieved` and
+unattested-`completed` reset (legacy semantics — the honest path to
+counting unattested is a per-manifest `required` contract, a future
+knob); late attests never retro-adjust a computed streak.
+
+**Cause regeneration** re-mints spent *triggered* causes (`on_unblock` +
+`on_item_match`) whose transport terminal is `failed` or `unknown` — the
+two machine-verified wedge classes; attestation never feeds the retry
+decision (attested-`blocked` rides its transport `completed` out of the
+family — a retry cannot clear an external blocker, and `on_unblock` is
+the lane for dependency-shaped blockers). Attempt k>0 is a distinct,
+stable occurrence identity for the same raw cause (attempt 0 hashes
+exactly the pre-AO bytes); bounds stack: the trigger cooldown floor
+spaces attempts, streak suspension halts the walk, and a hard per-cause
+cap (3 attempts total) holds even across streak resets. `on_item_match`
+retries re-derive the ORIGINAL batch from the dispatch-time consumed
+markers naming the failed attempt's occurrence id — nothing un-consumes,
+ever; re-annotation is append-only. The one-shot time lane keeps its
+re-approve ceremony (the owner scheduled a moment), and reminders are
+untouched. Journal rows for retries carry the additive display field
+`attempt`; the run line says "attempt 2 (auto-retry)" so regeneration is
+legible, and a suspended card names the last self-reported reason when
+one exists.
 
 ### Attribution, provenance display, and `--source`
 
