@@ -129,7 +129,13 @@ dashboard, attributed to your session.
   goal as stated is done; `partial` buys nothing machine-side, so there
   is no reason to inflate; `blocked`/`abandoned` say so and why. Your
   report is labeled self-report wherever it renders, and only sessions
-  in the occurrence's own lineage can write it.
+  in the occurrence's own lineage can write it. And when you hit a
+  decision only the owner can make — product taste, spend, scope
+  changes, an irreversible effect outside your manifest — park an
+  UNTAGGED `ask` question carrying your committed recommendation and
+  continue whatever your mandate still permits: it is non-blocking,
+  and the needs-you lane delivers it. Gate-tagged questions are the
+  steward lane; untagged questions are the owner's.
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.
