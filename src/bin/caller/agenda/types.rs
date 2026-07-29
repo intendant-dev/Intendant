@@ -466,6 +466,26 @@ pub struct AgendaApproval {
     pub(crate) kind: Option<String>,
 }
 
+/// The fired session's self-report attached to a run (Track AO: fold
+/// view of the latest `attest` op on the SAME occurrence — the full
+/// history stays in the op log). SELF-REPORT, never verified — every
+/// rendering labels it so, and it never shares a glyph with the
+/// transport verdict (the Q8 labeling law).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaAttestation {
+    pub(crate) outcome: AttestationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+    /// Pointer + pin (verify-only — never sealed; drift is a render
+    /// concern).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) refs: Vec<BindingRef>,
+    pub(crate) at_ms: u64,
+    /// The attesting session (the envelope's gate-resolved actor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+}
+
 /// The latest occurrence outcome recorded against an effect (fold view
 /// of daemon-authored `record_occurrence` ops — full history in the log
 /// and the occurrence journal).
@@ -479,6 +499,15 @@ pub struct AgendaRun {
     pub(crate) at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
+    /// The run's self-report (Track AO): attached by the `attest` fold
+    /// arm last-wins on the same occurrence, carried through the
+    /// terminal write-back. Absent = unattested — the derived state
+    /// (neutral copy, never anomaly styling). Additive and
+    /// skip-serialized: the DTO stays legacy-byte-identical when
+    /// unattested (pinned by
+    /// `agenda_run_dto_is_byte_identical_when_unattested`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attestation: Option<AgendaAttestation>,
 }
 
 /// One owner-requested extra instant of an approved standing manifest
@@ -2126,34 +2155,98 @@ pub(crate) fn apply_op(
                     "record_occurrence for unknown effect on {id} ignored"
                 ));
             };
+            // The attest-then-terminal ordering survives the write-back
+            // (Track AO §2.3): the terminal op replaces `last_run`
+            // wholesale but CARRIES the attestation forward when it
+            // names the occurrence the attest attached to.
+            let attestation = effect
+                .last_run
+                .as_ref()
+                .filter(|run| run.occurrence_id == *occurrence_id)
+                .and_then(|run| run.attestation.clone());
+            let carried = attestation.as_ref().map(|attestation| attestation.outcome);
             effect.last_run = Some(AgendaRun {
                 occurrence_id: occurrence_id.clone(),
                 state: state.clone(),
                 session_id: session_id.clone(),
                 at_ms,
                 note: note.clone(),
+                attestation,
             });
-            // The failure streak (G3-pre), from log order alone: attempted
-            // non-success counts, success resets, `missed` (daemon
-            // downtime, not the mandate's fault) and `started` are
-            // neutral.
+            // The failure streak (G3-pre + the AO Q4 ruled table), from
+            // log order alone: attempted non-success counts, success
+            // resets — unless the run's own report says otherwise.
+            // Attested blocked/abandoned on a transport-`completed` run
+            // count +1 (the silent-defeat fix); `partial` is neutral —
+            // it neither feeds suspension nor erases a surrounding
+            // failure streak; achieved and UNATTESTED reset exactly as
+            // today (self-report earns no MORE trust than transport
+            // success, and flipping unattested would mass-suspend
+            // standing automations that predate the verb — Q4c).
+            // `missed` (daemon downtime, not the mandate's fault) and
+            // `started` stay neutral. The weight reads the attestation
+            // carried at THIS fold step, so a late attest never
+            // retro-adjusts a computed streak.
             match state.as_str() {
                 "failed" | "unknown" => {
                     effect.consecutive_failures = effect.consecutive_failures.saturating_add(1);
                 }
-                "completed" => effect.consecutive_failures = 0,
+                "completed" => match carried {
+                    Some(AttestationOutcome::Blocked) | Some(AttestationOutcome::Abandoned) => {
+                        effect.consecutive_failures = effect.consecutive_failures.saturating_add(1);
+                    }
+                    Some(AttestationOutcome::Partial) => {}
+                    Some(AttestationOutcome::Achieved) | None => {
+                        effect.consecutive_failures = 0;
+                    }
+                },
                 _ => {}
             }
             item.updated_ms = at_ms;
             None
         }
-        AgendaOp::Attest { .. } => {
-            // History-only in this slice (Track AO): the op log IS the
-            // attestation history (`/api/agenda/ops` serves it). The
-            // run-view attach (`AgendaRun.attestation` — last-wins on
-            // the same occurrence, carried through the terminal
-            // write-back, warn-skip on mismatch) and the ruled streak
-            // weights land with the AO fold slice.
+        AgendaOp::Attest {
+            id,
+            effect_id,
+            occurrence_id,
+            outcome,
+            note,
+            refs,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("attest for unknown {id} ignored"));
+            };
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id) else {
+                return Some(format!("attest for unknown effect on {id} ignored"));
+            };
+            // Attach last-wins on the SAME occurrence (§2.3): the card
+            // shows the run's own report. An attest folding after a
+            // NEWER occurrence replaced `last_run` attaches to no card
+            // — first-class in the op history, invisible here (the
+            // ruled v1 limit). A LATE attest (after the terminal op)
+            // attaches for DISPLAY and never touches the streak: the
+            // weights were computed at the terminal fold, from log
+            // order alone (determinism — late attests never
+            // retro-adjust).
+            let Some(run) = effect
+                .last_run
+                .as_mut()
+                .filter(|run| run.occurrence_id == *occurrence_id)
+            else {
+                return Some(format!(
+                    "attest for occurrence {occurrence_id} on {id} attaches to no current \
+                     run (superseded) — kept as op history"
+                ));
+            };
+            let actor = rec.actor.clone().unwrap_or_default();
+            run.attestation = Some(AgendaAttestation {
+                outcome: *outcome,
+                note: note.clone(),
+                refs: refs.clone(),
+                at_ms,
+                session_id: actor.session_id,
+            });
+            item.updated_ms = at_ms;
             None
         }
         AgendaOp::Answer {
@@ -2317,6 +2410,195 @@ mod tests {
             due_ms: None,
             ask: None,
         }
+    }
+
+    /// Track AO pin `agenda_run_dto_is_byte_identical_when_unattested`
+    /// (Q3): the additive `attestation` field is skip-serialized —
+    /// legacy `AgendaRun` JSON round-trips byte-identically, so every
+    /// pre-AO consumer sees exactly yesterday's bytes; only an attested
+    /// run grows the key, and absent = unattested uniformly (Q10).
+    #[test]
+    fn agenda_run_dto_is_byte_identical_when_unattested() {
+        let legacy = "{\"occurrence_id\":\"occ-1\",\"state\":\"completed\",\
+                      \"session_id\":\"sess-1\",\"at_ms\":5,\"note\":\"done\"}";
+        let run: AgendaRun = serde_json::from_str(legacy).unwrap();
+        assert!(run.attestation.is_none(), "absent folds to unattested");
+        assert_eq!(
+            serde_json::to_string(&run).unwrap(),
+            legacy,
+            "unattested runs serialize to the legacy bytes"
+        );
+        let attested = AgendaRun {
+            attestation: Some(AgendaAttestation {
+                outcome: AttestationOutcome::Partial,
+                note: None,
+                refs: Vec::new(),
+                at_ms: 6,
+                session_id: None,
+            }),
+            ..run
+        };
+        let json = serde_json::to_string(&attested).unwrap();
+        assert!(
+            json.contains("\"attestation\":{\"outcome\":\"partial\""),
+            "{json}"
+        );
+    }
+
+    /// Track AO pin `streak_weights_follow_the_ruled_table` (Q4, all
+    /// three sub-calls as ruled): failed/unknown +1 · attested
+    /// blocked/abandoned on transport-`completed` +1 (the silent-defeat
+    /// fix) · partial neutral · achieved and UNATTESTED-completed reset
+    /// (Q4c back-compat) · missed/started neutral · late attests attach
+    /// for display but never retro-adjust a computed streak. Also pins
+    /// the §2.3 carry (attest-then-terminal survives the write-back)
+    /// and the superseded warn-skip (the ruled v1 limit).
+    #[test]
+    fn streak_weights_follow_the_ruled_table() {
+        let mut items = std::collections::BTreeMap::new();
+        apply_op(&mut items, &rec(1, add("it", "standing work"))).map(|w| panic!("{w}"));
+        let manifest: SessionManifest = serde_json::from_value(serde_json::json!({
+            "goal": "run it",
+            "fire_at_ms": 1_000,
+            "orchestrate": false,
+            "recurrence": { "every_ms": RECURRENCE_MIN_EVERY_MS }
+        }))
+        .unwrap();
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::ProposeEffect {
+                    id: "it".into(),
+                    effect_id: "ef".into(),
+                    manifest,
+                },
+            ),
+        )
+        .map(|w| panic!("{w}"));
+
+        let record = |occ: &str, state: &str| AgendaOp::RecordOccurrence {
+            id: "it".into(),
+            effect_id: "ef".into(),
+            occurrence_id: occ.into(),
+            state: state.into(),
+            session_id: None,
+            note: None,
+        };
+        let attest = |occ: &str, outcome: AttestationOutcome| AgendaOp::Attest {
+            id: "it".into(),
+            effect_id: "ef".into(),
+            occurrence_id: occ.into(),
+            outcome,
+            note: None,
+            refs: Vec::new(),
+        };
+        let mut at = 10u64;
+        let mut step = |items: &mut std::collections::BTreeMap<String, AgendaItem>,
+                        op: AgendaOp|
+         -> Option<String> {
+            at += 1;
+            apply_op(items, &rec(at, op))
+        };
+        macro_rules! streak {
+            () => {
+                items["it"].effects[0].consecutive_failures
+            };
+        }
+
+        // failed / unknown: +1 each (unchanged law).
+        step(&mut items, record("a", "failed"));
+        assert_eq!(streak!(), 1);
+        step(&mut items, record("b", "unknown"));
+        assert_eq!(streak!(), 2);
+
+        // attested achieved: reset — no MORE trust than transport
+        // success, and no less.
+        step(&mut items, record("c", "started"));
+        step(&mut items, attest("c", AttestationOutcome::Achieved));
+        step(&mut items, record("c", "completed"));
+        assert_eq!(streak!(), 0);
+        let run = items["it"].effects[0].last_run.as_ref().unwrap();
+        assert_eq!(
+            run.attestation.as_ref().unwrap().outcome,
+            AttestationOutcome::Achieved,
+            "the §2.3 carry: attest-then-terminal survives the write-back"
+        );
+
+        // Last-wins within the lineage (self-correction): the FINAL
+        // report is both the display attach and the weight input.
+        step(&mut items, record("c2", "started"));
+        step(&mut items, attest("c2", AttestationOutcome::Blocked));
+        step(&mut items, attest("c2", AttestationOutcome::Achieved));
+        step(&mut items, record("c2", "completed"));
+        assert_eq!(streak!(), 0, "the corrected (last) report is the weight");
+        let run = items["it"].effects[0].last_run.as_ref().unwrap();
+        assert_eq!(
+            run.attestation.as_ref().unwrap().outcome,
+            AttestationOutcome::Achieved,
+            "last-wins overwrites the earlier self-report"
+        );
+
+        // attested blocked / abandoned on transport-completed: +1 —
+        // explicit non-achievement stops masquerading as success.
+        step(&mut items, record("d", "failed"));
+        assert_eq!(streak!(), 1);
+        step(&mut items, record("e", "started"));
+        step(&mut items, attest("e", AttestationOutcome::Blocked));
+        step(&mut items, record("e", "completed"));
+        assert_eq!(streak!(), 2);
+        step(&mut items, record("f", "started"));
+        step(&mut items, attest("f", AttestationOutcome::Abandoned));
+        step(&mut items, record("f", "completed"));
+        assert_eq!(streak!(), 3);
+
+        // partial: neutral — neither feeds suspension nor erases the
+        // surrounding streak.
+        step(&mut items, record("g", "started"));
+        step(&mut items, attest("g", AttestationOutcome::Partial));
+        step(&mut items, record("g", "completed"));
+        assert_eq!(streak!(), 3);
+
+        // unattested completed: keeps RESETTING (Q4c — legacy standing
+        // automations must not mass-suspend for predating the verb).
+        step(&mut items, record("h", "completed"));
+        assert_eq!(streak!(), 0);
+
+        // missed / started: neutral.
+        step(&mut items, record("i", "failed"));
+        assert_eq!(streak!(), 1);
+        step(&mut items, record("j", "missed"));
+        assert_eq!(streak!(), 1);
+        step(&mut items, record("k", "started"));
+        assert_eq!(streak!(), 1);
+
+        // Late attest: attaches for display, NEVER retro-adjusts.
+        step(&mut items, record("l", "completed"));
+        assert_eq!(streak!(), 0);
+        step(&mut items, attest("l", AttestationOutcome::Blocked));
+        assert_eq!(streak!(), 0, "late attests never retro-adjust");
+        let run = items["it"].effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(
+            run.attestation.as_ref().unwrap().outcome,
+            AttestationOutcome::Blocked,
+            "the late attest attaches for display"
+        );
+
+        // Superseded: an attest after a NEWER occurrence replaced
+        // last_run warn-skips (kept as op history — the ruled v1
+        // limit); the current run keeps its own report.
+        let warned = step(&mut items, attest("g", AttestationOutcome::Achieved));
+        assert!(
+            warned.is_some_and(|w| w.contains("attaches to no current run")),
+            "superseded attests warn-skip by name"
+        );
+        let run = items["it"].effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.occurrence_id, "l");
+        assert_eq!(
+            run.attestation.as_ref().unwrap().outcome,
+            AttestationOutcome::Blocked
+        );
     }
 
     /// The manifest's additive fields are absent-on-the-wire at their

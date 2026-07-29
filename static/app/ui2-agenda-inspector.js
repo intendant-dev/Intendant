@@ -1245,7 +1245,7 @@ function agendaSchedSheetHtml(item) {
           <input type="number" min="1" placeholder="∞" class="ag2-sheet-num" data-sheet="maxRuns" value="${escapeHtml(s.maxRuns)}" aria-label="Maximum runs" />
           <span class="ag2-hint">runs</span>
         </div>
-        <span class="ag2-sheet-k" title="Consecutive failed or unknown outcomes that suspend the series — missed runs from daemon downtime don’t count">Suspend after</span>
+        <span class="ag2-sheet-k" title="Consecutive non-working outcomes that suspend the series: failed or unknown runs, and completed runs the session itself reported blocked or abandoned (self-reported). Achieved or unreported completions reset the streak; partial is neutral; missed runs from daemon downtime don’t count">Suspend after</span>
         <div class="ag2-sheet-inline">
           <input type="number" min="1" max="10" class="ag2-sheet-num" data-sheet="suspend" value="${escapeHtml(s.suspend)}" aria-label="Suspend after failures" />
           <span class="ag2-hint">failed runs in a row</span>
