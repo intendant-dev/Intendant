@@ -6845,6 +6845,29 @@ async fn drainer_exits_at_last_session_end() {
     )
     .await;
 
+    // HS5 (the HS4 ruling's N2 recommendation): on the durable-default
+    // OS the Memory plane rides the same handover — the drainer's
+    // drain-entry hook freed plane.lock BEFORE the lease flock, so the
+    // successor's role watch opens the SAME plane within its poll
+    // cadence. Other platforms run ephemeral by policy and skip this.
+    #[cfg(target_os = "macos")]
+    poll_until(
+        "the successor opening the durable memory plane",
+        RUN_TIMEOUT,
+        || async {
+            std::fs::read_to_string(daemon_a.rig.home.path().join("daemon-b.log"))
+                .unwrap_or_default()
+                .contains("[memory] durable plane")
+                .then_some(())
+        },
+        || {
+            std::fs::read_to_string(daemon_a.rig.home.path().join("daemon-b.log"))
+                .map(|log| tail(&log, 2000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+
     // The drainer's presence records the drain; its live session is
     // SPARED by the new holder (N4: the drainer's in-flight rows carry a
     // LIVE boot id — no unknown, ever).

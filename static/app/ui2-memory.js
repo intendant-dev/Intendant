@@ -26,6 +26,7 @@ let memoryLoadError = '';
 let memoryQuery = '';
 let memoryExpandedId = '';
 let memoryDurability = 'ephemeral';
+let memoryPlaneNotice = '';
 // Full view of the expanded claim (api_memory_claim read — search rows
 // are lean by §6.5, so judgment HISTORY only exists on the read view).
 let memoryDetail = null; // { id, claim } | null
@@ -54,6 +55,7 @@ async function memoryRefresh() {
       if (resp.ok && resp.body && Array.isArray(resp.body.results)) {
         memoryClaims = resp.body.results;
         memoryDurability = resp.body.durability || 'ephemeral';
+        memoryPlaneNotice = resp.body.plane_notice || '';
         memoryLoadError = '';
       } else {
         memoryLoadError = (resp.body && resp.body.error) || `memory unavailable (${resp.status})`;
@@ -333,9 +335,14 @@ function memoryRenderTab() {
   if (!list) return;
   const note = document.getElementById('memory-durability-note');
   if (note) {
-    note.textContent = memoryDurability === 'durable'
-      ? 'Durable plane — claims survive daemon restarts on this machine. Sync across machines arrives in a later phase.'
-      : 'Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage runs on the primary-OS daemon.';
+    // HS5 (HS4-N3): when the plane is not open on THIS daemon (it
+    // follows the scheduler-lease holder, or was handed to a handover
+    // successor), say where memory lives instead of the generic modes.
+    note.textContent = memoryPlaneNotice
+      ? `Memory is not served by this daemon right now — ${memoryPlaneNotice}.`
+      : memoryDurability === 'durable'
+        ? 'Durable plane — claims survive daemon restarts on this machine. Sync across machines arrives in a later phase.'
+        : 'Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage runs on the primary-OS daemon.';
   }
   const counts = document.getElementById('memory-tab-counts');
   if (counts) {

@@ -54,6 +54,25 @@ pub(crate) async fn start_task_with_state(
 ) -> Result<(), String> {
     let mut s = state.write().await;
 
+    // Track HS5 (the HS3 ruling's N2): this untargeted lane CREATES a
+    // session, and its callers (the MCP start_task tool, ctl start, the
+    // voice lane) get an optimistic ack — so consult the same
+    // classification the supervisor funnel enforces and refuse
+    // SYNCHRONOUSLY while draining, instead of acking a dispatch the
+    // funnel will refuse a beat later.
+    if let Some(runtime) = s.handover.as_ref().filter(|rt| rt.is_draining()) {
+        return Err(match runtime.successor_port() {
+            Some(port) => format!(
+                "daemon_draining: this daemon is draining — in-flight sessions \
+                 finish here; start new work on the successor daemon (:{port})"
+            ),
+            None => "daemon_draining: this daemon is draining — the successor has \
+                     not acquired yet; retry shortly, or start another daemon \
+                     with --takeover"
+                .to_string(),
+        });
+    }
+
     match s.phase {
         Phase::Thinking
         | Phase::RunningAgent

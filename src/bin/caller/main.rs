@@ -3699,18 +3699,12 @@ async fn main() -> Result<(), CallerError> {
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
-    // Daemon boot = a gateway-serving controller start: record where this
-    // controller binary lives so UNSUPERVISED agents can resolve a CLI
-    // (F1.5 discovery descriptor). Transient invocations (ctl, --no-web
-    // one-shots) never write it; failure only degrades discovery.
-    if use_web {
-        if let Err(err) = cli_descriptor::write_boot_descriptor(
-            &intendant_core::state_paths::intendant_home(),
-            web_port,
-        ) {
-            eprintln!("[cli-descriptor] not written: {err}");
-        }
-    }
+    // The CLI discovery descriptor (F1.5) is written at LEASE ACQUISITION
+    // (Track HS5, Q7): the holder — the daemon running standing
+    // automations — owns it, so its port stays holder-authoritative and
+    // co-homed secondaries stop clobbering it at boot. See
+    // `handover::write_holder_descriptor`; the boot-time write that
+    // lived here moved there.
 
     // Build the dashboard's TLS acceptor once (cheap to clone into each
     // gateway spawn site). Defaults to mTLS; `--no-tls` is the explicit

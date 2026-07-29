@@ -415,6 +415,9 @@ pub(crate) enum RouteHandlerId {
     AgendaStamp,
     /// Request drain of this daemon (Track HS3 takeover lane).
     DaemonTakeover,
+    /// Handover status: lease role, drain state, co-homed daemons with
+    /// probed liveness (the drain banner/successor chip's poll).
+    DaemonHandoverStatus,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1070,6 +1073,19 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::DaemonTakeover,
         "Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here",
     ),
+    // Handover observability (Track HS5): the scheduler-lease status
+    // block — role, drain state, sidecar, and every co-homed boot with
+    // probed liveness. Read-only display currency; the dashboard's drain
+    // banner and successor chip poll it.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/daemon/handover"),
+        PeerOperation::StatsRead,
+        BodyPolicy::None,
+        RouteHandlerId::DaemonHandoverStatus,
+        "Handover status: lease role, drain state, and co-homed daemons with probed liveness",
+    )
+    .with_tunnel(tunnel_method("api_daemon_handover")),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
     // dashboard consumes via authenticated fetch. HTTP-only for now — the

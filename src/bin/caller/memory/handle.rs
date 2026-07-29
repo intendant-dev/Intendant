@@ -179,6 +179,19 @@ impl MemoryHandle {
         self.lock_plane_id().clone()
     }
 
+    /// HS5 (the HS4 ruling's N3): a human-visible notice when the plane
+    /// is not open on this daemon — "memory lives on :PORT" — for every
+    /// surface that renders the durability label, not just the error
+    /// lanes. `None` while serving.
+    pub(crate) fn plane_notice(&self) -> Option<String> {
+        let mut slot = self.lock_slot();
+        match self.ready(&mut slot) {
+            Ok(_) => None,
+            Err(MemoryError::PlaneUnavailable { detail, .. }) => Some(detail),
+            Err(_) => None,
+        }
+    }
+
     /// Author a claim. `actor` is the gate-resolved binding from the
     /// authenticated edge that dispatched this write (the seam
     /// contract in `access/actor.rs`) — the service maps it into the

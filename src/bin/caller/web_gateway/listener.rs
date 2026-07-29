@@ -1127,6 +1127,9 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         Arc::clone(&hosted_control),
         Arc::clone(&fleet_zone_observed),
         relay_lifecycle_tx,
+        // Track HS5 (Q9): rendezvous publication follows the scheduler
+        // lease — only the holder speaks for this installation.
+        mcp_server.as_ref().and_then(|s| s.handover_runtime_now()),
     );
     // Reachability relay tunnel: hold a control channel to Connect and splice
     // relayed browser connections into the dedicated loopback-only ingress
