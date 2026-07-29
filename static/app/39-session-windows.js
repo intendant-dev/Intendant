@@ -509,11 +509,17 @@ function normalizeSessionBootEra(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const era = String(raw.era || '').toLowerCase();
   if (era !== 'current' && era !== 'preboot') return null;
-  return {
+  const out = {
     era,
     liveWrapper: raw.live_wrapper === true || raw.liveWrapper === true,
     ghost: raw.ghost === true,
   };
+  // The folding row's own id (stamped in sessionWindowMetaFromSession)
+  // rides along so resolveSessionWindowBootMeta can tell a writer's own
+  // lifecycle update from a dead twin's alias-folded claim.
+  const sourceSessionId = compactSessionText(raw.source_session_id || raw.sourceSessionId);
+  if (sourceSessionId) out.sourceSessionId = sourceSessionId;
+  return out;
 }
 
 function normalizeSessionWindowMeta(meta = {}) {
@@ -648,15 +654,33 @@ function sessionWindowMetadataSignature(meta = {}) {
       ].join('|')
       : '',
     meta.boot
-      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}`
+      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}|${meta.boot.sourceSessionId || ''}`
       : '',
   ].join('\u001f');
+}
+
+// A backend resumed across a daemon restart has TWO wrapper rows alias-
+// folding onto its backend-keyed card: the dead pre-restart twin
+// (ghost:true) and the live resume-attached twin (ghost:false). Fold
+// order must never decide which one the card wears: a live-wrapper
+// claim is only replaced by the same writer moving through its own
+// lifecycle, or by another live wrapper — never by a dead twin whose
+// ghost bit would sell a live session as safe to close.
+function resolveSessionWindowBootMeta(previous, incoming) {
+  if (!previous || !incoming) return incoming || previous || null;
+  const sameWriter = !!incoming.sourceSessionId
+    && incoming.sourceSessionId === previous.sourceSessionId;
+  if (previous.liveWrapper && !incoming.liveWrapper && !sameWriter) return previous;
+  return incoming;
 }
 
 function mergeSessionWindowMetadata(sessionId, meta = {}) {
   const sid = String(sessionId || '').trim();
   const normalized = normalizeSessionWindowMeta(meta);
   const previous = sid ? (sessionMetadataById.get(sid) || {}) : {};
+  if (normalized.boot && previous.boot) {
+    normalized.boot = resolveSessionWindowBootMeta(previous.boot, normalized.boot);
+  }
   const merged = Object.keys(normalized).length > 0
     ? { ...previous, ...normalized }
     : previous;
@@ -3839,7 +3863,9 @@ function sessionWindowMetaFromSession(session) {
     thread_source: session.thread_source,
     agent_nickname: session.agent_nickname,
     agenda: session.agenda,
-    boot: session.boot,
+    boot: session.boot && typeof session.boot === 'object'
+      ? { ...session.boot, source_session_id: session.session_id }
+      : session.boot,
   };
   if (
     Object.prototype.hasOwnProperty.call(session, 'goal') ||
