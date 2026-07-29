@@ -314,6 +314,14 @@ pub(crate) struct OccurrenceRecord {
     /// today's recover-at-boot semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) boot_id: Option<String>,
+    /// Track AO regeneration ordinal, display-only: k>0 marks a bounded
+    /// auto-retry of a triggered cause. Absent on attempt-0 and every
+    /// legacy row; identity lives in the occurrence id (the retry
+    /// segment), never here — the fold ignores it, the raw pages serve
+    /// it verbatim (the additive-field freedom this journal's HS
+    /// `generation`/`boot_id` precedent proved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt: Option<u32>,
 }
 
 /// Writer identity stamped onto journal rows (Track HS): set once per
@@ -348,7 +356,10 @@ pub(crate) enum OccurrenceState {
     Failed,
     /// The executor lost sight of the occurrence — crashed pre-launch
     /// confirmation or restarted mid-run. Fail-closed terminal per RFC
-    /// §7.5: never auto-retried; the owner re-approves to reschedule.
+    /// §7.5. The time lane never auto-retries it (the owner re-approves
+    /// to reschedule); a TRIGGERED cause regenerates a bounded
+    /// successor attempt (Track AO §2.5 — the crashed-cause rider's
+    /// deliberate amendment).
     Unknown,
 }
 
@@ -887,6 +898,11 @@ pub(crate) struct SpawnOccurrence {
     /// with the goal as its first user message and waits for the owner —
     /// composer parity — instead of running as an autonomous goal task.
     pub(crate) interactive: bool,
+    /// Track AO regeneration ordinal: 0 = the original firing of this
+    /// cause, k>0 = a bounded auto-retry (the identity carries the
+    /// retry segment). Stamped onto journal rows as the additive
+    /// display field — identity lives in the occurrence id alone.
+    pub(crate) attempt: u32,
     /// The manifest's explicit project root, if the approval bound one.
     pub(crate) project_root: Option<String>,
     /// The manifest's owner-approved agent-launch pins, forwarded verbatim
@@ -954,11 +970,20 @@ fn derive_spawn_session_name(
 /// triggered ones — scheduling floors (arm, cooldown) move when an
 /// occurrence fires, never what it is called, so a floor that advances
 /// cannot re-mint a spent cause.
+///
+/// `attempt` is Track AO's regeneration ordinal: attempt 0 hashes
+/// EXACTLY the pre-AO bytes (every existing id, journal row, and
+/// in-flight occurrence untouched — pinned by
+/// `attempt_zero_identity_is_byte_stable`); attempt k>0 appends the
+/// retry segment. The #617 law survives verbatim: a spent cause never
+/// re-mints ITSELF — regeneration mints a distinct, stable, bounded
+/// successor attempt of the same raw cause.
 pub(crate) fn session_occurrence_id(
     item_id: &str,
     effect_id: &str,
     digest: &str,
     identity_ms: u64,
+    attempt: u32,
 ) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
@@ -970,6 +995,10 @@ pub(crate) fn session_occurrence_id(
     hasher.update(digest.as_bytes());
     hasher.update(b"\0");
     hasher.update(identity_ms.to_string().as_bytes());
+    if attempt > 0 {
+        hasher.update(b"\0retry\0");
+        hasher.update(attempt.to_string().as_bytes());
+    }
     let out = hasher.finalize();
     let mut hex = String::with_capacity(32);
     for byte in out.iter().take(16) {
@@ -977,6 +1006,44 @@ pub(crate) fn session_occurrence_id(
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// Track AO regeneration cap: total attempts a triggered cause gets —
+/// the original plus its auto-retries. An integer tunable within single
+/// digits at implementation (the ruled law is the WALK SHAPE: transport
+/// terminals `failed`/`unknown` re-mint, anything else ends the family;
+/// C-floor cooldown spaces attempts; suspension halts the walk; the cap
+/// holds across streak resets because the journal rows never reset).
+pub(crate) const MAX_CAUSE_REGENERATIONS: u32 = 3;
+
+/// The attempt walk for one triggered cause (Track AO §2.5): find the
+/// first unattempted ordinal, stepping past attempts whose TRANSPORT
+/// terminal is `failed` or `unknown` — the two machine-verified wedge
+/// classes. Attestation is never consulted (it feeds streaks and
+/// surfaces, never the retry decision), so an attested-`blocked` run
+/// rides its transport `completed` out of the family. Any other
+/// terminal, or a live (`started`) attempt, ends the walk with nothing
+/// to plan; the caller applies its own residue policy to the returned
+/// progress (`prepared` crash residue: the planner's crashed lane, the
+/// display twin's no-fire skip).
+fn walk_cause_attempts(
+    journal: &OccurrenceJournal,
+    item_id: &str,
+    effect_id: &str,
+    digest: &str,
+    cause_ms: u64,
+) -> Option<(String, u32, OccurrenceProgress)> {
+    for attempt in 0..MAX_CAUSE_REGENERATIONS {
+        let occurrence_id = session_occurrence_id(item_id, effect_id, digest, cause_ms, attempt);
+        let progress = journal.progress(&occurrence_id);
+        match progress.terminal {
+            Some(OccurrenceState::Failed) | Some(OccurrenceState::Unknown) => continue,
+            Some(_) => return None,
+            None if progress.started.is_some() => return None,
+            None => return Some((occurrence_id, attempt, progress)),
+        }
+    }
+    None
 }
 
 /// One trigger-bearing effect's current due state (Track T): when it
@@ -1020,14 +1087,7 @@ pub(crate) fn trigger_due(
     started_sessions: &std::collections::BTreeSet<String>,
 ) -> Option<TriggerDue> {
     let arm = effect.manifest.fire_at_ms.max(approval_at_ms);
-    let cooldown_floor = effect.last_run.as_ref().and_then(|run| {
-        matches!(
-            run.state.as_str(),
-            "completed" | "failed" | "missed" | "unknown"
-        )
-        .then(|| run.at_ms.saturating_add(super::types::TRIGGER_COOLDOWN_MS))
-    });
-    let floored = |cause: u64| cooldown_floor.map_or(cause.max(arm), |cd| cause.max(arm).max(cd));
+    let floored = |cause: u64| trigger_floored_due(effect, approval_at_ms, cause);
     match trigger {
         super::types::TriggerSpec::OnUnblock => {
             // Every prerequisite Done. A retired or MISSING target does
@@ -1104,6 +1164,25 @@ pub(crate) fn trigger_due(
     }
 }
 
+/// The trigger lane's due floors, shared by the live derivation
+/// ([`trigger_due`]) and the retry reconstruction
+/// ([`on_item_match_retry_due`]): the ARM floor
+/// `max(fire_at_ms, approval)` and the COOLDOWN floor
+/// `last terminal + TRIGGER_COOLDOWN_MS` — the C-floor that spaces
+/// regeneration attempts (Track AO guardrail: floors move `due_ms`
+/// only, never identity).
+fn trigger_floored_due(effect: &AgendaEffect, approval_at_ms: u64, cause: u64) -> u64 {
+    let arm = effect.manifest.fire_at_ms.max(approval_at_ms);
+    let cooldown_floor = effect.last_run.as_ref().and_then(|run| {
+        matches!(
+            run.state.as_str(),
+            "completed" | "failed" | "missed" | "unknown"
+        )
+        .then(|| run.at_ms.saturating_add(super::types::TRIGGER_COOLDOWN_MS))
+    });
+    cooldown_floor.map_or(cause.max(arm), |cd| cause.max(arm).max(cd))
+}
+
 /// Fold-derived match consumption: a dispatch-time consumed-annotation
 /// from the daemon marks the item spent for this effect. Attribution-
 /// checked — the text prefix alone gates nothing (a non-daemon writer
@@ -1145,6 +1224,61 @@ fn trigger_consumed_markers(item: &AgendaItem) -> Vec<(String, String)> {
             Some((effect_id.to_string(), occurrence_id.to_string()))
         })
         .collect()
+}
+
+/// Track AO regeneration, the `on_item_match` retry cause: once
+/// dispatch consumed a batch, the live derivation yields nothing for
+/// that cause — so when the last run of an `on_item_match` effect
+/// terminaled `failed`/`unknown`, the ORIGINAL batch is RE-DERIVED from
+/// the dispatch-time consumed markers naming that attempt's occurrence
+/// id, and the cause instant is recomputed by the original formula
+/// (latest arrival among the recovered batch — deterministic, so the
+/// identity family is stable). NOTHING un-consumes, ever: the markers
+/// stay, and dispatch of the successor attempt re-annotates
+/// append-only. Items whose consumed-annotation never landed are
+/// absent here by construction — they re-batch through the live
+/// derivation as their own cause, exactly as today.
+fn on_item_match_retry_due(
+    items: &[AgendaItem],
+    effect: &AgendaEffect,
+    approval_at_ms: u64,
+) -> Option<TriggerDue> {
+    if !matches!(
+        effect.manifest.trigger,
+        Some(super::types::TriggerSpec::OnItemMatch { .. })
+    ) {
+        return None;
+    }
+    let last = effect.last_run.as_ref()?;
+    if !matches!(last.state.as_str(), "failed" | "unknown") {
+        return None;
+    }
+    let mut latest_arrival = 0u64;
+    let mut recovered: Vec<String> = Vec::new();
+    for candidate in items {
+        let consumed_by_attempt =
+            trigger_consumed_markers(candidate)
+                .iter()
+                .any(|(effect_id, occurrence_id)| {
+                    *effect_id == effect.effect_id && *occurrence_id == last.occurrence_id
+                });
+        if consumed_by_attempt {
+            latest_arrival = latest_arrival.max(candidate.provenance.created_ms);
+            recovered.push(candidate.id.clone());
+        }
+    }
+    if recovered.is_empty() {
+        return None;
+    }
+    Some(TriggerDue {
+        due_ms: trigger_floored_due(
+            effect,
+            approval_at_ms,
+            latest_arrival.saturating_add(super::types::TRIGGER_BATCH_WINDOW_MS),
+        ),
+        cause_ms: latest_arrival,
+        matched_item_ids: recovered,
+    })
 }
 
 /// A standing series' planner-relevant instants at one moment, from
@@ -1216,10 +1350,37 @@ pub(crate) struct Plan {
     /// never spawned, fail-closed (`missed` + a notification).
     pub(crate) missed_sessions: Vec<SpawnOccurrence>,
     /// `prepared`-but-never-`started` session occurrences (crash before
-    /// launch confirmation): resolved to `Unknown`, never auto-retried.
+    /// launch confirmation): resolved to `Unknown`. The time lane never
+    /// auto-retries them; a triggered cause's walk then mints its
+    /// bounded successor attempt (Track AO).
     pub(crate) crashed: Vec<SpawnOccurrence>,
     /// Next instant (epoch ms) the scheduler must re-plan, if any.
     pub(crate) next_wake_ms: Option<u64>,
+}
+
+/// One planner candidate instant: what would fire, its identity, and
+/// whether the Track AO attempt walk applies — the TRIGGER CAUSE lane
+/// only; requested instants and the whole time lane keep attempt-0
+/// dedup semantics verbatim (a spent instant stays spent, and the
+/// one-shot's re-approve ceremony is untouched — OPEN-6).
+struct PlanCandidate {
+    fire_ms: u64,
+    identity_ms: u64,
+    recurring: bool,
+    walk: bool,
+    batch: Vec<String>,
+}
+
+impl PlanCandidate {
+    fn attempt_zero(fire_ms: u64, identity_ms: u64, recurring: bool) -> Self {
+        Self {
+            fire_ms,
+            identity_ms,
+            recurring,
+            walk: false,
+            batch: Vec::new(),
+        }
+    }
 }
 
 /// The pure planner. `quiet_until_ms` is the precomputed end of the
@@ -1279,22 +1440,35 @@ pub(crate) fn plan(
             // the RAW cause — floors delay the fire but never rename the
             // occurrence, so a spent cause stays spent while the cooldown
             // floor advances past each terminal.
-            let mut candidates: Vec<(u64, u64, bool)> = Vec::new();
-            let mut trigger_batch: Vec<String> = Vec::new();
+            let mut candidates: Vec<PlanCandidate> = Vec::new();
             let triggered = effect.manifest.trigger.is_some();
             if let Some(trig) = &effect.manifest.trigger {
                 let started = journal.started_sessions_for_item(&item.id);
-                if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started)
-                {
-                    candidates.push((due.due_ms, due.cause_ms, true));
-                    trigger_batch = due.matched_item_ids;
+                // Track AO regeneration: the TRIGGER CAUSE is the one
+                // walk-bearing candidate. When the live derivation has
+                // nothing for a failed/unknown `on_item_match` cause
+                // (its batch was consumed at dispatch), the retry
+                // reconstruction re-derives it from the consumed
+                // markers — at most one walk-derived candidate per
+                // effect per pass, so a fresh cause and a pending retry
+                // never burst together.
+                let due = trigger_due(items, item, effect, trig, approval.at_ms, &started)
+                    .or_else(|| on_item_match_retry_due(items, effect, approval.at_ms));
+                if let Some(due) = due {
+                    candidates.push(PlanCandidate {
+                        fire_ms: due.due_ms,
+                        identity_ms: due.cause_ms,
+                        recurring: true,
+                        walk: true,
+                        batch: due.matched_item_ids,
+                    });
                 }
                 for req in &effect.requested {
-                    candidates.push((req.at_ms, req.at_ms, true));
+                    candidates.push(PlanCandidate::attempt_zero(req.at_ms, req.at_ms, true));
                 }
             } else {
                 match &effect.manifest.recurrence {
-                    None => candidates.push((
+                    None => candidates.push(PlanCandidate::attempt_zero(
                         effect.manifest.fire_at_ms,
                         effect.manifest.fire_at_ms,
                         false,
@@ -1302,13 +1476,14 @@ pub(crate) fn plan(
                     Some(rec) => {
                         let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
                         if let Some(due) = instants.due {
-                            candidates.push((due, due, true));
+                            candidates.push(PlanCandidate::attempt_zero(due, due, true));
                         }
                         if let Some(upcoming) = instants.upcoming {
                             consider_wake(upcoming, &mut plan);
                         }
                         for req in &effect.requested {
-                            candidates.push((req.at_ms, req.at_ms, true));
+                            candidates
+                                .push(PlanCandidate::attempt_zero(req.at_ms, req.at_ms, true));
                         }
                     }
                 }
@@ -1331,18 +1506,45 @@ pub(crate) fn plan(
                 || journal.started_unresolved_for_item(&item.id);
             let session_name =
                 derive_spawn_session_name(item, effect.manifest.trigger.as_ref(), items);
-            for (instant, identity_ms, recurring) in candidates {
-                let occurrence_id = session_occurrence_id(
-                    &item.id,
-                    &effect.effect_id,
-                    &approval.digest,
-                    identity_ms,
-                );
+            for PlanCandidate {
+                fire_ms: instant,
+                identity_ms,
+                recurring,
+                walk,
+                batch,
+            } in candidates
+            {
+                // The walk-bearing candidate (the trigger cause) steps
+                // past failed/unknown attempts to the first unattempted
+                // ordinal; everything else keeps attempt-0 dedup
+                // verbatim — a spent time-lane or requested instant
+                // stays spent, whatever its terminal.
+                let (occurrence_id, attempt, progress) = if walk {
+                    match walk_cause_attempts(
+                        journal,
+                        &item.id,
+                        &effect.effect_id,
+                        &approval.digest,
+                        identity_ms,
+                    ) {
+                        Some(walked) => walked,
+                        None => continue, // settled, live, or exhausted
+                    }
+                } else {
+                    let occurrence_id = session_occurrence_id(
+                        &item.id,
+                        &effect.effect_id,
+                        &approval.digest,
+                        identity_ms,
+                        0,
+                    );
+                    let progress = journal.progress(&occurrence_id);
+                    if progress.terminal.is_some() || progress.started.is_some() {
+                        continue;
+                    }
+                    (occurrence_id, 0, progress)
+                };
                 if in_flight.contains(&occurrence_id) {
-                    continue;
-                }
-                let progress = journal.progress(&occurrence_id);
-                if progress.terminal.is_some() || progress.started.is_some() {
                     continue;
                 }
                 let spawn = SpawnOccurrence {
@@ -1357,9 +1559,10 @@ pub(crate) fn plan(
                     project_root: effect.manifest.project_root.clone(),
                     agent_config: effect.manifest.agent_config.clone(),
                     provenance_session_id: item.provenance.session_id.clone(),
-                    matched_item_ids: trigger_batch.clone(),
+                    matched_item_ids: batch,
                     binding_refs: effect.manifest.binding_refs.clone(),
                     session_name: session_name.clone(),
+                    attempt,
                 };
                 if progress.prepared {
                     // Crash between prepare and launch confirmation: fail
@@ -1482,7 +1685,7 @@ pub(crate) fn effect_planner_view(
     // [`trigger_due`] with the planner so the two cannot drift, and the
     // trigger candidate's RAW-cause identity, so the journal dedup below
     // skips exactly what the planner skips.
-    let mut candidates: Vec<(u64, u64)> = Vec::new();
+    let mut candidates: Vec<(u64, u64, bool)> = Vec::new();
     let mut upcoming: Option<u64> = None;
     fn consider_upcoming(instant: u64, upcoming: &mut Option<u64>) {
         *upcoming = Some(upcoming.map_or(instant, |cur: u64| cur.min(instant)));
@@ -1491,35 +1694,65 @@ pub(crate) fn effect_planner_view(
     let mut trigger: Option<TriggerDue> = None;
     if let Some(trig) = &effect.manifest.trigger {
         let started = journal.started_sessions_for_item(&item.id);
-        if let Some(due) = trigger_due(items, item, effect, trig, approval.at_ms, &started) {
-            candidates.push((due.due_ms, due.cause_ms));
+        // The same live-or-retry derivation as `plan` (Track AO): a
+        // pending regeneration keeps the recovered batch visibly
+        // watched and the next-fire honest about the retry.
+        let due = trigger_due(items, item, effect, trig, approval.at_ms, &started)
+            .or_else(|| on_item_match_retry_due(items, effect, approval.at_ms));
+        if let Some(due) = due {
+            candidates.push((due.due_ms, due.cause_ms, true));
             trigger = Some(due);
         }
         for req in &effect.requested {
-            candidates.push((req.at_ms, req.at_ms));
+            candidates.push((req.at_ms, req.at_ms, false));
         }
     } else {
         match &effect.manifest.recurrence {
-            None => candidates.push((effect.manifest.fire_at_ms, effect.manifest.fire_at_ms)),
+            None => candidates.push((
+                effect.manifest.fire_at_ms,
+                effect.manifest.fire_at_ms,
+                false,
+            )),
             Some(rec) => {
                 let instants = series_instants(effect.manifest.fire_at_ms, rec, now_ms);
                 if let Some(due) = instants.due {
-                    candidates.push((due, due));
+                    candidates.push((due, due, false));
                 }
                 if let Some(next) = instants.upcoming {
                     consider_upcoming(next, &mut upcoming);
                 }
                 for req in &effect.requested {
-                    candidates.push((req.at_ms, req.at_ms));
+                    candidates.push((req.at_ms, req.at_ms, false));
                 }
             }
         }
     }
     let mut fires_next_pass: Option<u64> = None;
-    for (instant, identity_ms) in candidates {
-        let occurrence_id =
-            session_occurrence_id(&item.id, &effect.effect_id, &approval.digest, identity_ms);
-        let progress = journal.progress(&occurrence_id);
+    for (instant, identity_ms, walk) in candidates {
+        // Mirror `plan` attempt for attempt (the differential pin): the
+        // trigger cause walks past failed/unknown ordinals; everything
+        // else keeps attempt-0 dedup.
+        let progress = if walk {
+            match walk_cause_attempts(
+                journal,
+                &item.id,
+                &effect.effect_id,
+                &approval.digest,
+                identity_ms,
+            ) {
+                Some((_, _, progress)) => progress,
+                None => continue, // settled, live, or exhausted — no fire
+            }
+        } else {
+            let occurrence_id = session_occurrence_id(
+                &item.id,
+                &effect.effect_id,
+                &approval.digest,
+                identity_ms,
+                0,
+            );
+            journal.progress(&occurrence_id)
+        };
         // Spent or already executing (`plan` skips these), or crash
         // residue (`plan` resolves it through the crashed lane, never a
         // fire).
@@ -1885,6 +2118,7 @@ mod tests {
             session_id: session.map(str::to_string),
             generation: None,
             boot_id: None,
+            attempt: None,
         };
         journal
             .append(&record(OccurrenceState::Started, Some("sess-dead")))
@@ -1963,6 +2197,7 @@ mod tests {
                 session_id: None,
                 generation: None,
                 boot_id: None,
+                attempt: None,
             })
             .unwrap();
         journal
@@ -1977,6 +2212,7 @@ mod tests {
                 session_id: None,
                 generation: None,
                 boot_id: None,
+                attempt: None,
             })
             .unwrap();
         let again = plan(
@@ -2012,6 +2248,7 @@ mod tests {
                 session_id: session.map(str::to_string),
                 generation: None,
                 boot_id: None,
+                attempt: None,
             }
         };
         // occ-1: started by s1, re-keyed to successor s2, then completed.
@@ -2099,6 +2336,7 @@ mod tests {
                         session_id: None,
                         generation: None,
                         boot_id: None,
+                        attempt: None,
                     })
                     .unwrap();
                 if terminal {
@@ -2114,6 +2352,7 @@ mod tests {
                             session_id: None,
                             generation: None,
                             boot_id: None,
+                            attempt: None,
                         })
                         .unwrap();
                 }
@@ -2178,6 +2417,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             generation: None,
             boot_id: boot.map(str::to_string),
+            attempt: None,
         };
         let lines = [
             serde_json::to_string(&mk(OccurrenceState::Prepared, Some("boot-a"))).unwrap(),
@@ -2239,6 +2479,7 @@ mod tests {
             session_id: None,
             generation: None,
             boot_id: None,
+            attempt: None,
         };
         writer
             .append(&record("occ-1", OccurrenceState::Prepared))
@@ -2404,6 +2645,7 @@ mod tests {
                     session_id: None,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -2531,6 +2773,7 @@ mod tests {
                     session_id: None,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -2774,6 +3017,7 @@ mod tests {
                     session_id: Some("sess-live".into()),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -2823,6 +3067,7 @@ mod tests {
                 session_id: Some("sess-live".into()),
                 generation: None,
                 boot_id: None,
+                attempt: None,
             })
             .unwrap();
         let released = plan(
@@ -3005,6 +3250,7 @@ mod tests {
                     session_id: None,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -3111,6 +3357,7 @@ mod tests {
                 &effect.effect_id,
                 &effect.approval.as_ref().unwrap().digest,
                 now - 5_000,
+                0,
             );
             spend_occurrence(&mut journal, &occ, now - 4_000);
         }
@@ -3165,6 +3412,7 @@ mod tests {
                 &effect.effect_id,
                 &effect.approval.as_ref().unwrap().digest,
                 now - 1_000,
+                0,
             );
             spend_occurrence(&mut journal, &occ, now - 900);
         }
@@ -3194,7 +3442,8 @@ mod tests {
             let effect = &exhausted.effects[0];
             let digest = &effect.approval.as_ref().unwrap().digest;
             for instant in [now - 3 * EVERY, now - 2 * EVERY] {
-                let occ = session_occurrence_id(&exhausted.id, &effect.effect_id, digest, instant);
+                let occ =
+                    session_occurrence_id(&exhausted.id, &effect.effect_id, digest, instant, 0);
                 spend_occurrence(&mut journal, &occ, instant);
             }
         }
@@ -3215,7 +3464,7 @@ mod tests {
             let effect = &expired.effects[0];
             let digest = &effect.approval.as_ref().unwrap().digest;
             for instant in [now - 3 * EVERY, now - 2 * EVERY] {
-                let occ = session_occurrence_id(&expired.id, &effect.effect_id, digest, instant);
+                let occ = session_occurrence_id(&expired.id, &effect.effect_id, digest, instant, 0);
                 spend_occurrence(&mut journal, &occ, instant);
             }
         }
@@ -3251,6 +3500,7 @@ mod tests {
                 &effect.effect_id,
                 &effect.approval.as_ref().unwrap().digest,
                 now - 2_000,
+                0,
             );
             spend_occurrence(&mut journal, &occ, now - 1_900);
         }
@@ -3340,6 +3590,7 @@ mod tests {
                 session_id: None,
                 generation: None,
                 boot_id: None,
+                attempt: None,
             })
             .unwrap();
         assert_eq!(
@@ -3434,6 +3685,7 @@ mod tests {
                     session_id: None,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -3454,6 +3706,7 @@ mod tests {
                     session_id: session,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -3602,6 +3855,7 @@ mod tests {
                             session_id: Some("x".repeat(200)),
                             generation: None,
                             boot_id: None,
+                            attempt: None,
                         })
                         .unwrap();
                 }
@@ -3781,6 +4035,383 @@ mod tests {
             &empty_sets(),
         );
         assert_eq!(again.spawn[0].occurrence_id, spawn.occurrence_id);
+    }
+
+    /// Journal `prepared` + the given terminal for one occurrence —
+    /// the regeneration tests' failed/unknown fixture.
+    fn terminal_occurrence(
+        journal: &mut OccurrenceJournal,
+        occurrence_id: &str,
+        at_ms: u64,
+        terminal: OccurrenceState,
+    ) {
+        for state in [OccurrenceState::Prepared, terminal] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms,
+                    occurrence_id: occurrence_id.to_string(),
+                    item_id: "node-b".into(),
+                    due_ms: at_ms,
+                    state,
+                    urgency: None,
+                    session_id: None,
+                    generation: None,
+                    boot_id: None,
+                    attempt: None,
+                })
+                .unwrap();
+        }
+    }
+
+    fn failed_run(occurrence_id: &str, state: &str, at_ms: u64) -> AgendaRun {
+        AgendaRun {
+            occurrence_id: occurrence_id.into(),
+            state: state.into(),
+            session_id: None,
+            at_ms,
+            note: None,
+            attestation: None,
+        }
+    }
+
+    /// Track AO pin `attempt_zero_identity_is_byte_stable` (ruling R2):
+    /// pre-AO occurrence ids are byte-identical under the
+    /// attempt-indexed derivation — every existing id, journal row, and
+    /// in-flight occurrence untouched. The literal freezes the exact
+    /// bytes; retry ordinals are distinct and stable.
+    #[test]
+    fn attempt_zero_identity_is_byte_stable() {
+        assert_eq!(
+            session_occurrence_id("item", "effect", "digest", 1234, 0),
+            "2c3f16627f65f22916928a56c8251403",
+            "attempt 0 hashes exactly the pre-AO bytes"
+        );
+        let zero = session_occurrence_id("item", "effect", "digest", 1234, 0);
+        let one = session_occurrence_id("item", "effect", "digest", 1234, 1);
+        let two = session_occurrence_id("item", "effect", "digest", 1234, 2);
+        assert_ne!(zero, one, "a retry is a distinct occurrence");
+        assert_ne!(one, two);
+        assert_eq!(
+            one,
+            session_occurrence_id("item", "effect", "digest", 1234, 1),
+            "attempt identities are stable across re-plans"
+        );
+    }
+
+    /// Track AO pin `regeneration_only_for_triggered_failed_unknown`
+    /// (the ruled Q5 matrix): transport `failed` and `unknown` re-mint
+    /// a bounded successor attempt for TRIGGERED causes; `completed` —
+    /// attested `blocked` included (OPEN-5: attestation feeds streaks
+    /// and surfaces, never the retry decision) — ends the family; the
+    /// one-shot time lane keeps its re-approve ceremony (OPEN-6). The
+    /// plan↔view differential holds through every step.
+    #[test]
+    fn regeneration_only_for_triggered_failed_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let cause = 100_000u64;
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let digest = node.effects[0].approval.as_ref().unwrap().digest.clone();
+        let mut items = vec![done_at("node-a", cause), node];
+        let occ = |attempt: u32| session_occurrence_id("node-b", "ef-1", &digest, cause, attempt);
+
+        // failed → the walk mints attempt 1 of the SAME cause, spaced
+        // by the C-floor (the cooldown off the failed write-back).
+        terminal_occurrence(&mut journal, &occ(0), 150_000, OccurrenceState::Failed);
+        items[1].effects[0].last_run = Some(failed_run(&occ(0), "failed", 150_000));
+        items[1].effects[0].consecutive_failures = 1;
+        let floor = 150_000 + super::super::types::TRIGGER_COOLDOWN_MS;
+        let now = floor + 1;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1, "the failed cause regenerates");
+        assert_eq!(planned.spawn[0].occurrence_id, occ(1));
+        assert_eq!(planned.spawn[0].attempt, 1);
+        assert_eq!(
+            assert_agreement(&items, &items[1], &journal, &policy, now),
+            Some(floor),
+            "the display twin mirrors the walk"
+        );
+
+        // unknown → also re-mints (the crashed-cause rider's ruled
+        // amendment of RFC §7.5): attempt 2 follows.
+        terminal_occurrence(&mut journal, &occ(1), now + 10, OccurrenceState::Unknown);
+        items[1].effects[0].last_run = Some(failed_run(&occ(1), "unknown", now + 10));
+        items[1].effects[0].consecutive_failures = 2;
+        let now2 = now + 10 + super::super::types::TRIGGER_COOLDOWN_MS + 1;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now2,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1, "unknown regenerates too");
+        assert_eq!(planned.spawn[0].occurrence_id, occ(2));
+        assert_eq!(planned.spawn[0].attempt, 2);
+
+        // completed — even when the session itself attested blocked —
+        // ends the family: regeneration keys on TRANSPORT terminals
+        // alone, and a retry cannot clear an external blocker.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut journal2 = self::journal(dir2.path());
+        let mut node2 = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node2, "node-a");
+        let digest2 = node2.effects[0].approval.as_ref().unwrap().digest.clone();
+        let occ2_0 = session_occurrence_id("node-b", "ef-1", &digest2, cause, 0);
+        terminal_occurrence(&mut journal2, &occ2_0, 150_000, OccurrenceState::Completed);
+        let mut done_run = failed_run(&occ2_0, "completed", 150_000);
+        done_run.attestation = Some(super::super::types::AgendaAttestation {
+            outcome: super::super::types::AttestationOutcome::Blocked,
+            note: None,
+            refs: Vec::new(),
+            at_ms: 149_000,
+            session_id: None,
+        });
+        node2.effects[0].last_run = Some(done_run);
+        let items2 = vec![done_at("node-a", cause), node2];
+        let planned = plan(
+            &items2,
+            &journal2,
+            &policy,
+            now2,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(
+            planned.spawn.is_empty(),
+            "attested-blocked rides its transport completed OUT of the family"
+        );
+        assert_eq!(
+            assert_agreement(&items2, &items2[1], &journal2, &policy, now2),
+            None
+        );
+
+        // The one-shot time lane keeps the re-approve ceremony: a
+        // failed one-shot never auto-retries.
+        let dir3 = tempfile::tempdir().unwrap();
+        let mut journal3 = self::journal(dir3.path());
+        let oneshot = one_shot_item("solo", 50_000);
+        let digest3 = oneshot.effects[0].approval.as_ref().unwrap().digest.clone();
+        let solo_occ = session_occurrence_id("solo", "ef-1", &digest3, 50_000, 0);
+        terminal_occurrence(&mut journal3, &solo_occ, 51_000, OccurrenceState::Failed);
+        let items3 = vec![oneshot];
+        let planned = plan(
+            &items3,
+            &journal3,
+            &policy,
+            60_000,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(
+            planned.spawn.is_empty() && planned.crashed.is_empty(),
+            "the time lane never walks — re-approve is the only exit"
+        );
+    }
+
+    /// Track AO pin `regeneration_respects_cooldown_cap_and_suspension`:
+    /// attempts are C-floor-spaced (before the floor the walk registers
+    /// a wake, never a spawn); the per-cause cap holds across streak
+    /// resets (the journal rows never reset — a re-approval of the SAME
+    /// digest lifts suspension but cannot re-open an exhausted cause);
+    /// a suspended effect halts the walk wholesale.
+    #[test]
+    fn regeneration_respects_cooldown_cap_and_suspension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let approved = 10_000;
+        let cause = 100_000u64;
+
+        // (a) The C-floor: attempt 1 is not plannable before the
+        // cooldown floor — the wake registers instead.
+        let mut node = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node, "node-a");
+        let digest = node.effects[0].approval.as_ref().unwrap().digest.clone();
+        let occ = |attempt: u32| session_occurrence_id("node-b", "ef-1", &digest, cause, attempt);
+        terminal_occurrence(&mut journal, &occ(0), 150_000, OccurrenceState::Failed);
+        node.effects[0].last_run = Some(failed_run(&occ(0), "failed", 150_000));
+        node.effects[0].consecutive_failures = 1;
+        let mut items = vec![done_at("node-a", cause), node];
+        let floor = 150_000 + super::super::types::TRIGGER_COOLDOWN_MS;
+        let before = floor - 1_000;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            before,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(
+            planned.spawn.is_empty(),
+            "no attempt fires inside the cooldown"
+        );
+        assert_eq!(
+            planned.next_wake_ms,
+            Some(floor),
+            "the retry registers the wake at the floor"
+        );
+
+        // (b) The cap holds across streak resets: three attempts spent,
+        // streak reset to 1 (the re-approve re-arm) — the cause is
+        // exhausted regardless.
+        terminal_occurrence(&mut journal, &occ(1), floor + 10, OccurrenceState::Failed);
+        terminal_occurrence(
+            &mut journal,
+            &occ(2),
+            floor + super::super::types::TRIGGER_COOLDOWN_MS + 20,
+            OccurrenceState::Failed,
+        );
+        let last_at = floor + super::super::types::TRIGGER_COOLDOWN_MS + 20;
+        items[1].effects[0].last_run = Some(failed_run(&occ(2), "failed", last_at));
+        items[1].effects[0].consecutive_failures = 1; // post-re-arm
+        let late = last_at + 2 * super::super::types::TRIGGER_COOLDOWN_MS;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            late,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(
+            planned.spawn.is_empty(),
+            "MAX_CAUSE_REGENERATIONS attempts exhaust the cause across resets"
+        );
+        assert_eq!(
+            assert_agreement(&items, &items[1], &journal, &policy, late),
+            None,
+            "the display twin agrees the cause is exhausted"
+        );
+
+        // (c) Suspension halts the walk: one failed attempt, streak at
+        // the threshold — nothing plans, cap headroom or not.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut journal2 = self::journal(dir2.path());
+        let mut node2 = triggered_item("node-b", TriggerSpec::OnUnblock, approved, approved);
+        depends_on(&mut node2, "node-a");
+        let digest2 = node2.effects[0].approval.as_ref().unwrap().digest.clone();
+        let occ2_0 = session_occurrence_id("node-b", "ef-1", &digest2, cause, 0);
+        terminal_occurrence(&mut journal2, &occ2_0, 150_000, OccurrenceState::Failed);
+        node2.effects[0].last_run = Some(failed_run(&occ2_0, "failed", 150_000));
+        node2.effects[0].consecutive_failures = super::super::types::DEFAULT_SUSPEND_AFTER_FAILURES;
+        let items2 = vec![done_at("node-a", cause), node2];
+        let planned = plan(
+            &items2,
+            &journal2,
+            &policy,
+            late,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert!(planned.spawn.is_empty(), "suspension halts the walk");
+    }
+
+    /// Track AO pin
+    /// `batch_retry_rederives_original_batch_from_consumed_markers`:
+    /// once dispatch consumed an `on_item_match` batch, the live
+    /// derivation has nothing for that cause — the retry re-derives the
+    /// ORIGINAL batch from the markers naming the failed attempt's
+    /// occurrence id, minting the same cause family's next attempt.
+    /// NOTHING un-consumes (the markers stay; the items never re-match
+    /// on their own), and a NEW live cause takes precedence over a
+    /// pending retry — at most one walk candidate per pass.
+    #[test]
+    fn batch_retry_rederives_original_batch_from_consumed_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let watcher = triggered_item("watcher", gate_trigger(), 10_000, 10_000);
+        let digest = watcher.effects[0].approval.as_ref().unwrap().digest.clone();
+        let latest_arrival = 30_000u64;
+        let occ = |attempt: u32| {
+            session_occurrence_id("watcher", "ef-1", &digest, latest_arrival, attempt)
+        };
+        let consumed_note = |occurrence: &str| super::super::types::AgendaAnnotation {
+            text: format!(
+                "{}effect=ef-1 occurrence={occurrence}",
+                super::super::types::TRIGGER_CONSUMED_PREFIX
+            ),
+            at_ms: 40_000,
+            principal: None,
+            session_id: None,
+            kind: Some("daemon".into()),
+            source: Some(super::super::types::TRIGGER_CONSUMED_SOURCE.into()),
+        };
+        let mut q1 = matching_question("q1", 20_000, None);
+        q1.annotations.push(consumed_note(&occ(0)));
+        let mut q2 = matching_question("q2", latest_arrival, None);
+        q2.annotations.push(consumed_note(&occ(0)));
+        terminal_occurrence(&mut journal, &occ(0), 40_000, OccurrenceState::Failed);
+        let mut watcher = watcher;
+        watcher.effects[0].last_run = Some(failed_run(&occ(0), "failed", 40_000));
+        watcher.effects[0].consecutive_failures = 1;
+        let items = vec![watcher, q1, q2];
+        let now = 40_000
+            + super::super::types::TRIGGER_COOLDOWN_MS
+            + super::super::types::TRIGGER_BATCH_WINDOW_MS
+            + 1;
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now,
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1, "the consumed batch retries");
+        let spawn = &planned.spawn[0];
+        assert_eq!(spawn.occurrence_id, occ(1), "same cause family, attempt 1");
+        assert_eq!(spawn.attempt, 1);
+        assert_eq!(
+            spawn.matched_item_ids,
+            vec!["q1".to_string(), "q2".to_string()],
+            "the ORIGINAL batch rides the retry, re-derived from the markers"
+        );
+
+        // A NEW live cause outranks the pending retry — one walk
+        // candidate per pass, no burst.
+        let q3 = matching_question("q3", 60_000, None);
+        let mut items = items;
+        items.push(q3);
+        let planned = plan(
+            &items,
+            &journal,
+            &policy,
+            now.max(60_000 + super::super::types::TRIGGER_BATCH_WINDOW_MS + 1),
+            None,
+            &empty_sets(),
+            &empty_sets(),
+        );
+        assert_eq!(planned.spawn.len(), 1);
+        let spawn = &planned.spawn[0];
+        assert_eq!(
+            spawn.matched_item_ids,
+            vec!["q3".to_string()],
+            "the live cause wins the pass; the retry waits"
+        );
+        assert_eq!(spawn.attempt, 0, "a fresh cause starts its own family");
     }
 
     /// Empty relies_on is vacuously satisfied — the workflow-start
@@ -3969,7 +4600,7 @@ mod tests {
         let approval_digest = &items[1].effects[0].approval.as_ref().unwrap().digest;
         assert_eq!(
             occurrence,
-            session_occurrence_id("node-b", "ef-1", approval_digest, 100_000),
+            session_occurrence_id("node-b", "ef-1", approval_digest, 100_000, 0),
             "trigger identity = the raw cause instant"
         );
 
@@ -4027,7 +4658,7 @@ mod tests {
         let approval_digest = &items[0].effects[0].approval.as_ref().unwrap().digest;
         assert_eq!(
             occurrence,
-            session_occurrence_id("steward", "ef-1", approval_digest, 20_000),
+            session_occurrence_id("steward", "ef-1", approval_digest, 20_000, 0),
             "batch identity = the raw latest-arrival"
         );
 
@@ -4144,6 +4775,7 @@ mod tests {
                     session_id: Some("sess-fired".into()),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -4265,6 +4897,7 @@ mod tests {
                         .then(|| "sess-fired".to_string()),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
@@ -4359,6 +4992,7 @@ mod tests {
                 session_id: session.map(Into::into),
                 generation: None,
                 boot_id: None,
+                attempt: None,
             };
         journal
             .append(&record("occ-dispatching", OccurrenceState::Prepared, None))
