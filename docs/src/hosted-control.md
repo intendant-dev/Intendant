@@ -5,6 +5,14 @@ reaches a daemon at its fleet name. It is off by default. When off, the
 fleet-name and reachability-relay surfaces retain their discovery-only
 `role:none` behavior.
 
+The floor and the product direction are two deliberate layers. The
+discovery-only `role:none` floor is the immutable shipped default, while the
+ratified product direction (2026-07-16) makes this convenience lane the
+default lane of the remote-control product, with the user-owned custom-domain
+lane as the opt-in hardening path. Activation is staged behind alpha-launch
+stability; enabling it is always a per-daemon owner opt-in, no fleet-wide
+switch exists, and ambient hosted provenance stays `role:none` regardless.
+
 The separate [user-owned custom-domain lane](./custom-domain.md) uses the same
 compiled presets, immutable floor, proof-bound HTTP, and one-use WebSocket
 tickets. Its exact-name WebAuthn ceremony can approve the signed tab request
