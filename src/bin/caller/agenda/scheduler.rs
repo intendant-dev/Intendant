@@ -36,12 +36,13 @@ const DELEGATION_PREFIX: &str = "agenda-occ-";
 /// task names the durable end-channels instead. Lives beside the
 /// source-ids line in the ONE task builder (`send_start_task`), so
 /// dispatch and the resweep both carry it; the exact bytes are pinned
-/// by `epistemic_line_rides_every_fired_task`. The AO teaching pass
-/// AMENDS this line in place — never a second line.
+/// by `epistemic_line_rides_every_fired_task`. AMENDED in place by the
+/// AO teaching pass (ruling R4) when the attest lane shipped — one
+/// line, never two.
 const EPISTEMIC_RIDER_LINE: &str =
     "Your closing message reaches nobody by default — fired sessions end into a dead-letter \
-     channel. Durable channels are item annotations, refs, and durable files: write your \
-     handoff there before your last token.";
+     channel. Durable channels are item annotations, refs, durable files, and your occurrence \
+     attestation (ctl agenda attest): write your handoff there before your last token.";
 
 /// Cap on remembered pre-receipt session outcomes. Terminal events are
 /// rare (one per session end), and most remembered entries belong to
@@ -1900,15 +1901,17 @@ mod tests {
     /// teaching line rides EVERY fired task — the exact bytes are pinned
     /// here, and the resweep's re-send is byte-identical to the first
     /// send (the single-builder property: both send sites call
-    /// `send_start_task`). The AO teaching pass amends THIS pin when it
-    /// adds the attest verb — one block, never two.
+    /// `send_start_task`). The AO teaching pass (R4) AMENDED the line in
+    /// place with the attest verb — one block, never two; this pin is
+    /// the amendment's proof.
     #[tokio::test]
     async fn epistemic_line_rides_every_fired_task() {
         assert_eq!(
             EPISTEMIC_RIDER_LINE,
             "Your closing message reaches nobody by default — fired sessions end into a \
-             dead-letter channel. Durable channels are item annotations, refs, and durable \
-             files: write your handoff there before your last token.",
+             dead-letter channel. Durable channels are item annotations, refs, durable \
+             files, and your occurrence attestation (ctl agenda attest): write your \
+             handoff there before your last token.",
             "the taught bytes are law (amended only by the AO teaching pass)"
         );
         let dir = tempfile::tempdir().unwrap();

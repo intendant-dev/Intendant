@@ -200,6 +200,14 @@ impl AgendaHandle {
                 }));
             }
         }
+        // Attest binds HERE, at the tenant edge (Track AO): the handle
+        // holds the occurrence journal, so the journal-side intake
+        // checks — occurrence-belongs-to-item, actor in the started
+        // lineage — run before the store validates the rest. Every
+        // refusal is named (ruling R5).
+        if let AgendaCommand::Attest { id, occurrence, .. } = &cmd {
+            self.verify_attest_binding(id, occurrence, actor.as_ref())?;
+        }
         // Start-now resolves its project HERE, at the tenant edge where the
         // daemon context lives: explicit pick → the parking session's
         // recorded root → the daemon default — refused with a named error
@@ -701,6 +709,79 @@ impl AgendaHandle {
         }
     }
 
+    /// Track AO intake, the journal-side checks (ruling Q2): the
+    /// occurrence exists and belongs to the named item, and the
+    /// gate-resolved actor session is in its `started_history` —
+    /// Rider A's lineage law, with NO second resolver: superseded
+    /// originals and admitted successors both attest (last-wins is the
+    /// fold's concern). Non-session actors are refused by name (R5):
+    /// attestation is the fired session's self-report; an owner
+    /// statement about a run is a verification lane and must not wear
+    /// this label. Accepted while `started` and after a terminal alike
+    /// (late attests are display-only downstream); a prepared-only
+    /// occurrence has no started lineage and refuses on membership.
+    /// The session id is gate-bound by token possession — never echoed
+    /// from request fields — so membership here is attribution, not
+    /// claim.
+    fn verify_attest_binding(
+        &self,
+        id: &str,
+        occurrence: &str,
+        actor: Option<&super::types::AgendaActor>,
+    ) -> Result<(), AgendaError> {
+        let Some(session_id) = actor.and_then(|actor| actor.session_id.as_deref()) else {
+            return Err(AgendaError::Invalid(
+                "attest is the fired session's self-report — non-session actors cannot \
+                 attest (an owner statement about a run is a verification lane, not \
+                 self-report)"
+                    .into(),
+            ));
+        };
+        let progress = self
+            .with_journal(|journal| {
+                journal
+                    .refresh_if_stale()
+                    .map(|()| journal.progress(occurrence))
+            })
+            .ok_or_else(|| {
+                AgendaError::Invalid(
+                    "attest: the occurrence journal is unavailable — cannot verify the \
+                     attestation binding"
+                        .into(),
+                )
+            })?
+            .map_err(|err| {
+                AgendaError::Invalid(format!(
+                    "attest: the occurrence journal is unreadable ({err}) — cannot verify \
+                     the attestation binding"
+                ))
+            })?;
+        match progress.item_id.as_deref() {
+            None => {
+                return Err(AgendaError::NotFound(format!(
+                    "attest: occurrence {occurrence} is not in this daemon's journal"
+                )))
+            }
+            Some(owner) if owner != id => {
+                return Err(AgendaError::Invalid(format!(
+                    "attest: occurrence {occurrence} belongs to item {owner}, not {id}"
+                )))
+            }
+            Some(_) => {}
+        }
+        if !progress
+            .started_history
+            .iter()
+            .any(|started| started == session_id)
+        {
+            return Err(AgendaError::Invalid(format!(
+                "attest: session {session_id} is not in occurrence {occurrence}'s started \
+                 lineage — only the fired session (or its resume successors) attests"
+            )));
+        }
+        Ok(())
+    }
+
     /// Run `f` with the handle's journal reader (lazily opened, its own
     /// mutex — never nested with the store lock). `None` when the
     /// journal cannot be opened; callers degrade honestly.
@@ -996,6 +1077,317 @@ mod tests {
             "a deleted item degrades to id-only"
         );
         assert!(orphan.sealed_inputs.is_empty());
+    }
+
+    /// Attest test rig: an item with a proposed session effect, a bare
+    /// item without one, and journal `started` rows — occ-1 fired for
+    /// the effect item by sess-original then re-keyed to
+    /// sess-successor (Rider A's lineage), occ-2 fired under the bare
+    /// item by sess-other.
+    fn attest_rig(dir: &std::path::Path) -> (AgendaHandle, AgendaItem, AgendaItem) {
+        let handle = AgendaHandle::new(AgendaStore::open(dir).unwrap(), EventBus::new(), dir);
+        let owner = Some(AgendaActor {
+            principal: Some("principal:root:dashboard".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| AgendaCommand::Add {
+            refs: Vec::new(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let item = handle.apply(add("fired work"), owner.clone()).unwrap();
+        let item = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: "run it".into(),
+                    fire_at_ms: 1_000,
+                    orchestrate: false,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: Vec::new(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let bare = handle.apply(add("no effect here"), owner).unwrap();
+        {
+            let mut journal = OccurrenceJournal::open(dir).unwrap();
+            let row = |occurrence: &str, item_id: &str, session: &str| {
+                super::super::reminders::OccurrenceRecord {
+                    v: 1,
+                    at_ms: 1,
+                    occurrence_id: occurrence.to_string(),
+                    item_id: item_id.to_string(),
+                    due_ms: 1_000,
+                    state: OccurrenceState::Started,
+                    urgency: None,
+                    session_id: Some(session.to_string()),
+                    generation: None,
+                    boot_id: None,
+                }
+            };
+            journal
+                .append(&row("occ-1", &item.id, "sess-original"))
+                .unwrap();
+            journal
+                .append(&row("occ-1", &item.id, "sess-successor"))
+                .unwrap();
+            journal
+                .append(&row("occ-2", &bare.id, "sess-other"))
+                .unwrap();
+        }
+        (handle, item, bare)
+    }
+
+    fn session_actor(session_id: &str) -> Option<AgendaActor> {
+        Some(AgendaActor {
+            principal: None,
+            session_id: Some(session_id.into()),
+            kind: Some("agent_session".into()),
+        })
+    }
+
+    fn attest_cmd(
+        item_id: &str,
+        occurrence: &str,
+        outcome: super::super::types::AttestationOutcome,
+        refs: Vec<BindingRef>,
+    ) -> AgendaCommand {
+        AgendaCommand::Attest {
+            id: item_id.into(),
+            occurrence: occurrence.into(),
+            outcome,
+            note: Some("what happened, shortly".into()),
+            refs,
+            source: None,
+        }
+    }
+
+    /// Track AO pin `attest_requires_lineage_membership` (ruling Q2 +
+    /// R5): the superseded original and the admitted successor both
+    /// attest (last-wins is the fold's concern); a non-lineage session,
+    /// a non-session actor, an unknown occurrence, a wrong item, and an
+    /// effect-less item are each refused BY NAME.
+    #[test]
+    fn attest_requires_lineage_membership() {
+        use super::super::types::AttestationOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, item, bare) = attest_rig(dir.path());
+
+        // Both lineage members attest — Rider A: a re-key never
+        // un-attributes the original.
+        handle
+            .apply(
+                attest_cmd(&item.id, "occ-1", AttestationOutcome::Blocked, Vec::new()),
+                session_actor("sess-original"),
+            )
+            .expect("the superseded original attests");
+        handle
+            .apply(
+                attest_cmd(&item.id, "occ-1", AttestationOutcome::Partial, Vec::new()),
+                session_actor("sess-successor"),
+            )
+            .expect("the admitted successor attests");
+
+        let stranger = handle
+            .apply(
+                attest_cmd(&item.id, "occ-1", AttestationOutcome::Achieved, Vec::new()),
+                session_actor("sess-stranger"),
+            )
+            .unwrap_err();
+        assert!(
+            stranger.to_string().contains("started lineage"),
+            "{stranger}"
+        );
+
+        let owner_attempt = handle
+            .apply(
+                attest_cmd(&item.id, "occ-1", AttestationOutcome::Achieved, Vec::new()),
+                Some(AgendaActor {
+                    principal: Some("principal:root:dashboard".into()),
+                    session_id: None,
+                    kind: Some("dashboard".into()),
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            owner_attempt.to_string().contains("non-session actors"),
+            "{owner_attempt}"
+        );
+
+        let unknown = handle
+            .apply(
+                attest_cmd(
+                    &item.id,
+                    "occ-nope",
+                    AttestationOutcome::Achieved,
+                    Vec::new(),
+                ),
+                session_actor("sess-original"),
+            )
+            .unwrap_err();
+        assert!(
+            unknown.to_string().contains("not in this daemon's journal"),
+            "{unknown}"
+        );
+
+        let wrong_item = handle
+            .apply(
+                attest_cmd(&item.id, "occ-2", AttestationOutcome::Achieved, Vec::new()),
+                session_actor("sess-other"),
+            )
+            .unwrap_err();
+        assert!(
+            wrong_item.to_string().contains("belongs to item"),
+            "{wrong_item}"
+        );
+
+        let no_effect = handle
+            .apply(
+                attest_cmd(&bare.id, "occ-2", AttestationOutcome::Achieved, Vec::new()),
+                session_actor("sess-other"),
+            )
+            .unwrap_err();
+        assert!(
+            no_effect
+                .to_string()
+                .contains("no scheduled-session effect"),
+            "{no_effect}"
+        );
+
+        // Both accepted attests are durable ops, attributed on the
+        // envelope; the wire field `occurrence` landed as
+        // `occurrence_id` with the effect resolved server-side.
+        let page = handle.read_ops(0, Some(&item.id), 50).unwrap();
+        let attests: Vec<&serde_json::Value> = page
+            .ops
+            .iter()
+            .filter(|entry| entry["op"]["op"]["type"] == "attest")
+            .collect();
+        assert_eq!(attests.len(), 2, "last-wins keeps BOTH ops as history");
+        assert_eq!(attests[0]["op"]["actor"]["session_id"], "sess-original");
+        assert_eq!(attests[0]["op"]["op"]["outcome"], "blocked");
+        assert_eq!(attests[1]["op"]["actor"]["session_id"], "sess-successor");
+        assert_eq!(attests[1]["op"]["op"]["outcome"], "partial");
+        assert_eq!(
+            attests[0]["op"]["op"]["effect_id"],
+            item.effects[0].effect_id.as_str()
+        );
+        assert_eq!(attests[0]["op"]["op"]["occurrence_id"], "occ-1");
+    }
+
+    /// Track AO pin `attest_refs_hash_verified_at_intake` (Q2 check 3 +
+    /// OPEN-3 ruled verify-only): a stated pin the daemon's own read
+    /// contradicts is refused as malformed; the v1 grammar and the ≤ 8
+    /// rail hold; and NOTHING lands in the sealed store — pointer +
+    /// pin, never custody.
+    #[test]
+    fn attest_refs_hash_verified_at_intake() {
+        use super::super::types::AttestationOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, item, _bare) = attest_rig(dir.path());
+        let handoff = dir.path().join("handoff.md");
+        std::fs::write(&handoff, b"the durable handoff\n").unwrap();
+        let locator = format!("file:{}", handoff.display());
+        let good = super::super::store::digest_file(&handoff).unwrap();
+
+        handle
+            .apply(
+                attest_cmd(
+                    &item.id,
+                    "occ-1",
+                    AttestationOutcome::Achieved,
+                    vec![BindingRef {
+                        locator: locator.clone(),
+                        sha256: good.clone(),
+                    }],
+                ),
+                session_actor("sess-original"),
+            )
+            .expect("a pin matching the daemon's own read is accepted");
+        let page = handle.read_ops(0, Some(&item.id), 50).unwrap();
+        let attest = page
+            .ops
+            .iter()
+            .find(|entry| entry["op"]["op"]["type"] == "attest")
+            .expect("the attest op is durable");
+        assert_eq!(attest["op"]["op"]["refs"][0]["sha256"], good.as_str());
+        assert!(
+            !super::super::sealed_blobs::sealed_blob_path(dir.path(), &good).exists(),
+            "verify-only: attestation refs are never sealed"
+        );
+
+        let wrong = format!(
+            "{}{}",
+            &good[..63],
+            if good.ends_with('0') { "1" } else { "0" }
+        );
+        let mismatch = handle
+            .apply(
+                attest_cmd(
+                    &item.id,
+                    "occ-1",
+                    AttestationOutcome::Achieved,
+                    vec![BindingRef {
+                        locator: locator.clone(),
+                        sha256: wrong,
+                    }],
+                ),
+                session_actor("sess-original"),
+            )
+            .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not match the live content"),
+            "{mismatch}"
+        );
+
+        let over_rail = handle
+            .apply(
+                attest_cmd(
+                    &item.id,
+                    "occ-1",
+                    AttestationOutcome::Achieved,
+                    (0..9)
+                        .map(|_| BindingRef {
+                            locator: locator.clone(),
+                            sha256: good.clone(),
+                        })
+                        .collect(),
+                ),
+                session_actor("sess-original"),
+            )
+            .unwrap_err();
+        assert!(over_rail.to_string().contains("at most 8"), "{over_rail}");
+
+        let bad_hex = handle
+            .apply(
+                attest_cmd(
+                    &item.id,
+                    "occ-1",
+                    AttestationOutcome::Achieved,
+                    vec![BindingRef {
+                        locator,
+                        sha256: "deadbeef".into(),
+                    }],
+                ),
+                session_actor("sess-original"),
+            )
+            .unwrap_err();
+        assert!(
+            bad_hex.to_string().contains("64 hex characters"),
+            "{bad_hex}"
+        );
     }
 
     #[test]
