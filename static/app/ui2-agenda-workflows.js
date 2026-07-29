@@ -1,16 +1,19 @@
-// ---- Workflows & triggered mandates: catalog picks, daemon stamp,
-// one-gesture approval (Track T → AW) ----
-// Picker entries derive from the SERVED definition catalog; a click
-// stamps through the daemon's stamp op — the daemon reads, validates,
-// and SEALS the definition, parks the instance graph (an instance HUB
-// with the orientation body iff workflow, node items placed under it,
-// relies_on links), and proposes one on_unblock manifest per node.
-// STAMPING parks and proposes only; the approval sheet then previews
-// the sealed definition and the stamped graph, and the owner's single
+// ---- Definition stamping + the one-gesture workflow approval
+// (Track T → AW) ----
+// The automate sheet's explicit Stamp gesture calls the shared wrapper
+// below — the daemon's stamp op reads, validates, and SEALS the
+// definition, parks the instance graph (an instance HUB with the
+// orientation body iff workflow, node items placed under it, relies_on
+// links), and proposes one manifest per node. STAMPING parks and
+// proposes only; for workflows the approval sheet then previews the
+// sealed definition and the stamped graph, and the owner's single
 // confirm emits one ordinary per-node approval op — the UI batches,
 // the semantics never cascade, and no workflow-level object exists
 // anywhere (the emission-shape pin holds the approval lane to exactly
-// one emitter called from the owner-confirm handler).
+// one emitter called from the owner-confirm handler). The same sheet
+// closes the Review-&-adopt loop: a multi-node adopt re-proposes its
+// manifests (the seals fragment) and lands back here for the batch
+// re-approval.
 
 // One agenda op with the shared error/observe discipline.
 async function agendaWorkflowOp(params) {
@@ -26,12 +29,15 @@ async function agendaWorkflowOp(params) {
 // reads, validates, and seals the definition, parks the graph, and
 // proposes per node — the response is the whole stamped outcome (hub,
 // nodes, per-node digests, the sealed pin). Parks and proposes ONLY —
-// approval is the separate explicit act on the sheet this feeds. A
+// approval is the separate explicit act on the surface this feeds. A
 // mid-stamp failure leaves ordinary parked items visible on the board
-// (append-only history; nothing rolls back silently). Both the
-// workflow and triggered-action lanes ride this wrapper.
-async function agendaWorkflowStamp(entry, projectRoot) {
-  const params = { definition: entry.name };
+// (append-only history; nothing rolls back silently). Every definition
+// kind rides this wrapper; `overrides` carries the kind-gated stamp
+// fields the sheet collected (cadence/first-fire/executor — prefills
+// into the ordinary manifest intake, refused by name where the kind
+// takes none).
+async function agendaDefinitionStamp(entry, projectRoot, overrides) {
+  const params = { definition: entry.name, ...(overrides || {}) };
   if (projectRoot) params.project_root = projectRoot;
   const res = await daemonApi.request('api_agenda_stamp', params);
   if (!res.ok || !res.body || !res.body.stamp) {
@@ -90,15 +96,17 @@ function agendaWorkflowOpenApprovalSheet(stamped) {
   agendaWorkflowSheetOpen = true;
 
   const head = agendaStartSheetEl('div', 'ags-head');
-  head.appendChild(agendaStartSheetEl('span', 'ags-title', `Approve: ${stamped.title}`));
+  head.appendChild(agendaStartSheetEl('span', 'ags-title',
+    `${stamped.adopted ? 'Re-approve' : 'Approve'}: ${stamped.title}`));
   const close = agendaStartSheetEl('button', 'ags-close', '×');
   close.type = 'button';
   close.setAttribute('aria-label', 'Later');
   close.addEventListener('click', agendaWorkflowCloseSheet);
   head.appendChild(close);
   panel.appendChild(head);
-  panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
-    'Stamped and sealed — nothing runs yet. Each node below is its own digest-bound manifest pinning the sealed definition; approving arms them all, and the first node fires on approval.'));
+  panel.appendChild(agendaStartSheetEl('div', 'ags-sub', stamped.adopted
+    ? 'Adopted and re-sealed — nothing re-arms yet. Each node below was re-proposed on the fresh revision (its old approval is void); approving arms them all again.'
+    : 'Stamped and sealed — nothing runs yet. Each node below is its own digest-bound manifest pinning the sealed definition; approving arms them all, and the first node fires on approval.'));
 
   panel.appendChild(agendaStartSheetEl('label', 'ags-label',
     `The sealed definition (sha256 ${String(stamped.sha256 || '').slice(0, 12)}…) — every node pins exactly these bytes`));
@@ -175,8 +183,9 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
     await agendaWorkflowEmitApprovals(stamped);
     agendaWorkflowCloseSheet();
     if (typeof showControlToast === 'function') {
-      showControlToast('success',
-        `Workflow armed — ${stamped.nodes.length} approvals recorded; the first node fires now.`);
+      showControlToast('success', stamped.adopted
+        ? `Re-armed on the fresh revision — ${stamped.nodes.length} approvals recorded.`
+        : `Workflow armed — ${stamped.nodes.length} approvals recorded; the first node fires now.`);
     }
     const landId = stamped.hub ? stamped.hub.id
       : (stamped.nodes[0] && stamped.nodes[0].item ? stamped.nodes[0].item.id : null);
@@ -188,108 +197,10 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
   }
 }
 
-// The automate sheet's picker hook: workflow entries beside the
-// cadenced actions, derived from the served catalog the sheet fetched.
-// Stamping happens on click; the approval sheet opens the moment the
-// stamp lands. Invalid and shadowed entries render disabled with the
-// reason — visible, never hidden.
-function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet, getProjectRoot, entries) {
-  const catalog = Array.isArray(entries) ? entries : [];
-  if (typeof agendaTriggeredMandateRenderButtons === 'function') {
-    agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot, catalog);
-  }
-  for (const entry of catalog) {
-    if (!entry.workflow) continue;
-    const usable = entry.valid && !entry.shadowed;
-    const btn = agendaStartSheetEl('button', 'ags-seg-btn', usable
-      ? `${entry.title || entry.name} →`
-      : `${entry.title || entry.name} (${entry.shadowed ? 'shadowed' : 'invalid'})`);
-    btn.type = 'button';
-    btn.dataset.workflow = entry.name;
-    if (!usable) {
-      btn.disabled = true;
-      btn.title = entry.shadowed
-        ? 'shadowed by a personal definition of the same name'
-        : (entry.reason || 'invalid definition');
-      seg.appendChild(btn);
-      continue;
-    }
-    if (entry.advisories && entry.advisories.length) btn.title = entry.advisories.join('; ');
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      try {
-        const stamped = await agendaWorkflowStamp(entry,
-          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
-        closeAutomationSheet();
-        agendaWorkflowOpenApprovalSheet(stamped);
-      } catch (e) {
-        btn.disabled = false;
-        if (typeof showControlToast === 'function') {
-          showControlToast('error',
-            `Workflow stamp failed: ${(e && e.message) || e} — items stamped so far remain parked.`);
-        }
-      }
-    });
-    seg.appendChild(btn);
-  }
-}
-
-// ---- Triggered standing mandates (Track T, T3 → AW) ----
-// Fire-on-event instead of cadence: one item + one on_item_match
-// manifest, stamped through the same daemon stamp op off the served
-// catalog. The stamp path parks + proposes and lands the owner on the
-// ordinary Approve card — one digest, no sheet, and this lane emits no
-// approvals (the fragment's single-emitter pin counts them).
-
-// Stamp a triggered standing mandate through the daemon (the trigger
-// prefill rides the definition's config block into the ordinary
-// intake); approval stays the owner's ordinary card act.
-async function agendaTriggeredMandateStamp(entry, projectRoot) {
-  const stamp = await agendaWorkflowStamp(entry, projectRoot);
-  const landId = stamp.nodes && stamp.nodes[0] && stamp.nodes[0].item
-    ? stamp.nodes[0].item.id : null;
-  if (landId && typeof agendaOpenInspector === 'function') agendaOpenInspector(landId);
-  if (typeof showControlToast === 'function') {
-    showControlToast('success',
-      'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the standing mandate.');
-  }
-}
-
-// Picker entries for the triggered actions (catalog entries whose
-// single node declares a trigger), rendered by the same hook.
-function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot, entries) {
-  for (const entry of (Array.isArray(entries) ? entries : [])) {
-    if (entry.workflow) continue;
-    const node = (entry.nodes && entry.nodes[0]) || {};
-    if (!node.trigger_kind) continue;
-    const usable = entry.valid && !entry.shadowed;
-    const base = `${entry.title || entry.name} (${node.trigger_kind}:${(node.trigger_tags || []).join(',')})`;
-    const btn = agendaStartSheetEl('button', 'ags-seg-btn',
-      usable ? base : `${base} (${entry.shadowed ? 'shadowed' : 'invalid'})`);
-    btn.type = 'button';
-    btn.dataset.triggeredMandate = entry.name;
-    if (!usable) {
-      btn.disabled = true;
-      btn.title = entry.shadowed
-        ? 'shadowed by a personal definition of the same name'
-        : (entry.reason || 'invalid definition');
-      seg.appendChild(btn);
-      continue;
-    }
-    if (entry.advisories && entry.advisories.length) btn.title = entry.advisories.join('; ');
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      try {
-        await agendaTriggeredMandateStamp(entry,
-          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
-        closeAutomationSheet();
-      } catch (e) {
-        btn.disabled = false;
-        if (typeof showControlToast === 'function') {
-          showControlToast('error', `Stamp failed: ${(e && e.message) || e}`);
-        }
-      }
-    });
-    seg.appendChild(btn);
-  }
-}
+// The registry-era picker hooks (stamp-on-click workflow/triggered
+// buttons) died with the explicit-Stamp gesture: every kind now renders
+// in the automate sheet's picker, selection previews the definition,
+// and the ONLY stamp fires from the sheet's Stamp button — through the
+// shared wrapper above. This fragment keeps the transport and the
+// approval machinery; it renders no pickers and stamps nothing on its
+// own.

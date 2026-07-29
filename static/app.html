@@ -25077,10 +25077,9 @@ html.ui-v2 .agenda-card-add input:focus {
 }
 .ags-btn.ags-start:hover { background: var(--iris-2); border-color: var(--iris-2); }
 
-/* ---- Automate sheet (Track AU create-from-template) ---- */
+/* ---- Automate sheet (Track AW stamp-a-definition) ---- */
 
 html.ui-v2 .agsx-panel { max-width: 560px; }
-html.ui-v2 .agsx-templates { margin: 4px 0 8px; }
 html.ui-v2 .agsx-preview {
   max-height: 220px;
   overflow: auto;
@@ -25095,6 +25094,177 @@ html.ui-v2 .agsx-preview {
   margin: 2px 0 8px;
   color: var(--subtext1);
 }
+
+/* The definition picker: every kind side by side, each button a small
+   card — name + provenance, shape line, description. */
+html.ui-v2 .agsx-defs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+html.ui-v2 .agsx-def-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 7px 9px;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 9px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+html.ui-v2 .agsx-def-btn:hover { border-color: var(--overlay0); }
+html.ui-v2 .agsx-def-btn.active {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), 0.08);
+}
+html.ui-v2 .agsx-def-btn:disabled { opacity: 0.55; cursor: default; }
+html.ui-v2 .agsx-def-btn-name {
+  font-size: 12px;
+  font-weight: 650;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+html.ui-v2 .agsx-def-btn-kind { font-size: 10.5px; color: var(--subtext0); }
+html.ui-v2 .agsx-def-btn-desc {
+  font-size: 10.5px;
+  color: var(--subtext1);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+html.ui-v2 .agsx-prov {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--surface1);
+  color: var(--subtext0);
+}
+html.ui-v2 .agsx-prov-personal {
+  color: var(--iris);
+  border-color: rgba(var(--iris-rgb), 0.4);
+}
+
+/* The selected definition, rendered for reading. */
+html.ui-v2 .agsx-def { margin: 2px 0 8px; }
+html.ui-v2 .agsx-def-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .agsx-def-title { font-size: 13px; font-weight: 650; }
+html.ui-v2 .agsx-def-kind { font-size: 11px; color: var(--subtext0); }
+html.ui-v2 .agsx-def-desc { font-size: 11.5px; color: var(--subtext1); margin-top: 2px; }
+html.ui-v2 .agsx-def-adv { font-size: 11px; color: var(--amber); margin-top: 2px; }
+html.ui-v2 .agsx-def-node {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 11px;
+  margin-top: 3px;
+}
+html.ui-v2 .agsx-def-node-id { font-weight: 600; }
+html.ui-v2 .agsx-def-node-meta { color: var(--subtext0); }
+html.ui-v2 .agsx-def-prose { margin-top: 6px; max-height: 180px; }
+html.ui-v2 .agsx-exact { margin: 4px 0 2px; }
+html.ui-v2 .agsx-exact > summary {
+  font-size: 11px;
+  color: var(--subtext0);
+  cursor: pointer;
+}
+html.ui-v2 .agsx-exact[open] > summary { color: var(--text); }
+
+/* Pre-stamp summary: what the gesture will seal, park, and propose. */
+html.ui-v2 .agsx-summary {
+  border: 1px solid var(--surface0);
+  border-left: 2px solid var(--iris);
+  border-radius: 9px;
+  padding: 7px 10px;
+  margin: 2px 0 8px;
+  font-size: 11px;
+  color: var(--subtext1);
+}
+html.ui-v2 .agsx-summary-head {
+  font-weight: 650;
+  color: var(--text);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+html.ui-v2 .agsx-summary-line { margin-top: 1px; }
+
+/* ---- Sealed manifests: refs strip, drift, adopt (Track AW §2.4/§2.7) ---- */
+
+html.ui-v2 .ag2-seals {
+  border-top: 1px dashed var(--surface0);
+  margin-top: 7px;
+  padding-top: 6px;
+}
+html.ui-v2 .ag2-seals-head {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 10.5px;
+  font-weight: 650;
+  margin-bottom: 3px;
+}
+html.ui-v2 .ag2-seal-row {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 11px;
+  margin-top: 2px;
+}
+html.ui-v2 .ag2-seal-loc { font-weight: 600; overflow-wrap: anywhere; }
+html.ui-v2 .ag2-seal-drift { font-size: 10.5px; color: var(--subtext0); }
+html.ui-v2 .ag2-seal-drift.changed { color: var(--amber); font-weight: 600; }
+html.ui-v2 .ag2-seal-drift.missing { color: var(--subtext0); font-style: italic; }
+html.ui-v2 .ag2-seal-exact { margin: 2px 0 0; }
+html.ui-v2 .ag2-seal-exact > summary {
+  font-size: 10.5px;
+  color: var(--subtext0);
+  cursor: pointer;
+}
+html.ui-v2 .ag2-seal-pre {
+  max-height: 220px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 9px;
+  padding: 8px 10px;
+  margin: 3px 0 2px;
+  color: var(--subtext1);
+}
+html.ui-v2 .ag2-auto-sealed { color: var(--subtext0); }
+
+/* Review & adopt: sealed vs live, hashes + dates, one confirm. */
+html.ui-v2 .ag2-adopt-panel { max-width: 760px; }
+html.ui-v2 .ag2-adopt-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 4px 0 6px;
+}
+html.ui-v2 .ag2-adopt-col-head {
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--subtext0);
+  margin-bottom: 3px;
+}
+html.ui-v2 .ag2-adopt-col .agsx-preview { max-height: 300px; margin: 0; }
 /* ── static/app/ui2-agenda-inspector.css ── */
 /* Agenda inspector + schedule/preview/raw sheets + reminder-policy
    popover (redesign slices A + D — slice D adds the under-the-hood
@@ -37123,7 +37293,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5e9f5317cd6ee4b5';
+const INTENDANT_APP_BUILD = '65f28f55982d3ee5';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -91969,12 +92139,69 @@ function agendaFetchDefinitionCatalog(onSettled) {
     });
 }
 
-// Catalog view: the cadenced actions drive the automate sheet itself;
-// triggered actions and workflows render through the workflows
-// fragment's picker hook off the same fetch.
-function agendaCatalogActions(entries) {
-  return (entries || []).filter((d) => !d.workflow
-    && !(((d.nodes && d.nodes[0]) || {}).trigger_kind));
+// A catalog entry's stamp shape: 'workflow' (multi-node), 'triggered'
+// (single node firing on matching items), or 'action' (single node on a
+// cadence). Derived, never declared (the Q10 rule) — arity and the
+// node's trigger decide.
+function agendaDefinitionKind(entry) {
+  if (!entry) return null;
+  if (entry.workflow) return 'workflow';
+  return (((entry.nodes || [])[0] || {}).trigger_kind) ? 'triggered' : 'action';
+}
+
+// One line of what stamping this definition sets up — the picker's and
+// preview's kind caption, derived from the served nodes.
+function agendaDefinitionKindLine(entry) {
+  const kind = agendaDefinitionKind(entry);
+  if (kind === 'workflow') {
+    return `workflow · ${(entry.nodes || []).length} nodes, each its own approval`;
+  }
+  const node = (entry.nodes && entry.nodes[0]) || {};
+  if (kind === 'triggered') {
+    const tags = (node.trigger_tags || []).length ? `:${node.trigger_tags.join(',')}` : '';
+    return `standing action — fires on new ${node.trigger_kind || 'item'}${tags}`;
+  }
+  return node.every_ms
+    ? `standing action — every ${agendaCadenceLabel(node.every_ms)}`
+    : 'standing action — cadence chosen at stamp time';
+}
+
+// Provenance chip: which library serves this definition. Discovery
+// grants nothing either way — bindingness needs the stamp seal under an
+// approval digest.
+function agendaProvenanceChipEl(provenance) {
+  const p = provenance === 'personal' ? 'personal' : 'house';
+  const chip = agendaStartSheetEl('span', `agsx-prov agsx-prov-${p}`, p);
+  chip.title = p === 'house'
+    ? 'Ships with this daemon, materialized into the library root — stamping seals the file itself'
+    : 'From this daemon’s personal library — shadows a house definition of the same name';
+  return chip;
+}
+
+// Presentation split of a definition's bytes: drop the frontmatter fence
+// and the per-node ```toml config blocks, keep the authored prose the
+// fired session actually obeys. Display only — the exact sealed bytes
+// stay authoritative, one expander away.
+function agendaDefinitionProse(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  let i = 0;
+  if (lines[0] === '---') {
+    i = 1;
+    while (i < lines.length && lines[i] !== '---') i += 1;
+    i += 1;
+  }
+  const out = [];
+  let inConfig = false;
+  for (; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!inConfig && line.trim().startsWith('```toml')) { inConfig = true; continue; }
+    if (inConfig) {
+      if (line.trim() === '```') inConfig = false;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 // ---- Create-from-definition: the Automate sheet (Track AU → AW) ----
@@ -92003,7 +92230,7 @@ function agendaEnsureAutomationSheet() {
   const panel = document.createElement('div');
   panel.className = 'ags-panel agsx-panel';
   panel.setAttribute('role', 'dialog');
-  panel.setAttribute('aria-label', 'New automation from a mandate template');
+  panel.setAttribute('aria-label', 'New automation — stamp a definition');
   host.appendChild(backdrop);
   host.appendChild(panel);
   document.body.appendChild(host);
@@ -92047,7 +92274,7 @@ function agendaOpenAutomationSheet(anchor) {
   const panel = host.querySelector('.ags-panel');
   panel.textContent = '';
   agendaAutomationSheetOpen = true;
-  let entry = null; // the selected cadenced-action catalog entry
+  let entry = null; // the selected catalog entry, any kind
   let selectedName = '';
 
   const head = agendaStartSheetEl('div', 'ags-head');
@@ -92059,17 +92286,18 @@ function agendaOpenAutomationSheet(anchor) {
   head.appendChild(close);
   panel.appendChild(head);
   panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
-    'A standing supervised session on a cadence. Stamping seals the definition, parks it as an item, and proposes its schedule — nothing runs until you approve the digest on the card.'));
+    'Pick a definition, review it, then stamp: stamping seals the definition file, parks it on the agenda, and proposes its session manifests — nothing runs until you approve each digest on its card.'));
 
-  // Definition picker (served catalog).
-  const seg = agendaStartSheetEl('div', 'ags-seg agsx-templates');
+  // Definition picker (served catalog) — every kind side by side, each
+  // rendered as what it means: name, provenance, shape, description.
+  const seg = agendaStartSheetEl('div', 'agsx-defs');
   panel.appendChild(seg);
 
-  // Full definition text — the owner reads exactly the bytes a stamp
-  // seals; textContent rendering, no markup execution.
-  panel.appendChild(agendaStartSheetEl('label', 'ags-label',
-    'The definition — the full text a stamp seals; approval binds exactly this revision'));
-  const preview = agendaStartSheetEl('pre', 'agsx-preview');
+  // The definition, rendered for reading: header, node summary, and the
+  // authored prose the fired sessions obey — with the exact sealed
+  // bytes one explicit expander away (textContent rendering throughout,
+  // no markup execution).
+  const preview = agendaStartSheetEl('div', 'agsx-def');
   panel.appendChild(preview);
 
   // Cadence + first fire + suspend threshold.
@@ -92200,6 +92428,13 @@ function agendaOpenAutomationSheet(anchor) {
       });
   }
 
+  // Pre-stamp summary: exactly what the Stamp gesture will seal, park,
+  // and propose — rendered before the button, re-rendered as the
+  // controls change, so the gesture is never a surprise.
+  const summary = agendaStartSheetEl('div', 'agsx-summary');
+  summary.hidden = true;
+  panel.appendChild(summary);
+
   const error = agendaStartSheetEl('div', 'ags-error', '');
   error.hidden = true;
   panel.appendChild(error);
@@ -92211,56 +92446,162 @@ function agendaOpenAutomationSheet(anchor) {
   const cancel = agendaStartSheetEl('button', 'ags-btn', 'Cancel');
   cancel.type = 'button';
   cancel.addEventListener('click', agendaCloseAutomationSheet);
-  const park = agendaStartSheetEl('button', 'ags-btn ags-start', 'Park + propose');
-  park.type = 'button';
-  park.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { entry: () => entry, cadence, fire, suspend, project, configState, error, park }));
+  const stampBtn = agendaStartSheetEl('button', 'ags-btn ags-start', 'Stamp');
+  stampBtn.type = 'button';
+  stampBtn.title = 'Seals the definition, parks the item(s), proposes the manifest(s) — approves nothing';
+  stampBtn.addEventListener('click', () => agendaAutomationSheetSubmit(
+    { entry: () => entry, cadence, fire, suspend, project, configState, error, stampBtn }));
   foot.appendChild(cancel);
-  foot.appendChild(park);
+  foot.appendChild(stampBtn);
   panel.appendChild(foot);
 
-  const applyEntry = () => {
-    seg.querySelectorAll('button').forEach((b) =>
-      b.classList.toggle('active', !!entry && b.dataset.definition === entry.name));
+  const nodeExecutorLabel = (node) =>
+    [node.agent, node.model, node.effort].filter(Boolean).join(' · ') || 'daemon default';
+
+  const renderPreview = () => {
+    preview.textContent = '';
     if (!entry) {
-      preview.textContent = agendaDefinitionCatalog === null && !agendaDefinitionCatalogError
-        ? 'Loading the definition catalog…'
-        : (agendaDefinitionCatalogError
-          ? `Definition catalog unavailable: ${agendaDefinitionCatalogError}`
-          : 'No stampable cadenced definitions in the catalog.');
-      park.disabled = true;
+      preview.appendChild(agendaStartSheetEl('div', 'ags-hint',
+        agendaDefinitionCatalog === null && !agendaDefinitionCatalogError
+          ? 'Loading the definition catalog…'
+          : (agendaDefinitionCatalogError
+            ? `Definition catalog unavailable: ${agendaDefinitionCatalogError}`
+            : 'No stampable definitions in the catalog.')));
       return;
     }
-    park.disabled = false;
-    preview.textContent = entry.text;
-    const prefill = (entry.nodes && entry.nodes[0]) || {};
-    if (prefill.every_ms) {
-      const ms = String(prefill.every_ms);
-      if (!Array.from(cadence.options).some((o) => o.value === ms)) {
-        const option = document.createElement('option');
-        option.value = ms;
-        option.textContent = 'Definition default';
-        cadence.appendChild(option);
-      }
-      cadence.value = ms;
+    const dhead = agendaStartSheetEl('div', 'agsx-def-head');
+    dhead.appendChild(agendaStartSheetEl('span', 'agsx-def-title', entry.title || entry.name));
+    dhead.appendChild(agendaProvenanceChipEl(entry.provenance));
+    dhead.appendChild(agendaStartSheetEl('span', 'agsx-def-kind', agendaDefinitionKindLine(entry)));
+    preview.appendChild(dhead);
+    if (entry.description) {
+      preview.appendChild(agendaStartSheetEl('div', 'agsx-def-desc', entry.description));
     }
-    if (prefill.suspend_after) suspend.value = String(prefill.suspend_after);
-    else if (!suspend.value) suspend.value = '3';
+    if (entry.advisories && entry.advisories.length) {
+      preview.appendChild(agendaStartSheetEl('div', 'agsx-def-adv',
+        `Advisory: ${entry.advisories.join('; ')}`));
+    }
+    if (agendaDefinitionKind(entry) === 'workflow') {
+      for (const node of entry.nodes || []) {
+        const row = agendaStartSheetEl('div', 'agsx-def-node');
+        row.appendChild(agendaStartSheetEl('span', 'agsx-def-node-id', node.title || node.id));
+        const bits = [nodeExecutorLabel(node)];
+        if ((node.relies_on || []).length) bits.push(`after ${node.relies_on.join(', ')}`);
+        row.appendChild(agendaStartSheetEl('span', 'agsx-def-node-meta', bits.join(' · ')));
+        preview.appendChild(row);
+      }
+    }
+    const prose = agendaDefinitionProse(entry.text);
+    if (prose) {
+      const body = agendaStartSheetEl('pre', 'agsx-preview agsx-def-prose');
+      body.textContent = prose;
+      preview.appendChild(body);
+    }
+    // Verification honesty: the pretty rendering never replaces the
+    // bytes — the exact revision a stamp seals stays one gesture away.
+    const exact = document.createElement('details');
+    exact.className = 'agsx-exact';
+    const sum = document.createElement('summary');
+    sum.textContent = `Exact bytes a stamp seals${entry.sha256 ? ` — sha256 ${entry.sha256.slice(0, 12)}…` : ''}`;
+    exact.appendChild(sum);
+    const raw = agendaStartSheetEl('pre', 'agsx-preview');
+    raw.textContent = entry.text;
+    exact.appendChild(raw);
+    preview.appendChild(exact);
   };
+
+  const renderSummary = () => {
+    summary.textContent = '';
+    if (!entry) {
+      summary.hidden = true;
+      return;
+    }
+    summary.hidden = false;
+    const kind = agendaDefinitionKind(entry);
+    const add = (text) => summary.appendChild(agendaStartSheetEl('div', 'agsx-summary-line', text));
+    summary.appendChild(agendaStartSheetEl('div', 'agsx-summary-head', 'Stamp will'));
+    add(`seal this exact revision${entry.sha256 ? ` (sha256 ${entry.sha256.slice(0, 12)}…)` : ''} — firings execute the sealed bytes, whatever happens to the live file`);
+    if (kind === 'workflow') {
+      const n = (entry.nodes || []).length;
+      add(`park a hub + ${n} node tasks and propose ${n} manifests — each node fires when its prerequisites complete, each with its own approval`);
+    } else if (kind === 'triggered') {
+      const node = (entry.nodes && entry.nodes[0]) || {};
+      const tags = (node.trigger_tags || []).length ? ` tagged ${node.trigger_tags.join(', ')}` : '';
+      add(`park one item and propose one standing manifest — fires when a new open ${node.trigger_kind || 'item'}${tags} arrives`);
+    } else {
+      const everyMs = Number(cadence.value);
+      const firstRun = fire.value ? new Date(fire.value) : null;
+      add(`park one item and propose one standing manifest — every ${agendaCadenceLabel(everyMs)}, first run ${firstRun && !Number.isNaN(firstRun.getTime()) ? firstRun.toLocaleString() : 'to pick'}, suspends after ${Math.max(1, Number(suspend.value) || 3)} straight failures`);
+    }
+    if (kind !== 'workflow') {
+      const picks = [];
+      if (configState.backendOverride) picks.push(configState.backendOverride);
+      if (configState.modelSel && configState.modelSel.value) picks.push(configState.modelSel.value);
+      if (configState.effortSel && configState.effortSel.value) picks.push(configState.effortSel.value);
+      add(`executor: ${picks.length ? `${picks.join(' · ')} — recorded on the manifest` : 'daemon defaults'} · project: ${project.value.trim() || 'daemon default'}`);
+    } else {
+      add(`per-node executors and edges come from the definition · project: ${project.value.trim() || 'daemon default'}`);
+    }
+  };
+
+  const renderSelection = () => {
+    seg.querySelectorAll('button').forEach((b) =>
+      b.classList.toggle('active', !!entry && b.dataset.definition === entry.name));
+    const kind = agendaDefinitionKind(entry);
+    // Cadence and first-fire knobs exist only where the stamp op accepts
+    // them: cadenced actions. Workflows declare per-node executors and
+    // structural on_unblock edges in the definition; triggered actions
+    // fire on their declared match (executor override still applies).
+    cadRow.hidden = kind !== 'action';
+    fireRow.hidden = kind !== 'action';
+    suspendRow.hidden = kind !== 'action';
+    config.hidden = !kind || kind === 'workflow';
+    stampBtn.disabled = !entry;
+    if (entry && kind === 'action') {
+      const prefill = (entry.nodes && entry.nodes[0]) || {};
+      if (prefill.every_ms) {
+        const ms = String(prefill.every_ms);
+        if (!Array.from(cadence.options).some((o) => o.value === ms)) {
+          const option = document.createElement('option');
+          option.value = ms;
+          option.textContent = 'Definition default';
+          cadence.appendChild(option);
+        }
+        cadence.value = ms;
+      }
+      if (prefill.suspend_after) suspend.value = String(prefill.suspend_after);
+      else if (!suspend.value) suspend.value = '3';
+    }
+    renderPreview();
+    renderSummary();
+  };
+  // The summary mirrors the controls live — a stale promise line would
+  // be worse than none.
+  for (const [control, event] of [[cadence, 'change'], [fire, 'change'],
+    [suspend, 'input'], [project, 'input'], [config, 'change']]) {
+    control.addEventListener(event, renderSummary);
+  }
+
   const selectable = (d) => d.valid && !d.shadowed;
   const renderPicker = () => {
     seg.textContent = '';
-    const actions = agendaCatalogActions(agendaDefinitionCatalog);
-    entry = actions.find((d) => selectable(d) && d.name === selectedName)
-      || actions.find(selectable) || null;
+    const catalog = agendaDefinitionCatalog || [];
+    entry = catalog.find((d) => selectable(d) && d.name === selectedName)
+      || catalog.find(selectable) || null;
     selectedName = entry ? entry.name : '';
-    for (const d of actions) {
+    for (const d of catalog) {
       const usable = selectable(d);
-      const btn = agendaStartSheetEl('button', 'ags-seg-btn', usable
-        ? (d.title || d.name)
-        : `${d.title || d.name} (${d.shadowed ? 'shadowed' : 'invalid'})`);
+      const btn = agendaStartSheetEl('button', 'agsx-def-btn');
       btn.type = 'button';
       btn.dataset.definition = d.name;
+      const nameRow = agendaStartSheetEl('div', 'agsx-def-btn-name', d.title || d.name);
+      nameRow.appendChild(agendaProvenanceChipEl(d.provenance));
+      btn.appendChild(nameRow);
+      btn.appendChild(agendaStartSheetEl('div', 'agsx-def-btn-kind',
+        usable ? agendaDefinitionKindLine(d) : (d.shadowed ? 'shadowed' : 'invalid')));
+      if (d.description) {
+        btn.appendChild(agendaStartSheetEl('div', 'agsx-def-btn-desc', d.description));
+      }
       if (!usable) {
         btn.disabled = true;
         btn.title = d.shadowed
@@ -92268,18 +92609,11 @@ function agendaOpenAutomationSheet(anchor) {
           : (d.reason || 'invalid definition');
       } else {
         if (d.advisories && d.advisories.length) btn.title = d.advisories.join('; ');
-        btn.addEventListener('click', () => { entry = d; selectedName = d.name; applyEntry(); });
+        btn.addEventListener('click', () => { entry = d; selectedName = d.name; renderSelection(); });
       }
       seg.appendChild(btn);
     }
-    // Triggered actions and workflows stamp their own lanes and hand
-    // off to their own surfaces — rendered by the workflows fragment
-    // off the same catalog fetch.
-    if (typeof agendaWorkflowRenderPickerButtons === 'function') {
-      agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet,
-        () => project.value.trim(), agendaDefinitionCatalog || []);
-    }
-    applyEntry();
+    renderSelection();
   };
   renderPicker();
   agendaFetchDefinitionCatalog(() => {
@@ -92299,67 +92633,67 @@ async function agendaAutomationSheetSubmit(form) {
     showError('Pick a definition first.');
     return;
   }
-  const fireAt = form.fire.value ? new Date(form.fire.value).getTime() : NaN;
-  if (!Number.isFinite(fireAt) || fireAt <= Date.now()) {
-    showError('Pick a first-run time in the future.');
-    form.fire.focus();
-    return;
+  const kind = agendaDefinitionKind(entry);
+  // Overrides the stamp op accepts for this kind — prefills into the
+  // ordinary manifest intake, never around it. Workflows take none
+  // (per-node executors and edges are the definition's, v1).
+  const overrides = {};
+  if (kind !== 'workflow') {
+    // Explicit executor picks only — untouched selects inherit (the
+    // start sheet's exact assembly, so both lanes speak one vocabulary).
+    const spec = form.configState && form.configState.spec;
+    const agentConfig = {};
+    if (form.configState && form.configState.backendOverride) {
+      agentConfig.agent = form.configState.backendOverride;
+    }
+    if (spec && spec.backend && spec.backend !== 'internal') {
+      const model = form.configState.modelSel ? form.configState.modelSel.value : '';
+      const effort = form.configState.effortSel ? form.configState.effortSel.value : '';
+      if (model) agentConfig[spec.modelKey] = model;
+      if (effort) agentConfig[spec.effortKey] = effort;
+      if ((model || effort) && !agentConfig.agent) agentConfig.agent = spec.backend;
+    }
+    if (Object.keys(agentConfig).length) overrides.agent_config = agentConfig;
   }
-  const suspendAfter = Math.max(1, Number(form.suspend.value) || 3);
-  // Explicit executor picks only — untouched selects inherit (the start
-  // sheet's exact assembly, so both lanes speak one vocabulary).
-  const spec = form.configState && form.configState.spec;
-  const agentConfig = {};
-  if (form.configState && form.configState.backendOverride) {
-    agentConfig.agent = form.configState.backendOverride;
-  }
-  if (spec && spec.backend && spec.backend !== 'internal') {
-    const model = form.configState.modelSel ? form.configState.modelSel.value : '';
-    const effort = form.configState.effortSel ? form.configState.effortSel.value : '';
-    if (model) agentConfig[spec.modelKey] = model;
-    if (effort) agentConfig[spec.effortKey] = effort;
-    if ((model || effort) && !agentConfig.agent) agentConfig.agent = spec.backend;
-  }
-  form.park.disabled = true;
-  try {
-    // One daemon-side stamp: the daemon reads, validates, and SEALS the
-    // definition, parks the item, and proposes the manifest — the
-    // sheet's choices ride as prefills into the ordinary manifest
-    // intake, never around it. Parks + proposes ONLY; approval stays
-    // the owner's per-effect act on the card.
-    const stamp = {
-      definition: entry.name,
-      fire_at_ms: fireAt,
-      suspend_after: suspendAfter,
-    };
-    const everyMs = Number(form.cadence.value);
-    if (Number.isFinite(everyMs) && everyMs > 0) stamp.every_ms = everyMs;
-    const projectRoot = form.project && form.project.value.trim();
-    if (projectRoot) stamp.project_root = projectRoot;
-    if (Object.keys(agentConfig).length) stamp.agent_config = agentConfig;
-    const res = await daemonApi.request('api_agenda_stamp', stamp);
-    if (!res.ok || !res.body || !res.body.stamp) {
-      showError((res.body && res.body.error) || `stamp failed (${res.status})`);
+  if (kind === 'action') {
+    const fireAt = form.fire.value ? new Date(form.fire.value).getTime() : NaN;
+    if (!Number.isFinite(fireAt) || fireAt <= Date.now()) {
+      showError('Pick a first-run time in the future.');
+      form.fire.focus();
       return;
     }
-    const outcome = res.body.stamp;
-    if (outcome.hub) agendaObserveServerMessage({ item: outcome.hub });
-    for (const node of outcome.nodes || []) {
-      if (node.item) agendaObserveServerMessage({ item: node.item });
-    }
+    overrides.fire_at_ms = fireAt;
+    overrides.suspend_after = Math.max(1, Number(form.suspend.value) || 3);
+    const everyMs = Number(form.cadence.value);
+    if (Number.isFinite(everyMs) && everyMs > 0) overrides.every_ms = everyMs;
+  }
+  form.stampBtn.disabled = true;
+  try {
+    // THE stamp gesture — the only place this sheet stamps. One
+    // daemon-side op: the daemon reads, validates, and SEALS the
+    // definition, parks the instance graph, and proposes per node.
+    // Parks + proposes ONLY; approval stays the owner's per-effect act
+    // (the card, or the one-gesture sheet for a workflow's N nodes).
+    const stamped = await agendaDefinitionStamp(entry,
+      form.project ? form.project.value.trim() : '', overrides);
     agendaCloseAutomationSheet();
+    if (kind === 'workflow') {
+      agendaWorkflowOpenApprovalSheet(stamped);
+      return;
+    }
     // Land the owner on the ordinary Approve affordance.
-    const landId = outcome.nodes && outcome.nodes[0] && outcome.nodes[0].item
-      ? outcome.nodes[0].item.id : null;
+    const landId = stamped.nodes && stamped.nodes[0] && stamped.nodes[0].item
+      ? stamped.nodes[0].item.id : null;
     if (landId && typeof agendaOpenInspector === 'function') agendaOpenInspector(landId);
     if (typeof showControlToast === 'function') {
-      showControlToast('success',
-        'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the series.');
+      showControlToast('success', kind === 'triggered'
+        ? 'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the standing action.'
+        : 'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the series.');
     }
   } catch (e) {
     showError(String(e && e.message || e));
   } finally {
-    form.park.disabled = false;
+    form.stampBtn.disabled = false;
   }
 }
 /* ── static/app/ui2-agenda-cards.js ── */
@@ -92493,7 +92827,7 @@ function agendaEnsureScaffold() {
           <button type="button" class="ag2-fchip" id="ag2-f-frontier"
                   title="The un-triaged frontier: open items newer than the last triage summary, or unplaced with no triage note — the triage mandate’s scope">frontier</button>
           <button type="button" class="ag2-fchip" id="ag2-automate"
-                  title="Park a standing mandate from a template — triage, housekeeping — and propose its schedule; you approve the digest on the card">automate…</button>
+                  title="Stamp an automation definition — house or personal, action or workflow — sealing it, parking it, and proposing its schedule; you approve each digest on its card">automate…</button>
           <input id="ag2-search" class="ag2-search" type="text" autocomplete="off"
                  placeholder="Search the ledger — press /" aria-label="Search the agenda" />
         </div>
@@ -92777,8 +93111,8 @@ function agendaSearchMatch(item, q) {
 // filed arrives already placed and described — "untriaged" is false of
 // it; unfiling one re-admits it). A render-side convention over ordinary
 // data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
-// and the four expressions (ctl, this, docs, mandate template) move
-// together.
+// and the four expressions (ctl, this, docs, the triage definition)
+// move together.
 function agendaFrontierPredicate() {
   const newestSummary = Math.max(0, ...(agendaItems || [])
     .filter((x) => (x.tags || []).includes('triage:summary'))
@@ -93315,6 +93649,13 @@ function agendaAutomationStripHtml(item) {
     meta.push(`<span title="The planner's real next instant, served with the item">next ${escapeHtml(agendaAbsTime(e.next_fire_ms))}</span>`);
   } else if (st.kind === 'standing') {
     meta.push('<span>series ended</span>');
+  }
+  // Sealed inputs, list-render cheap: the count comes from the manifest
+  // already in hand — drift is judged on the item panel (expand-time,
+  // the G1 doctrine), never here.
+  const seals = (st.manifest.binding_refs || []).length;
+  if (seals) {
+    meta.push(`<span class="ag2-auto-sealed" title="Definition sealed under the approval digest — firings execute the sealed revision; drift and the sealed view live on the item panel">sealed ×${seals}</span>`);
   }
   // The manifest digest, always visible where the gesture lives — the
   // one thing depth never folds away, because it is what Approve signs
@@ -94421,6 +94762,7 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
+      ${typeof agendaSealsStripHtml === 'function' ? agendaSealsStripHtml(item) : ''}
       ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
       ${lastRun}
       ${acts.length ? `<div class="ag2-insp-actions">${acts.join('')}</div>` : ''}
@@ -97439,19 +97781,22 @@ function agendaPaletteEntries(query) {
   return entries;
 }
 /* ── static/app/ui2-agenda-workflows.js ── */
-// ---- Workflows & triggered mandates: catalog picks, daemon stamp,
-// one-gesture approval (Track T → AW) ----
-// Picker entries derive from the SERVED definition catalog; a click
-// stamps through the daemon's stamp op — the daemon reads, validates,
-// and SEALS the definition, parks the instance graph (an instance HUB
-// with the orientation body iff workflow, node items placed under it,
-// relies_on links), and proposes one on_unblock manifest per node.
-// STAMPING parks and proposes only; the approval sheet then previews
-// the sealed definition and the stamped graph, and the owner's single
+// ---- Definition stamping + the one-gesture workflow approval
+// (Track T → AW) ----
+// The automate sheet's explicit Stamp gesture calls the shared wrapper
+// below — the daemon's stamp op reads, validates, and SEALS the
+// definition, parks the instance graph (an instance HUB with the
+// orientation body iff workflow, node items placed under it, relies_on
+// links), and proposes one manifest per node. STAMPING parks and
+// proposes only; for workflows the approval sheet then previews the
+// sealed definition and the stamped graph, and the owner's single
 // confirm emits one ordinary per-node approval op — the UI batches,
 // the semantics never cascade, and no workflow-level object exists
 // anywhere (the emission-shape pin holds the approval lane to exactly
-// one emitter called from the owner-confirm handler).
+// one emitter called from the owner-confirm handler). The same sheet
+// closes the Review-&-adopt loop: a multi-node adopt re-proposes its
+// manifests (the seals fragment) and lands back here for the batch
+// re-approval.
 
 // One agenda op with the shared error/observe discipline.
 async function agendaWorkflowOp(params) {
@@ -97467,12 +97812,15 @@ async function agendaWorkflowOp(params) {
 // reads, validates, and seals the definition, parks the graph, and
 // proposes per node — the response is the whole stamped outcome (hub,
 // nodes, per-node digests, the sealed pin). Parks and proposes ONLY —
-// approval is the separate explicit act on the sheet this feeds. A
+// approval is the separate explicit act on the surface this feeds. A
 // mid-stamp failure leaves ordinary parked items visible on the board
-// (append-only history; nothing rolls back silently). Both the
-// workflow and triggered-action lanes ride this wrapper.
-async function agendaWorkflowStamp(entry, projectRoot) {
-  const params = { definition: entry.name };
+// (append-only history; nothing rolls back silently). Every definition
+// kind rides this wrapper; `overrides` carries the kind-gated stamp
+// fields the sheet collected (cadence/first-fire/executor — prefills
+// into the ordinary manifest intake, refused by name where the kind
+// takes none).
+async function agendaDefinitionStamp(entry, projectRoot, overrides) {
+  const params = { definition: entry.name, ...(overrides || {}) };
   if (projectRoot) params.project_root = projectRoot;
   const res = await daemonApi.request('api_agenda_stamp', params);
   if (!res.ok || !res.body || !res.body.stamp) {
@@ -97531,15 +97879,17 @@ function agendaWorkflowOpenApprovalSheet(stamped) {
   agendaWorkflowSheetOpen = true;
 
   const head = agendaStartSheetEl('div', 'ags-head');
-  head.appendChild(agendaStartSheetEl('span', 'ags-title', `Approve: ${stamped.title}`));
+  head.appendChild(agendaStartSheetEl('span', 'ags-title',
+    `${stamped.adopted ? 'Re-approve' : 'Approve'}: ${stamped.title}`));
   const close = agendaStartSheetEl('button', 'ags-close', '×');
   close.type = 'button';
   close.setAttribute('aria-label', 'Later');
   close.addEventListener('click', agendaWorkflowCloseSheet);
   head.appendChild(close);
   panel.appendChild(head);
-  panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
-    'Stamped and sealed — nothing runs yet. Each node below is its own digest-bound manifest pinning the sealed definition; approving arms them all, and the first node fires on approval.'));
+  panel.appendChild(agendaStartSheetEl('div', 'ags-sub', stamped.adopted
+    ? 'Adopted and re-sealed — nothing re-arms yet. Each node below was re-proposed on the fresh revision (its old approval is void); approving arms them all again.'
+    : 'Stamped and sealed — nothing runs yet. Each node below is its own digest-bound manifest pinning the sealed definition; approving arms them all, and the first node fires on approval.'));
 
   panel.appendChild(agendaStartSheetEl('label', 'ags-label',
     `The sealed definition (sha256 ${String(stamped.sha256 || '').slice(0, 12)}…) — every node pins exactly these bytes`));
@@ -97616,8 +97966,9 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
     await agendaWorkflowEmitApprovals(stamped);
     agendaWorkflowCloseSheet();
     if (typeof showControlToast === 'function') {
-      showControlToast('success',
-        `Workflow armed — ${stamped.nodes.length} approvals recorded; the first node fires now.`);
+      showControlToast('success', stamped.adopted
+        ? `Re-armed on the fresh revision — ${stamped.nodes.length} approvals recorded.`
+        : `Workflow armed — ${stamped.nodes.length} approvals recorded; the first node fires now.`);
     }
     const landId = stamped.hub ? stamped.hub.id
       : (stamped.nodes[0] && stamped.nodes[0].item ? stamped.nodes[0].item.id : null);
@@ -97629,111 +97980,372 @@ async function agendaWorkflowApproveConfirm(stamped, button, error) {
   }
 }
 
-// The automate sheet's picker hook: workflow entries beside the
-// cadenced actions, derived from the served catalog the sheet fetched.
-// Stamping happens on click; the approval sheet opens the moment the
-// stamp lands. Invalid and shadowed entries render disabled with the
-// reason — visible, never hidden.
-function agendaWorkflowRenderPickerButtons(seg, closeAutomationSheet, getProjectRoot, entries) {
-  const catalog = Array.isArray(entries) ? entries : [];
-  if (typeof agendaTriggeredMandateRenderButtons === 'function') {
-    agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot, catalog);
+// The registry-era picker hooks (stamp-on-click workflow/triggered
+// buttons) died with the explicit-Stamp gesture: every kind now renders
+// in the automate sheet's picker, selection previews the definition,
+// and the ONLY stamp fires from the sheet's Stamp button — through the
+// shared wrapper above. This fragment keeps the transport and the
+// approval machinery; it renders no pickers and stamps nothing on its
+// own.
+/* ── static/app/ui2-agenda-seals.js ── */
+// ---- Sealed manifests: refs strip, drift chip, Review & adopt
+// (Track AW §2.4/§2.7) ----
+// Manifests carrying binding refs grow a refs strip on the inspector's
+// effect card: locator, pin prefix, the sealed bytes one expander away
+// (served from the content-addressed lane), and an expand-time drift
+// chip — the daemon's file_ref_drift judgment extended to manifest
+// refs. Drift is INFORMATIONAL: firings keep executing the sealed
+// revision whatever happens to the live file (§2.7 / PR-B semantics).
+// "Review & adopt" shows sealed vs live and, on one confirm,
+// re-proposes the affected manifests with the fresh pin through the
+// EXISTING propose lane — new digests, approvals void, landing on the
+// ordinary approval (the one-gesture sheet for multi-node). Nothing
+// ever auto-adopts; declining leaves the sealed revision binding
+// indefinitely.
+
+// Expand-time drift judgments per item id ({at_ms, rows} or
+// {inflight:true}): the inspector re-renders on poll ticks, so
+// judgments cache briefly instead of re-hashing files every 2s; adopt
+// and recheck bust the entry.
+const agendaSealDriftCache = new Map();
+const AGENDA_SEAL_DRIFT_TTL_MS = 30_000;
+
+function agendaSealDriftRows(itemId) {
+  const hit = agendaSealDriftCache.get(itemId);
+  if (hit && !hit.inflight && Date.now() - hit.at_ms < AGENDA_SEAL_DRIFT_TTL_MS) {
+    return hit.rows;
   }
-  for (const entry of catalog) {
-    if (!entry.workflow) continue;
-    const usable = entry.valid && !entry.shadowed;
-    const btn = agendaStartSheetEl('button', 'ags-seg-btn', usable
-      ? `${entry.title || entry.name} →`
-      : `${entry.title || entry.name} (${entry.shadowed ? 'shadowed' : 'invalid'})`);
-    btn.type = 'button';
-    btn.dataset.workflow = entry.name;
-    if (!usable) {
-      btn.disabled = true;
-      btn.title = entry.shadowed
-        ? 'shadowed by a personal definition of the same name'
-        : (entry.reason || 'invalid definition');
-      seg.appendChild(btn);
-      continue;
-    }
-    if (entry.advisories && entry.advisories.length) btn.title = entry.advisories.join('; ');
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      try {
-        const stamped = await agendaWorkflowStamp(entry,
-          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
-        closeAutomationSheet();
-        agendaWorkflowOpenApprovalSheet(stamped);
-      } catch (e) {
-        btn.disabled = false;
-        if (typeof showControlToast === 'function') {
-          showControlToast('error',
-            `Workflow stamp failed: ${(e && e.message) || e} — items stamped so far remain parked.`);
-        }
-      }
+  if (!hit || (!hit.inflight && Date.now() - hit.at_ms >= AGENDA_SEAL_DRIFT_TTL_MS)) {
+    agendaSealDriftFetch(itemId);
+  }
+  return hit && hit.rows ? hit.rows : null;
+}
+
+function agendaSealDriftFetch(itemId) {
+  const prev = agendaSealDriftCache.get(itemId);
+  agendaSealDriftCache.set(itemId, { ...(prev || {}), inflight: true });
+  daemonApi.request('api_agenda_ref_drift', { item_id: itemId })
+    .then((res) => {
+      const rows = res.ok && res.body && Array.isArray(res.body.binding_refs)
+        ? res.body.binding_refs : [];
+      agendaSealDriftCache.set(itemId, { at_ms: Date.now(), rows });
+    })
+    .catch(() => {
+      agendaSealDriftCache.set(itemId, { at_ms: Date.now(), rows: null });
+    })
+    .finally(() => {
+      if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
     });
-    seg.appendChild(btn);
-  }
 }
 
-// ---- Triggered standing mandates (Track T, T3 → AW) ----
-// Fire-on-event instead of cadence: one item + one on_item_match
-// manifest, stamped through the same daemon stamp op off the served
-// catalog. The stamp path parks + proposes and lands the owner on the
-// ordinary Approve card — one digest, no sheet, and this lane emits no
-// approvals (the fragment's single-emitter pin counts them).
-
-// Stamp a triggered standing mandate through the daemon (the trigger
-// prefill rides the definition's config block into the ordinary
-// intake); approval stays the owner's ordinary card act.
-async function agendaTriggeredMandateStamp(entry, projectRoot) {
-  const stamp = await agendaWorkflowStamp(entry, projectRoot);
-  const landId = stamp.nodes && stamp.nodes[0] && stamp.nodes[0].item
-    ? stamp.nodes[0].item.id : null;
-  if (landId && typeof agendaOpenInspector === 'function') agendaOpenInspector(landId);
-  if (typeof showControlToast === 'function') {
-    showControlToast('success',
-      'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the standing mandate.');
-  }
+function agendaSealLocatorName(locator) {
+  const path = String(locator || '').replace(/^file:/, '');
+  const parts = path.split('/').filter(Boolean);
+  // SKILL.md files are named by their definition directory (spec law).
+  const base = parts.pop() || path;
+  return base === 'SKILL.md' && parts.length ? `${parts.pop()}/SKILL.md` : base;
 }
 
-// Picker entries for the triggered actions (catalog entries whose
-// single node declares a trigger), rendered by the same hook.
-function agendaTriggeredMandateRenderButtons(seg, closeAutomationSheet, getProjectRoot, entries) {
-  for (const entry of (Array.isArray(entries) ? entries : [])) {
-    if (entry.workflow) continue;
-    const node = (entry.nodes && entry.nodes[0]) || {};
-    if (!node.trigger_kind) continue;
-    const usable = entry.valid && !entry.shadowed;
-    const base = `${entry.title || entry.name} (${node.trigger_kind}:${(node.trigger_tags || []).join(',')})`;
-    const btn = agendaStartSheetEl('button', 'ags-seg-btn',
-      usable ? base : `${base} (${entry.shadowed ? 'shadowed' : 'invalid'})`);
-    btn.type = 'button';
-    btn.dataset.triggeredMandate = entry.name;
-    if (!usable) {
-      btn.disabled = true;
-      btn.title = entry.shadowed
-        ? 'shadowed by a personal definition of the same name'
-        : (entry.reason || 'invalid definition');
-      seg.appendChild(btn);
-      continue;
-    }
-    if (entry.advisories && entry.advisories.length) btn.title = entry.advisories.join('; ');
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-      try {
-        await agendaTriggeredMandateStamp(entry,
-          typeof getProjectRoot === 'function' ? getProjectRoot() : '');
-        closeAutomationSheet();
-      } catch (e) {
-        btn.disabled = false;
-        if (typeof showControlToast === 'function') {
-          showControlToast('error', `Stamp failed: ${(e && e.message) || e}`);
-        }
+// The strip: one row per sealed ref — locator, pin chip, drift chip,
+// and the sealed view (a <details> the toggle wire fills from
+// GET /api/agenda/sealed/{sha256} on first open). Renders on the
+// inspector's effect card only; the Automations lens row carries just
+// the cheap "sealed ×N" count (list render never hashes).
+function agendaSealsStripHtml(item) {
+  const st = typeof agendaEffectState === 'function' ? agendaEffectState(item) : null;
+  const refs = st && st.manifest && Array.isArray(st.manifest.binding_refs)
+    ? st.manifest.binding_refs : [];
+  if (!refs.length) return '';
+  const driftRows = agendaSealDriftRows(item.id);
+  const rows = refs.map((r) => {
+    const short = String(r.sha256 || '').slice(0, 12);
+    const row = driftRows
+      ? driftRows.find((d) => d.locator === r.locator && d.pin === r.sha256)
+      : null;
+    let drift = '<span class="ag2-seal-drift judging" title="Re-hashing the live file against the sealed pin — judged when the panel opens, never on list render">checking…</span>';
+    let adopt = '';
+    if (driftRows && !row) drift = '';
+    if (row) {
+      if (row.status === 'unchanged') {
+        drift = '<span class="ag2-seal-drift unchanged" title="The live file still matches the sealed revision">live file unchanged</span>';
+      } else if (row.status === 'changed') {
+        drift = '<span class="ag2-seal-drift changed" title="Informational — firings keep executing the sealed revision until you adopt the fresh one">live file moved on — sealed revision still serves</span>';
+        adopt = `<button type="button" class="ag2-linkbtn ag2-seal-adopt" data-seal-act="adopt"
+          data-seal-item="${escapeHtml(item.id)}" data-seal-locator="${escapeHtml(r.locator)}"
+          title="Review sealed vs live; one confirm re-proposes the affected manifests on the fresh revision — new digests, approvals void, nothing re-arms until you approve">Review &amp; adopt…</button>`;
+      } else {
+        drift = '<span class="ag2-seal-drift missing" title="The live file is gone or unreadable — harmless to firings: the sealed copy serves">live file missing — sealed copy serves</span>';
       }
-    });
-    seg.appendChild(btn);
+    }
+    return `<div class="ag2-seal-row">
+      <span class="ag2-seal-loc" title="${escapeHtml(r.locator)}">${escapeHtml(agendaSealLocatorName(r.locator))}</span>
+      <button type="button" class="ag2-digest-chip" data-copy-digest="${escapeHtml(r.sha256 || '')}"
+        title="${escapeHtml(`sha256 ${r.sha256} — the sealed revision every firing executes — click to copy`)}">sealed ${escapeHtml(short)}…</button>
+      ${drift}${adopt}
+    </div>
+    <details class="ag2-seal-exact" data-seal-sha="${escapeHtml(r.sha256 || '')}">
+      <summary>sealed view — the exact bytes firings execute</summary>
+      <pre class="ag2-seal-pre" data-seal-unloaded="1">Loading the sealed revision…</pre>
+    </details>`;
+  }).join('');
+  return `<div class="ag2-seals">
+    <div class="ag2-seals-head">
+      <span>Sealed inputs</span>
+      <span class="ag2-hint">the approval digest covers these pins — the live file cannot change what runs</span>
+    </div>
+    ${rows}
+  </div>`;
+}
+
+// Fill a sealed view on first expand — content-addressed, so the fetch
+// happens once per open panel and re-verifies nothing client-side (the
+// serving lane already refuses bytes that do not re-hash to the pin).
+document.addEventListener('toggle', (event) => {
+  const details = event.target;
+  if (!details || !details.classList || !details.classList.contains('ag2-seal-exact')) return;
+  if (!details.open) return;
+  const pre = details.querySelector('pre[data-seal-unloaded]');
+  if (!pre) return;
+  delete pre.dataset.sealUnloaded;
+  daemonApi.request('api_agenda_sealed', { sha256: details.dataset.sealSha })
+    .then((res) => {
+      pre.textContent = res.ok && res.body && res.body.encoding === 'utf8'
+        ? res.body.content
+        : `Sealed view unavailable (${(res.body && res.body.error) || `status ${res.status}`})`;
+    })
+    .catch((e) => { pre.textContent = `Sealed view unavailable (${(e && e.message) || e})`; });
+}, true);
+
+// ---- Review & adopt (§2.7) ----
+
+function agendaSealAdoptEnsureSheet() {
+  let host = document.getElementById('agenda-adopt-sheet');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'agenda-adopt-sheet';
+  host.hidden = true;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'ags-backdrop';
+  backdrop.addEventListener('click', agendaSealAdoptCloseSheet);
+  const panel = document.createElement('div');
+  panel.className = 'ags-panel agsx-panel ag2-adopt-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Review and adopt the fresh definition revision');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) agendaSealAdoptCloseSheet();
+  });
+  return host;
+}
+
+function agendaSealAdoptCloseSheet() {
+  const host = document.getElementById('agenda-adopt-sheet');
+  if (!host) return;
+  host.hidden = true;
+  host.classList.remove('sheet', 'popover');
+}
+
+// Every open item whose manifest pins this locator — a workflow's N
+// nodes share one file by construction, so adopting from any node's
+// card offers the whole set (§2.7: "the affected manifests").
+function agendaSealAdoptTargets(locator) {
+  return (agendaItems || []).filter((it) => {
+    if (it.status !== 'open') return false;
+    const m = (((it.effects || [])[0]) || {}).manifest;
+    return m && Array.isArray(m.binding_refs)
+      && m.binding_refs.some((r) => r.locator === locator);
+  });
+}
+
+function agendaSealAdoptOpenSheet(itemId, locator) {
+  const cached = agendaSealDriftCache.get(itemId);
+  const row = cached && cached.rows
+    ? cached.rows.find((d) => d.locator === locator) : null;
+  const targets = agendaSealAdoptTargets(locator);
+  if (!targets.length) return;
+  const pin = (((((targets[0].effects || [])[0]) || {}).manifest || {}).binding_refs || [])
+    .find((r) => r.locator === locator);
+  const host = agendaSealAdoptEnsureSheet();
+  const panel = host.querySelector('.ags-panel');
+  panel.textContent = '';
+
+  const head = agendaStartSheetEl('div', 'ags-head');
+  head.appendChild(agendaStartSheetEl('span', 'ags-title',
+    `Review & adopt: ${agendaSealLocatorName(locator)}`));
+  const close = agendaStartSheetEl('button', 'ags-close', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Keep the sealed revision');
+  close.addEventListener('click', agendaSealAdoptCloseSheet);
+  head.appendChild(close);
+  panel.appendChild(head);
+  panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
+    'The live file has moved on since this revision was sealed. Firings keep executing the sealed revision until you adopt: adopting re-proposes the affected manifests on the fresh revision — new digests, current approvals become void, and nothing re-arms until you approve again. Declining leaves the sealed revision binding indefinitely.'));
+
+  const cols = agendaStartSheetEl('div', 'ag2-adopt-cols');
+  panel.appendChild(cols);
+  const column = (label) => {
+    const col = agendaStartSheetEl('div', 'ag2-adopt-col');
+    col.appendChild(agendaStartSheetEl('div', 'ag2-adopt-col-head', label));
+    const pre = agendaStartSheetEl('pre', 'agsx-preview');
+    pre.textContent = 'Loading…';
+    col.appendChild(pre);
+    cols.appendChild(col);
+    return pre;
+  };
+  const effect = (targets[0].effects || [])[0] || {};
+  const sealedWhen = effect.approval
+    ? `approved ${agendaAbsTime(effect.approval.at_ms)}`
+    : `proposed ${agendaAbsTime(effect.proposed_ms || 0)}`;
+  const sealedPre = column(`Sealed — sha256 ${String((pin || {}).sha256 || '').slice(0, 12)}… · ${sealedWhen}`);
+  const liveWhen = row && row.live_mtime_ms ? ` · modified ${agendaAbsTime(row.live_mtime_ms)}` : '';
+  const livePre = column(`Live — sha256 ${row && row.live_sha256 ? `${row.live_sha256.slice(0, 12)}…` : 'unavailable'}${liveWhen}`);
+
+  if (pin) {
+    daemonApi.request('api_agenda_sealed', { sha256: pin.sha256 })
+      .then((res) => {
+        sealedPre.textContent = res.ok && res.body && res.body.encoding === 'utf8'
+          ? res.body.content
+          : `Sealed view unavailable (${(res.body && res.body.error) || `status ${res.status}`})`;
+      })
+      .catch((e) => { sealedPre.textContent = `Sealed view unavailable (${(e && e.message) || e})`; });
+  } else {
+    sealedPre.textContent = 'Sealed pin not found on the manifest.';
+  }
+
+  const error = agendaStartSheetEl('div', 'ags-error');
+  error.hidden = true;
+
+  // Live text serves only for definition-library files (the catalog
+  // reads exactly the paths a stamp resolves — no arbitrary-file read
+  // lane is added for this sheet); other refs review by hash + date.
+  const liveState = { valid: true, reason: '' };
+  const path = String(locator || '').replace(/^file:/, '');
+  const paintLive = () => {
+    const entry = (agendaDefinitionCatalog || []).find((d) => d.path === path);
+    if (!entry) {
+      livePre.textContent = row && row.status === 'missing'
+        ? 'The live file is gone or unreadable.'
+        : 'Live text is served only for definition-library files — review this one at its path; the hashes and dates above still tell the drift story.';
+      return;
+    }
+    livePre.textContent = entry.text;
+    if (!entry.valid) {
+      liveState.valid = false;
+      liveState.reason = entry.reason || 'invalid definition';
+      const warn = agendaStartSheetEl('div', 'ags-error',
+        `The live revision fails validation: ${liveState.reason} — fix the file before adopting; sealed firings would read a broken definition.`);
+      panel.insertBefore(warn, error);
+      confirm.disabled = true;
+    }
+  };
+
+  panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
+    `Adopting re-proposes ${targets.length} manifest${targets.length === 1 ? '' : 's'}: ${targets.map((t) => t.title).join(' · ')}`));
+  panel.appendChild(error);
+
+  const foot = agendaStartSheetEl('div', 'ags-foot');
+  const later = agendaStartSheetEl('button', 'ags-btn', 'Keep the sealed revision');
+  later.type = 'button';
+  later.addEventListener('click', agendaSealAdoptCloseSheet);
+  const confirm = agendaStartSheetEl('button', 'ags-btn ags-start',
+    `Adopt — re-propose ${targets.length} on the fresh revision`);
+  confirm.type = 'button';
+  if (!row || !row.live_sha256) {
+    confirm.disabled = true;
+    confirm.title = 'No live pin to restate — the live file is missing, unreadable, or past the hash bound.';
+  }
+  confirm.addEventListener('click', () =>
+    agendaSealAdoptConfirm(targets, locator, row ? row.live_sha256 : '', confirm, error));
+  foot.appendChild(later);
+  foot.appendChild(confirm);
+  panel.appendChild(foot);
+
+  paintLive();
+  if (agendaDefinitionCatalog === null && typeof agendaFetchDefinitionCatalog === 'function') {
+    agendaFetchDefinitionCatalog(() => { if (!host.hidden) paintLive(); });
+  }
+  agendaPresentStartSheet(host, panel, null);
+}
+
+// The one adopt emission: for each affected manifest, the SAME fields
+// re-proposed with the drifted ref restated at the fresh pin (other
+// refs keep their pins — a second drifted ref refuses by name at
+// intake; adopt it from its own row). Rides the existing propose lane
+// via the shared op wrapper — the edit surfaces stay clients of
+// re-propose, never second writers — and the intake re-verifies the
+// restated pin against the daemon's own read, so a file that moved
+// again mid-review refuses instead of sealing unreviewed bytes.
+async function agendaSealAdoptConfirm(targets, locator, liveSha, button, error) {
+  button.disabled = true;
+  error.hidden = true;
+  const adopted = [];
+  try {
+    for (const target of targets) {
+      const m = ((target.effects || [])[0] || {}).manifest;
+      if (!m) continue;
+      if (m.interactive) {
+        throw new Error(`${target.title}: interactive manifests cannot be re-proposed from here`);
+      }
+      const params = {
+        op: 'propose_effect',
+        id: target.id,
+        goal: m.goal,
+        fire_at_ms: m.fire_at_ms,
+        binding_refs: (m.binding_refs || []).map((r) => (r.locator === locator
+          ? { locator: r.locator, sha256: liveSha }
+          : { locator: r.locator, sha256: r.sha256 })),
+      };
+      if (m.orchestrate) params.orchestrate = true;
+      if (m.recurrence) params.recurrence = m.recurrence;
+      if (m.trigger) params.trigger = m.trigger;
+      if (m.agent_config) params.agent_config = m.agent_config;
+      if (m.project_root) params.project_root = m.project_root;
+      const updated = await agendaWorkflowOp(params);
+      agendaSealDriftCache.delete(target.id);
+      adopted.push({
+        title: updated.title,
+        digest: ((updated.effects || [])[0] || {}).digest || '',
+        item: updated,
+      });
+    }
+    agendaSealAdoptCloseSheet();
+    if (adopted.length > 1) {
+      // Multi-node: the one-gesture sheet again (§2.7) — its single
+      // pinned emitter stays the only approval lane.
+      agendaWorkflowOpenApprovalSheet({
+        title: agendaSealLocatorName(locator),
+        sha256: liveSha,
+        nodes: adopted,
+        hub: null,
+        adopted: true,
+      });
+    } else if (adopted.length === 1) {
+      if (typeof agendaOpenInspector === 'function') agendaOpenInspector(adopted[0].item.id);
+      if (typeof showControlToast === 'function') {
+        showControlToast('success',
+          'Re-proposed on the fresh revision — approve the new digest on the card to re-arm.');
+      }
+    }
+  } catch (e) {
+    error.textContent = `${(e && e.message) || e}${adopted.length
+      ? ` — ${adopted.length} manifest${adopted.length === 1 ? '' : 's'} already re-proposed keep their new digests (append-only; approve or revise them on their cards)` : ''}`;
+    error.hidden = false;
+    button.disabled = false;
   }
 }
+
+// One click wire for the strip's gestures, document-level like the
+// digest-copy wire (the strip renders inside the inspector's innerHTML).
+document.addEventListener('click', (event) => {
+  const btn = event.target && event.target.closest
+    && event.target.closest('[data-seal-act]');
+  if (!btn) return;
+  if (btn.dataset.sealAct === 'adopt') {
+    agendaSealAdoptOpenSheet(btn.dataset.sealItem, btn.dataset.sealLocator);
+  }
+});
 /* ── static/app/ui2-memory.js ── */
 // Memory Explorer: browse/search the daemon's Memory plane, propose
 // claims, and CURATE them (#tab-memory). Data flows through daemonApi

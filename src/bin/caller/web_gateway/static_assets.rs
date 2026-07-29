@@ -782,8 +782,10 @@ mod tests {
     /// registry-era twin died with mandate_templates.rs at the
     /// cutover; this copy carries the law): the sheet consumes the
     /// served definition catalog and stamps through the daemon's
-    /// stamp op — it neither proposes nor approves client-side, so the
-    /// owner's per-effect digest ceremony stays the only arming act.
+    /// stamp op (via the shared wrapper whose one transport call the
+    /// workflow-fragment pin counts) — it neither proposes nor
+    /// approves client-side, so the owner's per-effect digest ceremony
+    /// stays the only arming act.
     #[test]
     fn automate_sheet_consumes_the_catalog_and_never_approves() {
         let sheet = include_str!("../../../../static/app/ui2-agenda.js");
@@ -792,8 +794,13 @@ mod tests {
             "the automate sheet must read the served definition catalog"
         );
         assert!(
-            sheet.contains("api_agenda_stamp"),
-            "the automate sheet must stamp through the daemon's stamp op"
+            sheet.contains("agendaDefinitionStamp("),
+            "the automate sheet must stamp through the daemon's stamp op (the shared wrapper)"
+        );
+        assert_eq!(
+            sheet.matches("api_agenda_stamp").count(),
+            0,
+            "the stamp transport lives in the shared wrapper — one call site, one fragment"
         );
         assert_eq!(
             sheet.matches("approve_effect").count(),
@@ -886,6 +893,206 @@ mod tests {
         assert!(
             call > confirm,
             "the emitter is called from the owner-confirm handler, nowhere earlier"
+        );
+    }
+
+    /// Track AW surfaces (§2.5 rendering): the picker renders what a
+    /// definition MEANS — name, provenance chip, shape line,
+    /// description — and the preview renders header + node summary +
+    /// authored prose. Raw definition bytes never render as the default
+    /// view: the old `preview.textContent = entry.text` dump is gone,
+    /// and the only raw-bytes rendering lives inside the explicit
+    /// exact-bytes expander.
+    #[test]
+    fn picker_renders_meaning_never_raw_bytes() {
+        let sheet = include_str!("../../../../static/app/ui2-agenda.js");
+        for rendered in [
+            "agendaProvenanceChipEl(",   // provenance chip, picker + preview
+            "agsx-def-btn-desc",         // description under each entry
+            "agendaDefinitionKindLine(", // the shape line
+            "agendaDefinitionProse(",    // prose split, never raw dump
+        ] {
+            assert!(
+                sheet.contains(rendered),
+                "the picker/preview lost its meaning-rendering seam: {rendered}"
+            );
+        }
+        assert_eq!(
+            sheet.matches("preview.textContent = entry.text").count(),
+            0,
+            "raw definition bytes must never be the preview's default rendering"
+        );
+        // Provenance renders from the served field — house vs personal
+        // stays visible in every catalog (§2.5).
+        assert!(sheet.contains("agsx-prov-personal") || sheet.contains("agsx-prov-${p}"));
+    }
+
+    /// Track AW surfaces: the exact sealed (or to-be-sealed) bytes stay
+    /// ONE explicit expander away everywhere the pretty rendering
+    /// stands in for them — the sheet preview's "exact bytes a stamp
+    /// seals" expander, and the card-side sealed view served from the
+    /// content-addressed lane. Verification honesty: rendering never
+    /// replaces the bytes.
+    #[test]
+    fn sealed_bytes_stay_one_expander_away() {
+        let sheet = include_str!("../../../../static/app/ui2-agenda.js");
+        assert!(
+            sheet.contains("Exact bytes a stamp seals"),
+            "the sheet preview lost its exact-bytes expander"
+        );
+        let seals = include_str!("../../../../static/app/ui2-agenda-seals.js");
+        assert!(
+            seals.contains("api_agenda_sealed"),
+            "the card-side sealed view must serve from the content-addressed lane"
+        );
+        assert!(
+            seals.contains("ag2-seal-exact"),
+            "the sealed view renders as an expander on the refs strip"
+        );
+        assert!(
+            seals.contains("the exact bytes firings execute"),
+            "the sealed view names what the bytes ARE"
+        );
+    }
+
+    /// Track AW surfaces: stamping is an explicit gesture behind a
+    /// pre-stamp summary — for EVERY definition kind. Picker clicks
+    /// select and preview; the one Stamp button submits. Concretely:
+    /// the sheet's only stamp-transport references live inside the
+    /// submit handler (defined after the open/render function), the
+    /// registry-era stamp-on-click picker hooks are gone from the
+    /// workflows fragment, and the shared wrapper carries the single
+    /// transport call.
+    #[test]
+    fn stamping_requires_an_explicit_gesture_with_preview() {
+        let sheet = include_str!("../../../../static/app/ui2-agenda.js");
+        assert!(
+            sheet.contains("agsx-summary"),
+            "the pre-stamp summary must render before the gesture"
+        );
+        let (before_submit, submit) = sheet
+            .split_once("async function agendaAutomationSheetSubmit(")
+            .expect("the explicit submit handler must exist");
+        assert_eq!(
+            before_submit.matches("agendaDefinitionStamp(").count(),
+            0,
+            "nothing before the submit handler may stamp — selection previews, Stamp stamps"
+        );
+        assert!(
+            submit.contains("agendaDefinitionStamp("),
+            "the submit handler is where the one stamp gesture fires"
+        );
+        let workflows = include_str!("../../../../static/app/ui2-agenda-workflows.js");
+        assert_eq!(
+            workflows.matches("api_agenda_stamp").count(),
+            1,
+            "one stamp transport call, inside the shared wrapper"
+        );
+        for gone in [
+            "agendaWorkflowRenderPickerButtons",
+            "agendaTriggeredMandateRenderButtons",
+            "agendaTriggeredMandateStamp",
+        ] {
+            assert_eq!(
+                workflows.matches(gone).count(),
+                0,
+                "the stamp-on-click picker hooks must stay dead: found {gone}"
+            );
+        }
+    }
+
+    /// Track AW surfaces (Q9 vocabulary): the registry-era "template"
+    /// word is gone from the agenda fragments — the surfaces speak
+    /// action / workflow / definition / stamp. (The CSS keeps
+    /// `grid-template-*` property names; vocabulary lives in the JS.)
+    #[test]
+    fn template_vocabulary_is_gone() {
+        for (name, fragment) in [
+            (
+                "ui2-agenda.js",
+                include_str!("../../../../static/app/ui2-agenda.js"),
+            ),
+            (
+                "ui2-agenda-cards.js",
+                include_str!("../../../../static/app/ui2-agenda-cards.js"),
+            ),
+            (
+                "ui2-agenda-inspector.js",
+                include_str!("../../../../static/app/ui2-agenda-inspector.js"),
+            ),
+            (
+                "ui2-agenda-workflows.js",
+                include_str!("../../../../static/app/ui2-agenda-workflows.js"),
+            ),
+            (
+                "ui2-agenda-seals.js",
+                include_str!("../../../../static/app/ui2-agenda-seals.js"),
+            ),
+        ] {
+            assert_eq!(
+                fragment.to_ascii_lowercase().matches("template").count(),
+                0,
+                "{name}: the ratified vocabulary is action/workflow/definition/stamp — \
+                 'template' died with the registry"
+            );
+        }
+    }
+
+    /// Track AW §2.4/§2.7 (the deferred card rendering, shipped):
+    /// manifests with binding refs grow a refs strip on the inspector's
+    /// effect card — locator, pin chip, expand-time drift chip in
+    /// sealed-serving language — plus the Review-&-adopt gesture, whose
+    /// ONE emission site re-proposes through the existing propose lane
+    /// with the refreshed pin, landing on the ordinary approval (the
+    /// one-gesture sheet for multi-node). Nothing auto-adopts, and the
+    /// Automations row carries only the fetch-free sealed count.
+    #[test]
+    fn stamped_cards_show_refs_drift_and_adopt() {
+        let seals = include_str!("../../../../static/app/ui2-agenda-seals.js");
+        assert!(
+            seals.contains("api_agenda_ref_drift"),
+            "drift judges through the served expand-time lane"
+        );
+        assert!(
+            seals.contains("sealed revision still serves"),
+            "the drift chip speaks sealed-serving language — drift is informational"
+        );
+        assert!(seals.contains("Review &amp; adopt"));
+        // One adopt emission through the EXISTING propose lane, inside
+        // the confirm handler — refreshing exactly the drifted pin.
+        assert_eq!(
+            seals.matches("propose_effect").count(),
+            1,
+            "adopt re-proposes through one emission site"
+        );
+        let (before_confirm, confirm) = seals
+            .split_once("async function agendaSealAdoptConfirm(")
+            .expect("the adopt confirm handler must exist");
+        assert_eq!(
+            before_confirm.matches("propose_effect").count(),
+            0,
+            "nothing adopts before the explicit confirm"
+        );
+        assert!(confirm.contains("binding_refs: (m.binding_refs || [])"));
+        assert!(
+            confirm.contains("agendaWorkflowOpenApprovalSheet("),
+            "a multi-node adopt lands on the one-gesture approval sheet"
+        );
+        assert_eq!(
+            seals.matches("approve_effect").count(),
+            0,
+            "adopt never approves — the workflow fragment's single emitter stays the only lane"
+        );
+        // The strip renders on the inspector's effect card; the
+        // Automations row stays fetch-free (count chip only).
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(inspector.contains("agendaSealsStripHtml(item)"));
+        let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        assert!(cards.contains("ag2-auto-sealed"));
+        assert_eq!(
+            cards.matches("api_agenda_ref_drift").count(),
+            0,
+            "list render never hashes — drift is the item panel's expand-time judgment"
         );
     }
 

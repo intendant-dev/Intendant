@@ -51,7 +51,8 @@ pub(crate) use reminders::{
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};
 pub(crate) use store::{
-    digest_file, file_ref_drift, AgendaError, AgendaOpsPage, AgendaStore, AGENDA_OPS_DEFAULT_LIMIT,
+    binding_ref_drift, digest_file, file_ref_drift, AgendaError, AgendaOpsPage, AgendaStore,
+    AGENDA_OPS_DEFAULT_LIMIT,
 };
 pub(crate) use types::{
     AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaRefSpec,

@@ -1607,10 +1607,9 @@ html.ui-v2 .agenda-card-add input:focus {
 }
 .ags-btn.ags-start:hover { background: var(--iris-2); border-color: var(--iris-2); }
 
-/* ---- Automate sheet (Track AU create-from-template) ---- */
+/* ---- Automate sheet (Track AW stamp-a-definition) ---- */
 
 html.ui-v2 .agsx-panel { max-width: 560px; }
-html.ui-v2 .agsx-templates { margin: 4px 0 8px; }
 html.ui-v2 .agsx-preview {
   max-height: 220px;
   overflow: auto;
@@ -1625,3 +1624,174 @@ html.ui-v2 .agsx-preview {
   margin: 2px 0 8px;
   color: var(--subtext1);
 }
+
+/* The definition picker: every kind side by side, each button a small
+   card — name + provenance, shape line, description. */
+html.ui-v2 .agsx-defs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+html.ui-v2 .agsx-def-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 7px 9px;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 9px;
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+html.ui-v2 .agsx-def-btn:hover { border-color: var(--overlay0); }
+html.ui-v2 .agsx-def-btn.active {
+  border-color: var(--iris);
+  background: rgba(var(--iris-rgb), 0.08);
+}
+html.ui-v2 .agsx-def-btn:disabled { opacity: 0.55; cursor: default; }
+html.ui-v2 .agsx-def-btn-name {
+  font-size: 12px;
+  font-weight: 650;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+html.ui-v2 .agsx-def-btn-kind { font-size: 10.5px; color: var(--subtext0); }
+html.ui-v2 .agsx-def-btn-desc {
+  font-size: 10.5px;
+  color: var(--subtext1);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+html.ui-v2 .agsx-prov {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--surface1);
+  color: var(--subtext0);
+}
+html.ui-v2 .agsx-prov-personal {
+  color: var(--iris);
+  border-color: rgba(var(--iris-rgb), 0.4);
+}
+
+/* The selected definition, rendered for reading. */
+html.ui-v2 .agsx-def { margin: 2px 0 8px; }
+html.ui-v2 .agsx-def-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .agsx-def-title { font-size: 13px; font-weight: 650; }
+html.ui-v2 .agsx-def-kind { font-size: 11px; color: var(--subtext0); }
+html.ui-v2 .agsx-def-desc { font-size: 11.5px; color: var(--subtext1); margin-top: 2px; }
+html.ui-v2 .agsx-def-adv { font-size: 11px; color: var(--amber); margin-top: 2px; }
+html.ui-v2 .agsx-def-node {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 11px;
+  margin-top: 3px;
+}
+html.ui-v2 .agsx-def-node-id { font-weight: 600; }
+html.ui-v2 .agsx-def-node-meta { color: var(--subtext0); }
+html.ui-v2 .agsx-def-prose { margin-top: 6px; max-height: 180px; }
+html.ui-v2 .agsx-exact { margin: 4px 0 2px; }
+html.ui-v2 .agsx-exact > summary {
+  font-size: 11px;
+  color: var(--subtext0);
+  cursor: pointer;
+}
+html.ui-v2 .agsx-exact[open] > summary { color: var(--text); }
+
+/* Pre-stamp summary: what the gesture will seal, park, and propose. */
+html.ui-v2 .agsx-summary {
+  border: 1px solid var(--surface0);
+  border-left: 2px solid var(--iris);
+  border-radius: 9px;
+  padding: 7px 10px;
+  margin: 2px 0 8px;
+  font-size: 11px;
+  color: var(--subtext1);
+}
+html.ui-v2 .agsx-summary-head {
+  font-weight: 650;
+  color: var(--text);
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+html.ui-v2 .agsx-summary-line { margin-top: 1px; }
+
+/* ---- Sealed manifests: refs strip, drift, adopt (Track AW §2.4/§2.7) ---- */
+
+html.ui-v2 .ag2-seals {
+  border-top: 1px dashed var(--surface0);
+  margin-top: 7px;
+  padding-top: 6px;
+}
+html.ui-v2 .ag2-seals-head {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  font-size: 10.5px;
+  font-weight: 650;
+  margin-bottom: 3px;
+}
+html.ui-v2 .ag2-seal-row {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 11px;
+  margin-top: 2px;
+}
+html.ui-v2 .ag2-seal-loc { font-weight: 600; overflow-wrap: anywhere; }
+html.ui-v2 .ag2-seal-drift { font-size: 10.5px; color: var(--subtext0); }
+html.ui-v2 .ag2-seal-drift.changed { color: var(--amber); font-weight: 600; }
+html.ui-v2 .ag2-seal-drift.missing { color: var(--subtext0); font-style: italic; }
+html.ui-v2 .ag2-seal-exact { margin: 2px 0 0; }
+html.ui-v2 .ag2-seal-exact > summary {
+  font-size: 10.5px;
+  color: var(--subtext0);
+  cursor: pointer;
+}
+html.ui-v2 .ag2-seal-pre {
+  max-height: 220px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 9px;
+  padding: 8px 10px;
+  margin: 3px 0 2px;
+  color: var(--subtext1);
+}
+html.ui-v2 .ag2-auto-sealed { color: var(--subtext0); }
+
+/* Review & adopt: sealed vs live, hashes + dates, one confirm. */
+html.ui-v2 .ag2-adopt-panel { max-width: 760px; }
+html.ui-v2 .ag2-adopt-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 4px 0 6px;
+}
+html.ui-v2 .ag2-adopt-col-head {
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--subtext0);
+  margin-bottom: 3px;
+}
+html.ui-v2 .ag2-adopt-col .agsx-preview { max-height: 300px; margin: 0; }

@@ -954,9 +954,41 @@ pub(crate) async fn agenda_ref_drift_api_response(
             }))
         })
         .collect();
+    // The manifests' sealed binding refs get the same expand-time honesty
+    // check (Track AW §2.4), plus the live hash/mtime the Review-&-adopt
+    // gesture restates as its fresh pin. Presentation only: drift never
+    // changes what fires (firings execute the sealed revision), and the
+    // propose intake re-verifies any restated pin against the daemon's
+    // own read, so nothing served here is authority.
+    let binding_refs: Vec<serde_json::Value> = item
+        .effects
+        .iter()
+        .flat_map(|effect| {
+            effect.manifest.binding_refs.iter().map(|r| {
+                let live = crate::agenda::binding_ref_drift(&r.locator, &r.sha256);
+                let mut row = serde_json::json!({
+                    "effect_id": effect.effect_id,
+                    "locator": r.locator,
+                    "pin": r.sha256,
+                    "status": live.status,
+                });
+                if let Some(sha) = live.live_sha256 {
+                    row["live_sha256"] = sha.into();
+                }
+                if let Some(ms) = live.live_mtime_ms {
+                    row["live_mtime_ms"] = ms.into();
+                }
+                row
+            })
+        })
+        .collect();
     ApiResponse::json(
         200,
-        JsonBody::Value(serde_json::json!({ "item_id": item.id, "refs": refs })),
+        JsonBody::Value(serde_json::json!({
+            "item_id": item.id,
+            "refs": refs,
+            "binding_refs": binding_refs,
+        })),
     )
 }
 
