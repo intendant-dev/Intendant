@@ -257,7 +257,7 @@ pub(crate) fn scan_store_candidates(
     }
     // Newest first, so the per-boot cap spends its slots on the most
     // recently active work.
-    candidates.sort_by(|a, b| b.activity_secs.cmp(&a.activity_secs));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.activity_secs));
     candidates
 }
 
@@ -339,9 +339,11 @@ pub(crate) fn decide_candidate(
             short_id(&tip.intendant_session_id)
         ));
     }
-    let project_root =
-        crate::external_wrapper_index::recorded_project_root_for_wrapper(home, &candidate.session_id)
-            .map(PathBuf::from);
+    let project_root = crate::external_wrapper_index::recorded_project_root_for_wrapper(
+        home,
+        &candidate.session_id,
+    )
+    .map(PathBuf::from);
     if let Some(root) = &project_root {
         if !root.is_dir() {
             return ReadoptDecision::LeftDead(format!(
@@ -507,7 +509,10 @@ mod tests {
             .map(|candidate| candidate.session_id.as_str())
             .collect();
         assert!(ids.contains(&"sess-midturn"), "mid-turn is mid-work");
-        assert!(ids.contains(&"sess-parked"), "parked-with-pending is mid-work");
+        assert!(
+            ids.contains(&"sess-parked"),
+            "parked-with-pending is mid-work"
+        );
         assert!(!ids.contains(&"sess-idle"), "idle is not mid-work");
         assert!(dead_era
             .iter()
@@ -759,7 +764,10 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(session_id, None, "a daemon-level notification");
-                assert_eq!(id, "boot-readopt-boot-a", "boot-keyed, so repeats never stack");
+                assert_eq!(
+                    id, "boot-readopt-boot-a",
+                    "boot-keyed, so repeats never stack"
+                );
                 let title = title.expect("titled");
                 assert!(
                     title.contains("2 session(s) readopted") && title.contains("1 left dead"),
@@ -854,7 +862,9 @@ pub(crate) async fn run_boot_readopt_pass(
         );
     }
     let Some(watershed) = boot_watershed_secs(handover.state_root(), handover.boot_id()) else {
-        eprintln!("[readopt] no presence record for this boot — cannot draw the era line; skipping");
+        eprintln!(
+            "[readopt] no presence record for this boot — cannot draw the era line; skipping"
+        );
         return;
     };
     let live: HashSet<String> = crate::session_supervisor::published_live_session_registry()

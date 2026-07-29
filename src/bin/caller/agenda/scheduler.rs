@@ -298,10 +298,15 @@ pub(crate) fn spawn_reminder_scheduler(
             let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
             let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
             let readopt_wake_ms = sweep_readopt_watch(&handle, &mut journal, &mut state, now);
-            let next_wake_ms = [next_wake_ms, retry_wake_ms, lineage_wake_ms, readopt_wake_ms]
-                .into_iter()
-                .flatten()
-                .min();
+            let next_wake_ms = [
+                next_wake_ms,
+                retry_wake_ms,
+                lineage_wake_ms,
+                readopt_wake_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let sleep_for = next_wake_ms
                 .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
                 .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
@@ -4992,7 +4997,10 @@ mod tests {
             .readopt_watch
             .push(watch_entry("sess-stopped", now_ms()));
         sweep_readopt_watch(&handle, &mut journal, &mut state, now_ms());
-        assert!(state.readopt_watch.is_empty(), "stopped lineage: watch ends");
+        assert!(
+            state.readopt_watch.is_empty(),
+            "stopped lineage: watch ends"
+        );
         assert_eq!(
             journal.progress("occ-sess-stopped").started,
             None,
