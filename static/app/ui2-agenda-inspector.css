@@ -1033,6 +1033,34 @@ html.ui-v2 .ag2-sheet-error {
   padding-left: 8px;
   overflow-wrap: anywhere;
 }
+/* Sealed refs on the schedule sheet: read-only rows — locator + the
+   pinned hash chip. Deliberately input-less: the edit lane carries them
+   verbatim; re-sealing is its own ceremony. */
+html.ui-v2 .ag2-refs-ro {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 10px;
+  background: var(--code-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .ag2-refs-ro-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+html.ui-v2 .ag2-refs-ro-loc {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
 html.ui-v2 .ag2-sheet-prevwrap {
   border: 1px solid var(--line);
   border-radius: 11px;

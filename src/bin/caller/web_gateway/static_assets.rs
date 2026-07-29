@@ -889,6 +889,139 @@ mod tests {
         );
     }
 
+    /// The approval-time manifest editor's lane law: the card's Edit
+    /// affordance is an OPENER for the one schedule sheet, whose save is
+    /// the fragment set's single `propose_effect` emitter — the edit UI
+    /// is a client of re-propose, never a second writer. (The automate
+    /// and workflow guards above pin their fragments to zero.)
+    #[test]
+    fn edit_mints_through_the_repropose_lane() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        assert_eq!(
+            inspector.matches("propose_effect").count(),
+            1,
+            "exactly one propose emission site: the schedule sheet's confirm"
+        );
+        let (_, confirm) = inspector
+            .split_once("async function agendaSchedConfirm(")
+            .expect("the sheet confirm must exist");
+        assert!(
+            confirm.contains("op: 'propose_effect'"),
+            "the one emission lives inside the sheet confirm"
+        );
+        assert_eq!(
+            cards.matches("propose_effect").count(),
+            0,
+            "the card never proposes — its Edit affordance only opens the sheet"
+        );
+        // The pending strips carry the affordance; the delegation opens
+        // the sheet and sends no op.
+        assert!(cards.contains("data-edit-sched"));
+        assert!(
+            cards.contains("agendaOpenSchedSheet(editSched.dataset.editSched)"),
+            "the card edit handler opens the one editor"
+        );
+        // No edit lane for ALREADY-approved effects from the card: the
+        // affordance renders only in the pending branches (the inline
+        // strip and the automations strip), never beside Revoke.
+        assert_eq!(
+            cards.matches("data-edit-sched").count(),
+            3,
+            "two pending-branch buttons + the one delegation handler"
+        );
+    }
+
+    /// The shape toggle is honest about consequences ON the sheet, in
+    /// the scheduler's own semantics: interactive opens-and-waits (it
+    /// does not auto-run the goal), goal run is the autonomous one-shot.
+    /// The interactive pin rides the propose only for the interactive
+    /// shape, so a goal-run edit stays byte-compatible with daemons
+    /// that predate the field.
+    #[test]
+    fn shape_toggle_states_its_consequences() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(
+            inspector.contains(
+                "Opens with the goal as your message and waits for you — it does not auto-run."
+            ),
+            "the interactive consequence line must render with the toggle"
+        );
+        assert!(
+            inspector.contains("Autonomous one-shot — runs the goal unattended and writes back."),
+            "the goal-run consequence line must render with the toggle"
+        );
+        assert_eq!(
+            inspector.matches(r#"data-sheet-act="sched-shape""#).count(),
+            2,
+            "one segmented control, two shapes"
+        );
+        assert!(
+            inspector.contains("if (s.shape === 'interactive') params.interactive = true;"),
+            "interactive rides the propose only when chosen"
+        );
+    }
+
+    /// Sealed binding refs render READ-ONLY on the edit sheet — locator
+    /// plus pinned hash, no input controls — and the confirm carries the
+    /// state verbatim (`binding_refs: s.bindingRefs`); editing sealed
+    /// content stays the re-seal ceremony. The daemon-side twin
+    /// (`unchanged_binding_refs_carry_forward_past_live_drift`) pins the
+    /// intake half: a verbatim carry verifies against the sealed store.
+    #[test]
+    fn sealed_refs_render_readonly() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        let start = inspector
+            .find(r#"class="ag2-refs-ro" data-mf-field="binding_refs""#)
+            .expect("the read-only refs block must exist on the sheet");
+        let end = inspector
+            .find("Carried verbatim — this edit cannot change sealed content.")
+            .expect("the read-only law is stated where the refs render");
+        assert!(end > start, "the law line closes the refs block");
+        let block = &inspector[start..end];
+        for control in ["<input", "<textarea", "<select"] {
+            assert!(
+                !block.contains(control),
+                "the refs block is read-only — found {control:?}"
+            );
+        }
+        assert!(
+            block.contains("agendaDigestChipHtml(r.sha256"),
+            "each ref renders its pinned hash"
+        );
+        assert!(
+            inspector.contains("params.binding_refs = s.bindingRefs"),
+            "the confirm carries the sealed pins verbatim, never reconstructed"
+        );
+    }
+
+    /// Derive, don't mirror — the fragment half: every field
+    /// `SessionManifest`'s own schema declares appears on the edit sheet
+    /// as a `data-mf-field` marker (editor or read-only row), and no
+    /// marker names a field the schema doesn't have. With the command
+    /// parity pin in `agenda::types`, a tenth manifest field fails the
+    /// suite until the propose lane AND this form acknowledge it —
+    /// instead of shipping as an edit lane that silently drops it.
+    #[test]
+    fn editable_fields_derive_from_schema() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        let schema_fields = crate::agenda::session_manifest_schema_fields();
+        let marker = r#"data-mf-field=""#;
+        let mut markers = std::collections::BTreeSet::new();
+        for (idx, _) in inspector.match_indices(marker) {
+            let name = inspector[idx + marker.len()..]
+                .split('"')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            markers.insert(name);
+        }
+        assert_eq!(
+            markers, schema_fields,
+            "the edit sheet's field markers must be exactly the manifest schema's fields"
+        );
+    }
+
     /// The ledger search executes SPA-side — `agendaSearchMatch` filters
     /// the served item snapshot in the browser (the daemon serves items
     /// unfiltered) — so the digest lane is pinned at the fragment:
