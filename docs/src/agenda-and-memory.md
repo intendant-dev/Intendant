@@ -345,6 +345,30 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
+**The approval-time editor (owner-asked, 2026-07-29).** The pending
+card's **Edit…** opens the schedule sheet as a form over the manifest's
+owner-relevant fields — the goal text, the session **shape**
+(`interactive`: a goal run fires as the autonomous one-shot; interactive
+opens with the goal as the owner's message and waits — the toggle states
+exactly that on the sheet), executor (backend/model/effort), project
+root, first-run time, and cadence for standing effects. Saving mints the
+revised manifest **through the one re-propose lane** (`propose_effect`,
+which now carries `interactive` like the other manifest fields — absent
+keeps the legacy autonomous bytes; older daemons refuse the new field by
+name): same effect lineage, new digest, prior approval void, and the
+card's digest chip updates in place — an amber **revised** chip marks a
+digest that changed since the owner last looked (their own edits are
+pre-acknowledged; a stale Approve is refused by the daemon regardless,
+since approval binds exact bytes). The sheet round-trips **every**
+manifest field: what the owner isn't editing — the event trigger, the
+sealed binding refs (rendered read-only with their hashes) — rides the
+revision verbatim instead of being dropped by the form. Approved effects
+have no edit lane; revise-then-reapprove stays the ceremony (the
+inspector's "Edit (voids approval)" names it). The field list is pinned
+to `SessionManifest`'s own schema from both sides (the propose command
+and the sheet's field markers), so a new manifest field fails the suite
+until the edit lane acknowledges it.
+
 **Standing manifests (G3-pre, ratified 2026-07-22).** A manifest may
 declare its own recurrence *inside* the digest-bound body
 (`recurrence: { every_ms, until_ms?, max_occurrences?,
@@ -431,7 +455,13 @@ re-opens review. Intake verifies each pin against the daemon's own read
 v1 seals absolute `file:` paths only; `body:` and `git:` forms are
 future vocabulary) and **seals the verified bytes** into the
 content-addressed snapshot store (`<agenda dir>/blobs/<sha256>`, atomic
-writes, dedup by hash; GC deliberately deferred). **Every fire verifies
+writes, dedup by hash; GC deliberately deferred). On a **revision**, a
+pin restated verbatim from the current manifest verifies against the
+sealed snapshot instead of the live file — the reviewed bytes are
+already preserved, so live drift since sealing never blocks an edit
+around the ref (a missing snapshot still heals from live bytes matching
+the pin, and an unreconstructable one refuses by name); changing a pin
+is a ref edit and takes the live-verify + seal path. **Every fire verifies
 the snapshot**: the sealed bytes are the binding content — the fired
 task's rider line points the session at the sealed copy, and a live
 file that drifted (or vanished) after approval is an *informational
