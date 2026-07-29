@@ -840,6 +840,14 @@ impl SessionSupervisor {
         if holding > 0 || self.exec.latest_pending_heavy_key().is_some() {
             return false;
         }
+        // Intake §3.3's exit parenthetical (the HS3 ruling's N5): a
+        // transfer append mid-copy holds the daemon open — cutting a
+        // multi-GB spool at exit wastes it entirely. (Mid-stream HTTP
+        // uploads are the priced residual: request-scoped, usually
+        // session-accompanied, and re-uploadable against the successor.)
+        if crate::transfer_store::any_transfer_appending() {
+            return false;
+        }
         runtime.mark_exited();
         true
     }

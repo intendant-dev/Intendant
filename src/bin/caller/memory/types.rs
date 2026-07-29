@@ -245,4 +245,17 @@ pub(crate) enum MemoryError {
     Ambiguous(String, usize),
     #[error("{0}")]
     InvalidArg(String),
+    /// Track HS4: the durable plane is not open on THIS daemon right now
+    /// — being acquired (`plane-pending`), owned by the lease holder
+    /// (`plane-follows-holder`), or handed to a successor
+    /// (`plane-handed-over`). Named and fail-closed: reads AND writes
+    /// refuse (serving reads from a closed store would be dishonest
+    /// staleness — intake Q5(b)); the message carries the successor
+    /// pointer when the sidecar names one. Never the silent lifetime
+    /// ephemeral fallback this replaces.
+    #[error("unavailable: {outcome} — {detail}")]
+    PlaneUnavailable {
+        outcome: &'static str,
+        detail: String,
+    },
 }

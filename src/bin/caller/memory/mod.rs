@@ -30,5 +30,5 @@ pub(crate) mod service;
 pub(crate) mod store;
 pub(crate) mod types;
 
-pub(crate) use handle::{MemoryHandle, MemoryStorage};
+pub(crate) use handle::{durable_plane_dir, spawn_plane_role_watch, MemoryHandle, MemoryStorage};
 pub(crate) use types::{ClaimView, JudgeArgs, MemoryError, ProposeArgs, SearchArgs};
