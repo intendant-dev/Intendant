@@ -394,6 +394,9 @@ pub(crate) enum RouteHandlerId {
     /// Codex Cloud worker leases (cached store; `?refresh=1` re-syncs via
     /// the daemon host's Codex CLI and parks transition notes).
     CodexCloudWorkers,
+    /// Submit a new Codex Cloud task through the same lane as
+    /// `intendant codex-cloud exec` and record its worker lease.
+    CodexCloudSubmit,
     CodexCloudEnroll,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
@@ -963,6 +966,21 @@ pub(crate) static ROUTES: &[Route] = &[
         "Codex Cloud worker leases from the cached store (`?refresh=1` re-syncs via the Codex CLI)",
     )
     .with_tunnel(tunnel_method("api_codex_cloud_workers")),
+    // The dashboard's submit affordance rides the same submission lane as
+    // `intendant codex-cloud exec` and the `submit_codex_cloud_task` MCP
+    // tool: `codex_cloud::submit_task` through the daemon host's
+    // authenticated Codex CLI, which records the worker lease before the
+    // response is written. Task-classed like every other
+    // start-agent-work surface.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/codex-cloud/submit"),
+        PeerOperation::Task,
+        BodyPolicy::Default,
+        RouteHandlerId::CodexCloudSubmit,
+        "Submit a new Codex Cloud task via the daemon host's Codex CLI and track its worker lease",
+    )
+    .with_tunnel(tunnel_method("api_codex_cloud_submit")),
     // The attachment broker's redemption doorbell: an enrolling worker has
     // no identity yet, so the route is public and the single-use minted
     // token is the entire authorization (burned atomically; rate-limited;
