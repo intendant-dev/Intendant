@@ -52,3 +52,28 @@ html.ui-v2 .handover-update-honesty {
   font-size: 11px;
   color: var(--warning, #e5a50a);
 }
+html.ui-v2 .handover-update-actions {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .handover-update-actions button {
+  align-self: flex-start;
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .handover-update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+html.ui-v2 .handover-update-reach,
+html.ui-v2 .handover-update-note {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}

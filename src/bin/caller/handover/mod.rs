@@ -1027,4 +1027,102 @@ mod tests {
             );
         }
     }
+
+    /// Commission pin `update_chip_offers_action_not_command` (owner
+    /// directive on HS6): the update chip carries BUTTONS — the app
+    /// supervisor's one-click and the CLI daemon's hand-off — never a
+    /// command string for the owner to retype.
+    #[test]
+    fn update_chip_offers_action_not_command() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            "'Update now'",
+            "updateSwap.postMessage",
+            "Hand off to :",
+            "'/api/daemon/takeover'",
+            "__intendantAppSupervisor",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the update chip lost its action affordance: {needle}"
+            );
+        }
+    }
+
+    /// Commission pin `cli_daemon_button_is_honest_about_its_reach`: on
+    /// a CLI-launched daemon the chip can drain THIS daemon toward an
+    /// already-running newer one (the takeover lane), and when none is
+    /// running it says it cannot launch one — on the glass, without
+    /// delegating anyone to a terminal.
+    #[test]
+    fn cli_daemon_button_is_honest_about_its_reach() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        assert!(
+            fragment.contains("cannot launch one itself"),
+            "the no-successor state lost its honest reach line"
+        );
+        assert!(
+            fragment.contains("handoverSuccessorCandidate"),
+            "the hand-off candidate selection is gone"
+        );
+        assert!(
+            fragment.contains("runs the on-disk build"),
+            "the build-match hint on the hand-off button is gone"
+        );
+    }
+
+    /// Commission pin `empty_states_never_instruct_cli`, asserted for
+    /// the surfaces this commission touches: the handover fragment (the
+    /// drain banner's no-successor arm and every update-chip state)
+    /// carries no CLI invocation for the owner to retype.
+    #[test]
+    fn empty_states_never_instruct_cli() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for banned in ["--takeover", "intendant ctl", "intendant --"] {
+            assert!(
+                !fragment.contains(banned),
+                "the handover surface must never instruct CLI usage: found {banned:?}"
+            );
+        }
+    }
+
+    /// Commission pin `app_supervisor_one_click_swaps_without_kill`
+    /// (source-scan reach, stated honestly: the behavioral guarantee
+    /// lives in the supervisor's swap path and its doc contract; this
+    /// pin keeps the machinery and its load-bearing markers from being
+    /// gutted silently). The app supervisor's one-click swap exists,
+    /// follows the intake's spawn → readiness → swap → drain order, and
+    /// parks the predecessor in a draining slot the swap never
+    /// terminates; the app layer re-points the webview on
+    /// `didSwapToPort` and the SPA marker gates the one-click button.
+    #[test]
+    fn app_supervisor_one_click_swaps_without_kill() {
+        let supervisor = include_str!("../../../../macos-app/BackendSupervisor.swift");
+        for needle in [
+            "func beginUpdateSwap",
+            "drainingProcess",
+            // The intake's ordering marker (comment-wrapped in source).
+            "spawn → readiness",
+            "swap → drain",
+            "/api/daemon/takeover",
+            "didSwapToPort",
+        ] {
+            assert!(
+                supervisor.contains(needle),
+                "the app supervisor lost its update-swap machinery: {needle}"
+            );
+        }
+        let app_layer = include_str!("../../../../macos-app/main.swift");
+        for needle in [
+            "beginUpdateSwapFromDashboard",
+            "__intendantAppSupervisor = true",
+            "\"updateSwap\"",
+            "didSwapToPort",
+        ] {
+            assert!(
+                app_layer.contains(needle),
+                "the app layer lost its update-swap wiring: {needle}"
+            );
+        }
+    }
 }
