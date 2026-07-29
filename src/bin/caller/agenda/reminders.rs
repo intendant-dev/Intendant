@@ -298,9 +298,12 @@ pub(crate) struct OccurrenceRecord {
     pub(crate) session_id: Option<String>,
     /// Scheduler-lease generation held by the writing daemon (Track HS
     /// stamping). Absent on legacy rows and rows written without the
-    /// lease. Journal-side only — the agenda op-log vocabulary must NOT
-    /// grow this field (its op enum is `deny_unknown_fields` under a
-    /// skip-don't-brick fold; ruled in the HS intake, Q3 guardrail).
+    /// lease. Journal-side only — the HS intake's Q3 guardrail keeps the
+    /// op-log vocabulary free of this field. The compat rails, stated
+    /// truly (AO ruling R3): the durable op enum tolerates unknown
+    /// FIELDS additively (the `Add.ask` / `Answer.structured`
+    /// precedents) and skips unknown VARIANTS whole-line (`KNOWN_OPS`);
+    /// `deny_unknown_fields` guards the wire `AgendaCommand` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) generation: Option<u64>,
     /// The writing daemon's boot id (Track HS stamping): what boot-
