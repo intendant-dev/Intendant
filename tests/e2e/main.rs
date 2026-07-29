@@ -6855,9 +6855,17 @@ async fn drainer_exits_at_last_session_end() {
         "the successor opening the durable memory plane",
         RUN_TIMEOUT,
         || async {
+            // The OPEN line exactly ("durable plane <id> at <dir>") —
+            // the unavailable→ephemeral failure line shares the prefix,
+            // so a genuine store failure must not false-pass (HS5-N2).
             std::fs::read_to_string(daemon_a.rig.home.path().join("daemon-b.log"))
                 .unwrap_or_default()
-                .contains("[memory] durable plane")
+                .lines()
+                .any(|line| {
+                    line.contains("[memory] durable plane")
+                        && line.contains(" at ")
+                        && !line.contains("unavailable")
+                })
                 .then_some(())
         },
         || {

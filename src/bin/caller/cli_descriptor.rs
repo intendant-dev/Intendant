@@ -116,6 +116,22 @@ mod tests {
         assert!(!dir.path().join("cli-path.tmp").exists());
     }
 
+    /// The tolerant lane of [`meta_port`] (HS5-N1): absent, non-JSON,
+    /// and out-of-range sidecars all resolve `None` — discovery data,
+    /// never an error surface — while a holder-written descriptor
+    /// resolves its port.
+    #[test]
+    fn meta_port_tolerates_absent_and_corrupt_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(meta_port(dir.path()), None, "absent sidecar");
+        std::fs::write(dir.path().join(CLI_META_FILE), "not json").unwrap();
+        assert_eq!(meta_port(dir.path()), None, "unparseable sidecar");
+        std::fs::write(dir.path().join(CLI_META_FILE), "{\"port\": 70000}").unwrap();
+        assert_eq!(meta_port(dir.path()), None, "port outside u16");
+        write_boot_descriptor(dir.path(), 7001).unwrap();
+        assert_eq!(meta_port(dir.path()), Some(7001), "holder-written port");
+    }
+
     /// The F1.5 pin: every repo skill that shells to the Intendant CLI
     /// carries the canonical resolver preamble ($INTENDANT → PATH →
     /// descriptor → bare fallback), so a future skill cannot regress to
