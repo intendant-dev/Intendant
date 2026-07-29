@@ -1255,7 +1255,7 @@ durability.
 The current durable directory is:
 
 ```text
-~/.intendant/memory-plane/
+<INTENDANT_HOME or ~/.intendant>/memory-plane/
 ├── ctrl.iplog          plaintext genesis/control log
 ├── tenant.iplog        encrypted tenant item commits
 ├── custody.v1.json     0600 custody seeds and plane identifiers
@@ -1272,10 +1272,19 @@ mode rather than the macOS Keychain. Full multi-platform and OS-keystore
 custody remain outside this product slice. Memory is local to one daemon; no
 replica, backup, or cross-machine synchronization guarantee is shipped.
 
-> **Current path exception:** unlike other daemon state, durable Memory
-> currently resolves `~/.intendant/memory-plane` directly and does not honor
-> `INTENDANT_HOME`. This is a source/configuration inconsistency, not a
-> supported second state-root policy.
+**Co-homed daemons and handover:** durable-plane-open authority follows the
+active-scheduler lease. A co-homed secondary never opens the durable store —
+its memory surface serves a named `plane-follows-holder` refusal pointing at
+the holder (this replaced the old silent lifetime-ephemeral fallback, whose
+durable-intent writes were lost on exit). The lease holder acquires the store
+with a bounded retry: `plane.lock` held by another live daemon
+(`lock-denied`) is retried — it is not store corruption, and only genuine
+store failure falls to the labeled ephemeral plane. During a drain the
+departing daemon releases the store at drain entry (before the lease flock
+frees) and refuses reads and writes with `plane-handed-over` and the
+successor's port; the successor's retry acquires the same plane — identity,
+claims, and judgments carry over, because the plane's writer device is
+per-installation, not per-process.
 
 ### Surfaces and permissions
 

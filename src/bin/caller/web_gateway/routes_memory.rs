@@ -117,6 +117,11 @@ fn memory_error_status(err: &crate::memory::MemoryError) -> u16 {
         E::NotPermitted { .. } => 403,
         E::Ambiguous(..) | E::Vocabulary { .. } | E::InvalidArg(_) => 400,
         E::Rejected { .. } | E::Pending { .. } => 422,
+        // HS4: the plane is not open on this daemon right now (being
+        // acquired / follows the lease holder / handed to a successor) —
+        // service-unavailable with the named state and retry semantics,
+        // never a client error.
+        E::PlaneUnavailable { .. } => 503,
         E::Unimplemented(_) => 500,
     }
 }

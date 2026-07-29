@@ -72,6 +72,11 @@ pub(crate) struct HandoverRuntime {
     /// (agenda store failed — nothing fires), `request_drain` performs
     /// the entry inline.
     scheduler_attached: std::sync::atomic::AtomicBool,
+    /// Drain-entry hooks (§3.2 step 3), run BETWEEN the sidecar's
+    /// `draining` flip and the flock release — HS4's memory-plane
+    /// release installs here. Hooks must be quick, idempotent, and
+    /// infallible (failures are their own to log).
+    drain_hooks: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -176,6 +181,7 @@ impl HandoverRuntime {
             drain: std::sync::Mutex::new(DrainState::default()),
             drain_notify: tokio::sync::Notify::new(),
             scheduler_attached: std::sync::atomic::AtomicBool::new(false),
+            drain_hooks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -266,6 +272,25 @@ impl HandoverRuntime {
         }
     }
 
+    /// Register a drain-entry hook (HS4+: the memory-plane release).
+    /// Runs between the sidecar's `draining` flip and the flock release,
+    /// in registration order. Late registration during an active drain
+    /// runs the hook immediately — the entry already happened.
+    pub(crate) fn on_drain_entry(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        let already_entered = self
+            .drain
+            .lock()
+            .map(|drain| drain.entered_ms.is_some())
+            .unwrap_or(false);
+        if already_entered {
+            hook();
+            return;
+        }
+        if let Ok(mut hooks) = self.drain_hooks.lock() {
+            hooks.push(hook);
+        }
+    }
+
     /// A scheduler attached: drain entry becomes its between-passes duty
     /// (a firing pass can then never straddle the flock release).
     pub(crate) fn attach_scheduler(&self) {
@@ -350,6 +375,16 @@ impl HandoverRuntime {
             if let Some(mut lease) = slot.take() {
                 if let Err(err) = lease.mark_draining(&self.state_root) {
                     eprintln!("[handover] drain sidecar write failed ({err}) — releasing anyway");
+                }
+                // §3.2 step 3 (HS4): the drain hooks run while the flock
+                // is still ours — the memory hook drops the durable store
+                // (freeing plane.lock) BEFORE the successor can acquire
+                // the lease, so its bounded plane retry always races an
+                // already-freed lock.
+                if let Ok(hooks) = self.drain_hooks.lock() {
+                    for hook in hooks.iter() {
+                        hook();
+                    }
                 }
                 drop(lease); // the flock frees HERE
             }

@@ -288,6 +288,17 @@ fn evict_job(path: &Path) {
     map.remove(path);
 }
 
+/// Track HS4 (the HS3 ruling's N5): is any transfer append copying bytes
+/// RIGHT NOW? The drain exit condition holds the daemon open for these —
+/// cutting a multi-gigabyte copy at exit would waste the whole spool.
+/// Idle entries are resumable disk state (the successor serves resume)
+/// and do not hold.
+pub(crate) fn any_transfer_appending() -> bool {
+    let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    prune_active_jobs_locked(&mut map, now_unix());
+    map.values().any(|entry| entry.appending)
+}
+
 #[cfg(test)]
 fn reset_active_jobs_for_path(path: &Path) {
     evict_job(path);

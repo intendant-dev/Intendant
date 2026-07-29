@@ -417,51 +417,41 @@ pub(crate) fn spawn_mode_web_gateway(
     let agenda_boot_announce = mcp_http_state.agenda.clone();
     let agenda_for_supervisor = mcp_http_state.agenda.clone();
     // The P1 Memory service. The durable plane runs on the
-    // proven-custody OS (macOS);
-    // multi-platform custody stays full Gate B, so other OSes run
-    // ephemeral and say so on every view. INTENDANT_MEMORY_EPHEMERAL=1
-    // is the operator kill switch. Durable bootstrap failure fails
-    // SOFT to ephemeral (service stays available; the label stays
-    // honest) with the named outcome logged.
+    // proven-custody OS (macOS); multi-platform custody stays full
+    // Gate B, so other OSes run ephemeral and say so on every view.
+    // INTENDANT_MEMORY_EPHEMERAL=1 is the operator kill switch.
+    //
+    // Track HS4: durable-plane-open authority is LEASE-HOLDER-ONLY (the
+    // Q6 amendment) — the handle starts without a plane and the role
+    // watch follows the lease: a holder acquires with the bounded
+    // `LockDenied` retry (a held plane is not a corrupt store; only
+    // genuine store failure falls to the labeled ephemeral), a
+    // secondary serves the named follows-holder refusal instead of the
+    // old silent lifetime-ephemeral fallback, and drain entry hands the
+    // plane over (the runtime hook drops the store, freeing plane.lock
+    // for the successor). The plane dir follows the STATE ROOT
+    // (`durable_plane_dir` — the HS4 path fix; the old dirs::home_dir
+    // resolution ignored INTENDANT_HOME).
     let durable_default = cfg!(target_os = "macos")
         && std::env::var("INTENDANT_MEMORY_EPHEMERAL").map_or(true, |v| v != "1");
-    let storage = if durable_default {
-        match dirs::home_dir() {
-            Some(home) => {
-                crate::memory::MemoryStorage::Durable(home.join(".intendant").join("memory-plane"))
-            }
-            None => crate::memory::MemoryStorage::Ephemeral,
-        }
+    if durable_default {
+        let plane_dir = crate::memory::durable_plane_dir(&crate::platform::intendant_home());
+        let handle = Arc::new(crate::memory::MemoryHandle::deferred(
+            bus.clone(),
+            handover.clone(),
+        ));
+        mcp_http_state.memory = Some(handle.clone());
+        let hook_handle = handle.clone();
+        handover.on_drain_entry(Box::new(move || hook_handle.hand_over()));
+        // Detaches on drop like the mode listeners; settles once a plane
+        // installs (drain hand-over is the hook's job from there).
+        let _plane_watch =
+            crate::memory::spawn_plane_role_watch(handle, handover.clone(), plane_dir);
     } else {
-        crate::memory::MemoryStorage::Ephemeral
-    };
-    let storage = match &storage {
-        crate::memory::MemoryStorage::Durable(dir) => {
-            match crate::memory::MemoryHandle::bootstrap(
-                bus.clone(),
-                crate::memory::MemoryStorage::Durable(dir.clone()),
-            ) {
-                Ok(handle) => {
-                    println!(
-                        "[memory] durable plane {} at {}",
-                        &handle.plane_id_hex()[..16],
-                        dir.display()
-                    );
-                    mcp_http_state.memory = Some(Arc::new(handle));
-                    None
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[memory] durable plane unavailable ({err}) — falling back to ephemeral"
-                    );
-                    Some(crate::memory::MemoryStorage::Ephemeral)
-                }
-            }
-        }
-        crate::memory::MemoryStorage::Ephemeral => Some(crate::memory::MemoryStorage::Ephemeral),
-    };
-    if let Some(storage) = storage {
-        mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap(bus.clone(), storage) {
+        mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap(
+            bus.clone(),
+            crate::memory::MemoryStorage::Ephemeral,
+        ) {
             Ok(handle) => {
                 println!(
                     "[memory] ephemeral plane {} (nothing persists across restarts)",
