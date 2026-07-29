@@ -24,9 +24,11 @@
 
 mod lease;
 mod presence;
+mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
 pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence};
+pub(crate) use update_watch::spawn_update_watch;
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +79,16 @@ pub(crate) struct HandoverRuntime {
     /// release installs here. Hooks must be quick, idempotent, and
     /// infallible (failures are their own to log).
     drain_hooks: std::sync::Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    /// The daemon event bus, installed at wiring (`set_bus`) once it
+    /// exists: drain-entry and update notifications ride it, on EVERY
+    /// entry path (HS3-N4 — the storeless inline entry was
+    /// eprintln-only). Unset in bare test constructions: emissions then
+    /// degrade to the log line.
+    bus: std::sync::OnceLock<crate::event::EventBus>,
+    /// The rendered update-surface block (HS6), owned by the update
+    /// watch task; `status_json` serves it. `None` = the on-disk image
+    /// is the running one (no chip).
+    update_status: std::sync::Mutex<Option<serde_json::Value>>,
 }
 
 #[derive(Default)]
@@ -183,6 +195,43 @@ impl HandoverRuntime {
             drain_notify: tokio::sync::Notify::new(),
             scheduler_attached: std::sync::atomic::AtomicBool::new(false),
             drain_hooks: std::sync::Mutex::new(Vec::new()),
+            bus: std::sync::OnceLock::new(),
+            update_status: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Install the daemon event bus (wiring, once it exists). A second
+    /// call is a no-op — the first bus wins.
+    pub(crate) fn set_bus(&self, bus: crate::event::EventBus) {
+        let _ = self.bus.set(bus);
+    }
+
+    /// Owner-visible notification through the daemon bus, when one is
+    /// installed (bare test constructions degrade to nothing — callers
+    /// carry their own log lines).
+    pub(crate) fn notify_user(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        text: &str,
+        urgency: crate::types::NotificationUrgency,
+    ) {
+        if let Some(bus) = self.bus.get() {
+            bus.send(crate::event::AppEvent::UserNotification {
+                session_id: None,
+                id: id.to_string(),
+                title: title.map(str::to_string),
+                text: text.to_string(),
+                urgency,
+                ts: now_ms(),
+            });
+        }
+    }
+
+    /// The update watch's rendered block (HS6); `None` clears the chip.
+    pub(crate) fn set_update_status(&self, block: Option<serde_json::Value>) {
+        if let Ok(mut slot) = self.update_status.lock() {
+            *slot = block;
         }
     }
 
@@ -407,6 +456,19 @@ impl HandoverRuntime {
                 .map(|who| format!(" (requested by {who})"))
                 .unwrap_or_default()
         );
+        // Owner-visible on EVERY entry path (HS3-N4: the storeless
+        // inline entry was eprintln-only — notification-invisible, and
+        // its zero-session exit waited on the next unrelated bus
+        // event). The event also lands on the supervisor's observation
+        // lane, which re-evaluates the drain exit condition — covering
+        // zero-sessions-at-entry on both paths.
+        self.notify_user(
+            "handover-draining",
+            Some("Daemon draining"),
+            "standing automations handed off; in-flight sessions finish here, \
+             then this daemon exits",
+            crate::types::NotificationUrgency::Attention,
+        );
     }
 
     /// The Q4 successor watch, polled from the drainer's scheduler lane:
@@ -533,6 +595,11 @@ impl HandoverRuntime {
         }
         if let Some(err) = &self.presence_error {
             obj.insert("presence_error".into(), err.clone().into());
+        }
+        if let Ok(update) = self.update_status.lock() {
+            if let Some(update) = update.as_ref() {
+                obj.insert("update".into(), update.clone());
+            }
         }
         block
     }
@@ -892,5 +959,72 @@ mod tests {
             Some(2),
             "released lease reacquires with a bumped generation"
         );
+    }
+
+    /// HS3-N4 (folded into HS6): the INLINE drain entry — no scheduler
+    /// attached, the storeless shape — emits the owner-visible
+    /// "Daemon draining" notification through the bus, exactly like the
+    /// scheduler-owned path (which now rides the same emission inside
+    /// `perform_drain_entry`). The bus event is also what re-evaluates
+    /// the supervisor's drain exit condition, so a zero-session
+    /// storeless drain no longer waits on an unrelated event.
+    #[test]
+    fn inline_drain_entry_emits_the_owner_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HandoverRuntime::initialize(dir.path(), 7001, 0);
+        assert!(runtime.is_holder());
+        let bus = crate::event::EventBus::new();
+        let mut events = bus.subscribe();
+        runtime.set_bus(bus);
+        // No `attach_scheduler` call: `request_drain` performs the
+        // entry inline (the storeless shape).
+        assert_eq!(runtime.request_drain(None), DrainRequest::Entered);
+        let mut saw_draining_notification = false;
+        while let Ok(event) = events.try_recv() {
+            if let crate::event::AppEvent::UserNotification { id, urgency, .. } = event {
+                if id == "handover-draining" {
+                    assert_eq!(urgency, crate::types::NotificationUrgency::Attention);
+                    saw_draining_notification = true;
+                }
+            }
+        }
+        assert!(
+            saw_draining_notification,
+            "the inline entry path must be notification-visible (HS3-N4)"
+        );
+    }
+
+    /// HS6 conformance pin `spa_offers_reload_on_boot_id_change`: the
+    /// config payload carries the daemon's boot id on every lane
+    /// (serialized field + wiring assignment), and the shipped
+    /// dashboard bundle wires it into the reload nudge — the config
+    /// chokepoint feeds `maybeNudgeDaemonBoot`, whose banner offers the
+    /// reload. The artifact scan pins the SPA half the same way the
+    /// HTTP-map mirror test does.
+    #[test]
+    fn spa_offers_reload_on_boot_id_change() {
+        let mut config = crate::web_gateway::WebGatewayConfig::default();
+        config.boot_id = "boot-test".to_string();
+        let serialized = serde_json::to_value(&config).expect("config serializes");
+        assert_eq!(
+            serialized["boot_id"], "boot-test",
+            "the config payload must carry boot_id"
+        );
+
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // The nudge exists and the banner offers the reload…
+            "function maybeNudgeDaemonBoot",
+            "ui-daemon-boot-banner",
+            // …and both boot_id lanes feed it: the config chokepoint
+            // and the handover status poll.
+            "maybeNudgeDaemonBoot(cfg.boot_id)",
+            "maybeNudgeDaemonBoot(body.boot_id)",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the boot-id reload wiring: {needle}"
+            );
+        }
     }
 }

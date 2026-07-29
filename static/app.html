@@ -873,9 +873,11 @@ html {
   vertical-align: middle;
 }
 
-/* Stale-build reload nudge + event-lane staleness banner: slim fixed
-   strips at the top of the viewport, above everything, never blocking. */
+/* Stale-build / daemon-boot reload nudges + event-lane staleness banner:
+   slim fixed strips at the top of the viewport, above everything, never
+   blocking. */
 #ui-stale-build-banner,
+#ui-daemon-boot-banner,
 #ui-event-lane-banner {
   position: fixed;
   top: 8px;
@@ -893,7 +895,8 @@ html {
   font-size: 12.5px;
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
-#ui-stale-build-banner button {
+#ui-stale-build-banner button,
+#ui-daemon-boot-banner button {
   border: 1px solid var(--blue);
   background: transparent;
   color: var(--blue);
@@ -26617,6 +26620,34 @@ html.ui-v2 .handover-banner a {
   color: var(--accent, #62a0ea);
   font-weight: 600;
 }
+
+/* ── update-available chip (HS6): a quiet bottom-corner card — the fact
+   of a newer on-disk build, its provenance, and (macOS unsigned builds)
+   the keychain/TCC honesty line. Distinct from the drain banner: an
+   update waits; a drain is in motion. ─────────────────────────────── */
+html.ui-v2 .handover-update-chip {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 239;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #e6e6e6);
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--accent, #62a0ea);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+html.ui-v2 .handover-update-chip code {
+  font-size: 11px;
+}
+html.ui-v2 .handover-update-honesty {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--warning, #e5a50a);
+}
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
    All scoped html.ui-v2. Grid layout (ratified 2026-07-21, candidate B
@@ -37160,7 +37191,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '50633e5b03988d01';
+const INTENDANT_APP_BUILD = '1d91b406c7b2a74b';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -37184,6 +37215,46 @@ function maybeNudgeStaleBuild(serverBuild) {
   banner.id = 'ui-stale-build-banner';
   const text = document.createElement('span');
   text.textContent = 'The daemon updated — this dashboard is from an older build.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reload';
+  btn.addEventListener('click', () => location.reload());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && reloadSafe()) location.reload();
+  });
+}
+
+// ── Daemon boot identity / "daemon updated — reload" nudge (HS6) ──
+//
+// The config payload carries the daemon process's boot_id, and every
+// config lane lands on the applyGatewayConfig chokepoint (boot fetch,
+// tunnel config RPC, reconnect hydration) — plus the handover status
+// poll feeds it independently. A tab that hears a DIFFERENT boot_id
+// than it first recorded is talking to a NEW daemon process on the same
+// origin (a handover successor, or a plain restart after an update):
+// state the fact and offer the reload instead of letting the tab lie —
+// the same stale-photograph class as the bundle stamp, one level up.
+let daemonBootId = '';
+let daemonBootNudged = false;
+function maybeNudgeDaemonBoot(bootId) {
+  const boot = String(bootId || '').trim();
+  if (!boot) return;
+  if (!daemonBootId) { daemonBootId = boot; return; }
+  if (boot === daemonBootId || daemonBootNudged) return;
+  daemonBootNudged = true;
+  console.info(`[dashboard] daemon boot ${boot} is answering; this tab attached to ${daemonBootId} — reload to reattach`);
+  const reloadSafe = () =>
+    !(document.getElementById('new-session-input')?.value || '').trim();
+  if (document.hidden && reloadSafe()) {
+    location.reload();
+    return;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'ui-daemon-boot-banner';
+  const text = document.createElement('span');
+  text.textContent = 'The daemon updated — a new process is serving this dashboard.';
   const btn = document.createElement('button');
   btn.textContent = 'Reload';
   btn.addEventListener('click', () => location.reload());
@@ -37224,8 +37295,10 @@ const INTENDANT_TAB_ID = (() => {
 // lane-verify harness drive it with a synthetic server stamp instead.
 window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  bootInfo: () => ({ bootId: daemonBootId, nudged: daemonBootNudged }),
   tabId: () => INTENDANT_TAB_ID,
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
+  __testNudgeDaemonBoot: (v) => maybeNudgeDaemonBoot(v),
 });
 
 // ── Legacy federation auth compatibility ──
@@ -44918,8 +44991,10 @@ function applyGatewayConfig(config) {
   }
   // Every lane's config lands here (boot fetch, tunnel config RPC,
   // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
-  // a stale tab learns the daemon now serves a newer bundle.
+  // a stale tab learns the daemon now serves a newer bundle, or that a
+  // NEW daemon process answers on this origin (HS6 boot-id nudge).
   if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
+  if (typeof maybeNudgeDaemonBoot === 'function') maybeNudgeDaemonBoot(cfg.boot_id);
   applyMainBackendStatus();
 }
 
@@ -98363,19 +98438,71 @@ async function memoryProposeFromForm(button) {
   else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
 /* ── static/app/ui2-handover.js ── */
-// ── ui2-handover — drain banner + successor chip (Track HS5) ─────────────
+// ── ui2-handover — drain banner + successor chip (HS5) + update chip
+// (HS6) ──────────────────────────────────────────────────────────────
 // Polls GET /api/daemon/handover (tunnel twin api_daemon_handover): the
-// scheduler-lease status block. Two renders, one element:
+// scheduler-lease status block. Renders:
 //   - THIS daemon draining: a persistent banner — in-flight sessions
 //     finish here; new work continues on the successor (linked once the
 //     lease sidecar names it).
 //   - another co-homed daemon draining: a compact predecessor chip with
 //     its remaining session count.
-// Removed when neither applies; transient poll failures keep the last
-// honest render rather than flapping.
+//   - a newer/changed binary on disk (the daemon's update watch): the
+//     bottom-corner update chip with both builds' provenance and the
+//     keychain/TCC honesty line where it applies. Suppressed while
+//     draining — a drain in motion outranks the waiting update.
+// The payload's boot_id also feeds the "daemon updated — reload" nudge
+// (maybeNudgeDaemonBoot), beside the config-lane chokepoint.
+// Elements are removed when nothing applies; transient poll failures
+// keep the last honest render rather than flapping.
 (() => {
   const HANDOVER_POLL_MS = 30000;
   let bannerEl = null;
+  let updateEl = null;
+
+  function updateChip() {
+    if (!updateEl) {
+      updateEl = document.createElement('div');
+      updateEl.id = 'handover-update-chip';
+      updateEl.className = 'handover-update-chip';
+      document.body.appendChild(updateEl);
+    }
+    return updateEl;
+  }
+
+  function updateChipClear() {
+    if (updateEl) { updateEl.remove(); updateEl = null; }
+  }
+
+  // textContent construction throughout: the on-disk provenance strings
+  // come from probing a binary the daemon merely observed — never markup.
+  function handoverUpdateRender(body) {
+    const update = body && body.update;
+    if (!update || body.draining) { updateChipClear(); return; }
+    const disk = update.on_disk;
+    const running = update.running || {};
+    const el = updateChip();
+    el.textContent = '';
+    const strong = document.createElement('strong');
+    el.appendChild(strong);
+    if (disk) {
+      strong.textContent = 'Update on disk: ';
+      el.appendChild(document.createTextNode(
+        `commit ${disk.git_sha || '?'} · built ${disk.built_at || '?'} — running ${running.git_sha || '?'}`
+      ));
+      if (update.honesty) {
+        const honesty = document.createElement('div');
+        honesty.className = 'handover-update-honesty';
+        honesty.textContent = update.honesty;
+        el.appendChild(honesty);
+      }
+    } else {
+      strong.textContent = 'Binary changed on disk';
+      el.appendChild(document.createTextNode(
+        ` — provenance unreadable${update.probe_error ? ` (${update.probe_error})` : ''}`
+      ));
+    }
+  }
 
   function handoverBanner() {
     if (!bannerEl) {
@@ -98399,7 +98526,11 @@ async function memoryProposeFromForm(button) {
   }
 
   function handoverRender(body) {
-    if (!body || body.available === false) { handoverClear(); return; }
+    if (!body || body.available === false) { handoverClear(); updateChipClear(); return; }
+    if (body.boot_id && typeof maybeNudgeDaemonBoot === 'function') {
+      maybeNudgeDaemonBoot(body.boot_id);
+    }
+    handoverUpdateRender(body);
     if (body.draining) {
       const port = handoverSuccessorPort(body);
       const link = port
@@ -98409,7 +98540,7 @@ async function memoryProposeFromForm(button) {
       el.dataset.kind = 'draining';
       el.innerHTML = link
         ? `<strong>This daemon is draining.</strong> In-flight sessions finish here — continue new work on the successor at ${link}.`
-        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — the successor has not acquired yet (retry shortly, or start a daemon with --takeover).';
+        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — no successor has acquired the lease yet.';
       return;
     }
     const others = Array.isArray(body.daemons)

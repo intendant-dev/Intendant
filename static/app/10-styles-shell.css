@@ -797,9 +797,11 @@ html {
   vertical-align: middle;
 }
 
-/* Stale-build reload nudge + event-lane staleness banner: slim fixed
-   strips at the top of the viewport, above everything, never blocking. */
+/* Stale-build / daemon-boot reload nudges + event-lane staleness banner:
+   slim fixed strips at the top of the viewport, above everything, never
+   blocking. */
 #ui-stale-build-banner,
+#ui-daemon-boot-banner,
 #ui-event-lane-banner {
   position: fixed;
   top: 8px;
@@ -817,7 +819,8 @@ html {
   font-size: 12.5px;
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
-#ui-stale-build-banner button {
+#ui-stale-build-banner button,
+#ui-daemon-boot-banner button {
   border: 1px solid var(--blue);
   background: transparent;
   color: var(--blue);
