@@ -2553,6 +2553,53 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "attest" => {
+            // The fired session's self-report on its occurrence (Track
+            // AO): the daemon binds it to the started lineage at intake
+            // — only the fired session (or its resume successors) may
+            // attest, and every refusal is named. Refs are hashed HERE
+            // (the pin says what this side read) and verified against
+            // the daemon's own read; pointer + pin, never sealed.
+            let args = parse_command_args(
+                &raw[1..],
+                &["--occurrence", "--outcome", "--note", "--ref", "--source"],
+                &[],
+            )?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda attest requires an item id (a unique prefix is enough)",
+            )
+            .await?;
+            let occurrence = args.one("--occurrence").ok_or_else(|| {
+                "agenda attest requires --occurrence OCCURRENCE_ID — your fired task's \
+                 rider names it"
+                    .to_string()
+            })?;
+            let outcome = args.one("--outcome").ok_or_else(|| {
+                "agenda attest requires --outcome achieved|partial|blocked|abandoned".to_string()
+            })?;
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("attest".to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            map.insert(
+                "occurrence".to_string(),
+                Value::String(occurrence.to_string()),
+            );
+            map.insert("outcome".to_string(), Value::String(outcome.to_string()));
+            insert_string(&mut map, "note", args.one("--note"));
+            let refs = args
+                .all("--ref")
+                .map(|spec| hashed_file_ref_value("--ref", spec))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !refs.is_empty() {
+                map.insert("refs".to_string(), Value::Array(refs));
+            }
+            insert_string(&mut map, "source", args.one("--source"));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "block" => {
             let args = parse_command_args(&raw[1..], &["--source"], &[])?;
             let id = agenda_resolve_id(
@@ -2824,37 +2871,45 @@ fn agenda_ref_spec(raw: &str, explicit: Option<&str>) -> Result<(String, String)
     Ok((ref_type, locator))
 }
 
-/// `--binding-ref file:PATH` propose-time hashing (sealed refs): resolve
-/// PATH, sha256 its bytes NOW, and embed `{locator, sha256}` — the
+/// `--binding-ref file:PATH` propose-time hashing (sealed refs): the
 /// manifest pin the approval digest covers. The daemon verifies the pin
 /// against its own read at intake (a remote `--url` daemon reading
-/// different bytes refuses by name) and re-verifies at every fire. v1
-/// accepts `file:` locators only; other schemes refuse by name.
+/// different bytes refuses by name) and re-verifies at every fire.
 fn binding_ref_propose_value(spec: &str) -> Result<Value, String> {
+    hashed_file_ref_value("--binding-ref", spec)
+}
+
+/// `FLAG file:PATH` local hashing: resolve PATH, sha256 its bytes NOW,
+/// and embed `{locator, sha256}` — the pin says what THIS side read;
+/// the daemon verifies it against its own read at intake. v1 accepts
+/// `file:` locators only; other schemes refuse by name. `flag` names
+/// the CLI flag in refusals (`--binding-ref` on propose, `--ref` on
+/// attest).
+fn hashed_file_ref_value(flag: &str, spec: &str) -> Result<Value, String> {
     let Some(raw) = spec.strip_prefix("file:") else {
         return Err(format!(
-            "--binding-ref {spec:?}: v1 seals file:PATH locators only \
+            "{flag} {spec:?}: v1 accepts file:PATH locators only \
              (body:/git: forms are future vocabulary)"
         ));
     };
     if raw.is_empty() {
-        return Err("--binding-ref file: needs a path".to_string());
+        return Err(format!("{flag} file: needs a path"));
     }
     let path = std::path::Path::new(raw);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|err| format!("--binding-ref {spec:?}: cannot resolve the cwd ({err})"))?
+            .map_err(|err| format!("{flag} {spec:?}: cannot resolve the cwd ({err})"))?
             .join(path)
     };
-    // Canonical (symlink-free) so the daemon pins the same bytes at fire
-    // time that this hash read — a locator that dereferences differently
-    // later is exactly the drift the seal exists to catch.
+    // Canonical (symlink-free) so the daemon reads the same bytes this
+    // hash read — a locator that dereferences differently later is
+    // exactly the drift the pin exists to catch.
     let canonical = std::fs::canonicalize(&absolute)
-        .map_err(|err| format!("--binding-ref {spec:?}: not readable ({err})"))?;
+        .map_err(|err| format!("{flag} {spec:?}: not readable ({err})"))?;
     let sha256 = crate::agenda::digest_file(&canonical)
-        .map_err(|err| format!("--binding-ref {spec:?}: cannot hash ({err})"))?;
+        .map_err(|err| format!("{flag} {spec:?}: cannot hash ({err})"))?;
     Ok(serde_json::json!({
         "locator": format!("file:{}", canonical.display()),
         "sha256": sha256,
@@ -5300,6 +5355,8 @@ fn help_agenda() {
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
   intendant ctl agenda annotate ID_PREFIX NOTE... [--source LABEL]\n\
+  intendant ctl agenda attest ID_PREFIX --occurrence OCC_ID --outcome achieved|partial|blocked|abandoned\n\
+      [--note TEXT] [--ref file:PATH]... [--source LABEL]   # fired session's self-report on its occurrence\n\
   intendant ctl agenda block ID_PREFIX CRITERION... [--source LABEL]\n\
   intendant ctl agenda unblock ID_PREFIX [BLOCKER_PREFIX] [--source LABEL]\n\
   intendant ctl agenda relies-on ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\

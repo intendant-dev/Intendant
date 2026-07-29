@@ -51,6 +51,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda schedule 01KX --goal "Run the soak checks and summarize" --at +2d
 "$INTENDANT" ctl agenda schedule 01KX --goal "Weekly housekeeping pass" --at "+1d" --every 7d   # STANDING: one approval covers the series
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
+"$INTENDANT" ctl agenda attest 01KX --occurrence 98eb14c2... --outcome partial --note "3 of 5 slices landed" --ref file:$HOME/handoff.md   # fired sessions: self-report your occurrence (rider names its id)
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
 "$INTENDANT" ctl agenda relies-on 01KX 01KY    # 01KX waits on 01KY (--remove drops the link)
 "$INTENDANT" ctl agenda list --blocked         # open items with uncleared blockers / unmet deps
@@ -118,11 +119,17 @@ dashboard, attributed to your session.
   message reaches nobody by default.** A fired session ends into a
   dead-letter channel — the run write-back keeps one last-wins note
   nobody is pointed at, and transcripts are only mined after the fact.
-  Durable channels are the verbs above: `annotate` your source item with
-  what happened and what comes next, `ref` a handoff file you wrote (a
-  durable path, not /tmp — the digest makes drift visible), and park
-  follow-ups as their own items. Write your handoff there before your
-  last token.
+  Durable channels are the verbs above: **attest your occurrence**
+  (`attest` — the self-report machinery reads: outcome from the closed
+  set, a short note, refs to what you produced), `annotate` your source
+  item with what happened and what comes next, `ref` a handoff file you
+  wrote (a durable path, not /tmp — the digest makes drift visible),
+  and park follow-ups as their own items. Write your handoff there
+  before your last token. Attest honestly — `achieved` only when the
+  goal as stated is done; `partial` buys nothing machine-side, so there
+  is no reason to inflate; `blocked`/`abandoned` say so and why. Your
+  report is labeled self-report wherever it renders, and only sessions
+  in the occurrence's own lineage can write it.
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.
