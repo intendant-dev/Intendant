@@ -456,9 +456,13 @@ function agendaLensGroupsNow() {
   const pool = agendaFilteredPool();
   const seen = new Set();
   const take = (arr) => arr.filter((x) => !seen.has(x.id) && (seen.add(x.id), true));
-  const answer = take(pool
+  // The audience split (daemon-derived watched_by): questions an armed
+  // automation covers are machinery's inbox, not the owner's — they
+  // leave Answer for the FYI-grade Watched group below.
+  const openQuestions = pool
     .filter((x) => x.kind === 'question' && x.status === 'open' && !x.dismissed)
-    .sort(agendaByNew));
+    .sort(agendaByNew);
+  const answer = take(openQuestions.filter((x) => !x.watched_by));
   const approve = take(pool.filter((x) => {
     const st = agendaEffectState(x);
     return x.status === 'open' && st && st.kind === 'pending';
@@ -472,6 +476,11 @@ function agendaLensGroupsNow() {
   const attend = take(pool
     .filter((x) => x.status === 'open' && agendaTriageInfo(x))
     .sort(agendaAttendOrder));
+  // Watched questions take LAST: any needs-you-grade state above (a
+  // pending approval, a suspension) outranks the FYI grouping. Calm
+  // depth folds machinery-audience away entirely.
+  const watched = agendaDepthCalm() ? []
+    : take(openQuestions.filter((x) => x.watched_by));
   const groups = [];
   if (answer.length) {
     groups.push({
@@ -506,6 +515,13 @@ function agendaLensGroupsNow() {
       label: 'Attend',
       hint: 'triage-flagged items, ranked — ordinary annotations from the triage mandate; ranking gates nothing',
       rows: attend.map((x) => ({ item: x })),
+    });
+  }
+  if (watched.length) {
+    groups.push({
+      label: 'Watched',
+      hint: 'questions an armed automation will pick up — machinery’s inbox, not yours; anything it can’t deliver returns to Answer',
+      rows: watched.map((x) => ({ item: x, composer: true })),
     });
   }
   return groups;
@@ -677,11 +693,14 @@ function agendaLensGroupsArchive() {
 }
 
 // Distinct items the "Needs you" lens would show — the lens badge.
+// Watched questions (an armed automation covers them — daemon-derived
+// watched_by) are machinery's inbox and never count as needing you.
 function agendaNeedsYouCount() {
   const needs = new Set();
   (agendaItems || []).forEach((x) => {
     const st = agendaEffectState(x);
-    if (x.kind === 'question' && x.status === 'open' && !x.dismissed) needs.add(x.id);
+    if (x.kind === 'question' && x.status === 'open' && !x.dismissed
+      && !x.watched_by) needs.add(x.id);
     if (x.status === 'open' && st && st.kind === 'pending') needs.add(x.id);
     if (st && st.kind === 'suspended') needs.add(x.id);
     if (x.status === 'open' && x.due_ms && x.due_ms < Date.now()) needs.add(x.id);
@@ -739,6 +758,16 @@ function agendaCardChips(item) {
   if (item.kind === 'question' && item.status === 'open' && item.dismissed) {
     chips.push(agendaChipHtml('dismissed · still open', 'neutral',
       agendaDismissedTip(item.dismissed), true));
+  }
+  // Machinery-audience classification (daemon-derived, never stored):
+  // an armed automation covers this item. Absence = needs you.
+  if (item.status === 'open' && item.watched_by) {
+    const w = item.watched_by;
+    chips.push(agendaChipHtml(
+      agendaDepthCalm() ? 'watched' : `watched by ${w.watcher_title}`, 'sky',
+      w.due_ms
+        ? `“${w.watcher_title}” picks this up ${agendaRelTime(w.due_ms)} — returns to Needs you if it can’t deliver`
+        : `“${w.watcher_title}” is handling this now — returns to Needs you if it can’t deliver`));
   }
   // Answered ask whose delivery reached no session (the daemon-recorded
   // `delivered: false` marker; absent data claims nothing).

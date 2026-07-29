@@ -348,6 +348,7 @@ mod tests {
             part_of: None,
             relates_to: Vec::new(),
             deferred_until: None,
+            watched_by: None,
         }
     }
 

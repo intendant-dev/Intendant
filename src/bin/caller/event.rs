@@ -3773,7 +3773,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             method: method.clone(),
         }),
         AppEvent::AgendaChanged { item, counts } => Some(OutboundEvent::AgendaChanged {
-            item: item.clone(),
+            item: Box::new(item.clone()),
             counts: *counts,
         }),
         // Supervisor-internal delivery signal: browsers already see the
