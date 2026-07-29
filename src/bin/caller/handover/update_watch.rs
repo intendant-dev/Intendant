@@ -150,7 +150,11 @@ pub(crate) struct UpdateWatch {
 }
 
 impl UpdateWatch {
-    pub(crate) fn new(exe_path: PathBuf, boot_stamp: Option<BinaryStamp>, booted_at_ms: u64) -> Self {
+    pub(crate) fn new(
+        exe_path: PathBuf,
+        boot_stamp: Option<BinaryStamp>,
+        booted_at_ms: u64,
+    ) -> Self {
         UpdateWatch {
             exe_path,
             boot_stamp,
@@ -431,7 +435,7 @@ pub(crate) fn spawn_update_watch(runtime: std::sync::Arc<super::HandoverRuntime>
             ticks.tick().await;
             let stamp = BinaryStamp::read(watch.exe_path()).ok();
             let probe = if watch.probe_wanted(&stamp) {
-                Some(run_version_probe(&watch.exe_path().to_path_buf()).await)
+                Some(run_version_probe(watch.exe_path()).await)
             } else {
                 None
             };
@@ -527,7 +531,9 @@ mod tests {
         assert!(watch.status_json().is_some());
 
         // The boot image returns (revert): chip clears.
-        assert!(watch.record(Some(stamp(100, 1_000, 1)), None, 8_000).is_none());
+        assert!(watch
+            .record(Some(stamp(100, 1_000, 1)), None, 8_000)
+            .is_none());
         assert!(watch.status_json().is_none(), "revert clears the chip");
     }
 

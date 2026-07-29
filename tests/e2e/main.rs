@@ -7069,7 +7069,10 @@ async fn update_surface_probes_swapped_binary_and_serves_the_chip_block() {
         },
     )
     .await;
-    assert_eq!(body["update"]["on_disk"]["built_at"], "2026-07-29T00:00:00Z");
+    assert_eq!(
+        body["update"]["on_disk"]["built_at"],
+        "2026-07-29T00:00:00Z"
+    );
     assert!(
         body["update"]["running"]["git_sha"].is_string(),
         "the running provenance rides beside the on-disk build: {body}"

@@ -5051,6 +5051,11 @@ mod tests {
         let runtime = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
         runtime.attach_scheduler();
         let (handle, _) = handle_with_item(dir.path(), 1_000); // overdue
+
+        // Mirror the wiring: the runtime carries the daemon bus, and
+        // `perform_drain_entry` emits the drain notice through it on
+        // every entry path (HS3-N4).
+        runtime.set_bus(handle.bus().clone());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 
