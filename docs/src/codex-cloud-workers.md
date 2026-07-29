@@ -376,6 +376,18 @@ host's Codex CLI and parks agenda notes for any transitions it observes. A
 failed sync degrades to the cached view with the error shown — the card never
 goes blank because the provider CLI is missing.
 
+The subtab also carries the **submit form** — prompt, environment id,
+optional branch/attempts/title, exactly the `exec` verb's parameters.
+Submitting posts `POST /api/codex-cloud/submit` (tunnel twin
+`api_codex_cloud_submit`, Task-classed like every start-agent-work
+surface), which rides the same `submit_task` lane as the CLI verb and the
+MCP tool: the daemon host's authenticated Codex CLI creates the task and
+the worker lease is recorded before the response returns, so the form's
+immediate follow-up sync lists the new task even while the provider window
+lags. Environment suggestions derive from the tracked leases (there is no
+provider env-list verb); the last environment submitted from that browser
+is remembered locally.
+
 ## MCP tools
 
 The daemon's full MCP tool profile exposes `list_codex_cloud_workers`,

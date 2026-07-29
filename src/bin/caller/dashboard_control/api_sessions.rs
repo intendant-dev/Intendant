@@ -250,6 +250,7 @@ pub(crate) async fn control_request_frame(
         "api_codex_cloud_workers" => {
             api_codex_cloud_workers_response(id, params.as_ref(), &runtime).await
         }
+        "api_codex_cloud_submit" => api_codex_cloud_submit_response(id, params.as_ref()).await,
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_ops" => api_agenda_ops_response(id, params.as_ref(), &runtime).await,
         "api_agenda_occurrences" => {
@@ -1348,6 +1349,21 @@ pub(crate) async fn api_codex_cloud_workers_response(
         crate::web_gateway::codex_cloud_workers_api_response(refresh, runtime.mcp_server.as_ref())
             .await,
         "codex cloud workers",
+    )
+}
+
+/// Tunnel twin of `POST /api/codex-cloud/submit` — the submit request
+/// (`environment_id`, `prompt`, optional `branch`/`attempts`/`title`)
+/// rides `params` as the same JSON body the HTTP route reads.
+pub(crate) async fn api_codex_cloud_submit_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::codex_cloud_submit_api_response(&body_text).await,
+        "codex cloud submit",
     )
 }
 
