@@ -1078,6 +1078,7 @@ mod tests {
                     session_id: Some(session.to_string()),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 }
             };
             journal.append(&row(occ, &item.id, "sess-fired")).unwrap();
@@ -1168,6 +1169,7 @@ mod tests {
                     session_id: Some(session.to_string()),
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 }
             };
             journal
@@ -3051,6 +3053,7 @@ mod tests {
                     session_id: None,
                     generation: None,
                     boot_id: None,
+                    attempt: None,
                 })
                 .unwrap();
         }
