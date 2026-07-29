@@ -301,4 +301,106 @@ mod tests {
             "the stylesheet lost the ghost window treatment"
         );
     }
+
+    /// The join the original matrix missed (the 2026-07-28 ghost-flag
+    /// incident): a backend resumed across a daemon restart is TWO
+    /// wrapper rows — the dead pre-restart wrapper serves ghost:true
+    /// while the live resume-attached wrapper serves ghost:false, same
+    /// backend_session_id. Per-row truth is correct by construction;
+    /// the fragment pins below keep the SPA's alias fold from letting
+    /// the dead twin overwrite the live twin's card.
+    #[test]
+    fn resumed_across_restart_fixture_pinned() {
+        let root = tempfile::tempdir().unwrap();
+        let dead_dir = session_dir_with_transcript(root.path(), "wrapper-dead");
+        let live_dir = session_dir_with_transcript(root.path(), "wrapper-live");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Both transcripts predate the restart watershed; live-set
+        // membership alone separates the twins.
+        let envelope = joins(Some(now_secs + 3_600), Some(&["wrapper-live"]), None);
+
+        let mut dead = serde_json::json!({ "backend_session_id": "backend-a" });
+        let mut live = serde_json::json!({ "backend_session_id": "backend-a" });
+        envelope.attach(&mut dead, "wrapper-dead", &dead_dir);
+        envelope.attach(&mut live, "wrapper-live", &live_dir);
+
+        assert_eq!(
+            dead["boot"]["ghost"], true,
+            "the pre-restart twin is a ghost"
+        );
+        assert_eq!(dead["boot"]["era"], "preboot");
+        assert_eq!(
+            live["boot"]["ghost"], false,
+            "the resume-attached twin never is"
+        );
+        assert_eq!(live["boot"]["live_wrapper"], true);
+        assert_eq!(live["boot"]["era"], "current");
+        assert_eq!(
+            dead["backend_session_id"], live["backend_session_id"],
+            "both rows alias one backend-keyed card — the fold fight the SPA resolver settles"
+        );
+    }
+
+    /// SPA half of the fixture above: the served boot block is stamped
+    /// with its writing row's identity and the metadata merge routes
+    /// collisions through the resolver, so a dead twin's ghost bit never
+    /// folds across alias ids onto a card a live wrapper backs.
+    #[test]
+    fn ghost_bit_never_folds_across_aliases() {
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        for needle in [
+            // meta build: the writer stamp on the served block
+            "boot: session.boot && typeof session.boot === 'object'\n      ? { ...session.boot, source_session_id: session.session_id }\n      : session.boot,",
+            // normalize: the stamp survives both wire spellings
+            "compactSessionText(raw.source_session_id || raw.sourceSessionId)",
+            // merge: boot collisions resolve before the last-write spread
+            "normalized.boot = resolveSessionWindowBootMeta(previous.boot, normalized.boot);",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "session-windows fragment lost the alias-fold ghost guard: {needle}"
+            );
+        }
+    }
+
+    /// The dominance law, byte-pinned as one unit: a live-wrapper claim
+    /// on a shared card id is replaced only by the same writer's own
+    /// next state or by another live wrapper — never by a dead twin.
+    /// A behavior change must move this pin and the fragment together.
+    #[test]
+    fn live_wrapper_dominates_the_merge() {
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        let resolver = "function resolveSessionWindowBootMeta(previous, incoming) {\n  if (!previous || !incoming) return incoming || previous || null;\n  const sameWriter = !!incoming.sourceSessionId\n    && incoming.sourceSessionId === previous.sourceSessionId;\n  if (previous.liveWrapper && !incoming.liveWrapper && !sameWriter) return previous;\n  return incoming;\n}";
+        assert!(
+            fragment.contains(resolver),
+            "resolveSessionWindowBootMeta drifted from the pinned dominance law"
+        );
+    }
+
+    /// The card's operative state is read from the RESOLVED metadata
+    /// store — the actions fragment's class toggle plus the signature
+    /// segment that lets a writer handoff with identical bits still
+    /// reach that store — so a resumed backend's card shows the live
+    /// wrapper's era and affordances, never the dead lineage's.
+    #[test]
+    fn resumed_backend_card_shows_live_state() {
+        let actions = include_str!("../../../../../static/app/41-session-window-actions.js");
+        for needle in [
+            "const bootEra = (sessionMetadataById.get(sid) || {}).boot;",
+            "win.el.classList.toggle('session-window-ghost', !!(bootEra && bootEra.ghost));",
+        ] {
+            assert!(
+                actions.contains(needle),
+                "the actions fragment stopped reading the resolved boot store: {needle}"
+            );
+        }
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        assert!(
+            fragment.contains("${meta.boot.sourceSessionId || ''}"),
+            "the metadata signature lost the boot writer segment — same-bit writer handoffs would never land in the store"
+        );
+    }
 }

@@ -301,11 +301,23 @@ impl AgendaHandle {
         // rail (attention = tab badge + hidden-tab browser notification)
         // so the owner finds it without watching the agenda tab. The
         // notification is display-only; the reply rides the `answer` op.
+        // The copy classifies the audience — a question an armed
+        // automation already covers (the freshly decorated `watched_by`)
+        // says so instead of claiming the owner is needed; delivery and
+        // urgency stay identical either way (the owner asked to SEE
+        // every parked question — only the classification was wrong).
         if asked {
+            let title = match item.watched_by.as_ref() {
+                Some(watched) => format!(
+                    "Question parked — watched by \u{201c}{}\u{201d}",
+                    truncate(&watched.watcher_title, 120)
+                ),
+                None => "Question parked on the agenda".to_string(),
+            };
             self.bus.send(AppEvent::UserNotification {
                 session_id: None,
                 id: format!("agenda-question-{}", item.id),
-                title: Some("Question parked on the agenda".to_string()),
+                title: Some(title),
                 text: item.title.clone(),
                 urgency: crate::types::NotificationUrgency::Attention,
                 ts: now_ms(),
@@ -803,15 +815,41 @@ impl AgendaHandle {
     }
 
     /// Stamp the display-only planner derivations
-    /// (`effects[].next_fire_ms`, `deferred_until`) onto freshly folded
-    /// item clones, with the clock of this read — the serving seam for
-    /// every client-facing copy (list snapshots, command responses,
-    /// `agenda_changed` broadcasts). Computed by the REAL planner
-    /// functions ([`super::reminders::decorate_planner_fields`]), so
-    /// frontends never reimplement the math. Journal trouble degrades to
+    /// (`effects[].next_fire_ms`, `deferred_until`, `watched_by`) onto
+    /// freshly folded item clones, with the clock of this read — the
+    /// serving seam for every client-facing copy (list snapshots,
+    /// command responses, `agenda_changed` broadcasts). Computed by the
+    /// REAL planner functions
+    /// ([`super::reminders::decorate_planner_fields`]), so frontends
+    /// never reimplement the math. Journal trouble degrades to
     /// undecorated items (absence claims nothing). Never called under
-    /// the store lock — the journal reader has its own.
+    /// the store lock — the journal reader has its own. `items` here is
+    /// the FULL folded set (the list snapshot); a partial slice goes
+    /// through [`Self::decorate_item`], which supplies the full-fold
+    /// context the cross-item derivations need.
     fn decorate_items(&self, items: &mut [AgendaItem]) {
+        self.decorate_in_context(None, items);
+    }
+
+    /// Decorate one item copy (command responses, `agenda_changed`
+    /// broadcasts) against the FULL current fold: the trigger-lane
+    /// derivations read across items (match candidates, dependency
+    /// targets, watcher effects), so a lone item decorated against
+    /// itself under-reports `next_fire_ms` and never carries
+    /// `watched_by`. Sequential locks, never nested: the store lock for
+    /// the context snapshot drops before the journal lock is taken.
+    fn decorate_item(&self, item: &mut AgendaItem) {
+        let context = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before decoration failed: {err}");
+            }
+            store.snapshot()
+        };
+        self.decorate_in_context(Some(&context), std::slice::from_mut(item));
+    }
+
+    fn decorate_in_context(&self, context: Option<&[AgendaItem]>, items: &mut [AgendaItem]) {
         let policy = self.reminder_policy();
         let now_ms = now_ms();
         self.with_journal(|journal| {
@@ -819,6 +857,7 @@ impl AgendaHandle {
                 eprintln!("[agenda] journal refresh for decoration failed: {err}");
             }
             super::reminders::decorate_planner_fields(
+                context,
                 items,
                 journal,
                 &policy,
@@ -826,10 +865,6 @@ impl AgendaHandle {
                 &super::scheduler::local_minute_of_day_at,
             );
         });
-    }
-
-    fn decorate_item(&self, item: &mut AgendaItem) {
-        self.decorate_items(std::slice::from_mut(item));
     }
 
     /// One page of the raw occurrence journal (read-only; the
@@ -2722,6 +2757,268 @@ mod tests {
         let store = AgendaStore::open(dir.path()).unwrap();
         let raw = store.snapshot();
         assert_eq!(raw[0].effects[0].next_fire_ms, None);
+    }
+
+    /// An armed steward-gate style matcher, built through the real ops:
+    /// a watcher item titled `Steward gate` with an approved
+    /// `on_item_match(question + gate)` effect, armed strictly before
+    /// anything parked after it (the 2ms sleep keeps `created_ms >` the
+    /// arm floor on any clock). Returns the watcher's item id.
+    fn armed_gate_watcher(handle: &AgendaHandle) -> String {
+        let watcher = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "Steward gate".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    recurrence: None,
+                    id: watcher.id.clone(),
+                    goal: "rule on gate questions".into(),
+                    fire_at_ms: now_ms() - 60_000,
+                    orchestrate: false,
+                    agent_config: None,
+                    source: None,
+                    trigger: Some(super::super::types::TriggerSpec::OnItemMatch {
+                        item_kind: AgendaKind::Question,
+                        tags: vec!["gate".into()],
+                    }),
+                    project_root: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: watcher.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                actor("dashboard", None),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        watcher.id
+    }
+
+    fn park_question(handle: &AgendaHandle, title: &str, tags: Vec<String>) -> AgendaItem {
+        handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Question,
+                    title: title.into(),
+                    body: String::new(),
+                    tags,
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap()
+    }
+
+    /// watched_by derives at the serving seam: a question an armed
+    /// matcher covers carries the automation's identity on the command
+    /// response and on snapshot reads — while the fold product on disk
+    /// never does (the classification is recomputed per read, never
+    /// stored, exactly like `next_fire_ms`).
+    #[test]
+    fn watched_by_derives_at_the_serving_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            EventBus::new(),
+            dir.path(),
+        );
+        let watcher_id = armed_gate_watcher(&handle);
+        let question = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Question,
+                    title: "Gate: review the landing".into(),
+                    body: String::new(),
+                    tags: vec!["gate".into()],
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        // The command response (a decorated copy) carries the claim…
+        let watched = question.watched_by.as_ref().expect("watched at the seam");
+        assert_eq!(watched.watcher_item_id, watcher_id);
+        assert_eq!(watched.watcher_title, "Steward gate");
+        assert_eq!(
+            watched.due_ms,
+            Some(question.provenance.created_ms + super::super::types::TRIGGER_BATCH_WINDOW_MS),
+            "pickup = the planner's batching-window instant"
+        );
+        // …snapshot reads carry the same derivation…
+        let (items, _, _) = handle.snapshot();
+        let served = items.iter().find(|item| item.id == question.id).unwrap();
+        assert_eq!(served.watched_by, question.watched_by);
+        // …and the fold product itself never does.
+        let raw = AgendaStore::open(dir.path()).unwrap().snapshot();
+        let folded = raw.iter().find(|item| item.id == question.id).unwrap();
+        assert_eq!(folded.watched_by, None, "derived, never stored");
+    }
+
+    /// The parked-question notification names the watching automation
+    /// when one covers the question — and only then: an uncovered
+    /// question keeps the needs-you copy byte-for-byte.
+    #[test]
+    fn watched_copy_names_the_automation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        armed_gate_watcher(&handle);
+        let covered = park_question(&handle, "Gate: sign off HS6", vec!["gate".into()]);
+        let uncovered = park_question(&handle, "Which vendor for the NAS?", Vec::new());
+        let mut titles = std::collections::HashMap::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::UserNotification { id, title, .. } = event {
+                titles.insert(id, title);
+            }
+        }
+        assert_eq!(
+            titles.get(&format!("agenda-question-{}", covered.id)),
+            Some(&Some(
+                "Question parked — watched by \u{201c}Steward gate\u{201d}".to_string()
+            )),
+            "the watched copy names the automation"
+        );
+        assert_eq!(
+            titles.get(&format!("agenda-question-{}", uncovered.id)),
+            Some(&Some("Question parked on the agenda".to_string())),
+            "the unwatched copy stays the legacy needs-you line"
+        );
+    }
+
+    /// Classification changes the COPY, never the delivery: watched and
+    /// unwatched questions both emit the parked-question notification on
+    /// the same id lane at the same Attention urgency — the owner asked
+    /// to see every parked question.
+    #[test]
+    fn notification_delivery_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        armed_gate_watcher(&handle);
+        let covered = park_question(&handle, "Gate: queue entry", vec!["gate".into()]);
+        let uncovered = park_question(&handle, "Pick the offsite week?", Vec::new());
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::UserNotification {
+                id, text, urgency, ..
+            } = event
+            {
+                assert!(
+                    matches!(urgency, crate::types::NotificationUrgency::Attention),
+                    "same urgency on every parked-question notification"
+                );
+                seen.push((id, text));
+            }
+        }
+        let expected = [
+            (
+                format!("agenda-question-{}", covered.id),
+                covered.title.clone(),
+            ),
+            (
+                format!("agenda-question-{}", uncovered.id),
+                uncovered.title.clone(),
+            ),
+        ];
+        for (id, text) in expected {
+            assert!(
+                seen.contains(&(id.clone(), text)),
+                "notification {id} delivered regardless of classification"
+            );
+        }
+    }
+
+    /// Broadcast copies carry full decorations: a single-item
+    /// `agenda_changed` copy is decorated against the whole fold, so a
+    /// watcher's copy reports the trigger-lane `next_fire_ms` and a
+    /// watched question's copy carries `watched_by` — neither of which a
+    /// single-item universe could derive (the pre-fix starvation left
+    /// broadcast copies degraded until the next full-list read).
+    #[test]
+    fn broadcast_copies_carry_full_decorations() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let watcher_id = armed_gate_watcher(&handle);
+        let question = park_question(&handle, "Gate: soak the queue", vec!["gate".into()]);
+        let due = question.watched_by.as_ref().and_then(|w| w.due_ms);
+        assert!(due.is_some(), "fixture: the question is covered");
+
+        // An op touching the WATCHER broadcasts a singleton copy that
+        // still sees its match candidates.
+        let mut rx = handle.bus().subscribe();
+        let watcher = handle
+            .apply(
+                AgendaCommand::Annotate {
+                    id: watcher_id,
+                    text: "steward pass noted".into(),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            watcher.effects[0].next_fire_ms, due,
+            "the watcher's singleton copy carries the trigger-lane fire instant"
+        );
+        // An op touching the QUESTION broadcasts a copy that still knows
+        // its watcher.
+        let question = handle
+            .apply(
+                AgendaCommand::Annotate {
+                    id: question.id.clone(),
+                    text: "context added".into(),
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let watched = question
+            .watched_by
+            .as_ref()
+            .expect("the question's singleton copy carries watched_by");
+        assert_eq!(watched.watcher_title, "Steward gate");
+        // And the broadcast events carry the same decorated copies.
+        let mut broadcast_fire = None;
+        let mut broadcast_watched = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::AgendaChanged { item, .. } = event {
+                if item.id == question.id {
+                    broadcast_watched = item.watched_by.clone();
+                } else {
+                    broadcast_fire = item.effects[0].next_fire_ms;
+                }
+            }
+        }
+        assert_eq!(broadcast_fire, due);
+        assert_eq!(
+            broadcast_watched.map(|watched| watched.watcher_title),
+            Some("Steward gate".to_string())
+        );
     }
 
     /// The occurrence-journal read surface converges on scheduler writes:

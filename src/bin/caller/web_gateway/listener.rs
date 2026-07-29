@@ -1298,7 +1298,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                                 .await;
                                 crate::types::OutboundEvent::PeerEventForwarded {
                                     peer_id: peer.as_str().to_string(),
-                                    payload: rewritten_event,
+                                    payload: Box::new(rewritten_event),
                                 }
                             }
                         };

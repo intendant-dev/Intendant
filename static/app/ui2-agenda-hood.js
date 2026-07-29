@@ -481,7 +481,7 @@ function agendaHoodFooterHtml(item) {
 // the served DTO minus visual noise, pretty-printed. The label below the
 // pre names the truth precisely — the served item is the fold product
 // PLUS the planner's display-only decorations (next_fire_ms,
-// deferred_until), so "pure fold product" would be false.
+// deferred_until, watched_by), so "pure fold product" would be false.
 function agendaHoodStripRaw(value) {
   return JSON.parse(JSON.stringify(value, (key, v) =>
     (v === null || (Array.isArray(v) && !v.length) ? undefined : v)));
@@ -496,7 +496,7 @@ function agendaRawSheetHtml(item) {
     </div>
     <div class="ag2-sheet-item">${escapeHtml(`${item.id.slice(0, 6).toLowerCase()} · ${item.title}`)}</div>
     <pre class="ag2-sheet-raw">${escapeHtml(pretty)}</pre>
-    <div class="ag2-hood-footnote">Exactly what GET /api/agenda serves — the fold product of agenda.jsonl plus the planner’s display-only decorations (next_fire_ms, deferred_until). Nothing here is stored state beyond the ops.</div>`;
+    <div class="ag2-hood-footnote">Exactly what GET /api/agenda serves — the fold product of agenda.jsonl plus the planner’s display-only decorations (next_fire_ms, deferred_until, watched_by). Nothing here is stored state beyond the ops.</div>`;
 }
 
 // ---- Ledger footer ops count ----

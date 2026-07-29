@@ -568,7 +568,7 @@ pub struct AgendaEffect {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) requested: Vec<AgendaRequestedRun>,
     /// Display-only planner derivation: the next instant this effect
-    /// would actually fire ([`super::reminders::effect_next_fire_ms`] —
+    /// would actually fire ([`super::reminders::effect_planner_view`] —
     /// the real planner math, so frontends never reimplement it), or
     /// `None` when nothing will fire (unapproved, suspended, spent,
     /// exhausted). Decorated at the serving seam
@@ -732,6 +732,40 @@ pub struct AgendaItem {
     /// never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) deferred_until: Option<u64>,
+    /// Display-only planner derivation: the automation currently covering
+    /// this open item — an inversion of the matches the planner's own
+    /// trigger derivation reports ([`super::reminders::trigger_due`]), so
+    /// "needs you" surfaces can subtract what machinery already watches.
+    /// Claimed only while the watcher can deliver: the effect armed and
+    /// not suspended, or the consuming occurrence still running. `None`
+    /// is the needs-you complement — no healthy automation covers this
+    /// item, only the owner can. Decorated at the serving seam
+    /// ([`super::AgendaHandle`]) with the clock of the read; always
+    /// `None` in the fold product, never folded from ops, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) watched_by: Option<AgendaWatchedBy>,
+}
+
+/// The automation claiming an open item (the `watched_by` decoration):
+/// which watcher item, which effect, and when it picks the item up.
+/// Derived at the serving seam, never authored at park time — a static
+/// audience stamp would misroute self-excluded parks (an item parked by
+/// the mandate's own executor session never re-fires it) and could not
+/// follow watcher health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaWatchedBy {
+    /// The agenda item carrying the watching effect.
+    pub(crate) watcher_item_id: String,
+    /// That item's title — the human name surfaces render ("watched by
+    /// <title>"). Item-authored text: render quoted, like every title.
+    pub(crate) watcher_title: String,
+    /// The watching effect (stable across re-proposes).
+    pub(crate) effect_id: String,
+    /// The planner's fire instant over this item (batching window +
+    /// floors — [`super::reminders::TriggerDue::due_ms`]). `None` when
+    /// the claim comes from a consuming occurrence already running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) due_ms: Option<u64>,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -1703,6 +1737,7 @@ pub(crate) fn apply_op(
                     part_of: None,
                     relates_to: Vec::new(),
                     deferred_until: None,
+                    watched_by: None,
                 },
             );
             None

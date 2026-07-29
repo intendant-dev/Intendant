@@ -570,18 +570,31 @@ window while the daemon is down, or is interrupted before launch
 confirmation, fails closed and is not automatically retried. The outcome is
 written back to `effects[].last_run`.
 
-Two display-only fields ride the served item DTO so frontends never
-reimplement planner math — both computed at read time by the planner's own
+Three display-only fields ride the served item DTO so frontends never
+reimplement planner math — each computed at read time by the planner's own
 functions, never stored, never folded from operations. `effects[].next_fire_ms`
 is the next instant the effect would actually fire (approval-gated,
 suspension-aware, journal-deduped, series bounds respected; absent when
 nothing will fire). `deferred_until` is the instant a quiet-hours-deferred
 reminder would actually deliver (window end, midnight-spanning windows
 included; absent when nothing defers — including reminders disabled, where
-inventing a value would claim a delivery that never comes). They are stamped
-at the serving seam — list snapshots, command responses, `agenda_changed`
-broadcasts, the MCP tool — with the clock of that read, and are absent from
-the wire when unset, so the payload stays additive for older clients.
+inventing a value would claim a delivery that never comes). `watched_by` is
+the audience classification: the automation whose armed, healthy
+`on_item_match` trigger currently covers this open item (inverted from the
+same trigger derivation that powers `next_fire_ms`), or — for an item a
+firing already consumed — the automation whose occurrence is still running.
+Absent means needs-you: no machinery covers the item, only the owner can
+handle it. A sick watcher (suspended, approval voided, its firing crashed or
+abandoned, or completed without resolving the item) drops the claim, so the
+item re-joins the needs-you complement on the next read. The parked-question
+notification, the Agenda tab's Needs-you lens and badge, and the watched
+chip all branch on it; delivery and urgency never change — only the
+classification. All three are stamped at the serving seam — list snapshots,
+command responses, `agenda_changed` broadcasts, the MCP tool — with the
+clock of that read (single-item broadcast copies are decorated against the
+full fold, so they carry the same cross-item derivations as snapshots), and
+are absent from the wire when unset, so the payload stays additive for older
+clients.
 
 The scheduler observes dispatch receipts and completion events through the
 bounded broadcast EventBus. A lagged receiver is logged but not reconciled
