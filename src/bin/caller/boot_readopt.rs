@@ -516,6 +516,15 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// What the verification pass recorded for the boot summary: only
+/// `confirmed` counts as readopted; `died` names each dispatch whose
+/// continuation did not survive, with its reason.
+#[derive(Debug, Default)]
+pub(crate) struct VerifiedOutcomes {
+    pub(crate) confirmed: Vec<(String, MidWorkClass)>,
+    pub(crate) died: Vec<(String, String)>,
+}
+
 /// Outcome verification for the dispatched resumes: a dispatch is
 /// CONFIRMED once any wrapper in the candidate's lineage is live at
 /// verification time — the fresh continuation admits itself onto the
@@ -528,12 +537,11 @@ pub(crate) fn verify_dispatches(
     home: &Path,
     dispatched: &[ReadoptDispatch],
     live: Option<&HashSet<String>>,
-) -> (Vec<(String, MidWorkClass)>, Vec<(String, String)>) {
-    let mut confirmed = Vec::new();
-    let mut died = Vec::new();
+) -> VerifiedOutcomes {
+    let mut outcomes = VerifiedOutcomes::default();
     for dispatch in dispatched {
         let Some(live) = live else {
-            died.push((
+            outcomes.died.push((
                 dispatch.session_id.clone(),
                 "resume dispatched, but liveness could not be verified (registry unavailable)"
                     .to_string(),
@@ -549,9 +557,11 @@ pub(crate) fn verify_dispatches(
             .iter()
             .any(|record| live.contains(&record.intendant_session_id))
         {
-            confirmed.push((dispatch.session_id.clone(), dispatch.class));
+            outcomes
+                .confirmed
+                .push((dispatch.session_id.clone(), dispatch.class));
         } else {
-            died.push((
+            outcomes.died.push((
                 dispatch.session_id.clone(),
                 format!(
                     "resume dispatched, but no live continuation within {}s",
@@ -560,7 +570,7 @@ pub(crate) fn verify_dispatches(
             ));
         }
     }
-    (confirmed, died)
+    outcomes
 }
 
 /// The visible summary: one notification per boot with candidates, id
@@ -609,10 +619,7 @@ pub(crate) fn summary_notification(
         }
         lines.push(format!("Left as they were: {detail}."));
     }
-    let mut title = format!(
-        "Crash recovery: {} session(s) readopted",
-        confirmed.len()
-    );
+    let mut title = format!("Crash recovery: {} session(s) readopted", confirmed.len());
     if !died.is_empty() {
         title.push_str(&format!(", {} resume(s) died", died.len()));
     }
@@ -1104,9 +1111,9 @@ mod tests {
                 }
                 other => panic!("expected ResumeSession, got {other:?}"),
             },
-            other => panic!(
-                "a dead mid-work continuation leaves the lineage re-eligible, got {other:?}"
-            ),
+            other => {
+                panic!("a dead mid-work continuation leaves the lineage re-eligible, got {other:?}")
+            }
         }
 
         // The same tip, live: the automatic lane never doubles it.
@@ -1193,32 +1200,35 @@ mod tests {
         }];
 
         let live: HashSet<String> = ["wrapper-fresh".to_string()].into_iter().collect();
-        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, Some(&live));
+        let outcomes = verify_dispatches(home.path(), &dispatched, Some(&live));
         assert_eq!(
-            confirmed,
+            outcomes.confirmed,
             vec![("wrapper-dead".to_string(), MidWorkClass::MidTurn)],
             "a live continuation confirms the dispatch"
         );
-        assert!(died.is_empty());
+        assert!(outcomes.died.is_empty());
 
-        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, Some(&HashSet::new()));
+        let outcomes = verify_dispatches(home.path(), &dispatched, Some(&HashSet::new()));
         assert!(
-            confirmed.is_empty(),
+            outcomes.confirmed.is_empty(),
             "a resume that died is never recorded as a readopt"
         );
-        assert_eq!(died.len(), 1);
+        assert_eq!(outcomes.died.len(), 1);
         assert!(
-            died[0].1.contains("no live continuation"),
+            outcomes.died[0].1.contains("no live continuation"),
             "the reclassification names the cause: {}",
-            died[0].1
+            outcomes.died[0].1
         );
 
-        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, None);
-        assert!(confirmed.is_empty(), "an unreadable registry never confirms");
+        let outcomes = verify_dispatches(home.path(), &dispatched, None);
         assert!(
-            died[0].1.contains("could not be verified"),
+            outcomes.confirmed.is_empty(),
+            "an unreadable registry never confirms"
+        );
+        assert!(
+            outcomes.died[0].1.contains("could not be verified"),
             "the unverifiable case is honest about itself: {}",
-            died[0].1
+            outcomes.died[0].1
         );
     }
 
@@ -1427,26 +1437,29 @@ pub(crate) async fn run_boot_readopt_pass(
     // Dispatches are not outcomes: hold the summary until the resumes have
     // had the verify window to spawn, register, and stay up, then record
     // what actually happened to each.
-    let (confirmed, died) = if dispatched.is_empty() {
-        (Vec::new(), Vec::new())
+    let outcomes = if dispatched.is_empty() {
+        VerifiedOutcomes::default()
     } else {
         tokio::time::sleep(READOPT_VERIFY_WINDOW).await;
         let live_now = fetch_live_wrapper_ids_with_retry().await;
-        let (confirmed, died) = verify_dispatches(&home, &dispatched, live_now.as_ref());
-        for (id, _) in &confirmed {
+        let outcomes = verify_dispatches(&home, &dispatched, live_now.as_ref());
+        for (id, _) in &outcomes.confirmed {
             eprintln!(
                 "[readopt] confirmed {} alive after the verify window",
                 short_id(id)
             );
         }
-        for (id, reason) in &died {
+        for (id, reason) in &outcomes.died {
             eprintln!("[readopt] reclassifying {}: {reason}", short_id(id));
         }
-        (confirmed, died)
+        outcomes
     };
-    if let Some(notification) =
-        summary_notification(handover.boot_id(), &confirmed, &died, &left_dead)
-    {
+    if let Some(notification) = summary_notification(
+        handover.boot_id(),
+        &outcomes.confirmed,
+        &outcomes.died,
+        &left_dead,
+    ) {
         bus.send(notification);
     }
 }

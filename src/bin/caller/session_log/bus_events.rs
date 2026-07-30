@@ -2747,10 +2747,9 @@ mod tests {
         let mut clean = SessionLog::open(clean_dir.clone()).unwrap();
         clean.write_meta(Some(Path::new("/tmp")), Some("task"));
         clean.write_summary("task", "completed", 3);
-        let meta: SessionMeta = serde_json::from_str(
-            &fs::read_to_string(clean_dir.join("session_meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(clean_dir.join("session_meta.json")).unwrap())
+                .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
     }
 
