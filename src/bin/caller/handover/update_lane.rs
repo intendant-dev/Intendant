@@ -222,10 +222,12 @@ pub(crate) fn fold_source_check(
             rev_parse_tip.trim().chars().take(120).collect::<String>()
         ));
     }
-    let behind: u32 = rev_list_count
-        .trim()
-        .parse()
-        .map_err(|_| format!("unparseable behind-count from git: {:?}", rev_list_count.trim()))?;
+    let behind: u32 = rev_list_count.trim().parse().map_err(|_| {
+        format!(
+            "unparseable behind-count from git: {:?}",
+            rev_list_count.trim()
+        )
+    })?;
     Ok(SourceCheck {
         tip_sha,
         behind,
@@ -379,10 +381,13 @@ pub(crate) fn bundle_arch(rust_arch: &str) -> &'static str {
 pub(crate) fn select_release_asset<'a>(
     artifacts: &'a [crate::hosted_verify::ReleaseArtifactPlan],
     arch: &str,
-) -> Result<(
-    &'a crate::hosted_verify::ReleaseArtifactPlan,
-    &'a crate::hosted_verify::ReleaseArtifactPlan,
-), String> {
+) -> Result<
+    (
+        &'a crate::hosted_verify::ReleaseArtifactPlan,
+        &'a crate::hosted_verify::ReleaseArtifactPlan,
+    ),
+    String,
+> {
     let suffix = format!("-macos-{arch}.zip");
     let zip = artifacts
         .iter()
@@ -405,7 +410,11 @@ pub(crate) fn select_release_asset<'a>(
 
 /// Fail-closed download verdict: the bytes on disk must hash to exactly
 /// what the transparency log committed.
-pub(crate) fn download_verdict(name: &str, logged_sha: &str, actual_sha: &str) -> Result<(), String> {
+pub(crate) fn download_verdict(
+    name: &str,
+    logged_sha: &str,
+    actual_sha: &str,
+) -> Result<(), String> {
     if logged_sha == actual_sha {
         Ok(())
     } else {
@@ -429,7 +438,9 @@ pub(crate) fn gpg_verify_verdict(
     pinned_primary_fingerprint: &str,
 ) -> Result<(), String> {
     if !exit_ok {
-        return Err("gpg --verify failed — the artifact's signature does not check out".to_string());
+        return Err(
+            "gpg --verify failed — the artifact's signature does not check out".to_string(),
+        );
     }
     let valid = status_out.lines().any(|line| {
         let mut fields = line.split_whitespace();
@@ -463,7 +474,12 @@ const CHILD_ENV_BASE: &[&str] = &[
 /// Extra names for build/bundle children (toolchain discovery). No
 /// `CARGO_TARGET_DIR`: the artifact must land at the checkout's own
 /// `target/release` — the path the update watch watches.
-const CHILD_ENV_BUILD: &[&str] = &["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", "DEVELOPER_DIR"];
+const CHILD_ENV_BUILD: &[&str] = &[
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "DEVELOPER_DIR",
+];
 
 /// Extra names for git children: the owner's click authorizes exactly a
 /// pull from origin, so the agent socket (ssh remotes) and HOME-based
@@ -476,7 +492,11 @@ fn curated_env(extra: &[&str]) -> Vec<(String, String)> {
     CHILD_ENV_BASE
         .iter()
         .chain(extra.iter())
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_string(), value)))
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
         .collect()
 }
 
@@ -548,7 +568,10 @@ impl UpdateLane {
         });
         let obj = block.as_object_mut().expect("literal object");
         match &self.flavor {
-            InstallFlavor::Source { repo_root, app_bundle } => {
+            InstallFlavor::Source {
+                repo_root,
+                app_bundle,
+            } => {
                 obj.insert("repo_root".into(), repo_root.display().to_string().into());
                 obj.insert("app_bundle".into(), (*app_bundle).into());
             }
@@ -580,7 +603,11 @@ impl UpdateLane {
                     check_obj.insert("behind_capped".into(), source.behind_capped.into());
                     check_obj.insert("dirty".into(), source.dirty.into());
                 }
-                Some(Ok(CheckOutcome::Consumer { tag, version, newer })) => {
+                Some(Ok(CheckOutcome::Consumer {
+                    tag,
+                    version,
+                    newer,
+                })) => {
                     check_obj.insert("latest_tag".into(), tag.clone().into());
                     check_obj.insert("latest_version".into(), version.clone().into());
                     match newer {
@@ -833,9 +860,10 @@ impl UpdateLane {
         let lane = Arc::clone(self);
         tokio::spawn(async move {
             let outcome = match lane.flavor.clone() {
-                InstallFlavor::Source { repo_root, app_bundle } => {
-                    lane.produce_source(&repo_root, app_bundle).await
-                }
+                InstallFlavor::Source {
+                    repo_root,
+                    app_bundle,
+                } => lane.produce_source(&repo_root, app_bundle).await,
                 InstallFlavor::ConsumerApp { app_root } => lane.produce_consumer(&app_root).await,
                 InstallFlavor::Unmanaged { .. } => unreachable!("refused above"),
             };
@@ -848,9 +876,10 @@ impl UpdateLane {
 
     async fn run_check(self: &Arc<Self>) -> Result<CheckOutcome, String> {
         match self.flavor.clone() {
-            InstallFlavor::Source { repo_root, .. } => {
-                self.source_check(&repo_root).await.map(CheckOutcome::Source)
-            }
+            InstallFlavor::Source { repo_root, .. } => self
+                .source_check(&repo_root)
+                .await
+                .map(CheckOutcome::Source),
             InstallFlavor::ConsumerApp { .. } => self.consumer_check().await,
             InstallFlavor::Unmanaged { reason } => Err(reason),
         }
@@ -878,9 +907,7 @@ impl UpdateLane {
                      {running_sha} in this checkout's history?): {err}"
                 )
             })?;
-        let status = self
-            .git(repo_root, &["status", "--porcelain"])
-            .await?;
+        let status = self.git(repo_root, &["status", "--porcelain"]).await?;
         fold_source_check(&tip, &count, &status)
     }
 
@@ -934,7 +961,10 @@ impl UpdateLane {
             crate::hosted_verify::VerifyFailure::Unavailable(detail) => {
                 format!("release check unavailable: {detail}")
             }
-            crate::hosted_verify::VerifyFailure::Verification { summary, mismatches } => {
+            crate::hosted_verify::VerifyFailure::Verification {
+                summary,
+                mismatches,
+            } => {
                 format!(
                     "release verification FAILED: {summary}{}",
                     if mismatches.is_empty() {
@@ -1016,10 +1046,17 @@ impl UpdateLane {
                 self.run_child(
                     "build",
                     "cargo",
-                    ["build", "--release", "--bin", "intendant", "--bin", "intendant-runtime"]
-                        .iter()
-                        .map(|arg| arg.to_string())
-                        .collect(),
+                    [
+                        "build",
+                        "--release",
+                        "--bin",
+                        "intendant",
+                        "--bin",
+                        "intendant-runtime",
+                    ]
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect(),
                     Some(repo_root),
                     CHILD_ENV_BUILD,
                     BUILD_TIMEOUT,
@@ -1050,8 +1087,9 @@ impl UpdateLane {
     async fn produce_consumer(self: &Arc<Self>, app_root: &Path) -> Result<String, String> {
         self.set_phase("verify-manifest");
         let report = self.verified_release(None).await?;
-        let (zip, asc) = select_release_asset(&report.artifacts, bundle_arch(std::env::consts::ARCH))
-            .map(|(zip, asc)| (zip.clone(), asc.clone()))?;
+        let (zip, asc) =
+            select_release_asset(&report.artifacts, bundle_arch(std::env::consts::ARCH))
+                .map(|(zip, asc)| (zip.clone(), asc.clone()))?;
         self.job_log(format!(
             "release {} verified against the transparency log ({} artifacts; signing key {})",
             report.tag, report.artifact_count, report.pgp_fingerprint
@@ -1263,7 +1301,10 @@ fn install_app_swap(new_app: &Path, app_root: &Path) -> Result<(), String> {
             .status()
             .map_err(|err| format!("ditto copy into {}: {err}", parent.display()))?;
         if !status.success() {
-            return Err(format!("ditto copy into {} exited {status}", parent.display()));
+            return Err(format!(
+                "ditto copy into {} exited {status}",
+                parent.display()
+            ));
         }
     }
     let _ = std::fs::remove_dir_all(&previous);
@@ -1477,8 +1518,8 @@ mod tests {
     #[test]
     fn download_verdict_fails_closed_on_hash_mismatch() {
         assert!(download_verdict("a.zip", "aabbcc", "aabbcc").is_ok());
-        let err = download_verdict("a.zip", "aabbccddeeff00112233", "deadbeefdeadbeefdead")
-            .unwrap_err();
+        let err =
+            download_verdict("a.zip", "aabbccddeeff00112233", "deadbeefdeadbeefdead").unwrap_err();
         assert!(err.contains("refusing to install"));
         assert!(err.contains("a.zip"));
     }
@@ -1564,13 +1605,21 @@ mod tests {
         // No stamp: a consumer install.
         assert_eq!(
             detect_install_flavor(&exe),
-            InstallFlavor::ConsumerApp { app_root: app.clone() }
+            InstallFlavor::ConsumerApp {
+                app_root: app.clone()
+            }
         );
 
         // A valid stamp names the checkout: the source lane, app shape.
-        touch(&app.join("Contents").join("Resources").join(SOURCE_STAMP_RESOURCE));
+        touch(
+            &app.join("Contents")
+                .join("Resources")
+                .join(SOURCE_STAMP_RESOURCE),
+        );
         std::fs::write(
-            app.join("Contents").join("Resources").join(SOURCE_STAMP_RESOURCE),
+            app.join("Contents")
+                .join("Resources")
+                .join(SOURCE_STAMP_RESOURCE),
             format!("{}\n", repo.display()),
         )
         .unwrap();
@@ -1585,13 +1634,17 @@ mod tests {
         // A stamp whose path is gone (a release app carrying its CI
         // runner's checkout) falls down to the consumer lane.
         std::fs::write(
-            app.join("Contents").join("Resources").join(SOURCE_STAMP_RESOURCE),
+            app.join("Contents")
+                .join("Resources")
+                .join(SOURCE_STAMP_RESOURCE),
             "/nonexistent/ci/checkout\n",
         )
         .unwrap();
         assert_eq!(
             detect_install_flavor(&exe),
-            InstallFlavor::ConsumerApp { app_root: app.clone() }
+            InstallFlavor::ConsumerApp {
+                app_root: app.clone()
+            }
         );
 
         let stray = dir.path().join("bin").join("intendant");
@@ -1662,7 +1715,11 @@ mod tests {
         touch(&new_app.join("Contents").join("MacOS").join("new-marker"));
 
         install_app_swap(&new_app, &app).expect("swap succeeds");
-        assert!(app.join("Contents").join("MacOS").join("new-marker").is_file());
+        assert!(app
+            .join("Contents")
+            .join("MacOS")
+            .join("new-marker")
+            .is_file());
         assert!(parent
             .join("Intendant.app.previous")
             .join("Contents")

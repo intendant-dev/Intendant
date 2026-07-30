@@ -7142,8 +7142,11 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     );
     std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").expect("seed Cargo.toml");
     std::fs::create_dir_all(checkout.join("scripts")).expect("seed scripts dir");
-    std::fs::write(checkout.join("scripts").join("bundle-macos.sh"), "#!/bin/bash\n")
-        .expect("seed bundle script");
+    std::fs::write(
+        checkout.join("scripts").join("bundle-macos.sh"),
+        "#!/bin/bash\n",
+    )
+    .expect("seed bundle script");
     fixture_git(&checkout, &["add", "."]);
     fixture_git(&checkout, &["commit", "-m", "commit A"]);
     fixture_git(&checkout, &["push", "origin", "main"]);
@@ -7306,6 +7309,10 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     )
     .await;
     // Zero kills: the same boot answers, undrained, end to end.
-    assert_eq!(body["boot_id"], boot_id.as_str(), "same daemon boot: {body}");
+    assert_eq!(
+        body["boot_id"],
+        boot_id.as_str(),
+        "same daemon boot: {body}"
+    );
     assert_eq!(body["draining"], false);
 }

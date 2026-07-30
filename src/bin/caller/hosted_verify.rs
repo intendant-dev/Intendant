@@ -4617,13 +4617,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("asset.zip");
-        let sha = download_release_asset_to_file(
-            &format!("http://{addr}/asset.zip"),
-            &dest,
-            1024,
-        )
-        .await
-        .expect("download succeeds");
+        let sha = download_release_asset_to_file(&format!("http://{addr}/asset.zip"), &dest, 1024)
+            .await
+            .expect("download succeeds");
         assert_eq!(sha, sha256_hex(payload), "digest is of the written bytes");
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
 
