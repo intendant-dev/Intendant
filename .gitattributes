@@ -14,6 +14,11 @@ static/app/** -text diff
 # and parity-tested against the served bytes — eol conversion would change
 # the hash per platform (and churn the regenerated pin on autocrlf runners).
 static/vault-kernel.js -text diff
+# The release signing public key is include_str!-embedded (caller
+# pgp_identity.rs) and published byte-identical as a release asset; eol
+# conversion on autocrlf runners would fork the embedded bytes from the
+# committed ones and break the served-key byte-identity check.
+RELEASE-SIGNING-KEY.asc -text
 # The owner-plane D0-A corpus is vendored byte-exact from the stamped
 # asset (owner-plane-d0a @ 583f421a): the reducer's conformance suite
 # pins the spec's SHA-256 (`vendored_spec_bytes_match_the_stamp`) and
