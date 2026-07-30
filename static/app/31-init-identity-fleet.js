@@ -1149,6 +1149,7 @@ const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
   'stop_session',
   'restart_session',
   'reload_credentials',
+  'reload_credentials_all',
   'create_session',
   'start_task',
   'resume_session',

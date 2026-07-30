@@ -651,6 +651,11 @@ html.ui-v2 #agent-signin-section .vault-status-line > .vault-chip.warn {
   border-color: rgba(var(--amber-rgb), .26);
   color: var(--amber);
 }
+html.ui-v2 #agent-signin-section .vault-status-line .vault-entry-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
 html.ui-v2 #agent-signin-section .vault-entry-list { gap: 10px; }
 html.ui-v2 #agent-signin-section .vault-entry-row {
   gap: 10px;
@@ -681,6 +686,14 @@ html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip {
 html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.ok {
   background: rgba(var(--green-rgb), .12);
   color: var(--green);
+}
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.err {
+  background: rgba(var(--rose-rgb), .12);
+  color: var(--red);
 }
 html.ui-v2 #agent-signin-section .vault-entry-row .vault-entry-actions {
   margin-left: auto;
