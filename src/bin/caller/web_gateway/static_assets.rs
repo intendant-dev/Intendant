@@ -1672,5 +1672,17 @@ mod tests {
         // Regeneration legibility rides the same surfaces: the run line
         // names the bounded auto-retry.
         assert!(APP_HTML.contains("attempt ${e.last_run_attempt} (auto-retry)"));
+        // The session grid's chip obeys the same law (Track AO §2.8):
+        // the ◆/◇ family marks the self-report axis, and the
+        // safe-to-stop copy claims only what the machine knows.
+        assert!(APP_HTML.contains("`◆ self-reported: ${v.outcome}` : '◇ no self-report'"));
+        assert!(
+            APP_HTML.contains("Stopping kills a live agenda run — the occurrence records failed")
+        );
+        assert!(
+            APP_HTML.contains("stopping it kills that agenda run (the occurrence records failed)")
+        );
+        assert!(APP_HTML
+            .contains("Idle · no agenda-owed work — stopping loses only this session’s context"));
     }
 }

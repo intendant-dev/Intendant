@@ -85,17 +85,56 @@ impl GridEnvelopeJoins {
             .as_ref()
             .and_then(|envelopes| envelopes.get(session_id))
         {
+            // Safe-to-stop, the ruled Track AO conjunction, fail-closed
+            // from the durable journal facts alone (process state can
+            // never talk the debt away): the lineage TIP of a
+            // started-without-terminal occurrence is a live firing —
+            // stopping it kills the run (the owner-stop decree records
+            // it failed); a superseded member of one is still owed
+            // work; a terminaled occurrence is settled — and "settled"
+            // is a claim about AGENDA debt only, displayed beside the
+            // attestation so "safe" and "done well" never merge.
+            let stop = match (envelope.occurrence_state, envelope.lineage_role) {
+                (
+                    crate::agenda::OccurrenceState::Started,
+                    crate::agenda::SessionLineageRole::Tip,
+                ) => "kills_live_run",
+                (
+                    crate::agenda::OccurrenceState::Started,
+                    crate::agenda::SessionLineageRole::Superseded,
+                ) => "owed_work",
+                _ => "settled",
+            };
             let mut block = serde_json::json!({
                 "item_id": envelope.item_id,
                 // The occurrence rides as an object so Track AO's
-                // attestation can land beside `state` without reshaping
+                // attestation lands beside `state` without reshaping
                 // the wire.
                 "occurrence": {
                     "id": envelope.occurrence_id,
                     "state": serde_json::to_value(envelope.occurrence_state)
                         .unwrap_or(serde_json::Value::Null),
+                    "lineage_role": envelope.lineage_role.as_str(),
+                    "stop": stop,
                 },
             });
+            if let Some(attempt) = envelope.attempt {
+                block["occurrence"]["attempt"] = serde_json::json!(attempt);
+            }
+            if let Some(attestation) = envelope.attestation.as_ref() {
+                // SELF-REPORT (the Q8 labeling law rides the SPA copy):
+                // outcome + note + when — refs stay on the agenda
+                // surfaces; the chip is a pointer to them.
+                let mut att = serde_json::json!({
+                    "outcome": serde_json::to_value(attestation.outcome)
+                        .unwrap_or(serde_json::Value::Null),
+                    "at_ms": attestation.at_ms,
+                });
+                if let Some(note) = attestation.note.as_ref() {
+                    att["note"] = serde_json::Value::String(note.clone());
+                }
+                block["occurrence"]["attestation"] = att;
+            }
             if let Some(title) = envelope.item_title.as_ref() {
                 block["item_title"] = serde_json::Value::String(title.clone());
             }
@@ -235,21 +274,36 @@ mod tests {
         assert!(row.get("boot").is_none());
     }
 
+    fn envelope(
+        state: crate::agenda::OccurrenceState,
+        lineage_role: crate::agenda::SessionLineageRole,
+    ) -> crate::agenda::SessionAgendaEnvelope {
+        crate::agenda::SessionAgendaEnvelope {
+            item_id: "01ITEM".into(),
+            item_title: Some("the source".into()),
+            occurrence_id: "occ-1".into(),
+            occurrence_state: state,
+            lineage_role,
+            attempt: None,
+            attestation: None,
+            sealed_inputs: Vec::new(),
+        }
+    }
+
     /// The agenda block's wire shape: id chip + extensible occurrence
     /// object + title + sealed inputs; linkless sessions get no block.
     #[test]
     fn agenda_block_rides_the_row() {
         let root = tempfile::tempdir().unwrap();
         let dir = session_dir_with_transcript(root.path(), "s1");
-        let envelope = crate::agenda::SessionAgendaEnvelope {
-            item_id: "01ITEM".into(),
-            item_title: Some("the source".into()),
-            occurrence_id: "occ-1".into(),
-            occurrence_state: crate::agenda::OccurrenceState::Started,
-            sealed_inputs: Vec::new(),
-        };
         let mut envelopes = HashMap::new();
-        envelopes.insert("s1".to_string(), envelope);
+        envelopes.insert(
+            "s1".to_string(),
+            envelope(
+                crate::agenda::OccurrenceState::Started,
+                crate::agenda::SessionLineageRole::Tip,
+            ),
+        );
         let mut row = serde_json::json!({});
         joins(None, None, Some(envelopes)).attach(&mut row, "s1", &dir);
         assert_eq!(row["agenda"]["item_id"], "01ITEM");
@@ -263,6 +317,133 @@ mod tests {
 
         let mut row = serde_json::json!({});
         joins(None, None, Some(HashMap::new())).attach(&mut row, "s2", &dir);
+        assert!(row.get("agenda").is_none());
+    }
+
+    /// Track AO pin `grid_agenda_block_is_serving_seam_derived`: the
+    /// block is rebuilt from the per-read joins set on every attach —
+    /// nothing is stored on the row between builds, a session absent
+    /// from the derivation gets NO block (absence claims nothing), and
+    /// the Track AO fields (lineage role, the served stop derivation,
+    /// the regeneration ordinal, the self-report) ride the occurrence
+    /// object exactly as derived.
+    #[test]
+    fn grid_agenda_block_is_serving_seam_derived() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = session_dir_with_transcript(root.path(), "s1");
+        let mut env = envelope(
+            crate::agenda::OccurrenceState::Started,
+            crate::agenda::SessionLineageRole::Tip,
+        );
+        env.attempt = Some(2);
+        env.attestation = Some(crate::agenda::AgendaAttestation {
+            outcome: crate::agenda::AttestationOutcome::Partial,
+            note: Some("halfway".into()),
+            refs: Vec::new(),
+            at_ms: 9_000,
+            session_id: Some("s1".into()),
+        });
+        let mut envelopes = HashMap::new();
+        envelopes.insert("s1".to_string(), env);
+        let joins_set = joins(None, None, Some(envelopes));
+        let mut row = serde_json::json!({});
+        joins_set.attach(&mut row, "s1", &dir);
+        assert_eq!(row["agenda"]["occurrence"]["lineage_role"], "tip");
+        assert_eq!(row["agenda"]["occurrence"]["attempt"], 2);
+        assert_eq!(
+            row["agenda"]["occurrence"]["attestation"]["outcome"],
+            "partial"
+        );
+        assert_eq!(
+            row["agenda"]["occurrence"]["attestation"]["note"],
+            "halfway"
+        );
+        assert_eq!(row["agenda"]["occurrence"]["attestation"]["at_ms"], 9_000);
+
+        // The same joins set claims nothing for an underived session —
+        // and a fresh row starts from nothing (per-read derivation; no
+        // row state survives outside the attach call).
+        let mut other = serde_json::json!({});
+        joins_set.attach(&mut other, "s-unlinked", &dir);
+        assert!(
+            other.get("agenda").is_none(),
+            "unlinked sessions get no block"
+        );
+
+        // A next read deriving a changed state serves the change — the
+        // block follows the derivation, never a stored copy.
+        let mut settled = HashMap::new();
+        settled.insert(
+            "s1".to_string(),
+            envelope(
+                crate::agenda::OccurrenceState::Completed,
+                crate::agenda::SessionLineageRole::Tip,
+            ),
+        );
+        let mut row2 = serde_json::json!({});
+        joins(None, None, Some(settled)).attach(&mut row2, "s1", &dir);
+        assert_eq!(row2["agenda"]["occurrence"]["state"], "completed");
+        assert_eq!(row2["agenda"]["occurrence"]["stop"], "settled");
+        assert!(
+            row2["agenda"]["occurrence"].get("attestation").is_none(),
+            "no attestation derived, none served"
+        );
+    }
+
+    /// Track AO pin `safe_to_stop_is_the_ruled_conjunction`, machine
+    /// side: the lineage TIP of a started-without-terminal occurrence
+    /// serves `kills_live_run` (the live firing warns loudly — the
+    /// fragment pins hold the copy); a SUPERSEDED member of one serves
+    /// `owed_work` regardless of process state (the durable journal
+    /// debt no liveness can talk away); every terminal serves `settled`
+    /// with the attestation beside it, so "safe" and "done well" stay
+    /// different claims; and a session with no linkage serves NO block
+    /// — the busy-no-linkage card claims nothing.
+    #[test]
+    fn safe_to_stop_is_the_ruled_conjunction() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = session_dir_with_transcript(root.path(), "s1");
+        let case = |state, role| {
+            let mut envelopes = HashMap::new();
+            envelopes.insert("s1".to_string(), envelope(state, role));
+            let mut row = serde_json::json!({});
+            joins(None, None, Some(envelopes)).attach(&mut row, "s1", &dir);
+            row["agenda"]["occurrence"]["stop"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            case(
+                crate::agenda::OccurrenceState::Started,
+                crate::agenda::SessionLineageRole::Tip,
+            ),
+            "kills_live_run"
+        );
+        assert_eq!(
+            case(
+                crate::agenda::OccurrenceState::Started,
+                crate::agenda::SessionLineageRole::Superseded,
+            ),
+            "owed_work"
+        );
+        for terminal in [
+            crate::agenda::OccurrenceState::Completed,
+            crate::agenda::OccurrenceState::Failed,
+            crate::agenda::OccurrenceState::Unknown,
+            crate::agenda::OccurrenceState::Missed,
+        ] {
+            assert_eq!(
+                case(terminal, crate::agenda::SessionLineageRole::Tip),
+                "settled",
+                "every terminal settles the agenda debt"
+            );
+        }
+        // No linkage: no block, nothing claimed (the SPA's idle-only
+        // "safe" copy is the other half of the conjunction, pinned in
+        // the fragment needles).
+        let mut row = serde_json::json!({});
+        joins(None, None, Some(HashMap::new())).attach(&mut row, "s-busy", &dir);
         assert!(row.get("agenda").is_none());
     }
 
@@ -282,6 +463,12 @@ mod tests {
             "ghost",
             "preboot",
             "agendaShortDigest(",
+            // Track AO: the safe-to-stop derivation + lineage + retry +
+            // self-report wire names, consumed not re-derived.
+            "lineage_role",
+            "kills_live_run",
+            "owed_work",
+            "attestation",
         ] {
             assert!(
                 fragment.contains(needle),
