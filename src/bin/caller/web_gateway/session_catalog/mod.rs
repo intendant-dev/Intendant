@@ -17,7 +17,7 @@ mod replay_cache;
 pub(crate) use replay_cache::*;
 mod external_rows;
 
-mod grid_envelope;
+pub(crate) mod grid_envelope;
 pub(crate) use external_rows::*;
 mod detail_search;
 pub(crate) use detail_search::*;
@@ -1747,12 +1747,12 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
 /// next list pass.
 pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    // Format v4: native rows carry cumulative cache-write usage and price it
-    // separately. Bumping the layout invalidates persisted v3 rows once, so
-    // their old zero-write cost does not linger until the session dir changes.
-    // (v3 added conversation `preview`; v2 moved `updated_at` to transcript
-    // activity.)
-    ctx.update(&[4u8]);
+    // Format v5: rows carry the `terminal` block (summary outcome/ended_at +
+    // last error) — dead dirs never change, so without the bump every
+    // already-persisted dead session would serve the old shape forever.
+    // (v4 added cumulative cache-write usage; v3 conversation `preview`;
+    // v2 moved `updated_at` to transcript activity.)
+    ctx.update(&[5u8]);
     for entry in entries {
         ctx.update(entry.rel.as_bytes());
         ctx.update(&[0]);
@@ -1782,23 +1782,44 @@ pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint
 /// `intendant_session_list_row_from_dir` is terminal for consumers too.
 pub(crate) const SESSION_ENDED_STATUSES: [&str; 3] = ["completed", "failed", "interrupted"];
 
-fn summary_json_status(dir: &Path) -> Option<&'static str> {
+/// The dir-local terminal record `write_summary_with_rounds` leaves behind,
+/// parsed once per row build: `outcome` drives the status mapping and both
+/// fields ride the row's `terminal` block verbatim so a dead session's
+/// window can state how and when it ended.
+struct SessionSummaryFacts {
+    outcome: String,
+    ended_at: Option<String>,
+}
+
+fn session_summary_facts(dir: &Path) -> Option<SessionSummaryFacts> {
     let raw = std::fs::read_to_string(dir.join("summary.json")).ok()?;
     let summary: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let outcome = summary
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("completed");
+    Some(SessionSummaryFacts {
+        outcome: summary
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed")
+            .to_string(),
+        ended_at: summary
+            .get("ended_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+fn summary_outcome_status(outcome: &str) -> &'static str {
     let normalized = outcome.trim().to_ascii_lowercase();
-    Some(
-        if normalized.is_empty() || normalized == "completed" || normalized == "done" {
-            "completed"
-        } else if normalized.contains("stopped by user") || normalized.contains("interrupt") {
-            "interrupted"
-        } else {
-            "failed"
-        },
-    )
+    if normalized.is_empty() || normalized == "completed" || normalized == "done" {
+        "completed"
+    } else if normalized.contains("stopped by user") || normalized.contains("interrupt") {
+        "interrupted"
+    } else {
+        "failed"
+    }
+}
+
+fn summary_json_status(dir: &Path) -> Option<&'static str> {
+    session_summary_facts(dir).map(|facts| summary_outcome_status(&facts.outcome))
 }
 
 pub(crate) fn intendant_session_list_row_from_dir(
@@ -1834,6 +1855,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut worktree = serde_json::Value::Null;
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = session_activity_mtime_secs(dir);
+    let mut last_error: Option<(String, String)> = None;
 
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
@@ -2054,6 +2076,20 @@ pub(crate) fn intendant_session_list_row_from_dir(
                 "task_complete" | "session_end" | "session_ended" => {
                     status = "completed".to_string();
                 }
+                "error" => {
+                    // The freshest error is the best death hint a
+                    // crash-frozen dir has (no summary.json gets written):
+                    // "died mid-turn 15:50, API errors" is composed from it.
+                    if !message.is_empty() {
+                        last_error = Some((
+                            obj.get("ts")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            compact_text(message, 200),
+                        ));
+                    }
+                }
                 "session_capabilities" => {
                     capabilities = obj
                         .get("data")
@@ -2068,9 +2104,19 @@ pub(crate) fn intendant_session_list_row_from_dir(
         }
     }
 
-    if status != "completed" {
-        if let Some(ended) = summary_json_status(dir) {
-            status = ended.to_string();
+    // summary.json refines a terminal ONLY when the event stream's last
+    // word was terminal too. The graceful writer appends `session_end`
+    // and the summary in one call, so a fresh terminal always folds to
+    // "completed" first — the old `!= "completed"` gate made this consult
+    // unreachable for exactly those dirs (flattening backend deaths to
+    // "completed", the contract `summary_outcome_status` documents) while
+    // firing on the one shape where the summary is STALE: a wrapper
+    // resumed in place (its dir is reused, the old summary survives, and
+    // the fold's later `turn_start` correctly says in_progress).
+    let summary_facts = session_summary_facts(dir);
+    if status == "completed" {
+        if let Some(facts) = summary_facts.as_ref() {
+            status = summary_outcome_status(&facts.outcome).to_string();
         }
     }
 
@@ -2263,6 +2309,28 @@ pub(crate) fn intendant_session_list_row_from_dir(
     if let Some(preview) = preview.into_value() {
         wrapper_session["preview"] = preview;
     }
+    // Terminal honesty: the dir-local end facts, served raw so the
+    // dashboard can state HOW a dead session ended instead of freezing on
+    // its last mid-turn render — outcome/ended_at verbatim from
+    // summary.json, plus the freshest error event for the crash-frozen
+    // class that never got a summary. Dir-local by construction, so the
+    // fingerprint row cache stays correct.
+    let mut terminal = serde_json::Map::new();
+    if let Some(facts) = summary_facts {
+        terminal.insert("outcome".to_string(), facts.outcome.into());
+        if let Some(ended_at) = facts.ended_at {
+            terminal.insert("ended_at".to_string(), ended_at.into());
+        }
+    }
+    if let Some((ts, message)) = last_error {
+        terminal.insert(
+            "last_error".to_string(),
+            serde_json::json!({ "ts": ts, "message": message }),
+        );
+    }
+    if !terminal.is_empty() {
+        wrapper_session["terminal"] = serde_json::Value::Object(terminal);
+    }
     if let Some(config) = session_agent_config.as_ref() {
         crate::session_config::apply_config_to_session_json(&mut wrapper_session, config);
     }
@@ -2382,7 +2450,11 @@ pub(crate) fn intendant_session_skeleton_from_dir(
             }
         }
     }
-    if status != "completed" {
+    // Mirror of the row builder's summary gate: refine only a terminal
+    // meta status — a resumed-in-place dir flips meta back to "running"
+    // while its stale summary survives, and that summary must not
+    // overwrite the live status.
+    if status == "completed" {
         if let Some(ended) = summary_json_status(dir) {
             status = ended.to_string();
         }

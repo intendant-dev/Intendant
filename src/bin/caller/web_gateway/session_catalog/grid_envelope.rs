@@ -1,6 +1,7 @@
 //! The grid session window's operational-envelope extension: derived
-//! agenda linkage (source item / occurrence / sealed inputs) and boot
-//! era, attached to intendant catalog rows at serve time.
+//! agenda linkage (source item / occurrence / sealed inputs), boot era,
+//! and — for dead rows — lineage truth (terminal facts + the successor
+//! pointer), attached to intendant catalog rows at serve time.
 //!
 //! Derive-don't-mirror: nothing here is persisted or event-plumbed — the
 //! agenda block is [`crate::agenda::AgendaHandle::session_agenda_envelopes`]
@@ -12,10 +13,22 @@
 //! is fingerprint-cached on session-dir state, and every input here moves
 //! without touching session dirs (a daemon restart, a wrapper's death, a
 //! journal terminal), so the two list entry paths attach per build
-//! instead of baking the blocks into cached rows.
+//! instead of baking the blocks into cached rows. The one exception rides
+//! the other way: the row's `terminal` block IS dir-local (summary.json +
+//! the transcript's last error), so it bakes into the cached row and this
+//! join merely lifts it into the boot block — one writer-stamped unit for
+//! the SPA's alias-fold resolver to arbitrate.
+//!
+//! The successor pointer derives from the ONE shared lineage walker,
+//! [`crate::session_supervisor::resume_lineage::resolve_resume_lineage`]
+//! (never a private re-implementation), memoized on the seed dir's
+//! transcript fingerprint plus the wrapper-index fingerprint — every new
+//! wrapper generation writes the index, so a memo cannot outlive the
+//! chain it summarizes.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// This process's boot, per its own HS1 presence record.
 pub(crate) struct CurrentBoot {
@@ -47,6 +60,10 @@ pub(crate) struct GridEnvelopeJoins {
     /// computed from a guess.
     live_wrappers: Option<HashSet<String>>,
     agenda: Option<HashMap<String, crate::agenda::SessionAgendaEnvelope>>,
+    /// Home for the resume-lineage walk behind dead rows' successor
+    /// pointers; `None` skips the lineage join (tests that exercise only
+    /// the boot matrix).
+    home: Option<PathBuf>,
 }
 
 impl GridEnvelopeJoins {
@@ -65,6 +82,7 @@ impl GridEnvelopeJoins {
             boot,
             live_wrappers,
             agenda,
+            home: Some(home_path.to_path_buf()),
         }
     }
 
@@ -75,6 +93,25 @@ impl GridEnvelopeJoins {
             boot: None,
             live_wrappers: None,
             agenda: None,
+            home: None,
+        }
+    }
+
+    /// Test constructor with every join explicit, shared with the
+    /// session-supervisor tests that pin the registry→envelope chain
+    /// (the readopt-successor false-ghost class).
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        boot_start_secs: Option<u64>,
+        live_wrappers: Option<HashSet<String>>,
+        agenda: Option<HashMap<String, crate::agenda::SessionAgendaEnvelope>>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            boot: boot_start_secs.map(|start_secs| CurrentBoot { start_secs }),
+            live_wrappers,
+            agenda,
+            home,
         }
     }
 
@@ -127,14 +164,139 @@ impl GridEnvelopeJoins {
         // claims safe-to-close.
         let current =
             live_wrapper || super::caches::session_activity_mtime_secs(dir) >= boot.start_secs;
-        row["boot"] = serde_json::json!({
+        let ghost = !current && !live_wrapper;
+        let mut boot_block = serde_json::json!({
             "era": if current { "current" } else { "preboot" },
             "live_wrapper": live_wrapper,
             // Served, not SPA-derived: pre-boot with no live wrapper is
             // the safe-to-close state.
-            "ghost": !current && !live_wrapper,
+            "ghost": ghost,
         });
+        // Lift the row's dir-local terminal facts into the boot block so
+        // terminal + era + lineage reach the SPA as ONE writer-stamped
+        // unit — the alias-fold resolver then arbitrates whole claims and
+        // the winning row's terminal is the one the card states.
+        if let Some(terminal) = row.get("terminal").filter(|value| value.is_object()) {
+            boot_block["terminal"] = terminal.clone();
+        }
+        if ghost {
+            match dead_row_lineage_tip(self.home.as_deref(), session_id, dir) {
+                LineageTip::NoWrapperHistory => {}
+                LineageTip::SelfTip => {
+                    boot_block["lineage_tip"] = serde_json::Value::Bool(true);
+                }
+                LineageTip::ContinuedAs {
+                    source,
+                    wrapper_session_id,
+                    backend_session_id,
+                } => {
+                    boot_block["lineage_tip"] = serde_json::Value::Bool(false);
+                    // Live bit resolved per build, never memoized: the
+                    // registry keys post-identity entries by backend id
+                    // and aliases the wrapper dir id, so check both.
+                    let successor_live =
+                        live.contains(&wrapper_session_id) || live.contains(&backend_session_id);
+                    boot_block["continued_as"] = serde_json::json!({
+                        "source": source,
+                        "session_id": wrapper_session_id,
+                        "backend_session_id": backend_session_id,
+                        "live": successor_live,
+                    });
+                }
+            }
+        }
+        row["boot"] = boot_block;
     }
+}
+
+/// Where a dead row's lineage stands: no recorded wrapper history (native
+/// sessions), this row IS the chain's current incarnation, or the chain
+/// continued in another wrapper.
+#[derive(Clone)]
+enum LineageTip {
+    NoWrapperHistory,
+    SelfTip,
+    ContinuedAs {
+        source: String,
+        wrapper_session_id: String,
+        backend_session_id: String,
+    },
+}
+
+struct LineageTipMemoEntry {
+    transcript_fingerprint: (u64, u128),
+    index_fingerprint: (u64, u128),
+    tip: LineageTip,
+}
+
+const LINEAGE_TIP_MEMO_LIMIT: usize = 4096;
+
+fn lineage_tip_memo() -> &'static Mutex<HashMap<String, LineageTipMemoEntry>> {
+    static MEMO: OnceLock<Mutex<HashMap<String, LineageTipMemoEntry>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn transcript_fingerprint(dir: &Path) -> (u64, u128) {
+    match std::fs::metadata(dir.join("session.jsonl")) {
+        Ok(meta) => (
+            meta.len(),
+            meta.modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+/// The lineage tip behind one dead row, via the shared resume-lineage
+/// walker AND its own tip reduction (`successor_tip` past this row —
+/// only `Active` records qualify; `Superseded` rows are dead
+/// incarnations, never what a card should point at). Memoized on (own
+/// transcript, wrapper index) fingerprints: a dead dir never changes and
+/// every new wrapper generation writes the index, so hits are exact and
+/// misses are one bounded walk.
+fn dead_row_lineage_tip(home: Option<&Path>, session_id: &str, dir: &Path) -> LineageTip {
+    let Some(home) = home else {
+        return LineageTip::NoWrapperHistory;
+    };
+    let transcript = transcript_fingerprint(dir);
+    let index = crate::external_wrapper_index::index_fingerprint(home);
+    if let Ok(memo) = lineage_tip_memo().lock() {
+        if let Some(entry) = memo.get(session_id) {
+            if entry.transcript_fingerprint == transcript && entry.index_fingerprint == index {
+                return entry.tip.clone();
+            }
+        }
+    }
+    let lineage =
+        crate::session_supervisor::resume_lineage::resolve_resume_lineage(home, &[session_id]);
+    let tip = if let Some(record) = lineage.successor_tip(&[session_id]) {
+        LineageTip::ContinuedAs {
+            source: record.source.clone(),
+            wrapper_session_id: record.intendant_session_id.clone(),
+            backend_session_id: record.backend_session_id.clone(),
+        }
+    } else if lineage.has_wrapper_history() {
+        LineageTip::SelfTip
+    } else {
+        LineageTip::NoWrapperHistory
+    };
+    if let Ok(mut memo) = lineage_tip_memo().lock() {
+        if memo.len() >= LINEAGE_TIP_MEMO_LIMIT && !memo.contains_key(session_id) {
+            memo.clear();
+        }
+        memo.insert(
+            session_id.to_string(),
+            LineageTipMemoEntry {
+                transcript_fingerprint: transcript,
+                index_fingerprint: index,
+                tip: tip.clone(),
+            },
+        );
+    }
+    tip
 }
 
 #[cfg(test)]
@@ -176,11 +338,25 @@ mod tests {
         live: Option<&[&str]>,
         agenda: Option<HashMap<String, crate::agenda::SessionAgendaEnvelope>>,
     ) -> GridEnvelopeJoins {
-        GridEnvelopeJoins {
-            boot: boot_start_secs.map(|start_secs| CurrentBoot { start_secs }),
-            live_wrappers: live.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+        GridEnvelopeJoins::for_tests(
+            boot_start_secs,
+            live.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
             agenda,
-        }
+            None,
+        )
+    }
+
+    fn joins_with_home(
+        boot_start_secs: Option<u64>,
+        live: Option<&[&str]>,
+        home: &Path,
+    ) -> GridEnvelopeJoins {
+        GridEnvelopeJoins::for_tests(
+            boot_start_secs,
+            live.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+            None,
+            Some(home.to_path_buf()),
+        )
     }
 
     fn session_dir_with_transcript(root: &Path, session_id: &str) -> std::path::PathBuf {
@@ -282,6 +458,9 @@ mod tests {
             "ghost",
             "preboot",
             "agendaShortDigest(",
+            "lineage_tip",
+            "continued_as",
+            "raw.terminal",
         ] {
             assert!(
                 fragment.contains(needle),
@@ -366,17 +545,292 @@ mod tests {
         }
     }
 
-    /// The dominance law, byte-pinned as one unit: a live-wrapper claim
-    /// on a shared card id is replaced only by the same writer's own
-    /// next state or by another live wrapper — never by a dead twin.
-    /// A behavior change must move this pin and the fragment together.
+    /// The dominance law, byte-pinned as one unit: a writer's own
+    /// lifecycle update always lands; otherwise claims rank live wrapper
+    /// > current era > lineage tip > the rest, and only an equal-or-higher
+    /// rank replaces the standing claim — so a dead twin can never
+    /// overwrite a live wrapper's card, and between two DEAD generations
+    /// the chain's newest incarnation wins whatever order the rows folded
+    /// in. A behavior change must move this pin and the fragment together.
     #[test]
     fn live_wrapper_dominates_the_merge() {
         let fragment = include_str!("../../../../../static/app/39-session-windows.js");
-        let resolver = "function resolveSessionWindowBootMeta(previous, incoming) {\n  if (!previous || !incoming) return incoming || previous || null;\n  const sameWriter = !!incoming.sourceSessionId\n    && incoming.sourceSessionId === previous.sourceSessionId;\n  if (previous.liveWrapper && !incoming.liveWrapper && !sameWriter) return previous;\n  return incoming;\n}";
+        let resolver = "function resolveSessionWindowBootMeta(previous, incoming) {\n  if (!previous || !incoming) return incoming || previous || null;\n  const sameWriter = !!incoming.sourceSessionId\n    && incoming.sourceSessionId === previous.sourceSessionId;\n  if (sameWriter) return incoming;\n  const rank = claim => (claim.liveWrapper ? 3 : (claim.era === 'current' ? 2 : (claim.lineageTip ? 1 : 0)));\n  return rank(incoming) >= rank(previous) ? incoming : previous;\n}";
         assert!(
             fragment.contains(resolver),
-            "resolveSessionWindowBootMeta drifted from the pinned dominance law"
+            "resolveSessionWindowBootMeta drifted from the pinned dominance ladder"
+        );
+    }
+
+    fn write_jsonl(dir: &Path, lines: &[serde_json::Value]) {
+        let body = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("session.jsonl"), format!("{body}\n")).unwrap();
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A wrapper log dir announcing its backend conversation(s) — the
+    /// same durable trace live wrappers leave (the identity event also
+    /// writes the wrapper-index row), mirroring the resume_lineage test
+    /// helper.
+    fn announce(home: &Path, wrapper: &str, backend_ids: &[&str]) -> std::path::PathBuf {
+        let dir = crate::platform::intendant_home_in(home)
+            .join("logs")
+            .join(wrapper);
+        let mut log = crate::session_log::SessionLog::open(dir.clone()).unwrap();
+        log.write_meta(None, None);
+        for backend_id in backend_ids {
+            log.session_identity(wrapper, "claude-code", backend_id);
+        }
+        dir
+    }
+
+    /// (a) of the ghost-card terminal-honesty card (01KYR84M4PB8QVBR3Y…):
+    /// a dead session's window states its terminal fact plainly. Daemon
+    /// half: the row serves summary.json's outcome/ended_at verbatim, the
+    /// status stops flattening a backend death to "completed", and attach
+    /// lifts the facts into the boot block for the alias fold. SPA half:
+    /// the statement composer renders "Ended <when>: <outcome>" and the
+    /// note strip exists.
+    #[test]
+    fn dead_session_window_states_terminal_fact() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("gl1-wrapper");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_jsonl(
+            &dir,
+            &[
+                serde_json::json!({"event": "session_start", "ts": "2026-07-29 19:40:00"}),
+                serde_json::json!({"event": "turn_start", "turn": 22}),
+                serde_json::json!({"event": "session_end", "level": "info",
+                    "message": "Session ended: Claude Code process closed stdout (22 turns)"}),
+            ],
+        );
+        std::fs::write(
+            dir.join("summary.json"),
+            serde_json::json!({
+                "outcome": "Claude Code process closed stdout",
+                "ended_at": "2026-07-29 19:59:01",
+                "total_turns": 22,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut row = super::super::intendant_session_list_row_from_dir(&dir, "gl1-wrapper")
+            .expect("row builds");
+        assert_eq!(
+            row["terminal"]["outcome"], "Claude Code process closed stdout",
+            "summary outcome must ride the row verbatim"
+        );
+        assert_eq!(row["terminal"]["ended_at"], "2026-07-29 19:59:01");
+        assert_eq!(
+            row["status"], "failed",
+            "a backend death must not flatten to completed (the summary consult was unreachable)"
+        );
+
+        joins(Some(now_secs() + 3_600), Some(&[]), None).attach(&mut row, "gl1-wrapper", &dir);
+        assert_eq!(row["boot"]["ghost"], true);
+        assert_eq!(
+            row["boot"]["terminal"]["outcome"], "Claude Code process closed stdout",
+            "attach must lift the row's terminal facts into the boot block"
+        );
+
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        for needle in [
+            "function sessionWindowTerminalStatement(",
+            "Ended${when ? ` ${when}` : ''}: ${terminal.outcome}",
+            "session-window-terminal-note",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "session-windows fragment lost the terminal statement: {needle}"
+            );
+        }
+        let styles = include_str!("../../../../../static/app/12-styles-tasks-log.css");
+        assert!(
+            styles.contains(".session-window .session-window-terminal-note"),
+            "the stylesheet lost the terminal-note strip"
+        );
+    }
+
+    /// The refresh-rebuild lane (second specimen on 01KYMFPC) and the
+    /// f7a7ccba shape: a crash-frozen dir — mid-turn death on an API
+    /// error streak, no summary ever written — serves its frozen-at facts
+    /// (status still in_progress, the freshest error, ghost bit), and the
+    /// SPA states "Died mid-turn …" from METADATA (the updateSessionWindow
+    /// hook), so a rebuilt card is honest before any click hydrates it.
+    /// Liveness inference stays untouched: hydration still never flips
+    /// `ended` (the #637 stop-hide law).
+    #[test]
+    fn rebuilt_card_for_ended_session_renders_terminal_not_started_only() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("gl2-wrapper");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_jsonl(
+            &dir,
+            &[
+                serde_json::json!({"event": "session_start", "ts": "2026-07-29 15:00:00"}),
+                serde_json::json!({"event": "turn_start", "turn": 76}),
+                serde_json::json!({"event": "error", "level": "error", "ts": "2026-07-29 15:49:12",
+                    "message": "provider error: 500 upstream_error"}),
+                serde_json::json!({"event": "error", "level": "error", "ts": "2026-07-29 15:50:41",
+                    "message": "claude-code backend error (error_during_execution): API error"}),
+            ],
+        );
+
+        let mut row = super::super::intendant_session_list_row_from_dir(&dir, "gl2-wrapper")
+            .expect("row builds");
+        assert_eq!(
+            row["status"], "in_progress",
+            "the frozen mid-turn status is itself a fact — liveness comes from the boot join"
+        );
+        assert_eq!(
+            row["terminal"]["last_error"]["message"],
+            "claude-code backend error (error_during_execution): API error",
+            "the freshest error must ride the row"
+        );
+        assert_eq!(row["terminal"]["last_error"]["ts"], "2026-07-29 15:50:41");
+        assert!(
+            row["terminal"].get("outcome").is_none(),
+            "no summary was ever written — the row must not invent one"
+        );
+
+        joins(Some(now_secs() + 3_600), Some(&[]), None).attach(&mut row, "gl2-wrapper", &dir);
+        assert_eq!(row["boot"]["ghost"], true);
+        assert_eq!(
+            row["boot"]["terminal"]["last_error"]["ts"],
+            "2026-07-29 15:50:41"
+        );
+
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        for needle in [
+            // the mid-turn death statement branch
+            "Died mid-turn${when ? ` — last activity ${when}` : ''}",
+            // hydration still never flips ended (phase is not liveness)
+            "ended: false,",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "session-windows fragment lost the rebuild-lane terminal statement: {needle}"
+            );
+        }
+        let actions = include_str!("../../../../../static/app/41-session-window-actions.js");
+        for needle in [
+            // the note renders from the metadata path — before any click
+            "renderSessionWindowTerminalNote(win, sid);",
+            // and the pill stops advertising activity on a corpse
+            "return ghostTerminal?.outcome ? 'Ended' : 'Died';",
+        ] {
+            assert!(
+                actions.contains(needle),
+                "the actions fragment lost the pre-click terminal render: {needle}"
+            );
+        }
+    }
+
+    /// (b): a ghost card whose lineage continued serves a successor
+    /// pointer — `continued_as` with the tip's ids and live bit — while
+    /// the tip's own row says `lineage_tip: true` and points nowhere; the
+    /// SPA renders it as the clickable "continued as …" affordance.
+    #[test]
+    fn ghost_card_with_continued_lineage_shows_successor_pointer() {
+        let home = tempfile::tempdir().unwrap();
+        let old_dir = announce(home.path(), "gl3-wrapper-old", &["gl3-b1"]);
+        let new_dir = announce(home.path(), "gl3-wrapper-new", &["gl3-b1", "gl3-b2"]);
+        let watershed = now_secs() + 3_600;
+
+        let mut old_row = serde_json::json!({});
+        joins_with_home(Some(watershed), Some(&[]), home.path()).attach(
+            &mut old_row,
+            "gl3-wrapper-old",
+            &old_dir,
+        );
+        assert_eq!(old_row["boot"]["ghost"], true);
+        assert_eq!(old_row["boot"]["lineage_tip"], false);
+        assert_eq!(
+            old_row["boot"]["continued_as"]["session_id"], "gl3-wrapper-new",
+            "the dead original must point at the chain's current incarnation"
+        );
+        assert_eq!(old_row["boot"]["continued_as"]["live"], false);
+        assert!(old_row["boot"]["continued_as"]["backend_session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+
+        let mut new_row = serde_json::json!({});
+        joins_with_home(Some(watershed), Some(&[]), home.path()).attach(
+            &mut new_row,
+            "gl3-wrapper-new",
+            &new_dir,
+        );
+        assert_eq!(new_row["boot"]["ghost"], true);
+        assert_eq!(
+            new_row["boot"]["lineage_tip"], true,
+            "the tip's own row is the terminal authority, not a pointer"
+        );
+        assert!(new_row["boot"].get("continued_as").is_none());
+
+        // The live bit resolves per build against the (alias-closed)
+        // registry set — the successor counts as live under its backend
+        // id, exactly how post-identity entries are keyed.
+        let mut relive = serde_json::json!({});
+        joins_with_home(Some(watershed), Some(&["gl3-b2"]), home.path()).attach(
+            &mut relive,
+            "gl3-wrapper-old",
+            &old_dir,
+        );
+        assert_eq!(relive["boot"]["continued_as"]["live"], true);
+
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        for needle in [
+            "continued as ${continuationLabel}",
+            "session-window-terminal-continued",
+            "openSessionWindowForContinuation(",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "session-windows fragment lost the successor pointer: {needle}"
+            );
+        }
+    }
+
+    /// The pointer is DERIVED from the shared resume-lineage resolver,
+    /// never a private re-implementation: an edit-branch retirement edge
+    /// (`record_lineage_retired`) is only reachable through
+    /// `resolve_resume_lineage`'s conversation chain — a naive
+    /// wrappers_for lookup on the parent's conversation has no path to
+    /// the child, so this test fails against any re-implementation.
+    #[test]
+    fn successor_pointer_derived_from_lineage_resolver() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_dir = announce(home.path(), "gl4-wrapper-parent", &["gl4-b1"]);
+        announce(home.path(), "gl4-wrapper-child", &["gl4-b2"]);
+        crate::external_wrapper_index::record_lineage_retired(
+            home.path(),
+            "claude-code",
+            "gl4-b1",
+            "gl4-b2",
+        )
+        .unwrap();
+
+        let mut row = serde_json::json!({});
+        joins_with_home(Some(now_secs() + 3_600), Some(&[]), home.path()).attach(
+            &mut row,
+            "gl4-wrapper-parent",
+            &parent_dir,
+        );
+        assert_eq!(
+            row["boot"]["continued_as"]["session_id"], "gl4-wrapper-child",
+            "the retirement edge must reach the edit-branch child — only the shared resolver walks it"
         );
     }
 

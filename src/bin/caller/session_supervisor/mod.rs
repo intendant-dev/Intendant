@@ -451,19 +451,42 @@ impl LiveSessionRegistry {
     /// alike: lock contention yields `None` and the caller omits the
     /// join rather than serve a wrong liveness bit; a gone supervisor
     /// truthfully reports no live sessions.
+    ///
+    /// Alias-closed: `apply_session_identity` re-keys an external entry
+    /// to its backend id once the backend announces, leaving the wrapper
+    /// log-dir id behind as an alias — but catalog rows are keyed by the
+    /// log-dir id, so an entry-keys-only set read every post-identity
+    /// live session as dead and its row served `ghost:true` (the
+    /// readopt-successor false-ghost class, five specimens 2026-07-29).
+    /// Every alias that resolves to a live entry is therefore a live id
+    /// too; dangling aliases resolve to nothing and drop out on their
+    /// own.
     pub(crate) fn live_wrapper_ids(&self) -> Option<std::collections::HashSet<String>> {
         let Some(state) = self.state.upgrade() else {
             return Some(std::collections::HashSet::new());
         };
         let guard = state.try_lock().ok()?;
-        Some(
-            guard
-                .sessions
-                .values()
-                .filter(|session| !session.follow_up_tx.is_closed())
-                .map(|session| session.session_id.clone())
-                .collect(),
-        )
+        let mut live: std::collections::HashSet<String> = guard
+            .sessions
+            .values()
+            .filter(|session| !session.follow_up_tx.is_closed())
+            .map(|session| session.session_id.clone())
+            .collect();
+        for alias in guard.session_aliases.keys() {
+            if live.contains(alias) {
+                continue;
+            }
+            let alias_is_live = guard.resolve_session_id(alias).is_some_and(|key| {
+                guard
+                    .sessions
+                    .get(&key)
+                    .is_some_and(|session| !session.follow_up_tx.is_closed())
+            });
+            if alias_is_live {
+                live.insert(alias.clone());
+            }
+        }
+        Some(live)
     }
 }
 
@@ -1588,6 +1611,91 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("wrapper"));
         assert!(!state.session_is_managed("backend"));
+    }
+
+    /// The readopt-successor false-ghost class (five live specimens,
+    /// 2026-07-29): `apply_session_identity` re-keys a post-identity
+    /// entry to its backend id and leaves the wrapper log-dir id behind
+    /// as an alias, while catalog rows key by the log-dir id — an
+    /// entry-keys-only live set therefore read every post-identity live
+    /// session as dead and its card wore the ghost chip (fold-order
+    /// roulette against the dead twin). The published set is
+    /// alias-closed: aliases resolving to a live entry count; aliases of
+    /// closed-channel or removed entries do not. The grid half attaches
+    /// the successor's row under the closed set and must serve
+    /// live_wrapper:true / ghost:false.
+    #[test]
+    fn readopt_successor_card_does_not_false_ghost() {
+        let state = Arc::new(AsyncMutex::new(SupervisorState::default()));
+        let (open_tx, _open_rx) = mpsc::channel(1);
+        {
+            let mut guard = state.try_lock().unwrap();
+            // Post-identity live entry: keyed by the backend id, wrapper
+            // dir id aliased to it, follow-up channel open.
+            let mut entry = managed_session("rsg-backend-b", "claude-code");
+            entry.follow_up_tx = open_tx.clone();
+            guard.sessions.insert("rsg-backend-b".to_string(), entry);
+            guard
+                .session_aliases
+                .insert("rsg-wrapper-dir".to_string(), "rsg-backend-b".to_string());
+            // A finished entry's alias must not read live (closed
+            // channel)…
+            guard.sessions.insert(
+                "rsg-closed".to_string(),
+                managed_session("rsg-closed", "claude-code"),
+            );
+            guard
+                .session_aliases
+                .insert("rsg-closed-alias".to_string(), "rsg-closed".to_string());
+            // …and a dangling alias resolves to nothing.
+            guard
+                .session_aliases
+                .insert("rsg-dangling".to_string(), "rsg-gone".to_string());
+        }
+        let registry = LiveSessionRegistry {
+            state: Arc::downgrade(&state),
+        };
+        let live = registry.live_wrapper_ids().expect("uncontended lock");
+        assert!(live.contains("rsg-backend-b"));
+        assert!(
+            live.contains("rsg-wrapper-dir"),
+            "the wrapper log-dir alias of a live entry is live — the catalog row keys by it"
+        );
+        assert!(!live.contains("rsg-closed"));
+        assert!(!live.contains("rsg-closed-alias"));
+        assert!(!live.contains("rsg-dangling"));
+
+        // Grid half: the successor's catalog row (keyed by its log dir)
+        // stops false-ghosting under the closed set even though its
+        // transcript predates the boot watershed.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("rsg-wrapper-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.jsonl"), b"{}\n").unwrap();
+        let watershed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let joins =
+            crate::web_gateway::session_catalog::grid_envelope::GridEnvelopeJoins::for_tests(
+                Some(watershed),
+                Some(live),
+                None,
+                None,
+            );
+        let mut row = serde_json::json!({});
+        joins.attach(&mut row, "rsg-wrapper-dir", &dir);
+        assert_eq!(
+            row["boot"]["live_wrapper"], true,
+            "the alias-closed live set must reach the row"
+        );
+        assert_eq!(
+            row["boot"]["ghost"], false,
+            "a live readopt successor's card never wears the ghost chip"
+        );
+        assert_eq!(row["boot"]["era"], "current");
+        drop(open_tx);
     }
 
     #[test]
