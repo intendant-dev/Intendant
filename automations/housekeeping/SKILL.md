@@ -14,7 +14,8 @@ suspend_after = 3
 ```
 
 Agenda housekeeping pass. Read every agenda item (ctl agenda list --all
---json), then review for staleness, urgency, next actions, and blocker
+--json; for one item's full detail, ctl agenda show ID is cheaper than
+re-fetching the ledger), then review for staleness, urgency, next actions, and blocker
 evidence. MANDATE — propose, don't dispose: (1) write your findings as
 annotations on the items themselves (ctl agenda annotate) and park exactly
 ONE new summary item titled "Housekeeping summary <date>" for anything

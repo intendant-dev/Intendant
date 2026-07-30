@@ -2525,6 +2525,29 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "list" | "ls" => run_agenda_list(client, config, &raw[1..]).await?,
+        // Track AS S7: one item at full detail without fetching the
+        // ledger — the single-item watcher's lane (an answer poll reads
+        // ONE item, not the world).
+        "show" => {
+            let args = parse_command_args(&raw[1..], &[], &[])?;
+            let raw_id = args
+                .positional
+                .first()
+                .map(|id| id.trim())
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    "agenda show requires an item id (a unique prefix is enough)".to_string()
+                })?;
+            let item = agenda_fetch_item(client, config, raw_id).await?;
+            if config.json || config.raw {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&item).map_err(|e| e.to_string())?
+                );
+            } else {
+                agenda_print_item_detail(&item);
+            }
+        }
         "ops" => run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Ops).await?,
         "occurrences" => {
             run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Occurrences).await?
@@ -3187,6 +3210,115 @@ fn agenda_item_is_blocked(all_items: &[Value], item: &Value) -> bool {
         })
 }
 
+/// `agenda show`'s human detail (Track AS S7): the whole item, printed
+/// self-contained — no ledger fetch, so cross-item lookups (dependency
+/// target titles) print as ids. Bodies/notes/answers are quoted data.
+fn agenda_print_item_detail(item: &Value) {
+    println!("{}", agenda_render_row(item, false, &[]));
+    let s = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+    println!(
+        "  status {} · updated {}",
+        s("status"),
+        item.get("updated_ms")
+            .and_then(Value::as_u64)
+            .map(agenda_format_ms)
+            .unwrap_or_default()
+    );
+    if let Some(tags) = item.get("tags").and_then(Value::as_array) {
+        if !tags.is_empty() {
+            let tags: Vec<&str> = tags.iter().filter_map(Value::as_str).collect();
+            println!("  tags: {}", tags.join(", "));
+        }
+    }
+    let body = s("body");
+    if !body.trim().is_empty() {
+        println!("  --");
+        for line in body.lines() {
+            println!("  {line}");
+        }
+        println!("  --");
+    }
+    if let Some(answer) = item
+        .get("answer")
+        .and_then(|a| a.get("text"))
+        .and_then(Value::as_str)
+    {
+        println!("  answer: {answer}");
+    }
+    if let Some(blockers) = item.get("blockers").and_then(Value::as_array) {
+        for blocker in blockers.iter().filter(|b| b.get("cleared").is_none()) {
+            println!(
+                "  blocked — waiting on: {}",
+                blocker
+                    .get("criterion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            );
+        }
+    }
+    if let Some(edges) = item.get("relies_on").and_then(Value::as_array) {
+        for edge in edges {
+            println!(
+                "  relies on {}",
+                edge.get("target_id").and_then(Value::as_str).unwrap_or("?")
+            );
+        }
+    }
+    if let Some(parent) = item
+        .get("part_of")
+        .and_then(|p| p.get("parent_id"))
+        .and_then(Value::as_str)
+    {
+        println!("  part of {parent}");
+    }
+    if let Some(effects) = item.get("effects").and_then(Value::as_array) {
+        for effect in effects {
+            let digest = effect.get("digest").and_then(Value::as_str).unwrap_or("");
+            let armed = effect.get("approval").is_some_and(|a| !a.is_null());
+            let run = effect
+                .get("last_run")
+                .filter(|r| !r.is_null())
+                .and_then(|r| r.get("state"))
+                .and_then(Value::as_str);
+            println!(
+                "  effect {} · {}{}",
+                &digest[..digest.len().min(10)],
+                if armed { "armed" } else { "proposed" },
+                run.map(|r| format!(" · last run {r}")).unwrap_or_default()
+            );
+        }
+    }
+    if let Some(notes) = item.get("annotations").and_then(Value::as_array) {
+        let start = notes.len().saturating_sub(5);
+        if start > 0 {
+            println!("  … {start} earlier note(s)");
+        }
+        for note in &notes[start..] {
+            println!(
+                "  note [{}]: {}",
+                note.get("source")
+                    .and_then(Value::as_str)
+                    .or_else(|| note.get("kind").and_then(Value::as_str))
+                    .unwrap_or("unattributed"),
+                note.get("text").and_then(Value::as_str).unwrap_or("")
+            );
+        }
+    }
+    if let Some(refs) = item.get("refs").and_then(Value::as_array) {
+        for r in refs {
+            println!(
+                "  ref {}{}",
+                r.get("locator").and_then(Value::as_str).unwrap_or("?"),
+                if r.get("must_read").and_then(Value::as_bool).unwrap_or(false) {
+                    " [must-read]"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+}
+
 fn agenda_render_row(item: &Value, blocked: bool, all_items: &[Value]) -> String {
     let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
     let glyph = match (field("status"), field("kind")) {
@@ -3396,30 +3528,55 @@ async fn agenda_resolve_id_str(
     config: &Config,
     raw: &str,
 ) -> Result<String, String> {
+    Ok(agenda_fetch_item(client, config, raw)
+        .await?
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "agenda_item returned an item without an id".to_string())?
+        .to_string())
+}
+
+/// Fetch ONE full item by id or unique prefix via the `agenda_item`
+/// tool (Track AS S7): server-side resolution — exact id wins, an
+/// ambiguous prefix is refused with candidates — replacing the
+/// 18-subcommand whole-ledger fetch this file used to pay per lookup.
+async fn agenda_fetch_item(
+    client: &reqwest::Client,
+    config: &Config,
+    raw: &str,
+) -> Result<Value, String> {
     let raw = raw.trim().to_ascii_uppercase();
     if raw.is_empty() {
         return Err("empty agenda item id".to_string());
     }
-    let (items, _) = agenda_fetch(client, config, Value::Object(Map::new())).await?;
-    let matches: Vec<(&str, &str)> = items
-        .iter()
-        .filter_map(|item| {
-            let id = item.get("id").and_then(Value::as_str)?;
-            let title = item.get("title").and_then(Value::as_str).unwrap_or("");
-            id.starts_with(&raw).then_some((id, title))
-        })
-        .collect();
-    match matches.as_slice() {
-        [(id, _)] => Ok((*id).to_string()),
-        [] => Err(format!("no agenda item matches '{raw}'")),
-        many => {
-            let mut message = format!("'{raw}' is ambiguous; matches:");
-            for (id, title) in many.iter().take(5) {
-                message.push_str(&format!("\n  {id}  {title}"));
-            }
-            Err(message)
-        }
+    let response = call_tool(
+        client,
+        config,
+        "agenda_item",
+        serde_json::json!({ "id": raw }),
+    )
+    .await?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("agenda_item failed: {error}"));
     }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "JSON-RPC response missing result".to_string())?;
+    let text = single_text_content(result)
+        .ok_or_else(|| "agenda_item returned no text content".to_string())?;
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(text.to_string());
+    }
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| format!("agenda_item returned non-JSON: {e}"))?;
+    value
+        .get("item")
+        .cloned()
+        .ok_or_else(|| "agenda_item response missing item".to_string())
 }
 
 /// Fetch `(items, counts)` via the `agenda_list` tool.
@@ -5354,6 +5511,7 @@ fn help_agenda() {
   intendant ctl agenda ask QUESTION... [--body TEXT] [--tag TAG]... [--due WHEN] [--source LABEL]\n\
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
+  intendant ctl agenda show ID_PREFIX [--json]   # ONE item, full detail — never fetches the ledger\n\
   intendant ctl agenda annotate ID_PREFIX NOTE... [--source LABEL]\n\
   intendant ctl agenda attest ID_PREFIX --occurrence OCC_ID --outcome achieved|partial|blocked|abandoned\n\
       [--note TEXT] [--ref file:PATH]... [--source LABEL]   # fired session's self-report on its occurrence\n\

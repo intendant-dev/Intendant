@@ -23,7 +23,9 @@ untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each
-item's originating session and project).
+item's originating session and project — and, server-derived, each
+summary-shape item's frontier flag; ctl agenda show ID re-reads one
+item without the ledger).
 
 PLACEMENT (mechanical): file each frontier item into the graph. Seed
 part_of from the item's provenance-derived project: place under the

@@ -853,7 +853,8 @@ goal embeds the **mandate**. Template goal (paste into
 
 ```text
 Agenda housekeeping pass. Read every agenda item (ctl agenda list --all
---json), then review for staleness, urgency, next actions, and blocker
+--json; for one item's full detail, ctl agenda show ID is cheaper than
+re-fetching the ledger), then review for staleness, urgency, next actions, and blocker
 evidence. MANDATE — propose, don't dispose: (1) write your findings as
 annotations on the items themselves (ctl agenda annotate) and park exactly
 ONE new summary item titled "Housekeeping summary <date>" for anything
@@ -952,7 +953,9 @@ untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each
-item's originating session and project).
+item's originating session and project — and, server-derived, each
+summary-shape item's frontier flag; ctl agenda show ID re-reads one
+item without the ledger).
 
 PLACEMENT (mechanical): file each frontier item into the graph. Seed
 part_of from the item's provenance-derived project: place under the
@@ -1148,7 +1151,8 @@ effort — the owner's standing judgment-mandate preference):
 ```text
 Survey & propose. Read the ENTIRE agenda — open, done, and retired
 items (ctl agenda list --all --json; placing done items is allowed
-and useful for the hubs' history) — and propose, creating NOTHING
+and useful for the hubs' history; ctl agenda show ID re-checks one
+item without re-fetching) — and propose, creating NOTHING
 yet, the hub taxonomy that reconciles it: the hubs (and, where the
 population warrants it, nested super-hubs — clusters are hubs under
 hubs, no new layer; the store's ancestry-cycle guard governs

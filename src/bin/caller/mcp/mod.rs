@@ -250,6 +250,37 @@ impl IntendantServer {
         Ok(body)
     }
 
+    /// One item at full decorated grain by exact id or unique prefix
+    /// (Track AS S7 — the tool twin of `GET /api/agenda/items/{id}`,
+    /// ruling Q5 semantics): exact wins; an ambiguous prefix refuses by
+    /// name with a bounded candidate list; single-item watchers stop
+    /// polling the world.
+    async fn agenda_item_inner(
+        &self,
+        params: AgendaItemParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        let id = params.id.trim();
+        match agenda.resolve_prefix(id) {
+            crate::agenda::AgendaPrefixResolution::One(item) => {
+                Ok(serde_json::json!({ "item": *item }))
+            }
+            crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => Err(format!(
+                "ambiguous agenda id prefix '{id}': {}",
+                candidates
+                    .into_iter()
+                    .map(|(id, title)| format!("{id} ({title})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            crate::agenda::AgendaPrefixResolution::None => {
+                Err(format!("no agenda item matches '{id}'"))
+            }
+        }
+    }
+
     async fn agenda_op_inner(
         &self,
         cmd: crate::agenda::AgendaCommand,
@@ -626,6 +657,13 @@ impl IntendantServer {
                 Ok(match self.agenda_list_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("agenda_list failed: {message}")),
+                })
+            }
+            "agenda_item" => {
+                let Parameters(params) = parse_params::<AgendaItemParams>(args)?;
+                Ok(match self.agenda_item_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_item failed: {message}")),
                 })
             }
             "agenda_op" => {
@@ -3479,6 +3517,64 @@ pub(crate) mod tests {
         assert_eq!(body["counts"]["done"], 1);
         // S1: additive seq cursor on the bare tool response too.
         assert_eq!(body["seq"], 3);
+    }
+
+    /// Track AS S7: `agenda_item` resolves exact ids (always win),
+    /// unique prefixes, refuses ambiguity with candidates, and 404s by
+    /// name — the ruled Q5 semantics on the tool lane, so ctl and
+    /// single-item watchers stop fetching the world.
+    #[tokio::test]
+    async fn mcp_agenda_item_resolves_prefixes_with_exact_wins() {
+        let dir = tempdir().expect("agenda dir");
+        let bus = EventBus::new();
+        let state = test_state();
+        let handle = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        state.write().await.agenda = Some(handle.clone());
+        let server = IntendantServer::new(state, bus);
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: format!("{title} body"),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let first = handle.apply(add("first"), owner.clone()).unwrap();
+        handle.apply(add("second"), owner).unwrap();
+
+        let exact = server
+            .agenda_item_inner(AgendaItemParams {
+                id: first.id.clone(),
+            })
+            .await
+            .expect("exact id resolves");
+        assert_eq!(exact["item"]["id"], serde_json::json!(first.id));
+        assert_eq!(
+            exact["item"]["body"],
+            serde_json::json!("first body"),
+            "full grain on the tool lane"
+        );
+        let ambiguous = server
+            .agenda_item_inner(AgendaItemParams { id: "01".into() })
+            .await
+            .expect_err("ambiguous prefix refuses");
+        assert!(ambiguous.contains("ambiguous"));
+        assert!(ambiguous.contains(&first.id), "candidates are listed");
+        let missing = server
+            .agenda_item_inner(AgendaItemParams { id: "7ZZZZ".into() })
+            .await
+            .expect_err("unknown refuses by name");
+        assert!(missing.contains("no agenda item"));
     }
 
     /// Track AS S2: MCP `agenda_list`'s `since_seq` is a delta over the

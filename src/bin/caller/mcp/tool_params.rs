@@ -78,6 +78,13 @@ pub struct AgendaListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgendaItemParams {
+    /// The item's id, or a unique id prefix (an exact id always wins;
+    /// an ambiguous prefix is refused with the candidates).
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemorySearchParams {
     /// Substring query over statements, labels, and kind. Omit to list.
     #[serde(default)]

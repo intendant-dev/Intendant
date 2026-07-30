@@ -25,7 +25,8 @@ effort = "max"
 
 Survey & propose. Read the ENTIRE agenda — open, done, and retired
 items (ctl agenda list --all --json; placing done items is allowed
-and useful for the hubs' history) — and propose, creating NOTHING
+and useful for the hubs' history; ctl agenda show ID re-checks one
+item without re-fetching) — and propose, creating NOTHING
 yet, the hub taxonomy that reconciles it: the hubs (and, where the
 population warrants it, nested super-hubs — clusters are hubs under
 hubs, no new layer; the store's ancestry-cycle guard governs
