@@ -2038,11 +2038,18 @@ impl SessionLog {
             }
         }
 
-        // Update session_meta.json with completion status
+        // Update session_meta.json with completion status. "interrupted"
+        // stays: a signal shutdown marks open mid-turn sessions before the
+        // teardown the kill itself triggers reaches this write, and that
+        // marker is what the next boot's readopt scan reads — a kill must
+        // never be rewritten as a clean completion (a real new turn
+        // re-stamps "running" via write_meta first).
         let meta_path = self.dir.join("session_meta.json");
         if let Ok(meta_str) = fs::read_to_string(&meta_path) {
             if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                meta.status = Some("completed".to_string());
+                if meta.status.as_deref() != Some("interrupted") {
+                    meta.status = Some("completed".to_string());
+                }
                 meta.last_turn = Some(total_turns);
                 meta.rounds = rounds;
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
@@ -2701,6 +2708,49 @@ mod tests {
         let meta: SessionMeta =
             serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
                 .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("completed"));
+    }
+
+    /// The mirror of `mark_interrupted_does_not_overwrite_completed`: once a
+    /// signal shutdown has marked a mid-turn session "interrupted", the
+    /// wrapper teardown that the kill itself triggers (finish_session →
+    /// write_summary) must not rewrite the interruption as a clean
+    /// completion — the marker is what the next boot's readopt scan reads
+    /// (live specimen 2026-07-29: three swap-killed continuations were
+    /// stamped "completed" by their own teardown and the successor boot
+    /// silently stranded them).
+    #[test]
+    fn write_summary_does_not_overwrite_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.turn_start(9, 0.0, 100000);
+
+        // The SIGTERM handler marks the mid-turn session first…
+        log.mark_interrupted();
+        // …then the killed wrapper's teardown writes its summary.
+        log.write_summary("task", "Claude Code process closed stdout", 9);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta.status.as_deref(),
+            Some("interrupted"),
+            "a kill is never rewritten as a clean completion"
+        );
+        assert_eq!(meta.last_turn, Some(9), "turn bookkeeping still lands");
+
+        // A session that genuinely finished keeps stamping completed.
+        let clean_dir = dir.path().join("clean");
+        let mut clean = SessionLog::open(clean_dir.clone()).unwrap();
+        clean.write_meta(Some(Path::new("/tmp")), Some("task"));
+        clean.write_summary("task", "completed", 3);
+        let meta: SessionMeta = serde_json::from_str(
+            &fs::read_to_string(clean_dir.join("session_meta.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
     }
 

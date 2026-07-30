@@ -30,14 +30,25 @@
 //! readopt), never while draining, and rides the AUTOMATIC resume lane
 //! (`ResumeSession { auto_attach: true }` → `WrapperLineageIntent::
 //! Resume`), so owner-stop tombstones and retired lineages refuse and a
-//! live successor routes instead of double-spawning. A lineage whose
-//! index already shows an admitted successor past the dead session is
-//! left dead here too — someone (an earlier boot, the owner, a co-homed
-//! daemon) already continued it.
+//! live successor routes instead of double-spawning.
+//!
+//! Dispatches are not outcomes (the 2026-07-29 two-boot specimen): an
+//! admitted successor is a marker to EVALUATE, never a terminal verdict.
+//! A lineage whose tip is alive is left dead here (someone — an earlier
+//! boot, the owner, a co-homed daemon — is running it); a lineage whose
+//! tip concluded is done; but a tip that itself died mid-work (a swap or
+//! crash killed the dispatched continuation) leaves the lineage exactly
+//! as stranded as the original was, and the pass resumes the tip's own
+//! newest conversation. Each dispatched resume is then VERIFIED after a
+//! short window — a continuation that died on arrival is reclassified,
+//! never counted as readopted — and the agenda streak brake (suspension)
+//! propagates across the whole lineage so re-eligibility can never stand
+//! a suspended series back up through its continuation's candidacy.
 //!
 //! The pass is visible: one summary notification when there was anything
-//! to consider, and silence on clean boots. `[readopt] enabled = false`
-//! in intendant.toml (or `INTENDANT_BOOT_READOPT=0`) disables it.
+//! to consider — confirmed-alive, died-after-dispatch, and left-dead
+//! reported apart — and silence on clean boots. `[readopt] enabled =
+//! false` in intendant.toml (or `INTENDANT_BOOT_READOPT=0`) disables it.
 
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::handover::HandoverRuntime;
@@ -73,6 +84,14 @@ const READOPT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// store-scan classes alone (the scheduler may be disabled or its
 /// journal unavailable).
 const AGENDA_SEED_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The post-dispatch verification window: dispatches are not outcomes,
+/// so the pass holds its summary until the resumes have had this long to
+/// spawn, register, and stay up — a healthy continuation admits itself
+/// and registers within seconds, while the first production run's zombie
+/// died in ~1 s and was still counted as "readopted" by the dispatch-time
+/// bookkeeping this window replaces.
+const READOPT_VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One dead-boot `started`-without-terminal occurrence, as classified by
 /// the agenda scheduler's boot recovery pass (`resolve_lost_sessions`,
@@ -180,6 +199,43 @@ pub(crate) enum ReadoptDecision {
     LeftDead(String),
 }
 
+/// One dispatched resume, held for outcome verification: the summary
+/// records what happened to it, never the dispatch itself.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadoptDispatch {
+    pub(crate) session_id: String,
+    pub(crate) class: MidWorkClass,
+}
+
+/// The ONE durable mid-work classification, shared by the store scan and
+/// the lineage-tip evaluation (two readers of the same vocabulary WILL
+/// drift): `running` (the daemon died with the turn in flight) and
+/// `interrupted` (a signal shutdown marked it on the way down) are
+/// mid-turn; a pending limit park is parked work; everything else is
+/// idle-in-idle-out.
+pub(crate) fn midwork_class(meta: &SessionMeta) -> Option<MidWorkClass> {
+    let status = meta.status.as_deref().unwrap_or("");
+    if matches!(status, "running" | "interrupted") {
+        return Some(MidWorkClass::MidTurn);
+    }
+    if meta
+        .limit_park
+        .as_ref()
+        .is_some_and(|park| park.has_pending)
+        && status != "completed"
+    {
+        return Some(MidWorkClass::LimitPark);
+    }
+    None
+}
+
+/// The durable meta of a session dir, when one is readable.
+fn session_meta_for(home: &Path, session_id: &str) -> Option<SessionMeta> {
+    let dir = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)?;
+    let raw = std::fs::read_to_string(dir.join("session_meta.json")).ok()?;
+    serde_json::from_str::<SessionMeta>(&raw).ok()
+}
+
 /// The boot watershed: this boot's presence-registration instant, in
 /// epoch seconds. Sessions whose durable activity predates it belong to
 /// dead boots. `None` when presence is unreadable — the pass then
@@ -243,17 +299,7 @@ pub(crate) fn scan_store_candidates(
         if activity_secs >= watershed_secs {
             continue; // current boot's era — not the dead boot's
         }
-        let status = meta.status.as_deref().unwrap_or("");
-        let class = if matches!(status, "running" | "interrupted") {
-            MidWorkClass::MidTurn
-        } else if meta
-            .limit_park
-            .as_ref()
-            .is_some_and(|park| park.has_pending)
-            && status != "completed"
-        {
-            MidWorkClass::LimitPark
-        } else {
+        let Some(class) = midwork_class(&meta) else {
             continue; // idle in, idle out
         };
         candidates.push(ReadoptCandidate {
@@ -302,15 +348,48 @@ pub(crate) fn merge_candidates(
     store
 }
 
+/// The streak brake reaches the whole lineage: an agenda seed carries
+/// suspension for ONE session id, but the suspended series' dead
+/// continuation can surface as its own (store-class) candidate — standing
+/// it back up would bypass the brake the owner was told suspended the
+/// series. Spread suspension across every wrapper the suspended
+/// candidates' lineages record before deciding.
+pub(crate) fn propagate_suspension(home: &Path, candidates: &mut [ReadoptCandidate]) {
+    let suspended_seeds: Vec<String> = candidates
+        .iter()
+        .filter(|candidate| candidate.suspended)
+        .map(|candidate| candidate.session_id.clone())
+        .collect();
+    if suspended_seeds.is_empty() {
+        return;
+    }
+    let mut members: HashSet<String> = HashSet::new();
+    for seed in &suspended_seeds {
+        let lineage =
+            crate::session_supervisor::resume_lineage::resolve_resume_lineage(home, &[seed]);
+        for record in &lineage.wrapper_records {
+            members.insert(record.intendant_session_id.clone());
+        }
+    }
+    for candidate in candidates.iter_mut() {
+        if members.contains(&candidate.session_id) {
+            candidate.suspended = true;
+        }
+    }
+}
+
 /// The per-candidate guard ladder. Everything here reads durable state
-/// only; the resume lane's own admission (`admit`, intent `Resume`)
-/// stays the authoritative CAS gate — this ladder exists so refusals we
-/// can see coming are counted as honest left-dead reasons instead of
-/// spawn-time warnings.
+/// only, plus the live-wrapper snapshot for the one question durable
+/// state cannot answer — whether an admitted successor is alive NOW; the
+/// resume lane's own admission (`admit`, intent `Resume`) stays the
+/// authoritative CAS gate — this ladder exists so refusals we can see
+/// coming are counted as honest left-dead reasons instead of spawn-time
+/// warnings.
 pub(crate) fn decide_candidate(
     home: &Path,
     candidate: &ReadoptCandidate,
     now_secs: u64,
+    live: &HashSet<String>,
 ) -> ReadoptDecision {
     if candidate.suspended {
         return ReadoptDecision::LeftDead(
@@ -340,18 +419,66 @@ pub(crate) fn decide_candidate(
     if lineage.stopped_by_user {
         return ReadoptDecision::LeftDead("owner stopped this lineage".to_string());
     }
-    let excluded: Vec<&str> = vec![candidate.session_id.as_str()];
-    if let Some(tip) = lineage.successor_tip(&excluded) {
-        return ReadoptDecision::LeftDead(format!(
-            "already continued under session {}",
-            short_id(&tip.intendant_session_id)
-        ));
-    }
-    let project_root = crate::external_wrapper_index::recorded_project_root_for_wrapper(
-        home,
-        &candidate.session_id,
-    )
-    .map(PathBuf::from);
+    // The lineage tip is the newest ACTIVE wrapper — possibly the
+    // candidate itself (its own newest conversation generation), possibly
+    // an admitted continuation. "Already continued" is a marker to
+    // EVALUATE, never a terminal verdict: a dispatched continuation that
+    // the next shutdown killed mid-work leaves the lineage exactly as
+    // stranded as the original was (the 2026-07-29 two-boot specimen), so
+    // a dead tip is judged by its own durable state, and a still-mid-work
+    // tip is resumed in the candidate's stead.
+    let (resume_source, resume_conversation, resume_root_key) = match lineage.successor_tip(&[]) {
+        Some(tip) if tip.intendant_session_id != candidate.session_id => {
+            let tip_id = tip.intendant_session_id.clone();
+            if live.contains(&tip_id) {
+                return ReadoptDecision::LeftDead(format!(
+                    "already continued under session {} (live)",
+                    short_id(&tip_id)
+                ));
+            }
+            match session_meta_for(home, &tip_id) {
+                Some(meta) if midwork_class(&meta).is_some() => {
+                    // Dead mid-work continuation: the work is still
+                    // stranded — resume the tip's own conversation (the
+                    // newest generation carries every turn the
+                    // continuation added).
+                    (tip.source.clone(), tip.backend_session_id.clone(), tip_id)
+                }
+                Some(meta) => {
+                    return ReadoptDecision::LeftDead(format!(
+                        "already continued under session {} — that continuation concluded ({})",
+                        short_id(&tip_id),
+                        meta.status.as_deref().unwrap_or("no status")
+                    ));
+                }
+                // No durable state to judge the tip by: fail toward
+                // leaving it down (idle in, idle out).
+                None => {
+                    return ReadoptDecision::LeftDead(format!(
+                        "already continued under session {}",
+                        short_id(&tip_id)
+                    ));
+                }
+            }
+        }
+        // The candidate is its own tip: resume its newest recorded
+        // conversation — the ACTIVE row. (A resumed wrapper's eager row
+        // on its predecessor's conversation is superseded once its own
+        // identity lands; resuming that superseded generation would drop
+        // the newest turns.)
+        Some(tip) => (
+            tip.source.clone(),
+            tip.backend_session_id.clone(),
+            candidate.session_id.clone(),
+        ),
+        // No active row anywhere in the lineage (demotions, pruned dirs):
+        // fall back to the candidate's first recorded conversation, as
+        // the manual lane would.
+        None => (source, backend_session_id, candidate.session_id.clone()),
+    };
+    let project_root =
+        crate::external_wrapper_index::recorded_project_root_for_wrapper(home, &resume_root_key)
+            .map(PathBuf::from);
     if let Some(root) = &project_root {
         if !root.is_dir() {
             return ReadoptDecision::LeftDead(format!(
@@ -367,8 +494,8 @@ pub(crate) fn decide_candidate(
     // to a live wrapper instead of double-spawning; it must never be
     // the tombstone-clearing `Revive`/`Restart`.
     ReadoptDecision::Readopt(Box::new(ControlMsg::ResumeSession {
-        source,
-        session_id: backend_session_id,
+        source: resume_source,
+        session_id: resume_conversation,
         resume_id: None,
         project_root: project_root.map(|root| root.to_string_lossy().to_string()),
         task: Some(READOPT_CONTINUATION_TEXT.to_string()),
@@ -389,26 +516,84 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// Outcome verification for the dispatched resumes: a dispatch is
+/// CONFIRMED once any wrapper in the candidate's lineage is live at
+/// verification time — the fresh continuation admits itself onto the
+/// resumed conversation via the eager identity, and a resume the
+/// admission routed to an existing live wrapper counts the same way.
+/// Everything else is reclassified honestly (`None` for `live` means the
+/// registry could not be read: never confirm on a guess). The bookkeeping
+/// records outcomes, not dispatches.
+pub(crate) fn verify_dispatches(
+    home: &Path,
+    dispatched: &[ReadoptDispatch],
+    live: Option<&HashSet<String>>,
+) -> (Vec<(String, MidWorkClass)>, Vec<(String, String)>) {
+    let mut confirmed = Vec::new();
+    let mut died = Vec::new();
+    for dispatch in dispatched {
+        let Some(live) = live else {
+            died.push((
+                dispatch.session_id.clone(),
+                "resume dispatched, but liveness could not be verified (registry unavailable)"
+                    .to_string(),
+            ));
+            continue;
+        };
+        let lineage = crate::session_supervisor::resume_lineage::resolve_resume_lineage(
+            home,
+            &[&dispatch.session_id],
+        );
+        if lineage
+            .wrapper_records
+            .iter()
+            .any(|record| live.contains(&record.intendant_session_id))
+        {
+            confirmed.push((dispatch.session_id.clone(), dispatch.class));
+        } else {
+            died.push((
+                dispatch.session_id.clone(),
+                format!(
+                    "resume dispatched, but no live continuation within {}s",
+                    READOPT_VERIFY_WINDOW.as_secs()
+                ),
+            ));
+        }
+    }
+    (confirmed, died)
+}
+
 /// The visible summary: one notification per boot with candidates, id
 /// keyed by boot so repeats never stack, silence when nothing was
-/// mid-work.
+/// mid-work. Only VERIFIED continuations count as readopted — a resume
+/// that died after dispatch is named separately, with its reason.
 pub(crate) fn summary_notification(
     boot_id: &str,
-    readopted: &[(String, MidWorkClass)],
+    confirmed: &[(String, MidWorkClass)],
+    died: &[(String, String)],
     left_dead: &[(String, String)],
 ) -> Option<AppEvent> {
-    if readopted.is_empty() && left_dead.is_empty() {
+    if confirmed.is_empty() && died.is_empty() && left_dead.is_empty() {
         return None;
     }
     let mut lines = Vec::new();
-    if !readopted.is_empty() {
+    if !confirmed.is_empty() {
         lines.push(format!(
-            "Resuming: {}.",
-            readopted
+            "Readopted (confirmed alive): {}.",
+            confirmed
                 .iter()
                 .map(|(id, class)| format!("{} ({})", short_id(id), class.label()))
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    }
+    if !died.is_empty() {
+        lines.push(format!(
+            "Resumed but died: {}.",
+            died.iter()
+                .map(|(id, reason)| format!("{} — {}", short_id(id), reason))
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
     if !left_dead.is_empty() {
@@ -424,14 +609,18 @@ pub(crate) fn summary_notification(
         }
         lines.push(format!("Left as they were: {detail}."));
     }
+    let mut title = format!(
+        "Crash recovery: {} session(s) readopted",
+        confirmed.len()
+    );
+    if !died.is_empty() {
+        title.push_str(&format!(", {} resume(s) died", died.len()));
+    }
+    title.push_str(&format!(", {} left dead", left_dead.len()));
     Some(AppEvent::UserNotification {
         session_id: None,
         id: format!("boot-readopt-{boot_id}"),
-        title: Some(format!(
-            "Crash recovery: {} session(s) readopted, {} left dead",
-            readopted.len(),
-            left_dead.len()
-        )),
+        title: Some(title),
         text: lines.join(" "),
         urgency: crate::types::NotificationUrgency::Attention,
         ts: now_ms(),
@@ -454,13 +643,21 @@ mod tests {
         crate::platform::intendant_home_in(home).join("logs")
     }
 
-    /// A wrapper log dir announcing its backend conversation — the same
+    /// A wrapper log dir announcing its backend conversation(s) — the same
     /// eager-identity write live wrappers perform (meta + wrapper-index
-    /// row), borrowed from the resume-lineage tests.
-    fn announce(home: &Path, wrapper: &str, backend_id: &str) {
+    /// row), borrowed from the resume-lineage tests. A resumed wrapper
+    /// announces its predecessor's conversation first (the eager row) and
+    /// its own once the backend reports it.
+    fn announce_ids(home: &Path, wrapper: &str, backend_ids: &[&str]) {
         let mut log = SessionLog::open(logs_root(home).join(wrapper)).unwrap();
         log.write_meta(None, None);
-        log.session_identity(wrapper, "claude-code", backend_id);
+        for backend_id in backend_ids {
+            log.session_identity(wrapper, "claude-code", backend_id);
+        }
+    }
+
+    fn announce(home: &Path, wrapper: &str, backend_id: &str) {
+        announce_ids(home, wrapper, &[backend_id]);
     }
 
     fn write_meta(
@@ -568,9 +765,9 @@ mod tests {
         );
     }
 
-    /// The automatic lane never stands a second wrapper beside an
-    /// admitted successor: a lineage whose index already shows an
-    /// active wrapper past the dead session is left dead.
+    /// The automatic lane never stands a second wrapper beside a LIVE
+    /// admitted successor: a lineage whose tip is alive right now is left
+    /// dead, whatever the dead candidate's own markers say.
     #[test]
     fn readopt_never_spawns_beside_live_successor() {
         let home = tempfile::tempdir().unwrap();
@@ -582,14 +779,15 @@ mod tests {
             suspended: false,
             activity_secs: now_secs(),
         };
-        match decide_candidate(home.path(), &candidate, now_secs()) {
+        let live: HashSet<String> = ["wrapper-successor".to_string()].into_iter().collect();
+        match decide_candidate(home.path(), &candidate, now_secs(), &live) {
             ReadoptDecision::LeftDead(reason) => {
                 assert!(
                     reason.contains("already continued"),
                     "successor refusal names the cause: {reason}"
                 );
             }
-            other => panic!("expected LeftDead beside a successor, got {other:?}"),
+            other => panic!("expected LeftDead beside a live successor, got {other:?}"),
         }
     }
 
@@ -624,7 +822,7 @@ mod tests {
             suspended: false,
             activity_secs: now_secs(),
         };
-        match decide_candidate(home.path(), &candidate, now_secs()) {
+        match decide_candidate(home.path(), &candidate, now_secs(), &HashSet::new()) {
             ReadoptDecision::Readopt(resume) => match *resume {
                 ControlMsg::ResumeSession {
                     source,
@@ -669,7 +867,7 @@ mod tests {
         };
         assert!(
             matches!(
-                decide_candidate(home.path(), &suspended, now_secs()),
+                decide_candidate(home.path(), &suspended, now_secs(), &HashSet::new()),
                 ReadoptDecision::LeftDead(reason) if reason.contains("suspended")
             ),
             "a suspended series is never stood back up"
@@ -686,7 +884,7 @@ mod tests {
         };
         assert!(
             matches!(
-                decide_candidate(home.path(), &stopped, now_secs()),
+                decide_candidate(home.path(), &stopped, now_secs(), &HashSet::new()),
                 ReadoptDecision::LeftDead(reason) if reason.contains("owner stopped")
             ),
             "an owner stop is terminal for the automatic lane"
@@ -700,7 +898,7 @@ mod tests {
         };
         assert!(
             matches!(
-                decide_candidate(home.path(), &native, now_secs()),
+                decide_candidate(home.path(), &native, now_secs(), &HashSet::new()),
                 ReadoptDecision::LeftDead(reason) if reason.contains("no external resume lineage")
             ),
             "no recorded conversation ⇒ nothing to resume-attach"
@@ -715,7 +913,7 @@ mod tests {
         };
         assert!(
             matches!(
-                decide_candidate(home.path(), &stale, now_secs()),
+                decide_candidate(home.path(), &stale, now_secs(), &HashSet::new()),
                 ReadoptDecision::LeftDead(reason) if reason.contains("stale")
             ),
             "stale sessions are archaeology, not crash recovery"
@@ -752,7 +950,7 @@ mod tests {
     #[test]
     fn readopt_is_visible_and_summarized() {
         assert!(
-            summary_notification("boot-a", &[], &[]).is_none(),
+            summary_notification("boot-a", &[], &[], &[]).is_none(),
             "a clean boot stays silent"
         );
         let readopted = vec![
@@ -763,7 +961,7 @@ mod tests {
             "cccccccc-3333".to_string(),
             "owner stopped this lineage".to_string(),
         )];
-        match summary_notification("boot-a", &readopted, &left_dead) {
+        match summary_notification("boot-a", &readopted, &[], &left_dead) {
             Some(AppEvent::UserNotification {
                 session_id,
                 id,
@@ -788,6 +986,280 @@ mod tests {
                 assert!(
                     text.contains("cccccccc") && text.contains("owner stopped"),
                     "left-dead sessions carry their reasons: {text}"
+                );
+            }
+            other => panic!("expected one UserNotification, got {other:?}"),
+        }
+    }
+
+    /// The 2026-07-29 two-boot specimen, end to end: a dying boot marks
+    /// its dispatched continuation "interrupted during signal shutdown",
+    /// the continuation's own teardown then writes its summary (which
+    /// must NOT rewrite the marker as "completed" — the clobber that
+    /// stranded three real seats), and the successor boot's scan picks
+    /// the stranded continuation up as a mid-turn candidate whose
+    /// decision is a resume.
+    #[test]
+    fn swap_killed_continuation_leaves_session_re_eligible_next_boot() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-orig", "b1-conv");
+
+        // The continuation the dead boot dispatched: resumed b1 (the
+        // eager row) and upgraded to its own conversation, then was
+        // killed mid-turn by the next shutdown — the signal handler
+        // marks it (SessionLog::Drop rides the same running→interrupted
+        // marker), and the teardown the kill triggers writes the summary
+        // afterward.
+        {
+            let mut log = SessionLog::open(logs_root(home.path()).join("wrapper-cont")).unwrap();
+            log.write_meta(None, None); // status: running (mid-turn)
+            log.session_identity("wrapper-cont", "claude-code", "b1-conv");
+            log.session_identity("wrapper-cont", "claude-code", "b2-conv");
+        }
+        {
+            let mut log = SessionLog::open(logs_root(home.path()).join("wrapper-cont")).unwrap();
+            log.write_summary("task", "Claude Code process closed stdout", 22);
+        }
+        let meta: SessionMeta = serde_json::from_str(
+            &std::fs::read_to_string(
+                logs_root(home.path())
+                    .join("wrapper-cont")
+                    .join("session_meta.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            meta.status.as_deref(),
+            Some("interrupted"),
+            "the kill's own teardown must not rewrite the shutdown marker"
+        );
+
+        // The successor boot's scan picks the stranded continuation up…
+        let candidates = scan_store_candidates(home.path(), u64::MAX, &HashSet::new());
+        let continuation = candidates
+            .iter()
+            .find(|candidate| candidate.session_id == "wrapper-cont")
+            .expect("the swap-killed continuation is re-eligible next boot");
+        assert_eq!(continuation.class, MidWorkClass::MidTurn);
+
+        // …and both its own decision and the stranded original's converge
+        // on resuming the tip's newest conversation.
+        let original = ReadoptCandidate {
+            session_id: "wrapper-orig".to_string(),
+            class: MidWorkClass::MidTurn,
+            suspended: false,
+            activity_secs: now_secs(),
+        };
+        for candidate in [continuation.clone(), original] {
+            match decide_candidate(home.path(), &candidate, now_secs(), &HashSet::new()) {
+                ReadoptDecision::Readopt(resume) => match *resume {
+                    ControlMsg::ResumeSession { session_id, .. } => {
+                        assert_eq!(
+                            session_id, "b2-conv",
+                            "the resume targets the tip's own conversation"
+                        );
+                    }
+                    other => panic!("expected ResumeSession, got {other:?}"),
+                },
+                other => panic!(
+                    "{} must be re-eligible after the swap kill, got {other:?}",
+                    candidate.session_id
+                ),
+            }
+        }
+    }
+
+    /// "Already continued" is evaluated, never terminal: a LIVE successor
+    /// still refuses (the #652 law), a dead mid-work successor hands the
+    /// resume to the lineage tip — its own newest conversation, never a
+    /// superseded generation — and a dead successor that concluded leaves
+    /// the lineage down.
+    #[test]
+    fn already_continued_evaluates_the_lineage_tip() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-orig", "b1-conv");
+        announce_ids(home.path(), "wrapper-cont", &["b1-conv", "b2-conv"]);
+        let candidate = ReadoptCandidate {
+            session_id: "wrapper-orig".to_string(),
+            class: MidWorkClass::MidTurn,
+            suspended: false,
+            activity_secs: now_secs(),
+        };
+
+        // Dead mid-work tip (announce leaves its meta "running", the
+        // crash shape): the original's decision resumes the TIP's own
+        // conversation — the generation carrying every turn the
+        // continuation added.
+        match decide_candidate(home.path(), &candidate, now_secs(), &HashSet::new()) {
+            ReadoptDecision::Readopt(resume) => match *resume {
+                ControlMsg::ResumeSession {
+                    source, session_id, ..
+                } => {
+                    assert_eq!(source, "claude-code");
+                    assert_eq!(
+                        session_id, "b2-conv",
+                        "the tip's own active conversation, never the superseded eager row"
+                    );
+                }
+                other => panic!("expected ResumeSession, got {other:?}"),
+            },
+            other => panic!(
+                "a dead mid-work continuation leaves the lineage re-eligible, got {other:?}"
+            ),
+        }
+
+        // The same tip, live: the automatic lane never doubles it.
+        let live: HashSet<String> = ["wrapper-cont".to_string()].into_iter().collect();
+        match decide_candidate(home.path(), &candidate, now_secs(), &live) {
+            ReadoptDecision::LeftDead(reason) => {
+                assert!(
+                    reason.contains("already continued") && reason.contains("(live)"),
+                    "a live successor refuses with the cause: {reason}"
+                );
+            }
+            other => panic!("expected LeftDead beside a live successor, got {other:?}"),
+        }
+
+        // The same tip, dead and concluded: the work ended — stay down.
+        write_meta(home.path(), "wrapper-cont", "completed", None);
+        match decide_candidate(home.path(), &candidate, now_secs(), &HashSet::new()) {
+            ReadoptDecision::LeftDead(reason) => {
+                assert!(
+                    reason.contains("concluded"),
+                    "a concluded continuation ends the lineage: {reason}"
+                );
+            }
+            other => panic!("expected LeftDead past a concluded tip, got {other:?}"),
+        }
+    }
+
+    /// The trap from the commissioning card: re-eligibility must not
+    /// stand a suspended series back up through its continuation's own
+    /// store-class candidacy. The agenda seed carries suspension for one
+    /// session id; propagation spreads it across the lineage before
+    /// anything decides, and the brake's verdict stays surfaced, never
+    /// silent.
+    #[test]
+    fn re_eligibility_bounded_by_streak_brake() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-orig", "b1-conv");
+        announce_ids(home.path(), "wrapper-cont", &["b1-conv", "b2-conv"]);
+        let mut candidates = vec![
+            ReadoptCandidate {
+                session_id: "wrapper-cont".to_string(),
+                class: MidWorkClass::MidTurn,
+                suspended: false,
+                activity_secs: now_secs(),
+            },
+            ReadoptCandidate {
+                session_id: "wrapper-orig".to_string(),
+                class: MidWorkClass::Agenda,
+                suspended: true,
+                activity_secs: now_secs(),
+            },
+        ];
+        propagate_suspension(home.path(), &mut candidates);
+        assert!(
+            candidates.iter().all(|candidate| candidate.suspended),
+            "suspension reaches every lineage member: {candidates:?}"
+        );
+        match decide_candidate(home.path(), &candidates[0], now_secs(), &HashSet::new()) {
+            ReadoptDecision::LeftDead(reason) => {
+                assert!(
+                    reason.contains("suspended"),
+                    "the brake's verdict is surfaced: {reason}"
+                );
+            }
+            other => panic!("a suspended lineage is never stood back up, got {other:?}"),
+        }
+    }
+
+    /// Dispatches are not outcomes: the verification pass records what
+    /// actually happened. A dispatched resume whose lineage shows a live
+    /// wrapper afterward is confirmed; one whose continuation died (the
+    /// first production run's zombie died in ~1 s) is reclassified — and
+    /// an unavailable registry never inflates the confirmed count.
+    #[test]
+    fn readopt_records_outcomes_not_dispatches() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-dead", "b1-conv");
+        // The continuation the dispatch spawned, admitted onto the
+        // resumed conversation via the eager identity.
+        announce(home.path(), "wrapper-fresh", "b1-conv");
+        let dispatched = vec![ReadoptDispatch {
+            session_id: "wrapper-dead".to_string(),
+            class: MidWorkClass::MidTurn,
+        }];
+
+        let live: HashSet<String> = ["wrapper-fresh".to_string()].into_iter().collect();
+        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, Some(&live));
+        assert_eq!(
+            confirmed,
+            vec![("wrapper-dead".to_string(), MidWorkClass::MidTurn)],
+            "a live continuation confirms the dispatch"
+        );
+        assert!(died.is_empty());
+
+        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, Some(&HashSet::new()));
+        assert!(
+            confirmed.is_empty(),
+            "a resume that died is never recorded as a readopt"
+        );
+        assert_eq!(died.len(), 1);
+        assert!(
+            died[0].1.contains("no live continuation"),
+            "the reclassification names the cause: {}",
+            died[0].1
+        );
+
+        let (confirmed, died) = verify_dispatches(home.path(), &dispatched, None);
+        assert!(confirmed.is_empty(), "an unreadable registry never confirms");
+        assert!(
+            died[0].1.contains("could not be verified"),
+            "the unverifiable case is honest about itself: {}",
+            died[0].1
+        );
+    }
+
+    /// Summary honesty: only confirmed continuations count as readopted —
+    /// a resume dead in seconds never does; it is named separately with
+    /// its reason.
+    #[test]
+    fn boot_summary_separates_dispatched_from_confirmed_alive() {
+        let confirmed = vec![("aaaaaaaa-1111".to_string(), MidWorkClass::MidTurn)];
+        let died = vec![(
+            "bbbbbbbb-2222".to_string(),
+            "resume dispatched, but no live continuation within 60s".to_string(),
+        )];
+        match summary_notification("boot-b", &confirmed, &died, &[]) {
+            Some(AppEvent::UserNotification { title, text, .. }) => {
+                let title = title.expect("titled");
+                assert!(
+                    title.contains("1 session(s) readopted"),
+                    "only CONFIRMED continuations count as readopted: {title}"
+                );
+                assert!(
+                    title.contains("1 resume(s) died"),
+                    "died dispatches are counted apart, never folded in: {title}"
+                );
+                assert!(
+                    text.contains("aaaaaaaa") && text.contains("confirmed alive"),
+                    "confirmed sessions are labeled as such: {text}"
+                );
+                assert!(
+                    text.contains("bbbbbbbb") && text.contains("no live continuation"),
+                    "died dispatches carry their reasons: {text}"
+                );
+            }
+            other => panic!("expected one UserNotification, got {other:?}"),
+        }
+        // A boot whose every dispatch died reports zero readopted.
+        match summary_notification("boot-b", &[], &died, &[]) {
+            Some(AppEvent::UserNotification { title, .. }) => {
+                assert!(
+                    title.expect("titled").contains("0 session(s) readopted"),
+                    "a resume dead in seconds never counts as readopted"
                 );
             }
             other => panic!("expected one UserNotification, got {other:?}"),
@@ -895,26 +1367,53 @@ pub(crate) async fn run_boot_readopt_pass(
     if candidates.is_empty() {
         return;
     }
+    // The streak brake reaches the whole lineage before anything decides.
+    propagate_suspension(&home, &mut candidates);
     let now_secs = crate::session_activity::epoch_seconds();
-    let mut readopted: Vec<(String, MidWorkClass)> = Vec::new();
+    let mut dispatched: Vec<ReadoptDispatch> = Vec::new();
+    let mut dispatched_conversations: HashSet<(String, String)> = HashSet::new();
     let mut left_dead: Vec<(String, String)> = Vec::new();
     for candidate in candidates {
-        if readopted.len() >= READOPT_MAX_PER_BOOT {
+        if dispatched.len() >= READOPT_MAX_PER_BOOT {
             left_dead.push((
                 candidate.session_id,
                 format!("per-boot readopt cap ({READOPT_MAX_PER_BOOT}) reached"),
             ));
             continue;
         }
-        match decide_candidate(&home, &candidate, now_secs) {
+        match decide_candidate(&home, &candidate, now_secs, &live) {
             ReadoptDecision::Readopt(resume) => {
+                // One resume per lineage per boot: a stranded original and
+                // its dead mid-work continuation both resolve to the tip's
+                // conversation (candidates run newest-first, so the tip
+                // decides first), and the second dispatch would only race
+                // the admission CAS.
+                if let ControlMsg::ResumeSession {
+                    source, session_id, ..
+                } = resume.as_ref()
+                {
+                    if !dispatched_conversations.insert((source.clone(), session_id.clone())) {
+                        let reason =
+                            "already continued — its lineage's resume was dispatched this boot"
+                                .to_string();
+                        eprintln!(
+                            "[readopt] leaving {} dead: {reason}",
+                            short_id(&candidate.session_id)
+                        );
+                        left_dead.push((candidate.session_id, reason));
+                        continue;
+                    }
+                }
                 eprintln!(
                     "[readopt] resuming {} ({}) after the daemon restart",
                     short_id(&candidate.session_id),
                     candidate.class.label()
                 );
                 bus.send(AppEvent::ControlCommand(*resume));
-                readopted.push((candidate.session_id, candidate.class));
+                dispatched.push(ReadoptDispatch {
+                    session_id: candidate.session_id,
+                    class: candidate.class,
+                });
             }
             ReadoptDecision::LeftDead(reason) => {
                 eprintln!(
@@ -925,7 +1424,46 @@ pub(crate) async fn run_boot_readopt_pass(
             }
         }
     }
-    if let Some(notification) = summary_notification(handover.boot_id(), &readopted, &left_dead) {
+    // Dispatches are not outcomes: hold the summary until the resumes have
+    // had the verify window to spawn, register, and stay up, then record
+    // what actually happened to each.
+    let (confirmed, died) = if dispatched.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        tokio::time::sleep(READOPT_VERIFY_WINDOW).await;
+        let live_now = fetch_live_wrapper_ids_with_retry().await;
+        let (confirmed, died) = verify_dispatches(&home, &dispatched, live_now.as_ref());
+        for (id, _) in &confirmed {
+            eprintln!(
+                "[readopt] confirmed {} alive after the verify window",
+                short_id(id)
+            );
+        }
+        for (id, reason) in &died {
+            eprintln!("[readopt] reclassifying {}: {reason}", short_id(id));
+        }
+        (confirmed, died)
+    };
+    if let Some(notification) =
+        summary_notification(handover.boot_id(), &confirmed, &died, &left_dead)
+    {
         bus.send(notification);
     }
+}
+
+/// The live-wrapper snapshot, retried briefly: `live_wrapper_ids` is a
+/// try-lock read (contention yields `None`), and the verify pass must not
+/// reclassify every dispatch as dead because the registry was busy for
+/// one probe. A persistent `None` stays `None` — the caller never
+/// confirms on a guess.
+async fn fetch_live_wrapper_ids_with_retry() -> Option<HashSet<String>> {
+    for _ in 0..5 {
+        if let Some(live) = crate::session_supervisor::published_live_session_registry()
+            .and_then(|registry| registry.live_wrapper_ids())
+        {
+            return Some(live);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    None
 }
