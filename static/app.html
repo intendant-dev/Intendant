@@ -24906,9 +24906,16 @@ html.ui-v2 .agenda-card-add input:focus {
    #vitals-explainer house mechanics, in the agenda's token vocabulary.
    Nothing here depends on hover. */
 #agenda-start-sheet[hidden],
-#agenda-automation-sheet[hidden] { display: none; }
+#agenda-automation-sheet[hidden],
+#agenda-workflow-sheet[hidden],
+#agenda-adopt-sheet[hidden] { display: none; }
 #agenda-start-sheet .ags-backdrop,
 #agenda-automation-sheet .ags-backdrop { display: none; }
+/* The workflow approval and adopt sheets keep their backdrop in BOTH
+   form factors — they are modal ceremonies opened from mid-flow, not
+   anchored popovers. */
+#agenda-workflow-sheet .ags-backdrop,
+#agenda-adopt-sheet .ags-backdrop,
 #agenda-start-sheet.sheet .ags-backdrop,
 #agenda-automation-sheet.sheet .ags-backdrop {
   display: block;
@@ -24918,7 +24925,9 @@ html.ui-v2 .agenda-card-add input:focus {
   background: rgba(0, 0, 0, 0.45);
 }
 #agenda-start-sheet .ags-panel,
-#agenda-automation-sheet .ags-panel {
+#agenda-automation-sheet .ags-panel,
+#agenda-workflow-sheet .ags-panel,
+#agenda-adopt-sheet .ags-panel {
   position: fixed;
   z-index: 941;
   display: flex;
@@ -24936,8 +24945,30 @@ html.ui-v2 .agenda-card-add input:focus {
   line-height: 1.5;
   color: var(--text-2);
 }
+/* The panel is a max-height flex column that SCROLLS — children keep
+   their natural height. Without this, overflowing content makes
+   flexbox crush every child proportionally before overflow-y engages,
+   and the picker strip renders as a clipped sliver (observed live on
+   the owner's tab, 2026-07-29). */
+#agenda-start-sheet .ags-panel > *,
+#agenda-automation-sheet .ags-panel > *,
+#agenda-workflow-sheet .ags-panel > *,
+#agenda-adopt-sheet .ags-panel > * {
+  flex-shrink: 0;
+}
+/* Anchorless modal panels center themselves — their JS never sets
+   left/top (the anchored-popover path); inline coordinates would win
+   here if it ever did. */
+#agenda-workflow-sheet:not(.sheet) .ags-panel,
+#agenda-adopt-sheet:not(.sheet) .ags-panel {
+  left: 50%;
+  top: max(48px, 12vh);
+  transform: translateX(-50%);
+}
 #agenda-start-sheet.sheet .ags-panel,
-#agenda-automation-sheet.sheet .ags-panel {
+#agenda-automation-sheet.sheet .ags-panel,
+#agenda-workflow-sheet.sheet .ags-panel,
+#agenda-adopt-sheet.sheet .ags-panel {
   left: 0;
   right: 0;
   bottom: 0;
@@ -25107,7 +25138,14 @@ html.ui-v2 .agenda-card-add input:focus {
 
 /* ---- Automate sheet (Track AW stamp-a-definition) ---- */
 
-html.ui-v2 .agsx-panel { max-width: 560px; }
+/* Definition surfaces get the wider panel — ID-scoped so it actually
+   outweighs the ID-scoped base rule's `width` (the old bare
+   `.agsx-panel { max-width }` silently lost that fight), and
+   popover-only so the mobile bottom sheet keeps its full width. */
+#agenda-automation-sheet:not(.sheet) .ags-panel.agsx-panel,
+#agenda-workflow-sheet:not(.sheet) .ags-panel.agsx-panel {
+  width: min(560px, calc(100vw - 16px));
+}
 html.ui-v2 .agsx-preview {
   max-height: 220px;
   overflow: auto;
@@ -25278,8 +25316,12 @@ html.ui-v2 .ag2-seal-pre {
 }
 html.ui-v2 .ag2-auto-sealed { color: var(--subtext0); }
 
-/* Review & adopt: sealed vs live, hashes + dates, one confirm. */
-html.ui-v2 .ag2-adopt-panel { max-width: 760px; }
+/* Review & adopt: sealed vs live, hashes + dates, one confirm (wider
+   for the two columns; ID-scoped to outweigh the base panel width,
+   popover-only so the mobile bottom sheet keeps its full width). */
+#agenda-adopt-sheet:not(.sheet) .ags-panel.ag2-adopt-panel {
+  width: min(760px, calc(100vw - 16px));
+}
 html.ui-v2 .ag2-adopt-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -37401,7 +37443,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '9538617bb7dc4992';
+const INTENDANT_APP_BUILD = '676835cda97cab92';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
