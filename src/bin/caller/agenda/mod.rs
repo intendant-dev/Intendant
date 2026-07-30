@@ -66,6 +66,8 @@ pub(crate) use types::{
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
 #[cfg(test)]
+pub(crate) use types::session_manifest_schema_fields;
+#[cfg(test)]
 pub(crate) use types::AgendaAskResolution;
 #[cfg(test)]
 pub(crate) use types::{AgendaAttestation, AttestationOutcome};
