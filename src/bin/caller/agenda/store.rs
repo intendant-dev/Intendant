@@ -3649,7 +3649,7 @@ mod tests {
         );
 
         // The whole shape survives a reopen (fold-stable).
-        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        let reopened = AgendaStore::open(dir.path()).unwrap();
         let back = reopened.get(&item.id).unwrap();
         assert_eq!(back.tags, item.tags);
         assert_eq!(back.body, item.body);

@@ -47,8 +47,9 @@ env -u INTENDANT_MCP_URL -u INTENDANT_SESSION_ID ./target/debug/intendant ctl \
   --header Window --tag qa-decision \
   --body "Context wall. Recommendation: 14 days, fixed daemon-side constant. More prose." \
   --ref "$BRIEF" --must-read
-# note the printed item id:
+# note the printed item id, and read the CANONICALIZED ref locator back:
 ITEM=<id from the park output>
+LOCATOR=<refs[0].locator from `… agenda list --all --json`>   # /tmp → /private/tmp on macOS
 ```
 
 Verify the park landed structured: `… agenda list --json` shows the item
@@ -58,21 +59,25 @@ digest.
 ## 3. Drive the SPA — live serving + rendering assertions
 
 One idempotent `--wait-for-function` driver walks route → inspector →
-reader and returns true only when every rendering assertion holds:
+reader and returns true only when every rendering assertion holds. The
+fragments are scope-wrapped, so all driving goes through the
+`window.qa.agendaDecisionCard(drive)` closure hook (`route`/`open`/
+`readRef`/`closeReader`) — the harness never reaches agenda functions
+directly. Loopback daemons refuse tokenless owner requests: export
+`INTENDANT_LOOPBACK_TOKEN=$(cat "$QA_HOME"/loopback-tokens/$QA_PORT.token)`
+for every harness/ctl invocation (the token rotates each daemon boot).
+Note the seeded ref's locator is stored canonicalized (macOS `/tmp` →
+`/private/tmp`) — read it back from `agenda list --json`, don't assume.
 
 ```bash
 node scripts/validate-dashboard.cjs --url "http://127.0.0.1:$QA_PORT" --timeout 30000 \
-  --wait-for-function "(() => { const id='$ITEM', loc='$BRIEF';
-    if (typeof routeTo==='function') routeTo('agenda');
-    if (typeof agendaFindItem!=='function' || !agendaFindItem(id)) return false;
-    if (typeof agendaSelId==='undefined' || agendaSelId!==id) { agendaOpenInspector(id); return false; }
-    const qa = window.qa && window.qa.agendaDecisionCard && window.qa.agendaDecisionCard();
+  --wait-for-function "(() => { const qa = window.qa && window.qa.agendaDecisionCard
+      && window.qa.agendaDecisionCard({ route: true, open: '$ITEM', readRef: '$LOCATOR' });
     if (!qa) return false;
     if (!(qa.optionLabels.flat().includes('14 days (Recommended)') && qa.recommendedPills>=1)) return false;
     if (!(qa.recommendations.length>=1 && qa.recommendations[0].indexOf('14 days')===0)) return false;
     if (!(qa.openableFileRefs>=1)) return false;
-    if (!qa.refReader) { agendaOpenRefReader(id, loc); return false; }
-    if (qa.refReader.loading) return false;
+    if (!qa.refReader || qa.refReader.loading) return false;
     return qa.refReader.source==='live' && qa.refReader.drift==='unchanged' && !qa.refReader.error;
   })()" \
   --probe-json "decision=window.qa.agendaDecisionCard()"
@@ -87,25 +92,25 @@ live drift:
 ```bash
 env -u INTENDANT_MCP_URL -u INTENDANT_SESSION_ID ./target/debug/intendant ctl \
   --url "http://127.0.0.1:$QA_PORT/mcp" agenda schedule "$ITEM" \
-  --goal "qa: sealing carrier" --at +6h --binding-ref "file:$BRIEF"
-printf 'amended after sealing\n' >> "$BRIEF"
+  --goal "qa: sealing carrier" --at +6h --binding-ref "file:$LOCATOR"
+printf 'amended after sealing\n' >> "$LOCATOR"
 node scripts/validate-dashboard.cjs --url "http://127.0.0.1:$QA_PORT" --timeout 30000 \
-  --wait-for-function "(() => { const id='$ITEM', loc='$BRIEF';
-    if (typeof routeTo==='function') routeTo('agenda');
-    if (typeof agendaFindItem!=='function' || !agendaFindItem(id)) return false;
-    if (typeof agendaSelId==='undefined' || agendaSelId!==id) { agendaOpenInspector(id); return false; }
-    const qa = window.qa && window.qa.agendaDecisionCard && window.qa.agendaDecisionCard();
-    if (!qa) return false;
-    if (!qa.refReader || qa.refReader.error) { agendaOpenRefReader(id, loc); return false; }
-    if (qa.refReader.loading) return false;
+  --wait-for-function "(() => { const probe = window.qa && window.qa.agendaDecisionCard
+      && window.qa.agendaDecisionCard({ route: true, open: '$ITEM' });
+    if (!probe) return false;
+    const stale = probe.refReader && !probe.refReader.loading
+      && probe.refReader.source === 'live';
+    const qa = window.qa.agendaDecisionCard(stale
+      ? { closeReader: true } : { readRef: '$LOCATOR' });
+    if (!qa.refReader || qa.refReader.loading) return false;
     return qa.refReader.source==='sealed' && qa.refReader.drift==='changed';
   })()" \
   --probe-json "reader=window.qa.agendaDecisionCard().refReader"
 ```
 
-(The second driver re-opens the reader each poll until the fresh fetch
-lands; `source:'sealed'` proves snapshot precedence, `drift:'changed'`
-proves the live probe stays honest.)
+(The second driver closes a stale live-sourced sheet and re-reads until
+the fresh fetch lands; `source:'sealed'` proves snapshot precedence,
+`drift:'changed'` proves the live probe stays honest.)
 
 ## 5. One-click prefill (behavioral spot check)
 

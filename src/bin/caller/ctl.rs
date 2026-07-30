@@ -6108,7 +6108,7 @@ mod tests {
             "--tag",
             "track-as",
             "--ref",
-            "/tmp/findings.md",
+            "file:/tmp/findings.md",
             "--must-read",
             "--source",
             "steward",

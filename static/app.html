@@ -37296,7 +37296,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '6b70c33f7f985a1e';
+const INTENDANT_APP_BUILD = '6d270680728c7246';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -94425,10 +94425,29 @@ window.qa = Object.assign(window.qa || {}, {
     })),
     inflight: agendaPrTier2Inflight.size,
   }),
-  // Decision-card readback for the QA harness (`--probe-json` /
-  // `--wait-for-function`): the open inspector item's structured options,
-  // surfaced recommendations, and the ref-reader sheet's state.
-  agendaDecisionCard: () => {
+  // Decision-card readback + driver for the QA harness (`--probe-json` /
+  // `--wait-for-function`). Fragments are scope-wrapped, so harness code
+  // cannot reach the agenda functions directly — the optional `drive`
+  // argument is the closure-side driver (the station.activate pattern):
+  // `{route:true}` opens the Agenda tab, `{open:id}` the inspector,
+  // `{readRef:locator}` the ref reader (idempotent while that locator's
+  // sheet is up), `{closeReader:true}` closes a stale sheet first.
+  // Returns the readback: the open item's structured options, surfaced
+  // recommendations, and the ref-reader sheet's state.
+  agendaDecisionCard: (drive) => {
+    drive = drive || {};
+    if (drive.route && typeof routeTo === 'function') routeTo('agenda');
+    if (drive.open && agendaSelId !== drive.open && agendaFindItem(drive.open)) {
+      agendaOpenInspector(drive.open);
+    }
+    if (drive.closeReader && agendaSheetState && agendaSheetState.kind === 'refread') {
+      agendaSheetClose();
+    }
+    if (drive.readRef && agendaSelId
+      && !(agendaSheetState && agendaSheetState.kind === 'refread'
+        && agendaSheetState.locator === drive.readRef)) {
+      agendaOpenRefReader(agendaSelId, drive.readRef);
+    }
     const item = agendaInspItem();
     if (!item) return null;
     const sheet = agendaSheetState && agendaSheetState.kind === 'refread'

@@ -2227,17 +2227,15 @@ mod tests {
         });
         agenda
             .apply(
-                crate::agenda::AgendaCommand::Ask {
-                    questions: vec![crate::mcp::AskUserQuestionParams {
-                        question: question.to_string(),
-                        header: Some("Grid".into()),
-                        options: Vec::new(),
-                        previews: Vec::new(),
-                        pick_min: None,
-                        pick_max: None,
-                        free_text: None,
-                    }],
-                },
+                crate::agenda::AgendaCommand::ask(vec![crate::mcp::AskUserQuestionParams {
+                    question: question.to_string(),
+                    header: Some("Grid".into()),
+                    options: Vec::new(),
+                    previews: Vec::new(),
+                    pick_min: None,
+                    pick_max: None,
+                    free_text: None,
+                }]),
                 actor,
             )
             .unwrap()
