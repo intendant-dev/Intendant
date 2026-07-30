@@ -60,6 +60,7 @@ mod gateway_routes;
 mod global_store;
 mod handover;
 mod hosted_verify;
+mod pgp_identity;
 mod key_custody;
 mod lease_transcript_staging;
 mod lineage_ledger;

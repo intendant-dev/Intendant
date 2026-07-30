@@ -263,10 +263,15 @@ credentials are presented to the origin, so whatever code that name serves can
 try to wield them. The daemon-side fleet-SNI refusal plus the explicit
 lease/preset evaluator is the controlling boundary. A native app could instead
 collapse code trust to install-and-update
-moments, and the repository contains a signing/notarization pipeline, but its
-credentials are not provisioned and no Developer ID-signed/notarized release
-has been published for this alpha. Tags without those credentials produce
-clearly labelled `-unsigned-dev` artifacts. Separately, serving origins are
+moments. The release pipeline fail-closes on detached PGP signatures over
+every published artifact, committed with the signing-key fingerprint to
+the transparency log (the key is the repo's `RELEASE-SIGNING-KEY.asc`,
+pinned at compile time by `intendant hosted-verify --releases`); the
+Apple Developer ID/notarization lane stays dormant — its credentials are
+not provisioned and no Developer ID-signed/notarized release has been
+published for this alpha, so app archives keep their clearly labelled
+`-unsigned-dev` suffix and remain outside the application-anchor set.
+Separately, serving origins are
 answerable to **code transparency** —
 the artifacts an origin serves are committed to the rendezvous's public
 append-only log, and `intendant hosted-verify` re-downloads them exactly

@@ -1775,6 +1775,11 @@ struct ReleaseLeaf {
     version: String,
     platforms: Vec<String>,
     manifest_hash: String,
+    /// Primary fingerprint of the release signing key, as logged. The
+    /// log door requires it (`bin/connect/transparency.rs`), so a leaf
+    /// without one predates the PGP lane — nothing shipped from that era,
+    /// and the parser fails closed on it.
+    pgp_fingerprint: String,
     artifacts: Vec<ReleaseArtifact>,
 }
 
@@ -1840,6 +1845,19 @@ fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
     if release_manifest_hash_hex(&tag, &artifacts) != manifest_hash {
         return Err("manifest_hash does not recompute from the carried artifact list".to_string());
     }
+    let pgp_fingerprint = bounded_string(
+        leaf.get("pgp_fingerprint")
+            .and_then(|v| v.as_str())
+            .ok_or("release leaf missing pgp_fingerprint (the release signing key identity)")?,
+        "release pgp fingerprint",
+        METADATA_STRING_BYTE_CAP,
+    )?;
+    if !crate::pgp_identity::valid_pgp_fingerprint(&pgp_fingerprint) {
+        return Err(
+            "pgp_fingerprint is not a 40- or 64-char uppercase-hex OpenPGP fingerprint"
+                .to_string(),
+        );
+    }
     Ok(ReleaseLeaf {
         unix_ms: leaf.get("unix_ms").and_then(|v| v.as_u64()).unwrap_or(0),
         tag,
@@ -1871,6 +1889,7 @@ fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
                 .collect::<Result<Vec<_>, String>>()?
         },
         manifest_hash,
+        pgp_fingerprint,
         artifacts,
     })
 }
@@ -1967,6 +1986,71 @@ fn check_release_artifact(
     }
 }
 
+/// Read-side PGP identity checks over a logged release manifest: the
+/// logged fingerprint must be this binary's compiled pin, the manifest
+/// must list the public-key asset with the sha256 of the exact committed
+/// key bytes, every non-signature artifact must carry its detached
+/// `.asc`, and no signature may be stray. The coverage rules TWIN the
+/// log-door gate in
+/// `bin/connect/transparency.rs::release_signature_coverage_errors`
+/// (change both together); the fingerprint and key-byte pins exist only
+/// on this side, where the compiled-in key lives. Cryptographic
+/// signature verification stays `gpg --verify`'s job — the documented
+/// ritual this check makes trustworthy by pinning WHICH key.
+fn release_pgp_mismatches(leaf: &ReleaseLeaf) -> Vec<String> {
+    use crate::pgp_identity::{
+        RELEASE_SIGNING_KEY_ASSET, RELEASE_SIGNING_KEY_FINGERPRINT, RELEASE_SIGNING_PUBKEY_ASC,
+    };
+    let mut mismatches = Vec::new();
+    if leaf.pgp_fingerprint != RELEASE_SIGNING_KEY_FINGERPRINT {
+        mismatches.push(format!(
+            "logged signing key {} is not the release key this binary pins ({}) — verifying a \
+             fork's releases needs a hosted-verify built from that fork",
+            leaf.pgp_fingerprint, RELEASE_SIGNING_KEY_FINGERPRINT,
+        ));
+    }
+    let expected_key_sha = sha256_hex(RELEASE_SIGNING_PUBKEY_ASC.as_bytes());
+    match leaf
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == RELEASE_SIGNING_KEY_ASSET)
+    {
+        None => mismatches.push(format!(
+            "{RELEASE_SIGNING_KEY_ASSET}: not in the logged manifest — a release ships its \
+             public signing key beside the artifacts"
+        )),
+        Some(asset) if asset.sha256 != expected_key_sha => mismatches.push(format!(
+            "{RELEASE_SIGNING_KEY_ASSET}: logged sha256 {} is not the repo-committed key this \
+             binary embeds ({})",
+            short_hash(&asset.sha256),
+            short_hash(&expected_key_sha),
+        )),
+        Some(_) => {}
+    }
+    for artifact in &leaf.artifacts {
+        if let Some(base) = artifact.name.strip_suffix(".asc") {
+            if artifact.name != RELEASE_SIGNING_KEY_ASSET
+                && !leaf.artifacts.iter().any(|candidate| candidate.name == base)
+            {
+                mismatches.push(format!(
+                    "{}: detached signature without its artifact",
+                    artifact.name
+                ));
+            }
+        } else if !leaf
+            .artifacts
+            .iter()
+            .any(|candidate| candidate.name == format!("{}.asc", artifact.name))
+        {
+            mismatches.push(format!(
+                "{}: artifact without a detached .asc signature",
+                artifact.name
+            ));
+        }
+    }
+    mismatches
+}
+
 /// Assets on the release the log never blessed are loud in both modes:
 /// a quietly added artifact is exactly the equivocation this check
 /// exists to catch.
@@ -2010,6 +2094,9 @@ pub(crate) struct ReleaseVerifyReport {
     pub version: String,
     pub platforms: Vec<String>,
     pub manifest_hash: String,
+    /// Logged signing-key identity — equal to the compiled pin whenever
+    /// verification passed.
+    pub pgp_fingerprint: String,
     pub artifact_count: usize,
     /// Metadata mode: how many artifacts GitHub's API sha256 digests
     /// confirmed, vs. presence+size only.
@@ -2120,7 +2207,10 @@ pub(crate) async fn verify_hosted_release(
     };
     let assets = parse_github_assets(&release).map_err(Unavailable)?;
 
-    let mut mismatches = Vec::new();
+    // The signing-key identity and signature coverage come from the log
+    // alone; their findings aggregate with the GitHub comparison below so
+    // one run reports the whole divergence.
+    let mut mismatches = release_pgp_mismatches(&leaf);
     let mut digest_verified = 0usize;
     let mut presence_only = 0usize;
     let mut downloaded = 0usize;
@@ -2196,6 +2286,7 @@ pub(crate) async fn verify_hosted_release(
         version: leaf.version,
         platforms: leaf.platforms,
         manifest_hash: leaf.manifest_hash,
+        pgp_fingerprint: leaf.pgp_fingerprint,
         artifact_count: leaf.artifacts.len(),
         digest_verified,
         presence_only,
@@ -2333,6 +2424,20 @@ Usage: intendant hosted-verify [--connect <url>]
                     With --releases: the GitHub repository the logged
                     releases ship from (default intendant-dev/Intendant;
                     self-hosted forks override)
+  --github-api <url>
+                    With --releases: the GitHub API origin to compare
+                    against (default https://api.github.com; GitHub
+                    Enterprise forks and offline verification rigs
+                    override)
+
+--releases also checks the release's PGP identity against this binary:
+the logged signing-key fingerprint must equal the compiled-in pin of the
+repo-committed RELEASE-SIGNING-KEY.asc, the key must ship beside the
+release with exactly the committed bytes, and every artifact must carry
+its detached .asc signature. Cryptographic signature verification is
+gpg's job — after a PASS, `gpg --import RELEASE-SIGNING-KEY.asc` and
+`gpg --verify <asset>.asc <asset>` complete the ritual
+(docs/src/getting-started.md, \"Verifying a release\").
 
 Without --releases: fetches the logged artifact manifest with its
 inclusion proof and signed tree head, verifies the tree head extends the
@@ -2349,6 +2454,7 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
     let mut release_tag: Option<String> = None;
     let mut download = false;
     let mut repo: Option<String> = None;
+    let mut github_api: Option<String> = None;
     let mut iter = args.into_iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -2377,6 +2483,13 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
                     return 2;
                 }
             },
+            "--github-api" => match iter.next() {
+                Some(value) => github_api = Some(value),
+                None => {
+                    eprintln!("error: --github-api requires a URL");
+                    return 2;
+                }
+            },
             "--help" | "-h" => {
                 println!("{CLI_HELP}");
                 return 0;
@@ -2387,8 +2500,8 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
             }
         }
     }
-    if (download || repo.is_some()) && !releases {
-        eprintln!("error: --download and --repo only apply with --releases");
+    if (download || repo.is_some() || github_api.is_some()) && !releases {
+        eprintln!("error: --download, --repo, and --github-api only apply with --releases");
         return 2;
     }
     let base_raw = connect
@@ -2408,7 +2521,16 @@ pub(crate) async fn run_cli(args: Vec<String>) -> i32 {
     };
     if releases {
         let repo = repo.unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string());
-        let github_api = Url::parse(GITHUB_API_BASE).expect("static GitHub API base URL");
+        let github_api = match github_api {
+            Some(raw) => match Url::parse(&raw) {
+                Ok(url) => url,
+                Err(error) => {
+                    eprintln!("error: invalid GitHub API URL {raw:?}: {error}");
+                    return 2;
+                }
+            },
+            None => Url::parse(GITHUB_API_BASE).expect("static GitHub API base URL"),
+        };
         return run_release_cli(
             &base,
             &base_raw,
@@ -2522,6 +2644,11 @@ async fn run_release_cli(
                 report.artifact_count,
                 short_hash(&report.manifest_hash),
             );
+            println!(
+                "signing key: {} — matches this binary's pinned release key; the published key \
+                 bytes and per-artifact .asc coverage checked against the log",
+                report.pgp_fingerprint,
+            );
             if download {
                 println!(
                     "artifacts: {}/{} downloaded and sha256-verified against the log",
@@ -2549,6 +2676,11 @@ async fn run_release_cli(
                      --download for the strongest check)"
                 );
             }
+            println!(
+                "cryptographic check: gpg --import {} && gpg --verify <asset>.asc <asset> \
+                 (docs/src/getting-started.md, \"Verifying a release\")",
+                crate::pgp_identity::RELEASE_SIGNING_KEY_ASSET,
+            );
             0
         }
         Err(failure) => print_failure(
@@ -3374,12 +3506,37 @@ mod tests {
             "version": tag.trim_start_matches('v'),
             "platforms": ["macos-arm64"],
             "manifest_hash": release_manifest_hash_hex(tag, artifacts),
+            "pgp_fingerprint": crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT,
             "artifacts": artifacts
                 .iter()
                 .map(|a| serde_json::json!({ "name": a.name, "sha256": a.sha256, "size": a.size }))
                 .collect::<Vec<_>>(),
         })
         .to_string()
+    }
+
+    /// The committed public key as a logged artifact — exactly the bytes
+    /// this binary embeds, which is what the read-side pin demands.
+    fn release_key_artifact() -> ReleaseArtifact {
+        ReleaseArtifact {
+            name: crate::pgp_identity::RELEASE_SIGNING_KEY_ASSET.to_string(),
+            sha256: sha256_hex(crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.as_bytes()),
+            size: crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.len() as u64,
+        }
+    }
+
+    /// A base artifact with full PGP coverage: its detached signature and
+    /// the public-key asset beside it.
+    fn signed_release_artifacts(base: &ReleaseArtifact, sig_bytes: &[u8]) -> Vec<ReleaseArtifact> {
+        vec![
+            base.clone(),
+            ReleaseArtifact {
+                name: format!("{}.asc", base.name),
+                sha256: sha256_hex(sig_bytes),
+                size: sig_bytes.len() as u64,
+            },
+            release_key_artifact(),
+        ]
     }
 
     #[test]
@@ -3404,6 +3561,18 @@ mod tests {
         assert!(
             parse_release_leaf(&good.replace("release_manifest", "artifact_manifest")).is_err()
         );
+        // The signing-key identity is required and shape-checked: a leaf
+        // without one predates the PGP lane and fails closed.
+        let mut value: serde_json::Value = serde_json::from_str(&good).unwrap();
+        value.as_object_mut().unwrap().remove("pgp_fingerprint");
+        assert!(parse_release_leaf(&value.to_string()).is_err());
+        for bad in ["", "abcd", "a9b389c058dd177b3303a13522fc08f0a26d3d18"] {
+            value["pgp_fingerprint"] = serde_json::json!(bad);
+            assert!(
+                parse_release_leaf(&value.to_string()).is_err(),
+                "must reject fingerprint {bad:?}"
+            );
+        }
         // No artifacts is rejected.
         let empty = serde_json::json!({
             "kind": "release_manifest",
@@ -3413,6 +3582,95 @@ mod tests {
         })
         .to_string();
         assert!(parse_release_leaf(&empty).is_err());
+    }
+
+    /// The read-side PGP judgments: wrong key identity, unpinned key
+    /// bytes, missing coverage, and stray signatures are each loud; a
+    /// fully covered manifest under the compiled pin is silent.
+    #[test]
+    fn release_pgp_checks_flag_identity_and_coverage_divergence() {
+        let zip = ReleaseArtifact {
+            name: "Intendant-v1.2.3.zip".to_string(),
+            sha256: sha256_hex(b"app zip"),
+            size: 7,
+        };
+        let leaf = |fingerprint: &str, artifacts: Vec<ReleaseArtifact>| ReleaseLeaf {
+            unix_ms: 0,
+            tag: "v1.2.3".to_string(),
+            version: "1.2.3".to_string(),
+            platforms: vec![],
+            manifest_hash: release_manifest_hash_hex("v1.2.3", &artifacts),
+            pgp_fingerprint: fingerprint.to_string(),
+            artifacts,
+        };
+        let pin = crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT;
+
+        // Fully covered under the compiled pin: no findings.
+        assert!(release_pgp_mismatches(&leaf(pin, signed_release_artifacts(&zip, b"sig"))).is_empty());
+
+        // A foreign signing key is finding #1, loudly named.
+        let foreign = leaf(
+            &"F".repeat(40),
+            signed_release_artifacts(&zip, b"sig"),
+        );
+        let findings = release_pgp_mismatches(&foreign);
+        assert_eq!(findings.len(), 1, "findings were {findings:?}");
+        assert!(findings[0].contains("pins"), "was {}", findings[0]);
+
+        // Key asset absent entirely.
+        let missing_key = leaf(
+            pin,
+            vec![
+                zip.clone(),
+                ReleaseArtifact {
+                    name: format!("{}.asc", zip.name),
+                    sha256: sha256_hex(b"sig"),
+                    size: 3,
+                },
+            ],
+        );
+        let findings = release_pgp_mismatches(&missing_key);
+        assert_eq!(findings.len(), 1, "findings were {findings:?}");
+        assert!(findings[0].contains("public signing key"), "was {}", findings[0]);
+
+        // Key asset present but not the committed bytes.
+        let mut swapped_key = signed_release_artifacts(&zip, b"sig");
+        swapped_key
+            .iter_mut()
+            .find(|a| a.name == crate::pgp_identity::RELEASE_SIGNING_KEY_ASSET)
+            .unwrap()
+            .sha256 = sha256_hex(b"someone else's key");
+        let findings = release_pgp_mismatches(&leaf(pin, swapped_key));
+        assert_eq!(findings.len(), 1, "findings were {findings:?}");
+        assert!(
+            findings[0].contains("repo-committed key"),
+            "was {}",
+            findings[0]
+        );
+
+        // An artifact without its signature, and a signature without its
+        // artifact, are each their own finding.
+        let uncovered = leaf(pin, vec![zip.clone(), release_key_artifact()]);
+        let findings = release_pgp_mismatches(&uncovered);
+        assert_eq!(findings.len(), 1, "findings were {findings:?}");
+        assert!(
+            findings[0].contains("without a detached .asc signature"),
+            "was {}",
+            findings[0]
+        );
+        let mut with_stray = signed_release_artifacts(&zip, b"sig");
+        with_stray.push(ReleaseArtifact {
+            name: "ghost.zip.asc".to_string(),
+            sha256: sha256_hex(b"ghost"),
+            size: 5,
+        });
+        let findings = release_pgp_mismatches(&leaf(pin, with_stray));
+        assert_eq!(findings.len(), 1, "findings were {findings:?}");
+        assert!(
+            findings[0].contains("signature without its artifact"),
+            "was {}",
+            findings[0]
+        );
     }
 
     #[test]
@@ -3650,9 +3908,10 @@ mod tests {
             sha256: sha256_hex(&bytes),
             size: bytes.len() as u64,
         };
+        let artifacts = signed_release_artifacts(&artifact, b"sig bytes v1");
         let leaves = vec![
             serde_json::json!({ "kind": "daemon_claimed", "daemon_id": "d1" }).to_string(),
-            release_leaf_fixture("v1.2.3", &[artifact.clone()]),
+            release_leaf_fixture("v1.2.3", &artifacts),
         ];
         let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
             log: FixtureLog::new(leaves),
@@ -3662,12 +3921,19 @@ mod tests {
             downloads: std::collections::HashMap::new(),
         }));
         let (base, server) = spawn_fixture_server(fixture.clone()).await;
-        fixture.lock().unwrap().release_body = release_json(vec![serde_json::json!({
-            "name": artifact.name,
-            "size": artifact.size,
-            "digest": format!("sha256:{}", artifact.sha256),
-            "browser_download_url": format!("{base}dl/{}", artifact.name),
-        })]);
+        fixture.lock().unwrap().release_body = release_json(
+            artifacts
+                .iter()
+                .map(|artifact| {
+                    serde_json::json!({
+                        "name": artifact.name,
+                        "size": artifact.size,
+                        "digest": format!("sha256:{}", artifact.sha256),
+                        "browser_download_url": format!("{base}dl/{}", artifact.name),
+                    })
+                })
+                .collect(),
+        );
         let state_root = tempfile::tempdir().unwrap();
 
         // First contact: full metadata verification, pin created.
@@ -3686,8 +3952,12 @@ mod tests {
         assert_eq!(report.tag, "v1.2.3");
         assert_eq!(report.version, "1.2.3");
         assert_eq!(report.platforms, vec!["macos-arm64".to_string()]);
-        assert_eq!(report.artifact_count, 1);
-        assert_eq!(report.digest_verified, 1);
+        assert_eq!(
+            report.pgp_fingerprint,
+            crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT
+        );
+        assert_eq!(report.artifact_count, 3);
+        assert_eq!(report.digest_verified, 3);
         assert_eq!(report.presence_only, 0);
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.pinned_from_size, None);
@@ -3751,7 +4021,8 @@ mod tests {
             sha256: sha256_hex(b"the logged zip"),
             size: 14,
         };
-        let leaves = vec![release_leaf_fixture("v1.2.3", &[artifact.clone()])];
+        let artifacts = signed_release_artifacts(&artifact, b"the logged sig");
+        let leaves = vec![release_leaf_fixture("v1.2.3", &artifacts)];
         let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
             log: FixtureLog::new(leaves),
             manifest_index: 0,
@@ -3760,13 +4031,23 @@ mod tests {
             downloads: std::collections::HashMap::new(),
         }));
         let (base, server) = spawn_fixture_server(fixture.clone()).await;
-        // GitHub reports a different digest AND an asset the log never
-        // blessed.
+        // GitHub reports a different digest for the zip AND an asset the
+        // log never blessed; the signature and key assets are faithful.
         fixture.lock().unwrap().release_body = release_json(vec![
             serde_json::json!({
                 "name": artifact.name,
                 "size": artifact.size,
                 "digest": format!("sha256:{}", sha256_hex(b"a swapped zip")),
+            }),
+            serde_json::json!({
+                "name": artifacts[1].name,
+                "size": artifacts[1].size,
+                "digest": format!("sha256:{}", artifacts[1].sha256),
+            }),
+            serde_json::json!({
+                "name": artifacts[2].name,
+                "size": artifacts[2].size,
+                "digest": format!("sha256:{}", artifacts[2].sha256),
             }),
             serde_json::json!({ "name": "extra-payload.zip", "size": 3 }),
         ]);
@@ -3805,42 +4086,58 @@ mod tests {
     #[tokio::test]
     async fn release_flow_download_mode_hashes_artifacts() {
         let bytes = b"real artifact bytes".to_vec();
+        let sig_bytes = b"real signature bytes".to_vec();
         let artifact = ReleaseArtifact {
             name: "Intendant-v1.2.3.zip".to_string(),
             sha256: sha256_hex(&bytes),
             size: bytes.len() as u64,
         };
-        let leaves = vec![release_leaf_fixture("v1.2.3", &[artifact.clone()])];
+        let artifacts = signed_release_artifacts(&artifact, &sig_bytes);
+        let leaves = vec![release_leaf_fixture("v1.2.3", &artifacts)];
         let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
             log: FixtureLog::new(leaves),
             manifest_index: 0,
             release_status: 200,
             release_body: serde_json::Value::Null,
-            downloads: std::collections::HashMap::from([(artifact.name.clone(), bytes.clone())]),
+            downloads: std::collections::HashMap::from([
+                (artifact.name.clone(), bytes.clone()),
+                (artifacts[1].name.clone(), sig_bytes.clone()),
+                (
+                    artifacts[2].name.clone(),
+                    crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.as_bytes().to_vec(),
+                ),
+            ]),
         }));
         let (base, server) = spawn_fixture_server(fixture.clone()).await;
         // No digest from the API: the default path can only prove
         // presence+size; --download proves the bytes.
-        fixture.lock().unwrap().release_body = release_json(vec![serde_json::json!({
-            "name": artifact.name,
-            "size": artifact.size,
-            "browser_download_url": format!("{base}dl/{}", artifact.name),
-        })]);
+        fixture.lock().unwrap().release_body = release_json(
+            artifacts
+                .iter()
+                .map(|artifact| {
+                    serde_json::json!({
+                        "name": artifact.name,
+                        "size": artifact.size,
+                        "browser_download_url": format!("{base}dl/{}", artifact.name),
+                    })
+                })
+                .collect(),
+        );
         let state_root = tempfile::tempdir().unwrap();
 
         let report =
             verify_hosted_release(&base, &base, "test/repo", None, false, state_root.path())
                 .await
                 .expect("metadata-only run passes as presence-only");
-        assert_eq!(report.presence_only, 1);
+        assert_eq!(report.presence_only, 3);
         assert_eq!(report.digest_verified, 0);
         assert_eq!(report.downloaded, 0);
 
         let report =
             verify_hosted_release(&base, &base, "test/repo", None, true, state_root.path())
                 .await
-                .expect("download run hash-verifies the artifact");
-        assert_eq!(report.downloaded, 1);
+                .expect("download run hash-verifies the artifacts");
+        assert_eq!(report.downloaded, 3);
 
         // Served bytes that hash differently from the log are caught.
         fixture

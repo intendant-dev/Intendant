@@ -8,13 +8,34 @@ name: macOS app release
 # never pull_request or merge_group, so this workflow can never gate the
 # merge queue. A red release run blocks a release, not landings.
 #
-# Signing/notarization secrets (repo Settings → Secrets and variables →
-# Actions → Repository secrets). On a workflow_dispatch DRY-RUN with the
-# secrets absent, the job still runs end to end and keeps an UNSIGNED
-# "-unsigned-dev" artifact on the workflow run. TAG builds fail closed
-# instead: an official release is always signed, notarized, and committed
-# to the transparency log, or the run goes red before publishing anything.
-# Secret names, exactly:
+# Signing secrets (repo Settings → Secrets and variables → Actions →
+# Repository secrets). Two independent lanes:
+#
+# PGP (REQUIRED for tag releases — the alpha's distribution authenticity,
+# owner-ratified lane D: detached signatures + the transparency log, no
+# Apple Developer ID). A tag build without the pair goes red before
+# building anything; a workflow_dispatch DRY-RUN without it still runs end
+# to end and keeps only the explicitly UNSIGNED "-unsigned-dev" artifact
+# on the workflow run. Secret names, exactly:
+#
+#   PGP_SIGN_KEY_B64         base64 of the ASCII-armored SECRET SIGNING
+#                            SUBKEY export of the release key
+#                            (gpg --export-secret-subkeys), passphrase-
+#                            protected; the primary key never enters CI
+#   PGP_SIGN_KEY_PASSPHRASE  passphrase protecting that export
+#
+# The public half is committed at the repo root (RELEASE-SIGNING-KEY.asc),
+# published byte-identical beside every release, and pinned at compile
+# time by `intendant hosted-verify` (src/bin/caller/pgp_identity.rs); the
+# sign step self-verifies every signature against the COMMITTED key, so a
+# CI key that is not the committed key's signing subkey fails the run.
+#
+# Apple Developer ID + notarization (OPTIONAL — a deliberately parked
+# lane, dormant until its secrets are provisioned; the owner may elect it
+# later). When absent, a tag release publishes the PGP-signed
+# "-unsigned-dev" app archive and says so honestly in its notes. When
+# configured it must be COMPLETE on a tag (signed AND notarized) or the
+# run goes red. Secret names, exactly:
 #
 #   MACOS_SIGN_P12_B64       base64 of a "Developer ID Application" identity
 #                            exported as .p12 — export WITH the certificate
@@ -25,9 +46,12 @@ name: macOS app release
 #   NOTARY_ISSUER_ID         Issuer ID of the API-keys page
 #
 # Each group is all-or-nothing; a partially configured group fails the run
-# rather than silently shipping a less-signed artifact. Provisioning ceremony
-# (exporting the p12, minting the notary key): docs/src/getting-started.md,
-# "Signed releases".
+# rather than silently shipping a less-signed artifact. Provisioning
+# ceremonies (exporting the subkey from the escrow, exporting the p12,
+# minting the notary key) and the user-facing verify ritual:
+# docs/src/getting-started.md, "macOS releases: signing and notarization"
+# / "Verifying a release". Local end-to-end rehearsal of the PGP lane
+# (sign → log → verify, no tag or fleet): scripts/release-pgp-dryrun.sh.
 #
 # The cross-platform install scripts (scripts/install.sh, install.ps1)
 # also ship as release assets: tag builds stamp them with the release
@@ -125,8 +149,13 @@ jobs:
           NOTARY_KEY_B64: ${{ secrets.NOTARY_KEY_B64 }}
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          PGP_KEY_B64: ${{ secrets.PGP_SIGN_KEY_B64 }}
+          PGP_PASSPHRASE: ${{ secrets.PGP_SIGN_KEY_PASSPHRASE }}
         run: |
           set -euo pipefail
+          pgp_set=0
+          [ -n "$PGP_KEY_B64" ] && pgp_set=$((pgp_set + 1))
+          [ -n "$PGP_PASSPHRASE" ] && pgp_set=$((pgp_set + 1))
           sign_set=0
           [ -n "$P12_B64" ] && sign_set=$((sign_set + 1))
           [ -n "$P12_PASSWORD" ] && sign_set=$((sign_set + 1))
@@ -134,6 +163,10 @@ jobs:
           [ -n "$NOTARY_KEY_B64" ] && notary_set=$((notary_set + 1))
           [ -n "$NOTARY_KEY_ID" ] && notary_set=$((notary_set + 1))
           [ -n "$NOTARY_ISSUER_ID" ] && notary_set=$((notary_set + 1))
+          if [ "$pgp_set" = "1" ]; then
+            echo "::error::Partial PGP config: set both PGP_SIGN_KEY_B64 and PGP_SIGN_KEY_PASSPHRASE, or neither."
+            exit 1
+          fi
           if [ "$sign_set" = "1" ]; then
             echo "::error::Partial signing config: set both MACOS_SIGN_P12_B64 and MACOS_SIGN_P12_PASSWORD, or neither."
             exit 1
@@ -146,21 +179,37 @@ jobs:
             echo "::error::Notarization secrets are set but the signing identity is not; Apple only notarizes Developer ID-signed bundles."
             exit 1
           fi
-          sign=false notarize=false
+          pgp=false sign=false notarize=false
+          [ "$pgp_set" = "2" ] && pgp=true
           [ "$sign_set" = "2" ] && sign=true
           [ "$notary_set" = "3" ] && notarize=true
-          echo "sign=$sign" >> "$GITHUB_OUTPUT"
-          echo "notarize=$notarize" >> "$GITHUB_OUTPUT"
-          echo "Signing: $sign — notarization: $notarize"
-          # Official releases fail closed: a tag build must be fully signed
-          # AND notarized, or nothing is built or published. Unsigned output
-          # stays available for workflow_dispatch dry-runs only.
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && { [ "$sign" != "true" ] || [ "$notarize" != "true" ]; }; then
-            echo "::error::Official tag releases must be signed and notarized — configure the MACOS_SIGN_* and NOTARY_* secrets, or dry-run the pipeline via workflow_dispatch instead."
+          {
+            echo "pgp=$pgp"
+            echo "sign=$sign"
+            echo "notarize=$notarize"
+          } >> "$GITHUB_OUTPUT"
+          echo "PGP: $pgp — Apple signing: $sign — notarization: $notarize"
+          # Official releases fail closed on the PGP lane: a tag build must
+          # detach-sign and log every artifact, or nothing is built or
+          # published. Unsigned output stays available for
+          # workflow_dispatch dry-runs only.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$pgp" != "true" ]; then
+            echo "::error::Official tag releases must be PGP-signed — configure PGP_SIGN_KEY_B64 and PGP_SIGN_KEY_PASSPHRASE (escrow: the release-signing README), or dry-run the pipeline via workflow_dispatch instead."
             exit 1
           fi
-          if [ "$sign" = "false" ]; then
-            echo "::warning::No signing secrets configured — this dry-run produces an unsigned-dev artifact."
+          # The Apple lane is optional (dormant until provisioned), but an
+          # ENGAGED Apple lane on a tag must be complete: a
+          # signed-but-unnotarized official artifact is exactly the
+          # half-trust this gate refuses to mint.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$sign" = "true" ] && [ "$notarize" != "true" ]; then
+            echo "::error::The Apple signing identity is configured but notarization is not — an official tag build engages the Apple lane fully (sign AND notarize) or not at all."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$sign" != "true" ]; then
+            echo "::warning::Apple lane dormant — this release publishes the PGP-signed, transparency-logged app archive with its explicit -unsigned-dev suffix (Gatekeeper will warn; the release notes say so)."
+          fi
+          if [ "$pgp" = "false" ]; then
+            echo "::warning::No PGP signing secrets configured — this dry-run produces an unsigned-dev artifact with no signatures."
           fi
 
       # Throwaway keychain: created fresh, added to the FRONT of the user
@@ -217,6 +266,35 @@ jobs:
           umask 077
           printf '%s' "$NOTARY_KEY_B64" | base64 -d > "$RUNNER_TEMP/notary-key.p8"
           echo "INTENDANT_NOTARY_KEY_FILE=$RUNNER_TEMP/notary-key.p8" >> "$GITHUB_ENV"
+
+      # Throwaway GNUPGHOME under RUNNER_TEMP: the secret signing subkey
+      # exists only there and only for this run; the dedicated always()
+      # cleanup step below kills its agent and removes it even when a
+      # later step failed. The passphrase reaches gpg via a 0600 file and
+      # loopback pinentry — never argv, never the log.
+      - name: Import PGP release signing key (throwaway GNUPGHOME)
+        if: steps.gate.outputs.pgp == 'true'
+        shell: bash
+        env:
+          PGP_KEY_B64: ${{ secrets.PGP_SIGN_KEY_B64 }}
+          PGP_PASSPHRASE: ${{ secrets.PGP_SIGN_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          command -v gpg > /dev/null || { echo "::error::gnupg is not installed on this runner — install it (brew install gnupg) before releasing."; exit 1; }
+          PGP_HOME="$RUNNER_TEMP/pgp-home"
+          rm -rf "$PGP_HOME"
+          mkdir -p "$PGP_HOME"
+          chmod 700 "$PGP_HOME"
+          echo "allow-loopback-pinentry" > "$PGP_HOME/gpg-agent.conf"
+          printf '%s' "$PGP_KEY_B64" | base64 -d > "$RUNNER_TEMP/pgp-key.asc"
+          gpg --batch --homedir "$PGP_HOME" --import "$RUNNER_TEMP/pgp-key.asc"
+          rm -f "$RUNNER_TEMP/pgp-key.asc"
+          printf '%s' "$PGP_PASSPHRASE" > "$RUNNER_TEMP/pgp-passphrase"
+          {
+            echo "PGP_SIGN_HOME=$PGP_HOME"
+            echo "PGP_SIGN_PASSPHRASE_FILE=$RUNNER_TEMP/pgp-passphrase"
+          } >> "$GITHUB_ENV"
 
       # Lockfile gate first (the bundle script's own cargo build is not
       # --locked); its build then reuses this compilation unchanged.
@@ -306,11 +384,44 @@ jobs:
           (cd dist && shasum -a 256 install.ps1 > install.ps1.sha256)
           ls -l dist
 
+      # Every artifact that will publish gets a detached armored signature
+      # from the release signing subkey; the repo-committed public key is
+      # staged beside them byte-identically; and every signature is
+      # self-verified against THAT committed key before anything
+      # publishes (scripts/release-pgp-sign.sh) — a run whose documented
+      # verify ritual would fail can never ship. Runs on credentialed
+      # dispatch dry-runs too; a credential-less dispatch skips it and
+      # keeps only the explicitly -unsigned-dev artifact.
+      - name: PGP-sign release artifacts
+        if: steps.gate.outputs.pgp == 'true'
+        id: pgp_sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/release-pgp-sign.sh dist "$RUNNER_TEMP/pgp-fingerprint"
+          echo "fingerprint=$(cat "$RUNNER_TEMP/pgp-fingerprint")" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      # Runs in step order AFTER the signing use-site (the Apple cleanup
+      # step above sits earlier because bundling is the last Apple
+      # use-site); always(), so the subkey never outlives a failed run.
+      - name: Clean up PGP signing material
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$RUNNER_TEMP/pgp-home" ]; then
+            gpgconf --homedir "$RUNNER_TEMP/pgp-home" --kill gpg-agent 2>/dev/null || true
+            rm -rf "$RUNNER_TEMP/pgp-home"
+          fi
+          rm -f "$RUNNER_TEMP/pgp-key.asc" "$RUNNER_TEMP/pgp-passphrase"
+
       - name: Publish GitHub release
         if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          APPLE_SIGNED: ${{ steps.gate.outputs.sign }}
+          PGP_FINGERPRINT: ${{ steps.pgp_sign.outputs.fingerprint }}
         run: |
           set -euo pipefail
           # Self-hosted runner PATH may not include Homebrew.
@@ -318,15 +429,43 @@ jobs:
           command -v gh > /dev/null || { echo "::error::gh CLI not found on the runner"; exit 1; }
           tag="$GITHUB_REF_NAME"
           zip_file="$(ls dist/Intendant-*.zip)"
-          # Belt and suspenders behind the signing gate: a less-signed
-          # artifact must never be published under an official tag, even if
-          # the bundle script's fallback behavior ever drifts.
+          # Belt and suspenders behind the signing gate. A half-Apple
+          # artifact never publishes; with the Apple lane engaged, neither
+          # does an unsigned one. With the Apple lane dormant (lane D),
+          # the explicitly suffixed -unsigned-dev archive is the expected
+          # artifact — PGP signatures and the transparency log carry its
+          # authenticity, and the notes below say so.
           case "$zip_file" in
-            *-unsigned-dev.zip|*-signed-unnotarized.zip)
-              echo "::error::Refusing to publish $(basename "$zip_file") for tag $tag — official releases are signed and notarized; the signing gate should have failed this run before the build."
+            *-signed-unnotarized.zip)
+              echo "::error::Refusing to publish $(basename "$zip_file") for tag $tag — an Apple-signed official release must also be notarized; the signing gate should have failed this run."
               exit 1 ;;
+            *-unsigned-dev.zip)
+              if [ "$APPLE_SIGNED" = "true" ]; then
+                echo "::error::Refusing to publish $(basename "$zip_file") for tag $tag — the Apple identity was configured but the bundle came out unsigned; investigate the bundle step before releasing."
+                exit 1
+              fi ;;
           esac
-          signing_note="Signed with a Developer ID certificate, notarized by Apple, and stapled — Gatekeeper opens it without warnings."
+          # PGP belt and suspenders: every published artifact carries its
+          # detached signature and the committed public key ships beside
+          # them, or nothing publishes.
+          incomplete=0
+          for f in dist/*; do
+            case "$f" in *.asc) continue ;; esac
+            if [ ! -f "$f.asc" ]; then
+              echo "::error::$(basename "$f") has no detached .asc signature — the PGP sign step should have produced it."
+              incomplete=1
+            fi
+          done
+          if [ ! -f "dist/RELEASE-SIGNING-KEY.asc" ]; then
+            echo "::error::dist/ is missing RELEASE-SIGNING-KEY.asc — the PGP sign step stages the committed public key beside the artifacts."
+            incomplete=1
+          fi
+          [ "$incomplete" = "0" ] || exit 1
+          if [ "$APPLE_SIGNED" = "true" ]; then
+            signing_note="Signed with a Developer ID certificate, notarized by Apple, and stapled — Gatekeeper opens it without warnings. Every asset additionally carries a detached PGP signature."
+          else
+            signing_note="This alpha is deliberately not Apple-signed (no Developer ID): the app archive keeps its explicit \`-unsigned-dev\` suffix and Gatekeeper will warn on first open. Authenticity rides the detached PGP signatures and the public transparency log — verify before opening."
+          fi
           {
             echo "Native macOS app: the \`macos-app/\` WKWebView wrapper bundling the release \`intendant\` and \`intendant-runtime\` binaries (Apple Silicon)."
             echo
@@ -339,7 +478,14 @@ jobs:
             echo "curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/install.sh | sh"
             echo '```'
             echo
-            echo "**Verify the download:**"
+            echo "**Verify (PGP + transparency log):** every asset carries a detached \`.asc\` signature by the Intendant release signing key \`$PGP_FINGERPRINT\` — committed in-repo as \`RELEASE-SIGNING-KEY.asc\`, attached to this release, and pinned by \`intendant hosted-verify\`:"
+            echo '```'
+            echo "gpg --import RELEASE-SIGNING-KEY.asc"
+            echo "gpg --verify $(basename "$zip_file").asc $(basename "$zip_file")"
+            echo "intendant hosted-verify --releases $tag"
+            echo '```'
+            echo
+            echo "**Checksums:**"
             echo '```'
             echo "shasum -a 256 -c $(basename "$zip_file").sha256"
             echo '```'
@@ -375,12 +521,18 @@ jobs:
           CONNECT_RELEASE_TOKEN: ${{ secrets.CONNECT_RELEASE_TOKEN }}
           CONNECT_RELEASE_URL: ${{ vars.CONNECT_RELEASE_URL || 'https://intendant.dev' }}
           RELEASE_TAG: ${{ github.ref_name }}
+          PGP_FINGERPRINT: ${{ steps.pgp_sign.outputs.fingerprint }}
         run: |
           set -euo pipefail
           if [ -z "$CONNECT_RELEASE_TOKEN" ]; then
             echo "::error::CONNECT_RELEASE_TOKEN is not configured — an official tag release must commit its manifest to the transparency log (a published-but-unlogged release is the failure this gate exists to catch). Configure the secret, or dry-run without a tag via workflow_dispatch."
             exit 1
           fi
+          # The signed artifacts, their .asc signatures, and the public
+          # key asset all glob in; the log's submission gate refuses a
+          # manifest with unsigned or stray entries, and pgp_fingerprint
+          # commits WHICH key signed (the rendezvous validates it,
+          # `intendant hosted-verify` pins it).
           manifest="$RUNNER_TEMP/release-manifest.json"
           python3 - "$RELEASE_TAG" dist/* > "$manifest" <<'PY'
           import hashlib, json, os, sys
@@ -396,10 +548,14 @@ jobs:
                   "sha256": digest.hexdigest(),
                   "size": os.path.getsize(path),
               })
+          fingerprint = os.environ.get("PGP_FINGERPRINT", "")
+          if not fingerprint:
+              sys.exit("PGP_FINGERPRINT is empty — the sign step did not run?")
           print(json.dumps({
               "tag": tag,
               "version": tag.removeprefix("v"),
               "platforms": ["macos-arm64"],
+              "pgp_fingerprint": fingerprint,
               "artifacts": artifacts,
           }, indent=2))
           PY
