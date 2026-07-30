@@ -329,7 +329,12 @@ mod tests {
             on_block.contains("workflow_dispatch:"),
             "release.yml on-block must keep manual dispatch: {on_block:?}"
         );
-        for forbidden in ["pull_request", "merge_group", "schedule", "push:\n    branches"] {
+        for forbidden in [
+            "pull_request",
+            "merge_group",
+            "schedule",
+            "push:\n    branches",
+        ] {
             assert!(
                 !on_block.contains(forbidden),
                 "release.yml must stay tag/manual-only (found {forbidden} in the on-block)"
