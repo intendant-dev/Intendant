@@ -848,12 +848,30 @@ after "Later" renders exactly what was sealed. From the CLI,
 [--every INTERVAL] [--suspend-after N] [--agent …]` rides the ordinary
 op lane (works from owner shells and supervised sessions alike);
 approval stays per-effect on the dashboard or `ctl agenda approve`.
-The dashboard's Automate sheet and its workflow/triggered pickers
-consume exactly these surfaces: the picker renders the served catalog
-(invalid and shadowed entries stay visible, disabled with their
-reason), the preview shows the full text a stamp would seal, and every
-stamp rides the stamp op — the sheet neither proposes nor approves
-client-side.
+The dashboard's Automate sheet consumes exactly these surfaces: the
+picker renders every catalog entry as what it means — title,
+house/personal provenance chip, shape line, description; invalid and
+shadowed entries stay visible, disabled with their reason — and
+selecting one previews it for reading (header, per-node executors and
+edges for workflows, the authored prose) with the **exact bytes a stamp
+seals** one explicit expander away, labeled with their sha256.
+Stamping is one explicit gesture for every kind: a pre-stamp summary
+states what will be sealed, parked, and proposed, and the Stamp button
+fires the stamp op — the sheet neither proposes nor approves
+client-side. After the stamp, the ordinary card (or the workflow
+approval sheet) carries the ceremony. Stamped manifests then render
+their sealed pins on the item panel: a refs strip (locator + pin chip +
+expandable sealed view served from the sealed lane) with an expand-time
+drift chip — `GET /api/agenda/items/{id}/refs/drift` re-hashes manifest
+binding refs on panel open, and a live file that moved on renders
+"sealed revision still serves", informational by §2.7 semantics. Drift
+offers **Review & adopt**: sealed vs live side by side (hashes, dates,
+live text for definition-library files), and one confirm re-proposes
+the affected manifests with the fresh pin through the ordinary propose
+lane — new digests, approvals void, landing on the ordinary approval
+(the one-gesture sheet again for a workflow's nodes). Nothing
+auto-adopts; declining leaves the sealed revision binding
+indefinitely.
 
 ### The housekeeping recipe
 

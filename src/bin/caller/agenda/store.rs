@@ -2612,6 +2612,58 @@ fn path_ref_drift(path: &Path, attach_digest: &str) -> &'static str {
     }
 }
 
+/// One manifest binding ref's live state against its sealed pin
+/// (Track AW §2.4): [`file_ref_drift`]'s expand-time judgment extended
+/// with the live hash and mtime the Review-&-adopt gesture needs to
+/// restate a fresh pin. Presentation only, exactly like the G1 twin —
+/// never stored, computed on detail expand, and nothing served here is
+/// authority: the propose intake re-verifies every restated pin against
+/// the daemon's own read.
+pub(crate) struct BindingRefLiveState {
+    pub(crate) status: &'static str,
+    pub(crate) live_sha256: Option<String>,
+    pub(crate) live_mtime_ms: Option<u64>,
+}
+
+pub(crate) fn binding_ref_drift(locator: &str, pin: &str) -> BindingRefLiveState {
+    let missing = || BindingRefLiveState {
+        status: "missing",
+        live_sha256: None,
+        live_mtime_ms: None,
+    };
+    let Ok(path) = binding_ref_path(locator) else {
+        return missing();
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return missing();
+    };
+    if !meta.is_file() {
+        return missing();
+    }
+    let live_mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64);
+    if meta.len() > MAX_REF_FILE_HASH_BYTES {
+        // Grown past the hash bound: pins only ever seal files within it,
+        // so the live file is `changed` by size alone — and unpinnable.
+        return BindingRefLiveState {
+            status: "changed",
+            live_sha256: None,
+            live_mtime_ms,
+        };
+    }
+    match digest_file(path) {
+        Ok(live) => BindingRefLiveState {
+            status: if live == pin { "unchanged" } else { "changed" },
+            live_sha256: Some(live),
+            live_mtime_ms,
+        },
+        Err(_) => missing(),
+    }
+}
+
 /// Full sha256 of a file's bytes as lowercase hex, streamed in bounded
 /// chunks. Shared by attach-time intake and the expand-time drift check.
 pub(crate) fn digest_file(path: &Path) -> std::io::Result<String> {
@@ -4292,6 +4344,55 @@ mod tests {
         assert_eq!(file_ref_drift(&loc, &attach), "changed");
         std::fs::remove_file(&path).unwrap();
         assert_eq!(file_ref_drift(&loc, &attach), "missing");
+    }
+
+    /// The §2.4 twin for manifest binding refs: the same judgments plus
+    /// the live hash/mtime Review-&-adopt restates — present for a
+    /// readable live file (even a drifted one), absent past the hash
+    /// bound and for missing files. Locators here use the binding-ref
+    /// grammar (`file:` + absolute path), unlike G1's bare paths.
+    #[test]
+    fn binding_ref_drift_judgments_carry_the_live_pin() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("SKILL.md");
+        std::fs::write(&path, b"sealed revision").unwrap();
+        let loc = format!("file:{}", path.display());
+        let pin = digest_file(&path).unwrap();
+
+        let live = binding_ref_drift(&loc, &pin);
+        assert_eq!(live.status, "unchanged");
+        assert_eq!(live.live_sha256.as_deref(), Some(pin.as_str()));
+        assert!(live.live_mtime_ms.is_some());
+
+        std::fs::write(&path, b"the live file moved on").unwrap();
+        let live = binding_ref_drift(&loc, &pin);
+        assert_eq!(live.status, "changed");
+        assert_eq!(
+            live.live_sha256.as_deref(),
+            Some(digest_file(&path).unwrap().as_str()),
+            "adopt restates exactly this fresh pin"
+        );
+
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_REF_FILE_HASH_BYTES + 1).unwrap();
+        drop(f);
+        let live = binding_ref_drift(&loc, &pin);
+        assert_eq!(live.status, "changed");
+        assert!(
+            live.live_sha256.is_none(),
+            "a file past the hash bound is unpinnable"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let live = binding_ref_drift(&loc, &pin);
+        assert_eq!(live.status, "missing");
+        assert!(live.live_sha256.is_none());
+        assert!(live.live_mtime_ms.is_none());
+
+        // The binding-ref grammar is enforced: a bare path is refused
+        // (missing), never read.
+        let bare = binding_ref_drift(&path.to_string_lossy(), &pin);
+        assert_eq!(bare.status, "missing");
     }
 
     /// Track AO: attestation refs ride the same expand-time judgment
