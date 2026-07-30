@@ -128,7 +128,7 @@ function agendaEnsureScaffold() {
           <button type="button" class="ag2-fchip" id="ag2-f-frontier"
                   title="The un-triaged frontier: open items newer than the last triage summary, or unplaced with no triage note — the triage mandate’s scope">frontier</button>
           <button type="button" class="ag2-fchip" id="ag2-automate"
-                  title="Park a standing mandate from a template — triage, housekeeping — and propose its schedule; you approve the digest on the card">automate…</button>
+                  title="Stamp an automation definition — house or personal, action or workflow — sealing it, parking it, and proposing its schedule; you approve each digest on its card">automate…</button>
           <input id="ag2-search" class="ag2-search" type="text" autocomplete="off"
                  placeholder="Search the ledger — press /" aria-label="Search the agenda" />
         </div>
@@ -442,19 +442,10 @@ function agendaSearchMatch(item, q) {
     || String(item.id || '').toLowerCase().includes(q);
 }
 
-// The un-triaged frontier — the triage mandate's declared scope: open
-// items newer than the newest triage summary (`triage:summary` tag), or
-// unplaced with no triage annotation; summaries themselves excluded, and
-// so are daemon-parked items that are currently placed (Track PR ruling
-// 2, the mirror-writer exemption: a PR anchor the scanner parked and
-// filed arrives already placed and described — "untriaged" is false of
-// it; unfiling one re-admits it). A render-side convention over ordinary
-// data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
-// and the four expressions (ctl, this, docs, mandate template) move
-// together.
+// The un-triaged frontier — the triage mandate's declared scope.
 // Track AS S5: `frontier` is SERVED (the daemon's serving-seam
-// predicate — one implementation replacing the ctl/SPA/mandate-prose
-// triple; ruling §4.4). Event-lane rows age per the Q4 contract.
+// predicate — one implementation replacing the ctl/SPA/triage-definition
+// prose triple; ruling §4.4). Event-lane rows age per the Q4 contract.
 function agendaFrontierPredicate() {
   return (x) => x.frontier === true;
 }
@@ -1035,6 +1026,13 @@ function agendaAutomationStripHtml(item) {
     meta.push(`<span title="The planner's real next instant, served with the item">next ${escapeHtml(agendaAbsTime(e.next_fire_ms))}</span>`);
   } else if (st.kind === 'standing') {
     meta.push('<span>series ended</span>');
+  }
+  // Sealed inputs, list-render cheap: the count comes from the manifest
+  // already in hand — drift is judged on the item panel (expand-time,
+  // the G1 doctrine), never here.
+  const seals = (st.manifest.binding_refs || []).length;
+  if (seals) {
+    meta.push(`<span class="ag2-auto-sealed" title="Definition sealed under the approval digest — firings execute the sealed revision; drift and the sealed view live on the item panel">sealed ×${seals}</span>`);
   }
   // The manifest digest, always visible where the gesture lives — the
   // one thing depth never folds away, because it is what Approve signs

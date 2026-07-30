@@ -1940,7 +1940,7 @@ response omits the header.
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
-| GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
+| GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/pr-state` | AgendaRead | own origin | none | Live PR state for one anchor (expand-time render join; cached daemon-side) |
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |

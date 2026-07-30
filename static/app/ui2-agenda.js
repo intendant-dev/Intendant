@@ -1657,12 +1657,69 @@ function agendaFetchDefinitionCatalog(onSettled) {
     });
 }
 
-// Catalog view: the cadenced actions drive the automate sheet itself;
-// triggered actions and workflows render through the workflows
-// fragment's picker hook off the same fetch.
-function agendaCatalogActions(entries) {
-  return (entries || []).filter((d) => !d.workflow
-    && !(((d.nodes && d.nodes[0]) || {}).trigger_kind));
+// A catalog entry's stamp shape: 'workflow' (multi-node), 'triggered'
+// (single node firing on matching items), or 'action' (single node on a
+// cadence). Derived, never declared (the Q10 rule) — arity and the
+// node's trigger decide.
+function agendaDefinitionKind(entry) {
+  if (!entry) return null;
+  if (entry.workflow) return 'workflow';
+  return (((entry.nodes || [])[0] || {}).trigger_kind) ? 'triggered' : 'action';
+}
+
+// One line of what stamping this definition sets up — the picker's and
+// preview's kind caption, derived from the served nodes.
+function agendaDefinitionKindLine(entry) {
+  const kind = agendaDefinitionKind(entry);
+  if (kind === 'workflow') {
+    return `workflow · ${(entry.nodes || []).length} nodes, each its own approval`;
+  }
+  const node = (entry.nodes && entry.nodes[0]) || {};
+  if (kind === 'triggered') {
+    const tags = (node.trigger_tags || []).length ? `:${node.trigger_tags.join(',')}` : '';
+    return `standing action — fires on new ${node.trigger_kind || 'item'}${tags}`;
+  }
+  return node.every_ms
+    ? `standing action — every ${agendaCadenceLabel(node.every_ms)}`
+    : 'standing action — cadence chosen at stamp time';
+}
+
+// Provenance chip: which library serves this definition. Discovery
+// grants nothing either way — bindingness needs the stamp seal under an
+// approval digest.
+function agendaProvenanceChipEl(provenance) {
+  const p = provenance === 'personal' ? 'personal' : 'house';
+  const chip = agendaStartSheetEl('span', `agsx-prov agsx-prov-${p}`, p);
+  chip.title = p === 'house'
+    ? 'Ships with this daemon, materialized into the library root — stamping seals the file itself'
+    : 'From this daemon’s personal library — shadows a house definition of the same name';
+  return chip;
+}
+
+// Presentation split of a definition's bytes: drop the frontmatter fence
+// and the per-node ```toml config blocks, keep the authored prose the
+// fired session actually obeys. Display only — the exact sealed bytes
+// stay authoritative, one expander away.
+function agendaDefinitionProse(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  let i = 0;
+  if (lines[0] === '---') {
+    i = 1;
+    while (i < lines.length && lines[i] !== '---') i += 1;
+    i += 1;
+  }
+  const out = [];
+  let inConfig = false;
+  for (; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!inConfig && line.trim().startsWith('```toml')) { inConfig = true; continue; }
+    if (inConfig) {
+      if (line.trim() === '```') inConfig = false;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 // ---- Create-from-definition: the Automate sheet (Track AU → AW) ----
@@ -1691,7 +1748,7 @@ function agendaEnsureAutomationSheet() {
   const panel = document.createElement('div');
   panel.className = 'ags-panel agsx-panel';
   panel.setAttribute('role', 'dialog');
-  panel.setAttribute('aria-label', 'New automation from a mandate template');
+  panel.setAttribute('aria-label', 'New automation — stamp a definition');
   host.appendChild(backdrop);
   host.appendChild(panel);
   document.body.appendChild(host);
@@ -1735,7 +1792,7 @@ function agendaOpenAutomationSheet(anchor) {
   const panel = host.querySelector('.ags-panel');
   panel.textContent = '';
   agendaAutomationSheetOpen = true;
-  let entry = null; // the selected cadenced-action catalog entry
+  let entry = null; // the selected catalog entry, any kind
   let selectedName = '';
 
   const head = agendaStartSheetEl('div', 'ags-head');
@@ -1747,17 +1804,18 @@ function agendaOpenAutomationSheet(anchor) {
   head.appendChild(close);
   panel.appendChild(head);
   panel.appendChild(agendaStartSheetEl('div', 'ags-sub',
-    'A standing supervised session on a cadence. Stamping seals the definition, parks it as an item, and proposes its schedule — nothing runs until you approve the digest on the card.'));
+    'Pick a definition, review it, then stamp: stamping seals the definition file, parks it on the agenda, and proposes its session manifests — nothing runs until you approve each digest on its card.'));
 
-  // Definition picker (served catalog).
-  const seg = agendaStartSheetEl('div', 'ags-seg agsx-templates');
+  // Definition picker (served catalog) — every kind side by side, each
+  // rendered as what it means: name, provenance, shape, description.
+  const seg = agendaStartSheetEl('div', 'agsx-defs');
   panel.appendChild(seg);
 
-  // Full definition text — the owner reads exactly the bytes a stamp
-  // seals; textContent rendering, no markup execution.
-  panel.appendChild(agendaStartSheetEl('label', 'ags-label',
-    'The definition — the full text a stamp seals; approval binds exactly this revision'));
-  const preview = agendaStartSheetEl('pre', 'agsx-preview');
+  // The definition, rendered for reading: header, node summary, and the
+  // authored prose the fired sessions obey — with the exact sealed
+  // bytes one explicit expander away (textContent rendering throughout,
+  // no markup execution).
+  const preview = agendaStartSheetEl('div', 'agsx-def');
   panel.appendChild(preview);
 
   // Cadence + first fire + suspend threshold.
@@ -1888,6 +1946,13 @@ function agendaOpenAutomationSheet(anchor) {
       });
   }
 
+  // Pre-stamp summary: exactly what the Stamp gesture will seal, park,
+  // and propose — rendered before the button, re-rendered as the
+  // controls change, so the gesture is never a surprise.
+  const summary = agendaStartSheetEl('div', 'agsx-summary');
+  summary.hidden = true;
+  panel.appendChild(summary);
+
   const error = agendaStartSheetEl('div', 'ags-error', '');
   error.hidden = true;
   panel.appendChild(error);
@@ -1899,56 +1964,162 @@ function agendaOpenAutomationSheet(anchor) {
   const cancel = agendaStartSheetEl('button', 'ags-btn', 'Cancel');
   cancel.type = 'button';
   cancel.addEventListener('click', agendaCloseAutomationSheet);
-  const park = agendaStartSheetEl('button', 'ags-btn ags-start', 'Park + propose');
-  park.type = 'button';
-  park.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { entry: () => entry, cadence, fire, suspend, project, configState, error, park }));
+  const stampBtn = agendaStartSheetEl('button', 'ags-btn ags-start', 'Stamp');
+  stampBtn.type = 'button';
+  stampBtn.title = 'Seals the definition, parks the item(s), proposes the manifest(s) — approves nothing';
+  stampBtn.addEventListener('click', () => agendaAutomationSheetSubmit(
+    { entry: () => entry, cadence, fire, suspend, project, configState, error, stampBtn }));
   foot.appendChild(cancel);
-  foot.appendChild(park);
+  foot.appendChild(stampBtn);
   panel.appendChild(foot);
 
-  const applyEntry = () => {
-    seg.querySelectorAll('button').forEach((b) =>
-      b.classList.toggle('active', !!entry && b.dataset.definition === entry.name));
+  const nodeExecutorLabel = (node) =>
+    [node.agent, node.model, node.effort].filter(Boolean).join(' · ') || 'daemon default';
+
+  const renderPreview = () => {
+    preview.textContent = '';
     if (!entry) {
-      preview.textContent = agendaDefinitionCatalog === null && !agendaDefinitionCatalogError
-        ? 'Loading the definition catalog…'
-        : (agendaDefinitionCatalogError
-          ? `Definition catalog unavailable: ${agendaDefinitionCatalogError}`
-          : 'No stampable cadenced definitions in the catalog.');
-      park.disabled = true;
+      preview.appendChild(agendaStartSheetEl('div', 'ags-hint',
+        agendaDefinitionCatalog === null && !agendaDefinitionCatalogError
+          ? 'Loading the definition catalog…'
+          : (agendaDefinitionCatalogError
+            ? `Definition catalog unavailable: ${agendaDefinitionCatalogError}`
+            : 'No stampable definitions in the catalog.')));
       return;
     }
-    park.disabled = false;
-    preview.textContent = entry.text;
-    const prefill = (entry.nodes && entry.nodes[0]) || {};
-    if (prefill.every_ms) {
-      const ms = String(prefill.every_ms);
-      if (!Array.from(cadence.options).some((o) => o.value === ms)) {
-        const option = document.createElement('option');
-        option.value = ms;
-        option.textContent = 'Definition default';
-        cadence.appendChild(option);
-      }
-      cadence.value = ms;
+    const dhead = agendaStartSheetEl('div', 'agsx-def-head');
+    dhead.appendChild(agendaStartSheetEl('span', 'agsx-def-title', entry.title || entry.name));
+    dhead.appendChild(agendaProvenanceChipEl(entry.provenance));
+    dhead.appendChild(agendaStartSheetEl('span', 'agsx-def-kind', agendaDefinitionKindLine(entry)));
+    preview.appendChild(dhead);
+    if (entry.description) {
+      preview.appendChild(agendaStartSheetEl('div', 'agsx-def-desc', entry.description));
     }
-    if (prefill.suspend_after) suspend.value = String(prefill.suspend_after);
-    else if (!suspend.value) suspend.value = '3';
+    if (entry.advisories && entry.advisories.length) {
+      preview.appendChild(agendaStartSheetEl('div', 'agsx-def-adv',
+        `Advisory: ${entry.advisories.join('; ')}`));
+    }
+    if (agendaDefinitionKind(entry) === 'workflow') {
+      for (const node of entry.nodes || []) {
+        const row = agendaStartSheetEl('div', 'agsx-def-node');
+        row.appendChild(agendaStartSheetEl('span', 'agsx-def-node-id', node.title || node.id));
+        const bits = [nodeExecutorLabel(node)];
+        if ((node.relies_on || []).length) bits.push(`after ${node.relies_on.join(', ')}`);
+        row.appendChild(agendaStartSheetEl('span', 'agsx-def-node-meta', bits.join(' · ')));
+        preview.appendChild(row);
+      }
+    }
+    const prose = agendaDefinitionProse(entry.text);
+    if (prose) {
+      const body = agendaStartSheetEl('pre', 'agsx-preview agsx-def-prose');
+      body.textContent = prose;
+      preview.appendChild(body);
+    }
+    // Verification honesty: the pretty rendering never replaces the
+    // bytes — the exact revision a stamp seals stays one gesture away.
+    const exact = document.createElement('details');
+    exact.className = 'agsx-exact';
+    const sum = document.createElement('summary');
+    sum.textContent = `Exact bytes a stamp seals${entry.sha256 ? ` — sha256 ${entry.sha256.slice(0, 12)}…` : ''}`;
+    exact.appendChild(sum);
+    const raw = agendaStartSheetEl('pre', 'agsx-preview');
+    raw.textContent = entry.text;
+    exact.appendChild(raw);
+    preview.appendChild(exact);
   };
+
+  const renderSummary = () => {
+    summary.textContent = '';
+    if (!entry) {
+      summary.hidden = true;
+      return;
+    }
+    summary.hidden = false;
+    const kind = agendaDefinitionKind(entry);
+    const add = (text) => summary.appendChild(agendaStartSheetEl('div', 'agsx-summary-line', text));
+    summary.appendChild(agendaStartSheetEl('div', 'agsx-summary-head', 'Stamp will'));
+    add(`seal this exact revision${entry.sha256 ? ` (sha256 ${entry.sha256.slice(0, 12)}…)` : ''} — firings execute the sealed bytes, whatever happens to the live file`);
+    if (kind === 'workflow') {
+      const n = (entry.nodes || []).length;
+      add(`park a hub + ${n} node tasks and propose ${n} manifests — each node fires when its prerequisites complete, each with its own approval`);
+    } else if (kind === 'triggered') {
+      const node = (entry.nodes && entry.nodes[0]) || {};
+      const tags = (node.trigger_tags || []).length ? ` tagged ${node.trigger_tags.join(', ')}` : '';
+      add(`park one item and propose one standing manifest — fires when a new open ${node.trigger_kind || 'item'}${tags} arrives`);
+    } else {
+      const everyMs = Number(cadence.value);
+      const firstRun = fire.value ? new Date(fire.value) : null;
+      add(`park one item and propose one standing manifest — every ${agendaCadenceLabel(everyMs)}, first run ${firstRun && !Number.isNaN(firstRun.getTime()) ? firstRun.toLocaleString() : 'to pick'}, suspends after ${Math.max(1, Number(suspend.value) || 3)} straight failures`);
+    }
+    if (kind !== 'workflow') {
+      const picks = [];
+      if (configState.backendOverride) picks.push(configState.backendOverride);
+      if (configState.modelSel && configState.modelSel.value) picks.push(configState.modelSel.value);
+      if (configState.effortSel && configState.effortSel.value) picks.push(configState.effortSel.value);
+      add(`executor: ${picks.length ? `${picks.join(' · ')} — recorded on the manifest` : 'daemon defaults'} · project: ${project.value.trim() || 'daemon default'}`);
+    } else {
+      add(`per-node executors and edges come from the definition · project: ${project.value.trim() || 'daemon default'}`);
+    }
+  };
+
+  const renderSelection = () => {
+    seg.querySelectorAll('button').forEach((b) =>
+      b.classList.toggle('active', !!entry && b.dataset.definition === entry.name));
+    const kind = agendaDefinitionKind(entry);
+    // Cadence and first-fire knobs exist only where the stamp op accepts
+    // them: cadenced actions. Workflows declare per-node executors and
+    // structural on_unblock edges in the definition; triggered actions
+    // fire on their declared match (executor override still applies).
+    cadRow.hidden = kind !== 'action';
+    fireRow.hidden = kind !== 'action';
+    suspendRow.hidden = kind !== 'action';
+    config.hidden = !kind || kind === 'workflow';
+    stampBtn.disabled = !entry;
+    if (entry && kind === 'action') {
+      const prefill = (entry.nodes && entry.nodes[0]) || {};
+      if (prefill.every_ms) {
+        const ms = String(prefill.every_ms);
+        if (!Array.from(cadence.options).some((o) => o.value === ms)) {
+          const option = document.createElement('option');
+          option.value = ms;
+          option.textContent = 'Definition default';
+          cadence.appendChild(option);
+        }
+        cadence.value = ms;
+      }
+      if (prefill.suspend_after) suspend.value = String(prefill.suspend_after);
+      else if (!suspend.value) suspend.value = '3';
+    }
+    renderPreview();
+    renderSummary();
+  };
+  // The summary mirrors the controls live — a stale promise line would
+  // be worse than none.
+  for (const [control, event] of [[cadence, 'change'], [fire, 'change'],
+    [suspend, 'input'], [project, 'input'], [config, 'change']]) {
+    control.addEventListener(event, renderSummary);
+  }
+
   const selectable = (d) => d.valid && !d.shadowed;
   const renderPicker = () => {
     seg.textContent = '';
-    const actions = agendaCatalogActions(agendaDefinitionCatalog);
-    entry = actions.find((d) => selectable(d) && d.name === selectedName)
-      || actions.find(selectable) || null;
+    const catalog = agendaDefinitionCatalog || [];
+    entry = catalog.find((d) => selectable(d) && d.name === selectedName)
+      || catalog.find(selectable) || null;
     selectedName = entry ? entry.name : '';
-    for (const d of actions) {
+    for (const d of catalog) {
       const usable = selectable(d);
-      const btn = agendaStartSheetEl('button', 'ags-seg-btn', usable
-        ? (d.title || d.name)
-        : `${d.title || d.name} (${d.shadowed ? 'shadowed' : 'invalid'})`);
+      const btn = agendaStartSheetEl('button', 'agsx-def-btn');
       btn.type = 'button';
       btn.dataset.definition = d.name;
+      const nameRow = agendaStartSheetEl('div', 'agsx-def-btn-name', d.title || d.name);
+      nameRow.appendChild(agendaProvenanceChipEl(d.provenance));
+      btn.appendChild(nameRow);
+      btn.appendChild(agendaStartSheetEl('div', 'agsx-def-btn-kind',
+        usable ? agendaDefinitionKindLine(d) : (d.shadowed ? 'shadowed' : 'invalid')));
+      if (d.description) {
+        btn.appendChild(agendaStartSheetEl('div', 'agsx-def-btn-desc', d.description));
+      }
       if (!usable) {
         btn.disabled = true;
         btn.title = d.shadowed
@@ -1956,18 +2127,11 @@ function agendaOpenAutomationSheet(anchor) {
           : (d.reason || 'invalid definition');
       } else {
         if (d.advisories && d.advisories.length) btn.title = d.advisories.join('; ');
-        btn.addEventListener('click', () => { entry = d; selectedName = d.name; applyEntry(); });
+        btn.addEventListener('click', () => { entry = d; selectedName = d.name; renderSelection(); });
       }
       seg.appendChild(btn);
     }
-    // Triggered actions and workflows stamp their own lanes and hand
-    // off to their own surfaces — rendered by the workflows fragment
-    // off the same catalog fetch.
-    if (typeof agendaWorkflowRenderPickerButtons === 'function') {
-      agendaWorkflowRenderPickerButtons(seg, agendaCloseAutomationSheet,
-        () => project.value.trim(), agendaDefinitionCatalog || []);
-    }
-    applyEntry();
+    renderSelection();
   };
   renderPicker();
   agendaFetchDefinitionCatalog(() => {
@@ -1987,66 +2151,66 @@ async function agendaAutomationSheetSubmit(form) {
     showError('Pick a definition first.');
     return;
   }
-  const fireAt = form.fire.value ? new Date(form.fire.value).getTime() : NaN;
-  if (!Number.isFinite(fireAt) || fireAt <= Date.now()) {
-    showError('Pick a first-run time in the future.');
-    form.fire.focus();
-    return;
+  const kind = agendaDefinitionKind(entry);
+  // Overrides the stamp op accepts for this kind — prefills into the
+  // ordinary manifest intake, never around it. Workflows take none
+  // (per-node executors and edges are the definition's, v1).
+  const overrides = {};
+  if (kind !== 'workflow') {
+    // Explicit executor picks only — untouched selects inherit (the
+    // start sheet's exact assembly, so both lanes speak one vocabulary).
+    const spec = form.configState && form.configState.spec;
+    const agentConfig = {};
+    if (form.configState && form.configState.backendOverride) {
+      agentConfig.agent = form.configState.backendOverride;
+    }
+    if (spec && spec.backend && spec.backend !== 'internal') {
+      const model = form.configState.modelSel ? form.configState.modelSel.value : '';
+      const effort = form.configState.effortSel ? form.configState.effortSel.value : '';
+      if (model) agentConfig[spec.modelKey] = model;
+      if (effort) agentConfig[spec.effortKey] = effort;
+      if ((model || effort) && !agentConfig.agent) agentConfig.agent = spec.backend;
+    }
+    if (Object.keys(agentConfig).length) overrides.agent_config = agentConfig;
   }
-  const suspendAfter = Math.max(1, Number(form.suspend.value) || 3);
-  // Explicit executor picks only — untouched selects inherit (the start
-  // sheet's exact assembly, so both lanes speak one vocabulary).
-  const spec = form.configState && form.configState.spec;
-  const agentConfig = {};
-  if (form.configState && form.configState.backendOverride) {
-    agentConfig.agent = form.configState.backendOverride;
-  }
-  if (spec && spec.backend && spec.backend !== 'internal') {
-    const model = form.configState.modelSel ? form.configState.modelSel.value : '';
-    const effort = form.configState.effortSel ? form.configState.effortSel.value : '';
-    if (model) agentConfig[spec.modelKey] = model;
-    if (effort) agentConfig[spec.effortKey] = effort;
-    if ((model || effort) && !agentConfig.agent) agentConfig.agent = spec.backend;
-  }
-  form.park.disabled = true;
-  try {
-    // One daemon-side stamp: the daemon reads, validates, and SEALS the
-    // definition, parks the item, and proposes the manifest — the
-    // sheet's choices ride as prefills into the ordinary manifest
-    // intake, never around it. Parks + proposes ONLY; approval stays
-    // the owner's per-effect act on the card.
-    const stamp = {
-      definition: entry.name,
-      fire_at_ms: fireAt,
-      suspend_after: suspendAfter,
-    };
-    const everyMs = Number(form.cadence.value);
-    if (Number.isFinite(everyMs) && everyMs > 0) stamp.every_ms = everyMs;
-    const projectRoot = form.project && form.project.value.trim();
-    if (projectRoot) stamp.project_root = projectRoot;
-    if (Object.keys(agentConfig).length) stamp.agent_config = agentConfig;
-    const res = await daemonApi.request('api_agenda_stamp', stamp);
-    if (!res.ok || !res.body || !res.body.stamp) {
-      showError((res.body && res.body.error) || `stamp failed (${res.status})`);
+  if (kind === 'action') {
+    const fireAt = form.fire.value ? new Date(form.fire.value).getTime() : NaN;
+    if (!Number.isFinite(fireAt) || fireAt <= Date.now()) {
+      showError('Pick a first-run time in the future.');
+      form.fire.focus();
       return;
     }
-    const outcome = res.body.stamp;
-    if (outcome.hub) agendaObserveServerMessage({ item: outcome.hub });
-    for (const node of outcome.nodes || []) {
-      if (node.item) agendaObserveServerMessage({ item: node.item });
-    }
+    overrides.fire_at_ms = fireAt;
+    overrides.suspend_after = Math.max(1, Number(form.suspend.value) || 3);
+    const everyMs = Number(form.cadence.value);
+    if (Number.isFinite(everyMs) && everyMs > 0) overrides.every_ms = everyMs;
+  }
+  form.stampBtn.disabled = true;
+  try {
+    // THE stamp gesture — the only place this sheet stamps. One
+    // daemon-side op: the daemon reads, validates, and SEALS the
+    // definition, parks the instance graph, and proposes per node.
+    // Parks + proposes ONLY; approval stays the owner's per-effect act
+    // (the card, or the one-gesture sheet for a workflow's N nodes).
+    const stamped = await agendaDefinitionStamp(entry,
+      form.project ? form.project.value.trim() : '', overrides);
     agendaCloseAutomationSheet();
+    if (kind === 'workflow') {
+      agendaWorkflowOpenApprovalSheet(stamped);
+      return;
+    }
     // Land the owner on the ordinary Approve affordance.
-    const landId = outcome.nodes && outcome.nodes[0] && outcome.nodes[0].item
-      ? outcome.nodes[0].item.id : null;
+    const landId = stamped.nodes && stamped.nodes[0] && stamped.nodes[0].item
+      ? stamped.nodes[0].item.id : null;
     if (landId && typeof agendaOpenInspector === 'function') agendaOpenInspector(landId);
     if (typeof showControlToast === 'function') {
-      showControlToast('success',
-        'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the series.');
+      showControlToast('success', kind === 'triggered'
+        ? 'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the standing action.'
+        : 'Stamped — sealed, parked, and proposed. Approve the digest on the card to arm the series.');
     }
   } catch (e) {
     showError(String(e && e.message || e));
   } finally {
-    form.park.disabled = false;
+    form.stampBtn.disabled = false;
   }
 }
