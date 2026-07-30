@@ -3146,9 +3146,11 @@ async function stopSessionWindowAction(sessionId, options = {}) {
     return;
   }
   if (!options.skipConfirm) {
+    const agendaStopWarning = sessionWindowAgendaStopWarning(sid);
     const ok = await showDashboardConfirm({
       title: 'Stop session',
       message: 'Stop this live backend? Its history remains available in Sessions, but this card will not be restored after refresh or in other browsers until you resume it.',
+      ...(agendaStopWarning ? { warning: agendaStopWarning } : {}),
       confirmLabel: 'Stop session',
     });
     if (!ok) return;
@@ -3175,10 +3177,31 @@ function closeSideSessionWindowAction(sessionId) {
   }
 }
 
+// Track AO: the machine-scoped stop consequence from the SERVED agenda
+// block (grid_envelope.rs derives it from the durable occurrence
+// journal — the lineage tip of a started-without-terminal occurrence is
+// a live firing; a superseded member of one is still owed work). The
+// copy claims only what the machine knows; process state never talks
+// the debt away.
+function sessionWindowAgendaStopWarning(sid) {
+  const agenda = (sessionMetadataById.get(sid) || {}).agenda;
+  const occ = agenda && agenda.occurrence;
+  if (!occ || !occ.stop) return '';
+  const source = agenda.itemTitle ? `agenda item “${agenda.itemTitle}”` : 'an agenda item';
+  if (occ.stop === 'kills_live_run') {
+    return `This session is the live run of ${source} — stopping it kills that agenda run (the occurrence records failed).`;
+  }
+  if (occ.stop === 'owed_work') {
+    return `An agenda occurrence of ${source} is still owed work behind this session — stopping this superseded session does not settle that debt.`;
+  }
+  return '';
+}
+
 async function chooseSessionWindowCloseAction(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const stopAvailability = sessionWindowStopAvailability(sid);
+  const agendaStopWarning = sessionWindowAgendaStopWarning(sid);
   const canCloseSide = !stopAvailability.ok && sideCloseSupportedForSession(sid);
   const alternateLabel = stopAvailability.ok
     ? 'Stop session'
@@ -3197,7 +3220,9 @@ async function chooseSessionWindowCloseAction(sessionId) {
       ? 'Hide card only removes this card from this dashboard. Close side ends the side conversation in its parent backend thread.'
       : 'Hide card only removes this card from this dashboard.',
     warning: stopAvailability.ok
-      ? 'Session history remains available either way.'
+      ? (agendaStopWarning
+        ? `${agendaStopWarning} Session history remains available either way.`
+        : 'Session history remains available either way.')
       : canCloseSide
       ? 'The parent session remains available either way.'
       : stopAvailability.reason,

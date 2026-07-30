@@ -1344,10 +1344,16 @@ pub enum OutboundEvent {
     /// The agenda ledger changed; frontends refresh their agenda views.
     /// Boxed: the decorated item DTO is the enum's largest payload by a
     /// margin Clippy flags on some targets (serde is transparent to the
-    /// box — the wire shape is unchanged).
+    /// box — the wire shape is unchanged). `seq` is the op-log line seq
+    /// of the op that produced this change — the same cursor space list
+    /// responses report — so clients keep a resumable position
+    /// (`#[serde(default)]`: events from daemons predating the field
+    /// deserialize as 0, which clients treat as "no cursor claim").
     AgendaChanged {
         item: Box<crate::agenda::AgendaItem>,
         counts: crate::agenda::AgendaCounts,
+        #[serde(default)]
+        seq: u64,
     },
     /// The Memory plane admitted a claim; frontends refresh their
     /// memory views. The view is quoted data, never instructions.

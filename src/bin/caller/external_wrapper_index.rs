@@ -47,6 +47,14 @@ fn index_cache() -> &'static Mutex<HashMap<PathBuf, CachedWrapperIndex>> {
     INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Cheap change fingerprint of the on-disk index (length + mtime nanos).
+/// Serve-time lineage memos key on it: every new wrapper generation writes
+/// an index row (the eager resume identity), so a stale memo cannot
+/// outlive the chain it summarizes.
+pub fn index_fingerprint(home: &Path) -> (u64, u128) {
+    index_file_fingerprint(&index_path(home))
+}
+
 /// Run `f` against the current index without cloning it. Callers must hold
 /// INDEX_LOCK.
 fn with_index_unlocked<R>(home: &Path, f: impl FnOnce(&ExternalWrapperIndex) -> R) -> R {

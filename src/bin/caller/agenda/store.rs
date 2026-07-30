@@ -153,6 +153,17 @@ pub(crate) struct AgendaStore {
     /// [`Self::refresh_if_stale`] refolds. Appends are `O_APPEND`, so
     /// interleaved single-line writes stay whole.
     folded_len: u64,
+    /// Log line slots reflected in `items` — the fold's position in the
+    /// exact 0-based seq space [`Self::read_ops`] serves (`log_len`
+    /// there). Also the seq the next append will occupy. Serving reads
+    /// carry it so clients can hold a resumable cursor (Track AS).
+    log_lines: u64,
+    /// Per item, the seq of the last op that folded into it. Derived,
+    /// never serialized into the DTO; the delta-pull lane (`since_seq`)
+    /// and the per-op broadcast seq read it.
+    item_seqs: BTreeMap<String, u64>,
+    /// The boot-fold gauge, recorded once by [`Self::open`] (Q9).
+    boot_fold: AgendaFoldVital,
 }
 
 /// Facts of one scheduled-session occurrence outcome, written back by the
@@ -168,21 +179,42 @@ pub(crate) struct OccurrenceWriteBack<'a> {
     pub(crate) note: Option<String>,
 }
 
-/// Fold raw log bytes into derived state: `(items, ops folded, lines skipped)`.
-fn fold_bytes(bytes: &[u8]) -> (BTreeMap<String, AgendaItem>, u64, u64) {
+/// Everything one pass over the log derives. `lines` counts every line
+/// slot (empty and unparseable included) — the same 0-based seq space
+/// [`AgendaStore::read_ops`] serves, so `lines` is also the next seq an
+/// append will occupy. `item_seqs` records, per item, the seq of the
+/// last op that folded into it (ops the tolerant fold rejected advance
+/// no item's seq — they changed nothing).
+struct FoldOutcome {
+    items: BTreeMap<String, AgendaItem>,
+    ops: u64,
+    skipped_lines: u64,
+    lines: u64,
+    item_seqs: BTreeMap<String, u64>,
+}
+
+/// Fold raw log bytes into derived state.
+fn fold_bytes(bytes: &[u8]) -> FoldOutcome {
     let text = String::from_utf8_lossy(bytes);
     let mut items = BTreeMap::new();
     let mut ops = 0u64;
     let mut skipped_lines = 0u64;
+    let mut lines = 0u64;
+    let mut item_seqs = BTreeMap::new();
     for line in text.lines() {
+        let seq = lines;
+        lines += 1;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         match parse_record(line) {
             Ok(record) => {
-                if let Some(reason) = apply_op(&mut items, &record) {
-                    eprintln!("[agenda] fold: {reason}");
+                match apply_op(&mut items, &record) {
+                    Some(reason) => eprintln!("[agenda] fold: {reason}"),
+                    None => {
+                        item_seqs.insert(record.op.item_id().to_string(), seq);
+                    }
                 }
                 ops += 1;
             }
@@ -192,7 +224,25 @@ fn fold_bytes(bytes: &[u8]) -> (BTreeMap<String, AgendaItem>, u64, u64) {
             }
         }
     }
-    (items, ops, skipped_lines)
+    FoldOutcome {
+        items,
+        ops,
+        skipped_lines,
+        lines,
+        item_seqs,
+    }
+}
+
+/// The boot-fold gauge (design gate Q9): how long the startup fold took
+/// and how big the log it folded was. One observation, recorded at
+/// [`AgendaStore::open`] and logged once — the trend line that decides
+/// when a fold-snapshot sidecar (S9, unscheduled) becomes worth building.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AgendaFoldVital {
+    pub(crate) fold_micros: u64,
+    pub(crate) log_bytes: u64,
+    pub(crate) log_lines: u64,
+    pub(crate) ops: u64,
 }
 
 impl AgendaStore {
@@ -209,7 +259,14 @@ impl AgendaStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err),
         };
-        let (items, ops, skipped_lines) = fold_bytes(&bytes);
+        let fold_started = std::time::Instant::now();
+        let fold = fold_bytes(&bytes);
+        let boot_fold = AgendaFoldVital {
+            fold_micros: fold_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+            log_bytes: bytes.len() as u64,
+            log_lines: fold.lines,
+            ops: fold.ops,
+        };
         let mut folded_len = bytes.len() as u64;
 
         let mut log = std::fs::File::options()
@@ -220,16 +277,19 @@ impl AgendaStore {
             log.write_all(b"\n")?;
             folded_len += 1;
         }
-        let last_id = max_item_id(&items);
+        let last_id = max_item_id(&fold.items);
         let store = Self {
             dir: dir.to_path_buf(),
             log_path,
             log,
-            items,
+            items: fold.items,
             last_id,
-            ops,
-            skipped_lines,
+            ops: fold.ops,
+            skipped_lines: fold.skipped_lines,
             folded_len,
+            log_lines: fold.lines,
+            item_seqs: fold.item_seqs,
+            boot_fold,
         };
         store.sync_ask_state();
         Ok(store)
@@ -268,11 +328,13 @@ impl AgendaStore {
         // Shorter than folded means the append-only contract was broken
         // externally; refolding what's there is the honest recovery either way.
         let bytes = std::fs::read(&self.log_path)?;
-        let (items, ops, skipped_lines) = fold_bytes(&bytes);
-        self.items = items;
-        self.ops = ops;
-        self.skipped_lines = skipped_lines;
+        let fold = fold_bytes(&bytes);
+        self.items = fold.items;
+        self.ops = fold.ops;
+        self.skipped_lines = fold.skipped_lines;
         self.folded_len = bytes.len() as u64;
+        self.log_lines = fold.lines;
+        self.item_seqs = fold.item_seqs;
         // Never lower the mint floor: our own last mint is on disk, so the
         // folded max normally covers it, but a shrunk/tampered file must
         // not let a future mint sort below an id we already handed out.
@@ -1300,6 +1362,12 @@ impl AgendaStore {
         self.log.write_all(line.as_bytes())?;
         self.log.flush()?;
         self.folded_len += line.len() as u64;
+        // This record occupies the next line slot in the seq space
+        // `read_ops` serves (a serialized record is exactly one line —
+        // JSON escapes embedded newlines).
+        let seq = self.log_lines;
+        self.log_lines += 1;
+        self.item_seqs.insert(item_id.clone(), seq);
         if let Some(reason) = apply_op(&mut self.items, &record) {
             // Unreachable by construction: the op was validated against
             // the exact state the fold sees.
@@ -2054,6 +2122,24 @@ impl AgendaStore {
 
     pub(crate) fn counts(&self) -> AgendaCounts {
         counts(&self.items)
+    }
+
+    /// The fold's position in the op-log seq space — the same value
+    /// [`Self::read_ops`] reports as `log_len` (0-based line slots, so
+    /// this is also the seq the next append will occupy). Serving reads
+    /// carry it; a client that has consumed every op below it is current.
+    pub(crate) fn seq(&self) -> u64 {
+        self.log_lines
+    }
+
+    /// The seq of the last op that folded into `id`, if any op has.
+    pub(crate) fn item_seq(&self, id: &str) -> Option<u64> {
+        self.item_seqs.get(id).copied()
+    }
+
+    /// The boot-fold gauge recorded at [`Self::open`] (design gate Q9).
+    pub(crate) fn boot_fold_vital(&self) -> AgendaFoldVital {
+        self.boot_fold
     }
 
     /// One page of the raw op log (read-only; `GET /api/agenda/ops`).
@@ -6039,6 +6125,90 @@ mod tests {
         assert!(
             config.claude_effort.is_none(),
             "override replaces wholesale"
+        );
+    }
+
+    /// Track AS S1 pin (ruling R-AS4): the fold's `seq()` and the ops
+    /// route's `log_len` are ONE cursor space — the 0-based op-log line
+    /// count. Every serving read reports the same number the ops page
+    /// would, across local appends, foreign (other-daemon) appends
+    /// absorbed by `refresh_if_stale`, and torn tails.
+    #[test]
+    fn seq_space_equals_the_ops_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(store.seq(), 0);
+        assert_eq!(store.read_ops(0, None, 100).unwrap().log_len, 0);
+
+        let first = store
+            .apply_command(add_cmd("first"), owner(), 1000)
+            .unwrap();
+        let second = store
+            .apply_command(add_cmd("second"), owner(), 2000)
+            .unwrap();
+        store
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: first.id.clone(),
+                    source: None,
+                },
+                owner(),
+                3000,
+            )
+            .unwrap();
+        assert_eq!(store.seq(), 3);
+        let page = store.read_ops(0, None, 100).unwrap();
+        assert_eq!(page.log_len, store.seq());
+        // Per-item seqs name the LAST op that folded into each item.
+        assert_eq!(store.item_seq(&first.id), Some(2));
+        assert_eq!(store.item_seq(&second.id), Some(1));
+
+        // A foreign append (another daemon on the same home) advances the
+        // shared space: seq is a property of the file, not the process.
+        let mut other = AgendaStore::open(dir.path()).unwrap();
+        other
+            .apply_command(add_cmd("foreign"), owner(), 4000)
+            .unwrap();
+        store.refresh_if_stale().unwrap();
+        assert_eq!(store.seq(), 4);
+        assert_eq!(store.read_ops(0, None, 100).unwrap().log_len, 4);
+
+        // A torn tail (crash mid-append) occupies a line slot in both
+        // readers alike — served unparseable there, counted here.
+        {
+            use std::io::Write as _;
+            let mut raw = std::fs::File::options()
+                .append(true)
+                .open(store.log_path())
+                .unwrap();
+            raw.write_all(b"{\"torn").unwrap();
+        }
+        store.refresh_if_stale().unwrap();
+        assert_eq!(store.seq(), 5);
+        assert_eq!(store.read_ops(0, None, 100).unwrap().log_len, 5);
+        assert_eq!(store.skipped_lines(), 1);
+    }
+
+    /// Track AS S1 (design gate Q9): the boot fold records its one-gauge
+    /// vital — duration, log size, line count — so the daemon log carries
+    /// the trend that would ever justify a fold-snapshot sidecar (S9,
+    /// unscheduled).
+    #[test]
+    fn boot_fold_vital_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.apply_command(add_cmd("one"), owner(), 1000).unwrap();
+        store.apply_command(add_cmd("two"), owner(), 2000).unwrap();
+        drop(store);
+
+        let reopened = AgendaStore::open(dir.path()).unwrap();
+        let vital = reopened.boot_fold_vital();
+        assert_eq!(vital.ops, 2);
+        assert_eq!(vital.log_lines, 2);
+        assert_eq!(vital.log_lines, reopened.seq());
+        assert_eq!(
+            vital.log_bytes,
+            std::fs::metadata(reopened.log_path()).unwrap().len()
         );
     }
 }
