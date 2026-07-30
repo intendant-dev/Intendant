@@ -519,7 +519,196 @@ function normalizeSessionBootEra(raw) {
   // lifecycle update from a dead twin's alias-folded claim.
   const sourceSessionId = compactSessionText(raw.source_session_id || raw.sourceSessionId);
   if (sourceSessionId) out.sourceSessionId = sourceSessionId;
+  // Dead rows carry lineage truth (daemon-derived from the shared
+  // resume-lineage resolver): whether this row IS the chain's current
+  // incarnation, where the chain continued, and the writer's terminal
+  // facts — one writer-stamped unit for the fold resolver to arbitrate.
+  if (raw.lineage_tip === true || raw.lineageTip === true) out.lineageTip = true;
+  else if (raw.lineage_tip === false || raw.lineageTip === false) out.lineageTip = false;
+  const terminal = normalizeSessionTerminalFacts(raw.terminal);
+  if (terminal) out.terminal = terminal;
+  const continuedAs = normalizeSessionContinuedAs(raw.continued_as || raw.continuedAs);
+  if (continuedAs) out.continuedAs = continuedAs;
   return out;
+}
+
+// Dir-local terminal facts served on the row (and lifted into the boot
+// block daemon-side): how and when the session ended — summary outcome +
+// ended_at verbatim, plus the transcript's freshest error for the
+// crash-frozen class that never got a summary.
+function normalizeSessionTerminalFacts(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  const outcome = compactSessionText(raw.outcome);
+  if (outcome) out.outcome = outcome;
+  const endedAt = compactSessionText(raw.ended_at || raw.endedAt);
+  if (endedAt) out.endedAt = endedAt;
+  const lastErrorRaw = raw.last_error || raw.lastError;
+  if (lastErrorRaw && typeof lastErrorRaw === 'object') {
+    const message = compactSessionText(lastErrorRaw.message);
+    if (message) {
+      const ts = compactSessionText(lastErrorRaw.ts);
+      out.lastError = ts ? { ts, message } : { message };
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+// The successor pointer a dead row serves: where this conversation
+// continued (grid/backend ids owner-facing, wrapper ids parenthetical).
+function normalizeSessionContinuedAs(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const sessionId = compactSessionText(raw.session_id || raw.sessionId);
+  const backendSessionId = compactSessionText(raw.backend_session_id || raw.backendSessionId);
+  if (!sessionId && !backendSessionId) return null;
+  const out = { live: raw.live === true };
+  if (sessionId) out.sessionId = sessionId;
+  if (backendSessionId) out.backendSessionId = backendSessionId;
+  const source = compactSessionText(raw.source);
+  if (source) out.source = source;
+  return out;
+}
+
+function sessionTerminalFactsSignature(terminal) {
+  if (!terminal) return '';
+  return [
+    terminal.outcome || '',
+    terminal.endedAt || '',
+    terminal.lastError?.message || '',
+  ].join('^');
+}
+
+// Terminal honesty (agenda card 01KYR84M4PB8QVBR3Y9X9KG9WM): a dead
+// session's window states how and when it ended instead of freezing on
+// its last mid-turn render. This is PRESENTATION of daemon-served facts —
+// liveness stays event/boot-derived and hydration still never flips
+// `ended` (the #637 stop-hide law: phase is not liveness), and the
+// keepExternalDetached park survives untouched: the note renders ON the
+// parked card rather than replacing it.
+function sessionWindowTerminalStatement(sid) {
+  const meta = sessionMetadataById.get(sid) || {};
+  const boot = meta.boot || null;
+  if (boot && boot.liveWrapper) return null;
+  const ghost = !!(boot && boot.ghost);
+  const status = String(meta.status || '').toLowerCase();
+  const failedTerminal = status === 'failed' || status === 'interrupted';
+  // Clean non-ghost completions keep today's look (the Done pill already
+  // says it); the note exists for corpses and dishonest-looking ends.
+  if (!ghost && !failedTerminal) return null;
+  const terminal = (boot && boot.terminal) || meta.terminal || null;
+  const when = terminal?.endedAt || meta.updatedAt || '';
+  const lastError = terminal?.lastError?.message || '';
+  let text;
+  if (terminal?.outcome) {
+    text = `Ended${when ? ` ${when}` : ''}: ${terminal.outcome}`;
+  } else if (status === 'in_progress' || status === 'running') {
+    text = `Died mid-turn${when ? ` — last activity ${when}` : ''}${lastError ? ` (${lastError})` : ''}`;
+  } else {
+    text = `Died without a recorded end${when ? ` — last activity ${when}` : ''}${lastError ? ` (${lastError})` : ''}`;
+  }
+  return { text, continuedAs: (boot && boot.continuedAs) || null };
+}
+
+// The successor's display id under the house id dialect: grid/backend id
+// owner-facing, wrapper id parenthetical when both are known and differ.
+function sessionWindowContinuationLabel(continuedAs) {
+  const backendId = continuedAs?.backendSessionId || '';
+  const wrapperId = continuedAs?.sessionId || '';
+  const primary = backendId || wrapperId;
+  if (!primary) return '';
+  const parenthetical = backendId && wrapperId && backendId !== wrapperId
+    ? ` (${shortSessionId(wrapperId)})`
+    : '';
+  return `${shortSessionId(primary)}${parenthetical}`;
+}
+
+// The successor's terminal state, joined client-side from ITS OWN card
+// metadata in the same served list — the pointer itself is the only
+// daemon-derived fact (derive-don't-mirror: no second bookkeeping).
+function sessionWindowContinuationStateText(continuedAs) {
+  if (!continuedAs) return '';
+  if (continuedAs.live) return 'live';
+  for (const id of [continuedAs.backendSessionId, continuedAs.sessionId]) {
+    if (!id) continue;
+    const meta = sessionMetadataById.get(id);
+    if (!meta) continue;
+    const terminal = (meta.boot && meta.boot.terminal) || meta.terminal || null;
+    if (terminal?.outcome) {
+      return `ended${terminal.endedAt ? ` ${terminal.endedAt}` : ''} — ${terminal.outcome}`;
+    }
+    if (meta.status) return meta.status;
+  }
+  return '';
+}
+
+function openSessionWindowForContinuation(continuedAs) {
+  const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  if (targets.length === 0) return;
+  // Prefer the id an existing window is keyed by; else the owner-facing
+  // backend id (address-upgraded cards key by it).
+  const target = targets.find(id => sessionWindows.has(id)) || targets[0];
+  if (!sessionWindows.has(target)) {
+    ensureSessionWindow(target, {
+      source: continuedAs?.source || 'session',
+      phase: 'idle',
+      ended: false,
+    });
+    Promise.resolve(hydrateSessionWindowIfEmpty(target)).catch(() => {});
+  }
+  if (typeof focusSessionWindowFromLifecycle === 'function') {
+    focusSessionWindowFromLifecycle(target, {});
+  }
+}
+
+// Renders (or clears) the terminal-note strip on a session window from
+// the resolved metadata store. Reached from updateSessionWindow beside
+// the ghost-class toggle, so the refresh-rebuild lane states the terminal
+// fact before any click ever hydrates the card.
+function renderSessionWindowTerminalNote(win, sid) {
+  if (!win || !win.el) return;
+  const statement = sessionWindowTerminalStatement(sid);
+  let note = win.terminalNote || null;
+  if (!statement) {
+    if (note) {
+      note.remove();
+      win.terminalNote = null;
+    }
+    return;
+  }
+  if (!note || !note.isConnected) {
+    note = document.createElement('div');
+    note.className = 'session-window-terminal-note';
+    if (win.log && win.log.parentNode) {
+      win.log.parentNode.insertBefore(note, win.log);
+    } else {
+      win.el.appendChild(note);
+    }
+    win.terminalNote = note;
+  }
+  const continuationLabel = sessionWindowContinuationLabel(statement.continuedAs);
+  const signature = `${statement.text}${continuationLabel}${sessionWindowContinuationStateText(statement.continuedAs)}`;
+  if (note.dataset.signature === signature) return;
+  note.dataset.signature = signature;
+  note.textContent = '';
+  const fact = document.createElement('span');
+  fact.className = 'session-window-terminal-fact';
+  fact.textContent = statement.text;
+  note.appendChild(fact);
+  if (continuationLabel) {
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'session-window-terminal-continued';
+    const stateText = sessionWindowContinuationStateText(statement.continuedAs);
+    link.textContent = `continued as ${continuationLabel}${stateText ? ` — ${stateText}` : ''}`;
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openSessionWindowForContinuation(statement.continuedAs);
+    });
+    note.appendChild(link);
+  }
 }
 
 function normalizeSessionWindowMeta(meta = {}) {
@@ -552,6 +741,12 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (source) out.source = source;
   const status = compactSessionText(meta.status);
   if (status) out.status = status.toLowerCase();
+  // Row-level terminal facts survive even when the boot join is absent
+  // (non-daemon shapes): the terminal-note renderer falls back to them.
+  const terminalFacts = normalizeSessionTerminalFacts(meta.terminal);
+  if (terminalFacts) out.terminal = terminalFacts;
+  const updatedAt = compactSessionText(meta.updated_at || meta.updatedAt);
+  if (updatedAt) out.updatedAt = updatedAt;
   const intendantStatus = compactSessionText(meta.intendant_status || meta.intendantStatus);
   if (intendantStatus) out.intendantStatus = intendantStatus.toLowerCase();
   const sourceLabel = compactSessionText(meta.source_label || meta.sourceLabel);
@@ -654,24 +849,33 @@ function sessionWindowMetadataSignature(meta = {}) {
       ].join('|')
       : '',
     meta.boot
-      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}|${meta.boot.sourceSessionId || ''}`
+      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}|${meta.boot.sourceSessionId || ''}|${meta.boot.lineageTip === undefined ? '' : (meta.boot.lineageTip ? '1' : '0')}|${meta.boot.continuedAs ? `${meta.boot.continuedAs.sessionId || ''}:${meta.boot.continuedAs.backendSessionId || ''}:${meta.boot.continuedAs.live ? '1' : '0'}` : ''}|${sessionTerminalFactsSignature(meta.boot.terminal)}`
       : '',
+    sessionTerminalFactsSignature(meta.terminal),
+    meta.updatedAt || '',
   ].join('\u001f');
 }
 
-// A backend resumed across a daemon restart has TWO wrapper rows alias-
-// folding onto its backend-keyed card: the dead pre-restart twin
-// (ghost:true) and the live resume-attached twin (ghost:false). Fold
-// order must never decide which one the card wears: a live-wrapper
-// claim is only replaced by the same writer moving through its own
-// lifecycle, or by another live wrapper — never by a dead twin whose
-// ghost bit would sell a live session as safe to close.
+// A backend's card is an alias fold of every wrapper row in its lineage:
+// the dead pre-restart twin (ghost:true), a resume-attached or readopted
+// live twin (liveWrapper:true), an ended-this-boot successor (era
+// current), and older dead generations. Fold order must never decide
+// which claim the card wears — the dominance ladder does: a writer's own
+// lifecycle update always lands; otherwise live wrapper > current era >
+// lineage tip > the rest, and only an equal-or-higher rank replaces the
+// standing claim. The live rung keeps a dead twin's ghost bit from
+// selling a live session as safe to close (the 2026-07-28 incident); the
+// current-era and tip rungs keep two DEAD generations deterministic — the
+// chain's newest incarnation states the card's terminal fact whatever
+// order the rows folded in (the 2026-07-29 readopt-successor false-ghost
+// specimens).
 function resolveSessionWindowBootMeta(previous, incoming) {
   if (!previous || !incoming) return incoming || previous || null;
   const sameWriter = !!incoming.sourceSessionId
     && incoming.sourceSessionId === previous.sourceSessionId;
-  if (previous.liveWrapper && !incoming.liveWrapper && !sameWriter) return previous;
-  return incoming;
+  if (sameWriter) return incoming;
+  const rank = claim => (claim.liveWrapper ? 3 : (claim.era === 'current' ? 2 : (claim.lineageTip ? 1 : 0)));
+  return rank(incoming) >= rank(previous) ? incoming : previous;
 }
 
 function mergeSessionWindowMetadata(sessionId, meta = {}) {
@@ -3863,6 +4067,8 @@ function sessionWindowMetaFromSession(session) {
     thread_source: session.thread_source,
     agent_nickname: session.agent_nickname,
     agenda: session.agenda,
+    terminal: session.terminal,
+    updated_at: session.updated_at,
     boot: session.boot && typeof session.boot === 'object'
       ? { ...session.boot, source_session_id: session.session_id }
       : session.boot,

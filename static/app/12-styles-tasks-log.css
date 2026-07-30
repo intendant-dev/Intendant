@@ -985,6 +985,31 @@ body.context-focus-active {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--peach) 22%, transparent);
   filter: saturate(0.65);
 }
+/* Terminal honesty strip: a dead window's plain statement of how it
+   ended, with the lineage pointer when the work continued elsewhere. */
+.session-window .session-window-terminal-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  padding: 4px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: color-mix(in srgb, var(--peach) 70%, var(--text));
+  background: color-mix(in srgb, var(--peach) 9%, var(--session-window-bg));
+  border-bottom: 1px dashed color-mix(in srgb, var(--peach) 35%, var(--surface1));
+}
+.session-window .session-window-terminal-fact {
+  font-weight: 600;
+}
+.session-window .session-window-terminal-continued {
+  color: var(--blue);
+  text-decoration: underline dotted;
+  cursor: pointer;
+}
+.session-window .session-window-terminal-continued:hover {
+  text-decoration-style: solid;
+}
 .session-window.minimized {
   min-height: 36px;
   max-height: 36px;
