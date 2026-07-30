@@ -492,6 +492,7 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
+      ${typeof agendaSealsStripHtml === 'function' ? agendaSealsStripHtml(item) : ''}
       ${agendaDepthCalm() ? '' : `<div class="ag2-eff-goal">${escapeHtml(m.goal || '')}</div>`}
       ${lastRun}
       ${acts.length ? `<div class="ag2-insp-actions">${acts.join('')}</div>` : ''}

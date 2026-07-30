@@ -1140,7 +1140,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaRead,
         BodyPolicy::None,
         RouteHandlerId::AgendaRefDrift,
-        "Re-hash one item's file refs against their attach digests (expand-time drift check)",
+        "Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check)",
     )
     .with_tunnel(tunnel_method("api_agenda_ref_drift")),
     // Tier-2 render join for PR anchors (Track PR): checks/review/

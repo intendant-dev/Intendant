@@ -366,6 +366,14 @@ pub(crate) struct DefinitionCatalogEntry {
     /// The full definition text — what a stamp of this entry would seal
     /// (read from the same path the stamp lane resolves).
     pub(crate) text: String,
+    /// sha256 of `text` — the pin a stamp of this entry would seal right
+    /// now, from the same read that produced `text` (absent only when
+    /// the file was unreadable). What the sheet's exact-bytes expander
+    /// labels and what an adopt restates as its fresh pin; the propose
+    /// intake re-verifies any restated pin against its own read, so
+    /// serving the hash grants nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sha256: Option<String>,
     pub(crate) path: String,
 }
 
@@ -430,7 +438,7 @@ fn catalog_entry(
     provenance: DefinitionProvenance,
     shadowed: bool,
 ) -> DefinitionCatalogEntry {
-    let invalid = |reason: String, text: String| DefinitionCatalogEntry {
+    let invalid = |reason: String, text: String, sha256: Option<String>| DefinitionCatalogEntry {
         name: name.to_string(),
         provenance: provenance.as_str(),
         shadowed,
@@ -443,12 +451,14 @@ fn catalog_entry(
         orientation: None,
         nodes: Vec::new(),
         text,
+        sha256,
         path: path.display().to_string(),
     };
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(err) => return invalid(format!("unreadable: {err}"), String::new()),
+        Err(err) => return invalid(format!("unreadable: {err}"), String::new(), None),
     };
+    let sha256 = Some(super::sealed_blobs::digest_bytes(text.as_bytes()));
     match parse_definition(&text, name) {
         Ok(def) => DefinitionCatalogEntry {
             name: def.name.clone(),
@@ -482,9 +492,10 @@ fn catalog_entry(
                 })
                 .collect(),
             text,
+            sha256,
             path: path.display().to_string(),
         },
-        Err(reason) => invalid(reason, text),
+        Err(reason) => invalid(reason, text, sha256),
     }
 }
 
@@ -1302,6 +1313,12 @@ mod tests {
         );
         assert_eq!(steward.nodes[0].trigger_tags, vec!["gate".to_string()]);
         assert!(catalog.iter().all(|e| !e.text.is_empty()));
+        // Every readable entry serves the pin a stamp would seal right
+        // now, from the same read that produced `text`.
+        assert!(catalog.iter().all(|e| {
+            e.sha256.as_deref()
+                == Some(super::super::sealed_blobs::digest_bytes(e.text.as_bytes()).as_str())
+        }));
 
         // A personal definition shadows its house twin VISIBLY: both
         // list, the personal entry first, the house one flagged.
@@ -1335,6 +1352,8 @@ mod tests {
             "{:?}",
             broken_entry.reason
         );
+        // Invalid-but-readable still hashes: bytes are bytes.
+        assert!(broken_entry.sha256.is_some());
     }
 
     #[test]
