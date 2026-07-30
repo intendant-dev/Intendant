@@ -912,6 +912,7 @@ pub struct AgendaRelation {
 /// What a typed reference points at (G1). The discriminator mirrors the
 /// kernel's Appendix A.5 `evref` spirit (scheme + locator + digest) so the
 /// future D0-Agenda-Data migration maps refs mechanically: `file`→`file`,
+/// `dir`→directory pointer (locator-only, deliberately digestless),
 /// `session`→`session-log`, `url`→`url`, `memory`→plane claim ref. A
 /// ref type this build does not know fails the typed parse, so the whole
 /// line degrades to preserved-skipped — future types are op-vocabulary
@@ -920,6 +921,7 @@ pub struct AgendaRelation {
 #[serde(rename_all = "snake_case")]
 pub enum AgendaRefType {
     File,
+    Dir,
     Memory,
     Session,
     Url,
@@ -929,6 +931,7 @@ impl AgendaRefType {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             AgendaRefType::File => "file",
+            AgendaRefType::Dir => "dir",
             AgendaRefType::Memory => "memory",
             AgendaRefType::Session => "session",
             AgendaRefType::Url => "url",
@@ -947,8 +950,9 @@ impl AgendaRefType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaRef {
     pub(crate) ref_type: AgendaRefType,
-    /// `file`: absolute path; `memory`: claim id; `session`: conversation
-    /// id; `url`: http(s) URL. Stored verbatim as intake validated it.
+    /// `file`/`dir`: absolute path; `memory`: claim id; `session`:
+    /// conversation id; `url`: http(s) URL. Stored verbatim as intake
+    /// validated it (dir refs: trailing slashes normalized away).
     pub(crate) locator: String,
     /// File refs only: full sha256 hex of the file as it stood at attach —
     /// intake-minted and recorded in the op (replay never hashes). The

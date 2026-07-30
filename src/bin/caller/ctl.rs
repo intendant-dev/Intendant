@@ -2880,38 +2880,43 @@ async fn run_agenda(
 
 /// Resolve one ctl-side ref spec: `[type:]locator` with a `--type`
 /// override. Inference: http(s) URLs are `url`; a path that exists
-/// locally is `file` (canonicalized to the absolute path the daemon
-/// stores); anything else needs an explicit type. Client-side sugar only —
-/// the daemon re-validates everything at intake (and mints the digest).
+/// locally is `file` — or `dir` when it is a directory (both
+/// canonicalized to the absolute path the daemon stores); anything else
+/// needs an explicit type. Client-side sugar only — the daemon
+/// re-validates everything at intake (and mints file digests).
 fn agenda_ref_spec(raw: &str, explicit: Option<&str>) -> Result<(String, String), String> {
     let (prefixed, rest) = match raw.split_once(':') {
-        Some((t, rest)) if ["file", "memory", "session", "url"].contains(&t) => (Some(t), rest),
+        Some((t, rest)) if ["file", "dir", "memory", "session", "url"].contains(&t) => {
+            (Some(t), rest)
+        }
         _ => (None, raw),
     };
     let ref_type = match explicit.or(prefixed) {
         Some(t) => match t.trim().to_ascii_lowercase().as_str() {
-            t @ ("file" | "memory" | "session" | "url") => t.to_string(),
+            t @ ("file" | "dir" | "memory" | "session" | "url") => t.to_string(),
             other => {
                 return Err(format!(
-                    "unknown ref type '{other}' (file, memory, session, or url)"
+                    "unknown ref type '{other}' (file, dir, memory, session, or url)"
                 ))
             }
         },
         None => {
             if raw.starts_with("http://") || raw.starts_with("https://") {
                 "url".to_string()
+            } else if std::path::Path::new(raw).is_dir() {
+                "dir".to_string()
             } else if std::path::Path::new(raw).exists() {
                 "file".to_string()
             } else {
                 return Err(format!(
                     "cannot infer the ref type of {raw:?} — prefix it \
-                     (file:…, memory:…, session:…, url:https://…) or pass --type"
+                     (file:…, dir:…, memory:…, session:…, url:https://…) or pass --type"
                 ));
             }
         }
     };
     let locator = if prefixed.is_some() { rest } else { raw };
-    let locator = if ref_type == "file" {
+    let locator = if ref_type == "file" || ref_type == "dir" {
         // The daemon stores absolute paths; resolve relative args here. A
         // since-deleted file (removals) passes the stored path verbatim.
         match std::fs::canonicalize(locator) {
@@ -5631,7 +5636,7 @@ fn help_agenda() {
   intendant ctl agenda block ID_PREFIX CRITERION... [--source LABEL]\n\
   intendant ctl agenda unblock ID_PREFIX [BLOCKER_PREFIX] [--source LABEL]\n\
   intendant ctl agenda relies-on ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
-  intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|memory|session|url]\n\
+  intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|dir|memory|session|url]\n\
       [--must-read] [--label TEXT] [--remove] [--source LABEL]\n\
   intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
   intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--kind KIND] [--remove] [--source LABEL]\n\
@@ -5706,9 +5711,11 @@ lane — no --peer, and a supervised session's injected lane deliberately\n\
 lacks them (use `agenda list` there).\n\
 \n\
 `ref` attaches a typed POINTER (never content): a file path (digested at\n\
-attach so the detail view can show drift honestly), a Memory claim id, a\n\
+attach so the detail view can show drift honestly), a directory path\n\
+(pointer only — never digested), a Memory claim id, a\n\
 session/conversation id, or an http(s) URL. Type is inferred (URLs,\n\
-existing paths) or explicit via TYPE: prefix / --type; --must-read marks\n\
+existing paths — a directory infers dir) or explicit via TYPE: prefix /\n\
+--type; --must-read marks\n\
 it prominent for whoever picks the item up (a pointer they weigh, not an\n\
 order); --remove drops it (history stays). On `add`, repeat --ref to\n\
 attach at park time — one item, its context, one gesture.\n\

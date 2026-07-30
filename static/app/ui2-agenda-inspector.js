@@ -1212,12 +1212,14 @@ function agendaInspAddTag(item) {
 // Pointer type inference for the add row (the daemon validates the typed
 // command either way — this only picks the claimed type): http(s) → url,
 // a 12+-hex run → memory claim id, an id the sessions join knows → session,
-// anything else → file path.
+// a trailing slash → dir (the browser cannot stat; the daemon re-checks
+// and normalizes the slash away), anything else → file path.
 function agendaInspInferRefType(locator) {
   if (/^https?:\/\//i.test(locator)) return 'url';
   if (/^[0-9a-f]{12,}$/i.test(locator)) return 'memory';
   if (agendaSessions && agendaSessions[locator]) return 'session';
   if (/^sess-/.test(locator)) return 'session';
+  if (locator.length > 1 && /\/$/.test(locator)) return 'dir';
   return 'file';
 }
 

@@ -221,6 +221,7 @@ attributed ops):
 | type | locator | resolves to |
 |---|---|---|
 | `file` | absolute path | the file, plus the drift check below |
+| `dir` | absolute directory path | the directory — pointer only (no digest, no content lane) |
 | `memory` | Memory claim id | the Explorer claim |
 | `session` | conversation id | the Sessions row (F1 join) |
 | `url` | http(s) URL | a plain link |
@@ -243,7 +244,11 @@ button) and renders "changed since attached" or "missing" honestly —
 never on list render, and nothing derived is ever stored. **No blobs,
 ever**: no file contents, copies, or uploads enter the agenda for refs —
 the preview blob store remains exclusively Ask-v2's (pinned in
-`agenda/blobs.rs`). Digests travel; blobs wouldn't.
+`agenda/blobs.rs`). Digests travel; blobs wouldn't. `dir` refs are
+deliberately digest-less pointers (trailing slashes normalized at
+intake): a directory has no attach-time byte identity without a priced
+tree-hash scheme — future vocabulary — so presence is its only drift
+signal.
 
 ### The graph: placement and adjacency (G2)
 
