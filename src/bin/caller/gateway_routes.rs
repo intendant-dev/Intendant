@@ -307,6 +307,10 @@ pub(crate) enum RouteHandlerId {
     ApiKeyStatus,
     /// Tier-2 PR render join for one anchor (expand-time, cached).
     AgendaPrState,
+    /// One agenda item, full + decorated, by id or unique prefix
+    /// (Track AS S4 — the single-item read repairing the
+    /// full-ledger-per-lookup amplifier).
+    AgendaItem,
     /// GitHub App integration: seal credentials + set the watch list.
     GithubIntegrationSave,
     /// Integration presence + last-exchange state (never unseals).
@@ -998,9 +1002,24 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaRead,
         BodyPolicy::None,
         RouteHandlerId::AgendaList,
-        "Agenda ledger snapshot: items (oldest first) plus status counts",
+        "Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search) — the bare call serves the full ledger forever",
     )
     .with_tunnel(tunnel_method("api_agenda_list")),
+    // One item at full grain, by id or unique prefix (Track AS S4): the
+    // inspector's expand fetch and tooling's single-item reads — the
+    // repair for the 18-subcommand full-ledger-per-lookup amplifier.
+    // Exact id always wins; an ambiguous prefix refuses by name with a
+    // bounded candidate list. Rides the same agenda.read class as the
+    // list (a subset of what the list already serves).
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments("/api/agenda/items", &[SegmentSpec::Capture("item_id")]),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaItem,
+        "One agenda item, full + decorated, by id or unique prefix (+ its sessions join)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_item")),
     // The raw append-only op log behind the fold, read-only: per-item
     // history and manifest-revision diffs need the ops themselves, not
     // the fold product. Lines this build cannot fold are served verbatim

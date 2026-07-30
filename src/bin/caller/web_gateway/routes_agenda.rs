@@ -19,43 +19,55 @@ use super::*;
 /// `since_seq` (additive, Track AS S2) turns the same shape into a
 /// delta: only items whose last folding op seq is `>= since_seq` ride
 /// `items` — the healing lane for event gaps, reconnects, and foreign
-/// (other-daemon) appends. The BARE call keeps the full-ledger shape
-/// forever (ruling R-AS1); the sibling joins always cover exactly the
-/// served set (Q10), so they shrink with the delta automatically.
+/// (other-daemon) appends. `shape=summary` and `q=` (additive, Track AS
+/// S4) serve the summary projection — cross-item flags computed against
+/// the FULL fold — and server-side search (title/body/tags/id + ≥8-hex
+/// digest prefixes). The BARE call keeps the full-ledger shape forever
+/// (ruling R-AS1); the sibling joins always cover exactly the served
+/// set (Q10), so they shrink with delta, search, and window alike.
 pub(crate) async fn agenda_list_api_response(
     since_seq: Option<u64>,
+    shape: AgendaListShape,
+    q: Option<&str>,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let Some(agenda) = agenda_handle(mcp_server).await else {
         return ApiResponse::json_error(503, "agenda unavailable on this daemon");
     };
-    let snapshot = match since_seq {
-        Some(cursor) => agenda.changed_since(cursor),
-        None => agenda.snapshot(),
-    };
-    let (items, counts, skipped_lines, seq) = (
-        snapshot.items,
-        snapshot.counts,
-        snapshot.skipped_lines,
-        snapshot.seq,
-    );
-    let sessions = agenda_sessions_join(&crate::platform::home_dir(), &items);
+    let read = agenda.serving_read(since_seq);
+    let mut served = read.served;
+    if let Some(q) = q {
+        served.retain(|item| crate::agenda::matches_query(item, q));
+    }
+    let sessions = agenda_sessions_join(&crate::platform::home_dir(), &served);
     // Tier-1 PR state for the anchors this snapshot serves — the same
     // sibling discipline as `sessions`: keyed by the anchors' url-ref
     // locators, memory-only (the scanner's poll fetched it, not this
     // render), a locator with no entry claims nothing. Omitted entirely
     // when nothing joins.
     let pull_requests = crate::github_pr::join::tier1().for_locators(
-        items
+        served
             .iter()
             .flat_map(|item| item.refs.iter())
             .map(|r| r.locator.as_str()),
     );
+    let items_value = match shape {
+        AgendaListShape::Full => serde_json::to_value(&served),
+        AgendaListShape::Summary => {
+            serde_json::to_value(crate::agenda::summarize(&read.all, &served))
+        }
+    };
+    let items_value = match items_value {
+        Ok(value) => value,
+        Err(err) => {
+            return ApiResponse::json_error(500, format!("encoding agenda items: {err}"));
+        }
+    };
     let mut body = serde_json::json!({
-        "items": items,
-        "counts": counts,
-        "skipped_lines": skipped_lines,
-        "seq": seq,
+        "items": items_value,
+        "counts": read.counts,
+        "skipped_lines": read.skipped_lines,
+        "seq": read.seq,
         "reminder_policy": agenda.reminder_policy(),
         "sessions": sessions,
     });
@@ -65,6 +77,87 @@ pub(crate) async fn agenda_list_api_response(
             .insert("pull_requests".to_string(), pull_requests.into());
     }
     ApiResponse::json(200, JsonBody::Value(body))
+}
+
+/// The list response's item grain (Track AS S4). `Full` is the frozen
+/// bare default; `Summary` is the projection lenses group over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgendaListShape {
+    Full,
+    Summary,
+}
+
+impl AgendaListShape {
+    /// Parse the additive `shape` parameter: absent/empty/`full` =
+    /// `Full`; `summary` = `Summary`; anything else is a named refusal
+    /// (never a silent default — a typo must not quietly serve 700 KB).
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::Full),
+            Some("full") => Ok(Self::Full),
+            Some("summary") => Ok(Self::Summary),
+            Some(other) => Err(format!("unknown shape '{other}' (full or summary)")),
+        }
+    }
+}
+
+/// Transport-neutral core of `GET /api/agenda/items/{item_id}` (tunnel
+/// twin `api_agenda_item`, Track AS S4): ONE item at full decorated
+/// grain, resolved by exact id or unique prefix (exact always wins —
+/// ruling Q5), plus its own sessions join and tier-1 PR sibling. An
+/// ambiguous prefix refuses by name with a bounded candidate list
+/// (ids + titles) so callers disambiguate without refetching the world.
+pub(crate) async fn agenda_item_api_response(
+    item_id: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    match agenda.resolve_prefix(item_id) {
+        crate::agenda::AgendaPrefixResolution::One(item) => {
+            let sessions = agenda_sessions_join(
+                &crate::platform::home_dir(),
+                std::slice::from_ref(item.as_ref()),
+            );
+            let pull_requests = crate::github_pr::join::tier1()
+                .for_locators(item.refs.iter().map(|r| r.locator.as_str()));
+            let mut body = serde_json::json!({
+                "item": *item,
+                "sessions": sessions,
+            });
+            if !pull_requests.is_empty() {
+                body.as_object_mut()
+                    .expect("object body")
+                    .insert("pull_requests".to_string(), pull_requests.into());
+            }
+            ApiResponse::json(200, JsonBody::Value(body))
+        }
+        crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => ApiResponse::json(
+            400,
+            JsonBody::Value(serde_json::json!({
+                "error": format!("ambiguous agenda id prefix '{item_id}'"),
+                "candidates": candidates
+                    .into_iter()
+                    .map(|(id, title)| serde_json::json!({ "id": id, "title": title }))
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+        crate::agenda::AgendaPrefixResolution::None => {
+            ApiResponse::json_error(404, "agenda item not found")
+        }
+    }
+}
+
+pub(crate) async fn handle_agenda_item(
+    stream: DemuxStream,
+    item_id: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_item_api_response(&item_id, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Transport-neutral core of `GET /api/agenda/items/{item_id}/pr-state`
@@ -445,7 +538,17 @@ pub(crate) async fn handle_agenda_list(
     fleet_origin: Option<&str>,
 ) {
     let since_seq = query_param(request_line, "since_seq").and_then(|v| v.parse().ok());
-    let response = agenda_list_api_response(since_seq, mcp_server.as_ref()).await;
+    let shape_raw = query_param(request_line, "shape");
+    let shape = match AgendaListShape::parse(shape_raw.as_deref()) {
+        Ok(shape) => shape,
+        Err(err) => {
+            let response = ApiResponse::json_error(400, err);
+            return write_api_response(stream, response, cors, fleet_origin).await;
+        }
+    };
+    let q = query_param(request_line, "q").filter(|v| !v.trim().is_empty());
+    let response =
+        agenda_list_api_response(since_seq, shape, q.as_deref(), mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -679,7 +782,9 @@ mod tests {
             .unwrap();
         agenda.apply(add("open row", "live"), owner).unwrap();
 
-        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
+        let body = json_of(
+            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+        );
         let items = body["items"].as_array().expect("items array");
         assert_eq!(items.len(), 3, "every item, closed included");
         let served_done = items
@@ -744,21 +849,159 @@ mod tests {
         agenda
             .apply(add("before the cursor"), owner.clone())
             .unwrap();
-        let cursor = json_of(&agenda_list_api_response(None, Some(&server)).await)["seq"]
+        let cursor = json_of(
+            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+        )["seq"]
             .as_u64()
             .unwrap();
         let changed = agenda.apply(add("after the cursor"), owner).unwrap();
 
-        let delta = json_of(&agenda_list_api_response(Some(cursor), Some(&server)).await);
+        let delta = json_of(
+            &agenda_list_api_response(Some(cursor), AgendaListShape::Full, None, Some(&server))
+                .await,
+        );
         let items = delta["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["id"], serde_json::json!(changed.id));
         assert_eq!(delta["counts"]["open"], 2, "counts stay whole-ledger");
         assert_eq!(delta["seq"], cursor + 1);
         // An at-frontier pull is an empty delta with the same shape.
-        let empty = json_of(&agenda_list_api_response(Some(cursor + 1), Some(&server)).await);
+        let empty = json_of(
+            &agenda_list_api_response(Some(cursor + 1), AgendaListShape::Full, None, Some(&server))
+                .await,
+        );
         assert!(empty["items"].as_array().unwrap().is_empty());
         assert_eq!(empty["counts"]["open"], 2);
+    }
+
+    /// Track AS S4 pin (ruling Q5): the item route resolves an exact id
+    /// always, a unique prefix when unambiguous, and refuses an
+    /// ambiguous prefix by name with a bounded {id, title} candidate
+    /// list. The resolved item is full grain — body present — with its
+    /// own sessions join sibling.
+    #[tokio::test]
+    async fn item_route_resolves_unique_prefix_exact_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: format!("{title} — full-grain body"),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let first = agenda.apply(add("first"), owner.clone()).unwrap();
+        let second = agenda.apply(add("second"), owner).unwrap();
+
+        // Exact id wins.
+        let body = json_of(&agenda_item_api_response(&first.id, Some(&server)).await);
+        assert_eq!(body["item"]["id"], serde_json::json!(first.id));
+        assert_eq!(
+            body["item"]["body"],
+            serde_json::json!("first — full-grain body"),
+            "the item route serves full grain"
+        );
+
+        // A unique prefix resolves (the full id minus its tail is unique
+        // against any other ULID).
+        let unique_prefix = &first.id[..25];
+        if !second.id.starts_with(unique_prefix) {
+            let body = json_of(&agenda_item_api_response(unique_prefix, Some(&server)).await);
+            assert_eq!(body["item"]["id"], serde_json::json!(first.id));
+        }
+
+        // An ambiguous prefix ("01" prefixes every current ULID) refuses
+        // by name with bounded candidates.
+        let ambiguous = agenda_item_api_response("01", Some(&server)).await;
+        let ApiResponse::Json { status, body, .. } = &ambiguous else {
+            panic!("expected the JSON lane");
+        };
+        let (status, body) = (
+            *status,
+            serde_json::from_str::<serde_json::Value>(&body.as_text()).unwrap(),
+        );
+        assert_eq!(status, 400);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous agenda id prefix"));
+        let candidates = body["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|c| c.get("id").is_some() && c.get("title").is_some()));
+
+        // Unknown → 404 by name.
+        let missing = agenda_item_api_response("7ZZZZZZZZZ", Some(&server)).await;
+        let ApiResponse::Json { status, .. } = missing else {
+            panic!("expected the JSON lane");
+        };
+        assert_eq!(status, 404);
+    }
+
+    /// Track AS S4: `shape=summary` on the list core serves the summary
+    /// projection (no bodies; served flags present) while the bare call
+    /// stays full (the freeze pin above proves that separately).
+    #[tokio::test]
+    async fn summary_shape_serves_summaries_with_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Task,
+                    title: "summarized".into(),
+                    body: "a body that must not ride the summary".into(),
+                    tags: vec!["one".into()],
+                    due_ms: None,
+                    source: None,
+                    refs: Vec::new(),
+                },
+                owner,
+            )
+            .unwrap();
+        let body = json_of(
+            &agenda_list_api_response(None, AgendaListShape::Summary, None, Some(&server)).await,
+        );
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get("body").is_none(), "summaries carry no body");
+        assert!(items[0].get("blocked").is_some(), "served flag present");
+        assert!(items[0].get("frontier").is_some(), "served flag present");
+        assert_eq!(body["counts"]["open"], 1);
+        // q= composes on the same lane.
+        let hit = json_of(
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Summary,
+                Some("summarized"),
+                Some(&server),
+            )
+            .await,
+        );
+        assert_eq!(hit["items"].as_array().unwrap().len(), 1);
+        let miss = json_of(
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Summary,
+                Some("no-such-text"),
+                Some(&server),
+            )
+            .await,
+        );
+        assert!(miss["items"].as_array().unwrap().is_empty());
     }
 
     /// Tier 1 rides the snapshot as a sibling map keyed by served
@@ -777,7 +1020,9 @@ mod tests {
             .unwrap();
         crate::github_pr::join::tier1().update_repo("o/r", &open);
 
-        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
+        let body = json_of(
+            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+        );
         let joined = &body["pull_requests"][locator];
         assert_eq!(joined["draft"], true);
         assert_eq!(joined["title"], "live");

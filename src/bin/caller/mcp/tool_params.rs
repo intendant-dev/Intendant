@@ -51,6 +51,14 @@ pub struct AgendaListParams {
     /// `seq` a previous response reported). Omit for the full ledger.
     #[serde(default)]
     pub since_seq: Option<u64>,
+    /// Item grain: "full" (default) or "summary" (titles, chips, edges,
+    /// and served flags — no bodies; fetch the item for full detail).
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// Server-side search over title, body, tags, id, and ≥8-hex-char
+    /// digest prefixes. Omit for no filter.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
