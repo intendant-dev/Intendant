@@ -1733,8 +1733,8 @@ pub(crate) async fn verify_hosted_bundle(
 /// Repository whose GitHub releases the hosted log's release manifests
 /// describe (`macos-app/UpdateChecker.swift` twins this slug);
 /// `--repo` overrides for self-hosted forks.
-const DEFAULT_RELEASE_REPO: &str = "intendant-dev/Intendant";
-const GITHUB_API_BASE: &str = "https://api.github.com";
+pub(crate) const DEFAULT_RELEASE_REPO: &str = "intendant-dev/Intendant";
+pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 
 /// `--download` re-fetches whole release artifacts, which are allowed to
 /// be far bigger than Connect page/installer bundles.
@@ -2108,6 +2108,23 @@ pub(crate) struct ReleaseVerifyReport {
     pub downloaded: usize,
     /// `None` = first contact (this run created the pin).
     pub pinned_from_size: Option<u64>,
+    /// The verified plan: every LOGGED artifact with its log-committed
+    /// digest/size and the GitHub download URL observed beside it. Only
+    /// meaningful when verification passed (the fn errors otherwise);
+    /// the self-update lane consumes it to fetch exactly the committed
+    /// bytes.
+    pub artifacts: Vec<ReleaseArtifactPlan>,
+}
+
+/// One verified release artifact as the update lane consumes it: the
+/// name/digest/size come from the transparency log's manifest leaf, the
+/// download URL from the GitHub release the leaf was verified against.
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseArtifactPlan {
+    pub name: String,
+    pub sha256: String,
+    pub size: u64,
+    pub download_url: Option<String>,
 }
 
 fn github_release_tag_url(github_api: &Url, repo: &str, tag: &str) -> Result<Url, String> {
@@ -2280,6 +2297,20 @@ pub(crate) async fn verify_hosted_release(
     // Everything held — advance the pin.
     commit_verified_pin(&client, base, &entry).await?;
 
+    let artifact_plans = leaf
+        .artifacts
+        .iter()
+        .map(|artifact| ReleaseArtifactPlan {
+            name: artifact.name.clone(),
+            sha256: artifact.sha256.clone(),
+            size: artifact.size,
+            download_url: assets
+                .iter()
+                .find(|asset| asset.name == artifact.name)
+                .and_then(|asset| asset.download_url.clone()),
+        })
+        .collect();
+
     Ok(ReleaseVerifyReport {
         log_size: entry.sth.size,
         manifest_index: entry.index,
@@ -2294,7 +2325,67 @@ pub(crate) async fn verify_hosted_release(
         presence_only,
         downloaded,
         pinned_from_size: entry.pinned_from_size,
+        artifacts: artifact_plans,
     })
+}
+
+/// Download one release asset to a file, hashing the exact bytes as
+/// they stream (the same bounded client + timeout discipline as the
+/// `--download` verification lane). Returns the sha256 hex of what was
+/// WRITTEN — the caller compares it against the log's committed digest
+/// and deletes the file on mismatch (fail closed).
+pub(crate) async fn download_release_asset_to_file(
+    url: &str,
+    dest: &Path,
+    byte_cap: usize,
+) -> Result<String, String> {
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let client = release_download_client()?;
+    let url = Url::parse(url).map_err(|e| format!("asset URL {url}: {e}"))?;
+    let response = tokio::time::timeout(ARTIFACT_RESPONSE_TIMEOUT, client.get(url.clone()).send())
+        .await
+        .map_err(|_| format!("GET {url}: response headers timed out"))?
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > byte_cap as u64)
+    {
+        return Err(format!("GET {url}: response exceeds {byte_cap} bytes"));
+    }
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0usize;
+    let mut stream = response.bytes_stream();
+    loop {
+        let chunk = tokio::time::timeout(ARTIFACT_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| format!("GET {url}: response body became idle"))?;
+        let Some(chunk) = chunk else { break };
+        let chunk = chunk.map_err(|e| format!("GET {url}: {e}"))?;
+        total = total.saturating_add(chunk.len());
+        if total > byte_cap {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(format!("GET {url}: response exceeds {byte_cap} bytes"));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("flush {}: {e}", dest.display()))?;
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 // ── The daemon tripwire (advisory, fail-open; the CT tripwire's rhyme) ──
@@ -4507,5 +4598,46 @@ mod tests {
         assert!(!waiting.is_finished());
         drop(first);
         waiting.await.unwrap();
+    }
+
+    /// The self-update lane's fetch edge: bytes stream to the file while
+    /// hashing (the returned digest is of what was WRITTEN), and the
+    /// byte cap refuses oversize bodies, deleting the partial file —
+    /// the update lane's fail-closed download seam.
+    #[tokio::test]
+    async fn release_asset_download_writes_and_hashes_exactly() {
+        let payload: &[u8] = b"release artifact bytes";
+        let router = axum::Router::new().route(
+            "/asset.zip",
+            axum::routing::get(|| async { payload.to_vec() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("asset.zip");
+        let sha = download_release_asset_to_file(
+            &format!("http://{addr}/asset.zip"),
+            &dest,
+            1024,
+        )
+        .await
+        .expect("download succeeds");
+        assert_eq!(sha, sha256_hex(payload), "digest is of the written bytes");
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+
+        let capped = download_release_asset_to_file(
+            &format!("http://{addr}/asset.zip"),
+            &dir.path().join("capped.zip"),
+            4,
+        )
+        .await;
+        assert!(capped.is_err(), "over-cap bodies refuse");
+        assert!(
+            !dir.path().join("capped.zip").exists(),
+            "a refused download leaves no partial bytes behind"
+        );
+        server.abort();
     }
 }

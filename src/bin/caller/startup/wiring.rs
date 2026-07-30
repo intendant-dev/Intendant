@@ -344,6 +344,11 @@ pub(crate) fn spawn_mode_web_gateway(
     // the handover status payload + ONE deduped notification per
     // distinct on-disk sha.
     crate::handover::spawn_update_watch(handover.clone());
+    // The self-update lane (the PRODUCE half): bounded behind-main /
+    // behind-latest-release checks, and the owner-click produce job
+    // (supervised children; fail-closed verify) that lands a newer
+    // binary at the watched path for the chip/one-click swap above.
+    crate::handover::spawn_update_lane(&handover);
     // --takeover (Track HS3): this boot is the intended successor — ask
     // the current holder to drain, then fast-poll the freed lease.
     // Detached; bounded; failure degrades to ordinary secondary polling.

@@ -7078,3 +7078,234 @@ async fn update_surface_probes_swapped_binary_and_serves_the_chip_block() {
         "the running provenance rides beside the on-disk build: {body}"
     );
 }
+
+/// Run one git command in the update-lane fixture repos, with a pinned
+/// identity so commits work on a bare CI account.
+#[cfg(unix)]
+fn fixture_git(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "-c",
+            "user.name=e2e",
+            "-c",
+            "user.email=e2e@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .output()
+        .expect("run fixture git");
+    assert!(
+        output.status.success(),
+        "fixture git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The self-update lane's source leg (commission
+/// 01KYSWZC7BBPJGT48G9WYFF7J3 acceptance): a daemon whose running build
+/// is behind origin/main runs the bounded compare, the owner's click
+/// produces the artifact — REAL `git pull --ff-only` against a local
+/// origin, the build stubbed by the mock-gated
+/// `INTENDANT_UPDATE_LANE_BUILD_CMD` (a cargo build is not payable in
+/// CI) landing a new probe-able image at the watched path — and the
+/// EXISTING update watch then serves the chip block for the shipped
+/// one-click swap lane (whose drain half `drainer_exits_at_last_
+/// session_end` proves). Zero kills: the daemon's boot_id answers
+/// unchanged, undrained, through the whole flow. Unix-gated like its
+/// sibling (shebang-exec fakes).
+#[cfg(unix)]
+#[tokio::test]
+async fn update_lane_source_click_produces_artifact_and_chips() {
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // A real origin one commit ahead of the checkout: clone, seed the
+    // buildable-checkout shape, push commit A; commit B lands on origin
+    // through a second clone, so the checkout itself never sees it
+    // until the lane's own fetch/pull.
+    let origin = rig.home.path().join("origin.git");
+    std::fs::create_dir_all(&origin).expect("origin dir");
+    fixture_git(&origin, &["init", "--bare", "--initial-branch=main", "."]);
+    let checkout = rig.home.path().join("checkout");
+    fixture_git(
+        rig.home.path(),
+        &["clone", origin.to_str().expect("utf8"), "checkout"],
+    );
+    std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").expect("seed Cargo.toml");
+    std::fs::create_dir_all(checkout.join("scripts")).expect("seed scripts dir");
+    std::fs::write(checkout.join("scripts").join("bundle-macos.sh"), "#!/bin/bash\n")
+        .expect("seed bundle script");
+    fixture_git(&checkout, &["add", "."]);
+    fixture_git(&checkout, &["commit", "-m", "commit A"]);
+    fixture_git(&checkout, &["push", "origin", "main"]);
+    let sha_a = fixture_git(&checkout, &["rev-parse", "HEAD"]);
+    let ahead = rig.home.path().join("ahead");
+    fixture_git(
+        rig.home.path(),
+        &["clone", origin.to_str().expect("utf8"), "ahead"],
+    );
+    std::fs::write(ahead.join("NEWS.md"), "commit B\n").expect("seed ahead change");
+    fixture_git(&ahead, &["add", "."]);
+    fixture_git(&ahead, &["commit", "-m", "commit B"]);
+    fixture_git(&ahead, &["push", "origin", "main"]);
+    let sha_b = fixture_git(&ahead, &["rev-parse", "HEAD"]);
+
+    // The "running" image sits at the checkout's release path (the
+    // watched path AND what makes flavor detection read "source"), and
+    // the mock build script stands in for cargo: it writes a NEW
+    // probe-able image there, exactly what a real build does.
+    let watched = checkout.join("target").join("release").join("intendant");
+    std::fs::create_dir_all(watched.parent().expect("target dir")).expect("target dirs");
+    write_fake_watched_binary(&watched, "fakesha1");
+    let build_cmd = rig.home.path().join("mock-build.sh");
+    std::fs::write(
+        &build_cmd,
+        "#!/bin/bash\necho building...\ncat > target/release/intendant << 'FAKE'\n#!/bin/sh\n\
+         echo \"intendant 9.9.10 (commit fakesha2, built 2026-07-30T00:00:00Z, e2e-fake-triple)\"\n\
+         FAKE\nchmod +x target/release/intendant\n",
+    )
+    .expect("write mock build script");
+
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_POLL_MS", "300"),
+            ("INTENDANT_UPDATE_LANE_RUNNING_SHA", sha_a.as_str()),
+            (
+                "INTENDANT_UPDATE_LANE_BUILD_CMD",
+                build_cmd.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_HEADROOM", "ok"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    // Flavor detected + no chip yet (the watched image is the boot one).
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    let boot_id = body["boot_id"].as_str().expect("boot id").to_string();
+    assert_eq!(body["update_lane"]["flavor"], "source", "{body}");
+    assert!(body.get("update").is_none(), "no chip before any change");
+
+    // The bounded compare: behind origin/main by exactly commit B.
+    let check: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-lane/check"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST update-lane check")
+        .error_for_status()
+        .expect("check accepted")
+        .json()
+        .await
+        .expect("check body");
+    assert_eq!(check["started"], true, "{check}");
+    let body = poll_until(
+        "the behind-main compare verdict",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            (body["update_lane"]["check"]["behind"] == 1).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    assert_eq!(
+        body["update_lane"]["check"]["tip_sha"], sha_b,
+        "the compare names origin/main's tip: {body}"
+    );
+    assert_eq!(body["update_lane"]["check"]["dirty"], false);
+
+    // The owner's click: pull (real) + build (mock) + verify. The job
+    // finishes ok and reports the produced commit.
+    let produce: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-lane/produce"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST update-lane produce")
+        .error_for_status()
+        .expect("produce accepted")
+        .json()
+        .await
+        .expect("produce body");
+    assert_eq!(produce["started"], true, "{produce}");
+    let body = poll_until(
+        "the produce job finishing ok",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            (body["update_lane"]["job"]["ok"] == true).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 4000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    assert!(
+        body["update_lane"]["job"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fakesha2"),
+        "the job reports the produced commit: {body}"
+    );
+    let pulled = fixture_git(&checkout, &["rev-parse", "HEAD"]);
+    assert_eq!(pulled, sha_b, "the pull really fast-forwarded the checkout");
+
+    // Hand-off: the EXISTING watch sees the produced image and serves
+    // the chip block — from here the shipped one-click swap lane owns
+    // the story.
+    let body = poll_until(
+        "the update chip naming the produced sha",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            (body["update"]["on_disk"]["git_sha"] == "fakesha2").then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    // Zero kills: the same boot answers, undrained, end to end.
+    assert_eq!(body["boot_id"], boot_id.as_str(), "same daemon boot: {body}");
+    assert_eq!(body["draining"], false);
+}

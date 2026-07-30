@@ -101,3 +101,58 @@ pub(crate) async fn handle_daemon_handover_status(
     let response = daemon_handover_status_api_response(mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
+
+/// Transport-neutral core of the two self-update-lane actions (`POST
+/// /api/daemon/update-lane/{check,produce}`). Check runs the bounded
+/// behind-ness compare; produce is the owner's consent click — it
+/// starts the supervised produce job (or refuses honestly: no lane for
+/// this install, a job already running, an unsupported platform). Both
+/// answer the lane's fresh status block so the panel renders truth
+/// immediately.
+pub(crate) async fn daemon_update_lane_api_response(
+    produce: bool,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let runtime = match mcp_server {
+        Some(server) => server.handover_runtime().await,
+        None => None,
+    };
+    let lane = runtime.as_ref().and_then(|runtime| runtime.update_lane());
+    let Some(lane) = lane else {
+        return ApiResponse::json_error(503, "the self-update lane is not wired on this daemon");
+    };
+    if produce {
+        match lane.request_produce() {
+            Ok(block) => ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "started": true, "update_lane": block })),
+            ),
+            Err(refusal) => ApiResponse::json(
+                409,
+                JsonBody::Value(serde_json::json!({
+                    "error": "update_lane_refused",
+                    "detail": refusal,
+                    "update_lane": lane.status_block(),
+                })),
+            ),
+        }
+    } else {
+        let block = lane.request_check();
+        ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "started": true, "update_lane": block })),
+        )
+    }
+}
+
+/// `POST /api/daemon/update-lane/{check,produce}` — the HTTP wrappers.
+pub(crate) async fn handle_daemon_update_lane(
+    stream: DemuxStream,
+    produce: bool,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = daemon_update_lane_api_response(produce, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}

@@ -1958,6 +1958,8 @@ response omits the header.
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
+| POST | `/api/daemon/update-lane/check` | Settings | own origin | ≤ 4 KiB | Self-update lane: run the bounded behind-origin-main / behind-latest-release check now |
+| POST | `/api/daemon/update-lane/produce` | Settings | own origin | ≤ 4 KiB | Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/refs/content` | AgendaRead | own origin | none | One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise) |
