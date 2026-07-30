@@ -37605,7 +37605,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '47d4d928f643b7fc';
+const INTENDANT_APP_BUILD = '3f4dbadacf6fffdb';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -61723,16 +61723,26 @@ function vitalsLimitLabelLong(label) {
 }
 
 // Compact chip form of a window's credential-era account label. The
-// daemon sends `account` only while MORE than one credential era is live
-// for the backend (single-account steady state stays suffix-free), so
-// presence alone means "label this chip apart". Emails compress to their
-// local part — the pane and tooltips keep the full label.
+// daemon sends `account` while MORE than one credential era is live for
+// the backend (single-account steady state stays suffix-free), and
+// always alongside `accountPrior` — a superseded era's numbers never
+// arrive unlabeled — so presence alone means "label this chip apart".
+// Emails compress to their local part — the pane and tooltips keep the
+// full label.
 function vitalsLimitAccountShort(account) {
   const raw = String(account || '').trim();
   if (!raw) return '';
   const at = raw.indexOf('@');
   const short = at > 0 ? raw.slice(0, at) : raw;
   return short.length > 14 ? `${short.slice(0, 13)}…` : short;
+}
+
+// The tap-to-explain sentence for a superseded-era window ("still ‹acct›"
+// chips): why an old sign-in's numbers are still on screen, and what
+// makes them go away. One sentence, shared by the live and reset-passed
+// explain paths.
+function vitalsLimitPriorAccountLine(account) {
+  return `This window belongs to the “${account}” sign-in. The daemon has since signed into a different account, but this agent's backend still runs under “${account}” — it reads the new credentials when its process next starts.`;
 }
 
 // Compact chip form of a limit-window label. Known labels pass through;
@@ -62330,10 +62340,16 @@ const VITALS_SYMBOLS = {
     // base 7d chip a pixel-identical gauge is what made two real windows
     // read as a duplicate.
     icon: (v) => (String(v.label || '').includes('overage') ? 'gauge-plus' : 'gauge'),
+    // A window from a SUPERSEDED credential era (`accountPrior`: the
+    // daemon signed into another account, but this agent's backend has
+    // not restarted since, so these numbers are still that sign-in's
+    // truth) says "still ‹account›" — the explicit cue that keeps two
+    // eras' chips on one grid from reading as duplicate or conflicting
+    // data.
     chip: (v) => {
       const label = vitalsLimitLabelShort(v.label);
       const acct = vitalsLimitAccountShort(v.account);
-      const suffix = acct ? ` · ${acct}` : '';
+      const suffix = acct ? (v.accountPrior ? ` · still ${acct}` : ` · ${acct}`) : '';
       if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
       if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}${suffix}`;
@@ -62346,7 +62362,7 @@ const VITALS_SYMBOLS = {
     factText: (v) => {
       const label = vitalsLimitLabelShort(v.label);
       const acct = vitalsLimitAccountShort(v.account);
-      const suffix = acct ? ` · ${acct}` : '';
+      const suffix = acct ? (v.accountPrior ? ` · still ${acct}` : ` · ${acct}`) : '';
       if (v.rolled) return `${label} reset${suffix}`;
       const reset = v.reset ? ` · ↻${v.reset}` : '';
       if (v.usedPct !== null) return `${v.usedPct}% ${label}${reset}${suffix}`;
@@ -62357,6 +62373,7 @@ const VITALS_SYMBOLS = {
       const wall = formatLimitResetWallClock(v.resetsAtEpoch);
       if (v.rolled) {
         lines.push(`The provider's ${vitalsLimitLabelLong(v.label)} window has reset${wall ? ` (at ${wall})` : ''} — the last report predates it, so current usage is unknown until the agent's next model call refreshes it.`);
+        if (v.account && v.accountPrior) lines.push(vitalsLimitPriorAccountLine(v.account));
         return lines;
       }
       if (v.usedPct !== null) {
@@ -62367,17 +62384,21 @@ const VITALS_SYMBOLS = {
       if (v.reset) lines.push(`The window resets in ${v.reset}${wall ? ` — at ${wall}` : ''}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       else if (v.severity === 'warn') lines.push('If the window fills up, the provider will pause this agent until it resets.');
-      if (v.account) lines.push(`This window belongs to the “${v.account}” sign-in — sessions running under a different account track their own windows.`);
+      if (v.account && v.accountPrior) lines.push(vitalsLimitPriorAccountLine(v.account));
+      else if (v.account) lines.push(`This window belongs to the “${v.account}” sign-in — sessions running under a different account track their own windows.`);
       if (v.observedAgo) lines.push(`Last provider report: ${v.observedAgo} ago. Windows are account-wide, so any session's report updates this.`);
       return lines;
     },
     brief: (v) => {
-      if (v.rolled) return `${vitalsLimitLabelLong(v.label)} limit: window reset — awaiting a fresh report`;
+      const still = v.account && v.accountPrior
+        ? ` — still under the “${vitalsLimitAccountShort(v.account)}” sign-in`
+        : '';
+      if (v.rolled) return `${vitalsLimitLabelLong(v.label)} limit: window reset — awaiting a fresh report${still}`;
       // Name the driver: a hard status outranks the percentage.
       const what = v.usedPct !== null && v.usedPct >= 90 ? `${v.usedPct}% used`
         : v.statusWord !== 'ok' ? v.statusWord
           : `${v.usedPct}% used`;
-      return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ${v.reset}` : ''}`;
+      return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ${v.reset}` : ''}${still}`;
     },
   },
   // ── Grid envelope (catalog-row `agenda` + `boot` blocks, served
@@ -62850,10 +62871,14 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const observedAgoSecs = Number.isFinite(observedAt) && observedAt > 0
       ? Math.floor(Date.now() / 1000 - observedAt)
       : null;
-    // Credential-era attribution: present only while the daemon sees
-    // more than one live era for the backend — the cue to suffix the
-    // chip apart from another account's same-named window.
+    // Credential-era attribution: present while the daemon sees more
+    // than one live era for the backend — the cue to suffix the chip
+    // apart from another account's same-named window — and always on a
+    // superseded era (`accountPrior`: the backend hasn't announced since
+    // a newer sign-in), whose chips say "still ‹account›" instead of
+    // letting an old era's numbers read as the current sign-in's.
     const account = String(w?.account || '').trim();
+    const accountPrior = !!(account && w?.accountPrior);
     push('limit', `limit:${label}`, {
       label,
       usedPct,
@@ -62862,6 +62887,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       resetsAtEpoch: Number(w?.resetsAtEpoch) || 0,
       rolled,
       account,
+      accountPrior,
       observedAgo: observedAgoSecs !== null && observedAgoSecs > 120
         ? formatActivityElapsed(observedAgoSecs)
         : '',
@@ -62871,7 +62897,7 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // The countdown ticks in place (cache-ttl pattern): the sig excludes
       // it so the 1 Hz ticker hits the stable-DOM fast path.
       ticking: !!reset,
-      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}|${account}`,
+      sig: `${label}|${usedPct}|${w?.status || ''}|${severity}|${rolled ? 1 : 0}|${account}|${accountPrior ? 1 : 0}`,
     });
   }
 

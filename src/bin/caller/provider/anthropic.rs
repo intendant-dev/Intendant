@@ -2011,6 +2011,7 @@ mod tests {
             status: None,
             observed_at_epoch: None,
             account: None,
+            account_prior: false,
         }];
         let transcript = concat!(
             "data: not json at all\n\n",

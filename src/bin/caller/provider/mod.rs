@@ -127,8 +127,10 @@ fn anthropic_rate_limit_windows_from_headers(
                     .unwrap_or(0),
             ),
             // The wire carries no account identity; the vitals hub stamps
-            // the reporting session's credential era at the fold.
+            // the reporting session's credential era at the fold (and
+            // prior-ness only on the per-session mirror).
             account: None,
+            account_prior: false,
         });
     }
     windows
