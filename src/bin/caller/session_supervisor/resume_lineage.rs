@@ -16,12 +16,14 @@
 //! independent walkers WILL drift; add consumers here, never a private
 //! re-implementation.
 
-use super::launch::recorded_backend_conversations_in_home;
+use super::launch::{
+    recorded_backend_conversations_in_home, recorded_backend_conversations_in_home_with_dir,
+};
 use crate::external_wrapper_index::{
     lineage_tombstones, wrapper_preference, wrappers_for, ExternalWrapperRecord, WrapperState,
 };
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// Walk bounds: a lineage is a restart chain (human-gesture scale), so
 /// real chains are short; the caps only defend against a corrupted or
@@ -92,11 +94,32 @@ impl ResumeLineage {
 /// recorded identity or from wrapper-index rows of a conversation
 /// already in the closure.
 pub(crate) fn resolve_resume_lineage(home: &Path, seeds: &[&str]) -> ResumeLineage {
+    resolve_resume_lineage_with_dir_hints(home, seeds, &[])
+}
+
+/// [`resolve_resume_lineage`] with log dirs the caller already knows
+/// (`(session id, dir)` pairs — e.g. the catalog row's own dir behind a
+/// serve-time lineage join). Hints are an I/O shortcut, never new
+/// authority: an id resolves to the same dir the probe would find (a
+/// wrapper dir is named by its id), and ids without a hint still resolve
+/// through [`session_log_dir_for_id_in_home`] — but each closure record
+/// contributes its `log_path` as a further hint, so a hinted walk never
+/// pays the probe's O(store) directory-scan fallback per hop.
+pub(crate) fn resolve_resume_lineage_with_dir_hints(
+    home: &Path,
+    seeds: &[&str],
+    dir_hints: &[(&str, &Path)],
+) -> ResumeLineage {
     let mut lineage = ResumeLineage {
         candidates: Vec::new(),
         wrapper_records: Vec::new(),
         stopped_by_user: false,
     };
+    let mut known_dirs: HashMap<String, PathBuf> = dir_hints
+        .iter()
+        .filter(|(id, _)| !id.trim().is_empty())
+        .map(|(id, dir)| (id.trim().to_string(), dir.to_path_buf()))
+        .collect();
     let mut seen_sessions: HashSet<String> = HashSet::new();
     let mut seen_conversations: HashSet<(String, String)> = HashSet::new();
     let mut session_frontier: Vec<String> = seeds
@@ -115,7 +138,15 @@ pub(crate) fn resolve_resume_lineage(home: &Path, seeds: &[&str]) -> ResumeLinea
         if seen_sessions.len() > MAX_LINEAGE_SESSIONS {
             break;
         }
-        for (source, conversation_id) in recorded_backend_conversations_in_home(home, &session_id) {
+        // A known dir (hint or closure record) skips the id→dir probe;
+        // hintless ids take the probing composition unchanged.
+        let conversations = match known_dirs.get(&session_id) {
+            Some(dir) => {
+                recorded_backend_conversations_in_home_with_dir(home, &session_id, Some(dir))
+            }
+            None => recorded_backend_conversations_in_home(home, &session_id),
+        };
+        for (source, conversation_id) in conversations {
             // Conversation frontier, itself chained by retirement edges.
             let mut conversation_frontier = vec![conversation_id];
             while let Some(conversation_id) = conversation_frontier.pop() {
@@ -129,6 +160,9 @@ pub(crate) fn resolve_resume_lineage(home: &Path, seeds: &[&str]) -> ResumeLinea
                     .candidates
                     .push((source.clone(), conversation_id.clone()));
                 for record in wrappers_for(home, &source, &conversation_id) {
+                    known_dirs
+                        .entry(record.intendant_session_id.clone())
+                        .or_insert_with(|| PathBuf::from(&record.log_path));
                     lineage
                         .candidates
                         .push((source.clone(), record.intendant_session_id.clone()));
@@ -262,6 +296,43 @@ mod tests {
             .successor_tip(&["wrapper-parent"])
             .expect("the retirement edge reaches the edit-branch child");
         assert_eq!(tip.intendant_session_id, "wrapper-child");
+    }
+
+    /// Dir hints are an I/O shortcut, never a semantic input: a hinted
+    /// walk resolves the exact same closure as the probing walk — same
+    /// candidate order, same records, same flags.
+    #[test]
+    fn dir_hints_change_no_outcomes() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "hint-old", "claude-code", &["hb1"]);
+        announce(home.path(), "hint-mid", "claude-code", &["hb1", "hb2"]);
+        announce(home.path(), "hint-new", "claude-code", &["hb2"]);
+
+        let probed = resolve_resume_lineage(home.path(), &["hint-old"]);
+        let hinted_dir = logs_root(home.path()).join("hint-old");
+        let hinted = resolve_resume_lineage_with_dir_hints(
+            home.path(),
+            &["hint-old"],
+            &[("hint-old", hinted_dir.as_path())],
+        );
+        assert_eq!(hinted.candidates, probed.candidates);
+        assert_eq!(
+            hinted
+                .wrapper_records
+                .iter()
+                .map(|record| record.intendant_session_id.clone())
+                .collect::<Vec<_>>(),
+            probed
+                .wrapper_records
+                .iter()
+                .map(|record| record.intendant_session_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(hinted.stopped_by_user, probed.stopped_by_user);
+        assert_eq!(
+            hinted.successor_tip(&["hint-old"]).map(|r| r.intendant_session_id.clone()),
+            probed.successor_tip(&["hint-old"]).map(|r| r.intendant_session_id.clone()),
+        );
     }
 
     /// No recorded wrapper history (a native session id) resolves to an

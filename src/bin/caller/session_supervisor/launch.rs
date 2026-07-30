@@ -2197,6 +2197,25 @@ pub(crate) fn recorded_backend_conversations_in_home(
     if session_id.is_empty() {
         return Vec::new();
     }
+    let log_dir = session_log_dir_for_id_in_home(home, session_id);
+    recorded_backend_conversations_in_home_with_dir(home, session_id, log_dir.as_deref())
+}
+
+/// [`recorded_backend_conversations_in_home`] with the session's log dir
+/// already resolved (`None` = no dir; the scan section is skipped exactly
+/// as when the probe finds nothing). The resume-lineage walk passes dirs
+/// it already knows — the seed row's own dir, closure records'
+/// `log_path` — so per-session expansion never falls into
+/// [`session_log_dir_for_id_in_home`]'s O(store) directory probe.
+pub(crate) fn recorded_backend_conversations_in_home_with_dir(
+    home: &Path,
+    session_id: &str,
+    log_dir: Option<&Path>,
+) -> Vec<(String, String)> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Vec::new();
+    }
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |source: &str, backend_id: &str| {
         if !external_agent::source_session_id_is_canonical(source, backend_id) {
@@ -2210,36 +2229,106 @@ pub(crate) fn recorded_backend_conversations_in_home(
     for backend in EXTERNAL_BACKENDS {
         push(backend.as_short_str(), session_id);
     }
-    if let Some(log_dir) = session_log_dir_for_id_in_home(home, session_id) {
-        let canonical = crate::session_identity::canonical_session_id_from_meta(&log_dir);
-        if let Some(scan) = crate::session_identity::scan_session_dir(&log_dir, session_id) {
-            // Membership, not addressing: `event_names_session` (the
-            // predicate the index writer uses), NEVER `wrapper_matches` —
-            // the addressing predicate accepts ANY event id once the
-            // requested id prefixes the dir's canonical id, which would
-            // adopt the bus-tee copies in a daemon head-session's log.
-            for identity in scan.identities.iter().rev().filter(|identity| {
-                identity.wrapper_id.as_deref().is_some_and(|wrapper_id| {
-                    crate::session_identity::event_names_session(
-                        Some(wrapper_id),
-                        session_id,
-                        canonical.as_deref(),
-                    )
-                })
-            }) {
-                push(&identity.source, &identity.backend_session_id);
-            }
+    if let Some(log_dir) = log_dir {
+        for (source, backend_id) in recorded_identity_pairs_for_dir(log_dir, session_id) {
+            push(&source, &backend_id);
         }
     }
+    let records = crate::external_wrapper_index::wrapper_records_for_wrapper_id(home, session_id);
     for backend in EXTERNAL_BACKENDS {
         let source = backend.as_short_str();
-        for record in crate::external_wrapper_index::wrappers_for_source(home, source) {
-            if record.intendant_session_id == session_id {
-                push(&record.source, &record.backend_session_id);
-            }
+        for record in records.iter().filter(|record| record.source == source) {
+            push(&record.source, &record.backend_session_id);
         }
     }
     out
+}
+
+struct RecordedIdentityPairsMemoEntry {
+    transcript: (u64, u128),
+    meta: (u64, u128),
+    pairs: Vec<(String, String)>,
+}
+
+/// Comfortably above the session-store dir count (~4k on the machine
+/// that motivated the memo), so clear-on-full stays a corruption
+/// backstop instead of a per-pass thrash.
+const RECORDED_IDENTITY_PAIRS_MEMO_LIMIT: usize = 16_384;
+
+fn recorded_identity_pairs_memo(
+) -> &'static std::sync::Mutex<HashMap<(PathBuf, String), RecordedIdentityPairsMemoEntry>> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, String), RecordedIdentityPairsMemoEntry>>,
+    > = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn recorded_identity_file_fingerprint(path: &Path) -> (u64, u128) {
+    match std::fs::metadata(path) {
+        Ok(meta) => (
+            meta.len(),
+            meta.modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+/// The dir-local half of a session's recorded conversations: the
+/// `session_identity` facts in its own transcript that name it, newest
+/// first. Memoized per (dir, session id) on the (transcript, meta)
+/// fingerprints — the two files the scan reads — because the scan parses
+/// the WHOLE transcript: the resume-lineage walk expands every ghost row
+/// through here, and dead transcripts never change, so without the memo
+/// every lineage re-walk re-parsed the entire session store.
+fn recorded_identity_pairs_for_dir(log_dir: &Path, session_id: &str) -> Vec<(String, String)> {
+    let transcript = recorded_identity_file_fingerprint(&log_dir.join("session.jsonl"));
+    let meta = recorded_identity_file_fingerprint(&log_dir.join("session_meta.json"));
+    let memo_key = (log_dir.to_path_buf(), session_id.to_string());
+    if let Ok(memo) = recorded_identity_pairs_memo().lock() {
+        if let Some(entry) = memo.get(&memo_key) {
+            if entry.transcript == transcript && entry.meta == meta {
+                return entry.pairs.clone();
+            }
+        }
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let canonical = crate::session_identity::canonical_session_id_from_meta(log_dir);
+    if let Some(scan) = crate::session_identity::scan_session_dir(log_dir, session_id) {
+        // Membership, not addressing: `event_names_session` (the
+        // predicate the index writer uses), NEVER `wrapper_matches` —
+        // the addressing predicate accepts ANY event id once the
+        // requested id prefixes the dir's canonical id, which would
+        // adopt the bus-tee copies in a daemon head-session's log.
+        for identity in scan.identities.iter().rev().filter(|identity| {
+            identity.wrapper_id.as_deref().is_some_and(|wrapper_id| {
+                crate::session_identity::event_names_session(
+                    Some(wrapper_id),
+                    session_id,
+                    canonical.as_deref(),
+                )
+            })
+        }) {
+            pairs.push((identity.source.clone(), identity.backend_session_id.clone()));
+        }
+    }
+    if let Ok(mut memo) = recorded_identity_pairs_memo().lock() {
+        if memo.len() >= RECORDED_IDENTITY_PAIRS_MEMO_LIMIT && !memo.contains_key(&memo_key) {
+            memo.clear();
+        }
+        memo.insert(
+            memo_key,
+            RecordedIdentityPairsMemoEntry {
+                transcript,
+                meta,
+                pairs: pairs.clone(),
+            },
+        );
+    }
+    pairs
 }
 
 /// The three supervisable external backends (no ALL constant exists on
@@ -2556,6 +2645,36 @@ mod tests {
         assert!(bare
             .iter()
             .all(|(_, backend_id)| backend_id.as_str() == "sess-native"));
+    }
+
+    /// The identity-scan memo behind the collector serves cached pairs
+    /// only while the dir's transcript/meta fingerprints hold: an
+    /// identity appended after a memoized read (a live wrapper's upgrade)
+    /// must surface on the next read, never the stale pair set.
+    #[test]
+    fn recorded_conversations_memo_revalidates_on_transcript_growth() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_dir = home.path().join(".intendant").join("logs").join("wrap-m1");
+        let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
+        log.write_meta(None, None);
+        log.session_identity("wrap-m1", "claude-code", "thread-first");
+        let first = recorded_backend_conversations_in_home(home.path(), "wrap-m1");
+        assert!(first
+            .iter()
+            .any(|(_, backend_id)| backend_id == "thread-first"));
+        assert!(!first
+            .iter()
+            .any(|(_, backend_id)| backend_id == "thread-second"));
+
+        log.session_identity("wrap-m1", "claude-code", "thread-second");
+        drop(log);
+        let second = recorded_backend_conversations_in_home(home.path(), "wrap-m1");
+        assert!(
+            second
+                .iter()
+                .any(|(_, backend_id)| backend_id == "thread-second"),
+            "appended identity must invalidate the memoized scan: {second:?}"
+        );
     }
 
     /// The eager resume-identity write lands in the wrapper's own log and
