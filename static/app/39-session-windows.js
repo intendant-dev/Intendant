@@ -492,6 +492,24 @@ function normalizeSessionAgendaEnvelope(raw) {
       out.occurrence = { id };
       const state = compactSessionText(occ.state);
       if (state) out.occurrence.state = state.toLowerCase();
+      // Track AO: lineage role + the served safe-to-stop derivation +
+      // the regeneration ordinal + the run's self-report — all daemon
+      // truth (grid_envelope.rs); the SPA renders, never re-derives.
+      const lineageRole = compactSessionText(occ.lineage_role || occ.lineageRole);
+      if (lineageRole === 'tip' || lineageRole === 'superseded') out.occurrence.lineageRole = lineageRole;
+      const stop = compactSessionText(occ.stop);
+      if (stop === 'kills_live_run' || stop === 'owed_work' || stop === 'settled') out.occurrence.stop = stop;
+      const attempt = Number(occ.attempt);
+      if (Number.isFinite(attempt) && attempt > 0) out.occurrence.attempt = attempt;
+      const att = occ.attestation;
+      if (att && typeof att === 'object') {
+        const outcome = compactSessionText(att.outcome);
+        if (outcome) {
+          out.occurrence.attestation = { outcome: outcome.toLowerCase() };
+          const note = compactSessionText(att.note);
+          if (note) out.occurrence.attestation.note = note;
+        }
+      }
     }
   }
   const rawRefs = raw.sealed_inputs ?? raw.sealedInputs;
@@ -845,6 +863,11 @@ function sessionWindowMetadataSignature(meta = {}) {
         meta.agenda.itemTitle || '',
         meta.agenda.occurrence?.id || '',
         meta.agenda.occurrence?.state || '',
+        meta.agenda.occurrence?.lineageRole || '',
+        meta.agenda.occurrence?.stop || '',
+        meta.agenda.occurrence?.attempt || '',
+        meta.agenda.occurrence?.attestation?.outcome || '',
+        meta.agenda.occurrence?.attestation?.note || '',
         (meta.agenda.sealedInputs || []).map((ref) => ref.sha256).join(','),
       ].join('|')
       : '',
@@ -1953,18 +1976,55 @@ const VITALS_SYMBOLS = {
     label: 'Occurrence',
     priority: 26,
     icon: (v) => (v.state === 'started' ? 'dots' : v.state === 'completed' ? 'check' : 'triangle'),
-    chip: (v) => `${v.glyph} ${v.state}`,
+    chip: (v) => `${v.glyph} ${v.state}${v.attempt > 0 ? ` · attempt ${v.attempt}` : ''}`,
     // The occurrence object is the extensible slot: Track AO's
-    // attestation lands beside `state` on the same wire.
-    explain: (v) => [
-      v.state === 'started'
-        ? 'This firing is still running — no terminal record yet.'
-        : `This firing resolved: ${v.state}.`,
-      `Occurrence id: ${v.occurrenceId}`,
-    ],
+    // attestation lands beside `state` on the same wire, and the served
+    // safe-to-stop derivation (grid_envelope.rs — the durable journal
+    // facts, which process state can never talk away) drives the
+    // machine-scoped stop copy here and in the stop confirms.
+    explain: (v) => {
+      const lines = [];
+      if (v.stop === 'kills_live_run') {
+        lines.push(`This session is the live run of ${v.itemTitle ? `agenda item “${v.itemTitle}”` : 'an agenda item'} — stopping it kills that run (the occurrence records failed).`);
+      } else if (v.stop === 'owed_work') {
+        lines.push('An agenda occurrence behind this session is still owed work — started, no terminal — regardless of what the process looks like. A resume successor carries it; stopping this superseded session does not settle the debt.');
+      } else if (v.state === 'started') {
+        lines.push('This firing is still running — no terminal record yet.');
+      } else {
+        lines.push(`This firing resolved: ${v.state}. No agenda-owed work behind this session.`);
+      }
+      if (v.lineageRole === 'superseded') {
+        lines.push('This session is a superseded lineage member — the resume tip carries the occurrence now.');
+      }
+      if (v.attempt > 0) {
+        lines.push(`Attempt ${v.attempt} — a bounded auto-retry of the same spent cause.`);
+      }
+      lines.push(`Occurrence id: ${v.occurrenceId}`);
+      return lines;
+    },
+    brief: (v) => (v.stop === 'kills_live_run'
+      ? 'Live agenda run — stopping kills it'
+      : v.stop === 'owed_work' ? 'Agenda work still owed behind this session' : ''),
     action: (v) => [
       { label: 'Copy occurrence id', run: () => vitalsCopyText(v.occurrenceId) },
     ],
+  },
+  'agenda-attestation': {
+    label: 'Self-report',
+    priority: 25.5,
+    icon: 'pencil',
+    // The Q8 labeling law: the self-report axis wears its own ◆/◇ mark
+    // and says self-reported — never the transport glyphs above.
+    chip: (v) => (v.outcome ? `◆ self-reported: ${v.outcome}` : '◇ no self-report'),
+    explain: (v) => (v.outcome
+      ? [
+        `The session's own report on its goal: ${v.outcome} — not verified.`,
+        ...(v.note ? [`“${v.note}”`] : []),
+        'Full attestation history is on the agenda card (under the hood).',
+      ]
+      : [
+        'No self-report exists for this run — the session ended without attesting. Absence, not failure.',
+      ]),
   },
   'sealed-inputs': {
     label: 'Sealed inputs',
@@ -2011,7 +2071,7 @@ const VITALS_SYMBOLS = {
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
   'health', 'activity', 'model', 'permissions', 'agenda-source',
-  'agenda-occurrence', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
+  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -2224,9 +2284,27 @@ function vitalsChipModels(vitals, meta, sessionId) {
         occurrenceId: occurrence.id,
         state,
         glyph: ({ started: '▶', completed: '✓', failed: '✕', missed: '⌀', unknown: '?' })[state] || '▸',
+        lineageRole: occurrence.lineageRole || '',
+        stop: occurrence.stop || '',
+        attempt: occurrence.attempt || 0,
+        itemTitle: agendaMeta.itemTitle || '',
       }, {
-        tone: state === 'failed' || state === 'unknown' || state === 'missed' ? 'warn' : '',
+        // A live firing's stop hazard and the owed-work debt elevate
+        // with the transport failure classes — the ruled prominence.
+        tone: state === 'failed' || state === 'unknown' || state === 'missed'
+          || occurrence.stop === 'kills_live_run' || occurrence.stop === 'owed_work' ? 'warn' : '',
       });
+      // The self-report axis (Track AO): its own chip, never blended
+      // into the transport state word — and the derived absence state
+      // on terminal runs (◇, neutral, never anomaly).
+      if (occurrence.attestation) {
+        push('agenda-attestation', 'agenda-attestation', {
+          outcome: occurrence.attestation.outcome,
+          note: occurrence.attestation.note || '',
+        });
+      } else if (state !== 'started') {
+        push('agenda-attestation', 'agenda-attestation', { outcome: '', note: '' });
+      }
     }
     const sealedRefs = Array.isArray(agendaMeta.sealedInputs) ? agendaMeta.sealedInputs : [];
     if (sealedRefs.length) {

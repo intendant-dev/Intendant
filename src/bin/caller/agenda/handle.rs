@@ -1041,22 +1041,28 @@ impl AgendaHandle {
                 .into_iter()
                 .map(|(session_id, link)| {
                     let item = items.get(&link.item_id).and_then(|item| item.as_ref());
-                    let sealed_inputs = item
-                        .and_then(|item| {
-                            item.effects.iter().find(|effect| {
-                                effect
-                                    .last_run
-                                    .as_ref()
-                                    .is_some_and(|run| run.occurrence_id == link.occurrence_id)
-                            })
+                    let running_effect = item.and_then(|item| {
+                        item.effects.iter().find(|effect| {
+                            effect
+                                .last_run
+                                .as_ref()
+                                .is_some_and(|run| run.occurrence_id == link.occurrence_id)
                         })
+                    });
+                    let sealed_inputs = running_effect
                         .map(|effect| effect.manifest.binding_refs.clone())
                         .unwrap_or_default();
+                    let attestation = running_effect
+                        .and_then(|effect| effect.last_run.as_ref())
+                        .and_then(|run| run.attestation.clone());
                     let envelope = SessionAgendaEnvelope {
                         item_id: link.item_id,
                         item_title: item.map(|item| item.title.clone()),
                         occurrence_id: link.occurrence_id,
                         occurrence_state: link.state,
+                        lineage_role: link.lineage_role,
+                        attempt: link.attempt,
+                        attestation,
                         sealed_inputs,
                     };
                     (session_id, envelope)
@@ -1075,6 +1081,19 @@ pub(crate) struct SessionAgendaEnvelope {
     pub(crate) item_title: Option<String>,
     pub(crate) occurrence_id: String,
     pub(crate) occurrence_state: OccurrenceState,
+    /// This session's place in the occurrence's resume lineage (Track
+    /// AO §2.8): the tip is what the next terminal resolves through;
+    /// superseded members still belong to the run's lineage.
+    pub(crate) lineage_role: super::reminders::SessionLineageRole,
+    /// The occurrence's regeneration ordinal (display-only), when it is
+    /// a bounded auto-retry.
+    pub(crate) attempt: Option<u32>,
+    /// The run's self-report (Track AO), present when the effect's
+    /// `last_run` still names this occurrence — the same match the
+    /// sealed inputs ride; a newer occurrence replacing `last_run`
+    /// drops it here while the op log keeps the history (the ruled v1
+    /// limit).
+    pub(crate) attestation: Option<super::types::AgendaAttestation>,
     /// The digest-bound binding refs of the manifest that ran this
     /// occurrence; empty when unmatched (item gone, or re-proposed
     /// since the fire).
@@ -1226,6 +1245,16 @@ mod tests {
             );
             assert_eq!(envelope.sealed_inputs[0].sha256, sha256);
         }
+        // Track AO lineage roles ride the envelope: the successor's
+        // `started` row is the tip, the original a superseded member.
+        assert_eq!(
+            envelopes.get("sess-fired").unwrap().lineage_role,
+            super::super::reminders::SessionLineageRole::Superseded
+        );
+        assert_eq!(
+            envelopes.get("sess-successor").unwrap().lineage_role,
+            super::super::reminders::SessionLineageRole::Tip
+        );
         let orphan = envelopes.get("sess-orphan").expect("orphan linked");
         assert_eq!(orphan.item_id, "01GONE");
         assert_eq!(

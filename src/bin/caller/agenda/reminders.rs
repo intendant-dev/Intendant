@@ -433,6 +433,31 @@ pub(crate) struct SessionOccurrenceLink {
     /// un-attributing the original, and the one terminal that follows
     /// the lineage tip resolves the whole occurrence.
     pub(crate) state: OccurrenceState,
+    /// This session's place in the occurrence's resume lineage (Track
+    /// AO §2.8): `Tip` = the session the next terminal resolves
+    /// through; `Superseded` = an earlier lineage member a re-key
+    /// replaced. Derived from the same journal rows the scheduler
+    /// trusts — never a second resolver.
+    pub(crate) lineage_role: SessionLineageRole,
+    /// The occurrence's Track AO regeneration ordinal (display-only
+    /// fold retention), when it is a bounded auto-retry.
+    pub(crate) attempt: Option<u32>,
+}
+
+/// A session's place in its occurrence's resume lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionLineageRole {
+    Tip,
+    Superseded,
+}
+
+impl SessionLineageRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SessionLineageRole::Tip => "tip",
+            SessionLineageRole::Superseded => "superseded",
+        }
+    }
 }
 
 /// The append-only delivery ledger. `prepare` records are fsync'd — the
@@ -537,12 +562,22 @@ impl OccurrenceJournal {
             };
             let state = progress.terminal.unwrap_or(OccurrenceState::Started);
             for session_id in &progress.started_history {
+                // The tip is the LAST `started` row's session — exactly
+                // what the fold's last-wins `started` field holds,
+                // terminal or not (the terminal arm never clears it).
+                let lineage_role = if progress.started.as_deref() == Some(session_id.as_str()) {
+                    SessionLineageRole::Tip
+                } else {
+                    SessionLineageRole::Superseded
+                };
                 links.insert(
                     session_id.clone(),
                     SessionOccurrenceLink {
                         occurrence_id: occurrence_id.clone(),
                         item_id: item_id.to_string(),
                         state,
+                        lineage_role,
+                        attempt: progress.attempt,
                     },
                 );
             }
@@ -2314,9 +2349,21 @@ mod tests {
                 "the terminal follows the whole lineage"
             );
         }
+        // Track AO lineage roles: the re-key's last `started` row is the
+        // tip; the original stays a linked, superseded member.
+        assert_eq!(
+            links.get("s1").unwrap().lineage_role,
+            SessionLineageRole::Superseded
+        );
+        assert_eq!(
+            links.get("s2").unwrap().lineage_role,
+            SessionLineageRole::Tip
+        );
         let running = links.get("s3").expect("running session linked");
         assert_eq!(running.item_id, "item-b");
         assert_eq!(running.state, OccurrenceState::Started);
+        assert_eq!(running.lineage_role, SessionLineageRole::Tip);
+        assert_eq!(running.attempt, None, "attempt rides only when stamped");
         assert!(
             !links.contains_key("s4"),
             "itemless boot-recovery rows stay unattributable"

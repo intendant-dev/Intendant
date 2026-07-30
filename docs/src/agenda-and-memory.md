@@ -699,6 +699,21 @@ untouched. Journal rows for retries carry the additive display field
 legible, and a suspended card names the last self-reported reason when
 one exists.
 
+On the session grid, a fired session's window carries a derived agenda
+block — computed at the sessions serving seam from the occurrence
+journal fold and the item store on every read, never stored — with the
+source item, occurrence state, lineage role (`tip` or `superseded`),
+retry ordinal, and the run's self-report. The stop affordance claims
+only what the machine knows, fail-closed from the durable journal facts
+alone: the lineage tip of a started-without-terminal occurrence is a
+live firing (stopping it records the occurrence `failed`, and the
+dashboard confirms with exactly that consequence before acting); a
+superseded member of one is still owed work regardless of what the
+process looks like; "safe to stop" is claimed only for an idle session
+with no agenda linkage, or one whose linked occurrence is terminal —
+with the self-report displayed beside it, so "safe" and "done well"
+never merge. A busy session with no linkage claims nothing.
+
 ### Attribution, provenance display, and `--source`
 
 Every operation records the actor **as the daemon's gates resolved it**
