@@ -20,9 +20,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Daemon-level facts the agenda needs to resolve spawn projects: the
-/// state home (session records live under it) and the daemon's default
-/// project root, if it has one. Constructed once at wiring; tests inject
+/// Daemon-level facts the agenda needs to resolve spawn projects and
+/// executors: the state home (session records live under it), the
+/// daemon's default project root, and the daemon's default agent
+/// backend. Constructed once at wiring (boot-captured, like the default
+/// project — a later settings edit shows up after restart); tests inject
 /// temp dirs. The default context ([`AgendaHandle::new`] without
 /// `with_spawn_context`) resolves nothing — it never reads the real home.
 #[derive(Debug, Clone)]
@@ -32,6 +34,11 @@ pub(crate) struct SessionSpawnContext {
     pub(crate) home: PathBuf,
     /// The daemon's default project root (`None` on a projectless daemon).
     pub(crate) default_project_root: Option<PathBuf>,
+    /// The daemon's effective default agent backend (`--agent` flag →
+    /// `[agent] default_backend`), as its short wire string; `None` =
+    /// the internal native agent. The propose lane records this onto
+    /// executor-less manifests so the approval names WHO runs.
+    pub(crate) default_agent: Option<String>,
 }
 
 /// Where a resolved spawn project came from — surfaced in refusals, item
@@ -156,6 +163,7 @@ mod tests {
         SessionSpawnContext {
             home: home.to_path_buf(),
             default_project_root: default.map(Path::to_path_buf),
+            default_agent: None,
         }
     }
 

@@ -758,6 +758,10 @@ html.ui-v2 .ag2-auto-last.st-failed,
 html.ui-v2 .ag2-auto-last.st-unknown,
 html.ui-v2 .ag2-auto-streak { color: var(--rose); font-weight: 600; }
 html.ui-v2 .ag2-auto-last.st-completed { color: var(--green); }
+/* The missed-window terminal is a state the owner acts on (re-approve to
+   reschedule), not benign body text — amber, like the card state. */
+html.ui-v2 .ag2-auto-last.st-missed,
+html.ui-v2 .ag2-auto-unfireable { color: var(--amber); font-weight: 600; }
 html.ui-v2 .ag2-auto-run { cursor: pointer; text-decoration: underline; }
 /* Attestation (Track AO) — the self-report axis, never the transport
    palette: achieved sky (never transport-success green), the rest

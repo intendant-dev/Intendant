@@ -293,6 +293,11 @@ pub(crate) struct SummaryEffect {
     pub(crate) last_run_attempt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_run: Option<SummaryRun>,
+    /// The serving-seam fireability verdict (same field path as the full
+    /// DTO): present exactly when an approve/re-arm affordance would
+    /// meet a named refusal — the cards withhold Approve on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fireability_refusal: Option<super::fireability::FireabilityRefusalView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,6 +487,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
                 next_fire_ms: effect.next_fire_ms,
                 consecutive_failures: effect.consecutive_failures,
                 last_run_attempt: effect.last_run_attempt,
+                fireability_refusal: effect.fireability_refusal.clone(),
                 last_run: effect.last_run.as_ref().map(|run| SummaryRun {
                     state: run.state.clone(),
                     at_ms: run.at_ms,

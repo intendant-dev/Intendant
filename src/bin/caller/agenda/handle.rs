@@ -94,10 +94,12 @@ impl AgendaHandle {
             reminder_nudge: tokio::sync::Notify::new(),
             spawn_ctx: SessionSpawnContext {
                 // The agenda dir contains no session records, so the
-                // default context resolves no provenance and no default
-                // project — and never touches the real home.
+                // default context resolves no provenance, no default
+                // project, and no default agent — and never touches the
+                // real home.
                 home: dir.to_path_buf(),
                 default_project_root: None,
+                default_agent: None,
             },
             decoration_journal: Mutex::new(None),
             handover: None,
@@ -105,9 +107,15 @@ impl AgendaHandle {
     }
 
     /// Install the daemon's real spawn context (wiring edge; tests inject
-    /// tempdir-scoped ones to exercise resolution).
+    /// tempdir-scoped ones to exercise resolution). Pushed down into the
+    /// store too: the fireability legs of the propose/approve intake
+    /// resolve against it there, so the ONE validator lives in the ONE
+    /// lane (`command_to_op`) every mint surface routes through.
     pub(crate) fn with_spawn_context(mut self, spawn_ctx: SessionSpawnContext) -> Self {
-        self.spawn_ctx = spawn_ctx;
+        self.spawn_ctx = spawn_ctx.clone();
+        if let Ok(store) = self.store.get_mut() {
+            store.set_spawn_context(spawn_ctx);
+        }
         self
     }
 
@@ -1047,6 +1055,35 @@ impl AgendaHandle {
                 &super::scheduler::local_minute_of_day_at,
             );
         });
+        // Fireability decoration (display-only, the `next_fire_ms`
+        // pattern): stamped exactly where an approve/re-arm affordance
+        // could render — an open item's pending-review or suspended
+        // effect — so the dashboard withholds Approve on an unfireable
+        // manifest and opens the editor on the named field instead. The
+        // SAME validator the propose/approve intake runs, so the served
+        // verdict and the refusal a click would meet can never disagree.
+        let staleness_ms = policy.staleness_ms();
+        for item in items.iter_mut() {
+            if item.status != super::types::AgendaStatus::Open {
+                continue;
+            }
+            let provenance = item.provenance.session_id.clone();
+            for effect in item.effects.iter_mut() {
+                let approvable = effect.approval.is_none() || effect.suspended();
+                if !approvable {
+                    continue;
+                }
+                effect.fireability_refusal = super::fireability::validate(
+                    super::fireability::FireabilityCandidate::of_manifest(&effect.manifest),
+                    provenance.as_deref(),
+                    &self.spawn_ctx,
+                    staleness_ms,
+                    now_ms,
+                )
+                .err()
+                .map(|refusal| refusal.view());
+            }
+        }
     }
 
     /// One page of the raw occurrence journal (read-only; the

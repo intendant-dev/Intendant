@@ -900,20 +900,24 @@ mod tests {
     /// affordance is an OPENER for the one schedule sheet, whose save is
     /// the manifest-EDIT lane's single `propose_effect` emitter — the
     /// edit UI is a client of re-propose, never a second writer. The
-    /// fragment set's only other emitter is the seals module's adopt
+    /// fragment set's other emitters are the seals module's adopt
     /// confirm — the RE-SEAL ceremony (fresh pins from drift review),
-    /// pinned here to carry the manifest verbatim including the shape.
-    /// (The automate and workflow guards above pin their fragments to
-    /// zero.)
+    /// pinned here to carry the manifest verbatim including the shape —
+    /// and the missed-card RESCHEDULE lane (`agendaRescheduleMissed`,
+    /// fireability card): verbatim re-propose with the floor moved to
+    /// now + re-approve, one tap. Each lane exactly one emitter. (The
+    /// automate and workflow guards above pin their fragments to zero.)
     #[test]
     fn edit_mints_through_the_repropose_lane() {
         let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
         let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
         let seals = include_str!("../../../../static/app/ui2-agenda-seals.js");
         assert_eq!(
-            inspector.matches("propose_effect").count(),
-            1,
-            "exactly one edit-lane emission site: the schedule sheet's confirm"
+            inspector.matches("op: 'propose_effect'").count(),
+            2,
+            "exactly two emission sites in the inspector fragment: the \
+             schedule sheet's confirm (edit lane) and the missed-card \
+             reschedule (one-tap lane)"
         );
         assert_eq!(
             seals.matches("propose_effect").count(),
@@ -930,27 +934,93 @@ mod tests {
             .expect("the sheet confirm must exist");
         assert!(
             confirm.contains("op: 'propose_effect'"),
-            "the one emission lives inside the sheet confirm"
+            "the edit-lane emission lives inside the sheet confirm"
+        );
+        let (_, resched) = inspector
+            .split_once("async function agendaRescheduleMissed(")
+            .expect("the reschedule lane must exist");
+        assert!(
+            resched.contains("op: 'propose_effect'"),
+            "the reschedule emission lives inside agendaRescheduleMissed"
+        );
+        assert!(
+            resched.contains("if (m.interactive) params.interactive = true;"),
+            "the reschedule carries the manifest verbatim — shape included; \
+             only the floor moves"
         );
         assert_eq!(
             cards.matches("propose_effect").count(),
             0,
-            "the card never proposes — its Edit affordance only opens the sheet"
+            "the card never proposes — its affordances open the sheet or \
+             call the inspector's reschedule lane"
         );
         // The pending strips carry the affordance; the delegation opens
         // the sheet and sends no op.
         assert!(cards.contains("data-edit-sched"));
         assert!(
-            cards.contains("agendaOpenSchedSheet(editSched.dataset.editSched)"),
+            cards.contains("agendaOpenSchedSheet(editSched.dataset.editSched"),
             "the card edit handler opens the one editor"
         );
         // No edit lane for ALREADY-approved effects from the card: the
-        // affordance renders only in the pending branches (the inline
-        // strip and the automations strip), never beside Revoke.
+        // affordance renders only in the pending/suspended branches (the
+        // inline strip and the automations strip), never beside Revoke.
+        // Five sites: the inline strip's Fix-plan closure + its plain
+        // Edit…, the automations strip's Fix-plan + its plain Edit…, and
+        // the one delegation handler.
         assert_eq!(
             cards.matches("data-edit-sched").count(),
+            5,
+            "four branch buttons (two Fix-plan, two Edit…) + the one \
+             delegation handler"
+        );
+        // The missed-card one-tap: two strip emissions + the one
+        // delegation handler, which routes to the inspector lane.
+        assert_eq!(
+            cards.matches("data-resched-effect").count(),
             3,
-            "two pending-branch buttons + the one delegation handler"
+            "two missed-branch buttons + the one delegation handler"
+        );
+        assert!(
+            cards.contains("agendaRescheduleMissed(resched.dataset.reschedEffect"),
+            "the card reschedule handler calls the one reschedule lane"
+        );
+    }
+
+    /// The fireability class law on the render side: the cards NEVER
+    /// offer Approve/Re-arm against a served `fireability_refusal` —
+    /// both strips branch on the served verdict before emitting the
+    /// approve button, and the daemon's approve intake backs the law
+    /// (`approve_is_never_armed_on_an_unfireable_manifest` in the
+    /// agenda store tests). The SPA maps refusals by the daemon's
+    /// pinned grammar (`FIREABILITY_REFUSAL_PREFIX`).
+    #[test]
+    fn approve_is_gated_on_the_served_fireability_verdict() {
+        let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(
+            cards.matches("fireability_refusal").count() >= 2,
+            "both card strips read the served verdict"
+        );
+        // The inline strip's approve emission sits in the refusal-gated
+        // ternary; the automations strip's pending branch is reachable
+        // only past the refusal branch above it.
+        assert!(
+            cards.contains("refusal\n        ? fixBtn('Fix plan…')"),
+            "the inline strip offers Fix plan INSTEAD of Approve on a refusal"
+        );
+        assert!(
+            cards.contains("if (refusal && (st.kind === 'pending' || st.kind === 'suspended'))"),
+            "the automations strip gates Approve/Re-arm on the served refusal"
+        );
+        assert!(
+            inspector.contains("/^unfireable\\((project|executor|floor)\\): /"),
+            "the SPA parses exactly the daemon's refusal grammar \
+             (FIREABILITY_REFUSAL_PREFIX in agenda/fireability.rs)"
+        );
+        assert_eq!(
+            crate::agenda::FIREABILITY_REFUSAL_PREFIX,
+            "unfireable(",
+            "the grammar the SPA regex above matches"
         );
     }
 

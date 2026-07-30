@@ -604,11 +604,17 @@ async function agendaSendOp(params, button) {
     const message = (resp.body && resp.body.error) || `agenda op failed (${resp.status})`;
     agendaFlashError(message);
     agendaPaintRefusal(button, message);
+    if (typeof agendaFireabilityEditPrompt === 'function') {
+      agendaFireabilityEditPrompt(params, message);
+    }
     return false;
   } catch (e) {
     const message = String(e && e.message || e);
     agendaFlashError(message);
     agendaPaintRefusal(button, message);
+    if (typeof agendaFireabilityEditPrompt === 'function') {
+      agendaFireabilityEditPrompt(params, message);
+    }
     return false;
   } finally {
     if (button) button.disabled = false;
@@ -730,7 +736,14 @@ function agendaEffectState(item) {
           : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
             ? 'ready' : 'waiting')
           : rec ? 'standing'
-            : next > Date.now() ? 'armed' : 'finished';
+            // The missed-window terminal is its own self-explaining
+            // state, not a silent 'finished': a one-shot whose floor
+            // passed while the daemon was down carries its one-tap
+            // remedy (re-approve to reschedule) on the card. A missed
+            // instant on a standing series stays 'standing' above —
+            // the series continues unaffected.
+            : effect.last_run && effect.last_run.state === 'missed' ? 'missed'
+              : next > Date.now() ? 'armed' : 'finished';
   return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 

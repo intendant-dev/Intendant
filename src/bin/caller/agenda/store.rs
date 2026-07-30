@@ -169,6 +169,14 @@ pub(crate) struct AgendaStore {
     /// ([`Self::drain_foreign_changes`], Track AS S8/Q6). Deduped;
     /// bounded by the item count.
     foreign_changes: Vec<String>,
+    /// Daemon spawn facts the fireability legs of the ProposeEffect /
+    /// ApproveEffect intake resolve against (the ONE validator lives in
+    /// `command_to_op`, so the stamp lane inherits it per node). The
+    /// handle's `with_spawn_context` pushes the wiring-edge context down;
+    /// [`AgendaStore::open`] defaults to the hermetic nothing-resolves
+    /// shape (home = the agenda dir, no default project, no default
+    /// agent) so tests never touch the real home.
+    spawn_ctx: super::spawn_project::SessionSpawnContext,
 }
 
 /// Facts of one scheduled-session occurrence outcome, written back by the
@@ -296,9 +304,32 @@ impl AgendaStore {
             item_seqs: fold.item_seqs,
             boot_fold,
             foreign_changes: Vec::new(),
+            spawn_ctx: super::spawn_project::SessionSpawnContext {
+                home: dir.to_path_buf(),
+                default_project_root: None,
+                default_agent: None,
+            },
         };
         store.sync_ask_state();
         Ok(store)
+    }
+
+    /// Install the daemon's real spawn context for the fireability legs
+    /// of the propose/approve intake (pushed down by the handle's
+    /// `with_spawn_context`; tests inject tempdir-scoped contexts).
+    pub(crate) fn set_spawn_context(&mut self, ctx: super::spawn_project::SessionSpawnContext) {
+        self.spawn_ctx = ctx;
+    }
+
+    /// The reminder policy's staleness bound, read live from this
+    /// agenda's own policy file — the SAME bound the planner classifies
+    /// missed sessions with, so the floor leg of fireability and the
+    /// fire path can never disagree. A propose/approve is a rare verb;
+    /// the read is one small JSON file (absent = defaults).
+    fn staleness_ms(&self) -> u64 {
+        super::reminders::ReminderPolicyStore::open(&self.dir)
+            .policy()
+            .staleness_ms()
     }
 
     /// Post-fold bookkeeping for persisted rich asks: floor the process
@@ -1579,26 +1610,7 @@ impl AgendaStore {
                         "{id} is not open — reopen it before scheduling work on it"
                     )));
                 }
-                if fire_at_ms == 0 {
-                    return Err(AgendaError::Invalid("fire_at_ms must be set".into()));
-                }
-                // Executor pins are validated NOW, not at fire time: a
-                // digest-bound manifest is reviewed and approved long
-                // before it spawns, so every contradiction the launch
-                // path would deterministically reject must be named here
-                // (same rules, same wording — one authority). All-inherit
-                // normalizes to the legacy absent shape so a config-less
-                // propose keeps byte-identical manifest bytes and digests.
                 let agent_config = agent_config.filter(|config| !config.is_empty());
-                if let Some(config) = agent_config.as_deref() {
-                    crate::session_supervisor::validate_launch_config(config)
-                        .map_err(AgendaError::Invalid)?;
-                    if let Some(warning) =
-                        crate::session_supervisor::unrecognized_claude_model_warning(config)
-                    {
-                        eprintln!("[agenda] propose advisory: {warning}");
-                    }
-                }
                 if let Some(rec) = &recurrence {
                     if rec.every_ms < super::types::RECURRENCE_MIN_EVERY_MS {
                         return Err(AgendaError::Invalid(format!(
@@ -1635,30 +1647,57 @@ impl AgendaStore {
                     }
                     validate_trigger(trig)?;
                 }
-                // Explicit project pin (T3c): the same contradiction the
-                // launch path would deterministically refuse at fire time
-                // is named NOW, at review time — a picker-stamped
-                // standing manifest on a projectless daemon otherwise
-                // fires straight into the named refusal.
-                let project_root = match project_root.map(|p| p.trim().to_string()) {
-                    None => None,
-                    Some(p) if p.is_empty() => None,
-                    Some(p) => {
-                        let path = std::path::Path::new(&p);
-                        if !path.is_absolute() {
-                            return Err(AgendaError::Invalid(format!(
-                                "project_root must be an absolute path, got {p:?}"
-                            )));
-                        }
-                        if !path.is_dir() {
-                            return Err(AgendaError::Invalid(format!(
-                                "project_root {p:?} is not an existing directory — the spawn \
-                                 would be refused at fire time; fix the path or omit it for \
-                                 the daemon default"
-                            )));
-                        }
-                        Some(p)
+                // Fireability (card 01KYSZAGQVHAAYS7BK9H3QFM3C): an
+                // approvable manifest IS a fireable manifest — the ONE
+                // validator resolves the project through the fire path's
+                // own chain (explicit pin → the parking session's root →
+                // the daemon default, refused named when nothing
+                // resolves), resolves the executor (explicit selection →
+                // the daemon default → internal) and validates the
+                // config AS RESOLVED, and applies the planner's own
+                // missed rule to the floor. The resolutions are RECORDED
+                // below: the digest the owner approves names WHERE and
+                // WHO, never empty-means-whatever-fires. (This
+                // deliberately ends the byte-identical-to-legacy shape
+                // for pin-less proposes — a fresh propose mints a fresh
+                // digest anyway; parked legacy manifests refold
+                // untouched and keep their bound digests.)
+                let explicit_project = project_root
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty());
+                let resolved = super::fireability::validate(
+                    super::fireability::FireabilityCandidate {
+                        fire_at_ms,
+                        recurrence: recurrence.as_ref(),
+                        trigger: trigger.as_ref(),
+                        project_root: explicit_project,
+                        agent_config: agent_config.as_deref(),
+                    },
+                    item.provenance.session_id.as_deref(),
+                    &self.spawn_ctx,
+                    self.staleness_ms(),
+                    now_ms,
+                )
+                .map_err(|refusal| AgendaError::Invalid(refusal.message()))?;
+                let project_root = Some(resolved.project_root.to_string_lossy().into_owned());
+                let agent_config = {
+                    let mut config = agent_config.unwrap_or_default();
+                    if config
+                        .agent
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|agent| !agent.is_empty())
+                        .is_none()
+                    {
+                        config.agent = Some(resolved.agent.clone());
                     }
+                    if let Some(warning) =
+                        crate::session_supervisor::unrecognized_claude_model_warning(&config)
+                    {
+                        eprintln!("[agenda] propose advisory: {warning}");
+                    }
+                    Some(config)
                 };
                 let goal = {
                     let goal = goal.trim();
@@ -1714,12 +1753,11 @@ impl AgendaStore {
                         orchestrate,
                         // Shape rides the command (the approval-time
                         // editor's toggle); absent keeps the legacy
-                        // autonomous goal run. Without an explicit pin
-                        // the project resolves at fire time (provenance
-                        // → daemon default → named refusal). The
-                        // executor pins (if any) ride the digest-bound
-                        // manifest; absent fields inherit the daemon
-                        // defaults.
+                        // autonomous goal run. Project and executor are
+                        // the RESOLVED values recorded above — the
+                        // digest the owner approves names where and who;
+                        // remaining absent executor pins (model, effort)
+                        // inherit backend defaults at launch.
                         interactive: interactive.unwrap_or(false),
                         project_root,
                         agent_config,
@@ -2122,6 +2160,24 @@ impl AgendaStore {
                         effect.digest
                     )));
                 }
+                // Approve is the ARM gate: the same fireability check the
+                // propose lane runs, against the daemon's state NOW —
+                // approval can never arm a plan the fire path already
+                // refuses (the class law: approve is never offered on an
+                // unfireable manifest). This is also where a LEGACY
+                // pin-less manifest meets the validator: its project
+                // resolves through the unchanged fallback chain when the
+                // daemon can, and refuses named (the edit prompt) when it
+                // cannot. Check-only — an approval binds bytes and never
+                // rewrites them, so nothing is recorded here.
+                super::fireability::validate(
+                    super::fireability::FireabilityCandidate::of_manifest(&effect.manifest),
+                    item.provenance.session_id.as_deref(),
+                    &self.spawn_ctx,
+                    self.staleness_ms(),
+                    now_ms,
+                )
+                .map_err(|refusal| AgendaError::Invalid(refusal.message()))?;
                 Ok(AgendaOp::ApproveEffect {
                     id,
                     effect_id: effect.effect_id.clone(),

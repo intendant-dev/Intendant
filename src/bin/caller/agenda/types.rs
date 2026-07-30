@@ -584,6 +584,16 @@ pub struct AgendaEffect {
     /// never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_run_attempt: Option<u32>,
+    /// Display-only serving-seam decoration (the `next_fire_ms`
+    /// pattern): the fireability refusal an approve of THIS revision
+    /// would meet right now — stamped only on effects whose approve/
+    /// re-arm affordance could render (pending review, or suspended),
+    /// `None` otherwise and always `None` in the fold product. The
+    /// dashboard withholds the Approve affordance on it and opens the
+    /// plan editor on the named field instead (the class law: approve is
+    /// never offered on an unfireable manifest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fireability_refusal: Option<super::fireability::FireabilityRefusalView>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -2129,6 +2139,7 @@ pub(crate) fn apply_op(
                 requested: Vec::new(),
                 next_fire_ms: None,
                 last_run_attempt: None,
+                fireability_refusal: None,
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
                 Some(existing) => {
