@@ -121,7 +121,7 @@ async function agendaRefresh() {
       // Track AS S5: the list feed is SUMMARIES (titles, chips, edges,
       // served flags — ~9× lighter than full items); the inspector and
       // expansions fetch one full item on demand (agendaFullItemFor).
-      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary' });
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary', window: 'live' });
       if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
         agendaItems = resp.body.items;
         agendaCounts = resp.body.counts || agendaCounts;
@@ -231,6 +231,7 @@ async function agendaHeal(reason) {
       const resp = await daemonApi.request('api_agenda_list', {
         since_seq: agendaSeq,
         shape: 'summary',
+        window: 'live',
       });
       if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
         for (const item of resp.body.items) {
@@ -274,6 +275,41 @@ async function agendaHeal(reason) {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && agendaItems !== null) agendaHeal('tab-wake');
 });
+
+// Track AS S6 — the archive store: closed items OLDER than the live
+// window, paged from the server at FULL grain (ruling R-AS2 — these
+// rows render answer text) on Archive-lens demand. Owner-ratified:
+// fully paged, nothing preloaded. `next === null` means the archive is
+// exhausted; `undefined` means no page fetched yet.
+const agendaArchive = { items: [], next: undefined, loading: false };
+
+async function agendaArchiveLoadMore() {
+  if (agendaArchive.loading || agendaArchive.next === null) return;
+  agendaArchive.loading = true;
+  agendaRenderTab();
+  try {
+    const params = { window: 'archive', limit: 50 };
+    if (agendaArchive.next) {
+      params.before = agendaArchive.next.before;
+      params.before_id = agendaArchive.next.before_id;
+    }
+    const resp = await daemonApi.request('api_agenda_list', params);
+    if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+      for (const item of resp.body.items) {
+        if (!agendaArchive.items.some((x) => x.id === item.id)) {
+          agendaArchive.items.push(item);
+        }
+      }
+      agendaArchive.next = resp.body.next_page || null;
+      Object.assign(agendaSessions, resp.body.sessions || {});
+      Object.assign(agendaPullRequests, resp.body.pull_requests || {});
+    }
+  } catch (e) {
+    console.warn('[agenda] archive page failed', e);
+  }
+  agendaArchive.loading = false;
+  agendaRenderTab();
+}
 
 // QA readback (window.qa convention — the whole SPA is one module
 // scope, so the harness reaches state only through this deliberate

@@ -208,11 +208,24 @@ impl IntendantServer {
             Some("summary") => true,
             Some(other) => return Err(format!("unknown shape '{other}' (full or summary)")),
         };
+        let window = crate::agenda::AgendaWindow::parse(params.window.as_deref())?;
         let read = agenda.serving_read(params.since_seq);
         let mut items = read.served;
         if let Some(q) = params.q.as_deref().filter(|q| !q.trim().is_empty()) {
             items.retain(|item| crate::agenda::matches_query(item, q));
         }
+        // One shared window/paging implementation with the HTTP core
+        // (S6); the page cursor rides back as `next_page`.
+        let next_page = crate::agenda::apply_window(
+            &mut items,
+            window,
+            Some(crate::agenda::AgendaArchivePage {
+                before: params.before,
+                before_id: params.before_id.clone(),
+                limit: params.limit,
+            }),
+            crate::agenda::now_ms(),
+        );
         if let Some(status) = status {
             items.retain(|item| item.status == status);
         }
@@ -222,12 +235,19 @@ impl IntendantServer {
             serde_json::to_value(&items)
         }
         .map_err(|err| format!("encoding agenda items: {err}"))?;
-        Ok(serde_json::json!({
+        let mut body = serde_json::json!({
             "items": items_value,
             "counts": read.counts,
             "skipped_lines": read.skipped_lines,
             "seq": read.seq,
-        }))
+        });
+        if let Some((before, before_id)) = next_page {
+            body.as_object_mut().expect("object body").insert(
+                "next_page".to_string(),
+                serde_json::json!({ "before": before, "before_id": before_id }),
+            );
+        }
+        Ok(body)
     }
 
     async fn agenda_op_inner(
@@ -3437,6 +3457,10 @@ pub(crate) mod tests {
                 since_seq: None,
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("bare agenda_list");
@@ -3506,6 +3530,10 @@ pub(crate) mod tests {
                 since_seq: Some(1),
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("delta agenda_list");
@@ -3519,6 +3547,10 @@ pub(crate) mod tests {
                 since_seq: Some(1),
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("composed filters");

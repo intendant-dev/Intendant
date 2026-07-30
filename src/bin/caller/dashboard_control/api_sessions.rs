@@ -1356,12 +1356,41 @@ pub(crate) async fn api_agenda_list_response(
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
+    let window_raw = params
+        .and_then(|p| p.get("window"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let window = match crate::agenda::AgendaWindow::parse(window_raw.as_deref()) {
+        Ok(window) => window,
+        Err(err) => {
+            return frame_api_response(
+                id,
+                crate::web_gateway::ApiResponse::json_error(400, err),
+                "agenda list",
+            )
+        }
+    };
+    let page = crate::agenda::AgendaArchivePage {
+        before: params
+            .and_then(|p| p.get("before"))
+            .and_then(serde_json::Value::as_u64),
+        before_id: params
+            .and_then(|p| p.get("before_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        limit: params
+            .and_then(|p| p.get("limit"))
+            .and_then(serde_json::Value::as_u64),
+    };
     frame_api_response(
         id,
         crate::web_gateway::agenda_list_api_response(
             since_seq,
             shape,
             q.as_deref(),
+            window,
+            Some(page),
             runtime.mcp_server.as_ref(),
         )
         .await,

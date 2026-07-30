@@ -59,6 +59,22 @@ pub struct AgendaListParams {
     /// digest prefixes. Omit for no filter.
     #[serde(default)]
     pub q: Option<String>,
+    /// Serving window: "all" (default — the frozen full ledger), "live"
+    /// (every open item + closed items from the last 14 days), or
+    /// "archive" (older closed items, newest first, paged by
+    /// before/before_id/limit).
+    #[serde(default)]
+    pub window: Option<String>,
+    /// Archive page cursor: only items updated strictly before this
+    /// epoch-ms instant (with before_id breaking ties).
+    #[serde(default)]
+    pub before: Option<u64>,
+    /// Archive page tiebreak id for `before`.
+    #[serde(default)]
+    pub before_id: Option<String>,
+    /// Archive page size (default 50, max 200).
+    #[serde(default)]
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
