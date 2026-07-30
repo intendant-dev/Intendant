@@ -567,9 +567,18 @@ function agendaLensGroupsOpen() {
 function agendaLensGroupsHubs() {
   const q = agendaSearch.trim().toLowerCase();
   const frontier = agendaFrontierPredicate();
+  // Track AS S6: `children` roll-ups are SERVED against the whole fold,
+  // so a hub's totals stay honest while the live window carries only
+  // recent closed child rows (owner-ratified By-hub values). The
+  // in-feed derivation remains the fallback for rows without the field.
+  const hubTotal = (x) => {
+    const c = x.children;
+    if (c) return (c.open || 0) + (c.done || 0) + (c.retired || 0);
+    return agendaChildrenOf(x.id).length;
+  };
   const hubs = (agendaItems || [])
-    .filter((x) => x.status !== 'retired' && agendaChildrenOf(x.id).length)
-    .sort((a, b) => agendaChildrenOf(b.id).length - agendaChildrenOf(a.id).length);
+    .filter((x) => x.status !== 'retired' && hubTotal(x) > 0)
+    .sort((a, b) => hubTotal(b) - hubTotal(a));
   const groups = hubs.map((hub) => {
     const kids = agendaChildrenOf(hub.id)
       .filter((x) => x.status !== 'retired' && agendaSearchMatch(x, q))
@@ -578,10 +587,12 @@ function agendaLensGroupsHubs() {
       .sort((a, b) =>
         (a.status === 'open' ? -1 : 1) - (b.status === 'open' ? -1 : 1)
         || agendaByNew(a, b));
-    const open = kids.filter((k) => k.status === 'open').length;
+    const c = hub.children;
+    const open = c ? (c.open || 0) : kids.filter((k) => k.status === 'open').length;
+    const closed = c ? (c.done || 0) + (c.retired || 0) : kids.length - open;
     return {
       label: hub.title,
-      hint: `${open} open · ${kids.length - open} done — roll-ups derived at render`,
+      hint: `${open} open · ${closed} closed — served roll-up; closed rows shown from the last 14 days`,
       hubId: hub.id,
       rows: kids.map((x) => ({ item: x, noHub: true, composer: true })),
     };
@@ -693,7 +704,12 @@ function agendaLensGroupsQuestions() {
   return groups;
 }
 
+// Track AS S6: the live feed carries only the last 14 days of closed
+// items (owner-ratified fixed window); the Archive lens shows those
+// recent rows immediately and pages OLDER closed items from the server
+// on demand (full grain — answer text renders; nothing preloaded).
 function agendaLensGroupsArchive() {
+  const q = agendaSearch.trim().toLowerCase();
   const pool = agendaFilteredPool();
   const done = pool
     .filter((x) => x.status === 'done')
@@ -702,16 +718,29 @@ function agendaLensGroupsArchive() {
   const groups = [];
   if (done.length) {
     groups.push({
-      label: 'Done',
+      label: 'Done · last 14 days',
       hint: 'reopen resurrects — completing cancelled any pending reminder',
       rows: done.map((x) => ({ item: x, showAnswer: true })),
     });
   }
   if (retired.length) {
     groups.push({
-      label: 'Retired',
+      label: 'Retired · last 14 days',
       hint: 'hidden, never deleted — there is no destructive delete on this ledger',
       rows: retired.map((x) => ({ item: x })),
+    });
+  }
+  // The paged older archive (server order: newest-closed first). Rows
+  // whose item re-entered the live feed (a reopen) defer to the live
+  // copy; the local search still applies so filtering stays one gesture.
+  const older = agendaArchive.items
+    .filter((x) => !agendaFindItem(x.id))
+    .filter((x) => agendaSearchMatch(x, q));
+  if (older.length) {
+    groups.push({
+      label: 'Older',
+      hint: 'paged from the archive — the ledger keeps everything',
+      rows: older.map((x) => ({ item: x, showAnswer: x.status === 'done' })),
     });
   }
   return groups;
@@ -1466,6 +1495,10 @@ function agendaRenderTab() {
   lensesHost.querySelectorAll('button[data-lens]').forEach((btn) => {
     btn.addEventListener('click', () => {
       agendaLens = btn.dataset.lens;
+      // Lens interaction re-pulls the summaries (throttled) so served
+      // cross-item flags on untouched items refresh — the ruled Q4
+      // freshness affordance (gate fix F-AS1).
+      agendaSummariesRepull('lens');
       agendaRenderTab();
     });
   });
@@ -1552,14 +1585,61 @@ function agendaRenderTab() {
         ${hub ? agendaPipelineStripHtml(hub) : ''}
         <div class="ag2-cards">${group.rows.map(agendaCardHtml).join('')}</div>
       </div>`;
-    }).join('');
+    }).join('') + agendaLensFooterHtml(lens.id);
   });
   agendaHydratePreviewFrames(groupsHost);
+  // Archive lens (S6): first activation pulls the first page — the
+  // owner-ratified posture is fully paged, nothing preloaded.
+  if (lens.id === 'archive' && agendaArchive.next === undefined && !agendaArchive.loading) {
+    agendaArchiveLoadMore();
+  }
+}
+
+// Per-lens footer under the groups (Track AS S6): the Archive lens's
+// pager, and the see-archive door on the lenses whose closed rows are
+// now windowed to 14 days (owner-ratified Questions/Automations values).
+function agendaLensFooterHtml(lensId) {
+  if (lensId === 'archive') {
+    if (agendaArchive.loading) {
+      return '<div class="ag2-group-hint" style="padding:8px 2px;">Loading older items…</div>';
+    }
+    if (agendaArchive.next === null && agendaArchive.items.length === 0) {
+      return '<div class="ag2-group-hint" style="padding:8px 2px;">Nothing older than the last 14 days.</div>';
+    }
+    if (agendaArchive.next) {
+      return '<div style="padding:8px 2px;"><button type="button" class="ag2-btn ghost" data-archive-more>Load older items…</button></div>';
+    }
+    return agendaArchive.items.length
+      ? '<div class="ag2-group-hint" style="padding:8px 2px;">End of the archive — the ledger keeps everything.</div>'
+      : '';
+  }
+  if (lensId === 'questions' || lensId === 'automations') {
+    // Closed rows here cover the last 14 days; older history lives in
+    // the Archive. Total closed comes from the whole-ledger counts.
+    const closedTotal = (agendaCounts.done || 0) + (agendaCounts.retired || 0);
+    const closedInFeed = (agendaItems || []).filter((x) => x.status !== 'open').length;
+    if (closedTotal > closedInFeed) {
+      return `<div class="ag2-group-hint" style="padding:8px 2px;">Closed rows show the last 14 days — <a href="#" data-open-archive>${closedTotal - closedInFeed} older in the Archive ›</a></div>`;
+    }
+  }
+  return '';
 }
 
 // ---- List event delegation (wired once on #ag2-groups) ----
 
 function agendaGroupsClick(e) {
+  // S6 footer affordances: the Archive pager and the see-archive door.
+  if (e.target.closest('[data-archive-more]')) {
+    e.preventDefault();
+    agendaArchiveLoadMore();
+    return;
+  }
+  if (e.target.closest('[data-open-archive]')) {
+    e.preventDefault();
+    agendaLens = 'archive';
+    agendaRenderTab();
+    return;
+  }
   const sessionLink = e.target.closest('a.agenda-session-link');
   if (sessionLink) {
     e.preventDefault();

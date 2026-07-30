@@ -43,6 +43,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda ask "OK to drop the v1 shim next week?" --body "qa.transportShimHits()==0 for 2 days now."
 "$INTENDANT" ctl ask --park "Which grid layout?" --option Dense --option Airy   # RICH parked ask: options/previews on the rail, durable on the agenda
 "$INTENDANT" ctl agenda list            # open items (--all / --done / --retired)
+"$INTENDANT" ctl agenda show 01KX       # ONE item, full detail (body, thread, effects, refs) — never fetches the ledger; use it to check an answer instead of polling list
 "$INTENDANT" ctl agenda answer 01KX "yes — after the soak window"   # owner replies
 "$INTENDANT" ctl agenda complete 01KX   # any unique id prefix
 "$INTENDANT" ctl agenda reopen 01KX     # resurrects done or retired

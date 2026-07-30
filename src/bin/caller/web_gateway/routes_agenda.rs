@@ -29,6 +29,8 @@ pub(crate) async fn agenda_list_api_response(
     since_seq: Option<u64>,
     shape: AgendaListShape,
     q: Option<&str>,
+    window: crate::agenda::AgendaWindow,
+    page: Option<crate::agenda::AgendaArchivePage>,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let Some(agenda) = agenda_handle(mcp_server).await else {
@@ -39,6 +41,13 @@ pub(crate) async fn agenda_list_api_response(
     if let Some(q) = q {
         served.retain(|item| crate::agenda::matches_query(item, q));
     }
+    // The serving window (Track AS S6): live = every open item + closed
+    // items within the fixed 14-day recency; archive = the paged
+    // complement at FULL grain (R-AS2). Applied to the SERVED set only —
+    // the fold, the cross-item summary context (`read.all`), and every
+    // in-process consumer stay whole (ruling R-AS5).
+    let next_page = crate::agenda::apply_window(&mut served, window, page, crate::agenda::now_ms())
+        .map(|(before, before_id)| serde_json::json!({ "before": before, "before_id": before_id }));
     let sessions = agenda_sessions_join(&crate::platform::home_dir(), &served);
     // Tier-1 PR state for the anchors this snapshot serves — the same
     // sibling discipline as `sessions`: keyed by the anchors' url-ref
@@ -71,6 +80,11 @@ pub(crate) async fn agenda_list_api_response(
         "reminder_policy": agenda.reminder_policy(),
         "sessions": sessions,
     });
+    if let Some(next) = next_page {
+        body.as_object_mut()
+            .expect("object body")
+            .insert("next_page".to_string(), next);
+    }
     if !pull_requests.is_empty() {
         body.as_object_mut()
             .expect("object body")
@@ -253,11 +267,59 @@ fn agenda_sessions_join(
     out
 }
 
+/// The session-join resolution cache (Track AS S8, ruling Q10): the
+/// per-id resolution pays file I/O — `session_meta.json` reads,
+/// wrapper-index lookups, and on a miss a full `read_dir` scan of the
+/// logs root (~18 ms warm on a 3,600-entry box, once per id per
+/// request before this). Entries are keyed by `(home, id)` (hermetic
+/// tests inject tempdir homes) and validated by FILE IDENTITY — the
+/// session dir's mtime, or the logs root's mtime for unresolved ids
+/// (a new session dir bumps it, re-admitting the lookup). A cache
+/// entry is never authoritative: any identity change recomputes.
+type SessionJoinKey = (std::path::PathBuf, String);
+type SessionJoinEntry = (Option<std::time::SystemTime>, Option<serde_json::Value>);
+static SESSION_JOIN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<SessionJoinKey, SessionJoinEntry>>,
+> = std::sync::OnceLock::new();
+
+fn session_join_identity(
+    home: &std::path::Path,
+    recorded_id: &str,
+) -> Option<std::time::SystemTime> {
+    let session_dir = home.join("logs").join(recorded_id);
+    std::fs::metadata(&session_dir)
+        .or_else(|_| std::fs::metadata(home.join("logs")))
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
 /// One recorded session id → its display identity, or `None` when nothing
 /// on this daemon resolves it anymore. `project_root` (additive) is the
 /// session's recorded project root — the Start-now sheet's provenance
 /// prefill and the follow-up resume's launch root derive from it.
+/// Cached by file identity (see [`SESSION_JOIN_CACHE`]).
 fn agenda_session_join_entry(
+    home: &std::path::Path,
+    recorded_id: &str,
+) -> Option<serde_json::Value> {
+    let identity = session_join_identity(home, recorded_id);
+    let key = (home.to_path_buf(), recorded_id.to_string());
+    let cache = SESSION_JOIN_CACHE.get_or_init(Default::default);
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_identity, value)) = cache.get(&key) {
+            if *cached_identity == identity {
+                return value.clone();
+            }
+        }
+    }
+    let value = agenda_session_join_entry_uncached(home, recorded_id);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, (identity, value.clone()));
+    }
+    value
+}
+
+fn agenda_session_join_entry_uncached(
     home: &std::path::Path,
     recorded_id: &str,
 ) -> Option<serde_json::Value> {
@@ -547,8 +609,28 @@ pub(crate) async fn handle_agenda_list(
         }
     };
     let q = query_param(request_line, "q").filter(|v| !v.trim().is_empty());
-    let response =
-        agenda_list_api_response(since_seq, shape, q.as_deref(), mcp_server.as_ref()).await;
+    let window_raw = query_param(request_line, "window");
+    let window = match crate::agenda::AgendaWindow::parse(window_raw.as_deref()) {
+        Ok(window) => window,
+        Err(err) => {
+            let response = ApiResponse::json_error(400, err);
+            return write_api_response(stream, response, cors, fleet_origin).await;
+        }
+    };
+    let page = crate::agenda::AgendaArchivePage {
+        before: query_param(request_line, "before").and_then(|v| v.parse().ok()),
+        before_id: query_param(request_line, "before_id").filter(|v| !v.is_empty()),
+        limit: query_param(request_line, "limit").and_then(|v| v.parse().ok()),
+    };
+    let response = agenda_list_api_response(
+        since_seq,
+        shape,
+        q.as_deref(),
+        window,
+        Some(page),
+        mcp_server.as_ref(),
+    )
+    .await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -784,7 +866,15 @@ mod tests {
         agenda.apply(add("open row", "live"), owner).unwrap();
 
         let body = json_of(
-            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Full,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         );
         let items = body["items"].as_array().expect("items array");
         assert_eq!(items.len(), 3, "every item, closed included");
@@ -851,15 +941,30 @@ mod tests {
             .apply(add("before the cursor"), owner.clone())
             .unwrap();
         let cursor = json_of(
-            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Full,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         )["seq"]
             .as_u64()
             .unwrap();
         let changed = agenda.apply(add("after the cursor"), owner).unwrap();
 
         let delta = json_of(
-            &agenda_list_api_response(Some(cursor), AgendaListShape::Full, None, Some(&server))
-                .await,
+            &agenda_list_api_response(
+                Some(cursor),
+                AgendaListShape::Full,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         );
         let items = delta["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -868,8 +973,15 @@ mod tests {
         assert_eq!(delta["seq"], cursor + 1);
         // An at-frontier pull is an empty delta with the same shape.
         let empty = json_of(
-            &agenda_list_api_response(Some(cursor + 1), AgendaListShape::Full, None, Some(&server))
-                .await,
+            &agenda_list_api_response(
+                Some(cursor + 1),
+                AgendaListShape::Full,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         );
         assert!(empty["items"].as_array().unwrap().is_empty());
         assert_eq!(empty["counts"]["open"], 2);
@@ -974,7 +1086,15 @@ mod tests {
             )
             .unwrap();
         let body = json_of(
-            &agenda_list_api_response(None, AgendaListShape::Summary, None, Some(&server)).await,
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Summary,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         );
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -988,6 +1108,8 @@ mod tests {
                 None,
                 AgendaListShape::Summary,
                 Some("summarized"),
+                crate::agenda::AgendaWindow::All,
+                None,
                 Some(&server),
             )
             .await,
@@ -998,11 +1120,126 @@ mod tests {
                 None,
                 AgendaListShape::Summary,
                 Some("no-such-text"),
+                crate::agenda::AgendaWindow::All,
+                None,
                 Some(&server),
             )
             .await,
         );
         assert!(miss["items"].as_array().unwrap().is_empty());
+    }
+
+    /// Track AS S6 pin (ruling R-AS2): archive pages serve FULL items —
+    /// bodies present — page-bounded with the compound (updated_ms, id)
+    /// cursor riding back as `next_page`, newest-closed first, no
+    /// overlap between pages. The live window serves open items always.
+    #[tokio::test]
+    async fn archive_pages_are_full_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        // Three ancient closed items (completed decades before the
+        // window) + one open one, authored with explicit instants.
+        {
+            // Author through a direct store on the same dir so op
+            // instants are explicit (the handle clocks with the wall).
+            let mut store = crate::agenda::AgendaStore::open(&dir.path().join("agenda")).unwrap();
+            for (i, title) in ["old a", "old b", "old c"].iter().enumerate() {
+                let item = store
+                    .apply_command(
+                        crate::agenda::AgendaCommand::Add {
+                            kind: crate::agenda::AgendaKind::Task,
+                            title: (*title).into(),
+                            body: format!("{title} full body"),
+                            tags: Vec::new(),
+                            due_ms: None,
+                            source: None,
+                            refs: Vec::new(),
+                        },
+                        owner.clone(),
+                        1000 + i as u64,
+                    )
+                    .unwrap();
+                store
+                    .apply_command(
+                        crate::agenda::AgendaCommand::Complete {
+                            id: item.id.clone(),
+                            source: None,
+                        },
+                        owner.clone(),
+                        2000 + i as u64,
+                    )
+                    .unwrap();
+                let _ = item.id;
+            }
+        }
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Task,
+                    title: "live open".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                    refs: Vec::new(),
+                },
+                owner,
+            )
+            .unwrap();
+
+        let list = |window: &'static str, before: Option<(u64, String)>| {
+            let server = &server;
+            async move {
+                let page = crate::agenda::AgendaArchivePage {
+                    before: before.as_ref().map(|(ms, _)| *ms),
+                    before_id: before.as_ref().map(|(_, id)| id.clone()),
+                    limit: Some(2),
+                };
+                json_of(
+                    &agenda_list_api_response(
+                        None,
+                        AgendaListShape::Full,
+                        None,
+                        crate::agenda::AgendaWindow::parse(Some(window)).unwrap(),
+                        Some(page),
+                        Some(server),
+                    )
+                    .await,
+                )
+            }
+        };
+
+        // Live: the open item only (the closed trio is decades old).
+        let live = list("live", None).await;
+        let live_items = live["items"].as_array().unwrap();
+        assert_eq!(live_items.len(), 1);
+        assert_eq!(live_items[0]["title"], "live open");
+
+        // Archive page 1: two newest-closed, FULL grain, cursor back.
+        let page1 = list("archive", None).await;
+        let items1 = page1["items"].as_array().unwrap();
+        assert_eq!(items1.len(), 2);
+        assert!(
+            items1[0]["body"].as_str().unwrap().contains("full body"),
+            "archive pages are full items (R-AS2)"
+        );
+        let next = &page1["next_page"];
+        let cursor = (
+            next["before"].as_u64().expect("cursor ms"),
+            next["before_id"].as_str().expect("cursor id").to_string(),
+        );
+        // Page 2: the remaining one, no further cursor, no overlap.
+        let page2 = list("archive", Some(cursor)).await;
+        let items2 = page2["items"].as_array().unwrap();
+        assert_eq!(items2.len(), 1);
+        assert!(page2.get("next_page").is_none());
+        let ids1: Vec<&str> = items1.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert!(!ids1.contains(&items2[0]["id"].as_str().unwrap()));
     }
 
     /// Tier 1 rides the snapshot as a sibling map keyed by served
@@ -1022,7 +1259,15 @@ mod tests {
         crate::github_pr::join::tier1().update_repo("o/r", &open);
 
         let body = json_of(
-            &agenda_list_api_response(None, AgendaListShape::Full, None, Some(&server)).await,
+            &agenda_list_api_response(
+                None,
+                AgendaListShape::Full,
+                None,
+                crate::agenda::AgendaWindow::All,
+                None,
+                Some(&server),
+            )
+            .await,
         );
         let joined = &body["pull_requests"][locator];
         assert_eq!(joined["draft"], true);

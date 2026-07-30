@@ -450,8 +450,19 @@ impl AgendaHandle {
                 .collect();
             (outcome, counts, hub_seq, node_seqs)
         };
+        // One decoration context for the whole stamped graph (Track AS
+        // S8, the post-#649 batch reuse): a workflow's hub + N nodes
+        // decorate against one fold snapshot instead of cloning it per
+        // broadcast.
+        let context = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before decoration failed: {err}");
+            }
+            store.snapshot()
+        };
         if let Some(hub) = outcome.hub.as_mut() {
-            self.decorate_item(hub);
+            self.decorate_in_context(Some(&context), std::slice::from_mut(hub));
             self.bus.send(AppEvent::AgendaChanged {
                 item: hub.clone(),
                 counts,
@@ -459,7 +470,7 @@ impl AgendaHandle {
             });
         }
         for (node, seq) in outcome.nodes.iter_mut().zip(node_seqs) {
-            self.decorate_item(&mut node.item);
+            self.decorate_in_context(Some(&context), std::slice::from_mut(&mut node.item));
             self.bus.send(AppEvent::AgendaChanged {
                 item: node.item.clone(),
                 counts,
@@ -808,7 +819,7 @@ impl AgendaHandle {
     /// served) and the `served` subset a delta cursor selects (equal to
     /// `all` without a cursor). Decorated once, against the whole fold.
     pub(crate) fn serving_read(&self, since_seq: Option<u64>) -> AgendaServingRead {
-        let (mut all, counts, skipped_lines, seq, seq_by_id) = {
+        let (mut all, counts, skipped_lines, seq, seq_by_id, foreign) = {
             let mut store = self.lock();
             if let Err(err) = store.refresh_if_stale() {
                 eprintln!("[agenda] refresh before read failed: {err}");
@@ -824,9 +835,29 @@ impl AgendaHandle {
                 store.skipped_lines(),
                 store.seq(),
                 seq_by_id,
+                store.drain_foreign_changes(),
             )
         };
         self.decorate_items(&mut all);
+        // The refold-diff broadcast (Track AS S8, ruling Q6): items a
+        // stale refresh absorbed from ANOTHER daemon's appends emit one
+        // coalesced `agenda_changed` batch — every event carrying the
+        // same post-refold seq (the last folded line) and the same
+        // fresh counts — so daemon A's browsers hear daemon B's writes
+        // without polling. Damped by construction: the buffer drains
+        // once per refresh.
+        if !foreign.is_empty() {
+            let batch_seq = seq.saturating_sub(1);
+            for id in foreign {
+                if let Some(item) = all.iter().find(|item| item.id == id) {
+                    self.bus.send(AppEvent::AgendaChanged {
+                        item: item.clone(),
+                        counts,
+                        seq: batch_seq,
+                    });
+                }
+            }
+        }
         let served = match since_seq {
             // Missing map entries (unreachable by construction — every
             // folded item got there via an op that recorded its seq)
@@ -1131,7 +1162,7 @@ pub(crate) struct SessionAgendaEnvelope {
     pub(crate) sealed_inputs: Vec<super::types::BindingRef>,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1712,6 +1743,76 @@ mod tests {
         );
         assert_eq!(read.counts.open, 1);
         assert_eq!(read.counts.done, 1);
+    }
+
+    /// Track AS S8 pin (ruling Q6, the damping leg): a foreign append
+    /// absorbed by a stale refresh broadcasts ONE coalesced
+    /// `agenda_changed` batch on the next serving read — every event
+    /// carrying the same post-refold seq — and drains: the next read
+    /// broadcasts nothing.
+    #[test]
+    fn refold_diff_broadcast_is_damped_per_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
+        let owner = Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: None,
+        });
+        // Foreign daemon appends two ops (one item twice, one new item).
+        let foreign_handle =
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let f1 = foreign_handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "foreign".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        foreign_handle
+            .apply(
+                AgendaCommand::Annotate {
+                    id: f1.id.clone(),
+                    text: "note".into(),
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap();
+        // Drop the foreign handle's own broadcasts from the shared bus.
+        while rx.try_recv().is_ok() {}
+
+        let read = handle.serving_read(None);
+        let mut broadcast = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::AgendaChanged { item, seq, .. } = event {
+                broadcast.push((item.id, seq));
+            }
+        }
+        assert_eq!(broadcast.len(), 1, "one item changed → one event");
+        assert_eq!(broadcast[0].0, f1.id);
+        assert_eq!(
+            broadcast[0].1,
+            read.seq.saturating_sub(1),
+            "the batch carries the post-refold seq"
+        );
+
+        // Damped: a second read broadcasts nothing new.
+        handle.serving_read(None);
+        assert!(rx.try_recv().is_err(), "the buffer drained with the batch");
     }
 
     /// Track AS S2 pin (ruling R-AS4): a `since_seq` delta returns

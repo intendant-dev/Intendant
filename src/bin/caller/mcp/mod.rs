@@ -208,11 +208,24 @@ impl IntendantServer {
             Some("summary") => true,
             Some(other) => return Err(format!("unknown shape '{other}' (full or summary)")),
         };
+        let window = crate::agenda::AgendaWindow::parse(params.window.as_deref())?;
         let read = agenda.serving_read(params.since_seq);
         let mut items = read.served;
         if let Some(q) = params.q.as_deref().filter(|q| !q.trim().is_empty()) {
             items.retain(|item| crate::agenda::matches_query(item, q));
         }
+        // One shared window/paging implementation with the HTTP core
+        // (S6); the page cursor rides back as `next_page`.
+        let next_page = crate::agenda::apply_window(
+            &mut items,
+            window,
+            Some(crate::agenda::AgendaArchivePage {
+                before: params.before,
+                before_id: params.before_id.clone(),
+                limit: params.limit,
+            }),
+            crate::agenda::now_ms(),
+        );
         if let Some(status) = status {
             items.retain(|item| item.status == status);
         }
@@ -222,12 +235,50 @@ impl IntendantServer {
             serde_json::to_value(&items)
         }
         .map_err(|err| format!("encoding agenda items: {err}"))?;
-        Ok(serde_json::json!({
+        let mut body = serde_json::json!({
             "items": items_value,
             "counts": read.counts,
             "skipped_lines": read.skipped_lines,
             "seq": read.seq,
-        }))
+        });
+        if let Some((before, before_id)) = next_page {
+            body.as_object_mut().expect("object body").insert(
+                "next_page".to_string(),
+                serde_json::json!({ "before": before, "before_id": before_id }),
+            );
+        }
+        Ok(body)
+    }
+
+    /// One item at full decorated grain by exact id or unique prefix
+    /// (Track AS S7 — the tool twin of `GET /api/agenda/items/{id}`,
+    /// ruling Q5 semantics): exact wins; an ambiguous prefix refuses by
+    /// name with a bounded candidate list; single-item watchers stop
+    /// polling the world.
+    async fn agenda_item_inner(
+        &self,
+        params: AgendaItemParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        let id = params.id.trim();
+        match agenda.resolve_prefix(id) {
+            crate::agenda::AgendaPrefixResolution::One(item) => {
+                Ok(serde_json::json!({ "item": *item }))
+            }
+            crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => Err(format!(
+                "ambiguous agenda id prefix '{id}': {}",
+                candidates
+                    .into_iter()
+                    .map(|(id, title)| format!("{id} ({title})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            crate::agenda::AgendaPrefixResolution::None => {
+                Err(format!("no agenda item matches '{id}'"))
+            }
+        }
     }
 
     async fn agenda_op_inner(
@@ -606,6 +657,13 @@ impl IntendantServer {
                 Ok(match self.agenda_list_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("agenda_list failed: {message}")),
+                })
+            }
+            "agenda_item" => {
+                let Parameters(params) = parse_params::<AgendaItemParams>(args)?;
+                Ok(match self.agenda_item_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_item failed: {message}")),
                 })
             }
             "agenda_op" => {
@@ -3438,6 +3496,10 @@ pub(crate) mod tests {
                 since_seq: None,
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("bare agenda_list");
@@ -3456,6 +3518,64 @@ pub(crate) mod tests {
         assert_eq!(body["counts"]["done"], 1);
         // S1: additive seq cursor on the bare tool response too.
         assert_eq!(body["seq"], 3);
+    }
+
+    /// Track AS S7: `agenda_item` resolves exact ids (always win),
+    /// unique prefixes, refuses ambiguity with candidates, and 404s by
+    /// name — the ruled Q5 semantics on the tool lane, so ctl and
+    /// single-item watchers stop fetching the world.
+    #[tokio::test]
+    async fn mcp_agenda_item_resolves_prefixes_with_exact_wins() {
+        let dir = tempdir().expect("agenda dir");
+        let bus = EventBus::new();
+        let state = test_state();
+        let handle = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        state.write().await.agenda = Some(handle.clone());
+        let server = IntendantServer::new(state, bus);
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: format!("{title} body"),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let first = handle.apply(add("first"), owner.clone()).unwrap();
+        handle.apply(add("second"), owner).unwrap();
+
+        let exact = server
+            .agenda_item_inner(AgendaItemParams {
+                id: first.id.clone(),
+            })
+            .await
+            .expect("exact id resolves");
+        assert_eq!(exact["item"]["id"], serde_json::json!(first.id));
+        assert_eq!(
+            exact["item"]["body"],
+            serde_json::json!("first body"),
+            "full grain on the tool lane"
+        );
+        let ambiguous = server
+            .agenda_item_inner(AgendaItemParams { id: "01".into() })
+            .await
+            .expect_err("ambiguous prefix refuses");
+        assert!(ambiguous.contains("ambiguous"));
+        assert!(ambiguous.contains(&first.id), "candidates are listed");
+        let missing = server
+            .agenda_item_inner(AgendaItemParams { id: "7ZZZZ".into() })
+            .await
+            .expect_err("unknown refuses by name");
+        assert!(missing.contains("no agenda item"));
     }
 
     /// Track AS S2: MCP `agenda_list`'s `since_seq` is a delta over the
@@ -3507,6 +3627,10 @@ pub(crate) mod tests {
                 since_seq: Some(1),
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("delta agenda_list");
@@ -3520,6 +3644,10 @@ pub(crate) mod tests {
                 since_seq: Some(1),
                 shape: None,
                 q: None,
+                window: None,
+                before: None,
+                before_id: None,
+                limit: None,
             })
             .await
             .expect("composed filters");

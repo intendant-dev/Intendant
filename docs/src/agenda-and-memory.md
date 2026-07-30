@@ -883,7 +883,8 @@ goal embeds the **mandate**. Template goal (paste into
 
 ```text
 Agenda housekeeping pass. Read every agenda item (ctl agenda list --all
---json), then review for staleness, urgency, next actions, and blocker
+--json; for one item's full detail, ctl agenda show ID is cheaper than
+re-fetching the ledger), then review for staleness, urgency, next actions, and blocker
 evidence. MANDATE — propose, don't dispose: (1) write your findings as
 annotations on the items themselves (ctl agenda annotate) and park exactly
 ONE new summary item titled "Housekeeping summary <date>" for anything
@@ -982,7 +983,9 @@ untriaged, and one that gets unfiled re-enters your scope). The
 frontier is the ceiling — never sweep the whole agenda (that is the
 housekeeping mandate, a separate standing item). Read the frontier and
 the current hubs (ctl agenda list --all --json; the JSON carries each
-item's originating session and project).
+item's originating session and project — and, server-derived, each
+summary-shape item's frontier flag; ctl agenda show ID re-reads one
+item without the ledger).
 
 PLACEMENT (mechanical): file each frontier item into the graph. Seed
 part_of from the item's provenance-derived project: place under the
@@ -1178,7 +1181,8 @@ effort — the owner's standing judgment-mandate preference):
 ```text
 Survey & propose. Read the ENTIRE agenda — open, done, and retired
 items (ctl agenda list --all --json; placing done items is allowed
-and useful for the hubs' history) — and propose, creating NOTHING
+and useful for the hubs' history; ctl agenda show ID re-checks one
+item without re-fetching) — and propose, creating NOTHING
 yet, the hub taxonomy that reconciles it: the hubs (and, where the
 population warrants it, nested super-hubs — clusters are hubs under
 hubs, no new layer; the store's ancestry-cycle guard governs
@@ -1279,9 +1283,11 @@ tests is the tripwire, not a refactor.
   (`effects[].next_fire_ms`, `deferred_until`, `watched_by`) and the
   served flags are read-time values computed at the serving seam. A
   delta refreshes them only on returned items; untouched items'
-  decorations age between reads exactly as they always have. Clients
-  re-pull summaries on lens interaction and on wake; there is no
-  composite version vector unless live staleness ever bites.
+  decorations age between reads exactly as they always have. The dashboard
+  re-pulls the full summary feed on lens interaction and on a
+  minutes-scale idle timer while visible (both throttled); wake and
+  event gaps heal by delta. There is no composite version vector unless
+  live staleness ever bites.
 - **`shape=summary` (the projection).** The summary DTO carries exactly
   what the dashboard's cards render ungated: identity, chips, instants,
   who-line session ids, answer text on answered questions, UNCLEARED
@@ -1305,7 +1311,21 @@ tests is the tripwire, not a refactor.
   decorated grain with its own sessions join: `{id}` is an exact id
   (always wins) or a unique prefix; an ambiguous prefix refuses by name
   with a bounded `{id, title}` candidate list. Tooling resolves ids
-  here instead of pulling the ledger.
+  here instead of pulling the ledger — `ctl agenda show ID` and the MCP
+  `agenda_item` tool ride it.
+- **`window=live|archive` (the serving window).** `live` — the
+  dashboard's default feed — serves every OPEN item unconditionally
+  (open items never age off) plus closed items updated within the last
+  14 days (a fixed, owner-ratified daemon constant; no knob). `archive`
+  is the paged complement: closed items older than the window, newest
+  first, FULL grain (archive pages render answer text and bodies),
+  `before`/`before_id`/`limit` paging with the compound cursor riding
+  back as `next_page`. Summaries carry `children` roll-up counts
+  (open/done/retired per parent, computed against the whole fold) so
+  By-hub totals stay honest while the window trims child rows. The
+  window is wire vocabulary only: the fold and every in-process
+  consumer keep the whole ledger, and the bare lanes stay `window=all`
+  forever.
 
 In-process consumers — the reminder/effect scheduler, trigger
 evaluation, the PR scanner, session-catalog envelopes, boot re-announce

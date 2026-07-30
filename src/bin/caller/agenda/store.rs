@@ -164,6 +164,11 @@ pub(crate) struct AgendaStore {
     item_seqs: BTreeMap<String, u64>,
     /// The boot-fold gauge, recorded once by [`Self::open`] (Q9).
     boot_fold: AgendaFoldVital,
+    /// Item ids changed by FOREIGN appends absorbed during stale
+    /// refreshes, awaiting the serving seam's damped broadcast
+    /// ([`Self::drain_foreign_changes`], Track AS S8/Q6). Deduped;
+    /// bounded by the item count.
+    foreign_changes: Vec<String>,
 }
 
 /// Facts of one scheduled-session occurrence outcome, written back by the
@@ -290,6 +295,7 @@ impl AgendaStore {
             log_lines: fold.lines,
             item_seqs: fold.item_seqs,
             boot_fold,
+            foreign_changes: Vec::new(),
         };
         store.sync_ask_state();
         Ok(store)
@@ -315,7 +321,17 @@ impl AgendaStore {
     /// Multiple daemons on one home (the normal topology on a dev box)
     /// share `~/.intendant/agenda`; this keeps their views convergent
     /// without any cross-process coordination beyond `O_APPEND`. Call
-    /// before reads and writes — a stat per call, a refold only on change.
+    /// before reads and writes — a stat per call, and on growth an
+    /// INCREMENTAL fold of only the appended suffix (Track AS S8: the
+    /// log is append-only and `apply_op` is incremental by
+    /// construction, so convergence is O(delta), not O(file)). A file
+    /// SHORTER than folded means the append-only contract was broken
+    /// externally — that forces the full refold, the honest recovery.
+    ///
+    /// Foreign-changed item ids accumulate in
+    /// [`Self::drain_foreign_changes`]'s buffer so the serving seam can
+    /// broadcast one damped `agenda_changed` batch per refresh (ruling
+    /// Q6 — closing the multi-daemon quiet-refold hole at the source).
     pub(crate) fn refresh_if_stale(&mut self) -> std::io::Result<()> {
         let disk_len = match std::fs::metadata(&self.log_path) {
             Ok(meta) => meta.len(),
@@ -325,10 +341,64 @@ impl AgendaStore {
         if disk_len == self.folded_len {
             return Ok(());
         }
-        // Shorter than folded means the append-only contract was broken
-        // externally; refolding what's there is the honest recovery either way.
+        if disk_len > self.folded_len {
+            // Growth: fold the appended suffix only.
+            use std::io::{Read as _, Seek as _};
+            let mut file = std::fs::File::open(&self.log_path)?;
+            file.seek(std::io::SeekFrom::Start(self.folded_len))?;
+            let mut suffix = Vec::with_capacity((disk_len - self.folded_len) as usize);
+            file.read_to_end(&mut suffix)?;
+            let text = String::from_utf8_lossy(&suffix);
+            for line in text.lines() {
+                let seq = self.log_lines;
+                self.log_lines += 1;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match parse_record(line) {
+                    Ok(record) => {
+                        match apply_op(&mut self.items, &record) {
+                            Some(reason) => eprintln!("[agenda] fold: {reason}"),
+                            None => {
+                                let id = record.op.item_id().to_string();
+                                self.item_seqs.insert(id.clone(), seq);
+                                if !self.foreign_changes.contains(&id) {
+                                    self.foreign_changes.push(id);
+                                }
+                            }
+                        }
+                        self.ops += 1;
+                    }
+                    Err(reason) => {
+                        self.skipped_lines += 1;
+                        eprintln!("[agenda] skipping log line ({reason}): {line}");
+                    }
+                }
+            }
+            self.folded_len += suffix.len() as u64;
+            self.last_id = self.last_id.max(max_item_id(&self.items));
+            // Another instance's torn tail: terminate it (as `open`
+            // does) so our next append starts on a fresh line.
+            if !suffix.is_empty() && suffix.last() != Some(&b'\n') {
+                self.log.write_all(b"\n")?;
+                self.folded_len += 1;
+            }
+            self.sync_ask_state();
+            return Ok(());
+        }
+        // Shrink: the append-only contract was broken externally —
+        // refold everything from what's there (tamper recovery). Items
+        // whose fold product changed are queued for the damped
+        // broadcast; items that vanished cannot be broadcast (there is
+        // no item to carry) — the `since_seq` resync lane covers them.
         let bytes = std::fs::read(&self.log_path)?;
         let fold = fold_bytes(&bytes);
+        for (id, item) in &fold.items {
+            if self.items.get(id) != Some(item) && !self.foreign_changes.contains(id) {
+                self.foreign_changes.push(id.clone());
+            }
+        }
         self.items = fold.items;
         self.ops = fold.ops;
         self.skipped_lines = fold.skipped_lines;
@@ -339,8 +409,6 @@ impl AgendaStore {
         // folded max normally covers it, but a shrunk/tampered file must
         // not let a future mint sort below an id we already handed out.
         self.last_id = self.last_id.max(max_item_id(&self.items));
-        // Another instance's torn tail: terminate it (as `open` does) so
-        // our next append starts on a fresh line.
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
             self.log.write_all(b"\n")?;
             self.folded_len += 1;
@@ -348,6 +416,15 @@ impl AgendaStore {
         // Another instance may have parked or resolved asks.
         self.sync_ask_state();
         Ok(())
+    }
+
+    /// Drain the foreign-changed item ids the last stale refreshes
+    /// accumulated (Track AS S8/Q6): the serving seam broadcasts them
+    /// as one coalesced batch — every emitted item carrying the same
+    /// post-refold seq — then the buffer is empty until another foreign
+    /// append lands.
+    pub(crate) fn drain_foreign_changes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.foreign_changes)
     }
 
     /// Validate a frontend intent against current state, append the durable
@@ -6602,6 +6679,90 @@ mod tests {
         assert_eq!(store.seq(), 5);
         assert_eq!(store.read_ops(0, None, 100).unwrap().log_len, 5);
         assert_eq!(store.skipped_lines(), 1);
+    }
+
+    /// Track AS S8 pin: absorbing a foreign append folds ONLY the
+    /// appended suffix, and the result equals a from-scratch full fold
+    /// of the same file — items, seq space, per-item seqs, counts.
+    #[test]
+    fn suffix_fold_equals_full_refold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ours = AgendaStore::open(dir.path()).unwrap();
+        ours.apply_command(add_cmd("local"), owner(), 1000).unwrap();
+
+        let mut foreign = AgendaStore::open(dir.path()).unwrap();
+        let f1 = foreign
+            .apply_command(add_cmd("foreign one"), owner(), 2000)
+            .unwrap();
+        foreign
+            .apply_command(
+                AgendaCommand::Annotate {
+                    id: f1.id.clone(),
+                    text: "foreign note".into(),
+                    source: None,
+                },
+                owner(),
+                3000,
+            )
+            .unwrap();
+        foreign
+            .apply_command(add_cmd("foreign two"), owner(), 4000)
+            .unwrap();
+
+        ours.refresh_if_stale().unwrap();
+        let fresh = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(ours.snapshot(), fresh.snapshot(), "fold product equal");
+        assert_eq!(ours.seq(), fresh.seq(), "seq space equal");
+        assert_eq!(ours.counts(), fresh.counts());
+        for item in fresh.snapshot() {
+            assert_eq!(
+                ours.item_seq(&item.id),
+                fresh.item_seq(&item.id),
+                "per-item seqs equal"
+            );
+        }
+        // The foreign-changed set is exactly the touched items, deduped.
+        let mut drained = ours.drain_foreign_changes();
+        drained.sort();
+        let mut expect: Vec<String> = fresh
+            .snapshot()
+            .iter()
+            .filter(|item| item.title.starts_with("foreign"))
+            .map(|item| item.id.clone())
+            .collect();
+        expect.sort();
+        assert_eq!(drained, expect);
+        assert!(ours.drain_foreign_changes().is_empty(), "drained once");
+    }
+
+    /// Track AS S8 pin: an externally SHRUNK log (append-only contract
+    /// broken) forces the full refold — the fold converges on exactly
+    /// what remains on disk.
+    #[test]
+    fn shrink_forces_full_refold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.apply_command(add_cmd("kept"), owner(), 1000).unwrap();
+        let keep_len = std::fs::metadata(store.log_path()).unwrap().len();
+        store
+            .apply_command(add_cmd("tampered away"), owner(), 2000)
+            .unwrap();
+        assert_eq!(store.seq(), 2);
+
+        // External tamper: truncate the second record off.
+        let file = std::fs::File::options()
+            .write(true)
+            .open(store.log_path())
+            .unwrap();
+        file.set_len(keep_len).unwrap();
+        drop(file);
+
+        store.refresh_if_stale().unwrap();
+        let fresh = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(store.snapshot(), fresh.snapshot());
+        assert_eq!(store.seq(), 1, "seq follows the shrunk file");
+        assert_eq!(store.snapshot().len(), 1);
+        assert_eq!(store.snapshot()[0].title, "kept");
     }
 
     /// Track AS S1 (design gate Q9): the boot fold records its one-gauge

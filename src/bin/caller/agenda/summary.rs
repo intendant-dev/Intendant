@@ -20,6 +20,110 @@
 use super::types::{AgendaItem, AgendaKind, AgendaStatus};
 use serde::Serialize;
 
+/// The live serving window for CLOSED items (Track AS S6, owner-ratified
+/// 2026-07-29 on question 01KYR8X7ZB): done/retired items stay in the
+/// default dashboard feed for 14 days by `updated_ms`, then page from
+/// the archive on demand. A FIXED daemon-side constant by explicit owner
+/// decision — no settings knob. Open items are NEVER windowed out
+/// (ruling Q1: the window mechanism is binding design; only closed
+/// items age off the wire).
+pub(crate) const AGENDA_LIVE_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// Which slice of the ledger a list read serves (Track AS S6). `All`
+/// is the frozen bare default; `Live` is the dashboard's default feed;
+/// `Archive` is the paged complement (closed items older than the
+/// window), served at FULL grain (ruling R-AS2 — the lenses that page
+/// it render answer text and bodies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgendaWindow {
+    All,
+    Live,
+    Archive,
+}
+
+impl AgendaWindow {
+    /// Parse the additive `window` parameter: absent/empty/`all` = the
+    /// frozen full default; unknown values refuse by name.
+    pub(crate) fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim).filter(|s| !s.is_empty()) {
+            None => Ok(Self::All),
+            Some("all") => Ok(Self::All),
+            Some("live") => Ok(Self::Live),
+            Some("archive") => Ok(Self::Archive),
+            Some(other) => Err(format!("unknown window '{other}' (all, live, or archive)")),
+        }
+    }
+
+    /// Does `item` belong to this window at `now_ms`? Open items are in
+    /// `Live` unconditionally and never in `Archive`.
+    pub(crate) fn admits(self, item: &AgendaItem, now_ms: u64) -> bool {
+        match self {
+            Self::All => true,
+            Self::Live => {
+                item.status == AgendaStatus::Open
+                    || item.updated_ms >= now_ms.saturating_sub(AGENDA_LIVE_WINDOW_MS)
+            }
+            Self::Archive => {
+                item.status != AgendaStatus::Open
+                    && item.updated_ms < now_ms.saturating_sub(AGENDA_LIVE_WINDOW_MS)
+            }
+        }
+    }
+}
+
+/// Archive paging (Track AS S6): the compound recency cursor + page
+/// size for `window=archive`. Absent fields = first page, default size.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AgendaArchivePage {
+    pub(crate) before: Option<u64>,
+    pub(crate) before_id: Option<String>,
+    pub(crate) limit: Option<u64>,
+}
+
+/// Apply the serving window (and, for `Archive`, the recency-ordered
+/// page bound) to the SERVED set in place — one implementation for the
+/// HTTP core and the MCP tool alike. Returns the next page's compound
+/// cursor when the archive page filled. The fold and the cross-item
+/// summary context are never touched here (ruling R-AS5).
+pub(crate) fn apply_window(
+    items: &mut Vec<AgendaItem>,
+    window: AgendaWindow,
+    page: Option<AgendaArchivePage>,
+    now_ms: u64,
+) -> Option<(u64, String)> {
+    if window == AgendaWindow::All {
+        return None;
+    }
+    items.retain(|item| window.admits(item, now_ms));
+    if window != AgendaWindow::Archive {
+        return None;
+    }
+    // Newest-closed first; (updated_ms, id) is the stable compound
+    // cursor. Archive pages serve FULL items (ruling R-AS2) — callers
+    // render answer text and bodies — so bytes stay bounded by the page.
+    let page = page.unwrap_or_default();
+    items.sort_by(|a, b| {
+        b.updated_ms
+            .cmp(&a.updated_ms)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    if let Some(before) = page.before {
+        let before_id = page.before_id.as_deref().unwrap_or("");
+        items.retain(|item| {
+            item.updated_ms < before
+                || (item.updated_ms == before
+                    && !before_id.is_empty()
+                    && item.id.as_str() < before_id)
+        });
+    }
+    let limit = page.limit.unwrap_or(50).clamp(1, 200) as usize;
+    if items.len() > limit {
+        items.truncate(limit);
+        return items.last().map(|last| (last.updated_ms, last.id.clone()));
+    }
+    None
+}
+
 /// One item at summary grain. Field NAMES and sub-shapes mirror the
 /// full DTO wherever a field is carried (`provenance.session_id`,
 /// `relies_on[].target_id`, …) so lens code adopts summaries without
@@ -79,6 +183,13 @@ pub(crate) struct AgendaItemSummary {
     /// (newest `triage`-source annotation; "rank N" names the rank).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) triage: Option<SummaryTriage>,
+    /// Placed-children roll-up (Track AS S6): how many items name this
+    /// one as their `part_of` parent, by status — served on every
+    /// summary that HAS children, computed against the whole fold, so
+    /// By-hub renders honest totals even when the live window holds
+    /// only some child rows (owner-ratified S6 values).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) children: Option<super::types::AgendaCounts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,9 +354,30 @@ pub(crate) struct SummaryTriage {
 /// exactly like it starved `watched_by` (#649).
 pub(crate) fn summarize(all: &[AgendaItem], served: &[AgendaItem]) -> Vec<AgendaItemSummary> {
     let watermark = triage_watermark(all);
+    // Placed-children roll-ups (S6): one pass over the whole fold, so
+    // every parent's totals are honest regardless of which children the
+    // serving window carries.
+    let mut child_counts: std::collections::HashMap<&str, super::types::AgendaCounts> =
+        std::collections::HashMap::new();
+    for item in all {
+        if let Some(placement) = &item.part_of {
+            let counts = child_counts
+                .entry(placement.parent_id.as_str())
+                .or_default();
+            match item.status {
+                AgendaStatus::Open => counts.open += 1,
+                AgendaStatus::Done => counts.done += 1,
+                AgendaStatus::Retired => counts.retired += 1,
+            }
+        }
+    }
     served
         .iter()
-        .map(|item| summarize_one(all, item, watermark))
+        .map(|item| {
+            let mut summary = summarize_one(all, item, watermark);
+            summary.children = child_counts.get(item.id.as_str()).copied();
+            summary
+        })
         .collect()
 }
 
@@ -366,6 +498,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
         blocked: item_is_blocked(all, item),
         frontier: item_in_frontier(item, watermark),
         triage: triage_info(item),
+        children: None,
     }
 }
 
@@ -728,6 +861,76 @@ mod tests {
         let ask = resolved[0].ask.as_ref().expect("ask history marker");
         assert!(ask.questions.is_none(), "resolved ask slims to the count");
         assert_eq!(ask.questions_count, 1);
+    }
+
+    /// Track AS S6 pin (ruling R-AS5): the serving window is WIRE
+    /// vocabulary only — the fold, `snapshot()`, and `serving_read`'s
+    /// `all` context keep every item forever; only the served copy
+    /// windows. Open items are NEVER windowed out however old; closed
+    /// items age into the archive at the fixed 14-day constant.
+    #[test]
+    fn serving_window_never_filters_the_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 100 * AGENDA_LIVE_WINDOW_MS;
+        // Author history with explicit op instants through the store
+        // (the handle's clock is the wall clock), then serve through a
+        // fresh handle over the same log.
+        let (old_open, old_done, fresh_done) = {
+            let mut store = AgendaStore::open(dir.path()).unwrap();
+            let old_open = add(&mut store, "ancient open", 1000).unwrap();
+            let old_done = add(&mut store, "ancient done", 2000).unwrap();
+            store
+                .apply_command(
+                    AgendaCommand::Complete {
+                        id: old_done.id.clone(),
+                        source: None,
+                    },
+                    owner(),
+                    3000,
+                )
+                .unwrap();
+            let fresh_done = add(&mut store, "fresh done", now - 1000).unwrap();
+            store
+                .apply_command(
+                    AgendaCommand::Complete {
+                        id: fresh_done.id.clone(),
+                        source: None,
+                    },
+                    owner(),
+                    now - 500,
+                )
+                .unwrap();
+            (old_open, old_done, fresh_done)
+        };
+        let bus = crate::event::EventBus::new();
+        let handle = super::super::AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        );
+
+        // The fold and both serving-context views keep everything.
+        assert_eq!(handle.snapshot().len(), 3);
+        assert_eq!(handle.serving_read(None).all.len(), 3);
+
+        // Live: open always (however ancient) + fresh closed.
+        let mut live = handle.serving_read(None).served;
+        assert!(apply_window(&mut live, AgendaWindow::Live, None, now).is_none());
+        let live_ids: Vec<&str> = live.iter().map(|i| i.id.as_str()).collect();
+        assert!(
+            live_ids.contains(&old_open.id.as_str()),
+            "open never ages off"
+        );
+        assert!(live_ids.contains(&fresh_done.id.as_str()));
+        assert!(!live_ids.contains(&old_done.id.as_str()));
+
+        // Archive: exactly the aged closed complement.
+        let mut archive = handle.serving_read(None).served;
+        apply_window(&mut archive, AgendaWindow::Archive, None, now);
+        assert_eq!(
+            archive.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec![old_done.id.as_str()]
+        );
     }
 
     /// The server search covers the client search's exact reach: id,
