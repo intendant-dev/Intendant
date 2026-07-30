@@ -2558,14 +2558,21 @@ async fn run_agenda(
                 .ok_or_else(|| {
                     "agenda show requires an item id (a unique prefix is enough)".to_string()
                 })?;
-            let item = agenda_fetch_item(client, config, raw_id).await?;
+            let body = agenda_fetch_item(client, config, raw_id).await?;
+            let item = body
+                .get("item")
+                .cloned()
+                .ok_or_else(|| "agenda_item response missing item".to_string())?;
             if config.json || config.raw {
+                // The item object verbatim — scripts pin this shape; the
+                // sibling blocks stay a detail-print concern.
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&item).map_err(|e| e.to_string())?
                 );
             } else {
                 agenda_print_item_detail(&item);
+                agenda_print_working_set(&item, &body);
             }
         }
         "ops" => run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Ops).await?,
@@ -3326,6 +3333,47 @@ fn agenda_item_is_blocked(all_items: &[Value], item: &Value) -> bool {
 /// `agenda show`'s human detail (Track AS S7): the whole item, printed
 /// self-contained — no ledger fetch, so cross-item lookups (dependency
 /// target titles) print as ids. Bodies/notes/answers are quoted data.
+/// The item's derived territory block (the `working_set` sibling):
+/// file/dir refs across the item and its placed subtree, newest first.
+/// Detail print only — `--json` keeps the bare item object.
+fn agenda_print_working_set(item: &Value, body: &Value) {
+    let Some(ws) = body.get("working_set") else {
+        return;
+    };
+    let rows = ws
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+    let total = ws.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let own_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let shown = rows.len() as u64;
+    if total > shown {
+        println!("  territory ({total} distinct, newest {shown} shown):");
+    } else {
+        println!("  territory ({total} distinct):");
+    }
+    for row in &rows {
+        let s = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
+        let mut line = format!("    {} {}", s("ref_type"), s("locator"));
+        if row
+            .get("must_read")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            line.push_str(" [must-read]");
+        }
+        let via = s("item_id");
+        if !via.is_empty() && via != own_id {
+            line.push_str(&format!(" — via {}", s("item_title")));
+        }
+        println!("{line}");
+    }
+}
+
 fn agenda_print_item_detail(item: &Value) {
     println!("{}", agenda_render_row(item, false, &[]));
     let s = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
@@ -3643,7 +3691,8 @@ async fn agenda_resolve_id_str(
 ) -> Result<String, String> {
     Ok(agenda_fetch_item(client, config, raw)
         .await?
-        .get("id")
+        .get("item")
+        .and_then(|item| item.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| "agenda_item returned an item without an id".to_string())?
         .to_string())
@@ -3686,10 +3735,10 @@ async fn agenda_fetch_item(
     }
     let value: Value =
         serde_json::from_str(text).map_err(|e| format!("agenda_item returned non-JSON: {e}"))?;
-    value
-        .get("item")
-        .cloned()
-        .ok_or_else(|| "agenda_item response missing item".to_string())
+    if value.get("item").is_none() {
+        return Err("agenda_item response missing item".to_string());
+    }
+    Ok(value)
 }
 
 /// Fetch `(items, counts)` via the `agenda_list` tool.

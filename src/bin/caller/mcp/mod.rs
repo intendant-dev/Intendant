@@ -265,7 +265,19 @@ impl IntendantServer {
         let id = params.id.trim();
         match agenda.resolve_prefix(id) {
             crate::agenda::AgendaPrefixResolution::One(item) => {
-                Ok(serde_json::json!({ "item": *item }))
+                let mut body = serde_json::json!({ "item": *item });
+                // Derived territory sibling — same block the item route
+                // serves, so `ctl agenda show` (the supervised adoption
+                // lane) sees the working set too.
+                if let Some(working_set) = agenda.working_set(&item.id) {
+                    if working_set.total > 0 {
+                        body.as_object_mut().expect("object body").insert(
+                            "working_set".to_string(),
+                            serde_json::to_value(&working_set).expect("working set serializes"),
+                        );
+                    }
+                }
+                Ok(body)
             }
             crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => Err(format!(
                 "ambiguous agenda id prefix '{id}': {}",

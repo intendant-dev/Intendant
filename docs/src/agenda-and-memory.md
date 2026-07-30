@@ -250,6 +250,17 @@ intake): a directory has no attach-time byte identity without a priced
 tree-hash scheme — future vocabulary — so presence is its only drift
 signal.
 
+**The working set is served, never stored.** The item detail lanes —
+`GET /api/agenda/items/{id}` and the `agenda_item` tool behind `ctl
+agenda show` — carry a derived `working_set` block when territory
+exists: the item's and its placed subtree's file/dir refs, newest
+attach per locator, recency-ordered, capped at 48 rows with the
+distinct total named. Retired items contribute nothing (their children
+still do); done items DO contribute — finished work's territory is
+exactly the affinity signal an adopting session wants. Computed on
+demand from the fold like placed-children counts, and like every
+derivation here, never stored.
+
 ### The graph: placement and adjacency (G2)
 
 Two more link vocabularies make the agenda navigable, both ordinary
