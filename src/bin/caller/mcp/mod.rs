@@ -3469,6 +3469,7 @@ pub(crate) mod tests {
                     goal: "the digest-bound goal".into(),
                     fire_at_ms: 4_102_444_800_000,
                     orchestrate: false,
+                    interactive: None,
                     recurrence: None,
                     agent_config: None,
                     trigger: None,

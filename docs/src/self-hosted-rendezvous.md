@@ -651,18 +651,29 @@ The same log commits **what the project releases**, closing the update
 channel's side of the story ([Trust Tiers](./trust-tiers.md)): after
 publishing to GitHub Releases, the tag-triggered release pipeline
 (`.github/workflows/release.yml`) hashes every uploaded artifact — the
-app bundle and the stamped `install.sh` / `install.ps1` release assets
-alike, so the canonical install one-liner's bytes are themselves logged —
-and submits a `release_manifest` entry — `tag`, `version`, `platforms`, and
-a name-sorted `artifacts` list of `{name, sha256, size}` (lowercase-hex
-hashes, comparable to `sha256sum` output), plus `manifest_hash`: sha256
-over the canonical byte string `intendant-release-manifest-v1\n{tag}\n`
-then `{name}\t{sha256}\t{size}\n` per artifact. Submission is
+app bundle, the stamped `install.sh` / `install.ps1` release assets, each
+artifact's detached PGP `.asc` signature, and the public signing key
+itself, so the canonical install one-liner's bytes and the signatures over
+everything are all logged — and submits a `release_manifest` entry —
+`tag`, `version`, `platforms`, `pgp_fingerprint` (the release signing
+key's primary fingerprint, uppercase hex), and a name-sorted `artifacts`
+list of `{name, sha256, size}` (lowercase-hex hashes, comparable to
+`sha256sum` output), plus `manifest_hash`: sha256 over the canonical byte
+string `intendant-release-manifest-v1\n{tag}\n` then
+`{name}\t{sha256}\t{size}\n` per artifact. (`manifest_hash` deliberately
+covers `{tag, artifacts}` only — external monitors keep recomputing it
+from any faithful copy — while the log tree binds every leaf field,
+`pgp_fingerprint` included.) Submission is
 `POST /api/log/release-manifest`, gated by a dedicated bearer token
 (`--release-token` / `INTENDANT_CONNECT_RELEASE_TOKEN`; the pipeline
 holds it as the `CONNECT_RELEASE_TOKEN` repository secret). The token
 is deliberately not the operator `daemon_token`: the CI credential can
-only ever append release manifests. With no token configured the
+only ever append release manifests. Submission is also fail-closed on
+signature coverage: a manifest is refused unless the public key asset
+`RELEASE-SIGNING-KEY.asc` is in the list, every non-`.asc` artifact is
+accompanied by its detached `.asc`, no signature is stray, and
+`pgp_fingerprint` is well-formed — an unsigned or half-signed release
+cannot even be logged. With no token configured the
 endpoint answers 503; identical re-submissions dedupe; a *changed*
 manifest for an existing tag appends a new entry — republished
 artifacts become public history, never silent replacement. Reads stay
@@ -678,7 +689,14 @@ intendant hosted-verify --releases v0.3.0 --download
 
 The default mode verifies the log legs exactly like the bundle check
 (tree-head signature, inclusion proof, consistency against the same
-per-host pin), then compares the logged artifact list against the
+per-host pin), then checks the release's **PGP identity against the
+verifying binary itself** — the logged `pgp_fingerprint` must equal the
+compiled-in pin of the repo-committed `RELEASE-SIGNING-KEY.asc`, the
+published key asset must hash to exactly the committed key bytes, and
+per-artifact `.asc` coverage must be complete (cryptographic signature
+verification stays `gpg --verify`'s job: the ritual in
+[Getting Started's "Verifying a release"](./getting-started.md#verifying-a-release))
+— then compares the logged artifact list against the
 GitHub release's asset *metadata* — names, sizes, and the sha256
 digests the API reports — without downloading multi-hundred-MB
 artifacts; assets on the release that the log never blessed are flagged
@@ -690,9 +708,13 @@ client's short total timeout; connection, response-header, and between-chunk
 idle waits remain bounded. With an explicit tag, a release
 absent from the log is a failure (exit 1): an unlogged release is
 exactly what the check exists to catch. (`--repo <owner/name>` points
-self-hosted forks at their own repository, and the optional
+self-hosted forks at their own repository, `--github-api <url>` points at
+a GitHub Enterprise or rig origin, and the optional
 `CONNECT_RELEASE_URL` repository *variable* points their pipeline at
-their own rendezvous.) The macOS app's update check (launch and "Check
+their own rendezvous. A fork that mints its own release key builds its
+own `hosted-verify` — the compiled pin is the trust anchor, so a foreign
+key against this binary is a loud failure, not a soft note.) The macOS
+app's update check (launch and "Check
 for Updates…") also asks the log about the release it is offering and
 appends a "publicly committed / NOT committed / couldn't check"
 advisory line — fail-open like the bundle tripwire: a log outage never

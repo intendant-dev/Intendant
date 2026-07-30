@@ -1118,6 +1118,16 @@ pub enum AgendaCommand {
         fire_at_ms: u64,
         #[serde(default)]
         orchestrate: bool,
+        /// Session shape (the approval-time editor's toggle): `true`
+        /// opens the fired session interactively — the goal becomes the
+        /// opening user message and the session waits for the owner —
+        /// while absent/`false` keeps the legacy autonomous goal run, so
+        /// a shape-less propose stays byte-identical on the wire and an
+        /// older daemon refuses the new field by name at strict intake
+        /// (the recurrence/trigger precedent) instead of silently
+        /// parking the wrong shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interactive: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recurrence: Option<RecurrenceSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2430,6 +2440,24 @@ pub(crate) fn counts(items: &BTreeMap<String, AgendaItem>) -> AgendaCounts {
     c
 }
 
+/// The manifest vocabulary as [`SessionManifest`]'s OWN schema declares
+/// it — the single source both edit-lane mirrors are pinned to (the
+/// propose command here in `types`, the dashboard edit form's field
+/// markers in `web_gateway::static_assets`). Derive, don't mirror: a
+/// new manifest field fails both parity pins until each mirror
+/// acknowledges it by name.
+#[cfg(test)]
+pub(crate) fn session_manifest_schema_fields() -> std::collections::BTreeSet<String> {
+    let schema = serde_json::to_value(schemars::schema_for!(SessionManifest))
+        .expect("manifest schema serializes");
+    schema["properties"]
+        .as_object()
+        .expect("manifest schema declares properties")
+        .keys()
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2716,6 +2744,54 @@ mod tests {
         // manifest fields and config fields must not collide).
         let value = serde_json::to_value(&full).unwrap();
         assert_eq!(value["agent_config"]["claude_effort"], "xhigh");
+    }
+
+    /// The approval-time editor's derive law: `SessionManifest`'s own
+    /// schema is the source of truth for the manifest vocabulary, and
+    /// the propose command — the ONE mint/edit lane — exposes every
+    /// manifest field under the same name. A new manifest field fails
+    /// this pin until the propose lane acknowledges it (and the
+    /// fragment-parity twin in `web_gateway::static_assets` fails until
+    /// the dashboard edit form does), so vocabulary drift never ships
+    /// silently as an edit lane that drops fields on re-propose.
+    #[test]
+    fn editable_fields_derive_from_schema() {
+        let manifest_fields = session_manifest_schema_fields();
+        let command = serde_json::to_value(schemars::schema_for!(AgendaCommand)).unwrap();
+        let variants = command["oneOf"]
+            .as_array()
+            .or_else(|| command["anyOf"].as_array())
+            .expect("command schema enumerates variants");
+        let propose = variants
+            .iter()
+            .find(|variant| {
+                let op = &variant["properties"]["op"];
+                op["const"] == serde_json::json!("propose_effect")
+                    || op["enum"]
+                        .as_array()
+                        .is_some_and(|ops| ops.iter().any(|o| o == "propose_effect"))
+            })
+            .expect("propose_effect variant present in the command schema");
+        let mut command_fields: std::collections::BTreeSet<String> = propose["properties"]
+            .as_object()
+            .expect("propose variant declares properties")
+            .keys()
+            .cloned()
+            .collect();
+        // The propose ENVELOPE, not manifest vocabulary: the op tag, the
+        // item id, and the unsupervised-caller label.
+        for envelope in ["op", "id", "source"] {
+            assert!(
+                command_fields.remove(envelope),
+                "{envelope} is part of the propose envelope"
+            );
+        }
+        assert_eq!(
+            command_fields, manifest_fields,
+            "the propose lane exposes exactly the manifest vocabulary — a new \
+             SessionManifest field rides the command (or is excluded here by \
+             name) before it ships"
+        );
     }
 
     /// Track T: the trigger's wire shapes pinned byte-for-byte

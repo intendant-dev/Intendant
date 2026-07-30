@@ -780,6 +780,66 @@ const RELEASE_ARTIFACT_LIMIT: usize = 256;
 const RELEASE_ARTIFACT_NAME_MAX: usize = 200;
 const RELEASE_PLATFORM_LIMIT: usize = 32;
 
+/// Release-asset name of the PGP public signing key that must accompany
+/// every logged release. TWINNED with
+/// `bin/caller/pgp_identity.rs::RELEASE_SIGNING_KEY_ASSET` and with
+/// `ui.rs::RELEASE_KEY_ASSET_URL`'s tail (the two binaries never link
+/// each other); tests on each side pin the literal.
+pub(crate) const RELEASE_SIGNING_KEY_ASSET: &str = "RELEASE-SIGNING-KEY.asc";
+
+/// `pgp_fingerprint` vocabulary: a v4 (40 hex) or v6 (64 hex) OpenPGP
+/// fingerprint, uppercase only. TWINNED with
+/// `bin/caller/pgp_identity.rs::valid_pgp_fingerprint` — the log must
+/// never accept what the verifier would not read; change both together.
+fn valid_pgp_fingerprint(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64)
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
+}
+
+/// Fail-closed signature coverage at the log door: a release manifest is
+/// loggable only when the public signing key ships beside the artifacts,
+/// every non-signature artifact carries its detached `.asc`, and no
+/// signature is stray. The read side
+/// (`bin/caller/hosted_verify.rs::signature_coverage_mismatches`)
+/// re-derives the same judgments from the logged leaf; change both
+/// together.
+pub(crate) fn release_signature_coverage_errors(
+    artifacts: &[ReleaseArtifactRecord],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if !artifacts
+        .iter()
+        .any(|artifact| artifact.name == RELEASE_SIGNING_KEY_ASSET)
+    {
+        errors.push(format!(
+            "artifacts must include the public signing key {RELEASE_SIGNING_KEY_ASSET}"
+        ));
+    }
+    for artifact in artifacts {
+        if let Some(base) = artifact.name.strip_suffix(".asc") {
+            if artifact.name != RELEASE_SIGNING_KEY_ASSET
+                && !artifacts.iter().any(|candidate| candidate.name == base)
+            {
+                errors.push(format!(
+                    "{}: detached signature without its artifact",
+                    artifact.name
+                ));
+            }
+        } else if !artifacts
+            .iter()
+            .any(|candidate| candidate.name == format!("{}.asc", artifact.name))
+        {
+            errors.push(format!(
+                "{}: artifact without a detached .asc signature",
+                artifact.name
+            ));
+        }
+    }
+    errors
+}
+
 /// One released artifact: the GitHub release asset's file name, the
 /// lowercase-hex sha256 of its exact bytes, and its size in bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +911,11 @@ pub(crate) struct ValidatedReleaseManifest {
     /// Sorted by name — the canonical order the hash covers.
     pub artifacts: Vec<ReleaseArtifactRecord>,
     pub manifest_hash: String,
+    /// Primary fingerprint of the release signing key (uppercase hex).
+    /// Bound by the log tree like `version`/`platforms`, deliberately
+    /// outside the v1 canonical `manifest_hash` (which stays recomputable
+    /// from any faithful `{tag, artifacts}` copy).
+    pub pgp_fingerprint: String,
 }
 
 /// Tags, versions, platform labels, and artifact names share one strict
@@ -961,6 +1026,26 @@ pub(crate) fn validate_release_manifest(
     {
         return Err("artifact names must be unique".to_string());
     }
+    let pgp_fingerprint = body
+        .get("pgp_fingerprint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !valid_pgp_fingerprint(&pgp_fingerprint) {
+        return Err(
+            "pgp_fingerprint must be the release signing key's primary fingerprint: 40 or 64 \
+             uppercase hex chars"
+                .to_string(),
+        );
+    }
+    let coverage_errors = release_signature_coverage_errors(&artifacts);
+    if !coverage_errors.is_empty() {
+        return Err(format!(
+            "unsigned or stray release artifacts: {}",
+            coverage_errors.join("; ")
+        ));
+    }
     let manifest_hash = release_manifest_hash_hex(&tag, &artifacts);
     Ok(ValidatedReleaseManifest {
         tag,
@@ -968,6 +1053,7 @@ pub(crate) fn validate_release_manifest(
         platforms,
         artifacts,
         manifest_hash,
+        pgp_fingerprint,
     })
 }
 
@@ -1022,6 +1108,7 @@ pub(crate) fn record_release_manifest(
             "version": manifest.version,
             "platforms": manifest.platforms,
             "manifest_hash": manifest.manifest_hash,
+            "pgp_fingerprint": manifest.pgp_fingerprint,
             "artifacts": manifest.artifacts,
         }),
     );
@@ -1856,14 +1943,20 @@ mod tests {
         ));
     }
 
+    const TEST_PGP_FINGERPRINT: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
+
     fn release_fixture() -> ValidatedReleaseManifest {
         validate_release_manifest(&json!({
             "tag": "v1.2.3",
             "version": "1.2.3",
             "platforms": ["macos-arm64"],
+            "pgp_fingerprint": TEST_PGP_FINGERPRINT,
             "artifacts": [
                 { "name": "Intendant-v1.2.3.zip", "sha256": sha256_hex(b"app zip"), "size": 5 },
+                { "name": "Intendant-v1.2.3.zip.asc", "sha256": sha256_hex(b"app sig"), "size": 4 },
                 { "name": "Intendant-v1.2.3.zip.sha256", "sha256": sha256_hex(b"hash file"), "size": 3 },
+                { "name": "Intendant-v1.2.3.zip.sha256.asc", "sha256": sha256_hex(b"hash sig"), "size": 4 },
+                { "name": RELEASE_SIGNING_KEY_ASSET, "sha256": sha256_hex(b"pubkey"), "size": 9 },
             ],
         }))
         .unwrap()
@@ -1908,6 +2001,30 @@ mod tests {
         );
     }
 
+    /// `pgp_fingerprint` is bound by the log tree (the leaf carries it),
+    /// deliberately NOT by the v1 canonical manifest hash — external
+    /// monitors keep recomputing `manifest_hash` from any faithful
+    /// `{tag, artifacts}` copy, pre- and post-PGP alike.
+    #[test]
+    fn pgp_fingerprint_is_outside_the_canonical_manifest_hash() {
+        let mut body = json!({
+            "tag": "v1.2.3",
+            "version": "1.2.3",
+            "platforms": ["macos-arm64"],
+            "pgp_fingerprint": TEST_PGP_FINGERPRINT,
+            "artifacts": [
+                { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                { "name": "a.zip.asc", "sha256": sha256_hex(b"xs"), "size": 1 },
+                { "name": RELEASE_SIGNING_KEY_ASSET, "sha256": sha256_hex(b"k"), "size": 1 },
+            ],
+        });
+        let first = validate_release_manifest(&body).unwrap();
+        body["pgp_fingerprint"] = json!("FFFF6789ABCDEF0123456789ABCDEF0123456789");
+        let second = validate_release_manifest(&body).unwrap();
+        assert_ne!(first.pgp_fingerprint, second.pgp_fingerprint);
+        assert_eq!(first.manifest_hash, second.manifest_hash);
+    }
+
     #[test]
     fn release_manifest_validation_canonicalizes_and_rejects_bad_shapes() {
         let manifest = release_fixture();
@@ -1925,7 +2042,12 @@ mod tests {
             "tag": "v1.2.3",
             "version": "1.2.3",
             "platforms": ["macos-arm64"],
-            "artifacts": [{ "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 }],
+            "pgp_fingerprint": TEST_PGP_FINGERPRINT,
+            "artifacts": [
+                { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                { "name": "a.zip.asc", "sha256": sha256_hex(b"xs"), "size": 1 },
+                { "name": RELEASE_SIGNING_KEY_ASSET, "sha256": sha256_hex(b"k"), "size": 1 },
+            ],
         });
         let mutate = |key: &str, value: serde_json::Value| {
             let mut body = base.clone();
@@ -1965,6 +2087,52 @@ mod tests {
                 json!([
                     { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
                     { "name": "a.zip", "sha256": sha256_hex(b"y"), "size": 2 },
+                ]),
+            ),
+        ] {
+            assert!(
+                validate_release_manifest(&bad).is_err(),
+                "must reject {bad}"
+            );
+        }
+
+        // PGP identity and signature coverage are fail-closed at the log
+        // door: no fingerprint, a malformed one, an unsigned artifact, a
+        // stray signature, or a missing public key all refuse to log.
+        let mut missing_fingerprint = base.clone();
+        missing_fingerprint
+            .as_object_mut()
+            .unwrap()
+            .remove("pgp_fingerprint");
+        assert!(validate_release_manifest(&missing_fingerprint).is_err());
+        for bad in [
+            mutate("pgp_fingerprint", json!("")),
+            mutate(
+                "pgp_fingerprint",
+                json!(TEST_PGP_FINGERPRINT.to_lowercase()),
+            ),
+            mutate("pgp_fingerprint", json!("ABC123")),
+            mutate(
+                "artifacts",
+                json!([
+                    { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                    { "name": RELEASE_SIGNING_KEY_ASSET, "sha256": sha256_hex(b"k"), "size": 1 },
+                ]),
+            ),
+            mutate(
+                "artifacts",
+                json!([
+                    { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                    { "name": "a.zip.asc", "sha256": sha256_hex(b"xs"), "size": 1 },
+                    { "name": "ghost.zip.asc", "sha256": sha256_hex(b"g"), "size": 1 },
+                    { "name": RELEASE_SIGNING_KEY_ASSET, "sha256": sha256_hex(b"k"), "size": 1 },
+                ]),
+            ),
+            mutate(
+                "artifacts",
+                json!([
+                    { "name": "a.zip", "sha256": sha256_hex(b"x"), "size": 1 },
+                    { "name": "a.zip.asc", "sha256": sha256_hex(b"xs"), "size": 1 },
                 ]),
             ),
         ] {
@@ -2033,6 +2201,11 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .map(Vec::len),
             Some(1)
+        );
+        assert_eq!(
+            leaf.get("pgp_fingerprint").and_then(|v| v.as_str()),
+            Some(TEST_PGP_FINGERPRINT),
+            "the leaf must carry the signing-key identity"
         );
         let artifacts: Vec<ReleaseArtifactRecord> =
             serde_json::from_value(leaf.get("artifacts").cloned().unwrap()).unwrap();

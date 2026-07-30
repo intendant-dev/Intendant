@@ -1192,6 +1192,7 @@ impl AgendaStore {
                     goal: super::definitions::node_preamble(&def.name, &node.id),
                     fire_at_ms,
                     orchestrate: false,
+                    interactive: None,
                     recurrence,
                     agent_config,
                     trigger,
@@ -1546,6 +1547,7 @@ impl AgendaStore {
                 goal,
                 fire_at_ms,
                 orchestrate,
+                interactive,
                 recurrence,
                 agent_config,
                 trigger,
@@ -1661,7 +1663,18 @@ impl AgendaStore {
                 // store in the same act: preservation starts at propose,
                 // so the revision the owner reviews is the revision every
                 // fire serves, whatever happens to the live file later.
-                let binding_refs = validate_binding_refs(binding_refs, &self.dir)?;
+                // A re-propose carrying a pin UNCHANGED from the current
+                // manifest verifies against the sealed snapshot instead of
+                // the live file: the content is already preserved, and a
+                // live file that drifted since sealing must not block an
+                // edit that never touched the ref (editing sealed content
+                // stays the re-seal ceremony — restate a new pin).
+                let carried: &[BindingRef] = item
+                    .effects
+                    .first()
+                    .map(|effect| effect.manifest.binding_refs.as_slice())
+                    .unwrap_or(&[]);
+                let binding_refs = validate_binding_refs(binding_refs, carried, &self.dir)?;
                 // v1: one session effect per item — a re-propose revises it
                 // (stable effect_id lineage, fresh digest, approval void).
                 let effect_id = item
@@ -1681,13 +1694,15 @@ impl AgendaStore {
                         goal,
                         fire_at_ms,
                         orchestrate,
-                        // Proposals keep the legacy autonomous shape;
-                        // without an explicit pin the project resolves at
-                        // fire time (provenance → daemon default → named
-                        // refusal). The executor pins (if any) ride the
-                        // digest-bound manifest; absent fields inherit
-                        // the daemon defaults.
-                        interactive: false,
+                        // Shape rides the command (the approval-time
+                        // editor's toggle); absent keeps the legacy
+                        // autonomous goal run. Without an explicit pin
+                        // the project resolves at fire time (provenance
+                        // → daemon default → named refusal). The
+                        // executor pins (if any) ride the digest-bound
+                        // manifest; absent fields inherit the daemon
+                        // defaults.
+                        interactive: interactive.unwrap_or(false),
                         project_root,
                         agent_config,
                         recurrence,
@@ -2785,8 +2800,17 @@ pub(crate) fn binding_ref_path(locator: &str) -> Result<&Path, String> {
 /// the same act (single read: the bytes hashed ARE the bytes preserved —
 /// no re-read window). Pins normalize to lowercase hex; the returned
 /// refs are what the digest-bound manifest records.
+///
+/// `carried` is the current manifest's refs when this propose revises an
+/// existing effect: a `{locator, sha256}` pair restated verbatim from it
+/// verifies against the sealed snapshot instead of the live file, so an
+/// edit that never touched the ref is not refused for live drift the
+/// sealed store already absorbs. Changing a pin — new locator or new
+/// hash — always takes the live-verify + seal path (re-sealing content
+/// stays the explicit ceremony).
 fn validate_binding_refs(
     refs: Vec<BindingRef>,
+    carried: &[BindingRef],
     agenda_dir: &Path,
 ) -> Result<Vec<BindingRef>, AgendaError> {
     if refs.len() > MAX_BINDING_REFS_PER_MANIFEST {
@@ -2800,6 +2824,28 @@ fn validate_binding_refs(
             return Err(AgendaError::Invalid(format!(
                 "binding ref {locator} is listed twice"
             )));
+        }
+        // A pin carried verbatim from the current manifest (same
+        // locator, same hash — a re-propose that never touched the ref)
+        // verifies against the SEALED snapshot, not the live file: the
+        // approved bytes are already preserved, and live drift since
+        // sealing is a rider note at fire time, never a reason to
+        // refuse an edit of the fields around the ref. The snapshot
+        // check heals a missing blob from a still-matching live file
+        // and refuses corrupt/unreconstructable ones by name.
+        let sha_norm = sha256.to_ascii_lowercase();
+        if carried
+            .iter()
+            .any(|prior| prior.locator == locator && prior.sha256 == sha_norm)
+        {
+            let binding_ref = BindingRef {
+                locator,
+                sha256: sha_norm,
+            };
+            super::sealed_blobs::verify_sealed_binding_ref(agenda_dir, &binding_ref)
+                .map_err(AgendaError::Invalid)?;
+            validated.push(binding_ref);
+            continue;
         }
         let (binding_ref, bytes) = verify_stated_ref(locator, sha256, "binding ref")?;
         // Seal failure refuses the propose: a manifest whose snapshot
@@ -4636,6 +4682,7 @@ mod tests {
             goal: "standing sweep".into(),
             fire_at_ms: 1_000_000,
             orchestrate: false,
+            interactive: None,
             recurrence: Some(recurrence(every_ms)),
             agent_config: None,
             source: None,
@@ -4676,6 +4723,7 @@ mod tests {
                     goal: "g".into(),
                     fire_at_ms: 1_000_000,
                     orchestrate: false,
+                    interactive: None,
                     recurrence: Some(super::super::types::RecurrenceSpec {
                         until_ms: Some(999_999),
                         ..recurrence(3_600_000)
@@ -4694,6 +4742,7 @@ mod tests {
                     goal: "g".into(),
                     fire_at_ms: 1_000_000,
                     orchestrate: false,
+                    interactive: None,
                     recurrence: Some(super::super::types::RecurrenceSpec {
                         max_occurrences: Some(0),
                         ..recurrence(3_600_000)
@@ -5010,6 +5059,7 @@ mod tests {
             goal: "read the sealed brief and act".into(),
             fire_at_ms: 4_000_000_000_000,
             orchestrate: false,
+            interactive: None,
             recurrence: None,
             agent_config: None,
             trigger: None,
@@ -5150,6 +5200,246 @@ mod tests {
                 .contains(&MAX_BINDING_REFS_PER_MANIFEST.to_string()),
             "{err}"
         );
+    }
+
+    /// The approval-time editor's carry law: a re-propose restating a
+    /// `{locator, sha256}` pair VERBATIM from the current manifest
+    /// verifies against the sealed snapshot, so live drift since sealing
+    /// never blocks an edit that didn't touch the ref (the sealed store
+    /// already preserves the reviewed bytes). Changing the pin still
+    /// takes the live-verify + seal path, and a carried pair whose
+    /// snapshot is gone AND whose live file drifted refuses by name —
+    /// the revision cannot be reconstructed.
+    #[test]
+    fn unchanged_binding_refs_carry_forward_past_live_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let brief = content.path().join("brief.md");
+        std::fs::write(&brief, b"sealed revision one\n").unwrap();
+        let pin = digest_file(&brief).unwrap();
+        let locator = format!("file:{}", brief.display());
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let item = store
+            .apply_command(add_cmd("editable"), owner(), 1000)
+            .unwrap();
+        let propose = |goal: &str, refs: Vec<BindingRef>| AgendaCommand::ProposeEffect {
+            id: item.id.clone(),
+            goal: goal.into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            interactive: None,
+            recurrence: None,
+            agent_config: None,
+            trigger: None,
+            project_root: None,
+            binding_refs: refs,
+            source: None,
+        };
+        let sealed_ref = BindingRef {
+            locator: locator.clone(),
+            sha256: pin.clone(),
+        };
+        store
+            .apply_command(propose("v1", vec![sealed_ref.clone()]), owner(), 1001)
+            .unwrap();
+
+        // The live file drifts AFTER sealing — the rider-note case at
+        // fire time, and it must not block an edit around the ref.
+        std::fs::write(&brief, b"drifted live content\n").unwrap();
+        let revised = store
+            .apply_command(
+                propose("v2 edited goal", vec![sealed_ref.clone()]),
+                owner(),
+                1002,
+            )
+            .unwrap();
+        assert_eq!(
+            revised.effects[0].manifest.binding_refs,
+            vec![sealed_ref.clone()],
+            "the untouched pin rides the revised manifest verbatim"
+        );
+        assert_eq!(revised.effects[0].manifest.goal, "v2 edited goal");
+
+        // A WRONG pin on a carried locator is a ref edit — live verify
+        // refuses it by name (carry-forward needs the exact pair).
+        let err = store
+            .apply_command(
+                propose(
+                    "v3",
+                    vec![BindingRef {
+                        locator: locator.clone(),
+                        sha256: "ab".repeat(32),
+                    }],
+                ),
+                owner(),
+                1003,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not match the live content"),
+            "{err}"
+        );
+
+        // Restating the pin for the NEW live bytes is a ref edit too —
+        // the live-verify + seal path, and both snapshots now exist.
+        let new_pin = digest_file(&brief).unwrap();
+        let new_ref = BindingRef {
+            locator: locator.clone(),
+            sha256: new_pin.clone(),
+        };
+        store
+            .apply_command(propose("v4 reseal", vec![new_ref.clone()]), owner(), 1004)
+            .unwrap();
+        for sealed_pin in [&pin, &new_pin] {
+            assert!(
+                super::super::sealed_blobs::sealed_blob_path(dir.path(), sealed_pin).is_file(),
+                "both revisions stay preserved content-addressed"
+            );
+        }
+
+        // Carried pair (the manifest now binds new_pin), snapshot
+        // deleted, live drifted again: the revision is unreconstructable
+        // — refused by name, never silently unsealed.
+        std::fs::remove_file(super::super::sealed_blobs::sealed_blob_path(
+            dir.path(),
+            &new_pin,
+        ))
+        .unwrap();
+        std::fs::write(&brief, b"drifted a second time\n").unwrap();
+        let err = store
+            .apply_command(propose("v5", vec![new_ref]), owner(), 1005)
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be reconstructed"), "{err}");
+    }
+
+    /// The approval-time editor's digest law, end to end: an edit mints
+    /// a new digest through the SAME propose lane (stable effect_id,
+    /// approval voided), the stale digest the owner may still have on
+    /// screen is refused by name, and the approval that lands binds
+    /// exactly the edited bytes.
+    #[test]
+    fn approve_signs_the_edited_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let item = store
+            .apply_command(add_cmd("edit me"), owner(), 1000)
+            .unwrap();
+        let propose = |goal: &str, interactive: Option<bool>| AgendaCommand::ProposeEffect {
+            id: item.id.clone(),
+            goal: goal.into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            interactive,
+            recurrence: None,
+            agent_config: None,
+            trigger: None,
+            project_root: None,
+            binding_refs: Vec::new(),
+            source: None,
+        };
+        let proposed = store
+            .apply_command(propose("original goal", None), owner(), 1001)
+            .unwrap();
+        let first_digest = proposed.effects[0].digest.clone();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: first_digest.clone(),
+                },
+                owner(),
+                1002,
+            )
+            .unwrap();
+
+        // The owner edits: same lane, same effect_id, new digest, and
+        // the prior approval is void — nothing silently survives.
+        let edited = store
+            .apply_command(propose("edited goal", Some(true)), owner(), 1003)
+            .unwrap();
+        let effect = &edited.effects[0];
+        assert_eq!(effect.effect_id, effect_id, "stable lineage");
+        assert_ne!(effect.digest, first_digest, "an edit mints a new digest");
+        assert!(effect.approval.is_none(), "an edit voids the approval");
+        assert!(effect.manifest.interactive, "the shape edit landed");
+
+        // Approving the digest the owner READ before the edit refuses by
+        // name — the button on a stale card cannot sign the new bytes.
+        let err = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: first_digest,
+                },
+                owner(),
+                1004,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("revised since it was reviewed"),
+            "{err}"
+        );
+
+        // Approving the edited digest binds exactly those bytes.
+        let approved = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: edited.effects[0].digest.clone(),
+                },
+                owner(),
+                1005,
+            )
+            .unwrap();
+        let approval = approved.effects[0].approval.as_ref().unwrap();
+        assert_eq!(approval.digest, approved.effects[0].digest);
+        assert_eq!(approval.digest, edited.effects[0].digest);
+    }
+
+    /// The shape toggle rides the digest-bound manifest: `interactive`
+    /// set on the propose command lands on the manifest, flips the
+    /// digest (an approval never silently covers the other shape), and
+    /// the absent command field keeps the legacy autonomous bytes.
+    #[test]
+    fn propose_shape_toggle_rides_the_digest_bound_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let item = store
+            .apply_command(add_cmd("shaped"), owner(), 1000)
+            .unwrap();
+        let propose = |interactive: Option<bool>| AgendaCommand::ProposeEffect {
+            id: item.id.clone(),
+            goal: "same goal".into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            interactive,
+            recurrence: None,
+            agent_config: None,
+            trigger: None,
+            project_root: None,
+            binding_refs: Vec::new(),
+            source: None,
+        };
+        let goal_run = store.apply_command(propose(None), owner(), 1001).unwrap();
+        assert!(!goal_run.effects[0].manifest.interactive);
+        let goal_run_digest = goal_run.effects[0].digest.clone();
+
+        let interactive = store
+            .apply_command(propose(Some(true)), owner(), 1002)
+            .unwrap();
+        assert!(interactive.effects[0].manifest.interactive);
+        assert_ne!(
+            interactive.effects[0].digest, goal_run_digest,
+            "the shape is digest-covered — flipping it revises the manifest"
+        );
+
+        // An explicit false and the absent legacy wire are the SAME
+        // manifest bytes, so digests (and any approval) converge.
+        let explicit_false = store
+            .apply_command(propose(Some(false)), owner(), 1003)
+            .unwrap();
+        assert_eq!(explicit_false.effects[0].digest, goal_run_digest);
     }
 
     /// The sealed-refs twin of the cross-build rider: a build that
@@ -5306,6 +5596,7 @@ mod tests {
                 goal: "g".into(),
                 fire_at_ms: 1_000_000,
                 orchestrate: false,
+                interactive: None,
                 recurrence,
                 agent_config: None,
                 trigger,
@@ -5388,6 +5679,7 @@ mod tests {
                 goal: "triage pass".into(),
                 fire_at_ms: 1_000_000,
                 orchestrate: false,
+                interactive: None,
                 recurrence: Some(recurrence(3_600_000)),
                 agent_config: config.map(Box::new),
                 source: None,
@@ -5793,6 +6085,7 @@ mod tests {
             goal: "g".into(),
             fire_at_ms: 1_000_000,
             orchestrate: false,
+            interactive: None,
             recurrence: None,
             agent_config: None,
             trigger: None,

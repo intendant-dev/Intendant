@@ -23,8 +23,15 @@ let agendaInspRefDraft = '';
 let agendaInspRefMust = false;
 
 function agendaOpenInspector(id) {
-  if (!agendaFindItem(id)) return;
+  const opened = agendaFindItem(id);
+  if (!opened) return;
   agendaSelId = id;
+  // Reviewing IS looking: the revision on screen when the inspector
+  // opens is the one the changed-since chip measures against.
+  const st = agendaEffectState(opened);
+  if (st && typeof agendaAckEffectDigest === 'function') {
+    agendaAckEffectDigest(st.effect.effect_id, st.effect.digest);
+  }
   agendaHoodReset(); // slice D: a fresh selection starts collapsed
   agendaInspEditingTitle = false;
   agendaInspEditingBody = false;
@@ -495,10 +502,12 @@ function agendaInspEffectHtml(item) {
         <span class="ag2-eff-dot"></span>
         <span class="ag2-eff-state">${escapeHtml(stateLabel)}</span>
         <span class="ag2-spacer"></span>
+        ${agendaEffectRevisionChipHtml(e)}
         ${agendaDigestChipHtml(bound ? e.approval.digest : e.digest,
     bound ? 'Your recorded approval covers exactly this manifest revision'
       : e.approval ? 'Re-proposed since your last approval — the NEW revision Approve would bind'
-        : 'The manifest revision Approve would bind')}
+        : 'The manifest revision Approve would bind',
+    agendaDigestPulseClass(e.effect_id))}
         <span class="ag2-hint mono">${bound ? 'approved' : 'unapproved'}</span>
       </div>
       <div class="ag2-eff-grid">${rows.join('')}</div>
@@ -1234,8 +1243,20 @@ function agendaSheetRender() {
 // -- Schedule sheet --
 
 function agendaOpenSchedSheet(itemId) {
-  const item = agendaFindItem(itemId);
-  if (!item) return;
+  // Serving grain (Track AS): list rows are summaries — the manifest
+  // MINUS goal and sealed refs. The editor round-trips the WHOLE
+  // manifest, so it prefills only from the FULL item; until the
+  // single-flight fetch lands, the sheet shows a loading line and the
+  // arrival hook re-enters here. Prefilling from a summary would blank
+  // the goal and silently unseal the refs on save — the exact bug the
+  // round-trip law exists to prevent.
+  const item = agendaFullItemFor(itemId);
+  if (!item) {
+    if (!agendaFindItem(itemId)) return;
+    agendaSheetState = { kind: 'sched-loading', itemId };
+    agendaSheetRender();
+    return;
+  }
   const st = agendaEffectState(item);
   const m = st && st.manifest;
   const toLocal = (ms) => {
@@ -1248,16 +1269,37 @@ function agendaOpenSchedSheet(itemId) {
   // (edit executor → approval voided → re-approve) starts from what the
   // owner approved. Empty = inherit the daemon default at fire time.
   const cfg = (m && m.agent_config) || {};
+  // Cadence prefill round-trips faithfully: a whole-day cadence maps to
+  // its day count; anything else stays selectable as the literal
+  // manifest cadence (the model-pin pattern) so an edit around it never
+  // silently rewrites — or drops — what the owner isn't touching.
+  const days = rec && rec.every_ms % 864e5 === 0 ? String(rec.every_ms / 864e5) : '';
+  const untilLocal = (ms) => {
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  };
   agendaSheetState = {
     kind: 'sched',
     itemId,
     goal: m ? m.goal : agendaStartGoalStatement(item),
     when: toLocal(st && st.next > Date.now() ? st.next : Date.now() + 864e5),
-    repeat: rec ? String(Math.round(rec.every_ms / 864e5)) : '',
-    until: '',
+    repeat: rec ? (['1', '7', '14'].includes(days) ? days : 'keep') : '',
+    keepEveryMs: rec ? rec.every_ms : 0,
+    until: rec && rec.until_ms ? untilLocal(rec.until_ms) : '',
     maxRuns: rec && rec.max_occurrences ? String(rec.max_occurrences) : '',
     suspend: rec && rec.suspend_after_failures ? String(rec.suspend_after_failures) : '3',
     orchestrate: !!(m && m.orchestrate),
+    // The shape toggle (goal run vs interactive) — digest-bound like
+    // every other manifest field.
+    shape: m && m.interactive ? 'interactive' : 'goal',
+    projectRoot: (m && m.project_root) || '',
+    // Carried VERBATIM through an edit (rendered read-only): the event
+    // trigger and the sealed binding refs. The edit sheet is a client
+    // of re-propose, and re-propose replaces the whole manifest — what
+    // the owner isn't editing must ride along untouched.
+    trigger: (m && m.trigger) || null,
+    bindingRefs: m && Array.isArray(m.binding_refs) ? m.binding_refs.slice() : [],
     execBackend: cfg.agent || '',
     execModel: cfg.claude_model || cfg.codex_model || cfg.kimi_model || cfg.pi_model || '',
     execEffort: cfg.claude_effort || cfg.codex_reasoning_effort || cfg.kimi_thinking || cfg.pi_thinking || '',
@@ -1265,6 +1307,10 @@ function agendaOpenSchedSheet(itemId) {
     voids: !!(st && st.effect.approval),
     error: '',
   };
+  // Opening the editor IS looking at the current revision.
+  if (st && typeof agendaAckEffectDigest === 'function') {
+    agendaAckEffectDigest(st.effect.effect_id, st.effect.digest);
+  }
   agendaSheetRender();
   // Model/effort option lists come from the served settings; fetch like
   // the start sheet does and re-render when they land.
@@ -1280,6 +1326,14 @@ function agendaOpenSchedSheet(itemId) {
 
 function agendaSchedSheetHtml(item) {
   const s = agendaSheetState;
+  if (s.kind === 'sched-loading') {
+    return `<div class="ag2-sheet-head">
+        <span class="ag2-sheet-title">Loading the full manifest…</span>
+        <span class="ag2-spacer"></span>
+        <button type="button" class="ag2-x" data-sheet-act="close" title="Close — esc">×</button>
+      </div>
+      <div class="ag2-hint">The list serves summaries; the editor prefills from the full item so nothing is dropped on save.</div>`;
+  }
   const standing = !!s.repeat;
   const standingBlock = standing
     ? `<div class="ag2-sheet-callout t-green">Standing series — one approval covers every run until revoked. A failure streak suspends it for you to re-arm.</div>
@@ -1298,6 +1352,60 @@ function agendaSchedSheetHtml(item) {
         </div>
       </div>`
     : '';
+  // The shape toggle — honest about consequences ON the card, in the
+  // scheduler's own semantics (the fired session's launch shape).
+  const shapeHint = s.shape === 'interactive'
+    ? 'Opens with the goal as your message and waits for you — it does not auto-run.'
+    : 'Autonomous one-shot — runs the goal unattended and writes back.';
+  const shapeBlock = `<div class="ag2-sheet-grid" data-mf-field="interactive">
+      <span class="ag2-sheet-k">Shape</span>
+      <div>
+        <div class="ag2-sheet-inline">
+          <button type="button" class="ag2-seg-btn${s.shape !== 'interactive' ? ' active' : ''}" data-sheet-act="sched-shape" data-shape="goal">goal run</button>
+          <button type="button" class="ag2-seg-btn${s.shape === 'interactive' ? ' active' : ''}" data-sheet-act="sched-shape" data-shape="interactive">interactive</button>
+        </div>
+        <div class="ag2-hint">${escapeHtml(shapeHint)}</div>
+      </div>
+    </div>`;
+  // Cadence controls when the manifest is time-driven; the event
+  // trigger renders read-only (carried verbatim — cadence and trigger
+  // are mutually exclusive, and trigger editing has no form yet). A
+  // cadence the day-select can't express stays selectable as the
+  // literal manifest cadence (the model-pin pattern) so re-rendering
+  // never drops it.
+  const keepOption = s.keepEveryMs
+    && (s.keepEveryMs % 864e5 !== 0 || !['1', '7', '14'].includes(String(s.keepEveryMs / 864e5)))
+    ? `<option value="keep"${s.repeat === 'keep' ? ' selected' : ''}>keep — every ${escapeHtml(agendaCadenceLabel(s.keepEveryMs))}</option>`
+    : '';
+  const cadenceBlock = s.trigger
+    ? `<span class="ag2-sheet-k" data-mf-field="trigger">Fires</span>
+      <div>
+        <div>${escapeHtml(s.trigger.kind === 'on_item_match'
+    ? `on matching items (${[s.trigger.item_kind, ...(s.trigger.tags || [])].filter(Boolean).join(', ')})`
+    : 'when this item unblocks')}</div>
+        <div class="ag2-hint">Event-triggered — carried unchanged through this edit; the time above is the arm floor, not a fire instant.</div>
+      </div>`
+    : `<span class="ag2-sheet-k">Repeats</span>
+      <select data-sheet="repeat" data-mf-field="recurrence" aria-label="Repeats">
+        <option value=""${s.repeat === '' ? ' selected' : ''}>never — one run</option>
+        <option value="1"${s.repeat === '1' ? ' selected' : ''}>every day</option>
+        <option value="7"${s.repeat === '7' ? ' selected' : ''}>every week</option>
+        <option value="14"${s.repeat === '14' ? ' selected' : ''}>every two weeks</option>
+        ${keepOption}
+      </select>`;
+  // Sealed binding refs render READ-ONLY with their hashes: they are
+  // carried verbatim through the edit, and editing sealed content stays
+  // the re-seal ceremony (restate a new pin where the ref was minted).
+  const refsBlock = s.bindingRefs.length
+    ? `<div class="ag2-refs-ro" data-mf-field="binding_refs">
+      <div class="ag2-sheet-k">Sealed refs (read-only)</div>
+      ${s.bindingRefs.map((r) => `<div class="ag2-refs-ro-row">
+        <span class="ag2-refs-ro-loc" title="${escapeHtml(r.locator)}">${escapeHtml(r.locator)}</span>
+        ${agendaDigestChipHtml(r.sha256, 'The sealed revision this manifest binds')}
+      </div>`).join('')}
+      <div class="ag2-hint">Carried verbatim — this edit cannot change sealed content. Re-sealing (a new hash pin) is its own ceremony.</div>
+    </div>`
+    : '';
   return `<div class="ag2-sheet-head">
       <span class="ag2-sheet-title">${agendaEffectState(item) ? 'Revise the scheduled session' : 'Propose a scheduled session'}</span>
       <span class="ag2-spacer"></span>
@@ -1307,23 +1415,24 @@ function agendaSchedSheetHtml(item) {
     <div class="ag2-sheet-item">${escapeHtml(`${item.id.slice(0, 6).toLowerCase()} · ${item.title}`)}</div>
     <div>
       <div class="ag2-sheet-k">Goal (the manifest’s task text)</div>
-      <textarea rows="6" data-sheet="goal" data-fkey="sheet-goal" aria-label="Goal">${escapeHtml(s.goal)}</textarea>
+      <textarea rows="6" data-sheet="goal" data-mf-field="goal" data-fkey="sheet-goal" aria-label="Goal">${escapeHtml(s.goal)}</textarea>
       <div class="ag2-hint">Reviewed at approval time. Data under review — never instructions to whoever reads the agenda.</div>
     </div>
+    ${shapeBlock}
     <div class="ag2-sheet-grid">
-      <span class="ag2-sheet-k">First run</span>
-      <input type="datetime-local" data-sheet="when" value="${escapeHtml(s.when)}" aria-label="First run" />
-      <span class="ag2-sheet-k">Repeats</span>
-      <select data-sheet="repeat" aria-label="Repeats">
-        <option value=""${s.repeat === '' ? ' selected' : ''}>never — one run</option>
-        <option value="1"${s.repeat === '1' ? ' selected' : ''}>every day</option>
-        <option value="7"${s.repeat === '7' ? ' selected' : ''}>every week</option>
-        <option value="14"${s.repeat === '14' ? ' selected' : ''}>every two weeks</option>
-      </select>
+      <span class="ag2-sheet-k">${s.trigger ? 'Armed from' : 'First run'}</span>
+      <input type="datetime-local" data-sheet="when" data-mf-field="fire_at_ms" aria-label="${s.trigger ? 'Armed from' : 'First run'}" value="${escapeHtml(s.when)}" />
+      ${cadenceBlock}
+      <span class="ag2-sheet-k">Project</span>
+      <div>
+        <input type="text" data-sheet="projectRoot" data-mf-field="project_root" aria-label="Project root" placeholder="resolves at fire time" value="${escapeHtml(s.projectRoot)}" />
+        <div class="ag2-hint">Absolute directory the fired session runs under; digest-bound. Empty = the parking session’s project, else the daemon default.</div>
+      </div>
     </div>
     ${standingBlock}
     ${agendaSchedExecutorRowsHtml()}
-    <label class="ag2-check"><input type="checkbox" data-sheet="orchestrate"${s.orchestrate ? ' checked' : ''}>Orchestrated run (a conductor session fans out sub-agents)</label>
+    ${refsBlock}
+    <label class="ag2-check"><input type="checkbox" data-sheet="orchestrate" data-mf-field="orchestrate"${s.orchestrate ? ' checked' : ''}>Orchestrated run (a conductor session fans out sub-agents)</label>
     <label class="ag2-check top"><input type="checkbox" data-sheet="approveNow"${s.approveNow ? ' checked' : ''}><span>Approve immediately<br><span class="ag2-hint">You’re on an owner surface. Any later edit mints a new digest and voids this approval.</span></span></label>
     ${s.voids ? '<div class="ag2-sheet-callout t-amber">This revises the manifest — the current approval becomes void until re-approved.</div>' : ''}
     ${s.error ? `<div class="ag2-sheet-error">${escapeHtml(s.error)}</div>` : ''}
@@ -1368,7 +1477,7 @@ function agendaSchedExecutorRowsHtml() {
     modelRows = select('execModel', 'ag2-sched-model', models, s.execModel, 'Model')
       + select('execEffort', 'ag2-sched-effort', efforts, s.execEffort, spec.effortLabel || 'Effort');
   }
-  return `<div class="ag2-sheet-grid">
+  return `<div class="ag2-sheet-grid" data-mf-field="agent_config">
       ${backendRow}${modelRows}
     </div>
     <div class="ag2-hint">Digest-bound: the approval covers who runs this goal — changing the executor revises the manifest.</div>`;
@@ -1394,8 +1503,18 @@ async function agendaSchedConfirm(button) {
     op: 'propose_effect', id: item.id, goal, fire_at_ms: fire,
     orchestrate: !!s.orchestrate,
   };
-  if (s.repeat) {
-    const rec = { every_ms: Number(s.repeat) * 864e5 };
+  // Re-propose replaces the WHOLE manifest, so the sheet round-trips
+  // every field — what the owner isn't editing rides along verbatim
+  // (shape, project pin, event trigger, sealed refs), never dropped
+  // because this form happens not to edit it.
+  if (s.shape === 'interactive') params.interactive = true;
+  if (s.projectRoot && s.projectRoot.trim()) params.project_root = s.projectRoot.trim();
+  if (s.trigger) params.trigger = s.trigger;
+  if (s.bindingRefs && s.bindingRefs.length) params.binding_refs = s.bindingRefs;
+  if (s.repeat && !s.trigger) {
+    const rec = {
+      every_ms: s.repeat === 'keep' ? s.keepEveryMs : Number(s.repeat) * 864e5,
+    };
     if (s.until) {
       const until = new Date(`${s.until}T23:59`).getTime();
       if (until && !Number.isNaN(until)) rec.until_ms = until;
@@ -1427,6 +1546,13 @@ async function agendaSchedConfirm(button) {
     // The revision the daemon just minted from this sheet — its digest
     // comes back on the proposed item and is what any approval binds.
     const effect = (resp.body.item.effects || [])[0];
+    // The owner's own edit: acknowledge the new digest (no "revised"
+    // warning for a change they just made) and pulse the chip so the
+    // card visibly carries the in-place update.
+    if (effect && typeof agendaAckEffectDigest === 'function') {
+      agendaAckEffectDigest(effect.effect_id, effect.digest);
+      agendaDigestPulse = { effectId: effect.effect_id, at: Date.now() };
+    }
     let approved = false;
     if (s.approveNow && effect && effect.digest) {
       approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
@@ -1499,6 +1625,10 @@ function agendaSheetClick(e) {
   switch (act.dataset.sheetAct) {
     case 'close': agendaSheetClose(); break;
     case 'sched-confirm': agendaSchedConfirm(act); break;
+    case 'sched-shape':
+      s.shape = act.dataset.shape === 'interactive' ? 'interactive' : 'goal';
+      agendaSheetRender();
+      break;
     case 'prev-view':
       s.pi = Number(act.dataset.view) || 0;
       agendaSheetRender();

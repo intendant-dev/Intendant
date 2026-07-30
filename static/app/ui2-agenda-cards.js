@@ -979,8 +979,11 @@ function agendaCardEffectStrip(item) {
     line = `${proposer}: runs ${agendaAbsTime(st.manifest.fire_at_ms)}`
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + ' — needs your approval';
-    actions = agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision')
+    actions = agendaEffectRevisionChipHtml(e)
+      + agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision',
+        agendaDigestPulseClass(e.effect_id))
       + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — shape, executor, project, goal, cadence. Saving mints a new digest for you to approve">Edit…</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
@@ -1066,16 +1069,20 @@ function agendaAutomationStripHtml(item) {
   // The manifest digest, always visible where the gesture lives — the
   // one thing depth never folds away, because it is what Approve signs
   // (and what a recorded approval covers once bound).
+  const revised = agendaEffectRevisionChipHtml(e);
+  if (revised) meta.push(revised);
   meta.push(agendaDigestChipHtml(e.digest,
     st.kind === 'pending' ? 'Approve binds exactly this manifest revision'
       : st.kind === 'suspended' ? 'Re-arm re-approves exactly this unchanged manifest revision'
         : e.approval && e.approval.digest === e.digest
           ? 'Your recorded approval covers exactly this manifest revision'
-          : 'The manifest revision this row describes'));
+          : 'The manifest revision this row describes',
+    agendaDigestPulseClass(e.effect_id)));
   let actions = '';
   const digest = escapeHtml(e.digest || '');
   if (st.kind === 'pending') {
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`;
+    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`;
   } else if (st.kind === 'suspended') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`;
   } else if (st.kind === 'running') {
@@ -1653,6 +1660,13 @@ function agendaGroupsClick(e) {
     agendaSendOp(params, opBtn).then((item) => {
       if (item && params.op === 'approve_effect') agendaApprovalMoment(item);
     });
+    return;
+  }
+  const editSched = e.target.closest('[data-edit-sched]');
+  if (editSched) {
+    // The card's edit affordance OPENS the one editor — the schedule
+    // sheet — whose save is the one re-propose emitter. No op here.
+    agendaOpenSchedSheet(editSched.dataset.editSched);
     return;
   }
   const jump = e.target.closest('[data-jump-session]');

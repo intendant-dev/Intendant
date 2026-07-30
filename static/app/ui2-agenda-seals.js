@@ -295,9 +295,6 @@ async function agendaSealAdoptConfirm(targets, locator, liveSha, button, error) 
     for (const target of targets) {
       const m = ((target.effects || [])[0] || {}).manifest;
       if (!m) continue;
-      if (m.interactive) {
-        throw new Error(`${target.title}: interactive manifests cannot be re-proposed from here`);
-      }
       const params = {
         op: 'propose_effect',
         id: target.id,
@@ -308,6 +305,10 @@ async function agendaSealAdoptConfirm(targets, locator, liveSha, button, error) 
           : { locator: r.locator, sha256: r.sha256 })),
       };
       if (m.orchestrate) params.orchestrate = true;
+      // The shape rides the adopt verbatim (the propose command carries
+      // it since the approval-time editor) — adopting a fresh revision
+      // must not flip an interactive manifest to a goal run.
+      if (m.interactive) params.interactive = true;
       if (m.recurrence) params.recurrence = m.recurrence;
       if (m.trigger) params.trigger = m.trigger;
       if (m.agent_config) params.agent_config = m.agent_config;

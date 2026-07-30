@@ -88,10 +88,10 @@ function agendaShortDigest(digest) {
 // The interactive form every approval surface renders: hover reveals
 // the full digest, click copies it. Digest values are daemon-minted
 // lowercase hex; escaped like every interpolation anyway.
-function agendaDigestChipHtml(digest, tip) {
+function agendaDigestChipHtml(digest, tip, extraClass) {
   const d = String(digest || '');
   if (!d) return '';
-  return `<button type="button" class="ag2-digest-chip" data-copy-digest="${escapeHtml(d)}"`
+  return `<button type="button" class="ag2-digest-chip${extraClass || ''}" data-copy-digest="${escapeHtml(d)}"`
     + ` title="${escapeHtml(`${tip ? `${tip} — ` : ''}sha256 ${d} — click to copy`)}">`
     + `${escapeHtml(`digest ${agendaShortDigest(d)}`)}</button>`;
 }
@@ -101,6 +101,55 @@ function agendaDigestChipHtml(digest, tip) {
 document.addEventListener('click', (e) => {
   const btn = e.target && e.target.closest && e.target.closest('[data-copy-digest]');
   if (btn) agendaCopyText(btn.dataset.copyDigest, 'the manifest digest');
+});
+
+// ---- Changed-since (the approval-time editor's honesty chip) ----
+// The digest updates IN PLACE on the card when a manifest is revised —
+// by the owner's own edit or by a session re-proposing underneath an
+// open tab. Approve is mechanically safe either way (the button carries
+// the rendered revision's digest and the daemon refuses stale bytes);
+// this map makes the swap VISIBLE: per effect lineage, the digest the
+// owner last looked at. Seeded silently at first render; acknowledged
+// when they open the editor or inspector, click the chip, or save an
+// edit themselves (their own revision needs no warning — the toast and
+// the in-place pulse are the feedback). View-local by design: "since
+// you last looked" is a property of this tab, not daemon state — the
+// op log stays the durable revision history.
+const agendaSeenEffectDigests = Object.create(null);
+let agendaDigestPulse = null; // { effectId, at } — one-shot self-edit pulse
+
+function agendaAckEffectDigest(effectId, digest) {
+  if (effectId && digest) agendaSeenEffectDigests[effectId] = digest;
+}
+
+function agendaEffectRevisionChipHtml(effect) {
+  if (!effect || !effect.effect_id || !effect.digest) return '';
+  const seen = agendaSeenEffectDigests[effect.effect_id];
+  if (!seen) {
+    agendaSeenEffectDigests[effect.effect_id] = effect.digest;
+    return '';
+  }
+  if (seen === effect.digest) return '';
+  return `<button type="button" class="ag2-revised-chip" data-ack-effect="${escapeHtml(effect.effect_id)}"`
+    + ` data-ack-digest="${escapeHtml(effect.digest)}"`
+    + ` title="The manifest was revised since you last looked (you saw ${escapeHtml(agendaShortDigest(seen))};`
+    + ` it is now ${escapeHtml(agendaShortDigest(effect.digest))}). Approve signs the new bytes — review, then click to dismiss">`
+    + 'revised</button>';
+}
+
+// The one-shot pulse class for the render right after the owner's own
+// edit — the card visibly acknowledges the in-place digest update.
+function agendaDigestPulseClass(effectId) {
+  const p = agendaDigestPulse;
+  return p && p.effectId === effectId && Date.now() - p.at < 4000 ? ' is-pulse' : '';
+}
+
+document.addEventListener('click', (e) => {
+  const ack = e.target && e.target.closest && e.target.closest('[data-ack-effect]');
+  if (!ack) return;
+  agendaAckEffectDigest(ack.dataset.ackEffect, ack.dataset.ackDigest);
+  agendaRenderTab();
+  if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
 });
 
 let agendaSearch = '';
@@ -188,6 +237,14 @@ function agendaFullItemFor(id) {
         // A parked-ask announce may have been waiting on this item's
         // question payload (announce dedupes by ask id — idempotent).
         agendaAnnounceParkedAsks();
+        // The schedule editor waits on the full grain (its prefill
+        // round-trips the whole manifest) — re-enter the opener now
+        // that the item landed.
+        if (typeof agendaSheetState !== 'undefined' && agendaSheetState
+          && agendaSheetState.kind === 'sched-loading' && agendaSheetState.itemId === id
+          && typeof agendaOpenSchedSheet === 'function') {
+          agendaOpenSchedSheet(id);
+        }
       }
     })();
   }
