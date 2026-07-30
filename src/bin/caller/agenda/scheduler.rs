@@ -1961,6 +1961,50 @@ mod tests {
         )
     }
 
+    /// Seed an item + APPROVED pin-less manifest straight into the op
+    /// log — the history lane (folds never re-validate). The fireability
+    /// mint law refuses to CREATE this shape through intake now, but
+    /// pre-law logs and daemon downtime still hand it to the fire path,
+    /// which these tests pin. Call BEFORE the handle's next read; the
+    /// store absorbs the append via its stale-length refold.
+    fn seed_approved_legacy_effect(dir: &std::path::Path, item_id: &str, fire_at_ms: u64) {
+        let manifest = super::super::types::SessionManifest {
+            goal: "run the nightly sweep".into(),
+            fire_at_ms,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: None,
+            binding_refs: Vec::new(),
+        };
+        let effect_id = format!(
+            "ef-{}",
+            &super::super::reminders::occurrence_id(item_id, fire_at_ms)[..12]
+        );
+        let digest = super::super::types::manifest_digest(item_id, &effect_id, &manifest);
+        let mut lines = String::new();
+        for op in [
+            serde_json::json!({"v":1,"at_ms":1,"op":{"type":"add","id":item_id,
+                "kind":"task","title":"scheduled work","body":"","tags":[]}}),
+            serde_json::json!({"v":1,"at_ms":2,"op":{"type":"propose_effect","id":item_id,
+                "effect_id":effect_id,"manifest":manifest}}),
+            serde_json::json!({"v":1,"at_ms":3,"op":{"type":"approve_effect","id":item_id,
+                "effect_id":effect_id,"digest":digest}}),
+        ] {
+            lines.push_str(&op.to_string());
+            lines.push('\n');
+        }
+        use std::io::Write as _;
+        let mut log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(dir.join("agenda.jsonl"))
+            .unwrap();
+        log.write_all(lines.as_bytes()).unwrap();
+    }
+
     fn approved_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
         let item = handle
             .apply(
@@ -4363,8 +4407,12 @@ mod tests {
         let failed = items.iter().find(|i| i.id == item_id).unwrap();
         assert_eq!(failed.effects[0].last_run.as_ref().unwrap().state, "failed");
 
-        // Missed window: approved 25h ago (past the 12h staleness default).
-        let (missed_item, _, _) = approved_effect_item(&handle, now_ms() - 25 * 3_600_000);
+        // Missed window: approved 25h ago (past the 12h staleness
+        // default). The mint law refuses to CREATE a stale floor, so the
+        // shape is seeded as history — exactly what daemon downtime
+        // produces.
+        let missed_item = "it-missed-window".to_string();
+        seed_approved_legacy_effect(dir.path(), &missed_item, now_ms() - 25 * 3_600_000);
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state, None).await;
         let mut saw_start = false;
@@ -4497,7 +4545,11 @@ mod tests {
         ));
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut state = SchedulerState::default();
-        let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
+        // A pin-less approved manifest can no longer be MINTED on a
+        // projectless daemon (the fireability law) — seed it as history,
+        // the shape pre-law logs still carry to the fire path.
+        let item_id = "it-unresolvable".to_string();
+        seed_approved_legacy_effect(dir.path(), &item_id, now_ms() - 60_000);
 
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state, None).await;

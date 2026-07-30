@@ -1680,6 +1680,21 @@ impl AgendaStore {
                     now_ms,
                 )
                 .map_err(|refusal| AgendaError::Invalid(refusal.message()))?;
+                // The chain's resolution, named in the daemon log: a
+                // fallback-resolved recording is a real decision the
+                // owner reviews on the manifest, and this line says
+                // where it came from.
+                match resolved.project_source {
+                    super::spawn_project::SpawnProjectSource::Explicit => {}
+                    super::spawn_project::SpawnProjectSource::Provenance => eprintln!(
+                        "[agenda] propose: recorded the parking session's project root {}",
+                        resolved.project_root.display()
+                    ),
+                    super::spawn_project::SpawnProjectSource::DaemonDefault => eprintln!(
+                        "[agenda] propose: recorded the daemon default project root {}",
+                        resolved.project_root.display()
+                    ),
+                }
                 let project_root = Some(resolved.project_root.to_string_lossy().into_owned());
                 let agent_config = {
                     let mut config = agent_config.unwrap_or_default();
@@ -4898,6 +4913,7 @@ mod tests {
     fn g3pre_recurrence_intake_streak_and_rearm() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -5095,6 +5111,7 @@ mod tests {
     fn g3pre_start_now_routes_standing_manifests_to_requests() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -5241,6 +5258,7 @@ mod tests {
         let pin = digest_file(&brief).unwrap();
         let locator = format!("file:{}", brief.display());
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("sealed"), owner(), 1000)
             .unwrap();
@@ -5409,6 +5427,7 @@ mod tests {
         let pin = digest_file(&brief).unwrap();
         let locator = format!("file:{}", brief.display());
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("editable"), owner(), 1000)
             .unwrap();
@@ -5511,6 +5530,7 @@ mod tests {
     fn approve_signs_the_edited_digest() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("edit me"), owner(), 1000)
             .unwrap();
@@ -5595,6 +5615,7 @@ mod tests {
     fn propose_shape_toggle_rides_the_digest_bound_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("shaped"), owner(), 1000)
             .unwrap();
@@ -5774,6 +5795,7 @@ mod tests {
     fn trigger_intake_enforces_exclusion_and_the_predicate_bounds() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("triggered"), owner(), 1000)
             .unwrap()
@@ -5858,6 +5880,7 @@ mod tests {
     fn executor_propose_intake_records_validates_and_normalizes() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -5893,16 +5916,28 @@ mod tests {
         );
         let executor_digest = item.effects[0].digest.clone();
 
+        // A config-less propose RECORDS the resolved executor (the
+        // fireability mint law: no default backend on this hermetic
+        // store, so `internal`) — the owner approves WHO runs, never
+        // empty-means-whatever.
         let item = store.apply_command(propose(None), owner(), 1002).unwrap();
-        assert!(item.effects[0].manifest.agent_config.is_none());
+        assert_eq!(
+            item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         let plain_digest = item.effects[0].digest.clone();
         assert_ne!(
             executor_digest, plain_digest,
             "the executor is digest-visible — the owner approves WHO runs"
         );
 
-        // All-inherit normalizes to ABSENT: identical manifest bytes,
-        // identical digest — a config-less gesture is unchanged by AU.
+        // All-inherit normalizes to the SAME recorded shape as a
+        // config-less propose: identical manifest bytes, identical
+        // digest — the empty-config gesture and no config agree.
         let item = store
             .apply_command(
                 propose(Some(crate::event::AgentLaunchConfig::default())),
@@ -5910,7 +5945,14 @@ mod tests {
                 1003,
             )
             .unwrap();
-        assert!(item.effects[0].manifest.agent_config.is_none());
+        assert_eq!(
+            item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         assert_eq!(item.effects[0].digest, plain_digest);
 
         // Named intake rejections — the launch path's own rules, at
@@ -6423,8 +6465,8 @@ mod tests {
             .apply_command(add_cmd("who runs"), owner(), 1000)
             .unwrap()
             .id;
-        let propose = |config: Option<crate::event::AgentLaunchConfig>| {
-            AgendaCommand::ProposeEffect {
+        let propose =
+            |config: Option<crate::event::AgentLaunchConfig>| AgendaCommand::ProposeEffect {
                 binding_refs: Vec::new(),
                 id: id.clone(),
                 goal: "g".into(),
@@ -6436,8 +6478,7 @@ mod tests {
                 trigger: None,
                 project_root: None,
                 source: None,
-            }
-        };
+            };
         // No daemon default: internal is the recorded executor.
         let parked = store.apply_command(propose(None), owner(), 2000).unwrap();
         let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
@@ -6619,9 +6660,16 @@ mod tests {
     /// approvable-but-dead nodes.
     #[test]
     fn stamp_inherits_the_fireability_mint_law() {
-        let (_root, mut store) = stamp_rig();
+        // A BARE rig — house set materialized, but no daemon default
+        // project (stamp_rig() installs one; this test needs its
+        // absence).
+        let root = tempfile::tempdir().unwrap();
+        super::super::definitions::materialize_house_definitions(root.path()).unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let mut store = AgendaStore::open(&agenda).unwrap();
         let err = store
-            .apply_stamp_command(stamp_cmd("daily-digest"), owner(), 1000)
+            .apply_stamp_command(stamp_cmd("fix-task"), owner(), 1000)
             .unwrap_err();
         assert!(
             err.to_string().starts_with("unfireable(project): "),
@@ -6629,20 +6677,27 @@ mod tests {
         );
         let _project = with_default_project(&mut store);
         store
-            .apply_stamp_command(stamp_cmd("daily-digest"), owner(), 2000)
+            .apply_stamp_command(stamp_cmd("fix-task"), owner(), 2000)
             .unwrap();
     }
 
     // ---- Track AW: the stamp lane ----
 
     /// A state root with the house set materialized and the agenda under
-    /// `<root>/agenda` — the deployed layout, hermetic in a tempdir.
+    /// `<root>/agenda` — the deployed layout, hermetic in a tempdir. The
+    /// state root doubles as the daemon default project so pin-less
+    /// stamped nodes resolve (the fireability mint law refuses them
+    /// otherwise; `stamp_inherits_the_fireability_mint_law` exercises
+    /// the projectless refusal on a bare rig).
     fn stamp_rig() -> (tempfile::TempDir, AgendaStore) {
         let root = tempfile::tempdir().unwrap();
         super::super::definitions::materialize_house_definitions(root.path()).unwrap();
         let agenda = root.path().join("agenda");
         std::fs::create_dir_all(&agenda).unwrap();
-        let store = AgendaStore::open(&agenda).unwrap();
+        let mut store = AgendaStore::open(&agenda).unwrap();
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_project_root = Some(root.path().to_path_buf());
+        store.set_spawn_context(ctx);
         (root, store)
     }
 
@@ -6730,10 +6785,17 @@ mod tests {
         assert_eq!(investigate.agent.as_deref(), Some("claude-code"));
         assert_eq!(investigate.claude_model.as_deref(), Some("claude-fable-5"));
         assert_eq!(investigate.claude_effort.as_deref(), Some("max"));
-        assert!(by_node("implement").item.effects[0]
-            .manifest
-            .agent_config
-            .is_none());
+        // An unpinned node records the resolved executor (the
+        // fireability mint law — internal on this default-less rig)
+        // instead of the legacy absent shape.
+        assert_eq!(
+            by_node("implement").item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         // The durable log carries ordinary ops only — and no approval op
         // of any kind.
         let log = std::fs::read_to_string(store.log_path()).unwrap();

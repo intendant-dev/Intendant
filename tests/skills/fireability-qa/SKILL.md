@@ -72,8 +72,13 @@ has a default project — the repo checkout it launches from.)
 ## 2. Launch the scratch dashboard over the seeded home
 
 ```bash
-printf 'profiles: [{ match: "", turns: [{ text: "qa run done", done: true }] }]\n' > "$QA_HOME/mock.yaml"
-INTENDANT_HOME="$QA_HOME" PROVIDER=mock INTENDANT_MOCK_SCRIPT="$QA_HOME/mock.yaml" \
+cat > "$QA_HOME/mock.json" <<'EOF'
+{ "model": "mock-1", "profiles": [{ "match": "", "steps": [
+  { "content": "Done.", "tool_calls": [{ "name": "signal_done",
+    "arguments": { "message": "qa run complete" } }] }
+] }] }
+EOF
+INTENDANT_HOME="$QA_HOME" PROVIDER=mock INTENDANT_MOCK_SCRIPT="$QA_HOME/mock.json" \
   INTENDANT_MOCK_DISPLAY=synthetic node scripts/validate-dashboard.cjs \
   --launch-dashboard --hold-dashboard --port "$QA_PORT" \
   --dashboard-binary target/debug/intendant --selector body &

@@ -173,12 +173,9 @@ pub(crate) fn validate(
     staleness_ms: u64,
     now_ms: u64,
 ) -> Result<FireabilityResolution, FireabilityRefusal> {
-    let (project_root, project_source) = resolve_spawn_project(
-        candidate.project_root,
-        provenance_session,
-        ctx,
-    )
-    .map_err(|reason| FireabilityRefusal::new(FireabilityField::Project, reason))?;
+    let (project_root, project_source) =
+        resolve_spawn_project(candidate.project_root, provenance_session, ctx)
+            .map_err(|reason| FireabilityRefusal::new(FireabilityField::Project, reason))?;
     let agent = validate_executor(candidate.agent_config, ctx)?;
     validate_floor(&candidate, staleness_ms, now_ms)?;
     Ok(FireabilityResolution {
@@ -313,6 +310,7 @@ fn format_instant(ms: u64) -> String {
 /// fails the suite until its fireability class is declared here (covered
 /// by a leg, validated elsewhere in the same intake arm, or explicitly
 /// not a fireability input).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FireabilityCoverage {
     /// Read by a validator leg ([`FireabilityCandidate`] carries it).
@@ -325,6 +323,7 @@ pub(crate) enum FireabilityCoverage {
     NotAFireabilityInput,
 }
 
+#[cfg(test)]
 pub(crate) fn fireability_schema_coverage(
 ) -> std::collections::BTreeMap<&'static str, FireabilityCoverage> {
     use FireabilityCoverage as C;
@@ -417,7 +416,10 @@ mod tests {
     fn projectless_daemon_refuses_with_the_named_flag() {
         let err = validate(candidate(NOW), None, &ctx(None, None), STALENESS, NOW).unwrap_err();
         assert_eq!(err.field, FireabilityField::Project);
-        assert!(err.message().starts_with("unfireable(project): "), "{err:?}");
+        assert!(
+            err.message().starts_with("unfireable(project): "),
+            "{err:?}"
+        );
         assert!(err.reason.contains("--project"), "{}", err.reason);
     }
 
@@ -457,7 +459,9 @@ mod tests {
             ..candidate(NOW)
         };
         assert_eq!(
-            validate(explicit, None, &base, STALENESS, NOW).unwrap().agent,
+            validate(explicit, None, &base, STALENESS, NOW)
+                .unwrap()
+                .agent,
             "codex"
         );
     }
@@ -503,10 +507,23 @@ mod tests {
     fn one_shot_floor_refuses_only_past_the_staleness_window() {
         let dir = tempfile::tempdir().unwrap();
         let base = ctx(Some(dir.path()), None);
-        validate(candidate(NOW - STALENESS + HOUR), None, &base, STALENESS, NOW).unwrap();
+        validate(
+            candidate(NOW - STALENESS + HOUR),
+            None,
+            &base,
+            STALENESS,
+            NOW,
+        )
+        .unwrap();
         validate(candidate(NOW + HOUR), None, &base, STALENESS, NOW).unwrap();
-        let err =
-            validate(candidate(NOW - STALENESS - HOUR), None, &base, STALENESS, NOW).unwrap_err();
+        let err = validate(
+            candidate(NOW - STALENESS - HOUR),
+            None,
+            &base,
+            STALENESS,
+            NOW,
+        )
+        .unwrap_err();
         assert_eq!(err.field, FireabilityField::Floor);
         assert!(err.reason.contains("--at"), "{}", err.reason);
         let err = validate(candidate(0), None, &base, STALENESS, NOW).unwrap_err();

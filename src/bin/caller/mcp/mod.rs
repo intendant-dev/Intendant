@@ -3473,7 +3473,9 @@ pub(crate) mod tests {
                     recurrence: None,
                     agent_config: None,
                     trigger: None,
-                    project_root: None,
+                    // Fireability: the mint resolves and records a real
+                    // directory — the test's own tempdir.
+                    project_root: Some(dir.path().display().to_string()),
                     binding_refs: Vec::new(),
                     source: None,
                 },

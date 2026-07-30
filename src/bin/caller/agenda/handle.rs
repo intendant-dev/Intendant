@@ -1225,11 +1225,24 @@ mod tests {
     /// source item, occurrence state, title, and the sealed inputs of
     /// the manifest that ran it; every resume-lineage member shares the
     /// block; linkage outliving its item degrades to the id-only shape.
+
+    /// Fireability rig for handle tests: a spawn context whose daemon
+    /// default project is the agenda dir itself (absolute, exists for
+    /// the test's lifetime) so pin-less proposes resolve and record.
+    fn ctx_with_default_project(dir: &std::path::Path) -> SessionSpawnContext {
+        SessionSpawnContext {
+            home: dir.to_path_buf(),
+            default_project_root: Some(dir.to_path_buf()),
+            default_agent: None,
+        }
+    }
+
     #[test]
     fn session_agenda_envelopes_compose_journal_store_and_refs() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
 
         // A sealed input the proposer really read (intake re-hashes it).
         let sealed_src = dir.path().join("inputs.md");
@@ -1260,7 +1273,7 @@ mod tests {
                 AgendaCommand::ProposeEffect {
                     id: item.id.clone(),
                     goal: "run it".into(),
-                    fire_at_ms: 1_000,
+                    fire_at_ms: 4_102_444_800_000, // far-future floor: these tests never fire it
                     orchestrate: false,
                     interactive: None,
                     recurrence: None,
@@ -1370,7 +1383,8 @@ mod tests {
     /// sess-successor (Rider A's lineage), occ-2 fired under the bare
     /// item by sess-other.
     fn attest_rig(dir: &std::path::Path) -> (AgendaHandle, AgendaItem, AgendaItem) {
-        let handle = AgendaHandle::new(AgendaStore::open(dir).unwrap(), EventBus::new(), dir);
+        let handle = AgendaHandle::new(AgendaStore::open(dir).unwrap(), EventBus::new(), dir)
+            .with_spawn_context(ctx_with_default_project(dir));
         let owner = Some(AgendaActor {
             principal: Some("principal:root:dashboard".into()),
             session_id: None,
@@ -1391,7 +1405,7 @@ mod tests {
                 AgendaCommand::ProposeEffect {
                     id: item.id.clone(),
                     goal: "run it".into(),
-                    fire_at_ms: 1_000,
+                    fire_at_ms: 4_102_444_800_000, // far-future floor: these tests never fire it
                     orchestrate: false,
                     interactive: None,
                     recurrence: None,
@@ -2008,7 +2022,8 @@ mod tests {
         std::fs::create_dir_all(&agenda).unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda);
+        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda)
+            .with_spawn_context(ctx_with_default_project(&agenda));
         // Stamping parks + proposes, so agent sessions may do it —
         // approval stays the owner-surface act the existing gate tests
         // pin.
@@ -2065,7 +2080,8 @@ mod tests {
     fn agent_cannot_approve_its_own_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -2968,8 +2984,11 @@ mod tests {
         );
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(dir.path().join("agenda.jsonl"), legacy).unwrap();
-        let projectless =
-            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus.clone(), dir.path());
+        let projectless = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
         let served = projectless.snapshot();
         let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
         let refusal = effect
@@ -2982,13 +3001,12 @@ mod tests {
         // The same ledger under a daemon that CAN resolve it: verdict
         // absent, approve proceeds, and the ARMED effect is unstamped.
         let default_project = tempfile::tempdir().unwrap();
-        let resolvable =
-            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
-                .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
-                    home: dir.path().to_path_buf(),
-                    default_project_root: Some(default_project.path().to_path_buf()),
-                    default_agent: None,
-                });
+        let resolvable = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                home: dir.path().to_path_buf(),
+                default_project_root: Some(default_project.path().to_path_buf()),
+                default_agent: None,
+            });
         let served = resolvable.snapshot();
         let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
         assert!(effect.fireability_refusal.is_none());
@@ -3016,7 +3034,8 @@ mod tests {
     fn approval_binds_the_manifest_digest() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -3211,7 +3230,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -3366,7 +3386,8 @@ mod tests {
             AgendaStore::open(dir.path()).unwrap(),
             EventBus::new(),
             dir.path(),
-        );
+        )
+        .with_spawn_context(ctx_with_default_project(dir.path()));
         let watcher_id = armed_gate_watcher(&handle);
         let question = handle
             .apply(
@@ -3409,7 +3430,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         armed_gate_watcher(&handle);
         let covered = park_question(&handle, "Gate: sign off HS6", vec!["gate".into()]);
         let uncovered = park_question(&handle, "Which vendor for the NAS?", Vec::new());
@@ -3442,7 +3464,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         armed_gate_watcher(&handle);
         let covered = park_question(&handle, "Gate: queue entry", vec!["gate".into()]);
         let uncovered = park_question(&handle, "Pick the offsite week?", Vec::new());
@@ -3487,7 +3510,8 @@ mod tests {
     fn broadcast_copies_carry_full_decorations() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let watcher_id = armed_gate_watcher(&handle);
         let question = park_question(&handle, "Gate: soak the queue", vec!["gate".into()]);
         let due = question.watched_by.as_ref().and_then(|w| w.due_ms);

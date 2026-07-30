@@ -676,6 +676,11 @@ mod tests {
     fn summary_fields_derive_from_the_full_dto() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: dir.path().to_path_buf(),
+            default_project_root: Some(dir.path().to_path_buf()),
+            default_agent: None,
+        });
         let prereq = add(&mut store, "prerequisite", 1000).unwrap();
         let dependent = add(&mut store, "dependent", 2000).unwrap();
         store
@@ -945,6 +950,11 @@ mod tests {
     fn query_reach_matches_the_client_search() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: dir.path().to_path_buf(),
+            default_project_root: Some(dir.path().to_path_buf()),
+            default_agent: None,
+        });
         let item = store
             .apply_command(
                 AgendaCommand::Add {

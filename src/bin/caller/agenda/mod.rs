@@ -45,7 +45,6 @@ mod types;
 pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;
 pub(crate) use definitions::materialize_house_definitions;
-pub(crate) use fireability::FIREABILITY_REFUSAL_PREFIX;
 pub(crate) use handle::now_ms;
 pub(crate) use handle::{AgendaHandle, AgendaPrefixResolution, SessionAgendaEnvelope};
 pub(crate) use reminders::{
@@ -69,6 +68,8 @@ pub(crate) use types::{
 // with structured content.
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
+#[cfg(test)]
+pub(crate) use fireability::FIREABILITY_REFUSAL_PREFIX;
 #[cfg(test)]
 pub(crate) use sealed_blobs::seal_content;
 #[cfg(test)]
