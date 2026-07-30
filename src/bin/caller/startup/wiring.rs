@@ -389,6 +389,18 @@ pub(crate) fn spawn_mode_web_gateway(
                     // request_occurrence) refuse while draining.
                     .with_handover(handover.clone()),
             );
+            // The Q9 boot gauge (Track AS): one line per daemon boot, so
+            // the daemon log carries the trend that decides whether a
+            // fold-snapshot sidecar is ever worth building (threshold
+            // prose: ~250 ms).
+            let vital = handle.boot_fold_vital();
+            eprintln!(
+                "[agenda] boot fold: {} ops / {} lines / {} B in {:.1} ms",
+                vital.ops,
+                vital.log_lines,
+                vital.log_bytes,
+                vital.fold_micros as f64 / 1000.0
+            );
             // Read-side seam for lanes outside the state graph (the
             // session catalog's grid-envelope join).
             crate::agenda::publish_agenda_handle(handle.clone());
