@@ -154,6 +154,17 @@ async fn apply_backend_credentials_reload(
             turn: None,
         });
     };
+    // Typed twin of the announce lines: the supervisor stamps the served
+    // per-session reload lifecycle from these, so the Vault card's chips
+    // track the daemon's actual progress instead of client-side memory.
+    let progress = |progress: crate::event::CredentialReloadProgress| {
+        drain_config
+            .bus
+            .send(AppEvent::BackendCredentialsReloadProgress {
+                session_id: drain_config.session_id.clone(),
+                progress,
+            });
+    };
     if let Some(park) = limit_park.take() {
         *limit_park_streak = 0;
         slog(session_log, |l| l.set_limit_park(None));
@@ -174,6 +185,7 @@ async fn apply_backend_credentials_reload(
         "Reloading credentials: restarting {} resume-attached to its backend session",
         backend
     ));
+    progress(crate::event::CredentialReloadProgress::Respawning);
     if let Err(e) = agent.shutdown().await {
         slog(session_log, |l| {
             l.warn(&format!("Backend shutdown before credential reload: {e}"))
@@ -198,6 +210,7 @@ async fn apply_backend_credentials_reload(
             announce(
                 "Credential reload complete — the backend restarted on the fresh credential store",
             );
+            progress(crate::event::CredentialReloadProgress::Done);
             true
         }
         Err(e) => {
@@ -206,6 +219,9 @@ async fn apply_backend_credentials_reload(
                 backend
             );
             slog(session_log, |l| l.error(&line));
+            progress(crate::event::CredentialReloadProgress::Failed {
+                error: format!("could not respawn {backend}: {e}"),
+            });
             drain_config.bus.send(AppEvent::LoopError(line));
             false
         }
