@@ -964,7 +964,8 @@ mod tests {
         let item = park_file_ref_item(&agenda, &locator);
 
         // Live + unchanged: the attach pin matches the served bytes.
-        let body = json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
         assert_eq!(body["source"], "live");
         assert_eq!(body["drift"], "unchanged");
         assert_eq!(body["encoding"], "utf8");
@@ -977,7 +978,8 @@ mod tests {
         // Live + drifted after attach: still served (no snapshot exists),
         // with the honest verdict.
         std::fs::write(&file, b"decide: B (amended)").unwrap();
-        let body = json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
         assert_eq!(body["source"], "live");
         assert_eq!(body["drift"], "changed");
         assert_eq!(body["content"], "decide: B (amended)");
@@ -985,7 +987,8 @@ mod tests {
         // A sealed snapshot under the pin takes precedence: the sealed
         // bytes serve, and the live file's drift is reported alongside.
         crate::agenda::seal_content(agenda.dir(), &pin, b"decide: A").unwrap();
-        let body = json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
         assert_eq!(body["source"], "sealed");
         assert_eq!(body["content"], "decide: A");
         assert_eq!(body["drift"], "changed");
@@ -997,21 +1000,15 @@ mod tests {
         let response = agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await;
         assert_eq!(status_of(&response), 500);
         let body = json_of(&response);
-        assert!(
-            body["error"].as_str().unwrap().contains("sealed"),
-            "{body}"
-        );
+        assert!(body["error"].as_str().unwrap().contains("sealed"), "{body}");
 
         // Scoping: a real file that is NOT an attached ref of this item
         // answers 404 — same for a url ref's locator and an unknown item.
         let foreign = content.path().join("not-attached.md");
         std::fs::write(&foreign, b"nope").unwrap();
-        let response = agenda_ref_content_api_response(
-            &item.id,
-            &foreign.to_string_lossy(),
-            Some(&server),
-        )
-        .await;
+        let response =
+            agenda_ref_content_api_response(&item.id, &foreign.to_string_lossy(), Some(&server))
+                .await;
         assert_eq!(status_of(&response), 404);
         assert!(
             json_of(&response)["error"]
@@ -1021,9 +1018,12 @@ mod tests {
             "the refusal names the scoping rule"
         );
         let url_item = park_pr_anchor(&agenda, "https://github.com/o/r/pull/9");
-        let response =
-            agenda_ref_content_api_response(&url_item, "https://github.com/o/r/pull/9", Some(&server))
-                .await;
+        let response = agenda_ref_content_api_response(
+            &url_item,
+            "https://github.com/o/r/pull/9",
+            Some(&server),
+        )
+        .await;
         assert_eq!(status_of(&response), 404, "url refs are not file refs");
         let response =
             agenda_ref_content_api_response("01NEVEREXISTED", &locator, Some(&server)).await;
@@ -1075,8 +1075,9 @@ mod tests {
         std::fs::write(&png, [0x89u8, 0x50, 0x4e, 0x47, 0x00, 0xff]).unwrap();
         let png_locator = png.to_string_lossy().into_owned();
         let png_item = park_file_ref_item(&agenda, &png_locator);
-        let body =
-            json_of(&agenda_ref_content_api_response(&png_item.id, &png_locator, Some(&server)).await);
+        let body = json_of(
+            &agenda_ref_content_api_response(&png_item.id, &png_locator, Some(&server)).await,
+        );
         assert_eq!(body["encoding"], "base64");
         assert_eq!(body["mime"], "image/png");
         use base64::Engine as _;
@@ -1430,7 +1431,10 @@ pub(crate) async fn agenda_ref_content_api_response(
             }
             Ok(None) => {}
             Err(err) => {
-                return ApiResponse::json_error(500, format!("sealed snapshot for {locator}: {err}"))
+                return ApiResponse::json_error(
+                    500,
+                    format!("sealed snapshot for {locator}: {err}"),
+                )
             }
         }
     }

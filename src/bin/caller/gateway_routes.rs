@@ -3406,7 +3406,8 @@ mod tests {
         // Parked-ask preview blobs: two captures, literal raw tail.
         // The ref reader's row: one capture, the locator rides the query
         // string (never a path segment — locators are absolute paths).
-        let (route, captures) = match_route("GET", "/api/agenda/items/01ITEM/refs/content").unwrap();
+        let (route, captures) =
+            match_route("GET", "/api/agenda/items/01ITEM/refs/content").unwrap();
         assert!(matches!(route.handler, RouteHandlerId::AgendaRefContent));
         assert_eq!(captures, vec!["01ITEM"]);
 

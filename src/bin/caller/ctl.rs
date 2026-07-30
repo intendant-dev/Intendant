@@ -6140,15 +6140,14 @@ mod tests {
         assert_eq!(refs[0]["must_read"], true);
 
         // --pick rides verbatim and excludes --multi.
-        let value =
-            agenda_ask_args(&args(&["Q", "--option", "A", "--option", "B", "--pick", "0-2"]))
-                .unwrap();
+        let value = agenda_ask_args(&args(&[
+            "Q", "--option", "A", "--option", "B", "--pick", "0-2",
+        ]))
+        .unwrap();
         assert_eq!(value["questions"][0]["pick_min"], 0);
         assert_eq!(value["questions"][0]["pick_max"], 2);
-        let err = agenda_ask_args(&args(&[
-            "Q", "--option", "A", "--pick", "1", "--multi",
-        ]))
-        .unwrap_err();
+        let err =
+            agenda_ask_args(&args(&["Q", "--option", "A", "--pick", "1", "--multi"])).unwrap_err();
         assert!(err.contains("--pick replaces --multi"), "{err}");
 
         // Modifier flags without options refuse by name.
