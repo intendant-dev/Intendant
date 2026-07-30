@@ -373,6 +373,33 @@ html.ui-v2 .ag2-eff-note {
   border-left: 2px solid var(--line);
   padding-left: 9px;
 }
+/* The self-report block (Track AO): its own labeled lane under the
+   transport row — amber-edged so the axis never blends into the
+   transport note above it. */
+html.ui-v2 .ag2-eff-attest {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .ag2-eff-attest-note {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid rgba(var(--amber-rgb), 0.45);
+  padding-left: 9px;
+}
+html.ui-v2 .ag2-attest-ref {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+html.ui-v2 .ag2-attest-ref-loc {
+  font-family: var(--mono);
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
 html.ui-v2 .ag2-insp-noeff {
   display: flex;
   align-items: center;

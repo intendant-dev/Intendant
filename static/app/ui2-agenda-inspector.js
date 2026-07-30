@@ -423,13 +423,39 @@ function agendaInspEffectHtml(item) {
       const sessionLink = s && s.key
         ? ` <a class="ag2-linkbtn" data-jump-session="${escapeHtml(s.key)}">view session ›</a>`
         : '';
+      const attempt = (e.last_run_attempt || 0) > 0
+        ? ` · attempt ${e.last_run_attempt} (auto-retry after failure)` : '';
+      // The self-report axis (Track AO): rendered as its own labeled
+      // block BESIDE the transport verdict — never sharing its glyph
+      // or palette. The transport note above it stays the transport's
+      // last-words line (R6), tooltip included.
+      const att = run.attestation || null;
+      let attestHtml = '';
+      if (att) {
+        const refs = (att.refs || []).map((r) => `<div class="ag2-attest-ref">
+            <span class="ag2-attest-ref-loc">${escapeHtml(r.locator)}</span>
+            <span class="ag2-hint" title="The pin the session stated at attest time — hash-verified at intake, re-checked on demand; a pointer, never inlined content">pin ${escapeHtml((r.sha256 || '').slice(0, 8))}</span>
+            <span class="agenda-ref-drift" data-item="${escapeHtml(item.id)}" data-locator="${escapeHtml(r.locator)}"></span>
+          </div>`).join('');
+        attestHtml = `<div class="ag2-eff-attest">
+          <div class="ag2-eff-lastrun-head">
+            ${agendaAttestChipHtml(att)}
+            <span class="ag2-hint">${escapeHtml(agendaRelTime(att.at_ms))}</span>
+          </div>
+          ${att.note ? `<div class="ag2-eff-attest-note">${escapeHtml(att.note)}</div>` : ''}
+          ${refs}
+        </div>`;
+      } else if (run.state !== 'started') {
+        attestHtml = `<div class="ag2-eff-attest">${agendaUnattestedChipHtml()}</div>`;
+      }
       lastRun = `<div class="ag2-eff-lastrun">
         <div class="ag2-eff-lastrun-head">
           ${agendaChipHtml(`last run · ${run.state}`, runTone)}
-          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
+          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}${attempt}`)}</span>
           ${sessionLink}
         </div>
-        ${run.note ? `<div class="ag2-eff-note">${escapeHtml(run.note)}</div>` : ''}
+        ${run.note ? `<div class="ag2-eff-note" title="The session’s final message as the run ended — the transport record, not a self-report">${escapeHtml(run.note)}</div>` : ''}
+        ${attestHtml}
       </div>`;
     }
     const acts = [];

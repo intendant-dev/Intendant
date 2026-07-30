@@ -756,6 +756,9 @@ impl SessionSupervisor {
             event::ControlMsg::ReloadCredentials { session_id } => {
                 self.route_reload_credentials(session_id).await;
             }
+            event::ControlMsg::ReloadCredentialsAll { source } => {
+                self.route_reload_credentials_all(source).await;
+            }
             event::ControlMsg::RestartSession {
                 source,
                 session_id,

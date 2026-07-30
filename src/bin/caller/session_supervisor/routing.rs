@@ -833,9 +833,72 @@ impl SessionSupervisor {
             }
             Some(_) => {}
         }
+        // Stamp the daemon-owned lifecycle before emitting: the row shows
+        // `requested` from the moment the intent is accepted, and the
+        // loop's typed progress events advance it from there
+        // (reload_lifecycle_is_daemon_owned_and_served). Latest request
+        // wins — a re-request over a terminal state simply restarts the
+        // lifecycle; there is deliberately NO dedup here
+        // (stale_requests_never_block_a_fresh_ceremony).
+        {
+            let mut state = self.state.lock().await;
+            if let Some(session) = state.sessions.get_mut(&target_id) {
+                session.reload = Some(ReloadLifecycle::stamped_now(
+                    ReloadLifecycleState::Requested,
+                    None,
+                ));
+            }
+        }
         self.config.bus.send(AppEvent::ReloadBackendCredentials {
             session_id: Some(requested_id),
         });
+    }
+
+    /// The Vault card's "Reload all": fan the per-session credential
+    /// reload out over the supervisor's OWN live registry — the exact set
+    /// served as `reload_candidates` — stamping every matching row
+    /// `requested` under one lock, atomic with membership (a stale client
+    /// list can neither miss a fresh session nor target a dead one), then
+    /// emit the per-session event each loop already consumes
+    /// (reload_all_rides_the_served_candidate_set). `source` is the
+    /// `AgentBackend::as_short_str` vocabulary; native sessions have no
+    /// backend process to respawn, so a native/empty source is refused.
+    pub(crate) async fn route_reload_credentials_all(&self, source: String) {
+        let source = source.trim();
+        if source.is_empty() || source == "intendant" {
+            self.warn("Reload-all-credentials dropped: not an external backend source");
+            return;
+        }
+        let mut target_ids: Vec<String> = {
+            let mut state = self.state.lock().await;
+            let ids: Vec<String> = state
+                .sessions
+                .values()
+                .filter(|session| session.source == source)
+                .map(|session| session.session_id.clone())
+                .collect();
+            for id in &ids {
+                if let Some(session) = state.sessions.get_mut(id) {
+                    session.reload = Some(ReloadLifecycle::stamped_now(
+                        ReloadLifecycleState::Requested,
+                        None,
+                    ));
+                }
+            }
+            ids
+        };
+        if target_ids.is_empty() {
+            self.warn(&format!(
+                "Reload-all-credentials: no live {source} sessions to reload"
+            ));
+            return;
+        }
+        target_ids.sort();
+        for session_id in target_ids {
+            self.config.bus.send(AppEvent::ReloadBackendCredentials {
+                session_id: Some(session_id),
+            });
+        }
     }
 
     pub(crate) async fn stop_managed_session(
@@ -3210,6 +3273,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3420,6 +3484,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3485,6 +3550,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3542,6 +3608,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3617,6 +3684,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "thinking".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3691,6 +3759,7 @@ mod tests {
                     source: "codex".to_string(),
                     name: None,
                     phase: "thinking".to_string(),
+                    reload: None,
                     project_root: PathBuf::from("/tmp/project"),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx: tx,
@@ -3777,6 +3846,7 @@ mod tests {
                     source: "claude-code".to_string(),
                     name: None,
                     phase: "thinking".to_string(),
+                    reload: None,
                     project_root,
                     session_dir,
                     follow_up_tx: tx,

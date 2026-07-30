@@ -460,7 +460,7 @@ fn resolve_lost_sessions(
             "daemon restarted before the session dispatched — outcome unknown",
         ),
     };
-    let (items, _, _) = handle.snapshot();
+    let items = handle.snapshot().items;
     for row in unresolved {
         let (occurrence_id, session_id) = (row.occurrence_id, row.session_id);
         let _ = journal.append(&OccurrenceRecord {
@@ -702,20 +702,11 @@ async fn run_pass(
         // in-flight write-backs — draining protects in-flight work.
         if runtime.is_draining() {
             if runtime.take_drain_entry_duty() {
+                // The owner-visible "Daemon draining" notification (and
+                // its supervisor-lane exit re-evaluation side effect) is
+                // emitted by `perform_drain_entry` itself, so the
+                // storeless inline entry path carries it too (HS3-N4).
                 runtime.perform_drain_entry();
-                // Owner-visible, and it lands on the supervisor's
-                // observation lane — which re-evaluates the drain exit
-                // condition, covering the zero-sessions-at-entry case.
-                handle.bus().send(AppEvent::UserNotification {
-                    session_id: None,
-                    id: "handover-draining".to_string(),
-                    title: Some("Daemon draining".to_string()),
-                    text: "standing automations handed off; in-flight sessions \
-                           finish here, then this daemon exits"
-                        .to_string(),
-                    urgency: crate::types::NotificationUrgency::Attention,
-                    ts: now_ms(),
-                });
             }
             if let Some(alert) = runtime.drain_watch() {
                 eprintln!("[handover] {alert}");
@@ -753,7 +744,7 @@ async fn run_pass(
             return Some(now_ms() + crate::handover::lease_poll_interval().as_millis() as u64);
         }
     }
-    let (items, _, _) = handle.snapshot();
+    let items = handle.snapshot().items;
     let policy = handle.reminder_policy();
     let now = now_ms();
     let quiet_until = policy
@@ -2279,7 +2270,7 @@ mod tests {
                 .ends_with("(live file unreadable; the sealed revision is the binding content)"),
             "a deleted live file is an informational note, not a refusal: {vanish_task}"
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         for id in [&drift_item, &vanish_item] {
             let item = items.iter().find(|i| i.id == *id).unwrap();
             assert_eq!(
@@ -2366,7 +2357,7 @@ mod tests {
                 "a broken seal must not spawn"
             );
         }
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let corrupted = items.iter().find(|i| i.id == corrupt_item).unwrap();
         let run = corrupted.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "failed");
@@ -2555,7 +2546,7 @@ mod tests {
             journal.progress(&occurrence_id).started.as_deref(),
             Some("sess-run")
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let item = items.iter().find(|i| i.id == item_id).unwrap();
         assert_eq!(item.effects[0].last_run.as_ref().unwrap().state, "started");
 
@@ -2575,7 +2566,7 @@ mod tests {
             journal.progress(&occurrence_id).terminal,
             Some(OccurrenceState::Completed)
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let item = items.iter().find(|i| i.id == item_id).unwrap();
         let run = item.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "completed");
@@ -2616,7 +2607,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let revised = items.iter().find(|i| i.id == item_id).unwrap().effects[0].clone();
         assert!(
             revised.last_run.is_none(),
@@ -2665,7 +2656,7 @@ mod tests {
                 outcome: crate::event::TaskOutcome::Completed,
             },
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item_id).unwrap().effects[0]
             .last_run
             .clone()
@@ -2921,7 +2912,7 @@ mod tests {
             journal.progress(&occurrence_id).terminal,
             Some(OccurrenceState::Completed)
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
             .clone()
@@ -3044,7 +3035,7 @@ mod tests {
         let progress = journal.progress(&occurrence_id);
         assert_eq!(progress.started.as_deref(), Some("sess-fast"));
         assert_eq!(progress.terminal, Some(OccurrenceState::Completed));
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
             .clone()
@@ -3150,7 +3141,7 @@ mod tests {
         let progress = journal.progress(&occurrence_id);
         assert_eq!(progress.started.as_deref(), Some("sess-dead"));
         assert_eq!(progress.terminal, Some(OccurrenceState::Failed));
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
             .clone()
@@ -3265,7 +3256,7 @@ mod tests {
     }
 
     fn last_run_of(handle: &AgendaHandle, item_id: &str) -> super::super::types::AgendaRun {
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         items.iter().find(|i| i.id == item_id).unwrap().effects[0]
             .last_run
             .clone()
@@ -3731,7 +3722,7 @@ mod tests {
         ));
         assert!(journal.progress("occ-batch").prepared);
 
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         for id in [&q1.id, &q2.id] {
             let item = items.iter().find(|i| &i.id == id).unwrap();
             let note = item
@@ -3912,7 +3903,7 @@ mod tests {
             },
         );
         let effect_of = |handle: &AgendaHandle| {
-            let (items, _, _) = handle.snapshot();
+            let items = handle.snapshot().items;
             items.iter().find(|i| i.id == item.id).unwrap().effects[0].clone()
         };
         let effect = effect_of(&handle);
@@ -4179,7 +4170,7 @@ mod tests {
         }
         sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
         assert!(state.awaiting.is_empty(), "abandoned dispatches are freed");
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
             .clone()
@@ -4232,7 +4223,7 @@ mod tests {
         // Next boot: a fresh journal fold sees prepared-without-started.
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         resolve_lost_sessions(&handle, &mut journal, RecoveryScope::Unscoped);
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let run = items.iter().find(|i| i.id == item.id).unwrap().effects[0]
             .last_run
             .clone()
@@ -4289,7 +4280,7 @@ mod tests {
             Some(OccurrenceState::Unknown)
         );
 
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let running = items.iter().find(|item| item.id == running_item).unwrap();
         assert_eq!(
             running.effects[0].last_run.as_ref().unwrap().state,
@@ -4366,7 +4357,7 @@ mod tests {
             journal.progress(&occurrence_id).terminal,
             Some(OccurrenceState::Failed)
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let failed = items.iter().find(|i| i.id == item_id).unwrap();
         assert_eq!(failed.effects[0].last_run.as_ref().unwrap().state, "failed");
 
@@ -4389,7 +4380,7 @@ mod tests {
         }
         assert!(!saw_start, "missed windows never spawn");
         assert!(saw_missed_note);
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let missed = items.iter().find(|i| i.id == missed_item).unwrap();
         assert_eq!(missed.effects[0].last_run.as_ref().unwrap().state, "missed");
     }
@@ -4525,7 +4516,7 @@ mod tests {
         assert!(note.contains("no project for the session"), "{note}");
         assert!(state.awaiting.is_empty(), "nothing is left in flight");
 
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let item = items.iter().find(|i| i.id == item_id).unwrap();
         let run = item.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "failed");
@@ -4639,7 +4630,7 @@ mod tests {
         // A due, owner-approved standing manifest — the intake's exact
         // race subject.
         approved_effect_item(&handle, now - 1_000);
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let policy = handle.reminder_policy();
         // Two daemons' journals over one file, both still empty: both
         // planners pass the check before either appends `prepared`.
@@ -4958,7 +4949,7 @@ mod tests {
             journal.started_unresolved_for_item(&item_id),
             "the item's no-overlap hold re-arms while the successor runs"
         );
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let item = items.iter().find(|item| item.id == item_id).unwrap();
         let run = item.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "started");
@@ -5096,6 +5087,11 @@ mod tests {
         let runtime = crate::handover::HandoverRuntime::initialize(home.path(), 7001, 0);
         runtime.attach_scheduler();
         let (handle, _) = handle_with_item(dir.path(), 1_000); // overdue
+
+        // Mirror the wiring: the runtime carries the daemon bus, and
+        // `perform_drain_entry` emits the drain notice through it on
+        // every entry path (HS3-N4).
+        runtime.set_bus(handle.bus().clone());
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 

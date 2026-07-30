@@ -395,6 +395,12 @@ pub(crate) struct OccurrenceProgress {
     /// pre-stamping build downgrades the occurrence to legacy boot-time
     /// semantics — the fail-closed direction for mixed-version homes.
     pub(crate) writer_boot_id: Option<String>,
+    /// Track AO regeneration ordinal, retained from the last row that
+    /// carried one — DISPLAY-ONLY (the run-line/grid "attempt N" copy):
+    /// identity lives in the occurrence id's retry segment, and no
+    /// planner or recovery decision reads this. Recovery rows carry no
+    /// stamp and never clear it.
+    pub(crate) attempt: Option<u32>,
 }
 
 /// One row of [`OccurrenceJournal::started_unresolved`].
@@ -427,6 +433,31 @@ pub(crate) struct SessionOccurrenceLink {
     /// un-attributing the original, and the one terminal that follows
     /// the lineage tip resolves the whole occurrence.
     pub(crate) state: OccurrenceState,
+    /// This session's place in the occurrence's resume lineage (Track
+    /// AO §2.8): `Tip` = the session the next terminal resolves
+    /// through; `Superseded` = an earlier lineage member a re-key
+    /// replaced. Derived from the same journal rows the scheduler
+    /// trusts — never a second resolver.
+    pub(crate) lineage_role: SessionLineageRole,
+    /// The occurrence's Track AO regeneration ordinal (display-only
+    /// fold retention), when it is a bounded auto-retry.
+    pub(crate) attempt: Option<u32>,
+}
+
+/// A session's place in its occurrence's resume lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionLineageRole {
+    Tip,
+    Superseded,
+}
+
+impl SessionLineageRole {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SessionLineageRole::Tip => "tip",
+            SessionLineageRole::Superseded => "superseded",
+        }
+    }
 }
 
 /// The append-only delivery ledger. `prepare` records are fsync'd — the
@@ -531,12 +562,22 @@ impl OccurrenceJournal {
             };
             let state = progress.terminal.unwrap_or(OccurrenceState::Started);
             for session_id in &progress.started_history {
+                // The tip is the LAST `started` row's session — exactly
+                // what the fold's last-wins `started` field holds,
+                // terminal or not (the terminal arm never clears it).
+                let lineage_role = if progress.started.as_deref() == Some(session_id.as_str()) {
+                    SessionLineageRole::Tip
+                } else {
+                    SessionLineageRole::Superseded
+                };
                 links.insert(
                     session_id.clone(),
                     SessionOccurrenceLink {
                         occurrence_id: occurrence_id.clone(),
                         item_id: item_id.to_string(),
                         state,
+                        lineage_role,
+                        attempt: progress.attempt,
                     },
                 );
             }
@@ -801,6 +842,9 @@ pub(crate) struct AgendaOccurrencesPage {
 fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
     if !record.item_id.is_empty() && entry.item_id.is_none() {
         entry.item_id = Some(record.item_id.clone());
+    }
+    if record.attempt.is_some() {
+        entry.attempt = record.attempt;
     }
     match record.state {
         OccurrenceState::Prepared => {
@@ -1940,6 +1984,10 @@ pub(crate) fn decorate_planner_fields(
         item.watched_by = consumed.or_else(|| watched.remove(&item.id));
         for (effect, view) in item.effects.iter_mut().zip(item_views) {
             effect.next_fire_ms = view.and_then(|view| view.next_fire_ms);
+            effect.last_run_attempt = effect
+                .last_run
+                .as_ref()
+                .and_then(|run| journal.progress(&run.occurrence_id).attempt);
         }
     }
 }
@@ -2301,9 +2349,21 @@ mod tests {
                 "the terminal follows the whole lineage"
             );
         }
+        // Track AO lineage roles: the re-key's last `started` row is the
+        // tip; the original stays a linked, superseded member.
+        assert_eq!(
+            links.get("s1").unwrap().lineage_role,
+            SessionLineageRole::Superseded
+        );
+        assert_eq!(
+            links.get("s2").unwrap().lineage_role,
+            SessionLineageRole::Tip
+        );
         let running = links.get("s3").expect("running session linked");
         assert_eq!(running.item_id, "item-b");
         assert_eq!(running.state, OccurrenceState::Started);
+        assert_eq!(running.lineage_role, SessionLineageRole::Tip);
+        assert_eq!(running.attempt, None, "attempt rides only when stamped");
         assert!(
             !links.contains_key("s4"),
             "itemless boot-recovery rows stay unattributable"
@@ -2755,6 +2815,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }
@@ -3179,6 +3240,7 @@ mod tests {
                 consecutive_failures: 0,
                 requested: Vec::new(),
                 next_fire_ms: None,
+                last_run_attempt: None,
             });
             base
         };
@@ -3197,6 +3259,69 @@ mod tests {
     }
 
     // ---- Display-only planner derivations (next_fire_ms / deferred_until) ----
+
+    /// Track AO: `last_run_attempt` is a serving-seam decoration from
+    /// the journal fold's display-only `attempt` retention — present
+    /// exactly when the last run's occurrence carries a retry ordinal,
+    /// absent from the wire otherwise (the additive-DTO discipline).
+    /// Retention is last-Some-wins: a stampless recovery row never
+    /// clears the ordinal.
+    #[test]
+    fn last_run_attempt_is_decorated_from_the_journal_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = self::journal(dir.path());
+        let policy = ReminderPolicy::default();
+        let noon = |_: u64| 12 * 60;
+        let mut solo = one_shot_item("solo", 50_000);
+        solo.effects[0].last_run = Some(AgendaRun {
+            occurrence_id: "occ-retry".into(),
+            state: "failed".into(),
+            session_id: None,
+            at_ms: 60_000,
+            note: None,
+            attestation: None,
+        });
+        for (state, attempt) in [
+            (OccurrenceState::Prepared, Some(2)),
+            (OccurrenceState::Started, Some(2)),
+            (OccurrenceState::Unknown, None),
+        ] {
+            journal
+                .append(&OccurrenceRecord {
+                    v: 1,
+                    at_ms: 60_000,
+                    occurrence_id: "occ-retry".into(),
+                    item_id: "solo".into(),
+                    due_ms: 60_000,
+                    state,
+                    urgency: None,
+                    session_id: None,
+                    generation: None,
+                    boot_id: None,
+                    attempt,
+                })
+                .unwrap();
+        }
+        let mut items = vec![solo];
+        decorate_planner_fields(None, &mut items, &journal, &policy, 70_000, &noon);
+        assert_eq!(items[0].effects[0].last_run_attempt, Some(2));
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["effects"][0]["last_run_attempt"], serde_json::json!(2));
+
+        // Attempt-0 (and every legacy) run: no ordinal, no wire field.
+        items[0].effects[0].last_run = Some(AgendaRun {
+            occurrence_id: "occ-plain".into(),
+            state: "completed".into(),
+            session_id: None,
+            at_ms: 61_000,
+            note: None,
+            attestation: None,
+        });
+        decorate_planner_fields(None, &mut items, &journal, &policy, 70_000, &noon);
+        assert_eq!(items[0].effects[0].last_run_attempt, None);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert!(json["effects"][0].get("last_run_attempt").is_none());
+    }
 
     /// An approved one-shot item (no recurrence), effect id `ef-1`.
     fn one_shot_item(id: &str, fire_at: u64) -> AgendaItem {
@@ -3231,6 +3356,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }
@@ -3931,6 +4057,7 @@ mod tests {
             consecutive_failures: 0,
             requested: Vec::new(),
             next_fire_ms: None,
+            last_run_attempt: None,
         });
         base
     }

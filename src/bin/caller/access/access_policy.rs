@@ -1036,6 +1036,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         // whatever store already exists — the ceremony that WRITES the
         // store is gated on credentials.manage separately.
         | ControlMsg::ReloadCredentials { .. }
+        | ControlMsg::ReloadCredentialsAll { .. }
         | ControlMsg::Interrupt { .. } => PeerOperation::SessionManage,
         ControlMsg::Steer { .. } | ControlMsg::CancelSteer { .. } => PeerOperation::Message,
         ControlMsg::ListDisplays => PeerOperation::DisplayView,
