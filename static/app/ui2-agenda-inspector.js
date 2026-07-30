@@ -59,7 +59,13 @@ function agendaInspectorRender() {
     host.addEventListener('keydown', agendaInspKeydown);
     if (backdrop) backdrop.addEventListener('click', () => agendaCloseInspector());
   }
-  const item = agendaSelId ? agendaFindItem(agendaSelId) : null;
+  // Track AS S5: the inspector renders the FULL item (body, thread,
+  // ask questions, manifests). The list feed is summaries, so the full
+  // copy comes from the item-route cache — a miss renders the summary
+  // degraded (loading hints where full-only sections go) and the
+  // arrival repaints.
+  const summary = agendaSelId ? agendaFindItem(agendaSelId) : null;
+  const item = agendaSelId ? agendaFullItemFor(agendaSelId) || summary : null;
   if (!item) {
     // Selection gone (retired elsewhere, fold moved): close honestly.
     agendaSelId = null;
@@ -336,6 +342,10 @@ function agendaInspDetailsHtml(item) {
     </div>`;
   } else if (item.body) {
     body = `<div class="ag2-insp-body">${escapeHtml(item.body)}</div>`;
+  } else if (!Array.isArray(item.annotations)) {
+    // Summary row (S5): the full copy is being fetched — say so instead
+    // of passing "no body yet" off as "no body".
+    body = '<div class="ag2-hint">Loading detail…</div>';
   } else {
     body = '<div class="ag2-hint">No body — the title is the whole note.</div>';
   }
@@ -770,6 +780,12 @@ function agendaInspRefsHtml(item) {
 // ---- Thread ----
 
 function agendaInspThreadHtml(item) {
+  if (!Array.isArray(item.annotations)) {
+    // Summary row (S5): the thread rides the full item, being fetched.
+    const n = item.annotations_count || 0;
+    return `<section class="ag2-sec"><div class="ag2-hint">${n
+      ? `Loading the ${n}-note thread…` : 'Loading detail…'}</div></section>`;
+  }
   const notes = item.annotations || [];
   const all = agendaExpandedThreads.has(item.id);
   const shown = all ? notes : notes.slice(-3);
@@ -808,7 +824,10 @@ function agendaInspThreadHtml(item) {
 // ---- Inspector event delegation ----
 
 function agendaInspItem() {
-  return agendaSelId ? agendaFindItem(agendaSelId) : null;
+  // Full copy when the cache has one (S5); summary otherwise — action
+  // handlers only need ids/status, which both shapes carry.
+  if (!agendaSelId) return null;
+  return agendaFullItemFor(agendaSelId) || agendaFindItem(agendaSelId);
 }
 
 function agendaInspClick(e) {

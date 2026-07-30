@@ -37468,7 +37468,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4f5addf2a76b4922';
+const INTENDANT_APP_BUILD = 'cb56b4e4389e6289';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40131,7 +40131,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
   api_codex_cloud_workers: { verb: 'GET', path: '/api/codex-cloud/workers', query: ['refresh'] },
   api_codex_cloud_submit: { verb: 'POST', path: '/api/codex-cloud/submit' },
-  api_agenda_list: { verb: 'GET', path: '/api/agenda' },
+  api_agenda_list: { verb: 'GET', path: '/api/agenda', query: ['since_seq', 'shape', 'q'] },
+  api_agenda_item: { verb: 'GET', path: '/api/agenda/items/{item_id}' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
   api_agenda_definitions: { verb: 'GET', path: '/api/agenda/definitions' },
   api_agenda_sealed: { verb: 'GET', path: '/api/agenda/sealed/{sha256}' },
@@ -91376,6 +91377,12 @@ let agendaCounts = { open: 0, done: 0, retired: 0 };
 let agendaSkippedLines = 0;
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
+// Track AS S3 — the resume cursor: the daemon's op-log line seq as of
+// the last full fetch, advanced by each `agenda_changed` (which carries
+// its producing op's seq) and by each heal. null until a response
+// carries one (a pre-seq daemon serves none — healing then falls back
+// to the full refetch).
+let agendaSeq = null;
 let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 // Session-resolution join from the list response: recorded session id →
 // { source, conversation_id, key, name, project_root } for the
@@ -91467,11 +91474,15 @@ async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
   agendaFetchInFlight = (async () => {
     try {
-      const resp = await daemonApi.request('api_agenda_list', {});
+      // Track AS S5: the list feed is SUMMARIES (titles, chips, edges,
+      // served flags — ~9× lighter than full items); the inspector and
+      // expansions fetch one full item on demand (agendaFullItemFor).
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary' });
       if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
         agendaItems = resp.body.items;
         agendaCounts = resp.body.counts || agendaCounts;
         agendaSkippedLines = resp.body.skipped_lines || 0;
+        if (typeof resp.body.seq === 'number') agendaSeq = resp.body.seq;
         agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
         agendaSessions = resp.body.sessions || {};
         agendaPullRequests = resp.body.pull_requests || {};
@@ -91491,6 +91502,159 @@ async function agendaRefresh() {
   })();
   return agendaFetchInFlight;
 }
+
+// Track AS S5 — the full-item side cache: the inspector and expansions
+// read FULL items (body, annotation thread, ask questions, manifests)
+// fetched one at a time from the item route; the list feed stays
+// summaries. Entries are keyed by id and validated by updated_ms — a
+// newer summary/event for the id invalidates a staler full copy at read
+// time (no eviction sweep needed; the map is bounded by items ever
+// inspected this page-load plus event arrivals).
+const agendaFullItems = new Map();
+const agendaFullFetchesInFlight = new Set();
+
+// The freshest FULL item for `id` if the cache has one at least as new
+// as the list's summary row; otherwise fires one background fetch
+// (single-flight per id) and returns null — callers render the summary
+// degraded and repaint on arrival.
+function agendaFullItemFor(id) {
+  if (!id) return null;
+  const summary = agendaFindItem(id);
+  const cached = agendaFullItems.get(id);
+  if (cached && (!summary || (cached.updated_ms || 0) >= (summary.updated_ms || 0))) {
+    return cached;
+  }
+  if (!agendaFullFetchesInFlight.has(id)) {
+    agendaFullFetchesInFlight.add(id);
+    (async () => {
+      try {
+        const resp = await daemonApi.request('api_agenda_item', { item_id: id });
+        if (resp.ok && resp.body && resp.body.item) {
+          agendaFullItems.set(id, resp.body.item);
+          // The per-item join may resolve ids the list join skipped.
+          Object.assign(agendaSessions, resp.body.sessions || {});
+          Object.assign(agendaPullRequests, resp.body.pull_requests || {});
+        }
+      } catch (e) {
+        console.warn('[agenda] full-item fetch failed', id, e);
+      } finally {
+        agendaFullFetchesInFlight.delete(id);
+        agendaRenderAll();
+        if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
+        // A parked-ask announce may have been waiting on this item's
+        // question payload (announce dedupes by ask id — idempotent).
+        agendaAnnounceParkedAsks();
+      }
+    })();
+  }
+  return null;
+}
+
+// Adopt a FULL item arriving outside the summary feed (the
+// `agenda_changed` event lane, op-response merges): file it in the
+// full-item cache, and shape a summary-compatible row for the list —
+// slim derivations only (counts), never predicate re-derivation. The
+// served flags (blocked/frontier/triage) carry over from the replaced
+// summary row and AGE until the next summary pull refreshes them — the
+// ruled Q4 decoration-freshness contract; a brand-new item wears no
+// flags until first summarized.
+function agendaAdoptFullItem(full) {
+  agendaFullItems.set(full.id, full);
+  const prior = agendaFindItem(full.id);
+  const row = Object.assign({}, full, {
+    annotations_count: Array.isArray(full.annotations) ? full.annotations.length : 0,
+    blocked: prior ? prior.blocked : undefined,
+    frontier: prior ? prior.frontier : undefined,
+    triage: prior ? prior.triage : undefined,
+  });
+  return row;
+}
+
+// Track AS S3 — the healing lane. A held cursor turns "did I miss
+// anything?" into a delta pull (`since_seq`): the daemon returns only
+// items changed by ops at or after the cursor, upserted over the cache
+// exactly like the event lane's merges (append-only log ⇒ no deletions
+// to reconcile). Wired into event_gap recovery, transport re-hydration
+// (reconnects), and tab wake — the full refetch remains bootstrap-only.
+// No cursor (never fetched, or a pre-seq daemon) falls back to the full
+// refresh; a heal FAILURE keeps the cache and the cursor untouched (the
+// next signal retries; the data on screen stays live-known-stale).
+async function agendaHeal(reason) {
+  if (agendaItems === null || typeof agendaSeq !== 'number') return agendaRefresh();
+  if (agendaFetchInFlight) return agendaFetchInFlight;
+  agendaFetchInFlight = (async () => {
+    try {
+      const resp = await daemonApi.request('api_agenda_list', {
+        since_seq: agendaSeq,
+        shape: 'summary',
+      });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        for (const item of resp.body.items) {
+          const at = agendaItems.findIndex((x) => x.id === item.id);
+          // An event that landed while this pull was in flight may be
+          // newer than the pull's copy — never let the heal roll an
+          // item backwards (updated_ms is op-time, monotonic per item;
+          // ties take the incoming copy for its fresher decorations).
+          if (at >= 0 && (agendaItems[at].updated_ms || 0) > (item.updated_ms || 0)) continue;
+          if (at >= 0) agendaItems[at] = item;
+          else agendaItems.push(item);
+        }
+        agendaCounts = resp.body.counts || agendaCounts;
+        if (typeof resp.body.skipped_lines === 'number') agendaSkippedLines = resp.body.skipped_lines;
+        if (typeof resp.body.seq === 'number') agendaSeq = resp.body.seq;
+        // Delta joins cover the served (changed) set only — merge, never
+        // replace, so entries for untouched items survive.
+        Object.assign(agendaSessions, resp.body.sessions || {});
+        Object.assign(agendaPullRequests, resp.body.pull_requests || {});
+        resp.body.items
+          .flatMap(agendaItemSessionIds)
+          .forEach((id) => agendaSessionLookupsAttempted.add(id));
+        agendaLoadError = '';
+        // A parked ask that arrived while events were down re-surfaces
+        // exactly like one that arrived live.
+        agendaAnnounceParkedAsks();
+      }
+    } catch (e) {
+      console.warn('[agenda] heal failed', reason || '', e);
+    } finally {
+      agendaFetchInFlight = null;
+    }
+    agendaRenderAll();
+  })();
+  return agendaFetchInFlight;
+}
+
+// Tab wake: a hidden tab's event socket may have quietly gapped or the
+// browser throttled it — one cheap delta on return to visibility keeps
+// the surfaces honest (empty delta in the common case).
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && agendaItems !== null) agendaHeal('tab-wake');
+});
+
+// QA readback (window.qa convention — the whole SPA is one module
+// scope, so the harness reaches state only through this deliberate
+// seam). Serving-grain state for the Track AS QA gates: the resume
+// cursor, cache grain, and the healing wiring. Read-only.
+window.qa = Object.assign(window.qa || {}, {
+  agendaServing() {
+    const sample = Array.isArray(agendaItems) && agendaItems.length ? agendaItems[0] : null;
+    return {
+      seq: agendaSeq,
+      items: Array.isArray(agendaItems) ? agendaItems.length : null,
+      healWired: typeof agendaHeal === 'function',
+      summaryFeed: agendaRefresh.toString().includes("shape: 'summary'"),
+      servedFlagsAdopted: agendaItemIsBlocked.toString().includes('item.blocked'),
+      fullItemLane: typeof agendaFullItemFor === 'function',
+      fullItemsCached: agendaFullItems.size,
+      sampleIsSummary: sample ? !Array.isArray(sample.annotations) : null,
+      loadError: agendaLoadError || null,
+    };
+  },
+  async agendaHealNow() {
+    await agendaHeal('qa-probe');
+    return window.qa.agendaServing();
+  },
+});
 
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
 // question rail after a FRESH load — a daemon restart wipes the
@@ -91515,16 +91679,22 @@ function agendaAnnounceParkedAsks() {
   }
   const open = agendaItems
     .filter((item) => item.status === 'open'
-      && item.ask && item.ask.ask_id && Array.isArray(item.ask.questions)
-      && item.ask.questions.length && !item.dismissed)
+      && item.ask && item.ask.ask_id && !item.dismissed)
     // Oldest first, so with several parked asks the panel lands on the
     // newest — the same "latest ask surfaces" behavior live asks have.
     .sort((a, b) => (a.id < b.id ? -1 : 1));
   for (const item of open) {
     const askId = item.ask.ask_id;
     if (agendaAnnouncedAsks.has(askId)) continue;
+    // Summary rows carry the ask id but not the question payload (S5);
+    // the full copy comes from the item cache — a miss warms the fetch
+    // and the arrival re-runs this announce (dedupe makes it safe).
+    const full = Array.isArray(item.ask.questions) ? item : agendaFullItemFor(item.id);
+    if (!full || !full.ask || !Array.isArray(full.ask.questions) || !full.ask.questions.length) {
+      continue;
+    }
     agendaAnnouncedAsks.add(askId);
-    showUserQuestion(askId, item.ask.questions, '', undefined, false, { agendaBacked: true });
+    showUserQuestion(askId, full.ask.questions, '', undefined, false, { agendaBacked: true });
   }
 }
 
@@ -91532,8 +91702,18 @@ function agendaAnnounceParkedAsks() {
 // question section). Unlike the once-per-load announce this is a user
 // act: it re-surfaces even a tucked or previously-dismissed panel, and it
 // navigates to the Activity tab where the panel lives.
-function agendaOpenParkedAsk(itemId) {
-  const item = (agendaItems || []).find((candidate) => candidate.id === itemId);
+function agendaOpenParkedAsk(itemId, retriesLeft = 6) {
+  let item = (agendaItems || []).find((candidate) => candidate.id === itemId);
+  if (item && item.ask && item.ask.ask_id && !Array.isArray(item.ask.questions)) {
+    // Summary row (S5): the click needs the question payload — warm the
+    // full-item fetch and retry briefly (loopback resolves in ms).
+    const full = agendaFullItemFor(itemId);
+    if (!full) {
+      if (retriesLeft > 0) setTimeout(() => agendaOpenParkedAsk(itemId, retriesLeft - 1), 300);
+      return;
+    }
+    item = full;
+  }
   if (!item || !item.ask || !Array.isArray(item.ask.questions) || !item.ask.questions.length) {
     return;
   }
@@ -91601,10 +91781,16 @@ function agendaObserveServerMessage(d) {
     if (document.getElementById('ui2-agenda-card') || agendaTabVisible()) agendaRefresh();
     return;
   }
+  const row = agendaAdoptFullItem(d.item);
   const at = agendaItems.findIndex((item) => item.id === d.item.id);
-  if (at >= 0) agendaItems[at] = d.item;
-  else agendaItems.push(d.item);
+  if (at >= 0) agendaItems[at] = row;
+  else agendaItems.push(row);
   if (d.counts) agendaCounts = d.counts;
+  // Track AS S3: the event names its producing op — advance the resume
+  // cursor past it. max() because a delta pull may already sit ahead.
+  if (typeof d.seq === 'number') {
+    agendaSeq = Math.max(typeof agendaSeq === 'number' ? agendaSeq : 0, d.seq + 1);
+  }
   // A session id this tab has never tried to resolve (a fresh session
   // parked something): refetch once to pick up the join entry. Ids that
   // already failed resolution stay raw — no loops.
@@ -91724,10 +91910,13 @@ function agendaLinkState(link) {
   return { satisfied: false, review: '' };
 }
 
+// Track AS S5: `blocked` is SERVED (the daemon's serving-seam predicate
+// — one implementation, ruling §4.4; the client re-derivation is
+// deleted). Event-lane rows carry the flag forward from their replaced
+// summary and age until the next pull (the ruled Q4 freshness
+// contract); a row that has never been summarized wears no flag.
 function agendaItemIsBlocked(item) {
-  if (item.status !== 'open') return false;
-  if ((item.blockers || []).some((b) => !b.cleared)) return true;
-  return (item.relies_on || []).some((link) => !agendaLinkState(link).satisfied);
+  return item.blocked === true;
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
@@ -91841,14 +92030,12 @@ function agendaRelationPartners(item) {
 // group and labels the chip, and gates nothing (annotations are data).
 // The newest ranked triage note wins; an unranked one still marks the
 // item as triage-flagged.
+// Track AS S5: the rank/note now arrive SERVED (`item.triage`, derived
+// once at the daemon's serving seam from the same convention); the
+// client parse is deleted. Return shape unchanged for callers.
 function agendaTriageInfo(item) {
-  const notes = (item.annotations || []).filter((a) => a.source === 'triage');
-  if (!notes.length) return null;
-  for (let i = notes.length - 1; i >= 0; i--) {
-    const m = /rank (\d+)/.exec(notes[i].text || '');
-    if (m) return { rank: Number(m[1]), text: notes[i].text || '' };
-  }
-  return { rank: null, text: notes[notes.length - 1].text || '' };
+  if (!item.triage) return null;
+  return { rank: item.triage.rank ?? null, text: item.triage.note || '' };
 }
 
 function agendaActorLabel(p) {
@@ -93619,6 +93806,7 @@ function agendaWireScaffold() {
   });
   document.getElementById('ag2-search').addEventListener('input', (e) => {
     agendaSearch = e.target.value;
+    agendaServerSearchKick();
     agendaRenderTab();
   });
   document.getElementById('ag2-f-blocked').addEventListener('click', () => {
@@ -93773,8 +93961,45 @@ function agendaItemDigests(item) {
   return out;
 }
 
+// Track AS S5 — server-reach search. Summaries carry no bodies, so the
+// body reach moved to the daemon's `q=` (which also covers digests and
+// everything local matching covers): a debounced fetch resolves the
+// current query to an id set; local field matching stays as the
+// instant-feedback lane and the union renders. A failed/stale server
+// pass degrades to local-only — never a blank.
+let agendaServerSearch = { q: '', ids: null };
+let agendaServerSearchTimer = null;
+function agendaServerSearchKick() {
+  if (agendaServerSearchTimer) clearTimeout(agendaServerSearchTimer);
+  const q = agendaSearch.trim().toLowerCase();
+  if (!q) {
+    agendaServerSearch = { q: '', ids: null };
+    return;
+  }
+  agendaServerSearchTimer = setTimeout(async () => {
+    agendaServerSearchTimer = null;
+    try {
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary', q });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        // Only adopt if the query is still current (races drop stale).
+        if (agendaSearch.trim().toLowerCase() === q) {
+          agendaServerSearch = { q, ids: new Set(resp.body.items.map((x) => x.id)) };
+          agendaRenderTab();
+        }
+      }
+    } catch (e) {
+      console.warn('[agenda] server search failed', e);
+    }
+  }, 250);
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Server-resolved hits for the live query (body + digest reach).
+  if (agendaServerSearch.ids && agendaServerSearch.q === q
+    && agendaServerSearch.ids.has(item.id)) {
+    return true;
+  }
   // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
   // lowercased) match any digest the item owns, resolving to the
   // owning item exactly like an id search. The 8-char floor sits under
@@ -93790,25 +94015,12 @@ function agendaSearchMatch(item, q) {
     || String(item.id || '').toLowerCase().includes(q);
 }
 
-// The un-triaged frontier — the triage mandate's declared scope: open
-// items newer than the newest triage summary (`triage:summary` tag), or
-// unplaced with no triage annotation; summaries themselves excluded, and
-// so are daemon-parked items that are currently placed (Track PR ruling
-// 2, the mirror-writer exemption: a PR anchor the scanner parked and
-// filed arrives already placed and described — "untriaged" is false of
-// it; unfiling one re-admits it). A render-side convention over ordinary
-// data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
-// and the four expressions (ctl, this, docs, the triage definition)
-// move together.
+// The un-triaged frontier — the triage mandate's declared scope.
+// Track AS S5: `frontier` is SERVED (the daemon's serving-seam
+// predicate — one implementation replacing the ctl/SPA/triage-definition
+// prose triple; ruling §4.4). Event-lane rows age per the Q4 contract.
 function agendaFrontierPredicate() {
-  const newestSummary = Math.max(0, ...(agendaItems || [])
-    .filter((x) => (x.tags || []).includes('triage:summary'))
-    .map((x) => (x.provenance && x.provenance.created_ms) || 0));
-  return (x) => x.status === 'open'
-    && !(x.tags || []).includes('triage:summary')
-    && !(x.part_of && x.provenance && x.provenance.kind === 'daemon')
-    && (((x.provenance && x.provenance.created_ms) || 0) > newestSummary
-      || (!x.part_of && !(x.annotations || []).some((a) => a.source === 'triage')));
+  return (x) => x.frontier === true;
 }
 
 function agendaFilteredPool() {
@@ -94831,9 +95043,12 @@ function agendaRenderTab() {
   const bellDot = document.getElementById('ag2-bell-dot');
   if (bellDot) bellDot.hidden = !agendaQuietNow();
 
-  // Ledger + load/loading states.
+  // Ledger + load/loading states. A failed refresh with data in hand
+  // renders the DATA plus a stale notice — never a blank over a live
+  // cache (Track AS S3, the abort-resilience bridge: the since_seq
+  // healing lane retries on the next gap/wake/reconnect signal).
   const ledger = document.getElementById('ag2-ledger');
-  if (agendaLoadError) {
+  if (agendaLoadError && agendaItems === null) {
     agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
     ledger.textContent = '';
@@ -94848,10 +95063,13 @@ function agendaRenderTab() {
   const skipped = agendaSkippedLines > 0
     ? ` · ${agendaSkippedLines} newer-build line${agendaSkippedLines === 1 ? '' : 's'} preserved unfolded (an older binary never destroys history it can’t read)`
     : '';
+  const stale = agendaLoadError
+    ? ` · last refresh failed (showing last-known data): ${agendaLoadError}`
+    : '';
   // Real ops truth from GET /api/agenda/ops (slice D, ui2-agenda-hood.js):
   // the segment renders once fetched; the sync fetches only while this
   // tab is visible and the data signature moved.
-  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}`;
+  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}${stale}`;
   agendaLedgerOpsSync();
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
@@ -95093,7 +95311,13 @@ function agendaInspectorRender() {
     host.addEventListener('keydown', agendaInspKeydown);
     if (backdrop) backdrop.addEventListener('click', () => agendaCloseInspector());
   }
-  const item = agendaSelId ? agendaFindItem(agendaSelId) : null;
+  // Track AS S5: the inspector renders the FULL item (body, thread,
+  // ask questions, manifests). The list feed is summaries, so the full
+  // copy comes from the item-route cache — a miss renders the summary
+  // degraded (loading hints where full-only sections go) and the
+  // arrival repaints.
+  const summary = agendaSelId ? agendaFindItem(agendaSelId) : null;
+  const item = agendaSelId ? agendaFullItemFor(agendaSelId) || summary : null;
   if (!item) {
     // Selection gone (retired elsewhere, fold moved): close honestly.
     agendaSelId = null;
@@ -95370,6 +95594,10 @@ function agendaInspDetailsHtml(item) {
     </div>`;
   } else if (item.body) {
     body = `<div class="ag2-insp-body">${escapeHtml(item.body)}</div>`;
+  } else if (!Array.isArray(item.annotations)) {
+    // Summary row (S5): the full copy is being fetched — say so instead
+    // of passing "no body yet" off as "no body".
+    body = '<div class="ag2-hint">Loading detail…</div>';
   } else {
     body = '<div class="ag2-hint">No body — the title is the whole note.</div>';
   }
@@ -95804,6 +96032,12 @@ function agendaInspRefsHtml(item) {
 // ---- Thread ----
 
 function agendaInspThreadHtml(item) {
+  if (!Array.isArray(item.annotations)) {
+    // Summary row (S5): the thread rides the full item, being fetched.
+    const n = item.annotations_count || 0;
+    return `<section class="ag2-sec"><div class="ag2-hint">${n
+      ? `Loading the ${n}-note thread…` : 'Loading detail…'}</div></section>`;
+  }
   const notes = item.annotations || [];
   const all = agendaExpandedThreads.has(item.id);
   const shown = all ? notes : notes.slice(-3);
@@ -95842,7 +96076,10 @@ function agendaInspThreadHtml(item) {
 // ---- Inspector event delegation ----
 
 function agendaInspItem() {
-  return agendaSelId ? agendaFindItem(agendaSelId) : null;
+  // Full copy when the cache has one (S5); summary otherwise — action
+  // handlers only need ids/status, which both shapes carry.
+  if (!agendaSelId) return null;
+  return agendaFullItemFor(agendaSelId) || agendaFindItem(agendaSelId);
 }
 
 function agendaInspClick(e) {
@@ -104088,6 +104325,19 @@ async function hydrateDashboardFromControl() {
   for (const frame of frames) {
     if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(frame);
   }
+  // Agenda heal (Track AS S3): events missed while the transport was
+  // down are unrecoverable from the frame replay above — the since_seq
+  // delta pull recovers exactly them (full refetch only when no cursor
+  // is held). Fire-and-forget: hydration must not fail on a lagging
+  // agenda lane.
+  if (typeof agendaHeal === 'function') {
+    try {
+      const healed = agendaHeal('transport-rehydrate');
+      if (healed && typeof healed.catch === 'function') {
+        healed.catch(err => console.warn('[dashboard-control] rehydrate agenda heal failed', err));
+      }
+    } catch (err) { console.warn('[dashboard-control] rehydrate agenda heal failed', err); }
+  }
   dashboardUpdateTransportStatus();
 }
 
@@ -106997,6 +107247,17 @@ function dashboardHandleEventGap(msg, lane = 'tunnel') {
     }
     if (typeof refreshHistory === 'function') {
       try { refreshHistory(); } catch (err) { console.warn('[server-msg] event_gap history refresh failed', err); }
+    }
+    // Agenda heal (Track AS S3): a since_seq delta pull, so it runs on
+    // EVERY gap without the bootstrap re-pull's rate limit — the missed
+    // agenda_changed events are exactly what the cursor recovers.
+    if (typeof agendaHeal === 'function') {
+      try {
+        const healed = agendaHeal('event_gap');
+        if (healed && typeof healed.catch === 'function') {
+          healed.catch(err => console.warn('[server-msg] event_gap agenda heal failed', err));
+        }
+      } catch (err) { console.warn('[server-msg] event_gap agenda heal failed', err); }
     }
     const now = Date.now();
     if (

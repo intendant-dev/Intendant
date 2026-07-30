@@ -38,12 +38,13 @@ mod scheduler;
 mod sealed_blobs;
 mod spawn_project;
 mod store;
+mod summary;
 mod types;
 
 pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;
 pub(crate) use definitions::materialize_house_definitions;
-pub(crate) use handle::{AgendaHandle, SessionAgendaEnvelope};
+pub(crate) use handle::{AgendaHandle, AgendaPrefixResolution, SessionAgendaEnvelope};
 pub(crate) use reminders::{
     journal_generation_floor, AgendaOccurrencesPage, OccurrenceState, ReminderPolicyPatch,
     SessionLineageRole, AGENDA_OCCURRENCES_DEFAULT_LIMIT,
@@ -54,6 +55,7 @@ pub(crate) use store::{
     attestation_ref_drift, binding_ref_drift, digest_file, file_ref_drift, AgendaError,
     AgendaOpsPage, AgendaStore, AGENDA_OPS_DEFAULT_LIMIT,
 };
+pub(crate) use summary::{matches_query, summarize};
 pub(crate) use types::{
     AgendaActor, AgendaAnswer, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaRefSpec,
     AgendaRefType, AgendaStatus,

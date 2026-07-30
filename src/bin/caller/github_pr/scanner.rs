@@ -302,7 +302,7 @@ pub(crate) async fn scan_once(
         // Feed the tier-1 render join before planning: the list read
         // already paid for this state; rendering must never re-fetch it.
         tier1.update_repo(repo, &open);
-        let snapshot = agenda.snapshot().items;
+        let snapshot = agenda.snapshot();
         let anchors = anchors_for_repo(&snapshot, repo);
         let actions = plan_repo(&anchors, &open);
         if actions.is_empty() {
@@ -317,7 +317,7 @@ pub(crate) async fn scan_once(
                     };
                     let hub = match &hub_id {
                         Some(id) => id.clone(),
-                        None => match find_or_create_hub(agenda, &agenda.snapshot().items) {
+                        None => match find_or_create_hub(agenda, &agenda.snapshot()) {
                             Ok(id) => {
                                 hub_id = Some(id.clone());
                                 id
@@ -389,7 +389,7 @@ pub(crate) async fn scan_once(
                     }
                     // State-checked executor: re-entry after a crash
                     // between these ops must not duplicate any of them.
-                    let current = agenda.snapshot().items;
+                    let current = agenda.snapshot();
                     let Some(item) = current.iter().find(|i| i.id == item_id) else {
                         continue;
                     };
@@ -445,7 +445,7 @@ pub(crate) async fn scan_once(
                         summary.reopened += 1;
                         let hub = match &hub_id {
                             Some(id) => Some(id.clone()),
-                            None => match find_or_create_hub(agenda, &agenda.snapshot().items) {
+                            None => match find_or_create_hub(agenda, &agenda.snapshot()) {
                                 Ok(id) => {
                                     hub_id = Some(id.clone());
                                     Some(id)
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(summary.parked, 2);
         assert!(summary.errors.is_empty());
 
-        let snapshot = agenda.snapshot().items;
+        let snapshot = agenda.snapshot();
         let hub = snapshot
             .iter()
             .find(|i| i.tags.iter().any(|t| t == PRS_HUB_TAG))
@@ -882,7 +882,7 @@ mod tests {
         let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary.completed, 1);
 
-        let snapshot = agenda.snapshot().items;
+        let snapshot = agenda.snapshot();
         let anchor = snapshot
             .iter()
             .find(|i| i.refs.iter().any(|r| r.locator.ends_with("/pull/2")))
@@ -913,7 +913,7 @@ mod tests {
         let summary = scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         assert_eq!(summary.reopened, 1);
         assert_eq!(summary.parked, 0);
-        let snapshot = agenda.snapshot().items;
+        let snapshot = agenda.snapshot();
         assert_eq!(snapshot.len(), items_after_merge, "no duplicate anchor");
         let anchor = snapshot.iter().find(|i| i.id == anchor_id).unwrap();
         assert_eq!(anchor.status, AgendaStatus::Open);
@@ -937,7 +937,6 @@ mod tests {
         scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         let anchor_id = agenda
             .snapshot()
-            .items
             .iter()
             .find(|i| i.tags.iter().any(|t| t == PR_TAG))
             .unwrap()
@@ -970,7 +969,7 @@ mod tests {
             );
             scan_once(&agenda, &client, &["o/r".to_string()], &mut state, &tier1).await;
         }
-        let snapshot = agenda.snapshot().items;
+        let snapshot = agenda.snapshot();
         let anchor = snapshot.iter().find(|i| i.id == anchor_id).unwrap();
         assert_eq!(anchor.status, AgendaStatus::Retired);
         let notes = anchor

@@ -200,27 +200,33 @@ impl IntendantServer {
                 .map_err(|_| format!("unknown status '{s}' (open, done, or retired)"))
             })
             .transpose()?;
-        // Delta first, status second: the two filters compose (a delta
-        // pull may still want only open items). Absent both = the frozen
-        // bare full-ledger shape (ruling R-AS1).
-        let snapshot = match params.since_seq {
-            Some(cursor) => agenda.changed_since(cursor),
-            None => agenda.snapshot(),
+        // The additive filters compose: delta cursor, then search, then
+        // status; `shape` picks the item grain last. Absent all = the
+        // frozen bare full-ledger shape (ruling R-AS1).
+        let summary = match params.shape.as_deref().map(str::trim) {
+            None | Some("") | Some("full") => false,
+            Some("summary") => true,
+            Some(other) => return Err(format!("unknown shape '{other}' (full or summary)")),
         };
-        let (mut items, counts, skipped_lines, seq) = (
-            snapshot.items,
-            snapshot.counts,
-            snapshot.skipped_lines,
-            snapshot.seq,
-        );
+        let read = agenda.serving_read(params.since_seq);
+        let mut items = read.served;
+        if let Some(q) = params.q.as_deref().filter(|q| !q.trim().is_empty()) {
+            items.retain(|item| crate::agenda::matches_query(item, q));
+        }
         if let Some(status) = status {
             items.retain(|item| item.status == status);
         }
+        let items_value = if summary {
+            serde_json::to_value(crate::agenda::summarize(&read.all, &items))
+        } else {
+            serde_json::to_value(&items)
+        }
+        .map_err(|err| format!("encoding agenda items: {err}"))?;
         Ok(serde_json::json!({
-            "items": items,
-            "counts": counts,
-            "skipped_lines": skipped_lines,
-            "seq": seq,
+            "items": items_value,
+            "counts": read.counts,
+            "skipped_lines": read.skipped_lines,
+            "seq": read.seq,
         }))
     }
 
@@ -3429,6 +3435,8 @@ pub(crate) mod tests {
             .agenda_list_inner(AgendaListParams {
                 status: None,
                 since_seq: None,
+                shape: None,
+                q: None,
             })
             .await
             .expect("bare agenda_list");
@@ -3496,6 +3504,8 @@ pub(crate) mod tests {
             .agenda_list_inner(AgendaListParams {
                 status: None,
                 since_seq: Some(1),
+                shape: None,
+                q: None,
             })
             .await
             .expect("delta agenda_list");
@@ -3507,6 +3517,8 @@ pub(crate) mod tests {
             .agenda_list_inner(AgendaListParams {
                 status: Some("open".into()),
                 since_seq: Some(1),
+                shape: None,
+                q: None,
             })
             .await
             .expect("composed filters");
