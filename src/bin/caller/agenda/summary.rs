@@ -104,12 +104,22 @@ pub(crate) struct SummaryAnswer {
     pub(crate) session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delivered: Option<bool>,
+    /// The structured rich-ask breakdown — answered question cards
+    /// render per-question selections ungated (render-completeness law).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) structured: Option<super::types::AgendaAskResolution>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SummaryAsk {
     pub(crate) ask_id: u64,
-    pub(crate) questions: u32,
+    pub(crate) questions_count: u32,
+    /// The question payload itself — carried ONLY while the ask is live
+    /// (open, undismissed): the attention rail and the card's inline
+    /// answer composer render it ungated. Resolved/dismissed asks slim
+    /// to the count; the inspector fetches the item for history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) questions: Option<Vec<crate::types::UserQuestion>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,28 +150,64 @@ pub(crate) struct SummaryRef {
     pub(crate) label: Option<String>,
 }
 
+/// One effect at summary grain: everything the cards' effect strips and
+/// the Automations lens render ungated (state derivation inputs, the
+/// proposer line, streak/attestation honesty) — MINUS the manifest's
+/// `goal` (the single heaviest manifest field, inspector-only) and the
+/// run/attestation plumbing beyond what strips show. Sub-shapes mirror
+/// the full DTO's field paths (`approval.digest`, `manifest.recurrence`,
+/// `last_run.attestation.outcome`) so lens code reads both grains.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SummaryEffect {
     pub(crate) effect_id: String,
     pub(crate) digest: String,
-    /// The proposing session (the who-line's join key on effect chips).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) proposed_session_id: Option<String>,
-    /// `armed` (approval bound) / `proposed` / `suspended` (recurrence
-    /// failure ceiling reached — the planner's own predicate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_kind: Option<String>,
+    /// `armed` (approval bound) / `proposed` / `suspended` (failure
+    /// ceiling reached — the planner's own predicate). A convenience
+    /// digest of the parts below; ctl/tool consumers read it without
+    /// re-deriving.
     pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) approval_digest: Option<String>,
+    pub(crate) approval: Option<SummaryApproval>,
+    pub(crate) manifest: SummaryManifest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_fire_ms: Option<u64>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) recurring: bool,
-    /// The trigger kind (`on_unblock` / `on_item_match`) when the
-    /// manifest is event-fired.
+    pub(crate) consecutive_failures: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) trigger: Option<&'static str>,
+    pub(crate) last_run_attempt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_run: Option<SummaryRun>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SummaryApproval {
+    pub(crate) digest: String,
+    pub(crate) at_ms: u64,
+}
+
+/// The digest-bound manifest minus `goal` (and minus nothing else that
+/// strips render): fire instant, cadence, trigger, executor pins,
+/// project pin. Field names mirror [`super::types::SessionManifest`].
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SummaryManifest {
+    pub(crate) fire_at_ms: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) orchestrate: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) interactive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recurrence: Option<super::types::RecurrenceSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trigger: Option<super::types::TriggerSpec>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +216,17 @@ pub(crate) struct SummaryRun {
     pub(crate) at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// The fired session's self-report (Track AO), outcome + note only —
+    /// the suspended strip renders "last self-report: blocked — …".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attestation: Option<SummaryAttestation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SummaryAttestation {
+    pub(crate) outcome: super::types::AttestationOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,10 +271,13 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             at_ms: answer.at_ms,
             session_id: answer.session_id.clone(),
             delivered: answer.delivered,
+            structured: answer.structured.clone(),
         }),
         ask: item.ask.as_ref().map(|ask| SummaryAsk {
             ask_id: ask.ask_id,
-            questions: ask.questions.len() as u32,
+            questions_count: ask.questions.len() as u32,
+            questions: (item.status == AgendaStatus::Open && item.dismissed.is_none())
+                .then(|| ask.questions.clone()),
         }),
         dismissed: item.dismissed.is_some(),
         blockers: item
@@ -265,6 +325,8 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
                 effect_id: effect.effect_id.clone(),
                 digest: effect.digest.clone(),
                 proposed_session_id: effect.proposed_session_id.clone(),
+                proposed_principal: effect.proposed_principal.clone(),
+                proposed_kind: effect.proposed_kind.clone(),
                 state: if effect.suspended() {
                     "suspended"
                 } else if effect.approval.is_some() {
@@ -272,17 +334,30 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
                 } else {
                     "proposed"
                 },
-                approval_digest: effect.approval.as_ref().map(|a| a.digest.clone()),
-                next_fire_ms: effect.next_fire_ms,
-                recurring: effect.manifest.recurrence.is_some(),
-                trigger: effect.manifest.trigger.as_ref().map(|t| match t {
-                    super::types::TriggerSpec::OnUnblock => "on_unblock",
-                    super::types::TriggerSpec::OnItemMatch { .. } => "on_item_match",
+                approval: effect.approval.as_ref().map(|approval| SummaryApproval {
+                    digest: approval.digest.clone(),
+                    at_ms: approval.at_ms,
                 }),
+                manifest: SummaryManifest {
+                    fire_at_ms: effect.manifest.fire_at_ms,
+                    orchestrate: effect.manifest.orchestrate,
+                    interactive: effect.manifest.interactive,
+                    project_root: effect.manifest.project_root.clone(),
+                    agent_config: effect.manifest.agent_config.clone(),
+                    recurrence: effect.manifest.recurrence,
+                    trigger: effect.manifest.trigger.clone(),
+                },
+                next_fire_ms: effect.next_fire_ms,
+                consecutive_failures: effect.consecutive_failures,
+                last_run_attempt: effect.last_run_attempt,
                 last_run: effect.last_run.as_ref().map(|run| SummaryRun {
                     state: run.state.clone(),
                     at_ms: run.at_ms,
                     session_id: run.session_id.clone(),
+                    attestation: run.attestation.as_ref().map(|att| SummaryAttestation {
+                        outcome: att.outcome,
+                        note: att.note.clone(),
+                    }),
                 }),
             })
             .collect(),
@@ -588,6 +663,72 @@ mod tests {
             wire.get("body").is_none(),
             "bodies stay excluded from the summary shape (Q3)"
         );
+
+        // The effect strip's render inputs ride the summary — manifest
+        // WITHOUT its goal (the heavy field stays inspector-only), the
+        // approval sub-shape mirroring the full DTO's path, and the
+        // state digest.
+        let dep = summaries.iter().find(|s| s.id == dependent.id).unwrap();
+        let dep_wire = serde_json::to_value(dep).unwrap();
+        let eff = &dep_wire["effects"][0];
+        assert_eq!(eff["manifest"]["fire_at_ms"], 4_102_444_800_000u64);
+        assert!(
+            eff["manifest"].get("goal").is_none(),
+            "manifest goals stay excluded from the summary shape"
+        );
+        assert_eq!(eff["state"], "proposed");
+    }
+
+    /// Live asks carry their question payload on the summary (the rail
+    /// and the card composer render them ungated); resolved asks slim to
+    /// the count — history is full-item material.
+    #[test]
+    fn live_asks_ride_the_summary_resolved_asks_slim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let parked = store
+            .apply_command(
+                AgendaCommand::Ask {
+                    questions: vec![crate::mcp::AskUserQuestionParams {
+                        question: "ship it?".into(),
+                        header: Some("Ship".into()),
+                        options: Vec::new(),
+                        pick_min: None,
+                        pick_max: None,
+                        free_text: None,
+                        previews: Vec::new(),
+                    }],
+                },
+                owner(),
+                1000,
+            )
+            .unwrap();
+        let all = store.snapshot();
+        let live = summarize(&all, &all);
+        let ask = live[0].ask.as_ref().expect("ask on the summary");
+        assert_eq!(ask.questions_count, 1);
+        assert!(
+            ask.questions.as_ref().is_some_and(|qs| qs.len() == 1),
+            "open ask carries its questions"
+        );
+
+        store
+            .apply_command(
+                AgendaCommand::Answer {
+                    id: parked.id.clone(),
+                    text: "yes".into(),
+                    structured: None,
+                    source: None,
+                },
+                owner(),
+                2000,
+            )
+            .unwrap();
+        let all = store.snapshot();
+        let resolved = summarize(&all, &all);
+        let ask = resolved[0].ask.as_ref().expect("ask history marker");
+        assert!(ask.questions.is_none(), "resolved ask slims to the count");
+        assert_eq!(ask.questions_count, 1);
     }
 
     /// The server search covers the client search's exact reach: id,

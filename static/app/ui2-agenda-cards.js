@@ -233,6 +233,7 @@ function agendaWireScaffold() {
   });
   document.getElementById('ag2-search').addEventListener('input', (e) => {
     agendaSearch = e.target.value;
+    agendaServerSearchKick();
     agendaRenderTab();
   });
   document.getElementById('ag2-f-blocked').addEventListener('click', () => {
@@ -387,8 +388,45 @@ function agendaItemDigests(item) {
   return out;
 }
 
+// Track AS S5 — server-reach search. Summaries carry no bodies, so the
+// body reach moved to the daemon's `q=` (which also covers digests and
+// everything local matching covers): a debounced fetch resolves the
+// current query to an id set; local field matching stays as the
+// instant-feedback lane and the union renders. A failed/stale server
+// pass degrades to local-only — never a blank.
+let agendaServerSearch = { q: '', ids: null };
+let agendaServerSearchTimer = null;
+function agendaServerSearchKick() {
+  if (agendaServerSearchTimer) clearTimeout(agendaServerSearchTimer);
+  const q = agendaSearch.trim().toLowerCase();
+  if (!q) {
+    agendaServerSearch = { q: '', ids: null };
+    return;
+  }
+  agendaServerSearchTimer = setTimeout(async () => {
+    agendaServerSearchTimer = null;
+    try {
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary', q });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        // Only adopt if the query is still current (races drop stale).
+        if (agendaSearch.trim().toLowerCase() === q) {
+          agendaServerSearch = { q, ids: new Set(resp.body.items.map((x) => x.id)) };
+          agendaRenderTab();
+        }
+      }
+    } catch (e) {
+      console.warn('[agenda] server search failed', e);
+    }
+  }, 250);
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Server-resolved hits for the live query (body + digest reach).
+  if (agendaServerSearch.ids && agendaServerSearch.q === q
+    && agendaServerSearch.ids.has(item.id)) {
+    return true;
+  }
   // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
   // lowercased) match any digest the item owns, resolving to the
   // owning item exactly like an id search. The 8-char floor sits under
@@ -414,15 +452,11 @@ function agendaSearchMatch(item, q) {
 // data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
 // and the four expressions (ctl, this, docs, mandate template) move
 // together.
+// Track AS S5: `frontier` is SERVED (the daemon's serving-seam
+// predicate — one implementation replacing the ctl/SPA/mandate-prose
+// triple; ruling §4.4). Event-lane rows age per the Q4 contract.
 function agendaFrontierPredicate() {
-  const newestSummary = Math.max(0, ...(agendaItems || [])
-    .filter((x) => (x.tags || []).includes('triage:summary'))
-    .map((x) => (x.provenance && x.provenance.created_ms) || 0));
-  return (x) => x.status === 'open'
-    && !(x.tags || []).includes('triage:summary')
-    && !(x.part_of && x.provenance && x.provenance.kind === 'daemon')
-    && (((x.provenance && x.provenance.created_ms) || 0) > newestSummary
-      || (!x.part_of && !(x.annotations || []).some((a) => a.source === 'triage')));
+  return (x) => x.frontier === true;
 }
 
 function agendaFilteredPool() {

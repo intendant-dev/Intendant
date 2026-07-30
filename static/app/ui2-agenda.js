@@ -118,7 +118,10 @@ async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
   agendaFetchInFlight = (async () => {
     try {
-      const resp = await daemonApi.request('api_agenda_list', {});
+      // Track AS S5: the list feed is SUMMARIES (titles, chips, edges,
+      // served flags — ~9× lighter than full items); the inspector and
+      // expansions fetch one full item on demand (agendaFullItemFor).
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary' });
       if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
         agendaItems = resp.body.items;
         agendaCounts = resp.body.counts || agendaCounts;
@@ -144,6 +147,73 @@ async function agendaRefresh() {
   return agendaFetchInFlight;
 }
 
+// Track AS S5 — the full-item side cache: the inspector and expansions
+// read FULL items (body, annotation thread, ask questions, manifests)
+// fetched one at a time from the item route; the list feed stays
+// summaries. Entries are keyed by id and validated by updated_ms — a
+// newer summary/event for the id invalidates a staler full copy at read
+// time (no eviction sweep needed; the map is bounded by items ever
+// inspected this page-load plus event arrivals).
+const agendaFullItems = new Map();
+const agendaFullFetchesInFlight = new Set();
+
+// The freshest FULL item for `id` if the cache has one at least as new
+// as the list's summary row; otherwise fires one background fetch
+// (single-flight per id) and returns null — callers render the summary
+// degraded and repaint on arrival.
+function agendaFullItemFor(id) {
+  if (!id) return null;
+  const summary = agendaFindItem(id);
+  const cached = agendaFullItems.get(id);
+  if (cached && (!summary || (cached.updated_ms || 0) >= (summary.updated_ms || 0))) {
+    return cached;
+  }
+  if (!agendaFullFetchesInFlight.has(id)) {
+    agendaFullFetchesInFlight.add(id);
+    (async () => {
+      try {
+        const resp = await daemonApi.request('api_agenda_item', { item_id: id });
+        if (resp.ok && resp.body && resp.body.item) {
+          agendaFullItems.set(id, resp.body.item);
+          // The per-item join may resolve ids the list join skipped.
+          Object.assign(agendaSessions, resp.body.sessions || {});
+          Object.assign(agendaPullRequests, resp.body.pull_requests || {});
+        }
+      } catch (e) {
+        console.warn('[agenda] full-item fetch failed', id, e);
+      } finally {
+        agendaFullFetchesInFlight.delete(id);
+        agendaRenderAll();
+        if (typeof agendaInspectorRender === 'function') agendaInspectorRender();
+        // A parked-ask announce may have been waiting on this item's
+        // question payload (announce dedupes by ask id — idempotent).
+        agendaAnnounceParkedAsks();
+      }
+    })();
+  }
+  return null;
+}
+
+// Adopt a FULL item arriving outside the summary feed (the
+// `agenda_changed` event lane, op-response merges): file it in the
+// full-item cache, and shape a summary-compatible row for the list —
+// slim derivations only (counts), never predicate re-derivation. The
+// served flags (blocked/frontier/triage) carry over from the replaced
+// summary row and AGE until the next summary pull refreshes them — the
+// ruled Q4 decoration-freshness contract; a brand-new item wears no
+// flags until first summarized.
+function agendaAdoptFullItem(full) {
+  agendaFullItems.set(full.id, full);
+  const prior = agendaFindItem(full.id);
+  const row = Object.assign({}, full, {
+    annotations_count: Array.isArray(full.annotations) ? full.annotations.length : 0,
+    blocked: prior ? prior.blocked : undefined,
+    frontier: prior ? prior.frontier : undefined,
+    triage: prior ? prior.triage : undefined,
+  });
+  return row;
+}
+
 // Track AS S3 — the healing lane. A held cursor turns "did I miss
 // anything?" into a delta pull (`since_seq`): the daemon returns only
 // items changed by ops at or after the cursor, upserted over the cache
@@ -158,7 +228,10 @@ async function agendaHeal(reason) {
   if (agendaFetchInFlight) return agendaFetchInFlight;
   agendaFetchInFlight = (async () => {
     try {
-      const resp = await daemonApi.request('api_agenda_list', { since_seq: agendaSeq });
+      const resp = await daemonApi.request('api_agenda_list', {
+        since_seq: agendaSeq,
+        shape: 'summary',
+      });
       if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
         for (const item of resp.body.items) {
           const at = agendaItems.findIndex((x) => x.id === item.id);
@@ -202,6 +275,31 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && agendaItems !== null) agendaHeal('tab-wake');
 });
 
+// QA readback (window.qa convention — the whole SPA is one module
+// scope, so the harness reaches state only through this deliberate
+// seam). Serving-grain state for the Track AS QA gates: the resume
+// cursor, cache grain, and the healing wiring. Read-only.
+window.qa = Object.assign(window.qa || {}, {
+  agendaServing() {
+    const sample = Array.isArray(agendaItems) && agendaItems.length ? agendaItems[0] : null;
+    return {
+      seq: agendaSeq,
+      items: Array.isArray(agendaItems) ? agendaItems.length : null,
+      healWired: typeof agendaHeal === 'function',
+      summaryFeed: agendaRefresh.toString().includes("shape: 'summary'"),
+      servedFlagsAdopted: agendaItemIsBlocked.toString().includes('item.blocked'),
+      fullItemLane: typeof agendaFullItemFor === 'function',
+      fullItemsCached: agendaFullItems.size,
+      sampleIsSummary: sample ? !Array.isArray(sample.annotations) : null,
+      loadError: agendaLoadError || null,
+    };
+  },
+  async agendaHealNow() {
+    await agendaHeal('qa-probe');
+    return window.qa.agendaServing();
+  },
+});
+
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
 // question rail after a FRESH load — a daemon restart wipes the
 // state-line replay cache, and a parked question must not evaporate with
@@ -225,16 +323,22 @@ function agendaAnnounceParkedAsks() {
   }
   const open = agendaItems
     .filter((item) => item.status === 'open'
-      && item.ask && item.ask.ask_id && Array.isArray(item.ask.questions)
-      && item.ask.questions.length && !item.dismissed)
+      && item.ask && item.ask.ask_id && !item.dismissed)
     // Oldest first, so with several parked asks the panel lands on the
     // newest — the same "latest ask surfaces" behavior live asks have.
     .sort((a, b) => (a.id < b.id ? -1 : 1));
   for (const item of open) {
     const askId = item.ask.ask_id;
     if (agendaAnnouncedAsks.has(askId)) continue;
+    // Summary rows carry the ask id but not the question payload (S5);
+    // the full copy comes from the item cache — a miss warms the fetch
+    // and the arrival re-runs this announce (dedupe makes it safe).
+    const full = Array.isArray(item.ask.questions) ? item : agendaFullItemFor(item.id);
+    if (!full || !full.ask || !Array.isArray(full.ask.questions) || !full.ask.questions.length) {
+      continue;
+    }
     agendaAnnouncedAsks.add(askId);
-    showUserQuestion(askId, item.ask.questions, '', undefined, false, { agendaBacked: true });
+    showUserQuestion(askId, full.ask.questions, '', undefined, false, { agendaBacked: true });
   }
 }
 
@@ -242,8 +346,18 @@ function agendaAnnounceParkedAsks() {
 // question section). Unlike the once-per-load announce this is a user
 // act: it re-surfaces even a tucked or previously-dismissed panel, and it
 // navigates to the Activity tab where the panel lives.
-function agendaOpenParkedAsk(itemId) {
-  const item = (agendaItems || []).find((candidate) => candidate.id === itemId);
+function agendaOpenParkedAsk(itemId, retriesLeft = 6) {
+  let item = (agendaItems || []).find((candidate) => candidate.id === itemId);
+  if (item && item.ask && item.ask.ask_id && !Array.isArray(item.ask.questions)) {
+    // Summary row (S5): the click needs the question payload — warm the
+    // full-item fetch and retry briefly (loopback resolves in ms).
+    const full = agendaFullItemFor(itemId);
+    if (!full) {
+      if (retriesLeft > 0) setTimeout(() => agendaOpenParkedAsk(itemId, retriesLeft - 1), 300);
+      return;
+    }
+    item = full;
+  }
   if (!item || !item.ask || !Array.isArray(item.ask.questions) || !item.ask.questions.length) {
     return;
   }
@@ -311,9 +425,10 @@ function agendaObserveServerMessage(d) {
     if (document.getElementById('ui2-agenda-card') || agendaTabVisible()) agendaRefresh();
     return;
   }
+  const row = agendaAdoptFullItem(d.item);
   const at = agendaItems.findIndex((item) => item.id === d.item.id);
-  if (at >= 0) agendaItems[at] = d.item;
-  else agendaItems.push(d.item);
+  if (at >= 0) agendaItems[at] = row;
+  else agendaItems.push(row);
   if (d.counts) agendaCounts = d.counts;
   // Track AS S3: the event names its producing op — advance the resume
   // cursor past it. max() because a delta pull may already sit ahead.
@@ -439,10 +554,13 @@ function agendaLinkState(link) {
   return { satisfied: false, review: '' };
 }
 
+// Track AS S5: `blocked` is SERVED (the daemon's serving-seam predicate
+// — one implementation, ruling §4.4; the client re-derivation is
+// deleted). Event-lane rows carry the flag forward from their replaced
+// summary and age until the next pull (the ruled Q4 freshness
+// contract); a row that has never been summarized wears no flag.
 function agendaItemIsBlocked(item) {
-  if (item.status !== 'open') return false;
-  if ((item.blockers || []).some((b) => !b.cleared)) return true;
-  return (item.relies_on || []).some((link) => !agendaLinkState(link).satisfied);
+  return item.blocked === true;
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
@@ -556,14 +674,12 @@ function agendaRelationPartners(item) {
 // group and labels the chip, and gates nothing (annotations are data).
 // The newest ranked triage note wins; an unranked one still marks the
 // item as triage-flagged.
+// Track AS S5: the rank/note now arrive SERVED (`item.triage`, derived
+// once at the daemon's serving seam from the same convention); the
+// client parse is deleted. Return shape unchanged for callers.
 function agendaTriageInfo(item) {
-  const notes = (item.annotations || []).filter((a) => a.source === 'triage');
-  if (!notes.length) return null;
-  for (let i = notes.length - 1; i >= 0; i--) {
-    const m = /rank (\d+)/.exec(notes[i].text || '');
-    if (m) return { rank: Number(m[1]), text: notes[i].text || '' };
-  }
-  return { rank: null, text: notes[notes.length - 1].text || '' };
+  if (!item.triage) return null;
+  return { rank: item.triage.rank ?? null, text: item.triage.note || '' };
 }
 
 function agendaActorLabel(p) {
