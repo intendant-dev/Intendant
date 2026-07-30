@@ -428,6 +428,10 @@ pub(crate) enum RouteHandlerId {
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
+    /// One attached file ref's bytes (?locator=): sealed snapshot when
+    /// pinned, live with the drift verdict otherwise. Ref-scoped —
+    /// never a generic file server.
+    AgendaRefContent,
     /// Merge-patch the owner's reminder delivery policy.
     AgendaReminderPolicy,
     /// Bounded Memory claim search (q/limit/candidates query params).
@@ -1162,6 +1166,29 @@ pub(crate) static ROUTES: &[Route] = &[
         "Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check)",
     )
     .with_tunnel(tunnel_method("api_agenda_ref_drift")),
+    // The in-dashboard ref reader (decision-card UX): the bytes behind
+    // ONE file ref already attached to ONE item — ref-scoped by
+    // construction (`?locator=` must equal an attached file ref's
+    // locator verbatim), never a generic file server. Digest-aware: a
+    // pinned ref with a sealed snapshot serves the SEALED bytes
+    // (fail-closed on corruption); otherwise live bytes with the honest
+    // drift verdict. Read-only; nothing stored, nothing sealed.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/agenda/items",
+            &[
+                SegmentSpec::Capture("item_id"),
+                SegmentSpec::Literal("refs"),
+                SegmentSpec::Literal("content"),
+            ],
+        ),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaRefContent,
+        "One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_ref_content")),
     // Tier-2 render join for PR anchors (Track PR): checks/review/
     // mergeability fetched through the daemon cache on card expand —
     // never on list render, never stored, never an op. Degrades to
@@ -3396,6 +3423,13 @@ mod tests {
         );
         assert!(route.tunnel.is_none());
         // Parked-ask preview blobs: two captures, literal raw tail.
+        // The ref reader's row: one capture, the locator rides the query
+        // string (never a path segment — locators are absolute paths).
+        let (route, captures) =
+            match_route("GET", "/api/agenda/items/01ITEM/refs/content").unwrap();
+        assert!(matches!(route.handler, RouteHandlerId::AgendaRefContent));
+        assert_eq!(captures, vec!["01ITEM"]);
+
         let (route, captures) = match_route("GET", "/api/agenda/blobs/01ITEM/blob1/raw").unwrap();
         assert_eq!(route.handler, RouteHandlerId::AgendaBlobRaw);
         assert_eq!(

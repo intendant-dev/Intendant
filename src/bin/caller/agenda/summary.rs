@@ -689,17 +689,15 @@ mod tests {
         let mut store = AgendaStore::open(dir.path()).unwrap();
         let parked = store
             .apply_command(
-                AgendaCommand::Ask {
-                    questions: vec![crate::mcp::AskUserQuestionParams {
-                        question: "ship it?".into(),
-                        header: Some("Ship".into()),
-                        options: Vec::new(),
-                        pick_min: None,
-                        pick_max: None,
-                        free_text: None,
-                        previews: Vec::new(),
-                    }],
-                },
+                AgendaCommand::ask(vec![crate::mcp::AskUserQuestionParams {
+                    question: "ship it?".into(),
+                    header: Some("Ship".into()),
+                    options: Vec::new(),
+                    pick_min: None,
+                    pick_max: None,
+                    free_text: None,
+                    previews: Vec::new(),
+                }]),
                 owner(),
                 1000,
             )

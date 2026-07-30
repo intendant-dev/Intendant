@@ -1163,6 +1163,178 @@ mod tests {
         );
     }
 
+    fn park_file_ref_item(
+        agenda: &crate::agenda::AgendaHandle,
+        locator: &str,
+    ) -> crate::agenda::AgendaItem {
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Task,
+                    title: "carrier".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                    refs: vec![crate::agenda::AgendaRefSpec {
+                        ref_type: crate::agenda::AgendaRefType::File,
+                        locator: locator.to_string(),
+                        must_read: true,
+                        label: None,
+                    }],
+                },
+                None,
+            )
+            .unwrap()
+    }
+
+    fn status_of(response: &ApiResponse) -> u16 {
+        match response {
+            ApiResponse::Json { status, .. } => *status,
+            _ => panic!("expected the JSON lane"),
+        }
+    }
+
+    /// The ref reader end to end: live serving with the drift verdict,
+    /// sealed precedence once the pin has a snapshot, fail-closed
+    /// corruption (never a silent live fallback), and the ref-scoping
+    /// that keeps this lane from being a file server.
+    #[tokio::test]
+    async fn ref_content_serves_sealed_or_live_with_drift_and_stays_ref_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let content = tempfile::tempdir().unwrap();
+        let file = content.path().join("findings.md");
+        std::fs::write(&file, b"decide: A").unwrap();
+        let locator = file.to_string_lossy().into_owned();
+        let item = park_file_ref_item(&agenda, &locator);
+
+        // Live + unchanged: the attach pin matches the served bytes.
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        assert_eq!(body["source"], "live");
+        assert_eq!(body["drift"], "unchanged");
+        assert_eq!(body["encoding"], "utf8");
+        assert_eq!(body["content"], "decide: A");
+        assert_eq!(body["mime"], "text/plain; charset=utf-8");
+        assert_eq!(body["name"], "findings.md");
+        let pin = body["pinned_sha256"].as_str().unwrap().to_string();
+        assert_eq!(body["sha256"], pin.as_str());
+
+        // Live + drifted after attach: still served (no snapshot exists),
+        // with the honest verdict.
+        std::fs::write(&file, b"decide: B (amended)").unwrap();
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        assert_eq!(body["source"], "live");
+        assert_eq!(body["drift"], "changed");
+        assert_eq!(body["content"], "decide: B (amended)");
+
+        // A sealed snapshot under the pin takes precedence: the sealed
+        // bytes serve, and the live file's drift is reported alongside.
+        crate::agenda::seal_content(agenda.dir(), &pin, b"decide: A").unwrap();
+        let body =
+            json_of(&agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await);
+        assert_eq!(body["source"], "sealed");
+        assert_eq!(body["content"], "decide: A");
+        assert_eq!(body["drift"], "changed");
+        assert_eq!(body["sha256"], pin.as_str());
+
+        // Corruption refuses by name — the reader must never quietly
+        // substitute live bytes for what the pin preserves.
+        std::fs::write(agenda.dir().join("blobs").join(&pin), b"corrupted").unwrap();
+        let response = agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await;
+        assert_eq!(status_of(&response), 500);
+        let body = json_of(&response);
+        assert!(body["error"].as_str().unwrap().contains("sealed"), "{body}");
+
+        // Scoping: a real file that is NOT an attached ref of this item
+        // answers 404 — same for a url ref's locator and an unknown item.
+        let foreign = content.path().join("not-attached.md");
+        std::fs::write(&foreign, b"nope").unwrap();
+        let response =
+            agenda_ref_content_api_response(&item.id, &foreign.to_string_lossy(), Some(&server))
+                .await;
+        assert_eq!(status_of(&response), 404);
+        assert!(
+            json_of(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("attached refs only"),
+            "the refusal names the scoping rule"
+        );
+        let url_item = park_pr_anchor(&agenda, "https://github.com/o/r/pull/9");
+        let response = agenda_ref_content_api_response(
+            &url_item,
+            "https://github.com/o/r/pull/9",
+            Some(&server),
+        )
+        .await;
+        assert_eq!(status_of(&response), 404, "url refs are not file refs");
+        let response =
+            agenda_ref_content_api_response("01NEVEREXISTED", &locator, Some(&server)).await;
+        assert_eq!(status_of(&response), 404);
+    }
+
+    /// Serving-cap pin (a deliberate act to change) plus the named
+    /// oversize and missing-file refusals.
+    #[tokio::test]
+    async fn ref_content_caps_and_missing_files_refuse_by_name() {
+        assert_eq!(AGENDA_REF_CONTENT_MAX_BYTES, 16 * 1024 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let content = tempfile::tempdir().unwrap();
+        let file = content.path().join("artifact.bin");
+        std::fs::write(&file, b"small").unwrap();
+        let locator = file.to_string_lossy().into_owned();
+        let item = park_file_ref_item(&agenda, &locator);
+
+        // Grown past the reader cap (sparse): named 413, not a truncated
+        // serve.
+        let handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        handle.set_len(AGENDA_REF_CONTENT_MAX_BYTES + 1).unwrap();
+        drop(handle);
+        let response = agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await;
+        assert_eq!(status_of(&response), 413);
+        assert!(
+            json_of(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("reader cap"),
+            "oversize names the cap"
+        );
+
+        // Deleted live file with no snapshot: honest 404.
+        std::fs::remove_file(&file).unwrap();
+        let response = agenda_ref_content_api_response(&item.id, &locator, Some(&server)).await;
+        assert_eq!(status_of(&response), 404);
+        assert!(
+            json_of(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("unreadable"),
+            "missing live file is named"
+        );
+
+        // Binary bytes ride base64 with an image MIME from the extension.
+        let png = content.path().join("shot.png");
+        std::fs::write(&png, [0x89u8, 0x50, 0x4e, 0x47, 0x00, 0xff]).unwrap();
+        let png_locator = png.to_string_lossy().into_owned();
+        let png_item = park_file_ref_item(&agenda, &png_locator);
+        let body = json_of(
+            &agenda_ref_content_api_response(&png_item.id, &png_locator, Some(&server)).await,
+        );
+        assert_eq!(body["encoding"], "base64");
+        assert_eq!(body["mime"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body["content"].as_str().unwrap())
+                .unwrap(),
+            [0x89u8, 0x50, 0x4e, 0x47, 0x00, 0xff]
+        );
+    }
+
     /// The F1 provenance resolver: a recorded wrapper id — even a
     /// superseded incarnation whose own log dir is gone — resolves to its
     /// backend conversation with the Sessions-tab row key and the human
@@ -1439,6 +1611,186 @@ pub(crate) async fn handle_agenda_ref_drift(
     fleet_origin: Option<&str>,
 ) {
     let response = agenda_ref_drift_api_response(&item_id, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+/// Serving cap for one attached ref's bytes through the in-dashboard
+/// reader — comfortably above the working artifacts the reader exists
+/// for (briefs, findings files, screenshots) while keeping the JSON
+/// envelope (base64 inflates 4/3) tunnel-friendly. Deliberately below
+/// the 64 MiB attach-hash bound: a ref past THIS cap is still valid
+/// agenda data, it just reads on the machine instead of in a panel.
+pub(crate) const AGENDA_REF_CONTENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Transport-neutral core of `GET /api/agenda/items/{item_id}/refs/content`
+/// (tunnel twin `api_agenda_ref_content`): the bytes behind ONE file ref
+/// already attached to the item. Ref-scoped by construction — the
+/// `locator` must equal an attached file ref's locator verbatim, so this
+/// lane can never serve a path the agenda does not point at (it is not a
+/// file server). Digest-aware:
+///
+/// - a pinned ref whose sealed snapshot exists serves the SEALED bytes
+///   (content-addressed; a corrupt blob refuses by name, never a silent
+///   live fallback), with the live file probed only to report `drift`
+///   honestly;
+/// - otherwise the LIVE file serves, `drift` naming the served bytes'
+///   relation to the attach-time pin (`unchanged`/`changed`) or
+///   `unpinned` when the ref never carried one (foreign logs).
+///
+/// Read-only: nothing is stored and nothing is sealed here — sealing
+/// mints approved revisions and stays a propose-time act.
+pub(crate) async fn agenda_ref_content_api_response(
+    item_id: &str,
+    locator: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let Some(item) = agenda.item_by_id(item_id) else {
+        return ApiResponse::json_error(404, "agenda item not found");
+    };
+    if locator.is_empty() {
+        return ApiResponse::json_error(400, "locator query parameter required");
+    }
+    let Some(file_ref) = item
+        .refs
+        .iter()
+        .find(|r| r.ref_type == crate::agenda::AgendaRefType::File && r.locator == locator)
+    else {
+        return ApiResponse::json_error(
+            404,
+            "no file ref with that locator on this item — the reader serves attached refs only",
+        );
+    };
+    // Pinned ref with a sealed snapshot: the snapshot is the content.
+    // Corruption refuses by name — falling back to live bytes here would
+    // silently serve something other than what the pin preserves.
+    if let Some(pin) = file_ref.digest.as_deref() {
+        match agenda.sealed_content(pin) {
+            Ok(Some(bytes)) => {
+                if bytes.len() as u64 > AGENDA_REF_CONTENT_MAX_BYTES {
+                    return ref_content_too_large(locator, bytes.len() as u64);
+                }
+                let drift = crate::agenda::file_ref_drift(locator, pin);
+                return ref_content_response(item_id, locator, "sealed", drift, Some(pin), bytes);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return ApiResponse::json_error(
+                    500,
+                    format!("sealed snapshot for {locator}: {err}"),
+                )
+            }
+        }
+    }
+    // Live serving: the ref's verbatim locator, capped, with the served
+    // bytes themselves hashed for the drift verdict (no re-read window).
+    let path = std::path::Path::new(locator);
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return ApiResponse::json_error(404, format!("live file unreadable: {locator} ({err})"))
+        }
+    };
+    if !meta.is_file() {
+        return ApiResponse::json_error(404, format!("not a regular file: {locator}"));
+    }
+    if meta.len() > AGENDA_REF_CONTENT_MAX_BYTES {
+        return ref_content_too_large(locator, meta.len());
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return ApiResponse::json_error(404, format!("live file unreadable: {locator} ({err})"))
+        }
+    };
+    let drift = match file_ref.digest.as_deref() {
+        Some(pin) if crate::agenda::digest_bytes(&bytes) == pin => "unchanged",
+        Some(_) => "changed",
+        None => "unpinned",
+    };
+    ref_content_response(
+        item_id,
+        locator,
+        "live",
+        drift,
+        file_ref.digest.as_deref(),
+        bytes,
+    )
+}
+
+fn ref_content_too_large(locator: &str, size: u64) -> ApiResponse {
+    ApiResponse::json_error(
+        413,
+        format!(
+            "{locator} is {size} bytes — beyond the {AGENDA_REF_CONTENT_MAX_BYTES}-byte reader \
+             cap; open it on the machine"
+        ),
+    )
+}
+
+/// The reader envelope: JSON on every transport (the tunnel twin needs
+/// it), text as UTF-8 and everything else as base64 — exactly the
+/// sealed-snapshot route's encoding split. `sha256` is the hash of the
+/// bytes actually served; `drift` is the LIVE file's relation to the
+/// attach-time pin (probed when serving sealed, computed from the served
+/// bytes when serving live, `unpinned` when no pin exists).
+fn ref_content_response(
+    item_id: &str,
+    locator: &str,
+    source: &str,
+    drift: &str,
+    pinned_sha256: Option<&str>,
+    bytes: Vec<u8>,
+) -> ApiResponse {
+    let path = std::path::Path::new(locator);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| locator.to_string());
+    let mime = crate::transfer_store::content_type_for_path(path);
+    let size = bytes.len() as u64;
+    let sha256 = crate::agenda::digest_bytes(&bytes);
+    let (encoding, content) = match String::from_utf8(bytes) {
+        Ok(text) => ("utf8", text),
+        Err(err) => {
+            use base64::Engine as _;
+            (
+                "base64",
+                base64::engine::general_purpose::STANDARD.encode(err.into_bytes()),
+            )
+        }
+    };
+    let mut body = serde_json::json!({
+        "item_id": item_id,
+        "locator": locator,
+        "name": name,
+        "mime": mime,
+        "size": size,
+        "source": source,
+        "sha256": sha256,
+        "drift": drift,
+        "encoding": encoding,
+        "content": content,
+    });
+    if let Some(pin) = pinned_sha256 {
+        body.as_object_mut()
+            .expect("object body")
+            .insert("pinned_sha256".to_string(), pin.into());
+    }
+    ApiResponse::json(200, JsonBody::Value(body))
+}
+
+pub(crate) async fn handle_agenda_ref_content(
+    stream: DemuxStream,
+    item_id: String,
+    locator: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_ref_content_api_response(&item_id, &locator, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 

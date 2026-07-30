@@ -365,8 +365,16 @@ impl AgendaStore {
         let source = validate_source(cmd.take_source())?;
         // Rich-ask park: blob commits interleave with the id mint and need
         // rollback on any later failure, so it has its own arm.
-        if let AgendaCommand::Ask { questions } = cmd {
-            return self.apply_ask(questions, actor, now_ms);
+        if let AgendaCommand::Ask {
+            questions,
+            body,
+            tags,
+            due_ms,
+            source: _,
+            refs,
+        } = cmd
+        {
+            return self.apply_ask(questions, body, tags, due_ms, refs, actor, source, now_ms);
         }
         // Park (G1: optionally with attached refs): one `add` plus one
         // `add_ref` per spec appended under this same lock — its own arm
@@ -850,26 +858,7 @@ impl AgendaStore {
         let title = validate_title(&title)?;
         let body = validate_body(body)?;
         let tags = validate_tags(tags)?;
-        if refs.len() > MAX_REFS_PER_ITEM {
-            return Err(AgendaError::Invalid(format!(
-                "more than {MAX_REFS_PER_ITEM} refs"
-            )));
-        }
-        let mut validated: Vec<ValidatedRef> = Vec::with_capacity(refs.len());
-        for spec in refs {
-            let vref = validate_ref(spec.ref_type, &spec.locator, spec.must_read, spec.label)?;
-            if validated
-                .iter()
-                .any(|v| v.ref_type == vref.ref_type && v.locator == vref.locator)
-            {
-                return Err(AgendaError::Invalid(format!(
-                    "duplicate {} ref {:?} in one park",
-                    vref.ref_type.as_str(),
-                    vref.locator
-                )));
-            }
-            validated.push(vref);
-        }
+        let validated = validate_park_refs(refs)?;
         let id = self.mint_id()?;
         let mut item = self.append_op(
             AgendaOp::Add {
@@ -1168,10 +1157,16 @@ impl AgendaStore {
     /// of this park on any failure — mirrors `ask_user_inner`'s
     /// cross-question rollback), mint the rail `ask_id`, and append the
     /// `add`.
+    #[allow(clippy::too_many_arguments)]
     fn apply_ask(
         &mut self,
         questions: Vec<crate::mcp::AskUserQuestionParams>,
+        body: String,
+        tags: Vec<String>,
+        due_ms: Option<u64>,
+        refs: Vec<super::types::AgendaRefSpec>,
         actor: Option<AgendaActor>,
+        source: Option<String>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
         if questions.is_empty() {
@@ -1179,6 +1174,11 @@ impl AgendaStore {
                 "ask requires at least one question".into(),
             ));
         }
+        // The Add park fields, validated identically — refused up front,
+        // before any blob commit exists to roll back.
+        let body = validate_body(body)?;
+        let tags = validate_tags(tags)?;
+        let validated_refs = validate_park_refs(refs)?;
         // The exact ask_user validation (counts, pick bounds, preview
         // decode, the shared ≤8 MB preview budget) — derive, don't mirror.
         let params = crate::mcp::AskUserParams {
@@ -1274,21 +1274,39 @@ impl AgendaStore {
             id: item_id.clone(),
             kind: super::types::AgendaKind::Question,
             title,
-            body: String::new(),
-            tags: Vec::new(),
-            due_ms: None,
+            body,
+            tags,
+            due_ms,
             ask: Some(super::types::AgendaAsk { ask_id, questions }),
         };
-        match self.append_op(op, actor, None, now_ms) {
-            Ok(item) => Ok(item),
+        let mut item = match self.append_op(op, actor.clone(), source.clone(), now_ms) {
+            Ok(item) => item,
             Err(err) => {
                 // The append never made it to disk: the blobs are orphans.
                 if let Err(cleanup) = super::blobs::delete_item_blobs(&self.dir, &item_id) {
                     eprintln!("[agenda] rollback of {item_id} blobs: {cleanup}");
                 }
-                Err(err)
+                return Err(err);
             }
+        };
+        // Ref sugar, appended after the add under this same lock —
+        // exactly `apply_add`'s shape (specs were validated up front).
+        for vref in validated_refs {
+            item = self.append_op(
+                AgendaOp::AddRef {
+                    id: item_id.clone(),
+                    ref_type: vref.ref_type,
+                    locator: vref.locator,
+                    digest: vref.digest,
+                    must_read: vref.must_read,
+                    label: vref.label,
+                },
+                actor.clone(),
+                source.clone(),
+                now_ms,
+            )?;
         }
+        Ok(item)
     }
 
     /// Daemon-internal dismissal of an open rich question (rail
@@ -2476,6 +2494,35 @@ struct ValidatedRef {
     digest: Option<String>,
     must_read: bool,
     label: Option<String>,
+}
+
+/// Validate a park's whole ref-sugar batch (`add`/`ask`): count cap,
+/// per-spec [`validate_ref`], and the in-park duplicate check — the
+/// all-or-nothing front half both parking commands share.
+fn validate_park_refs(
+    refs: Vec<super::types::AgendaRefSpec>,
+) -> Result<Vec<ValidatedRef>, AgendaError> {
+    if refs.len() > MAX_REFS_PER_ITEM {
+        return Err(AgendaError::Invalid(format!(
+            "more than {MAX_REFS_PER_ITEM} refs"
+        )));
+    }
+    let mut validated: Vec<ValidatedRef> = Vec::with_capacity(refs.len());
+    for spec in refs {
+        let vref = validate_ref(spec.ref_type, &spec.locator, spec.must_read, spec.label)?;
+        if validated
+            .iter()
+            .any(|v| v.ref_type == vref.ref_type && v.locator == vref.locator)
+        {
+            return Err(AgendaError::Invalid(format!(
+                "duplicate {} ref {:?} in one park",
+                vref.ref_type.as_str(),
+                vref.locator
+            )));
+        }
+        validated.push(vref);
+    }
+    Ok(validated)
 }
 
 /// Validate one typed-ref spec (G1). Per-type locator rules with named
@@ -3730,7 +3777,82 @@ mod tests {
     }
 
     fn ask_cmd(questions: Vec<crate::mcp::AskUserQuestionParams>) -> AgendaCommand {
-        AgendaCommand::Ask { questions }
+        AgendaCommand::ask(questions)
+    }
+
+    /// The decision-card park fields ride the ask lane: body/tags/due/
+    /// source validated like `add`, ref sugar appended as `add_ref` ops
+    /// with intake-minted digests, all folded onto the one question item
+    /// and stable across a reopen — options as choices, not prose, with
+    /// no second bookkeeping.
+    #[test]
+    fn park_ask_carries_add_park_fields_and_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let brief = content.path().join("brief.md");
+        std::fs::write(&brief, b"the whole story").unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+
+        let mut question = ask_question("Live-window width?");
+        question.options = vec![
+            crate::mcp::AskUserOptionParams {
+                label: "14 days (Recommended)".into(),
+                description: Some("fixed daemon-side constant".into()),
+            },
+            crate::mcp::AskUserOptionParams {
+                label: "30 days".into(),
+                description: None,
+            },
+        ];
+        let cmd = AgendaCommand::Ask {
+            questions: vec![question],
+            body: "ORIENTATION: pick one.".into(),
+            tags: vec!["gate".into(), "track-as".into()],
+            due_ms: Some(99),
+            source: Some("steward".into()),
+            refs: vec![super::super::types::AgendaRefSpec {
+                ref_type: AgendaRefType::File,
+                locator: brief.to_string_lossy().into_owned(),
+                must_read: true,
+                label: None,
+            }],
+        };
+        let item = store.apply_command(cmd, None, 5).unwrap();
+        assert_eq!(item.kind, super::super::types::AgendaKind::Question);
+        assert_eq!(item.body, "ORIENTATION: pick one.");
+        assert_eq!(item.tags, vec!["gate".to_string(), "track-as".to_string()]);
+        assert_eq!(item.due_ms, Some(99));
+        let ask = item.ask.as_ref().expect("structured payload");
+        assert_eq!(ask.questions[0].options.len(), 2);
+        assert_eq!(ask.questions[0].options[0].label, "14 days (Recommended)");
+        assert_eq!(item.refs.len(), 1, "ref sugar rides the same park");
+        assert!(item.refs[0].must_read);
+        assert!(
+            item.refs[0].digest.is_some(),
+            "file ref digest minted at intake"
+        );
+
+        // The whole shape survives a reopen (fold-stable).
+        let reopened = AgendaStore::open(dir.path()).unwrap();
+        let back = reopened.get(&item.id).unwrap();
+        assert_eq!(back.tags, item.tags);
+        assert_eq!(back.body, item.body);
+        assert_eq!(back.refs.len(), 1);
+        assert_eq!(
+            back.ask.as_ref().unwrap().questions[0].options[0].label,
+            "14 days (Recommended)"
+        );
+
+        // Bad park fields refuse the whole park — nothing lands.
+        let refused = AgendaCommand::Ask {
+            questions: vec![ask_question("Q?")],
+            body: String::new(),
+            tags: vec!["  ".into()],
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        assert!(store.apply_command(refused, None, 6).is_err());
     }
 
     /// Slice 1's park path end to end at store level: validation rides the

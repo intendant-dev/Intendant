@@ -806,6 +806,16 @@ html.ui-v2 .ag2-pill.recorded.on {
   color: var(--green);
   box-shadow: inset 0 0 0 1px rgba(var(--green-rgb), 0.45);
 }
+/* The "(Recommended)" option — the ask-rail's recommendation convention
+   rides the label; the highlight makes it the visually obvious pick. */
+html.ui-v2 .ag2-pill.rec {
+  border-color: rgba(var(--iris-rgb), 0.55);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), 0.22);
+  color: var(--text-1);
+}
+html.ui-v2 .ag2-pill.rec.on {
+  box-shadow: inset 0 0 0 1px rgba(var(--iris-rgb), 0.45), 0 0 0 1px rgba(var(--iris-rgb), 0.3);
+}
 html.ui-v2 .ag2-qa-row {
   display: flex;
   gap: 7px;

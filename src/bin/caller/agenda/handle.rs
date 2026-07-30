@@ -644,7 +644,7 @@ impl AgendaHandle {
     ) -> Result<AgendaItem, AgendaError> {
         let (mut item, counts, seq) = {
             let mut store = self.lock();
-            let item = store.apply_command(AgendaCommand::Ask { questions }, actor, now_ms())?;
+            let item = store.apply_command(AgendaCommand::ask(questions), actor, now_ms())?;
             if let Some(ask) = &item.ask {
                 crate::mcp::register_pending_ask(ask.ask_id);
             }
@@ -2076,20 +2076,18 @@ mod tests {
 
         let parked = handle
             .apply(
-                AgendaCommand::Ask {
-                    questions: vec![crate::mcp::AskUserQuestionParams {
-                        question: "Which grid?".into(),
-                        header: Some("Grid".into()),
-                        options: vec![crate::mcp::AskUserOptionParams {
-                            label: "A".into(),
-                            description: None,
-                        }],
-                        previews: Vec::new(),
-                        pick_min: None,
-                        pick_max: None,
-                        free_text: None,
+                AgendaCommand::ask(vec![crate::mcp::AskUserQuestionParams {
+                    question: "Which grid?".into(),
+                    header: Some("Grid".into()),
+                    options: vec![crate::mcp::AskUserOptionParams {
+                        label: "A".into(),
+                        description: None,
                     }],
-                },
+                    previews: Vec::new(),
+                    pick_min: None,
+                    pick_max: None,
+                    free_text: None,
+                }]),
                 actor("agent_session", Some("sess-park")),
             )
             .unwrap();
@@ -2226,17 +2224,15 @@ mod tests {
         let park = |text: &str| {
             handle
                 .apply(
-                    AgendaCommand::Ask {
-                        questions: vec![crate::mcp::AskUserQuestionParams {
-                            question: text.to_string(),
-                            header: None,
-                            options: Vec::new(),
-                            previews: Vec::new(),
-                            pick_min: None,
-                            pick_max: None,
-                            free_text: None,
-                        }],
-                    },
+                    AgendaCommand::ask(vec![crate::mcp::AskUserQuestionParams {
+                        question: text.to_string(),
+                        header: None,
+                        options: Vec::new(),
+                        previews: Vec::new(),
+                        pick_min: None,
+                        pick_max: None,
+                        free_text: None,
+                    }]),
                     None,
                 )
                 .unwrap()
@@ -2306,17 +2302,15 @@ mod tests {
     }
 
     fn one_question_ask(text: &str) -> AgendaCommand {
-        AgendaCommand::Ask {
-            questions: vec![crate::mcp::AskUserQuestionParams {
-                question: text.to_string(),
-                header: None,
-                options: Vec::new(),
-                previews: Vec::new(),
-                pick_min: None,
-                pick_max: None,
-                free_text: None,
-            }],
-        }
+        AgendaCommand::ask(vec![crate::mcp::AskUserQuestionParams {
+            question: text.to_string(),
+            header: None,
+            options: Vec::new(),
+            previews: Vec::new(),
+            pick_min: None,
+            pick_max: None,
+            free_text: None,
+        }])
     }
 
     fn outcome_events(events: &[AppEvent]) -> Vec<(String, String, bool)> {
