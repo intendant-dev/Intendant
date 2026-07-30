@@ -1955,6 +1955,7 @@ mod tests {
                 super::super::spawn_project::SessionSpawnContext {
                     home: dir.to_path_buf(),
                     default_project_root: Some(default_project.to_path_buf()),
+                    default_agent: None,
                 },
             ),
         )
@@ -3183,6 +3184,7 @@ mod tests {
                 super::super::spawn_project::SessionSpawnContext {
                     home: home.to_path_buf(),
                     default_project_root: Some(default_project.to_path_buf()),
+                    default_agent: None,
                 },
             ),
         )
@@ -4413,6 +4415,7 @@ mod tests {
                 .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
                     home: home.path().to_path_buf(),
                     default_project_root: None,
+                    default_agent: None,
                 }),
         );
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();

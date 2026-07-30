@@ -3124,6 +3124,18 @@ mod tests {
         })
     }
 
+    /// Fireability rig: give the hermetic store a daemon default project
+    /// so pin-less proposes resolve (the mint law refuses them
+    /// otherwise). Returns the tempdir GUARD — it must outlive every
+    /// propose, or the recorded root stops existing and approve refuses.
+    fn with_default_project(store: &mut AgendaStore) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_project_root = Some(project.path().to_path_buf());
+        store.set_spawn_context(ctx);
+        project
+    }
+
     #[test]
     fn add_persists_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6245,10 +6257,12 @@ mod tests {
         }
     }
 
-    /// T3c: an explicit project pin is validated at review time — the
-    /// same contradiction the launch path would refuse at fire time,
-    /// named NOW — and binds the digest (the approval covers WHERE);
-    /// blank normalizes to the legacy absent shape.
+    /// T3c, extended by the fireability mint law: an explicit project
+    /// pin is validated at review time — the same contradiction the
+    /// launch path would refuse at fire time, named NOW — and binds the
+    /// digest (the approval covers WHERE). A blank/absent pin resolves
+    /// through the fire path's chain and the RESOLUTION is recorded;
+    /// with nothing to resolve against, the propose refuses named.
     #[test]
     fn propose_project_root_validates_and_binds() {
         let dir = tempfile::tempdir().unwrap();
@@ -6270,6 +6284,17 @@ mod tests {
             project_root,
             source: None,
         };
+        // Projectless store, no provenance: a pin-less propose refuses
+        // with the concrete missing flag named (the mint law's headline
+        // case — the approvable-but-unfireable class dies here).
+        let err = store
+            .apply_command(propose(Some("   ".into())), owner(), 1500)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--project"), "{err}");
         for (bad, needle) in [
             (
                 Some("relative/path".to_string()),
@@ -6288,12 +6313,16 @@ mod tests {
                 "expected {needle:?} in {err}"
             );
         }
+        // With a daemon default: blank RESOLVES and the resolution is
+        // recorded — the digest the owner reviews names where.
+        let default_project = with_default_project(&mut store);
         let parked = store
             .apply_command(propose(Some("   ".into())), owner(), 3000)
             .unwrap();
         assert_eq!(
-            parked.effects[0].manifest.project_root, None,
-            "blank normalizes absent"
+            parked.effects[0].manifest.project_root,
+            Some(default_project.path().display().to_string()),
+            "the chain's resolution is recorded, never left empty"
         );
         let unpinned_digest = parked.effects[0].digest.clone();
         let proj = tempfile::tempdir().unwrap();
@@ -6312,6 +6341,296 @@ mod tests {
             pinned.effects[0].digest, unpinned_digest,
             "the pin revises the digest"
         );
+    }
+
+    // ---- Fireability (card 01KYSZAGQVHAAYS7BK9H3QFM3C) ----
+
+    /// The parking-session leg of the mint law: a pin-less propose on an
+    /// item parked BY A SESSION resolves through that session's recorded
+    /// project root and records it — the fallback chain is validated
+    /// against, never narrowed to explicit-only.
+    #[test]
+    fn propose_records_the_parking_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        // The parking session's recorded project, under the ctx home.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let meta_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join("sess-parker");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(
+            meta_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "sess-parker",
+                "created_at": "now",
+                "project_root": project.path().to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: home.path().to_path_buf(),
+            default_project_root: None,
+            default_agent: None,
+        });
+        let parker = Some(AgendaActor {
+            principal: Some("principal:agent-session:sess-parker".into()),
+            session_id: Some("sess-parker".into()),
+            kind: Some("agent_session".into()),
+        });
+        let id = store
+            .apply_command(add_cmd("parked by a session"), parker, 1000)
+            .unwrap()
+            .id;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1_000_000,
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                2000,
+            )
+            .unwrap();
+        assert_eq!(
+            parked.effects[0].manifest.project_root,
+            Some(project.path().display().to_string()),
+            "the parking session's root is the recorded resolution"
+        );
+    }
+
+    /// Executor honesty: a config-less propose records the daemon's
+    /// default backend (or internal), an explicit selection is kept, and
+    /// a pin contradicting the resolved default refuses at the mint.
+    #[test]
+    fn propose_records_the_resolved_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let project = with_default_project(&mut store);
+        let _ = &project;
+        let id = store
+            .apply_command(add_cmd("who runs"), owner(), 1000)
+            .unwrap()
+            .id;
+        let propose = |config: Option<crate::event::AgentLaunchConfig>| {
+            AgendaCommand::ProposeEffect {
+                binding_refs: Vec::new(),
+                id: id.clone(),
+                goal: "g".into(),
+                fire_at_ms: 1_000_000,
+                orchestrate: false,
+                interactive: None,
+                recurrence: None,
+                agent_config: config.map(Box::new),
+                trigger: None,
+                project_root: None,
+                source: None,
+            }
+        };
+        // No daemon default: internal is the recorded executor.
+        let parked = store.apply_command(propose(None), owner(), 2000).unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("internal"));
+        // A daemon default backend is recorded when the config is bare.
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_agent = Some("claude-code".into());
+        store.set_spawn_context(ctx);
+        let parked = store.apply_command(propose(None), owner(), 3000).unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("claude-code"));
+        // Explicit selection wins over the default.
+        let parked = store
+            .apply_command(
+                propose(Some(crate::event::AgentLaunchConfig {
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                })),
+                owner(),
+                4000,
+            )
+            .unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("codex"));
+        // A model pin contradicting the resolved default refuses at the
+        // mint — executor unfireability, named.
+        let err = store
+            .apply_command(
+                propose(Some(crate::event::AgentLaunchConfig {
+                    codex_model: Some("gpt-5.3-codex".into()),
+                    ..Default::default()
+                })),
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(executor): "),
+            "{err}"
+        );
+    }
+
+    /// THE CLASS TEST: approve is never offered on an unfireable
+    /// manifest — the approve intake re-runs the same validator against
+    /// the daemon's state NOW, so a legacy pin-less manifest (folded
+    /// from an old log) or a plan whose window already passed refuses
+    /// at the arm gate with the named edit prompt, never arms dead.
+    #[test]
+    fn approve_is_never_armed_on_an_unfireable_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // A LEGACY pin-less manifest enters via the op log (the fold
+        // never validates — parked history loads untouched).
+        let legacy = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"it\",\"kind\":\"task\",",
+            "\"title\":\"legacy\",\"body\":\"\",\"tags\":[]}}\n",
+            "{\"v\":1,\"at_ms\":2,\"op\":{\"type\":\"propose_effect\",\"id\":\"it\",",
+            "\"effect_id\":\"ef-legacy000000\",\"manifest\":{\"goal\":\"g\",",
+            "\"fire_at_ms\":1000000}}}\n"
+        );
+        std::fs::write(dir.path().join(LOG_FILE), legacy).unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let digest = store.item("it").unwrap().effects[0].digest.clone();
+        let approve = AgendaCommand::ApproveEffect {
+            id: "it".into(),
+            digest: digest.clone(),
+        };
+        // Projectless daemon: the arm gate refuses, named — the edit
+        // prompt's grammar, field first.
+        let err = store
+            .apply_command(approve.clone(), owner(), 3000)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        // The same manifest arms once the daemon can resolve it — the
+        // chain is consulted at the gate, legacy bytes untouched.
+        let _project = with_default_project(&mut store);
+        store.apply_command(approve, owner(), 4000).unwrap();
+        assert!(store.item("it").unwrap().effects[0].approval.is_some());
+
+        // Floor half of the class law: a one-shot proposed sane can
+        // still go stale before the owner approves — the arm gate is
+        // where the guarantee holds, so approving past the staleness
+        // window refuses with the reschedule remedy named.
+        let id = store
+            .apply_command(add_cmd("stale floor"), owner(), 5000)
+            .unwrap()
+            .id;
+        let hour = 3_600_000u64;
+        let fire_at = 24 * hour;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: fire_at,
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                23 * hour,
+            )
+            .unwrap();
+        let digest = parked.effects[0].digest.clone();
+        let err = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner(),
+                fire_at + 13 * hour, // 12h staleness default + 1h
+            )
+            .unwrap_err();
+        assert!(err.to_string().starts_with("unfireable(floor): "), "{err}");
+        assert!(err.to_string().contains("--at"), "{err}");
+        // Within the window the same approve arms.
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect { id, digest },
+                owner(),
+                fire_at + hour,
+            )
+            .unwrap();
+    }
+
+    /// TRAP pin: trigger-armed schedules are never floor-refused — the
+    /// floor is the ARM floor, and a long-past floor is an immediate
+    /// arming, at propose and at approve alike.
+    #[test]
+    fn trigger_manifests_are_never_floor_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("gate"), owner(), 1000)
+            .unwrap()
+            .id;
+        let month = 30 * 24 * 3_600_000u64;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1, // the arm floor, arbitrarily old
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: Some(super::super::types::TriggerSpec::OnUnblock),
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                2 * month,
+            )
+            .unwrap();
+        let digest = parked.effects[0].digest.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect { id, digest },
+                owner(),
+                3 * month,
+            )
+            .unwrap();
+    }
+
+    /// The stamp lane inherits the mint law per node (it proposes
+    /// through the same intake arm): a projectless stamp with no
+    /// project pin anywhere refuses named instead of parking
+    /// approvable-but-dead nodes.
+    #[test]
+    fn stamp_inherits_the_fireability_mint_law() {
+        let (_root, mut store) = stamp_rig();
+        let err = store
+            .apply_stamp_command(stamp_cmd("daily-digest"), owner(), 1000)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        let _project = with_default_project(&mut store);
+        store
+            .apply_stamp_command(stamp_cmd("daily-digest"), owner(), 2000)
+            .unwrap();
     }
 
     // ---- Track AW: the stamp lane ----

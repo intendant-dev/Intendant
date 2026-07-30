@@ -2753,6 +2753,7 @@ mod tests {
             .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
                 home: dir.path().to_path_buf(),
                 default_project_root: Some(default_project.path().to_path_buf()),
+                default_agent: None,
             });
         let item = handle
             .apply(
@@ -2858,6 +2859,7 @@ mod tests {
             .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
                 home: home.path().to_path_buf(),
                 default_project_root: None,
+                default_agent: None,
             });
         let item = handle
             .apply(
@@ -2941,6 +2943,71 @@ mod tests {
         let items = handle.snapshot();
         let orphan_now = items.iter().find(|i| i.id == orphan.id).unwrap();
         assert!(orphan_now.effects.is_empty(), "refusal mints nothing");
+    }
+
+    /// The serving half of the fireability class law: an approvable
+    /// state (pending review) whose manifest the validator refuses is
+    /// SERVED with the verdict (`fireability_refusal`, the
+    /// `next_fire_ms` decoration pattern) so no frontend has to offer
+    /// Approve blind — and the verdict clears once the daemon state
+    /// resolves it. Armed effects are never stamped (no approve
+    /// affordance renders there).
+    #[test]
+    fn pending_effects_serve_their_fireability_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        // A LEGACY pin-less manifest folded from the log — the propose
+        // intake would refuse minting this on a projectless daemon, so
+        // seed it as history (the migration-honesty class).
+        let legacy = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"it\",\"kind\":\"task\",",
+            "\"title\":\"legacy\",\"body\":\"\",\"tags\":[]}}\n",
+            "{\"v\":1,\"at_ms\":2,\"op\":{\"type\":\"propose_effect\",\"id\":\"it\",",
+            "\"effect_id\":\"ef-legacy000000\",\"manifest\":{\"goal\":\"g\",",
+            "\"fire_at_ms\":4102444800000}}}\n"
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("agenda.jsonl"), legacy).unwrap();
+        let projectless =
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus.clone(), dir.path());
+        let served = projectless.snapshot();
+        let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
+        let refusal = effect
+            .fireability_refusal
+            .as_ref()
+            .expect("a pending unresolvable manifest serves its refusal");
+        assert_eq!(refusal.field, "project");
+        assert!(refusal.reason.contains("--project"), "{}", refusal.reason);
+
+        // The same ledger under a daemon that CAN resolve it: verdict
+        // absent, approve proceeds, and the ARMED effect is unstamped.
+        let default_project = tempfile::tempdir().unwrap();
+        let resolvable =
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+                .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                    home: dir.path().to_path_buf(),
+                    default_project_root: Some(default_project.path().to_path_buf()),
+                    default_agent: None,
+                });
+        let served = resolvable.snapshot();
+        let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
+        assert!(effect.fireability_refusal.is_none());
+        let digest = effect.digest.clone();
+        let armed = resolvable
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: "it".into(),
+                    digest,
+                },
+                Some(AgendaActor {
+                    principal: Some("owner".into()),
+                    session_id: None,
+                    kind: Some("dashboard".into()),
+                }),
+            )
+            .unwrap();
+        assert!(armed.effects[0].approval.is_some());
+        assert!(armed.effects[0].fireability_refusal.is_none());
     }
 
     /// Approval binds the digest: an edit (re-propose) voids it, and a
