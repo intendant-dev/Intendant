@@ -1243,8 +1243,20 @@ function agendaSheetRender() {
 // -- Schedule sheet --
 
 function agendaOpenSchedSheet(itemId) {
-  const item = agendaFindItem(itemId);
-  if (!item) return;
+  // Serving grain (Track AS): list rows are summaries — the manifest
+  // MINUS goal and sealed refs. The editor round-trips the WHOLE
+  // manifest, so it prefills only from the FULL item; until the
+  // single-flight fetch lands, the sheet shows a loading line and the
+  // arrival hook re-enters here. Prefilling from a summary would blank
+  // the goal and silently unseal the refs on save — the exact bug the
+  // round-trip law exists to prevent.
+  const item = agendaFullItemFor(itemId);
+  if (!item) {
+    if (!agendaFindItem(itemId)) return;
+    agendaSheetState = { kind: 'sched-loading', itemId };
+    agendaSheetRender();
+    return;
+  }
   const st = agendaEffectState(item);
   const m = st && st.manifest;
   const toLocal = (ms) => {
@@ -1314,6 +1326,14 @@ function agendaOpenSchedSheet(itemId) {
 
 function agendaSchedSheetHtml(item) {
   const s = agendaSheetState;
+  if (s.kind === 'sched-loading') {
+    return `<div class="ag2-sheet-head">
+        <span class="ag2-sheet-title">Loading the full manifest…</span>
+        <span class="ag2-spacer"></span>
+        <button type="button" class="ag2-x" data-sheet-act="close" title="Close — esc">×</button>
+      </div>
+      <div class="ag2-hint">The list serves summaries; the editor prefills from the full item so nothing is dropped on save.</div>`;
+  }
   const standing = !!s.repeat;
   const standingBlock = standing
     ? `<div class="ag2-sheet-callout t-green">Standing series — one approval covers every run until revoked. A failure streak suspends it for you to re-arm.</div>

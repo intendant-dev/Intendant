@@ -954,6 +954,43 @@ mod tests {
         );
     }
 
+    /// The serving-grain law for the editor (Track AS × the manifest
+    /// editor): list rows are summaries — the manifest MINUS `goal` and
+    /// the sealed refs — but the edit sheet round-trips the WHOLE
+    /// manifest, so its opener prefills only from the FULL item
+    /// (`agendaFullItemFor`), parking on a loading state until the
+    /// single-flight fetch lands and the arrival hook re-enters. A
+    /// summary prefill would blank the goal and silently unseal the
+    /// refs on save — the exact bug the round-trip law prevents.
+    #[test]
+    fn edit_prefills_from_the_full_item_grain() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        let shared = include_str!("../../../../static/app/ui2-agenda.js");
+        let (_, opener) = inspector
+            .split_once("function agendaOpenSchedSheet(")
+            .expect("the sheet opener must exist");
+        let opener = opener
+            .split_once("\nfunction ")
+            .map(|(body, _)| body)
+            .unwrap_or(opener);
+        assert!(
+            opener.contains("agendaFullItemFor(itemId)"),
+            "the opener prefills from the full item grain, never the summary row"
+        );
+        assert!(
+            opener.contains("'sched-loading'"),
+            "an uncached full item parks the sheet on the loading state"
+        );
+        assert!(
+            inspector.contains("Loading the full manifest…"),
+            "the loading state renders honestly instead of a degraded form"
+        );
+        assert!(
+            shared.contains("agendaSheetState.kind === 'sched-loading'"),
+            "the full-item arrival hook re-enters the waiting opener"
+        );
+    }
+
     /// The shape toggle is honest about consequences ON the sheet, in
     /// the scheduler's own semantics: interactive opens-and-waits (it
     /// does not auto-run the goal), goal run is the autonomous one-shot.

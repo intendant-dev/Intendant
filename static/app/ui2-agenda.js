@@ -237,6 +237,14 @@ function agendaFullItemFor(id) {
         // A parked-ask announce may have been waiting on this item's
         // question payload (announce dedupes by ask id — idempotent).
         agendaAnnounceParkedAsks();
+        // The schedule editor waits on the full grain (its prefill
+        // round-trips the whole manifest) — re-enter the opener now
+        // that the item landed.
+        if (typeof agendaSheetState !== 'undefined' && agendaSheetState
+          && agendaSheetState.kind === 'sched-loading' && agendaSheetState.itemId === id
+          && typeof agendaOpenSchedSheet === 'function') {
+          agendaOpenSchedSheet(id);
+        }
       }
     })();
   }
