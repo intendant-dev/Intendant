@@ -12,9 +12,9 @@ use crate::{
     emit_external_turn_status, emit_fission_detach_relationships, emit_follow_up_status,
     emit_user_message_log, fission_anchor_cut_line, fission_anchor_first_lines,
     fission_anchor_reachable_after_rewind, fission_detach_parent_candidates,
-    is_codex_injected_user_text_for_main, CodexThreadActionDedupe, DrainOutcome,
-    ExternalBackendRecovery, ExternalContextSnapshotState, ExternalDiffDeltaTracker,
-    PendingRuntimeSteer, UserAttachments, UserTurnRevisionState,
+    is_codex_injected_user_text_for_main, transient_service_condition, CodexThreadActionDedupe,
+    DrainOutcome, ExternalBackendRecovery, ExternalContextSnapshotState, ExternalDiffDeltaTracker,
+    FatalRoundError, PendingRuntimeSteer, UserAttachments, UserTurnRevisionState,
 };
 use crate::{
     context_rewind, external_wrapper_index, fission_ledger, fission_lifecycle, frontend,
@@ -425,9 +425,10 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
     request: Option<ExternalContextRewindRequest>,
     turn_stop_status: ManagedContextRewindTurnStopStatus,
     recovery: Option<ExternalBackendRecovery>,
-    fatal_round_error: Option<String>,
+    fatal_round_error: Option<FatalRoundError>,
     message: Option<String>,
     turns_in_round: usize,
+    turn_had_started: bool,
 ) -> DrainOutcome {
     if let Some(request) = request {
         return DrainOutcome::ContextRewindRequested {
@@ -444,15 +445,31 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
             turns_in_round,
         };
     }
-    // A fatal backend error that ended a ZERO-turn round is the
-    // launch-refusal class: nothing ran, so completing the round would
-    // journal a lie. A round with completed turns keeps its completion
-    // shape even when a fatal error ends it — real work happened and the
-    // error is already logged; only the did-nothing round fails.
-    if turns_in_round == 0 {
-        if let Some(reason) = fatal_round_error {
+    if let Some(fatal) = fatal_round_error {
+        // The round-outcome classification (recovery scheduling for
+        // early round endings): a TEMPORARY service condition — the
+        // provider-incident class — must not end the round's story with
+        // a completion (a DoneSignal journals a scheduled occurrence
+        // COMPLETED and strands the commission fake-idle; 2026-07-29
+        // specimens 24f01636/13e53300) or a terminal failure; the
+        // caller arms the error park and the work resumes on its wake
+        // schedule regardless of how many turns died with the round.
+        if transient_service_condition(&fatal.reason) {
+            return DrainOutcome::TransientRoundDeath {
+                reason: fatal.reason,
+                turns_in_round,
+                turn_had_started,
+            };
+        }
+        // PERMANENT causes keep their terminal shapes. A fatal error
+        // that ended a ZERO-turn round is the launch-refusal class:
+        // nothing ran, so completing the round would journal a lie. A
+        // round with completed turns keeps its completion shape even
+        // when a fatal error ends it — real work happened and the error
+        // is already logged; only the did-nothing round fails.
+        if turns_in_round == 0 {
             return DrainOutcome::TurnFailed {
-                reason,
+                reason: fatal.reason,
                 turns_in_round,
             };
         }
@@ -815,19 +832,29 @@ pub(crate) fn find_context_rewind_anchor_entry(
 mod tests {
     use super::*;
 
+    fn fatal(reason: &str) -> Option<FatalRoundError> {
+        Some(FatalRoundError {
+            reason: reason.to_string(),
+            raw_message: reason.to_string(),
+        })
+    }
+
     /// Drain-exit precedence: a pending rewind and a pending recovery both
-    /// outrank a fatal round error, and the fatal error fails ONLY a
-    /// zero-turn round — a round with real turns keeps its completion
-    /// shape (the 2026-07-26 launch-refusal rider's deliberate scope).
+    /// outrank a fatal round error, and a PERMANENT-cause fatal error
+    /// fails ONLY a zero-turn round — a round with real turns keeps its
+    /// completion shape (the 2026-07-26 launch-refusal rider's deliberate
+    /// scope). Transient-cause deaths take their own outcome
+    /// ([`terminal_deaths_stay_terminal`] pins the permanent side).
     #[test]
     fn drain_exit_fails_only_zero_turn_rounds_with_a_fatal_error() {
         let outcome = backend_recovery_outcome_or_context_rewind(
             None,
             ManagedContextRewindTurnStopStatus::NotRequested,
             None,
-            Some("claude-code backend error (success): bad model".to_string()),
+            fatal("claude-code backend error (success): bad model"),
             None,
             0,
+            false,
         );
         match outcome {
             DrainOutcome::TurnFailed {
@@ -846,9 +873,10 @@ mod tests {
                 None,
                 ManagedContextRewindTurnStopStatus::NotRequested,
                 None,
-                Some("late fatal error".to_string()),
+                fatal("late fatal error"),
                 Some("did things".to_string()),
                 2,
+                true,
             ),
             DrainOutcome::TurnCompleted { .. }
         ));
@@ -862,12 +890,131 @@ mod tests {
                     message: "starved".to_string(),
                     recovery_hint: None,
                 }),
-                Some("fatal cause".to_string()),
+                fatal("fatal cause"),
                 None,
                 0,
+                false,
             ),
             DrainOutcome::RecoveryRequired { .. }
         ));
+    }
+
+    /// PIN `terminal_deaths_stay_terminal`: permanent-class round endings
+    /// — auth problems, refusals, invalid pins, deliberate exits — keep
+    /// today's terminal shapes exactly (TurnFailed for the did-nothing
+    /// round, the completion shape after real work), and never classify
+    /// as a temporary service condition.
+    #[test]
+    fn terminal_deaths_stay_terminal() {
+        for permanent in [
+            "Claude Code backend error (success): There's an issue with the selected model \
+             (fable-5). It may not exist or you may not have access to it.",
+            "Claude Code backend error (error_during_execution): API Error: 401 \
+             {\"type\":\"authentication_error\"}",
+            "Codex backend error (usageNotIncluded): To use Codex with your plan, upgrade",
+            "Claude Code backend error: OAuth token has expired",
+            "Claude Code turn failed: error_max_budget_usd",
+            "Session ended: stopped by user",
+        ] {
+            assert!(
+                !transient_service_condition(permanent),
+                "permanent cause misclassified transient: {permanent}"
+            );
+            // Zero-turn: the launch-refusal terminal, unchanged.
+            assert!(
+                matches!(
+                    backend_recovery_outcome_or_context_rewind(
+                        None,
+                        ManagedContextRewindTurnStopStatus::NotRequested,
+                        None,
+                        fatal(permanent),
+                        None,
+                        0,
+                        false,
+                    ),
+                    DrainOutcome::TurnFailed { .. }
+                ),
+                "zero-turn permanent death must stay TurnFailed: {permanent}"
+            );
+            // After real work: the completion shape, unchanged.
+            assert!(
+                matches!(
+                    backend_recovery_outcome_or_context_rewind(
+                        None,
+                        ManagedContextRewindTurnStopStatus::NotRequested,
+                        None,
+                        fatal(permanent),
+                        Some("partial work".to_string()),
+                        3,
+                        true,
+                    ),
+                    DrainOutcome::TurnCompleted { .. }
+                ),
+                "permanent death after real turns must keep the completion shape: {permanent}"
+            );
+        }
+    }
+
+    /// The transient half of the round-outcome classification: a fatal
+    /// cause carrying a service-condition marker resolves as
+    /// `TransientRoundDeath` — at zero turns AND after real work (the
+    /// 2026-07-29 specimens died with 91/76 turns and rode a DoneSignal)
+    /// — carrying the drain's delivery awareness through.
+    #[test]
+    fn transient_causes_classify_to_transient_round_death() {
+        for transient in [
+            "Claude Code backend error (error_during_execution): API Error: 500 \
+             {\"type\":\"api_error\",\"message\":\"Internal server error\"}",
+            "Claude Code backend error: API Error: 529 {\"type\":\"overloaded_error\"}",
+            "Codex backend error (streamDisconnected): stream disconnected before completion",
+            "Codex backend error: 502 Bad Gateway",
+            "Kimi backend error: 503 Service Unavailable",
+            "backend error: connection reset by peer",
+        ] {
+            assert!(
+                transient_service_condition(transient),
+                "transient cause not recognized: {transient}"
+            );
+            match backend_recovery_outcome_or_context_rewind(
+                None,
+                ManagedContextRewindTurnStopStatus::NotRequested,
+                None,
+                fatal(transient),
+                Some(transient.to_string()),
+                91,
+                true,
+            ) {
+                DrainOutcome::TransientRoundDeath {
+                    reason,
+                    turns_in_round,
+                    turn_had_started,
+                } => {
+                    assert_eq!(reason, transient);
+                    assert_eq!(turns_in_round, 91);
+                    assert!(turn_had_started);
+                }
+                _ => panic!("transient death after real turns must classify: {transient}"),
+            }
+            assert!(
+                matches!(
+                    backend_recovery_outcome_or_context_rewind(
+                        None,
+                        ManagedContextRewindTurnStopStatus::NotRequested,
+                        None,
+                        fatal(transient),
+                        None,
+                        0,
+                        false,
+                    ),
+                    DrainOutcome::TransientRoundDeath {
+                        turns_in_round: 0,
+                        turn_had_started: false,
+                        ..
+                    }
+                ),
+                "zero-turn transient death must classify, not TurnFailed: {transient}"
+            );
+        }
     }
 
     #[test]
