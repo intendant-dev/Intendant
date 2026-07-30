@@ -242,6 +242,10 @@ pub(crate) struct SummaryBlocker {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SummaryEdge {
     pub(crate) target_id: String,
+    /// G2 typed-adjacency kind — served on `relates_to` edges only
+    /// (`relies_on` edges carry none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) link_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -426,6 +430,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             .iter()
             .map(|edge| SummaryEdge {
                 target_id: edge.target_id.clone(),
+                link_kind: None,
             })
             .collect(),
         part_of: item.part_of.as_ref().map(|placement| SummaryPlacement {
@@ -436,6 +441,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             .iter()
             .map(|edge| SummaryEdge {
                 target_id: edge.target_id.clone(),
+                link_kind: edge.link_kind.clone(),
             })
             .collect(),
         refs: item

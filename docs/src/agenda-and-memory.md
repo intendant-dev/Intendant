@@ -221,6 +221,7 @@ attributed ops):
 | type | locator | resolves to |
 |---|---|---|
 | `file` | absolute path | the file, plus the drift check below |
+| `dir` | absolute directory path | the directory — pointer only (no digest, no content lane) |
 | `memory` | Memory claim id | the Explorer claim |
 | `session` | conversation id | the Sessions row (F1 join) |
 | `url` | http(s) URL | a plain link |
@@ -243,7 +244,22 @@ button) and renders "changed since attached" or "missing" honestly —
 never on list render, and nothing derived is ever stored. **No blobs,
 ever**: no file contents, copies, or uploads enter the agenda for refs —
 the preview blob store remains exclusively Ask-v2's (pinned in
-`agenda/blobs.rs`). Digests travel; blobs wouldn't.
+`agenda/blobs.rs`). Digests travel; blobs wouldn't. `dir` refs are
+deliberately digest-less pointers (trailing slashes normalized at
+intake): a directory has no attach-time byte identity without a priced
+tree-hash scheme — future vocabulary — so presence is its only drift
+signal.
+
+**The working set is served, never stored.** The item detail lanes —
+`GET /api/agenda/items/{id}` and the `agenda_item` tool behind `ctl
+agenda show` — carry a derived `working_set` block when territory
+exists: the item's and its placed subtree's file/dir refs, newest
+attach per locator, recency-ordered, capped at 48 rows with the
+distinct total named. Retired items contribute nothing (their children
+still do); done items DO contribute — finished work's territory is
+exactly the affinity signal an adopting session wants. Computed on
+demand from the fold like placed-children counts, and like every
+derivation here, never stored.
 
 ### The graph: placement and adjacency (G2)
 
@@ -259,11 +275,19 @@ attributed ops, both **pure navigation**:
   convention. Roll-up counts, the tree lens (the dashboard's "By hub"
   toggle, `ctl agenda list --under <id>`), and "hub done · open children"
   flags are all derived at render from the ordinary snapshot.
-- **`relates_to`** (`add_relates_to` / `remove_relates_to`) — untyped
-  see-also adjacency: stored directed (the writer's item carries the
-  link), rendered as the undirected union, deduped in both directions at
-  intake; removal names the pair in either order and the daemon resolves
-  the stored side. Capped at 32 stored links per item.
+- **`relates_to`** (`add_relates_to` / `remove_relates_to`) — see-also
+  adjacency, optionally typed: `link_kind` draws from a closed vocabulary
+  (`duplicates`, `supersedes`, `follow_up_of`, `evidences`; absent = plain
+  see-also). Intake refuses unknown kinds by name; the fold stores what
+  the log says, so a newer vocabulary never bricks an older reader (the
+  foreign kind rides through as text). Typed or not, adjacency stays pure
+  navigation — nothing derives, evaluates, blocks, or fires from it.
+  Stored directed (the writer's item carries the link; a typed link reads
+  storing-side → target, so "A supersedes B" lives on A), rendered as the
+  undirected union, deduped in both directions at intake — one link per
+  pair, so changing a kind is remove + re-add; removal names the pair in
+  either order and the daemon resolves the stored side. Capped at 32
+  stored links per item.
 
 **Two rules are pinned.** *Anti-hiding:* a `part_of` placement never
 removes an item from the flat recent lens — grouping is an opt-in reorder

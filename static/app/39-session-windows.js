@@ -5362,16 +5362,23 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     }
     if (!data) throw lastError || new Error('session detail fetch failed');
     const entries = Array.isArray(data.entries) ? data.entries : [];
-    if (!entries.length) return;
     applySessionIdentitiesFromReplayEntries(entries);
     applyExternalIdentitiesFromLogEntries(entries);
     applySessionGoalsFromReplayEntries(entries);
     applySessionPrsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
+    // Live-feed parity lane: fresh transcript-materialized reasoning rows
+    // enter the MAIN Activity feed before the window merge below, so the
+    // mirrored copy is already in the window history and the merge's
+    // signature scan collapses the pair (41b-reasoning-log.js). Runs on
+    // the empty fetch too — the first pass arms the per-session
+    // watermark even when the transcript has no rows yet.
+    const injected = injectTranscriptReasoningIntoLiveFeed(entries, targetSid, record.source);
+    if (!entries.length) return;
     const targetWin = sessionWindows.get(targetSid) || record.win;
     updateSessionWindowRemotePageState(targetWin, data, record.source, record.sessionId);
     const rendered = appendMissingRestoredSessionWindowEntries(targetWin, entries, targetSid);
-    if (rendered > 0) stationScheduleUpdate();
+    if (rendered > 0 || injected > 0) stationScheduleUpdate();
   } catch (err) {
     console.warn('Failed to sync external session window transcript', record.sessionId, err);
   } finally {
