@@ -4092,6 +4092,7 @@ mod tests {
             // blocks — grid_envelope.rs pins their wire fields).
             "'agenda-source':",
             "'agenda-occurrence':",
+            "'agenda-attestation':",
             "'sealed-inputs':",
             "boot:",
         ] {

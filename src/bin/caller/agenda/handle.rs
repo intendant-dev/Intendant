@@ -18,6 +18,30 @@ use crate::event::{AppEvent, EventBus};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// One serving read of the whole fold: every item oldest-first
+/// (decorated by the caller), status counts, preserved-but-unfolded
+/// line count, and the fold's `seq` — the op-log line cursor
+/// ([`AgendaStore::read_ops`]'s `log_len` space) a client can hold to
+/// resume from later without refetching the world (Track AS).
+pub(crate) struct AgendaSnapshot {
+    pub(crate) items: Vec<AgendaItem>,
+    pub(crate) counts: AgendaCounts,
+    pub(crate) skipped_lines: u64,
+    pub(crate) seq: u64,
+}
+
+/// The seq riding an `agenda_changed` broadcast: the seq of the last op
+/// that folded into the broadcast item — recorded by the append that
+/// just ran, so the map hit is unconditional in practice. The fallback
+/// (the last appended line) keeps the impossible branch monotonic-safe:
+/// it never exceeds the true frontier, so a client cursor built from it
+/// can under-count but never skip history.
+fn broadcast_seq(store: &AgendaStore, item_id: &str) -> u64 {
+    store
+        .item_seq(item_id)
+        .unwrap_or_else(|| store.seq().saturating_sub(1))
+}
+
 pub(crate) struct AgendaHandle {
     store: Mutex<AgendaStore>,
     bus: EventBus,
@@ -91,6 +115,15 @@ impl AgendaHandle {
 
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The boot-fold gauge the store recorded when it opened (design
+    /// gate Q9): fold duration + log size/lines/ops. The daemon wiring
+    /// logs it once per boot; the trend line decides whether a
+    /// fold-snapshot sidecar (S9, unscheduled) ever becomes worth
+    /// building.
+    pub(crate) fn boot_fold_vital(&self) -> super::store::AgendaFoldVital {
+        self.lock().boot_fold_vital()
     }
 
     pub(crate) fn bus(&self) -> &EventBus {
@@ -283,11 +316,12 @@ impl AgendaHandle {
         };
         let proposed = matches!(&cmd, AgendaCommand::ProposeEffect { .. });
         let actor_session = actor.as_ref().and_then(|actor| actor.session_id.clone());
-        let (mut item, counts) = {
+        let (mut item, counts, seq) = {
             let mut store = self.lock();
             let item = store.apply_command(cmd, actor, now_ms())?;
             let counts = store.counts();
-            (item, counts)
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq)
         };
         // Decorate once, outside the store lock: the broadcast, the ask
         // emissions below, and the returned command response all carry
@@ -296,6 +330,7 @@ impl AgendaHandle {
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
+            seq,
         });
         // A parked question is a durable ask: surface it on the attention
         // rail (attention = tab badge + hidden-tab browser notification)
@@ -386,24 +421,35 @@ impl AgendaHandle {
         actor: Option<AgendaActor>,
     ) -> Result<super::store::AgendaStampOutcome, AgendaError> {
         Self::authorize_command(&cmd, actor.as_ref())?;
-        let (mut outcome, counts) = {
+        let (mut outcome, counts, hub_seq, node_seqs) = {
             let mut store = self.lock();
             let outcome = store.apply_stamp_command(cmd, actor, now_ms())?;
             let counts = store.counts();
-            (outcome, counts)
+            let hub_seq = outcome
+                .hub
+                .as_ref()
+                .map(|hub| broadcast_seq(&store, &hub.id));
+            let node_seqs: Vec<u64> = outcome
+                .nodes
+                .iter()
+                .map(|node| broadcast_seq(&store, &node.item.id))
+                .collect();
+            (outcome, counts, hub_seq, node_seqs)
         };
         if let Some(hub) = outcome.hub.as_mut() {
             self.decorate_item(hub);
             self.bus.send(AppEvent::AgendaChanged {
                 item: hub.clone(),
                 counts,
+                seq: hub_seq.unwrap_or_default(),
             });
         }
-        for node in outcome.nodes.iter_mut() {
+        for (node, seq) in outcome.nodes.iter_mut().zip(node_seqs) {
             self.decorate_item(&mut node.item);
             self.bus.send(AppEvent::AgendaChanged {
                 item: node.item.clone(),
                 counts,
+                seq,
             });
         }
         let manifests = outcome.nodes.len();
@@ -526,7 +572,7 @@ impl AgendaHandle {
         let target = self
             .open_ask_item(ask_id)
             .ok_or_else(|| AgendaError::NotFound(format!("no open ask {ask_id}")))?;
-        let (mut item, counts) = {
+        let (mut item, counts, seq) = {
             let mut store = self.lock();
             let item = store.dismiss_question(
                 &target.id,
@@ -535,12 +581,14 @@ impl AgendaHandle {
                 now_ms(),
             )?;
             let counts = store.counts();
-            (item, counts)
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq)
         };
         self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
+            seq,
         });
         self.bus.send(AppEvent::ApprovalResolved {
             session_id: item.provenance.session_id.clone(),
@@ -580,19 +628,21 @@ impl AgendaHandle {
         questions: Vec<crate::mcp::AskUserQuestionParams>,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (mut item, counts) = {
+        let (mut item, counts, seq) = {
             let mut store = self.lock();
             let item = store.apply_command(AgendaCommand::ask(questions), actor, now_ms())?;
             if let Some(ask) = &item.ask {
                 crate::mcp::register_pending_ask(ask.ask_id);
             }
             let counts = store.counts();
-            (item, counts)
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq)
         };
         self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
+            seq,
         });
         self.reminder_nudge.notify_waiters();
         Ok(item)
@@ -623,7 +673,7 @@ impl AgendaHandle {
     /// way back, and answer/reopen clears the marker (the log keeps the
     /// dismissal as history). Returns how many were announced.
     pub(crate) fn announce_open_asks(&self) -> usize {
-        let (items, _, _) = self.snapshot();
+        let items = self.snapshot().items;
         let mut announced = 0;
         for item in &items {
             if item.status == super::types::AgendaStatus::Open
@@ -649,16 +699,18 @@ impl AgendaHandle {
         delivered: bool,
         session_id: Option<String>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (mut item, counts) = {
+        let (mut item, counts, seq) = {
             let mut store = self.lock();
             let item = store.record_ask_delivery(item_id, delivered, session_id, now_ms())?;
             let counts = store.counts();
-            (item, counts)
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq)
         };
         self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
+            seq,
         });
         Ok(item)
     }
@@ -669,33 +721,101 @@ impl AgendaHandle {
         &self,
         write: OccurrenceWriteBack<'_>,
     ) -> Result<AgendaItem, AgendaError> {
-        let (mut item, counts) = {
+        let (mut item, counts, seq) = {
             let mut store = self.lock();
             let item = store.record_occurrence(write, now_ms())?;
             let counts = store.counts();
-            (item, counts)
+            let seq = broadcast_seq(&store, &item.id);
+            (item, counts, seq)
         };
         self.decorate_item(&mut item);
         self.bus.send(AppEvent::AgendaChanged {
             item: item.clone(),
             counts,
+            seq,
         });
         Ok(item)
     }
 
-    /// Fresh snapshot: every item oldest-first, counts, and how many log
-    /// lines this build preserved but could not fold. Items carry the
-    /// display-only planner decorations, computed with this read's clock.
-    pub(crate) fn snapshot(&self) -> (Vec<AgendaItem>, AgendaCounts, u64) {
-        let (mut items, counts, skipped) = {
+    /// Fresh snapshot: every item oldest-first, counts, how many log
+    /// lines this build preserved but could not fold, and the fold's
+    /// seq cursor. Items carry the display-only planner decorations,
+    /// computed with this read's clock.
+    pub(crate) fn snapshot(&self) -> AgendaSnapshot {
+        let (mut items, counts, skipped_lines, seq) = {
             let mut store = self.lock();
             if let Err(err) = store.refresh_if_stale() {
                 eprintln!("[agenda] refresh before read failed: {err}");
             }
-            (store.snapshot(), store.counts(), store.skipped_lines())
+            (
+                store.snapshot(),
+                store.counts(),
+                store.skipped_lines(),
+                store.seq(),
+            )
         };
         self.decorate_items(&mut items);
-        (items, counts, skipped)
+        AgendaSnapshot {
+            items,
+            counts,
+            skipped_lines,
+            seq,
+        }
+    }
+
+    /// Delta read (Track AS S2): every item whose last folding op seq is
+    /// `>= since_seq`, plus full counts and the fold's frontier seq —
+    /// complete because items only ever change by ops, so a client that
+    /// upserts the returned items over a snapshot taken at `since_seq`
+    /// holds the same fold state a fresh full snapshot would give it.
+    ///
+    /// Two honest limits, both ruled (Q4/R-AS4): decorations are
+    /// read-time values — this refreshes them only on RETURNED items;
+    /// untouched items' decorations age exactly as they do between any
+    /// two reads today. And the filter is fold-state grain: items are
+    /// decorated against the FULL fold before filtering (a subset
+    /// context starves cross-item decorations — the #649 lesson), but
+    /// an item whose only change is another item's op (a watcher armed
+    /// elsewhere) is NOT returned — `watched_by` freshness rides lens
+    /// interaction re-pulls, never this lane.
+    ///
+    /// A cursor from the future (`since_seq > seq`: a shrunk/tampered
+    /// log, or a cursor minted by a longer foreign log this daemon has
+    /// not converged with) serves the FULL set — resync is the honest
+    /// repair when the cursor space itself is in doubt.
+    pub(crate) fn changed_since(&self, since_seq: u64) -> AgendaSnapshot {
+        let (mut items, counts, skipped_lines, seq, seq_by_id) = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before read failed: {err}");
+            }
+            let items = store.snapshot();
+            let seq_by_id: std::collections::HashMap<String, u64> = items
+                .iter()
+                .filter_map(|item| store.item_seq(&item.id).map(|seq| (item.id.clone(), seq)))
+                .collect();
+            (
+                items,
+                store.counts(),
+                store.skipped_lines(),
+                store.seq(),
+                seq_by_id,
+            )
+        };
+        self.decorate_items(&mut items);
+        if since_seq <= seq {
+            // Missing map entries (unreachable by construction — every
+            // folded item got there via an op that recorded its seq)
+            // INCLUDE rather than drop: this is a healing lane, and
+            // over-returning is safe where under-returning loses data.
+            items.retain(|item| seq_by_id.get(&item.id).copied().unwrap_or(u64::MAX) >= since_seq);
+        }
+        AgendaSnapshot {
+            items,
+            counts,
+            skipped_lines,
+            seq,
+        }
     }
 
     /// One page of the raw op log (read-only; the `GET /api/agenda/ops`
@@ -921,22 +1041,28 @@ impl AgendaHandle {
                 .into_iter()
                 .map(|(session_id, link)| {
                     let item = items.get(&link.item_id).and_then(|item| item.as_ref());
-                    let sealed_inputs = item
-                        .and_then(|item| {
-                            item.effects.iter().find(|effect| {
-                                effect
-                                    .last_run
-                                    .as_ref()
-                                    .is_some_and(|run| run.occurrence_id == link.occurrence_id)
-                            })
+                    let running_effect = item.and_then(|item| {
+                        item.effects.iter().find(|effect| {
+                            effect
+                                .last_run
+                                .as_ref()
+                                .is_some_and(|run| run.occurrence_id == link.occurrence_id)
                         })
+                    });
+                    let sealed_inputs = running_effect
                         .map(|effect| effect.manifest.binding_refs.clone())
                         .unwrap_or_default();
+                    let attestation = running_effect
+                        .and_then(|effect| effect.last_run.as_ref())
+                        .and_then(|run| run.attestation.clone());
                     let envelope = SessionAgendaEnvelope {
                         item_id: link.item_id,
                         item_title: item.map(|item| item.title.clone()),
                         occurrence_id: link.occurrence_id,
                         occurrence_state: link.state,
+                        lineage_role: link.lineage_role,
+                        attempt: link.attempt,
+                        attestation,
                         sealed_inputs,
                     };
                     (session_id, envelope)
@@ -955,6 +1081,19 @@ pub(crate) struct SessionAgendaEnvelope {
     pub(crate) item_title: Option<String>,
     pub(crate) occurrence_id: String,
     pub(crate) occurrence_state: OccurrenceState,
+    /// This session's place in the occurrence's resume lineage (Track
+    /// AO §2.8): the tip is what the next terminal resolves through;
+    /// superseded members still belong to the run's lineage.
+    pub(crate) lineage_role: super::reminders::SessionLineageRole,
+    /// The occurrence's regeneration ordinal (display-only), when it is
+    /// a bounded auto-retry.
+    pub(crate) attempt: Option<u32>,
+    /// The run's self-report (Track AO), present when the effect's
+    /// `last_run` still names this occurrence — the same match the
+    /// sealed inputs ride; a newer occurrence replacing `last_run`
+    /// drops it here while the op log keeps the history (the ruled v1
+    /// limit).
+    pub(crate) attestation: Option<super::types::AgendaAttestation>,
     /// The digest-bound binding refs of the manifest that ran this
     /// occurrence; empty when unmatched (item gone, or re-proposed
     /// since the fire).
@@ -1106,6 +1245,16 @@ mod tests {
             );
             assert_eq!(envelope.sealed_inputs[0].sha256, sha256);
         }
+        // Track AO lineage roles ride the envelope: the successor's
+        // `started` row is the tip, the original a superseded member.
+        assert_eq!(
+            envelopes.get("sess-fired").unwrap().lineage_role,
+            super::super::reminders::SessionLineageRole::Superseded
+        );
+        assert_eq!(
+            envelopes.get("sess-successor").unwrap().lineage_role,
+            super::super::reminders::SessionLineageRole::Tip
+        );
         let orphan = envelopes.get("sess-orphan").expect("orphan linked");
         assert_eq!(orphan.item_id, "01GONE");
         assert_eq!(
@@ -1457,9 +1606,13 @@ mod tests {
             Ok(AppEvent::AgendaChanged {
                 item: changed,
                 counts,
+                seq,
             }) => {
                 assert_eq!(changed, item);
                 assert_eq!(counts.open, 1);
+                // The broadcast seq names the producing op: the fixture's
+                // single `add` landed on line 0 of a fresh log.
+                assert_eq!(seq, 0);
             }
             other => panic!("expected AgendaChanged, got {other:?}"),
         }
@@ -1475,6 +1628,139 @@ mod tests {
             )
             .is_err());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Track AS S1 (ruling R-AS4): broadcast seqs name their producing
+    /// ops and the snapshot's seq is the fold's frontier — one cursor
+    /// space, so `max(cursor, broadcast seq + 1)` on the client equals
+    /// the frontier a fresh snapshot would report.
+    #[test]
+    fn broadcast_and_snapshot_seq_advance_with_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let owner = Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: None,
+        });
+        let add = |title: &str| AgendaCommand::Add {
+            refs: Vec::new(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let first = handle.apply(add("first"), owner.clone()).unwrap();
+        handle.apply(add("second"), owner.clone()).unwrap();
+        handle
+            .apply(
+                AgendaCommand::Complete {
+                    id: first.id,
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap();
+        let mut seqs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::AgendaChanged { seq, .. } = event {
+                seqs.push(seq);
+            }
+        }
+        assert_eq!(seqs, vec![0, 1, 2], "each broadcast names its op's line");
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.seq, 3,
+            "the snapshot reports the fold's frontier — last broadcast seq + 1"
+        );
+        assert_eq!(snapshot.counts.open, 1);
+        assert_eq!(snapshot.counts.done, 1);
+    }
+
+    /// Track AS S2 pin (ruling R-AS4): a `since_seq` delta returns
+    /// exactly the items changed by ops at or after the cursor —
+    /// including changes another daemon appended to the shared log
+    /// (converged by `refresh_if_stale`, no broadcast ever fired here) —
+    /// and nothing else. At the frontier the delta is empty; a cursor
+    /// from the future serves the full set (resync as honest repair).
+    #[test]
+    fn since_seq_returns_exactly_the_changed_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
+        let owner = Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: None,
+        });
+        let add = |title: &str| AgendaCommand::Add {
+            refs: Vec::new(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let untouched = handle.apply(add("untouched"), owner.clone()).unwrap(); // seq 0
+        let touched = handle.apply(add("touched later"), owner.clone()).unwrap(); // seq 1
+        let cursor = handle.snapshot().seq; // 2 — the client is current here
+        handle
+            .apply(
+                AgendaCommand::Annotate {
+                    id: touched.id.clone(),
+                    text: "changed after the cursor".into(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap(); // seq 2
+
+        let delta = handle.changed_since(cursor);
+        assert_eq!(delta.seq, 3);
+        assert_eq!(
+            delta
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![touched.id.as_str()],
+            "exactly the changed item — the untouched one stays home"
+        );
+        assert_eq!(delta.counts.open, 2, "counts stay whole-ledger");
+
+        // Foreign-append leg: another daemon on the same home appends;
+        // no local broadcast fires, but the delta pull heals it because
+        // seq is a property of the shared file, not the process.
+        let foreign_handle =
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let foreign = foreign_handle.apply(add("foreign"), owner).unwrap(); // seq 3
+
+        let healed = handle.changed_since(delta.seq);
+        assert_eq!(healed.seq, 4);
+        assert_eq!(
+            healed
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![foreign.id.as_str()],
+            "the foreign append is exactly what the delta returns"
+        );
+
+        // Current cursor → empty delta; future cursor → full resync.
+        assert!(handle.changed_since(healed.seq).items.is_empty());
+        let resync = handle.changed_since(healed.seq + 100);
+        assert_eq!(resync.items.len(), 3);
+        assert!(resync.items.iter().any(|item| item.id == untouched.id));
     }
 
     /// The sealed-serving pin (Track AW slice 2): the read lane serves
@@ -1943,7 +2229,7 @@ mod tests {
         // The resolver runs async off the bus: poll the fold briefly.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let (items, _, _) = handle.snapshot();
+            let items = handle.snapshot().items;
             let answered = items
                 .iter()
                 .find(|item| item.id == answered_item.id)
@@ -2480,7 +2766,7 @@ mod tests {
             }
             other => panic!("expected the named no-project refusal, got {other:?}"),
         }
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let orphan_now = items.iter().find(|i| i.id == orphan.id).unwrap();
         assert!(orphan_now.effects.is_empty(), "refusal mints nothing");
     }
@@ -2743,7 +3029,7 @@ mod tests {
             Some(fire_at)
         );
         // …and so does every snapshot read.
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         assert_eq!(items[0].effects[0].next_fire_ms, Some(fire_at));
         // No quiet hours configured: the reminder field stays absent.
         assert_eq!(items[0].deferred_until, None);
@@ -2863,7 +3149,7 @@ mod tests {
             "pickup = the planner's batching-window instant"
         );
         // …snapshot reads carry the same derivation…
-        let (items, _, _) = handle.snapshot();
+        let items = handle.snapshot().items;
         let served = items.iter().find(|item| item.id == question.id).unwrap();
         assert_eq!(served.watched_by, question.watched_by);
         // …and the fold product itself never does.

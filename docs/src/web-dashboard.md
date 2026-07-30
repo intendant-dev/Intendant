@@ -313,9 +313,24 @@ no live wrapper renders unmistakably as a **ghost** (`👻` warn chip +
 dashed desaturated frame): the safe-to-close state, served as a
 precomputed bit. A backend resumed across a restart is two wrapper rows
 aliasing one card — the dead pre-restart twin and the live
-resume-attached twin; the live wrapper's block wins that fold
-(`resolveSessionWindowBootMeta`), so the dead lineage never re-labels a
-live card as a ghost. Fired sessions keep their derived names (the source
+resume-attached twin; claims on the fold rank live wrapper > current
+era > lineage tip > the rest (`resolveSessionWindowBootMeta`), so the
+dead lineage never re-labels a live card as a ghost and two dead
+generations resolve deterministically to the chain's newest incarnation.
+The live set is alias-closed daemon-side (a post-identity entry is keyed
+by its backend id with the wrapper log-dir id aliased; both count), so
+readopt-created successors stop false-ghosting. A dead window also
+carries **terminal honesty**: the row serves its dir-local end facts
+(`terminal` — summary outcome + ended_at verbatim, or the freshest
+error for crash-frozen dirs), the window states them plainly ("Ended
+… : outcome" / "Died mid-turn — last activity …") instead of freezing
+on a mid-execution look, the status pill reads `Ended`/`Died` rather
+than a stale active phase, and a ghost whose lineage continued shows a
+clickable "continued as …" pointer derived from the shared
+resume-lineage resolver (`boot.continued_as`; the successor's state is
+joined client-side from its own card). Liveness itself stays
+event/boot-derived — hydration never flips `ended` (the #637 stop-hide
+law), and the note is presentation of served facts. Fired sessions keep their derived names (the source
 item's title, or `workflow - node` for workflow nodes); an owner
 rename always wins, and the Track AW refinement — stamped definitions
 deriving `definition name - node id` — lands later at the same single
@@ -1943,7 +1958,7 @@ response omits the header.
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
-| GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
+| GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/refs/content` | AgendaRead | own origin | none | One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise) |
 | GET | `/api/agenda/items/{item_id}/pr-state` | AgendaRead | own origin | none | Live PR state for one anchor (expand-time render join; cached daemon-side) |
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |

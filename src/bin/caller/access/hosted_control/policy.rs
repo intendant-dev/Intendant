@@ -565,6 +565,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::CodexThreadAction { .. }
         | ControlMsg::ConfigureSessionAgent { .. }
         | ControlMsg::ReloadCredentials { .. }
+        | ControlMsg::ReloadCredentialsAll { .. }
         | ControlMsg::SetClaudeModel { .. }
         | ControlMsg::SetClaudeEffort { .. }
         | ControlMsg::SetClaudePermissionMode { .. }

@@ -573,6 +573,8 @@
 }
 .vault-chip.ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
 .vault-chip.warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+.vault-chip.err { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
+.vault-status-line .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
 .vault-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .vault-error { font-size: 11px; color: var(--red); line-height: 1.5; }
 .vault-warning {

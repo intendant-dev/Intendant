@@ -47,6 +47,10 @@ pub struct AgendaListParams {
     /// Filter by status: "open", "done", or "retired". Omit for every item.
     #[serde(default)]
     pub status: Option<String>,
+    /// Delta cursor: only items changed by ops at or after this seq (the
+    /// `seq` a previous response reported). Omit for the full ledger.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

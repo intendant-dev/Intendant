@@ -163,6 +163,17 @@ pub enum TaskOutcome {
     Failed,
 }
 
+/// The three observable outcomes of a credential-reload respawn
+/// (`BackendCredentialsReloadProgress`). `Failed` carries the respawn
+/// error verbatim: the loop is about to exit on it, so this event is the
+/// last honest state the session's registry row will ever serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialReloadProgress {
+    Respawning,
+    Done,
+    Failed { error: String },
+}
+
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -267,6 +278,17 @@ pub enum AppEvent {
     /// re-deliver after the respawn.
     ReloadBackendCredentials {
         session_id: Option<String>,
+    },
+    /// Typed progress of an in-place credential-reload respawn, reported
+    /// by the supervised loop's apply lane at the same points as its
+    /// LogEntry narration. The supervisor consumes it exactly like the
+    /// phase events (`observe_lifecycle_event`) to stamp the per-session
+    /// reload lifecycle it serves on `ReloadCandidate` rows — the Vault
+    /// card renders THAT, never client-side request memory
+    /// (reload_lifecycle_is_daemon_owned_and_served).
+    BackendCredentialsReloadProgress {
+        session_id: Option<String>,
+        progress: CredentialReloadProgress,
     },
     /// A dashboard sign-in ceremony for an external backend completed:
     /// the credential store now holds `account`'s credentials (`None`
@@ -1278,10 +1300,14 @@ pub enum AppEvent {
 
     /// The agenda ledger changed (item added, patched, or transitioned).
     /// Carries the item as it now stands plus fresh counts so frontends
-    /// update live without refetching.
+    /// update live without refetching, and the op-log seq of the op that
+    /// produced it — the same cursor space list responses report — so a
+    /// client can advance its resume cursor (`max(cursor, seq + 1)`)
+    /// instead of guessing (Track AS).
     AgendaChanged {
         item: crate::agenda::AgendaItem,
         counts: crate::agenda::AgendaCounts,
+        seq: u64,
     },
 
     /// A recorded outcome on an agenda-backed rich ask: an answer resolved
@@ -1817,6 +1843,18 @@ pub enum ControlMsg {
     /// its queued/pending messages after the respawn.
     ReloadCredentials {
         session_id: String,
+    },
+    /// Ask EVERY live supervised session of one external backend to
+    /// reload its credentials — the Vault card's "Reload all". The
+    /// supervisor fans out over its own live registry (the exact set it
+    /// serves as `reload_candidates`), stamping each row `requested`
+    /// atomically with membership before emitting the per-session reload
+    /// event each loop already consumes — so a stale client list can
+    /// neither miss a fresh session nor target a dead one
+    /// (reload_all_rides_the_served_candidate_set). `source` is the
+    /// `AgentBackend::as_short_str` vocabulary.
+    ReloadCredentialsAll {
+        source: String,
     },
     /// Stop a live external-agent session and immediately resume it using the
     /// persisted launch config for that session.
@@ -2958,6 +2996,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Loop-internal respawn signal; frontends follow the reload through
         // LogEntry lines and session lifecycle events.
         AppEvent::ReloadBackendCredentials { .. } => None,
+        // Supervisor-internal lifecycle stamp; the Vault card polls it off
+        // the served ReloadCandidate rows rather than a push event.
+        AppEvent::BackendCredentialsReloadProgress { .. } => None,
         AppEvent::Interrupted { session_id, reason } => Some(OutboundEvent::Interrupted {
             session_id: session_id.clone(),
             reason: reason.clone(),
@@ -3772,9 +3813,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             backend: backend.clone(),
             method: method.clone(),
         }),
-        AppEvent::AgendaChanged { item, counts } => Some(OutboundEvent::AgendaChanged {
+        AppEvent::AgendaChanged { item, counts, seq } => Some(OutboundEvent::AgendaChanged {
             item: Box::new(item.clone()),
             counts: *counts,
+            seq: *seq,
         }),
         // Supervisor-internal delivery signal: browsers already see the
         // resolution via AgendaChanged + ApprovalResolved.

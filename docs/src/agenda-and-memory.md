@@ -314,17 +314,28 @@ terminal occurrences, mid-turn interruptions, and limit-parked wrappers
 with pending work — under fresh wrappers with a continuation nudge, on the
 automatic resume lane (owner-stopped and retired lineages refuse; a live
 successor is never doubled; suspended series stay down; only the lease
-holder readopts). The scheduler watches each fail-closed occurrence's
-durable resume lineage for a bounded window: when a successor is admitted
-(the readopt pass's, or a manual post-crash resume), it journals a fresh
-`started` row naming the successor — a later `started` **re-opens** a
-terminaled occurrence in the fold — re-arming the item's no-overlap hold
-and letting the successor's terminal close the occurrence normally. Each
-crash cycle still costs one `unknown` on the effect's failure streak until
-a completion resets it, so a crash-looping series suspends and the readopt
-pass respects the suspension — the existing streak law is the crash-loop
+holder readopts). Dispatches are not outcomes: an admitted successor in
+the lineage is evaluated, never trusted as terminal — a live tip refuses
+the resume, a concluded tip ends the lineage, and a tip that itself died
+mid-work (a signal shutdown marks open mid-turn sessions `interrupted`,
+and that marker survives the killed wrapper's own teardown) leaves the
+lineage re-eligible: the pass resumes the tip's newest conversation
+instead of skipping the original as "already continued". Each dispatched
+resume is verified after a short window and reclassified honestly if the
+continuation died on arrival. The scheduler watches each fail-closed
+occurrence's durable resume lineage for a bounded window: when a
+successor is admitted (the readopt pass's, or a manual post-crash
+resume), it journals a fresh `started` row naming the successor — a later
+`started` **re-opens** a terminaled occurrence in the fold — re-arming
+the item's no-overlap hold and letting the successor's terminal close the
+occurrence normally. Each crash cycle still costs one `unknown` on the
+effect's failure streak until a completion resets it, so a crash-looping
+series suspends and the readopt pass respects the suspension across the
+whole lineage (a suspended series' dead continuation is never stood back
+up through its own candidacy) — the existing streak law is the crash-loop
 brake. The pass is visible: one summary notification per boot with
-anything mid-work, naming what was resumed and what was left dead and why.
+anything mid-work, reporting confirmed-alive, died-after-dispatch, and
+left-dead separately, with reasons.
 
 ### Scheduled sessions
 
@@ -688,6 +699,21 @@ untouched. Journal rows for retries carry the additive display field
 legible, and a suspended card names the last self-reported reason when
 one exists.
 
+On the session grid, a fired session's window carries a derived agenda
+block — computed at the sessions serving seam from the occurrence
+journal fold and the item store on every read, never stored — with the
+source item, occurrence state, lineage role (`tip` or `superseded`),
+retry ordinal, and the run's self-report. The stop affordance claims
+only what the machine knows, fail-closed from the durable journal facts
+alone: the lineage tip of a started-without-terminal occurrence is a
+live firing (stopping it records the occurrence `failed`, and the
+dashboard confirms with exactly that consequence before acting); a
+superseded member of one is still owed work regardless of what the
+process looks like; "safe to stop" is claimed only for an idle session
+with no agenda linkage, or one whose linked occurrence is terminal —
+with the self-report displayed beside it, so "safe" and "done well"
+never merge. A busy session with no linkage claims nothing.
+
 ### Attribution, provenance display, and `--source`
 
 Every operation records the actor **as the daemon's gates resolved it**
@@ -792,12 +818,30 @@ after "Later" renders exactly what was sealed. From the CLI,
 [--every INTERVAL] [--suspend-after N] [--agent …]` rides the ordinary
 op lane (works from owner shells and supervised sessions alike);
 approval stays per-effect on the dashboard or `ctl agenda approve`.
-The dashboard's Automate sheet and its workflow/triggered pickers
-consume exactly these surfaces: the picker renders the served catalog
-(invalid and shadowed entries stay visible, disabled with their
-reason), the preview shows the full text a stamp would seal, and every
-stamp rides the stamp op — the sheet neither proposes nor approves
-client-side.
+The dashboard's Automate sheet consumes exactly these surfaces: the
+picker renders every catalog entry as what it means — title,
+house/personal provenance chip, shape line, description; invalid and
+shadowed entries stay visible, disabled with their reason — and
+selecting one previews it for reading (header, per-node executors and
+edges for workflows, the authored prose) with the **exact bytes a stamp
+seals** one explicit expander away, labeled with their sha256.
+Stamping is one explicit gesture for every kind: a pre-stamp summary
+states what will be sealed, parked, and proposed, and the Stamp button
+fires the stamp op — the sheet neither proposes nor approves
+client-side. After the stamp, the ordinary card (or the workflow
+approval sheet) carries the ceremony. Stamped manifests then render
+their sealed pins on the item panel: a refs strip (locator + pin chip +
+expandable sealed view served from the sealed lane) with an expand-time
+drift chip — `GET /api/agenda/items/{id}/refs/drift` re-hashes manifest
+binding refs on panel open, and a live file that moved on renders
+"sealed revision still serves", informational by §2.7 semantics. Drift
+offers **Review & adopt**: sealed vs live side by side (hashes, dates,
+live text for definition-library files), and one confirm re-proposes
+the affected manifests with the fresh pin through the ordinary propose
+lane — new digests, approvals void, landing on the ordinary approval
+(the one-gesture sheet again for a workflow's nodes). Nothing
+auto-adopts; declining leaves the sealed revision binding
+indefinitely.
 
 ### The housekeeping recipe
 

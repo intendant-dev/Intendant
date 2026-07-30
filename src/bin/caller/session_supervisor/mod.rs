@@ -315,6 +315,10 @@ struct ManagedSession {
     source: String,
     name: Option<String>,
     phase: String,
+    /// Credential-reload lifecycle, `None` until a reload is first
+    /// requested; overwritten whole on each `requested` stamp (latest
+    /// request wins) and by each loop progress event.
+    reload: Option<ReloadLifecycle>,
     project_root: PathBuf,
     session_dir: PathBuf,
     follow_up_tx: mpsc::Sender<FollowUpMessage>,
@@ -354,6 +358,51 @@ pub(crate) struct ReloadCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
     pub(crate) phase: String,
+    /// The daemon-owned reload lifecycle for this row, when a reload was
+    /// ever requested this registry lifetime — the ONLY reload state the
+    /// Vault card renders (reload_lifecycle_is_daemon_owned_and_served).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reload: Option<ReloadLifecycle>,
+}
+
+/// Daemon-owned per-session credential-reload lifecycle: stamped
+/// `requested` by [`SessionSupervisor::route_reload_credentials`] (and
+/// the reload-all fan-out), then advanced by the loop's typed
+/// [`event::CredentialReloadProgress`] events to `respawning` →
+/// `done`/`failed`, and served verbatim on [`ReloadCandidate::reload`].
+/// It lives on the registry row and dies with the session, so terminal
+/// states linger only as history beside an always-available Reload
+/// button — never as a gate on re-requesting
+/// (terminal_states_always_restore_the_button).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ReloadLifecycle {
+    pub(crate) state: ReloadLifecycleState,
+    pub(crate) at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+impl ReloadLifecycle {
+    pub(crate) fn stamped_now(state: ReloadLifecycleState, error: Option<String>) -> Self {
+        let at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            state,
+            at_unix_ms,
+            error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReloadLifecycleState {
+    Requested,
+    Respawning,
+    Done,
+    Failed,
 }
 
 /// Read-side view of the live managed-session registry for lanes outside
@@ -386,6 +435,7 @@ impl LiveSessionRegistry {
                 source: session.source.clone(),
                 name: session.name.clone(),
                 phase: session.phase.clone(),
+                reload: session.reload.clone(),
             })
             .collect();
         rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -401,19 +451,42 @@ impl LiveSessionRegistry {
     /// alike: lock contention yields `None` and the caller omits the
     /// join rather than serve a wrong liveness bit; a gone supervisor
     /// truthfully reports no live sessions.
+    ///
+    /// Alias-closed: `apply_session_identity` re-keys an external entry
+    /// to its backend id once the backend announces, leaving the wrapper
+    /// log-dir id behind as an alias — but catalog rows are keyed by the
+    /// log-dir id, so an entry-keys-only set read every post-identity
+    /// live session as dead and its row served `ghost:true` (the
+    /// readopt-successor false-ghost class, five specimens 2026-07-29).
+    /// Every alias that resolves to a live entry is therefore a live id
+    /// too; dangling aliases resolve to nothing and drop out on their
+    /// own.
     pub(crate) fn live_wrapper_ids(&self) -> Option<std::collections::HashSet<String>> {
         let Some(state) = self.state.upgrade() else {
             return Some(std::collections::HashSet::new());
         };
         let guard = state.try_lock().ok()?;
-        Some(
-            guard
-                .sessions
-                .values()
-                .filter(|session| !session.follow_up_tx.is_closed())
-                .map(|session| session.session_id.clone())
-                .collect(),
-        )
+        let mut live: std::collections::HashSet<String> = guard
+            .sessions
+            .values()
+            .filter(|session| !session.follow_up_tx.is_closed())
+            .map(|session| session.session_id.clone())
+            .collect();
+        for alias in guard.session_aliases.keys() {
+            if live.contains(alias) {
+                continue;
+            }
+            let alias_is_live = guard.resolve_session_id(alias).is_some_and(|key| {
+                guard
+                    .sessions
+                    .get(&key)
+                    .is_some_and(|session| !session.follow_up_tx.is_closed())
+            });
+            if alias_is_live {
+                live.insert(alias.clone());
+            }
+        }
+        Some(live)
     }
 }
 
@@ -956,6 +1029,7 @@ mod tests {
             source: source.to_string(),
             name: None,
             phase: "idle".to_string(),
+            reload: None,
             project_root: PathBuf::from("/tmp/project"),
             session_dir: PathBuf::from("/tmp/session"),
             follow_up_tx: tx,
@@ -1220,12 +1294,14 @@ mod tests {
                     source: "claude-code".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                 },
                 ReloadCandidate {
                     session_id: "claude-b".to_string(),
                     source: "claude-code".to_string(),
                     name: Some("steward pass".to_string()),
                     phase: "running".to_string(),
+                    reload: None,
                 },
             ]
         );
@@ -1326,6 +1402,157 @@ mod tests {
         );
     }
 
+    /// The served lifecycle is the daemon's own bookkeeping: a routed
+    /// reload stamps `requested` on the exact row it accepts, the loop's
+    /// typed progress events advance it (respawning → done / failed with
+    /// the error served verbatim), and the candidate list carries it —
+    /// the client renders THIS, never local request memory. A re-request
+    /// over a terminal state simply restarts the lifecycle: the daemon
+    /// keeps no dedup latch, so a stale request can never block a fresh
+    /// ceremony.
+    #[tokio::test]
+    async fn reload_lifecycle_is_daemon_owned_and_served() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("ext-1".to_string(), managed_session("ext-1", "claude-code"));
+        }
+        let registry = supervisor.live_session_registry();
+        let lifecycle = |candidates: Vec<ReloadCandidate>| candidates[0].reload.clone();
+
+        assert_eq!(
+            lifecycle(registry.reload_candidates_for_source("claude-code").await),
+            None,
+            "no lifecycle serves until a reload is first requested"
+        );
+
+        supervisor
+            .route_reload_credentials("ext-1".to_string())
+            .await;
+        let requested = lifecycle(registry.reload_candidates_for_source("claude-code").await)
+            .expect("an accepted reload stamps requested");
+        assert_eq!(requested.state, ReloadLifecycleState::Requested);
+        assert!(requested.at_unix_ms > 0, "stamps carry their time");
+
+        supervisor
+            .update_reload_lifecycle(Some("ext-1"), &event::CredentialReloadProgress::Respawning)
+            .await;
+        assert_eq!(
+            lifecycle(registry.reload_candidates_for_source("claude-code").await)
+                .expect("progress serves")
+                .state,
+            ReloadLifecycleState::Respawning
+        );
+
+        supervisor
+            .update_reload_lifecycle(
+                Some("ext-1"),
+                &event::CredentialReloadProgress::Failed {
+                    error: "could not respawn claude-code: exec failed".to_string(),
+                },
+            )
+            .await;
+        let failed = lifecycle(registry.reload_candidates_for_source("claude-code").await)
+            .expect("failure serves");
+        assert_eq!(failed.state, ReloadLifecycleState::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("could not respawn claude-code: exec failed"),
+            "the respawn error rides the served row"
+        );
+
+        // A fresh request over the terminal state restarts the lifecycle
+        // — no latch survives.
+        supervisor
+            .route_reload_credentials("ext-1".to_string())
+            .await;
+        let restarted = lifecycle(registry.reload_candidates_for_source("claude-code").await)
+            .expect("re-request stamps requested again");
+        assert_eq!(restarted.state, ReloadLifecycleState::Requested);
+        assert_eq!(restarted.error, None, "the old failure never lingers");
+
+        supervisor
+            .update_reload_lifecycle(Some("ext-1"), &event::CredentialReloadProgress::Done)
+            .await;
+        assert_eq!(
+            lifecycle(registry.reload_candidates_for_source("claude-code").await)
+                .expect("done serves")
+                .state,
+            ReloadLifecycleState::Done
+        );
+    }
+
+    /// Reload-all fans out over the supervisor's OWN live registry — the
+    /// exact set served as candidates: every row of the source is stamped
+    /// `requested` atomically with membership and gets its own
+    /// per-session reload event; other backends and native rows are
+    /// untouched, and a native/empty source is refused outright.
+    #[tokio::test]
+    async fn reload_all_rides_the_served_candidate_set() {
+        let bus = EventBus::new();
+        let mut bus_rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            for (id, source) in [
+                ("ext-b", "claude-code"),
+                ("ext-a", "claude-code"),
+                ("codex-1", "codex"),
+                ("native-1", "intendant"),
+            ] {
+                state
+                    .sessions
+                    .insert(id.to_string(), managed_session(id, source));
+            }
+        }
+        supervisor
+            .route_reload_credentials_all("claude-code".to_string())
+            .await;
+
+        let registry = supervisor.live_session_registry();
+        let claude = registry.reload_candidates_for_source("claude-code").await;
+        assert!(
+            claude.iter().all(|candidate| candidate
+                .reload
+                .as_ref()
+                .is_some_and(|reload| reload.state == ReloadLifecycleState::Requested)),
+            "every row of the source is stamped requested"
+        );
+        assert_eq!(
+            registry.reload_candidates_for_source("codex").await[0].reload,
+            None,
+            "other backends' rows are untouched"
+        );
+
+        let mut reloaded = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::ReloadBackendCredentials { session_id } = event {
+                reloaded.push(session_id.expect("fan-out events are targeted"));
+            }
+        }
+        assert_eq!(
+            reloaded,
+            vec!["ext-a".to_string(), "ext-b".to_string()],
+            "one per-session event per matching row, in stable order"
+        );
+
+        // Native and empty sources are refused before any stamp or event.
+        supervisor
+            .route_reload_credentials_all("intendant".to_string())
+            .await;
+        supervisor
+            .route_reload_credentials_all("  ".to_string())
+            .await;
+        while let Ok(event) = bus_rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ReloadBackendCredentials { .. }),
+                "a refused source fans nothing out"
+            );
+        }
+    }
+
     /// The delegation dedup ledger: first writer wins for a given id,
     /// and the FIFO bound evicts the oldest acceptance, never the
     /// newest.
@@ -1384,6 +1611,91 @@ mod tests {
         assert!(removed.is_some());
         assert!(!state.session_is_managed("wrapper"));
         assert!(!state.session_is_managed("backend"));
+    }
+
+    /// The readopt-successor false-ghost class (five live specimens,
+    /// 2026-07-29): `apply_session_identity` re-keys a post-identity
+    /// entry to its backend id and leaves the wrapper log-dir id behind
+    /// as an alias, while catalog rows key by the log-dir id — an
+    /// entry-keys-only live set therefore read every post-identity live
+    /// session as dead and its card wore the ghost chip (fold-order
+    /// roulette against the dead twin). The published set is
+    /// alias-closed: aliases resolving to a live entry count; aliases of
+    /// closed-channel or removed entries do not. The grid half attaches
+    /// the successor's row under the closed set and must serve
+    /// live_wrapper:true / ghost:false.
+    #[test]
+    fn readopt_successor_card_does_not_false_ghost() {
+        let state = Arc::new(AsyncMutex::new(SupervisorState::default()));
+        let (open_tx, _open_rx) = mpsc::channel(1);
+        {
+            let mut guard = state.try_lock().unwrap();
+            // Post-identity live entry: keyed by the backend id, wrapper
+            // dir id aliased to it, follow-up channel open.
+            let mut entry = managed_session("rsg-backend-b", "claude-code");
+            entry.follow_up_tx = open_tx.clone();
+            guard.sessions.insert("rsg-backend-b".to_string(), entry);
+            guard
+                .session_aliases
+                .insert("rsg-wrapper-dir".to_string(), "rsg-backend-b".to_string());
+            // A finished entry's alias must not read live (closed
+            // channel)…
+            guard.sessions.insert(
+                "rsg-closed".to_string(),
+                managed_session("rsg-closed", "claude-code"),
+            );
+            guard
+                .session_aliases
+                .insert("rsg-closed-alias".to_string(), "rsg-closed".to_string());
+            // …and a dangling alias resolves to nothing.
+            guard
+                .session_aliases
+                .insert("rsg-dangling".to_string(), "rsg-gone".to_string());
+        }
+        let registry = LiveSessionRegistry {
+            state: Arc::downgrade(&state),
+        };
+        let live = registry.live_wrapper_ids().expect("uncontended lock");
+        assert!(live.contains("rsg-backend-b"));
+        assert!(
+            live.contains("rsg-wrapper-dir"),
+            "the wrapper log-dir alias of a live entry is live — the catalog row keys by it"
+        );
+        assert!(!live.contains("rsg-closed"));
+        assert!(!live.contains("rsg-closed-alias"));
+        assert!(!live.contains("rsg-dangling"));
+
+        // Grid half: the successor's catalog row (keyed by its log dir)
+        // stops false-ghosting under the closed set even though its
+        // transcript predates the boot watershed.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("rsg-wrapper-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.jsonl"), b"{}\n").unwrap();
+        let watershed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let joins =
+            crate::web_gateway::session_catalog::grid_envelope::GridEnvelopeJoins::for_tests(
+                Some(watershed),
+                Some(live),
+                None,
+                None,
+            );
+        let mut row = serde_json::json!({});
+        joins.attach(&mut row, "rsg-wrapper-dir", &dir);
+        assert_eq!(
+            row["boot"]["live_wrapper"], true,
+            "the alias-closed live set must reach the row"
+        );
+        assert_eq!(
+            row["boot"]["ghost"], false,
+            "a live readopt successor's card never wears the ghost chip"
+        );
+        assert_eq!(row["boot"]["era"], "current");
+        drop(open_tx);
     }
 
     #[test]

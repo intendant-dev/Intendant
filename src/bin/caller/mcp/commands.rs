@@ -1304,6 +1304,21 @@ pub(crate) async fn handle_control_command_mcp(
             );
             None
         }
+        ControlMsg::ReloadCredentialsAll { source } => {
+            // Same honest refusal as the per-session shape: the fan-out
+            // iterates the daemon supervisor's live registry, which this
+            // foreground/MCP shape does not run.
+            emit_control_result(
+                control_tx,
+                "reload_credentials_all",
+                false,
+                format!(
+                    "reload_credentials_all is only available for daemon-supervised sessions (requested source: {source})"
+                ),
+                None,
+            );
+            None
+        }
         ControlMsg::FollowUp {
             text, direct: _, ..
         } => {

@@ -200,7 +200,19 @@ impl IntendantServer {
                 .map_err(|_| format!("unknown status '{s}' (open, done, or retired)"))
             })
             .transpose()?;
-        let (mut items, counts, skipped_lines) = agenda.snapshot();
+        // Delta first, status second: the two filters compose (a delta
+        // pull may still want only open items). Absent both = the frozen
+        // bare full-ledger shape (ruling R-AS1).
+        let snapshot = match params.since_seq {
+            Some(cursor) => agenda.changed_since(cursor),
+            None => agenda.snapshot(),
+        };
+        let (mut items, counts, skipped_lines, seq) = (
+            snapshot.items,
+            snapshot.counts,
+            snapshot.skipped_lines,
+            snapshot.seq,
+        );
         if let Some(status) = status {
             items.retain(|item| item.status == status);
         }
@@ -208,6 +220,7 @@ impl IntendantServer {
             "items": items,
             "counts": counts,
             "skipped_lines": skipped_lines,
+            "seq": seq,
         }))
     }
 
@@ -3342,6 +3355,165 @@ pub(crate) mod tests {
 
     pub(crate) fn test_state() -> SharedMcpState {
         test_state_with_log_dir(std::path::PathBuf::from("/tmp/test_session"))
+    }
+
+    /// Track AS freeze pin (ruling R-AS1, §6.3): bare MCP `agenda_list` —
+    /// the tool every supervised backend sees, and the lane
+    /// `ctl agenda list --all --json` rides — serves the FULL ledger
+    /// forever: closed items present, multi-KB bodies verbatim, effects
+    /// with digests. The only server-side filter is the explicit `status`
+    /// param; nothing about the BARE call's shape may change. Editing
+    /// this test is the tripwire (the §8 failure mode: a "cleanup" that
+    /// slims the tool in place under running agents' feet).
+    #[tokio::test]
+    async fn bare_mcp_agenda_list_serves_the_full_ledger() {
+        let dir = tempdir().expect("agenda dir");
+        let bus = EventBus::new();
+        let state = test_state();
+        let handle = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        state.write().await.agenda = Some(handle.clone());
+        let server = IntendantServer::new(state, bus);
+
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let big_body = "archive freight ".repeat(300); // ~4.8 KB
+        let closed = handle
+            .apply(
+                crate::agenda::AgendaCommand::Add {
+                    kind: crate::agenda::AgendaKind::Task,
+                    title: "closed with body".into(),
+                    body: big_body.clone(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                    refs: Vec::new(),
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        handle
+            .apply(
+                crate::agenda::AgendaCommand::ProposeEffect {
+                    id: closed.id.clone(),
+                    goal: "the digest-bound goal".into(),
+                    fire_at_ms: 4_102_444_800_000,
+                    orchestrate: false,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: Vec::new(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        handle
+            .apply(
+                crate::agenda::AgendaCommand::Complete {
+                    id: closed.id.clone(),
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap();
+
+        let body = server
+            .agenda_list_inner(AgendaListParams {
+                status: None,
+                since_seq: None,
+            })
+            .await
+            .expect("bare agenda_list");
+        let items = body["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["status"], "done", "closed items are served bare");
+        assert_eq!(
+            items[0]["body"].as_str().expect("body served"),
+            big_body,
+            "multi-KB bodies ride the bare tool verbatim"
+        );
+        assert!(!items[0]["effects"][0]["digest"]
+            .as_str()
+            .expect("digest served")
+            .is_empty());
+        assert_eq!(body["counts"]["done"], 1);
+        // S1: additive seq cursor on the bare tool response too.
+        assert_eq!(body["seq"], 3);
+    }
+
+    /// Track AS S2: MCP `agenda_list`'s `since_seq` is a delta over the
+    /// same shape and composes with `status`. Exactness semantics are
+    /// pinned at the handle; this pins the tool-param plumbing. (The
+    /// bare-lane freeze pin above stays untouched by design — it is the
+    /// R-AS1 tripwire.)
+    #[tokio::test]
+    async fn mcp_agenda_list_since_seq_is_a_delta_and_composes_with_status() {
+        let dir = tempdir().expect("agenda dir");
+        let bus = EventBus::new();
+        let state = test_state();
+        let handle = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        state.write().await.agenda = Some(handle.clone());
+        let server = IntendantServer::new(state, bus);
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        handle.apply(add("before"), owner.clone()).unwrap(); // seq 0
+        let after = handle.apply(add("after"), owner.clone()).unwrap(); // seq 1
+        handle
+            .apply(
+                crate::agenda::AgendaCommand::Complete {
+                    id: after.id.clone(),
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap(); // seq 2
+
+        let delta = server
+            .agenda_list_inner(AgendaListParams {
+                status: None,
+                since_seq: Some(1),
+            })
+            .await
+            .expect("delta agenda_list");
+        let items = delta["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(after.id));
+        assert_eq!(delta["seq"], 3);
+        let composed = server
+            .agenda_list_inner(AgendaListParams {
+                status: Some("open".into()),
+                since_seq: Some(1),
+            })
+            .await
+            .expect("composed filters");
+        assert!(
+            composed["items"].as_array().unwrap().is_empty(),
+            "status=open composes with the delta: the changed item is done"
+        );
     }
 
     pub(crate) fn test_state_with_log_dir(log_dir: std::path::PathBuf) -> SharedMcpState {

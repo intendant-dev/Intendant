@@ -11,15 +11,34 @@ use super::*;
 
 /// Transport-neutral core of `GET /api/agenda` (tunnel twin
 /// `api_agenda_list`): every item oldest-first plus status counts, the
-/// count of preserved-but-unfolded log lines, and the reminder policy
-/// (read-only here — mutations ride the Settings-gated policy route).
+/// count of preserved-but-unfolded log lines, the fold's `seq` cursor
+/// (Track AS — the op-log line count, `read_ops`' space), and the
+/// reminder policy (read-only here — mutations ride the Settings-gated
+/// policy route).
+///
+/// `since_seq` (additive, Track AS S2) turns the same shape into a
+/// delta: only items whose last folding op seq is `>= since_seq` ride
+/// `items` — the healing lane for event gaps, reconnects, and foreign
+/// (other-daemon) appends. The BARE call keeps the full-ledger shape
+/// forever (ruling R-AS1); the sibling joins always cover exactly the
+/// served set (Q10), so they shrink with the delta automatically.
 pub(crate) async fn agenda_list_api_response(
+    since_seq: Option<u64>,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let Some(agenda) = agenda_handle(mcp_server).await else {
         return ApiResponse::json_error(503, "agenda unavailable on this daemon");
     };
-    let (items, counts, skipped_lines) = agenda.snapshot();
+    let snapshot = match since_seq {
+        Some(cursor) => agenda.changed_since(cursor),
+        None => agenda.snapshot(),
+    };
+    let (items, counts, skipped_lines, seq) = (
+        snapshot.items,
+        snapshot.counts,
+        snapshot.skipped_lines,
+        snapshot.seq,
+    );
     let sessions = agenda_sessions_join(&crate::platform::home_dir(), &items);
     // Tier-1 PR state for the anchors this snapshot serves — the same
     // sibling discipline as `sessions`: keyed by the anchors' url-ref
@@ -36,6 +55,7 @@ pub(crate) async fn agenda_list_api_response(
         "items": items,
         "counts": counts,
         "skipped_lines": skipped_lines,
+        "seq": seq,
         "reminder_policy": agenda.reminder_policy(),
         "sessions": sessions,
     });
@@ -419,11 +439,13 @@ fn agenda_error_status(err: &crate::agenda::AgendaError) -> u16 {
 
 pub(crate) async fn handle_agenda_list(
     stream: DemuxStream,
+    request_line: &str,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = agenda_list_api_response(mcp_server.as_ref()).await;
+    let since_seq = query_param(request_line, "since_seq").and_then(|v| v.parse().ok());
+    let response = agenda_list_api_response(since_seq, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -586,6 +608,159 @@ mod tests {
         }
     }
 
+    /// Track AS freeze pin (ruling R-AS1, §6.3): the BARE list lane —
+    /// `GET /api/agenda` and its tunnel twin `api_agenda_list`, which
+    /// delegates to this exact core (`dashboard_control/api_sessions.rs::
+    /// api_agenda_list_response`) — serves the FULL ledger forever:
+    /// closed items present, multi-KB bodies present verbatim, effects
+    /// with digests present. Every Track AS capability is an additive
+    /// parameter or field, never a changed default. Editing this test is
+    /// the tripwire the ruling names: a "cleanup" that windows, slims,
+    /// or summarizes the bare shape is the §8 failure mode, not progress.
+    #[tokio::test]
+    async fn bare_agenda_lanes_serve_the_full_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let big_body = "archive freight ".repeat(300); // ~4.8 KB
+        let add = |title: &str, body: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: body.into(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let done = agenda
+            .apply(add("closed with body", &big_body), owner.clone())
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::ProposeEffect {
+                    id: done.id.clone(),
+                    goal: "the digest-bound goal".into(),
+                    fire_at_ms: 4_102_444_800_000,
+                    orchestrate: false,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: Vec::new(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Complete {
+                    id: done.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let retired = agenda
+            .apply(add("retired row", "gone but present"), owner.clone())
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Retire {
+                    id: retired.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda.apply(add("open row", "live"), owner).unwrap();
+
+        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
+        let items = body["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 3, "every item, closed included");
+        let served_done = items
+            .iter()
+            .find(|item| item["id"] == serde_json::json!(done.id))
+            .expect("the closed item is served");
+        assert_eq!(served_done["status"], "done");
+        assert_eq!(
+            served_done["body"].as_str().expect("body served"),
+            big_body,
+            "multi-KB bodies ride the bare lane verbatim"
+        );
+        assert!(
+            !served_done["effects"][0]["digest"]
+                .as_str()
+                .expect("effect digest served")
+                .is_empty(),
+            "effects ride with their digests"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["status"] == "retired")
+                .count(),
+            1,
+            "retired items stay reachable on the bare lane"
+        );
+        assert_eq!(body["counts"]["open"], 1);
+        assert_eq!(body["counts"]["done"], 1);
+        assert_eq!(body["counts"]["retired"], 1);
+        // S1: the bare response now also carries the fold's seq cursor —
+        // additive, and exactly the ops route's line count (6 ops here:
+        // three adds, one propose, one complete, one retire).
+        assert_eq!(body["seq"], 6);
+    }
+
+    /// Track AS S2: `since_seq` on the list core (HTTP `?since_seq=` and
+    /// the tunnel twin's `{since_seq}` params both land here) serves the
+    /// same response shape as a delta — changed items only, whole-ledger
+    /// counts, fresh seq — and the sessions join covers exactly the
+    /// served set (Q10). Exactness semantics are pinned at the handle
+    /// (`since_seq_returns_exactly_the_changed_items`); this pins the
+    /// param plumbing and the shape.
+    #[tokio::test]
+    async fn since_seq_param_serves_a_delta_of_the_same_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        agenda
+            .apply(add("before the cursor"), owner.clone())
+            .unwrap();
+        let cursor = json_of(&agenda_list_api_response(None, Some(&server)).await)["seq"]
+            .as_u64()
+            .unwrap();
+        let changed = agenda.apply(add("after the cursor"), owner).unwrap();
+
+        let delta = json_of(&agenda_list_api_response(Some(cursor), Some(&server)).await);
+        let items = delta["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(changed.id));
+        assert_eq!(delta["counts"]["open"], 2, "counts stay whole-ledger");
+        assert_eq!(delta["seq"], cursor + 1);
+        // An at-frontier pull is an empty delta with the same shape.
+        let empty = json_of(&agenda_list_api_response(Some(cursor + 1), Some(&server)).await);
+        assert!(empty["items"].as_array().unwrap().is_empty());
+        assert_eq!(empty["counts"]["open"], 2);
+    }
+
     /// Tier 1 rides the snapshot as a sibling map keyed by served
     /// anchors' locators — items without joined refs produce no key at
     /// all, and the item DTO itself never grows a state field.
@@ -602,7 +777,7 @@ mod tests {
             .unwrap();
         crate::github_pr::join::tier1().update_repo("o/r", &open);
 
-        let body = json_of(&agenda_list_api_response(Some(&server)).await);
+        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
         let joined = &body["pull_requests"][locator];
         assert_eq!(joined["draft"], true);
         assert_eq!(joined["title"], "live");
@@ -1143,9 +1318,41 @@ pub(crate) async fn agenda_ref_drift_api_response(
                 }),
         )
         .collect();
+    // The manifests' sealed binding refs get the same expand-time honesty
+    // check (Track AW §2.4), plus the live hash/mtime the Review-&-adopt
+    // gesture restates as its fresh pin. Presentation only: drift never
+    // changes what fires (firings execute the sealed revision), and the
+    // propose intake re-verifies any restated pin against the daemon's
+    // own read, so nothing served here is authority.
+    let binding_refs: Vec<serde_json::Value> = item
+        .effects
+        .iter()
+        .flat_map(|effect| {
+            effect.manifest.binding_refs.iter().map(|r| {
+                let live = crate::agenda::binding_ref_drift(&r.locator, &r.sha256);
+                let mut row = serde_json::json!({
+                    "effect_id": effect.effect_id,
+                    "locator": r.locator,
+                    "pin": r.sha256,
+                    "status": live.status,
+                });
+                if let Some(sha) = live.live_sha256 {
+                    row["live_sha256"] = sha.into();
+                }
+                if let Some(ms) = live.live_mtime_ms {
+                    row["live_mtime_ms"] = ms.into();
+                }
+                row
+            })
+        })
+        .collect();
     ApiResponse::json(
         200,
-        JsonBody::Value(serde_json::json!({ "item_id": item.id, "refs": refs })),
+        JsonBody::Value(serde_json::json!({
+            "item_id": item.id,
+            "refs": refs,
+            "binding_refs": binding_refs,
+        })),
     )
 }
 
