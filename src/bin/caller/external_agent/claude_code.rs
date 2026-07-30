@@ -3003,12 +3003,30 @@ impl CcReader {
                     .pointer("/content_block/type")
                     .and_then(|t| t.as_str())
                 {
-                    Some("thinking") | Some("redacted_thinking") => self.observe_activity(
-                        ActivityObs::ReasoningStarted {
-                            delta_heartbeat: true,
-                        },
-                        out,
-                    ),
+                    Some("thinking") | Some("redacted_thinking") => {
+                        // The stream shape permits the opening block to carry
+                        // initial `thinking` text. No shipped CLI does today
+                        // (2.1.220 wire capture: {"thinking":"","signature":""},
+                        // and print mode withholds summarized-thinking text
+                        // everywhere), but text materialized here has no other
+                        // path into the envelope drain — buffer it exactly
+                        // like a thinking_delta so it would render, never be
+                        // silently dropped.
+                        if let Some(text) = event
+                            .pointer("/content_block/thinking")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| !t.is_empty())
+                        {
+                            let index = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                            self.buffer_thinking_delta(Self::thinking_scope(msg), index, text);
+                        }
+                        self.observe_activity(
+                            ActivityObs::ReasoningStarted {
+                                delta_heartbeat: true,
+                            },
+                            out,
+                        )
+                    }
                     _ => self.observe_activity(ActivityObs::ResponseDelta, out),
                 }
             }
@@ -6064,6 +6082,30 @@ mod tests {
             reader.thinking_buffers.is_empty(),
             "the envelope drain must consume the buffered block"
         );
+    }
+
+    /// A thinking block whose `content_block_start` carries initial text
+    /// (no shipped CLI does — the 2.1.220 print-mode wire opens with
+    /// `{"thinking":"","signature":""}` — but the stream shape permits it)
+    /// must reach the envelope drain like any streamed delta, ahead of
+    /// whatever deltas follow.
+    #[test]
+    fn reader_recovers_thinking_from_content_block_start_initial_text() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"Opening thought. "}},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Then a delta."}},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"sig-s"}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(
+            reasoning_texts(&out),
+            vec!["Opening thought. Then a delta."]
+        );
+        assert!(reader.thinking_buffers.is_empty());
     }
 
     /// Older CLIs (≤ 2.1.210) still materialize the thinking text into the

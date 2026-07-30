@@ -48,6 +48,11 @@ let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
 let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+// Projection state: 'all' (whole non-retired ledger), 'hubs' (the
+// over-cap hub overview), 'focus' (one hub's placed subtree). The render
+// pass decides the projection; build/draw only read it.
+let agendaGraphFocus = null;
+let agendaGraphProjection = 'all';
 let agendaGraphMouse = { x: -1e4, y: -1e4, down: false, moved: 0 };
 let agendaGraphHover = null;
 let agendaGraphPalCache = null;
@@ -63,15 +68,61 @@ function agendaGraphReducedMotion() {
 
 // The graph's pool: every non-retired item, deliberately unfiltered —
 // the constellation shows the whole topology; search and the lens-bar
-// filter chips keep applying to the card lenses only.
+// filter chips keep applying to the card lenses only. A focused hub
+// narrows the pool to its placed subtree (self included); a focus whose
+// item left the ledger clears itself.
 function agendaGraphPoolItems() {
-  return (agendaItems || []).filter((item) => item.status !== 'retired');
+  const all = (agendaItems || []).filter((item) => item.status !== 'retired');
+  if (agendaGraphFocus) {
+    if (!all.some((item) => item.id === agendaGraphFocus)) {
+      agendaGraphFocus = null;
+    } else {
+      const desc = agendaDescendantIds(agendaGraphFocus);
+      return all.filter(
+        (item) => item.id === agendaGraphFocus || desc.has(item.id),
+      );
+    }
+  }
+  return all;
+}
+
+// The over-cap degradation: instead of refusing, the constellation
+// becomes a hub overview — only items with placed children — and a
+// click focuses one hub's subtree. The projection stays functional at
+// any ledger size a real taxonomy produces.
+function agendaGraphHubOverviewItems(all) {
+  const parents = new Set();
+  all.forEach((item) => {
+    if (item.part_of) parents.add(item.part_of.parent_id);
+  });
+  return all.filter((item) => parents.has(item.id));
+}
+
+// The active projection's node pool — the one truth build and draw use.
+function agendaGraphProjectionItems() {
+  const pool = agendaGraphPoolItems();
+  if (agendaGraphProjection === 'hubs' && !agendaGraphFocus) {
+    return agendaGraphHubOverviewItems(pool);
+  }
+  return pool;
 }
 
 // ---- Lens surface (the AGENDA_LENSES render/deactivate pair) ----
 
 function agendaGraphRenderLens(host) {
-  const items = agendaGraphPoolItems();
+  // Pick the projection: focused subtree when a focus is set; the whole
+  // ledger under the cap; past the cap, degrade to the hub overview
+  // (the ratified cap still bounds every projection — the O(n²)
+  // relaxation and the label field stop earning their keep beyond it).
+  let items = agendaGraphPoolItems();
+  agendaGraphProjection = agendaGraphFocus ? 'focus' : 'all';
+  if (!agendaGraphFocus && items.length > AGENDA_GRAPH_NODE_CAP) {
+    const hubs = agendaGraphHubOverviewItems(items);
+    if (hubs.length && hubs.length <= AGENDA_GRAPH_NODE_CAP) {
+      items = hubs;
+      agendaGraphProjection = 'hubs';
+    }
+  }
   if (!items.length) {
     agendaGraphTeardown();
     host.innerHTML = `<div class="ag2-empty">
@@ -82,14 +133,15 @@ function agendaGraphRenderLens(host) {
     return;
   }
   if (items.length > AGENDA_GRAPH_NODE_CAP) {
-    // Ratified cap: past this the O(n²) relaxation and the label field
-    // stop earning their keep — skip the layout entirely.
     agendaGraphTeardown();
+    const hint = agendaGraphFocus
+      ? 'This subtree exceeds the cap — focus a narrower hub, or use By hub.'
+      : 'Use By hub for large flat ledgers.';
     host.innerHTML = `<div class="ag2-graph-panel empty">
       <div class="ag2-empty">
         <div class="ag2-empty-glyph">◍</div>
         <div class="ag2-empty-title">The constellation caps at ${AGENDA_GRAPH_NODE_CAP} items</div>
-        <div class="ag2-empty-hint">Use By hub for large ledgers.</div>
+        <div class="ag2-empty-hint">${hint}</div>
       </div>
     </div>`;
     return;
@@ -98,6 +150,23 @@ function agendaGraphRenderLens(host) {
   if (!canvas) {
     host.innerHTML = agendaGraphPanelHtml();
     canvas = host.querySelector('#ag2-graph-canvas');
+  }
+  // Per-projection static chrome: hint text and the clear-focus button.
+  const hintLine = host.querySelector('#ag2-graph-hint');
+  if (hintLine) {
+    hintLine.textContent = agendaGraphProjection === 'hubs'
+      ? 'hub overview — click a hub to focus its subtree'
+      : agendaGraphProjection === 'focus'
+        ? 'focused subtree — double-click empty space to clear'
+        : 'drag to orbit · click a node to open it · double-click a hub to focus';
+  }
+  const clear = host.querySelector('#ag2-graph-clear');
+  if (clear) {
+    clear.hidden = !agendaGraphFocus;
+    clear.onclick = () => {
+      agendaGraphFocus = null;
+      agendaRenderTab();
+    };
   }
   agendaGraphBindCanvas(canvas);
   agendaGraphEnsureLoop();
@@ -117,15 +186,18 @@ function agendaGraphPanelHtml() {
       <div class="ag2-graph-eyebrow-title">Constellation</div>
       <div class="ag2-graph-eyebrow-sub">placement · adjacency · dependencies</div>
     </div>
-    <div class="ag2-graph-hint">drag to orbit · click a node to open it</div>
+    <div class="ag2-graph-hint" id="ag2-graph-hint">drag to orbit · click a node to open it</div>
+    <button type="button" class="ag2-dashbtn ag2-graph-clear" id="ag2-graph-clear" hidden>show all</button>
     <div class="ag2-graph-legend">
       ${agendaGraphLegendChip('s-dot t-iris', 'open')}
       ${agendaGraphLegendChip('s-dot t-amber', 'question')}
       ${agendaGraphLegendChip('s-dot t-green', 'done')}
       ${agendaGraphLegendChip('s-ring t-rose', 'blocked')}
       ${agendaGraphLegendChip('s-ring t-green', 'standing run')}
+      ${agendaGraphLegendChip('s-ring t-terr', 'territory')}
       ${agendaGraphLegendChip('s-line t-place', 'filed under')}
       ${agendaGraphLegendChip('s-line t-rel', 'see-also')}
+      ${agendaGraphLegendChip('s-line t-typed', 'typed →')}
       ${agendaGraphLegendChip('s-line t-dep', 'waits on')}
     </div>
   </div>`;
@@ -163,13 +235,30 @@ function agendaGraphBindCanvas(canvas) {
     },
     up: () => {
       const m = agendaGraphMouse;
-      // A press that traveled under ~6px is a click; open its node in
-      // the slice-A inspector.
+      // A press that traveled under ~6px is a click. In the hub
+      // overview a click focuses the hub's subtree; everywhere else it
+      // opens the node in the slice-A inspector.
       if (m.down && m.moved < 6 && agendaGraphHover) {
-        agendaOpenInspector(agendaGraphHover);
+        if (agendaGraphProjection === 'hubs') {
+          agendaGraphFocus = agendaGraphHover;
+          agendaRenderTab();
+        } else {
+          agendaOpenInspector(agendaGraphHover);
+        }
       }
       m.down = false;
       agendaGraphArmAutoResume();
+    },
+    dbl: () => {
+      // Double-click a hub to focus its subtree; double-click empty
+      // space to clear an active focus.
+      if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
+        agendaGraphFocus = agendaGraphHover;
+        agendaRenderTab();
+      } else if (!agendaGraphHover && agendaGraphFocus) {
+        agendaGraphFocus = null;
+        agendaRenderTab();
+      }
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -185,6 +274,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mousedown', hooks.down);
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
+  canvas.addEventListener('dblclick', hooks.dbl);
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -196,6 +286,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mousedown', hooks.down);
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
+    canvas.removeEventListener('dblclick', hooks.dbl);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -276,12 +367,14 @@ function agendaGraphTeardown() {
 // nodes keep their positions and the settle budget re-arms so the new
 // shape relaxes in over the following frames.
 function agendaGraphBuild() {
-  const items = agendaGraphPoolItems();
-  const key = items.map((x) => [
+  const items = agendaGraphProjectionItems();
+  const key = `${agendaGraphProjection}|${agendaGraphFocus || ''};` + items.map((x) => [
     x.id,
     x.status,
     x.part_of ? x.part_of.parent_id : '',
-    (x.relates_to || []).length,
+    // Adjacency keyed per-link (target + kind) so a re-typed link
+    // rebuilds even when the count is unchanged.
+    (x.relates_to || []).map((l) => `${l.target_id}~${l.link_kind || ''}`).join(','),
     (x.relies_on || []).length,
     x.kind,
   ].join('|')).join(';');
@@ -309,13 +402,20 @@ function agendaGraphBuild() {
         links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'dep' });
       }
     });
-    // relates_to renders undirected: dedupe the two stored directions.
+    // relates_to renders undirected and deduped across the two stored
+    // directions; a typed link keeps its stored direction (a = storer,
+    // b = target — "A supersedes B" draws its arrow at B).
     (x.relates_to || []).forEach((link) => {
       if (!idx.has(link.target_id)) return;
       const pair = [x.id, link.target_id].sort().join(':');
       if (seenRel.has(pair)) return;
       seenRel.add(pair);
-      links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'rel' });
+      links.push({
+        a: idx.get(x.id),
+        b: idx.get(link.target_id),
+        t: 'rel',
+        k: link.link_kind || null,
+      });
     });
   });
   agendaGraphLinks = links;
@@ -400,8 +500,8 @@ function agendaGraphDraw(ts) {
   const items = agendaGraphBuild();
   if (!items.length || items.length > AGENDA_GRAPH_NODE_CAP) {
     // The ledger crossed a boundary between renders (event-lane merge):
-    // re-enter through the render pass, which owns the cap and empty
-    // states (it tears this loop down).
+    // re-enter through the render pass, which owns projection choice,
+    // the cap, and the empty states (it tears this loop down).
     agendaRenderTab();
     return;
   }
@@ -485,10 +585,17 @@ function agendaGraphDraw(ts) {
       g.strokeStyle = `rgba(${pal.iris},${depth * (hot ? 0.75 : 0.38)})`;
       g.lineWidth = hot ? 1.6 : 1.1;
     } else if (link.t === 'rel') {
-      g.setLineDash([3, 5]);
-      g.lineDashOffset = 0;
-      g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.5 : 0.16)})`;
-      g.lineWidth = 1;
+      if (link.k) {
+        // Typed adjacency: solid and slightly stronger than see-also.
+        g.setLineDash([]);
+        g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.6 : 0.26)})`;
+        g.lineWidth = hot ? 1.4 : 1.05;
+      } else {
+        g.setLineDash([3, 5]);
+        g.lineDashOffset = 0;
+        g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.5 : 0.16)})`;
+        g.lineWidth = 1;
+      }
     } else {
       g.setLineDash([2, 6]);
       g.lineDashOffset = reduced ? 0 : -ts * 0.02;
@@ -497,6 +604,30 @@ function agendaGraphDraw(ts) {
     }
     g.stroke();
     g.setLineDash([]);
+    if (link.t === 'rel' && link.k) {
+      // A typed link reads storer → target: arrowhead at the target
+      // end, the kind labeled at the midpoint while an endpoint is hot.
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      const ax = b.x - Math.cos(ang) * 11;
+      const ay = b.y - Math.sin(ang) * 11;
+      const sz = 3.2 + (hot ? 0.9 : 0);
+      g.beginPath();
+      g.moveTo(ax + Math.cos(ang) * sz, ay + Math.sin(ang) * sz);
+      g.lineTo(ax + Math.cos(ang + 2.5) * sz, ay + Math.sin(ang + 2.5) * sz);
+      g.lineTo(ax + Math.cos(ang - 2.5) * sz, ay + Math.sin(ang - 2.5) * sz);
+      g.closePath();
+      g.fillStyle = `rgba(${pal.text},${depth * (hot ? 0.7 : 0.32)})`;
+      g.fill();
+      if (hot) {
+        g.font = '9px "JetBrains Mono", monospace';
+        g.fillStyle = `rgba(${pal.text},.8)`;
+        g.fillText(
+          link.k.replace(/_/g, ' '),
+          (a.x + b.x) / 2 + 5,
+          (a.y + b.y) / 2 - 5,
+        );
+      }
+    }
   });
   // Nodes far → near.
   const order = nodes.map((n, i) => i).sort((a, b) => pts[b].z - pts[a].z);
@@ -539,6 +670,16 @@ function agendaGraphDraw(ts) {
         (reduced ? 0.65 : 0.45 + 0.4 * Math.sin(ts / 280)) * alpha);
     }
     if (st && st.kind === 'pending') ring(pal.amber, 5.4, 0.75 * alpha);
+    // Territory halo: a dotted outer ring on nodes carrying file/dir
+    // refs — the declared working set made visible.
+    const territory = (item.refs || []).filter(
+      (r) => r.ref_type === 'file' || r.ref_type === 'dir',
+    ).length;
+    if (territory) {
+      g.setLineDash([1.5, 3.2]);
+      ring(pal.text, 7.6, 0.3 * alpha);
+      g.setLineDash([]);
+    }
     if (kids || hot) {
       g.font = `${hot ? '700' : '600'} 11px "Hanken Grotesk", sans-serif`;
       const title = String(item.title || '');
@@ -556,12 +697,34 @@ function agendaGraphDraw(ts) {
       if (hot) {
         g.font = '9.5px "JetBrains Mono", monospace';
         g.fillStyle = pal.t3;
+        const open = agendaGraphProjection === 'hubs'
+          ? 'click to focus'
+          : 'click to open';
         g.fillText(
-          `${item.kind} · ${item.status}${kids ? ` · hub, ${kids} filed` : ''} — click to open`,
+          `${item.kind} · ${item.status}${kids ? ` · hub, ${kids} filed` : ''}${territory ? ` · ${territory} territory` : ''} — ${open}`,
           lx, ly + 13);
       }
     }
   });
+  // Projection badge (painted, inert pixels like every label): what the
+  // constellation is currently showing.
+  if (agendaGraphProjection !== 'all') {
+    const allCount = (agendaItems || []).filter(
+      (x) => x.status !== 'retired',
+    ).length;
+    let badge = '';
+    if (agendaGraphProjection === 'hubs') {
+      badge = `hub overview · ${nodes.length} hubs of ${allCount} items`;
+    } else {
+      const focused = byId.get(agendaGraphFocus);
+      const title = focused ? String(focused.title || '') : '';
+      const short = title.length > 40 ? `${title.slice(0, 39)}…` : title;
+      badge = `focused: ${short} · ${nodes.length} of ${allCount} items`;
+    }
+    g.font = '10px "JetBrains Mono", monospace';
+    g.fillStyle = pal.t3;
+    g.fillText(badge, 14, 64);
+  }
 }
 
 // ---- Wire (the one permanent listener; see the fragment header) ----
