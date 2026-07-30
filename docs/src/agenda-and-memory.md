@@ -259,11 +259,19 @@ attributed ops, both **pure navigation**:
   convention. Roll-up counts, the tree lens (the dashboard's "By hub"
   toggle, `ctl agenda list --under <id>`), and "hub done · open children"
   flags are all derived at render from the ordinary snapshot.
-- **`relates_to`** (`add_relates_to` / `remove_relates_to`) — untyped
-  see-also adjacency: stored directed (the writer's item carries the
-  link), rendered as the undirected union, deduped in both directions at
-  intake; removal names the pair in either order and the daemon resolves
-  the stored side. Capped at 32 stored links per item.
+- **`relates_to`** (`add_relates_to` / `remove_relates_to`) — see-also
+  adjacency, optionally typed: `link_kind` draws from a closed vocabulary
+  (`duplicates`, `supersedes`, `follow_up_of`, `evidences`; absent = plain
+  see-also). Intake refuses unknown kinds by name; the fold stores what
+  the log says, so a newer vocabulary never bricks an older reader (the
+  foreign kind rides through as text). Typed or not, adjacency stays pure
+  navigation — nothing derives, evaluates, blocks, or fires from it.
+  Stored directed (the writer's item carries the link; a typed link reads
+  storing-side → target, so "A supersedes B" lives on A), rendered as the
+  undirected union, deduped in both directions at intake — one link per
+  pair, so changing a kind is remove + re-add; removal names the pair in
+  either order and the daemon resolves the stored side. Capped at 32
+  stored links per item.
 
 **Two rules are pinned.** *Anti-hiding:* a `part_of` placement never
 removes an item from the flat recent lens — grouping is an opt-in reorder

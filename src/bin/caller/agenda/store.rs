@@ -12,7 +12,7 @@ use super::types::{
     MAX_REF_FILE_LOCATOR_CHARS, MAX_REF_ID_LOCATOR_CHARS, MAX_REF_LABEL_CHARS,
     MAX_REF_URL_LOCATOR_CHARS, MAX_RELATES_TO_PER_ITEM, MAX_RELIES_ON_PER_ITEM, MAX_SOURCE_CHARS,
     MAX_TAGS, MAX_TAG_CHARS, MAX_TITLE_CHARS, MAX_UNCLEARED_BLOCKERS_PER_ITEM,
-    TRIGGER_MATCH_TAGS_MAX,
+    RELATES_TO_LINK_KINDS, TRIGGER_MATCH_TAGS_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -1981,9 +1981,24 @@ impl AgendaStore {
             AgendaCommand::AddRelatesTo {
                 id,
                 target_id,
+                link_kind,
                 source: _,
             } => {
                 let target_id = target_id.trim().to_string();
+                // The vocabulary gate lives at intake so the durable log
+                // only ever carries ruled kinds; the fold stays tolerant
+                // of whatever a foreign log says.
+                let link_kind = link_kind
+                    .map(|kind| kind.trim().to_string())
+                    .filter(|kind| !kind.is_empty());
+                if let Some(kind) = &link_kind {
+                    if !RELATES_TO_LINK_KINDS.contains(&kind.as_str()) {
+                        return Err(AgendaError::Invalid(format!(
+                            "unknown link kind {kind:?}; the vocabulary is {}",
+                            RELATES_TO_LINK_KINDS.join(", ")
+                        )));
+                    }
+                }
                 let item = self.require(&id)?;
                 if target_id == id {
                     return Err(AgendaError::Invalid(
@@ -2005,7 +2020,11 @@ impl AgendaStore {
                         "more than {MAX_RELATES_TO_PER_ITEM} relations"
                     )));
                 }
-                Ok(AgendaOp::AddRelatesTo { id, target_id })
+                Ok(AgendaOp::AddRelatesTo {
+                    id,
+                    target_id,
+                    link_kind,
+                })
             }
             AgendaCommand::RemoveRelatesTo {
                 id,
@@ -4727,6 +4746,7 @@ mod tests {
                 AgendaCommand::AddRelatesTo {
                     id: child.clone(),
                     target_id: grand.clone(),
+                    link_kind: None,
                     source: None,
                 },
                 owner(),
@@ -4738,6 +4758,7 @@ mod tests {
                 AgendaCommand::AddRelatesTo {
                     id: grand.clone(),
                     target_id: child.clone(),
+                    link_kind: None,
                     source: None,
                 },
                 owner(),
@@ -4759,6 +4780,40 @@ mod tests {
             )
             .unwrap();
         assert!(store.item(&child).unwrap().relates_to.is_empty());
+
+        // Typed adjacency: a ruled kind rides intake to the stored link;
+        // an unknown kind refuses, named.
+        store
+            .apply_command(
+                AgendaCommand::AddRelatesTo {
+                    id: child.clone(),
+                    target_id: grand.clone(),
+                    link_kind: Some("supersedes".into()),
+                    source: None,
+                },
+                owner(),
+                1403,
+            )
+            .unwrap();
+        assert_eq!(
+            store.item(&child).unwrap().relates_to[0]
+                .link_kind
+                .as_deref(),
+            Some("supersedes")
+        );
+        let err = store
+            .apply_command(
+                AgendaCommand::AddRelatesTo {
+                    id: child.clone(),
+                    target_id: hub2.clone(),
+                    link_kind: Some("rhymes_with".into()),
+                    source: None,
+                },
+                owner(),
+                1404,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown link kind"));
 
         // Depth rail: a chain of exactly MAX_PART_OF_DEPTH nodes is legal;
         // the link that would make it deeper refuses, named.
