@@ -1854,8 +1854,7 @@ fn parse_release_leaf(leaf_json: &str) -> Result<ReleaseLeaf, String> {
     )?;
     if !crate::pgp_identity::valid_pgp_fingerprint(&pgp_fingerprint) {
         return Err(
-            "pgp_fingerprint is not a 40- or 64-char uppercase-hex OpenPGP fingerprint"
-                .to_string(),
+            "pgp_fingerprint is not a 40- or 64-char uppercase-hex OpenPGP fingerprint".to_string(),
         );
     }
     Ok(ReleaseLeaf {
@@ -2030,7 +2029,10 @@ fn release_pgp_mismatches(leaf: &ReleaseLeaf) -> Vec<String> {
     for artifact in &leaf.artifacts {
         if let Some(base) = artifact.name.strip_suffix(".asc") {
             if artifact.name != RELEASE_SIGNING_KEY_ASSET
-                && !leaf.artifacts.iter().any(|candidate| candidate.name == base)
+                && !leaf
+                    .artifacts
+                    .iter()
+                    .any(|candidate| candidate.name == base)
             {
                 mismatches.push(format!(
                     "{}: detached signature without its artifact",
@@ -3606,13 +3608,12 @@ mod tests {
         let pin = crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT;
 
         // Fully covered under the compiled pin: no findings.
-        assert!(release_pgp_mismatches(&leaf(pin, signed_release_artifacts(&zip, b"sig"))).is_empty());
+        assert!(
+            release_pgp_mismatches(&leaf(pin, signed_release_artifacts(&zip, b"sig"))).is_empty()
+        );
 
         // A foreign signing key is finding #1, loudly named.
-        let foreign = leaf(
-            &"F".repeat(40),
-            signed_release_artifacts(&zip, b"sig"),
-        );
+        let foreign = leaf(&"F".repeat(40), signed_release_artifacts(&zip, b"sig"));
         let findings = release_pgp_mismatches(&foreign);
         assert_eq!(findings.len(), 1, "findings were {findings:?}");
         assert!(findings[0].contains("pins"), "was {}", findings[0]);
@@ -3631,7 +3632,11 @@ mod tests {
         );
         let findings = release_pgp_mismatches(&missing_key);
         assert_eq!(findings.len(), 1, "findings were {findings:?}");
-        assert!(findings[0].contains("public signing key"), "was {}", findings[0]);
+        assert!(
+            findings[0].contains("public signing key"),
+            "was {}",
+            findings[0]
+        );
 
         // Key asset present but not the committed bytes.
         let mut swapped_key = signed_release_artifacts(&zip, b"sig");
@@ -4104,7 +4109,9 @@ mod tests {
                 (artifacts[1].name.clone(), sig_bytes.clone()),
                 (
                     artifacts[2].name.clone(),
-                    crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.as_bytes().to_vec(),
+                    crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC
+                        .as_bytes()
+                        .to_vec(),
                 ),
             ]),
         }));

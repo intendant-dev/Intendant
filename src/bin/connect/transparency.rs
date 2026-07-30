@@ -805,7 +805,9 @@ fn valid_pgp_fingerprint(value: &str) -> bool {
 /// (`bin/caller/hosted_verify.rs::signature_coverage_mismatches`)
 /// re-derives the same judgments from the logged leaf; change both
 /// together.
-pub(crate) fn release_signature_coverage_errors(artifacts: &[ReleaseArtifactRecord]) -> Vec<String> {
+pub(crate) fn release_signature_coverage_errors(
+    artifacts: &[ReleaseArtifactRecord],
+) -> Vec<String> {
     let mut errors = Vec::new();
     if !artifacts
         .iter()
