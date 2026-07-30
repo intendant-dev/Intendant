@@ -2758,7 +2758,7 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "relates" | "relates-to" => {
-            let args = parse_command_args(&raw[1..], &["--source"], &["--remove"])?;
+            let args = parse_command_args(&raw[1..], &["--source", "--kind"], &["--remove"])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2770,7 +2770,14 @@ async fn run_agenda(
                 return Err("agenda relates requires the related item id second".to_string());
             };
             let target = agenda_resolve_id_str(client, config, target_raw).await?;
-            let op = if args.has("--remove") {
+            let removing = args.has("--remove");
+            if removing && args.one("--kind").is_some() {
+                return Err(
+                    "agenda relates --kind types the link being added; drop it with --remove"
+                        .to_string(),
+                );
+            }
+            let op = if removing {
                 "remove_relates_to"
             } else {
                 "add_relates_to"
@@ -2779,6 +2786,9 @@ async fn run_agenda(
             map.insert("op".to_string(), Value::String(op.to_string()));
             map.insert("id".to_string(), Value::String(id));
             map.insert("target_id".to_string(), Value::String(target));
+            if !removing {
+                insert_string(&mut map, "link_kind", args.one("--kind"));
+            }
             insert_string(&mut map, "source", args.one("--source"));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
@@ -5624,7 +5634,8 @@ fn help_agenda() {
   intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|memory|session|url]\n\
       [--must-read] [--label TEXT] [--remove] [--source LABEL]\n\
   intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
-  intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
+  intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--kind KIND] [--remove] [--source LABEL]\n\
+      # KIND: duplicates|supersedes|follow_up_of|evidences — optional typed edge, reads ITEM -> TARGET\n\
   intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
   intendant ctl agenda list --frontier           # the un-triaged frontier (triage mandate's scope)\n\
   intendant ctl agenda ops [ID_PREFIX] [--since N] [--limit N]           # raw op-log page\n\
@@ -5708,7 +5719,11 @@ attach at park time — one item, its context, one gesture.\n\
 old placement is touched); --remove unplaces. Placement is pure\n\
 navigation: it NEVER propagates blocking, completion never cascades, and\n\
 a placed item still appears in the flat list (nothing hides). `relates`\n\
-draws an untyped see-also edge, deduped in both directions; `list\n\
+draws a see-also edge, deduped in both directions — one link per pair;\n\
+--kind types it from the closed vocabulary (duplicates, supersedes,\n\
+follow_up_of, evidences; a typed edge reads ITEM -> TARGET, e.g. A\n\
+supersedes B is drawn from A; change a kind by --remove then re-add).\n\
+Typed or not, nothing derives or fires from adjacency. `list\n\
 --under` scopes to a hub's subtree; hub rows show open-children roll-ups\n\
 derived at print time.\n\
 \n\

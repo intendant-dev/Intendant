@@ -24,6 +24,15 @@ pub(crate) const MAX_CRITERION_CHARS: usize = 1000;
 /// primary intended use), and the depth cap keeps the tree a working
 /// surface, not an ontology.
 pub(crate) const MAX_RELATES_TO_PER_ITEM: usize = 32;
+/// The closed `relates_to` link vocabulary (G2 typed adjacency, v1).
+/// Absent = plain "see-also". A typed link reads storing-side → target
+/// ("A supersedes B" lives on A targeting B). Intake refuses kinds
+/// outside this set by name; the fold stores what the log says, so a
+/// newer vocabulary never bricks an older reader. Typed or not,
+/// adjacency stays non-causal — nothing derives, evaluates, blocks, or
+/// fires from it.
+pub(crate) const RELATES_TO_LINK_KINDS: [&str; 4] =
+    ["duplicates", "supersedes", "follow_up_of", "evidences"];
 pub(crate) const MAX_PART_OF_DEPTH: usize = 16;
 pub(crate) const MAX_CHILDREN_PER_HUB: usize = 500;
 /// G1 caps (steward-ruled 2026-07-22). Refs follow the blockers/links
@@ -876,13 +885,19 @@ pub struct AgendaPlacement {
     pub(crate) source: Option<String>,
 }
 
-/// One stored adjacency link (G2 `add_relates_to` fold view): untyped,
-/// purely navigational — nothing derives, evaluates, blocks, or fires
-/// from adjacency, ever. Stored directed (the writer's item carries it),
-/// rendered undirected and deduped by every surface.
+/// One stored adjacency link (G2 `add_relates_to` fold view): see-also
+/// adjacency, optionally typed via `link_kind` from the closed
+/// [`RELATES_TO_LINK_KINDS`] vocabulary (absent = plain see-also).
+/// Typed or not, purely navigational — nothing derives, evaluates,
+/// blocks, or fires from adjacency, ever. Stored directed (the writer's
+/// item carries it; a typed link reads storing-side → target), rendered
+/// undirected and deduped by every surface; one link per pair either
+/// direction, so changing a kind is remove + re-add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaRelation {
     pub(crate) target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) link_kind: Option<String>,
     pub(crate) added_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) principal: Option<String>,
@@ -1314,11 +1329,15 @@ pub enum AgendaCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
-    /// Add an undirected adjacency link (stored on this item). Purely
-    /// navigational.
+    /// Add an adjacency link (stored on this item), optionally typed via
+    /// `link_kind` from the closed [`RELATES_TO_LINK_KINDS`] vocabulary
+    /// (unknown kinds refuse at intake, named). Purely navigational
+    /// either way; a typed link reads `id` → `target_id`.
     AddRelatesTo {
         id: String,
         target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_kind: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
@@ -1568,10 +1587,14 @@ pub(crate) enum AgendaOp {
         id: String,
         parent_id: String,
     },
-    /// Adjacency link added (G2), stored on `id`'s side.
+    /// Adjacency link added (G2), stored on `id`'s side. `link_kind`
+    /// (additive) was vocabulary-checked at intake; the fold stores
+    /// what the log says.
     AddRelatesTo {
         id: String,
         target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_kind: Option<String>,
     },
     /// Adjacency link removed (G2).
     RemoveRelatesTo {
@@ -1941,7 +1964,11 @@ pub(crate) fn apply_op(
                 )),
             }
         }
-        AgendaOp::AddRelatesTo { id, target_id } => {
+        AgendaOp::AddRelatesTo {
+            id,
+            target_id,
+            link_kind,
+        } => {
             if target_id == id {
                 return Some(format!("self-relation on {id} ignored"));
             }
@@ -1956,6 +1983,7 @@ pub(crate) fn apply_op(
             let actor = rec.actor.clone().unwrap_or_default();
             item.relates_to.push(AgendaRelation {
                 target_id: target_id.clone(),
+                link_kind: link_kind.clone(),
                 added_ms: at_ms,
                 principal: actor.principal,
                 session_id: actor.session_id,
@@ -4564,6 +4592,7 @@ mod tests {
                 AgendaOp::AddRelatesTo {
                     id: "01CHILD".into(),
                     target_id: "01PEER".into(),
+                    link_kind: None,
                 },
             ),
         )
@@ -4575,6 +4604,7 @@ mod tests {
                 AgendaOp::AddRelatesTo {
                     id: "01CHILD".into(),
                     target_id: "01PEER".into(),
+                    link_kind: None,
                 },
             ),
         )
@@ -4586,6 +4616,7 @@ mod tests {
                 AgendaOp::AddRelatesTo {
                     id: "01PEER".into(),
                     target_id: "01PEER".into(),
+                    link_kind: None,
                 },
             ),
         )
@@ -4603,6 +4634,24 @@ mod tests {
         )
         .is_none());
         assert!(items["01CHILD"].relates_to.is_empty());
+
+        // Typed re-add: the kind rides the op and lands on the relation.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                11,
+                AgendaOp::AddRelatesTo {
+                    id: "01CHILD".into(),
+                    target_id: "01PEER".into(),
+                    link_kind: Some("supersedes".into()),
+                },
+            ),
+        )
+        .is_none());
+        assert_eq!(
+            items["01CHILD"].relates_to[0].link_kind.as_deref(),
+            Some("supersedes")
+        );
     }
 
     /// The ruled no-transitive pin: placement NEVER propagates blocking —
@@ -4690,6 +4739,7 @@ mod tests {
                     op: AgendaOp::AddRelatesTo {
                         id: "01X".into(),
                         target_id: "01Y".into(),
+                        link_kind: None,
                     },
                 },
                 r#"{"v":1,"at_ms":42,"op":{"type":"add_relates_to","id":"01X","target_id":"01Y"}}"#,
@@ -4706,6 +4756,20 @@ mod tests {
                     },
                 },
                 r#"{"v":1,"at_ms":43,"op":{"type":"remove_relates_to","id":"01X","target_id":"01Y"}}"#,
+            ),
+            (
+                AgendaOpRecord {
+                    v: 1,
+                    at_ms: 44,
+                    actor: None,
+                    source: None,
+                    op: AgendaOp::AddRelatesTo {
+                        id: "01X".into(),
+                        target_id: "01Y".into(),
+                        link_kind: Some("supersedes".into()),
+                    },
+                },
+                r#"{"v":1,"at_ms":44,"op":{"type":"add_relates_to","id":"01X","target_id":"01Y","link_kind":"supersedes"}}"#,
             ),
         ] {
             let line = serde_json::to_string(&record).unwrap();
@@ -4887,6 +4951,10 @@ mod tests {
             ),
             (
                 r#"{"op":"add_relates_to","id":"01X","target_id":"01Y"}"#,
+                true,
+            ),
+            (
+                r#"{"op":"add_relates_to","id":"01X","target_id":"01Y","link_kind":"supersedes"}"#,
                 true,
             ),
             (
