@@ -187,7 +187,10 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn content_type_for_path(path: &Path) -> String {
+/// Extension → MIME for served file bytes. Shared with the agenda
+/// ref-content reader (`web_gateway::routes_agenda`) — one mapping, not
+/// two drifting ones.
+pub(crate) fn content_type_for_path(path: &Path) -> String {
     match path
         .extension()
         .and_then(|extension| extension.to_str())

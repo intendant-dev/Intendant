@@ -1093,9 +1093,28 @@ pub enum AgendaCommand {
     /// question item. Returns immediately: nothing blocks on the answer.
     /// The daemon validates, commits preview blobs into the agenda blob
     /// store, and mints both the item id and the rail `ask_id` — commands
-    /// carry no client-minted ids.
+    /// carry no client-minted ids. `body`/`tags`/`due_ms`/`source`
+    /// (additive, decision-card UX) are the `Add` park fields, validated
+    /// identically and folded through the same `add` op — so a
+    /// gate-tagged owner decision can carry structured options instead
+    /// of prose, with no second bookkeeping. Older daemons reject the
+    /// unknown fields at strict intake rather than silently dropping a
+    /// tag (the `BindingRef` fail-closed precedent).
     Ask {
         questions: Vec<crate::mcp::AskUserQuestionParams>,
+        /// Markdown body — data, never instructions to whoever reads it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        body: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Refs riding the park (the `Add` G1 sugar, identically
+        /// validated and appended as `add_ref` ops after the `add`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        refs: Vec<AgendaRefSpec>,
     },
     /// Propose (or revise) the item's scheduled-session manifest. Open to
     /// every agenda writer — proposing carries no authority: nothing fires
@@ -1408,6 +1427,20 @@ impl AgendaItem {
 impl AgendaCommand {
     /// Detach the self-described `--source` label for envelope recording.
     /// The owner-surface verbs (approve/revoke) carry none by design.
+    /// Questions-only ask park — the rail waiter's and `ctl ask --park`'s
+    /// historic shape: no body/tags/due/source (those are the decision-card
+    /// park fields the CLI/op lanes fill explicitly).
+    pub(crate) fn ask(questions: Vec<crate::mcp::AskUserQuestionParams>) -> Self {
+        AgendaCommand::Ask {
+            questions,
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        }
+    }
+
     pub(crate) fn take_source(&mut self) -> Option<String> {
         match self {
             AgendaCommand::Add { source, .. }
@@ -1430,9 +1463,9 @@ impl AgendaCommand {
             | AgendaCommand::RemoveRelatesTo { source, .. }
             | AgendaCommand::AddRef { source, .. }
             | AgendaCommand::RemoveRef { source, .. }
-            | AgendaCommand::Stamp { source, .. } => source.take(),
-            AgendaCommand::Ask { .. }
-            | AgendaCommand::ApproveEffect { .. }
+            | AgendaCommand::Stamp { source, .. }
+            | AgendaCommand::Ask { source, .. } => source.take(),
+            AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. }
             | AgendaCommand::RequestOccurrence { .. }
             | AgendaCommand::StartNow { .. } => None,
@@ -4139,10 +4172,42 @@ mod tests {
         )
         .unwrap();
         match cmd {
-            AgendaCommand::Ask { questions } => {
+            AgendaCommand::Ask {
+                questions,
+                body,
+                tags,
+                due_ms,
+                source,
+                refs,
+            } => {
                 assert_eq!(questions.len(), 1);
                 assert_eq!(questions[0].question, "Which grid?");
                 assert_eq!(questions[0].options.len(), 2);
+                // Absent park fields default to the historic shape.
+                assert!(body.is_empty() && tags.is_empty() && refs.is_empty());
+                assert!(due_ms.is_none() && source.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // The decision-card park fields ride the same command (additive;
+        // an older daemon's deny_unknown_fields refuses them by name
+        // instead of silently dropping a tag).
+        let cmd: AgendaCommand = serde_json::from_str(
+            r#"{"op":"ask","questions":[{"question":"Ship?","options":[{"label":"Yes (Recommended)"}]}],"body":"why","tags":["gate"],"due_ms":5,"source":"steward"}"#,
+        )
+        .unwrap();
+        match cmd {
+            AgendaCommand::Ask {
+                body,
+                tags,
+                due_ms,
+                source,
+                ..
+            } => {
+                assert_eq!(body, "why");
+                assert_eq!(tags, vec!["gate".to_string()]);
+                assert_eq!(due_ms, Some(5));
+                assert_eq!(source.as_deref(), Some("steward"));
             }
             other => panic!("unexpected {other:?}"),
         }

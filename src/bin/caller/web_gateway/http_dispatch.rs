@@ -1426,6 +1426,24 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaRefContent => {
+                // The row's `{item_id}` capture; the ref's locator rides
+                // `?locator=` (URL-decoded like every query param).
+                let item_id = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let locator = query_param(request_line, "locator").unwrap_or_default();
+                return handle_agenda_ref_content(
+                    stream,
+                    item_id,
+                    locator,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaReminderPolicy => {
                 return handle_agenda_reminder_policy(
                     stream,

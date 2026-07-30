@@ -1231,7 +1231,10 @@ function agendaQaPillsHtml(item, qi) {
     : null;
   const pills = (q.options || []).map((o) => {
     const on = answered ? answered.includes(o.label) : picks.includes(o.label);
-    return `<button type="button" class="ag2-pill${on ? ' on' : ''}${answered ? ' recorded' : ''}"
+    // The ask-rail's recommendation convention — "(Recommended)" in the
+    // label, no separate flag — gets the highlight (decision-card UX).
+    const rec = /\(recommended\)\s*$/i.test(o.label);
+    return `<button type="button" class="ag2-pill${on ? ' on' : ''}${answered ? ' recorded' : ''}${rec ? ' rec' : ''}"
       data-pill-item="${escapeHtml(item.id)}" data-pill-q="${qi}" data-pill-label="${escapeHtml(o.label)}"
       ${o.description ? ` title="${escapeHtml(o.description)}"` : ''}>${escapeHtml(o.label)}</button>`;
   });
