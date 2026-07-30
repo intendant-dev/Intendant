@@ -469,6 +469,7 @@ function ensureSessionWindow(sessionId, meta = {}) {
     header,
     minimize,
     maximize,
+    close,
     jumpBottom,
     phase: normalizeSessionPhase(meta.phase || 'idle'),
     pendingActiveUntil: 0,
@@ -704,6 +705,28 @@ function updateSessionWindow(sessionId, meta = {}) {
   // how it ended (and where its lineage continued) instead of freezing on
   // a mid-execution look.
   renderSessionWindowTerminalNote(win, sid);
+  // Track AO safe-to-stop: the × affordance claims exactly what the
+  // machine knows — the served stop derivation for agenda-linked
+  // sessions; for linkless sessions, "safe" only as the ruled
+  // conjunction (idle ∧ no linkage), and a busy linkless session claims
+  // NOTHING (the default title stands).
+  if (win.close) {
+    const agendaOcc = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
+    let closeTitle = 'Hide or stop session';
+    if (agendaOcc && agendaOcc.stop === 'kills_live_run') {
+      closeTitle = 'Stopping kills a live agenda run — the occurrence records failed';
+    } else if (agendaOcc && agendaOcc.stop === 'owed_work') {
+      closeTitle = 'Agenda work is still owed behind this session — stopping does not settle it';
+    } else if (agendaOcc && agendaOcc.stop === 'settled') {
+      closeTitle = 'No agenda-owed work — the linked occurrence is settled';
+    } else if (!agendaOcc && win.phase === 'idle') {
+      closeTitle = 'Idle · no agenda-owed work — stopping loses only this session’s context';
+    }
+    if (win.close.title !== closeTitle) {
+      win.close.title = closeTitle;
+      win.close.setAttribute('aria-label', closeTitle);
+    }
+  }
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).

@@ -46,8 +46,8 @@ pub(crate) use blobs::find_blob;
 pub(crate) use definitions::materialize_house_definitions;
 pub(crate) use handle::{AgendaHandle, AgendaPrefixResolution, SessionAgendaEnvelope};
 pub(crate) use reminders::{
-    journal_generation_floor, AgendaOccurrencesPage, ReminderPolicyPatch,
-    AGENDA_OCCURRENCES_DEFAULT_LIMIT,
+    journal_generation_floor, AgendaOccurrencesPage, OccurrenceState, ReminderPolicyPatch,
+    SessionLineageRole, AGENDA_OCCURRENCES_DEFAULT_LIMIT,
 };
 pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};
@@ -66,9 +66,9 @@ pub(crate) use types::{
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
 #[cfg(test)]
-pub(crate) use reminders::OccurrenceState;
-#[cfg(test)]
 pub(crate) use types::AgendaAskResolution;
+#[cfg(test)]
+pub(crate) use types::{AgendaAttestation, AttestationOutcome};
 
 use std::path::{Path, PathBuf};
 
