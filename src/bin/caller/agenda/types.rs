@@ -3450,6 +3450,36 @@ mod tests {
         }
     }
 
+    /// The dashboard's typed-adjacency vocabulary is a static mirror of
+    /// [`RELATES_TO_LINK_KINDS`] (the sanctioned frontend-fallback
+    /// pattern): the generated app.html must carry the mirror array —
+    /// derived here from the daemon constant, order included — and a
+    /// chip-label entry per ruled kind, so a vocabulary change that
+    /// forgets the dashboard fails this suite instead of shipping as
+    /// drift.
+    #[test]
+    fn relates_link_kind_vocabulary_is_pinned_in_app_html() {
+        let app = include_str!("../../../../static/app.html");
+        let mirror = format!(
+            "const AGENDA_REL_KINDS = [{}]",
+            RELATES_TO_LINK_KINDS
+                .iter()
+                .map(|kind| format!("'{kind}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            app.contains(&mirror),
+            "app.html lost the AGENDA_REL_KINDS mirror ({mirror})"
+        );
+        for kind in RELATES_TO_LINK_KINDS {
+            assert!(
+                app.contains(&format!("{kind}: [")),
+                "app.html chip-label map lost the {kind:?} entry"
+            );
+        }
+    }
+
     /// Pins the `--source` envelope field (additive to v1): recorded
     /// verbatim beside the actor, folded into add provenance, absent from
     /// the wire when unset (the existing pin tests prove that half).

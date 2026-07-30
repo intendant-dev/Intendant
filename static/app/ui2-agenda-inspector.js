@@ -21,6 +21,28 @@ let agendaInspAnnDraft = '';
 let agendaInspTagDraft = '';
 let agendaInspRefDraft = '';
 let agendaInspRefMust = false;
+let agendaInspRelKind = '';
+
+// The typed-adjacency vocabulary (G2 `link_kind`) — a static mirror of
+// the daemon's RELATES_TO_LINK_KINDS, pinned by a daemon-side parity
+// test so a vocabulary change that forgets this file fails the suite
+// instead of shipping as drift.
+const AGENDA_REL_KINDS = ['duplicates', 'supersedes', 'follow_up_of', 'evidences'];
+// Reading direction: a typed link reads storer → target ("A supersedes
+// B" lives on A). The passive forms keep the incoming side readable.
+const AGENDA_REL_KIND_LABELS = {
+  duplicates: ['duplicates ▸', '◂ duplicated by'],
+  supersedes: ['supersedes ▸', '◂ superseded by'],
+  follow_up_of: ['follow-up of ▸', '◂ has follow-up'],
+  evidences: ['evidences ▸', '◂ evidenced by'],
+};
+
+function agendaRelKindLabel(kind, outgoing) {
+  const pair = AGENDA_REL_KIND_LABELS[kind];
+  // Unknown kinds (a newer daemon's vocabulary) stay readable as text.
+  if (!pair) return outgoing ? `${kind} ▸` : `◂ ${kind}`;
+  return outgoing ? pair[0] : pair[1];
+}
 
 function agendaOpenInspector(id) {
   const opened = agendaFindItem(id);
@@ -730,14 +752,23 @@ function agendaInspOrganizationHtml(item) {
       const selected = item.part_of && item.part_of.parent_id === x.id ? ' selected' : '';
       return `<option value="${escapeHtml(x.id)}"${selected}>${hub}${escapeHtml(x.title.slice(0, 46))}</option>`;
     }).join('');
-  const partners = agendaRelationPartners(item);
-  const rels = [...partners].map((pid) => {
+  const relEdges = agendaRelationEdges(item);
+  const partners = new Set(relEdges.map((edge) => edge.pid));
+  const rels = relEdges.map(({ pid, kind, outgoing }) => {
     const target = agendaFindItem(pid);
     if (!target) return '';
+    const kindChip = kind
+      ? `<span class="ag2-relkind">${escapeHtml(agendaRelKindLabel(kind, outgoing))}</span>`
+      : '';
     return `<span class="ag2-relchip">
-      <a data-open-item="${escapeHtml(pid)}">${escapeHtml(target.title.slice(0, 34))}</a>
-      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the see-also link (the log keeps history)">×</button>
+      ${kindChip}<a data-open-item="${escapeHtml(pid)}">${escapeHtml(target.title.slice(0, 34))}</a>
+      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the link (the log keeps history; re-add to change its kind)">×</button>
     </span>`;
+  }).join('');
+  const relKindOptions = ['', ...AGENDA_REL_KINDS].map((kind) => {
+    const selected = kind === agendaInspRelKind ? ' selected' : '';
+    const label = kind ? kind.replace(/_/g, ' ') : 'see-also';
+    return `<option value="${kind}"${selected}>${label}</option>`;
   }).join('');
   const relOptions = others
     .filter((x) => !partners.has(x.id))
@@ -762,6 +793,9 @@ function agendaInspOrganizationHtml(item) {
         <span class="ag2-orgk">See also</span>
         <div class="ag2-orgv">
           ${rels}
+          <select class="ag2-relkind-add" data-act-change="rel-kind" aria-label="Link kind (reads this item → target)">
+            ${relKindOptions}
+          </select>
           <select class="ag2-reladd" data-act-change="rel-add" aria-label="Relate to">
             <option value="">+ relate…</option>${relOptions}
           </select>
@@ -1143,10 +1177,18 @@ function agendaInspChange(e) {
     agendaSetItemUrgency(item.id, t.value, t);
   } else if (t.dataset.actChange === 'place') {
     agendaInspPlace(item, t.value, t);
+  } else if (t.dataset.actChange === 'rel-kind') {
+    // Draft only — the link sends when a target is picked.
+    agendaInspRelKind = t.value;
   } else if (t.dataset.actChange === 'rel-add') {
     const v = t.value;
     t.value = '';
-    if (v) agendaSendOp({ op: 'add_relates_to', id: item.id, target_id: v }, t);
+    if (v) {
+      const params = { op: 'add_relates_to', id: item.id, target_id: v };
+      if (agendaInspRelKind) params.link_kind = agendaInspRelKind;
+      agendaInspRelKind = '';
+      agendaSendOp(params, t);
+    }
   } else if (t.dataset.actChange === 'dep-add') {
     const v = t.value;
     if (v) {
