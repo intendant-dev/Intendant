@@ -14,6 +14,7 @@
 //! time, so the shipped binary never parses key material at all, let
 //! alone network input.
 
+#[cfg(test)]
 use ring::digest;
 
 /// The armored release public key as committed at the repo root
