@@ -20,6 +20,7 @@ mod claude_auth_ceremony;
 mod codex_auth_ceremony;
 mod codex_cloud;
 mod codex_cloud_attach;
+mod commission_sweep;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;

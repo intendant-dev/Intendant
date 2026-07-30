@@ -1068,6 +1068,19 @@ impl AgendaHandle {
             })
     }
 
+    /// The started-session lineage the journal recorded for one
+    /// occurrence (fold view, in journal order — the boot commission
+    /// sweep's lineage seeds). `None` when the journal cannot be
+    /// opened; callers degrade honestly.
+    pub(crate) fn occurrence_started_history(&self, occurrence_id: &str) -> Option<Vec<String>> {
+        self.with_journal(|journal| {
+            if let Err(err) = journal.refresh_if_stale() {
+                eprintln!("[agenda] journal refresh for started history failed: {err}");
+            }
+            journal.progress(occurrence_id).started_history
+        })
+    }
+
     /// Per-session source linkage for the session catalog's grid
     /// envelope, composed here so the catalog never touches the store:
     /// the journal's reverse fold names the occurrence and owning item
