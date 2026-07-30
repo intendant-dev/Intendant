@@ -2792,21 +2792,22 @@ new file mode 100644
     /// without the state it announces.
     #[tokio::test]
     async fn transient_round_death_arms_error_park() {
-        let specimen =
-            "Claude Code backend error (error_during_execution): API Error: 500 \
+        let specimen = "Claude Code backend error (error_during_execution): API Error: 500 \
              {\"type\":\"api_error\",\"message\":\"Internal server error\"}";
         assert!(transient_service_condition(specimen));
 
         let now = tokio::time::Instant::now();
         // The specimen shape: a backend-started/mid-commission round the
         // backend had engaged — the pending is the resume nudge.
-        let (park, line) =
-            transient_round_death_error_park(specimen, now, 1, 0, true, None);
+        let (park, line) = transient_round_death_error_park(specimen, now, 1, 0, true, None);
         assert_eq!(park.kind, ParkKind::ServiceCondition);
         assert_eq!(park.resume_at, now + error_park_delay(1, 0));
         let pending = park.pending.as_ref().expect("started turn parks a nudge");
         assert_eq!(pending.text, ERROR_MIDTURN_CONTINUATION_TEXT);
-        assert!(line.contains("parked"), "announcement names the park: {line}");
+        assert!(
+            line.contains("parked"),
+            "announcement names the park: {line}"
+        );
         assert!(
             line.contains("recovery attempt 1 of 5"),
             "announcement names the schedule position: {line}"
@@ -2815,8 +2816,7 @@ new file mode 100644
         // A backend-started death observed before any work parks
         // pending-less — the timer still wakes the lane and messages
         // arriving meanwhile queue instead of burning.
-        let (park, _line) =
-            transient_round_death_error_park(specimen, now, 1, 0, false, None);
+        let (park, _line) = transient_round_death_error_park(specimen, now, 1, 0, false, None);
         assert!(park.pending.is_none());
         assert_eq!(park.kind, ParkKind::ServiceCondition);
     }
@@ -2916,11 +2916,8 @@ new file mode 100644
     async fn error_park_shares_the_delivery_aware_seam() {
         // Never delivered: verbatim re-send, exactly like the limit twin.
         let rejected = rejected_park_message();
-        let pending = delivery_aware_park_pending(
-            rejected.clone(),
-            false,
-            ERROR_MIDTURN_CONTINUATION_TEXT,
-        );
+        let pending =
+            delivery_aware_park_pending(rejected.clone(), false, ERROR_MIDTURN_CONTINUATION_TEXT);
         assert_eq!(pending.text, rejected.text);
         assert_eq!(pending.follow_up_id, rejected.follow_up_id);
         assert_eq!(pending.edit_user_turn_index, Some(3));

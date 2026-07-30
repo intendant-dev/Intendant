@@ -2741,9 +2741,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // stays unreachable on the CC wire.
                 let completion_is_the_error_itself = pending_fatal_round_error
                     .as_ref()
-                    .is_some_and(|fatal| {
-                        message.as_deref() == Some(fatal.raw_message.as_str())
-                    });
+                    .is_some_and(|fatal| message.as_deref() == Some(fatal.raw_message.as_str()));
                 pending_turn_completion = Some((message, turns_in_round));
                 if !completion_is_the_error_itself {
                     pending_fatal_round_error = None;

@@ -2279,9 +2279,7 @@ pub(crate) async fn run_with_presence(
                                     // the next user message re-drives.
                                     persistent_error_park_streak =
                                         persistent_error_park_streak.saturating_add(1);
-                                    if error_park_attempts_exhausted(
-                                        persistent_error_park_streak,
-                                    ) {
+                                    if error_park_attempts_exhausted(persistent_error_park_streak) {
                                         cumulative_stats.rounds = round;
                                         let line = error_park_exhausted_line(
                                             &reason,
@@ -2301,15 +2299,14 @@ pub(crate) async fn run_with_presence(
                                             turn: None,
                                         });
                                     } else {
-                                        let (park, park_line) =
-                                            transient_round_death_error_park(
-                                                &reason,
-                                                tokio::time::Instant::now(),
-                                                persistent_error_park_streak,
-                                                error_park_jitter_secs(),
-                                                turn_had_started,
-                                                None,
-                                            );
+                                        let (park, park_line) = transient_round_death_error_park(
+                                            &reason,
+                                            tokio::time::Instant::now(),
+                                            persistent_error_park_streak,
+                                            error_park_jitter_secs(),
+                                            turn_had_started,
+                                            None,
+                                        );
                                         slog(&session_log, |l| l.warn(&park_line));
                                         bus.send(AppEvent::LogEntry {
                                             session_id: session_log_id(&session_log),
