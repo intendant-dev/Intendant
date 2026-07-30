@@ -64,8 +64,9 @@ credentials and must be deleted securely afterward.
 - Kimi's distinct structured `AskUserQuestion` request/answer rail, including
   a one-choice answer that must remain typed as multi-select.
 - The generated bearer-authenticated Intendant MCP bridge, through a real
-  read-only `list_displays` call, Kimi's native MCP approval request when the
-  selected release requires one, and
+  read-only `list_displays` call selected by its concrete collision-renamed
+  native tool name, Kimi's native MCP approval request when the selected
+  release requires one, and
   correlated tool output while a project MCP declaration deliberately
   occupies the default server name.
 - Dashboard-staged ordinary-file and image attachments delivered through

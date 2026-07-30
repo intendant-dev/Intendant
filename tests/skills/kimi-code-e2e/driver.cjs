@@ -1018,10 +1018,32 @@ async function pollActiveTools(
     ) {
       return lastResult;
     }
-    await sleep(250);
+    await sleep(750);
   }
   throw new Error(
     `active tools did not converge to ${JSON.stringify(expected)}; last=` +
+      `${lastResult?.message || "none"}`,
+  );
+}
+
+async function pollRegisteredToolName(
+  run,
+  sessionId,
+  predicate,
+  timeoutMs = 30_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastResult;
+  while (Date.now() < deadline) {
+    lastResult = await threadAction(run, sessionId, "tools", {}, 15_000);
+    if (lastResult.success === true) {
+      const match = registeredToolNames(lastResult.message).find(predicate);
+      if (match) return { name: match, result: lastResult };
+    }
+    await sleep(750);
+  }
+  throw new Error(
+    "registered Kimi tool did not appear; last=" +
       `${lastResult?.message || "none"}`,
   );
 }
@@ -1627,6 +1649,34 @@ async function scenario(run, port, kimiVersion) {
   // Exercise the generated, bearer-authenticated MCP bridge itself. This is
   // intentionally a read-only deterministic tool, but it proves Kimi loaded
   // the scoped server declaration and can reach Intendant through it.
+  //
+  // Discover the concrete collision-renamed tool from Kimi's native inventory
+  // rather than asking the model to infer the generated server suffix. Make it
+  // the only active tool for this turn so a stochastic EnterPlanMode or other
+  // built-in call cannot hide an otherwise healthy MCP bridge.
+  const managedMcp = await pollRegisteredToolName(
+    run,
+    sessionId,
+    (name) =>
+      /^mcp__intendant_managed_[a-f0-9]{8}(?:_\d+)?__list_displays$/.test(
+        name,
+      ),
+  );
+  check(
+    "injected-intendant-mcp-collision-name",
+    !managedMcp.name.startsWith("mcp__intendant__"),
+    managedMcp.name,
+  );
+  await expectAction(run, sessionId, "tools-set", {
+    names: [managedMcp.name],
+  });
+  const mcpOnlyTools = await pollActiveTools(run, sessionId, [managedMcp.name]);
+  check(
+    "injected-intendant-mcp-only-active-tool",
+    sameStrings(activeToolNames(mcpOnlyTools.message), [managedMcp.name]),
+    mcpOnlyTools.message || "",
+  );
+
   const mcpMark = run.mark();
   let mcpApproval = null;
   run.approvalResponder = (event) => {
@@ -1644,8 +1694,9 @@ async function scenario(run, port, kimiVersion) {
     session_id: sessionId,
     direct: true,
     text:
-      "Use the injected Intendant MCP server's list_displays tool exactly " +
-      "once. Do not use Bash or any other tool. After it succeeds, reply " +
+      `Call the exact registered tool named ${managedMcp.name} exactly once. ` +
+      "It is the only active tool; do not enter plan mode or call anything " +
+      "else. After it succeeds, reply " +
       "with exactly INTENDANT_MCP_OK and do nothing else.",
   });
   const mcpToolStart = await run.waitFor(
@@ -1698,6 +1749,7 @@ async function scenario(run, port, kimiVersion) {
       !/denied|forbidden|unauthorized/i.test(mcpToolOutput.stdout || ""),
     `${mcpToolStart.commands_preview || ""} ${(mcpToolOutput.stdout || "").slice(0, 300)}`,
   );
+  await expectAction(run, sessionId, "tools-all");
 
   // Upload one ordinary file and one image through the real dashboard route,
   // then target the live external session with StartTask attachments.
@@ -1731,11 +1783,13 @@ async function scenario(run, port, kimiVersion) {
     action: "start_task",
     session_id: sessionId,
     task:
-      `The attached text file contains a token. Remember both that token and ` +
-      `the conversation codeword ${KEEP_CODEWORD}. The attached image is red. ` +
-      "Use the Write tool (not Bash) to create probe.txt containing exactly " +
-      `${ATTACHMENT_TOKEN}. Then reply with exactly ` +
-      `ATTACHMENT_OK=${ATTACHMENT_TOKEN}; COLOR=red; CODEWORD=${KEEP_CODEWORD}.`,
+      "First call Read exactly once on the attached text file and remember " +
+      "the token you read. Call ReadMediaFile exactly once on the attached " +
+      "image and identify its color; do not infer either value from this " +
+      `instruction. Remember the conversation codeword ${KEEP_CODEWORD}. ` +
+      "Then use Write exactly once (not Bash) to create probe.txt containing " +
+      "exactly the token you read. Reply with exactly ATTACHMENT_OK=<the token " +
+      `you read>; COLOR=<the color you observed>; CODEWORD=${KEEP_CODEWORD}.`,
     direct: true,
     attachments: [`upload:${textUpload.id}`, `upload:${imageUpload.id}`],
   });
@@ -1752,8 +1806,28 @@ async function scenario(run, port, kimiVersion) {
   run.approvalResponder = null;
   check(
     "native-file-and-image-attachments",
-    /red/i.test(responseText(attachmentResponse)),
+    responseText(attachmentResponse).includes(ATTACHMENT_TOKEN) &&
+      /red/i.test(responseText(attachmentResponse)),
     responseText(attachmentResponse).slice(0, 300),
+  );
+  const attachmentToolStarts = run.events
+    .slice(attachmentMark)
+    .filter((event) => event.event === "agent_started")
+    .map((event) => event.commands_preview || "");
+  check(
+    "ordinary-attachment-read-natively",
+    attachmentToolStarts.some(
+      (preview) => /^Read:/i.test(preview) && /e2e-token\.txt/i.test(preview),
+    ),
+    attachmentToolStarts.join(" | ").slice(0, 500),
+  );
+  check(
+    "image-attachment-read-natively",
+    attachmentToolStarts.some(
+      (preview) =>
+        /ReadMediaFile/i.test(preview) && /red-pixel\.png/i.test(preview),
+    ),
+    attachmentToolStarts.join(" | ").slice(0, 500),
   );
   const probePath = path.join(WORKDIR, "probe.txt");
   check(
@@ -2297,14 +2371,20 @@ async function scenario(run, port, kimiVersion) {
     "/api/sessions",
     (body) => {
       const row = sessionRowForId(body, sessionId);
-      return Boolean(
-        row?.kimi_model &&
-          row?.kimi_thinking === expectedKimiThinking &&
-          row?.kimi_permission_mode &&
-          Array.isArray(row?.kimi_allowed_tools),
+      const tools = [...(row?.kimi_allowed_tools || [])]
+        .filter((value) => typeof value === "string")
+        .sort();
+      return (
+        row?.kimi_model === MODEL &&
+        row?.kimi_thinking === expectedKimiThinking &&
+        row?.kimi_permission_mode === "yolo" &&
+        row?.kimi_plan_mode === false &&
+        row?.kimi_swarm_mode === false &&
+        sameStrings(tools, restoredTools)
       );
     },
     60_000,
+    (body) => JSON.stringify(kimiProfileRowsForId(body, sessionId)),
   );
   const parentProfileRow = sessionRowForId(parentProfileSessions, sessionId);
   const parentConfiguredTools = [

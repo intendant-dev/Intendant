@@ -325,13 +325,15 @@ const CODEX_ITEM_TYPES: &[&str] = &[
     "function_call_output",
 ];
 
-// Kimi Code 0.27.0-0.28.0's server-v1 WebSocket event vocabulary. The server
+// Kimi Code 0.27.0-0.29.2's server-v1 WebSocket event vocabulary. The server
 // projects both its public session events and the underlying agent event bus.
 // The adapter consumes a subset, but the watch distinguishes known ignorable
 // internal notifications from genuinely novel wire shapes.
 const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "error",
     "warning",
+    "agent.created",
+    "agent.disposed",
     "agent.activity.updated",
     "agent.status.updated",
     "session.meta.updated",
@@ -379,6 +381,7 @@ const KIMI_SERVER_EVENT_TYPES: &[&str] = &[
     "context.apply_compaction",
     "context.clear",
     "context.spliced",
+    "context.undone",
     "context.undo",
     "context.update_token_count",
     "full_compaction.begin",
@@ -2428,7 +2431,13 @@ mod tests {
             "payload": { "text": "SENTINEL_KIMI_CONTENT" },
         }))
         .is_empty());
-        for event_type in ["context.spliced", "permission.approval.requested"] {
+        for event_type in [
+            "context.spliced",
+            "context.undone",
+            "agent.created",
+            "agent.disposed",
+            "permission.approval.requested",
+        ] {
             assert!(
                 kimi_findings(&serde_json::json!({
                     "type": event_type,

@@ -32,11 +32,18 @@ pub(crate) fn session_mcp_port() -> Option<u16> {
     SESSION_MCP_PORT.get().copied()
 }
 
+/// Whether the request carries browser-origin provenance.
+///
+/// `Sec-Fetch-Mode` is deliberately insufficient by itself: Node's built-in
+/// `fetch` adds `Sec-Fetch-Mode: cors` to server-side requests, including the
+/// MCP SDK used by Kimi Code. Browsers also supply an Origin or another Fetch
+/// Metadata context header, which keeps browser calls out of the cleartext
+/// credential lanes without rejecting non-browser Node clients.
 pub(crate) fn has_browser_origin_headers(header_text: &str) -> bool {
     http_header_present(header_text, "origin")
         || http_header_present(header_text, "sec-fetch-site")
-        || http_header_present(header_text, "sec-fetch-mode")
         || http_header_present(header_text, "sec-fetch-dest")
+        || http_header_present(header_text, "sec-fetch-user")
 }
 
 /// Derive the session-scoped MCP token injected into a supervised backend's
@@ -1103,6 +1110,22 @@ mod tests {
         let authorized_mcp_bearer = format!(
             "POST /mcp?session_id=child HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
+        // Node's built-in fetch emits Sec-Fetch-Mode even for server-side
+        // requests. Kimi's MCP client uses that fetch implementation, so the
+        // mode header alone is not browser provenance. Origin and the other
+        // Fetch Metadata context headers remain fail-closed below.
+        let kimi_session = "kimi-managed-session";
+        let kimi_token = session_scoped_mcp_token(token, kimi_session);
+        let authorized_kimi_mcp = format!(
+            "POST /mcp?session_id={kimi_session}&tool_profile=core HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Authorization: Bearer {kimi_token}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Accept-Language: *\r\n\
+             Sec-Fetch-Mode: cors\r\n\
+             User-Agent: node\r\n\r\n"
+        );
 
         assert!(is_loopback_cleartext_mcp_request(
             loopback,
@@ -1118,6 +1141,12 @@ mod tests {
             loopback,
             false,
             &authorized_mcp_bearer
+        ));
+        assert!(!has_browser_origin_headers(&authorized_kimi_mcp));
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &authorized_kimi_mcp
         ));
         assert!(!is_loopback_cleartext_mcp_request(
             loopback,
@@ -1161,6 +1190,13 @@ mod tests {
             false,
             &format!(
                 "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
+            )
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &format!(
+                "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: empty\r\n\r\n"
             )
         ));
     }
