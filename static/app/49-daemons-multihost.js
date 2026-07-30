@@ -1342,6 +1342,19 @@ async function hydrateDashboardFromControl() {
   for (const frame of frames) {
     if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(frame);
   }
+  // Agenda heal (Track AS S3): events missed while the transport was
+  // down are unrecoverable from the frame replay above — the since_seq
+  // delta pull recovers exactly them (full refetch only when no cursor
+  // is held). Fire-and-forget: hydration must not fail on a lagging
+  // agenda lane.
+  if (typeof agendaHeal === 'function') {
+    try {
+      const healed = agendaHeal('transport-rehydrate');
+      if (healed && typeof healed.catch === 'function') {
+        healed.catch(err => console.warn('[dashboard-control] rehydrate agenda heal failed', err));
+      }
+    } catch (err) { console.warn('[dashboard-control] rehydrate agenda heal failed', err); }
+  }
   dashboardUpdateTransportStatus();
 }
 

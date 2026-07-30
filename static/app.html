@@ -37256,7 +37256,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '79dd4cc23324cd4e';
+const INTENDANT_APP_BUILD = '5b6b7f47467c5296';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39919,7 +39919,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
   api_codex_cloud_workers: { verb: 'GET', path: '/api/codex-cloud/workers', query: ['refresh'] },
   api_codex_cloud_submit: { verb: 'POST', path: '/api/codex-cloud/submit' },
-  api_agenda_list: { verb: 'GET', path: '/api/agenda' },
+  api_agenda_list: { verb: 'GET', path: '/api/agenda', query: ['since_seq', 'shape', 'q'] },
+  api_agenda_item: { verb: 'GET', path: '/api/agenda/items/{item_id}' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
   api_agenda_definitions: { verb: 'GET', path: '/api/agenda/definitions' },
   api_agenda_sealed: { verb: 'GET', path: '/api/agenda/sealed/{sha256}' },
@@ -91038,6 +91039,12 @@ let agendaCounts = { open: 0, done: 0, retired: 0 };
 let agendaSkippedLines = 0;
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
+// Track AS S3 — the resume cursor: the daemon's op-log line seq as of
+// the last full fetch, advanced by each `agenda_changed` (which carries
+// its producing op's seq) and by each heal. null until a response
+// carries one (a pre-seq daemon serves none — healing then falls back
+// to the full refetch).
+let agendaSeq = null;
 let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 // Session-resolution join from the list response: recorded session id →
 // { source, conversation_id, key, name, project_root } for the
@@ -91134,6 +91141,7 @@ async function agendaRefresh() {
         agendaItems = resp.body.items;
         agendaCounts = resp.body.counts || agendaCounts;
         agendaSkippedLines = resp.body.skipped_lines || 0;
+        if (typeof resp.body.seq === 'number') agendaSeq = resp.body.seq;
         agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
         agendaSessions = resp.body.sessions || {};
         agendaPullRequests = resp.body.pull_requests || {};
@@ -91153,6 +91161,64 @@ async function agendaRefresh() {
   })();
   return agendaFetchInFlight;
 }
+
+// Track AS S3 — the healing lane. A held cursor turns "did I miss
+// anything?" into a delta pull (`since_seq`): the daemon returns only
+// items changed by ops at or after the cursor, upserted over the cache
+// exactly like the event lane's merges (append-only log ⇒ no deletions
+// to reconcile). Wired into event_gap recovery, transport re-hydration
+// (reconnects), and tab wake — the full refetch remains bootstrap-only.
+// No cursor (never fetched, or a pre-seq daemon) falls back to the full
+// refresh; a heal FAILURE keeps the cache and the cursor untouched (the
+// next signal retries; the data on screen stays live-known-stale).
+async function agendaHeal(reason) {
+  if (agendaItems === null || typeof agendaSeq !== 'number') return agendaRefresh();
+  if (agendaFetchInFlight) return agendaFetchInFlight;
+  agendaFetchInFlight = (async () => {
+    try {
+      const resp = await daemonApi.request('api_agenda_list', { since_seq: agendaSeq });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        for (const item of resp.body.items) {
+          const at = agendaItems.findIndex((x) => x.id === item.id);
+          // An event that landed while this pull was in flight may be
+          // newer than the pull's copy — never let the heal roll an
+          // item backwards (updated_ms is op-time, monotonic per item;
+          // ties take the incoming copy for its fresher decorations).
+          if (at >= 0 && (agendaItems[at].updated_ms || 0) > (item.updated_ms || 0)) continue;
+          if (at >= 0) agendaItems[at] = item;
+          else agendaItems.push(item);
+        }
+        agendaCounts = resp.body.counts || agendaCounts;
+        if (typeof resp.body.skipped_lines === 'number') agendaSkippedLines = resp.body.skipped_lines;
+        if (typeof resp.body.seq === 'number') agendaSeq = resp.body.seq;
+        // Delta joins cover the served (changed) set only — merge, never
+        // replace, so entries for untouched items survive.
+        Object.assign(agendaSessions, resp.body.sessions || {});
+        Object.assign(agendaPullRequests, resp.body.pull_requests || {});
+        resp.body.items
+          .flatMap(agendaItemSessionIds)
+          .forEach((id) => agendaSessionLookupsAttempted.add(id));
+        agendaLoadError = '';
+        // A parked ask that arrived while events were down re-surfaces
+        // exactly like one that arrived live.
+        agendaAnnounceParkedAsks();
+      }
+    } catch (e) {
+      console.warn('[agenda] heal failed', reason || '', e);
+    } finally {
+      agendaFetchInFlight = null;
+    }
+    agendaRenderAll();
+  })();
+  return agendaFetchInFlight;
+}
+
+// Tab wake: a hidden tab's event socket may have quietly gapped or the
+// browser throttled it — one cheap delta on return to visibility keeps
+// the surfaces honest (empty delta in the common case).
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && agendaItems !== null) agendaHeal('tab-wake');
+});
 
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
 // question rail after a FRESH load — a daemon restart wipes the
@@ -91267,6 +91333,11 @@ function agendaObserveServerMessage(d) {
   if (at >= 0) agendaItems[at] = d.item;
   else agendaItems.push(d.item);
   if (d.counts) agendaCounts = d.counts;
+  // Track AS S3: the event names its producing op — advance the resume
+  // cursor past it. max() because a delta pull may already sit ahead.
+  if (typeof d.seq === 'number') {
+    agendaSeq = Math.max(typeof agendaSeq === 'number' ? agendaSeq : 0, d.seq + 1);
+  }
   // A session id this tab has never tried to resolve (a fresh session
   // parked something): refetch once to pick up the join entry. Ids that
   // already failed resolution stay raw — no loops.
@@ -94322,9 +94393,12 @@ function agendaRenderTab() {
   const bellDot = document.getElementById('ag2-bell-dot');
   if (bellDot) bellDot.hidden = !agendaQuietNow();
 
-  // Ledger + load/loading states.
+  // Ledger + load/loading states. A failed refresh with data in hand
+  // renders the DATA plus a stale notice — never a blank over a live
+  // cache (Track AS S3, the abort-resilience bridge: the since_seq
+  // healing lane retries on the next gap/wake/reconnect signal).
   const ledger = document.getElementById('ag2-ledger');
-  if (agendaLoadError) {
+  if (agendaLoadError && agendaItems === null) {
     agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
     ledger.textContent = '';
@@ -94339,10 +94413,13 @@ function agendaRenderTab() {
   const skipped = agendaSkippedLines > 0
     ? ` · ${agendaSkippedLines} newer-build line${agendaSkippedLines === 1 ? '' : 's'} preserved unfolded (an older binary never destroys history it can’t read)`
     : '';
+  const stale = agendaLoadError
+    ? ` · last refresh failed (showing last-known data): ${agendaLoadError}`
+    : '';
   // Real ops truth from GET /api/agenda/ops (slice D, ui2-agenda-hood.js):
   // the segment renders once fetched; the sync fetches only while this
   // tab is visible and the data signature moved.
-  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}`;
+  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}${stale}`;
   agendaLedgerOpsSync();
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
@@ -103308,6 +103385,19 @@ async function hydrateDashboardFromControl() {
   for (const frame of frames) {
     if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(frame);
   }
+  // Agenda heal (Track AS S3): events missed while the transport was
+  // down are unrecoverable from the frame replay above — the since_seq
+  // delta pull recovers exactly them (full refetch only when no cursor
+  // is held). Fire-and-forget: hydration must not fail on a lagging
+  // agenda lane.
+  if (typeof agendaHeal === 'function') {
+    try {
+      const healed = agendaHeal('transport-rehydrate');
+      if (healed && typeof healed.catch === 'function') {
+        healed.catch(err => console.warn('[dashboard-control] rehydrate agenda heal failed', err));
+      }
+    } catch (err) { console.warn('[dashboard-control] rehydrate agenda heal failed', err); }
+  }
   dashboardUpdateTransportStatus();
 }
 
@@ -106217,6 +106307,17 @@ function dashboardHandleEventGap(msg, lane = 'tunnel') {
     }
     if (typeof refreshHistory === 'function') {
       try { refreshHistory(); } catch (err) { console.warn('[server-msg] event_gap history refresh failed', err); }
+    }
+    // Agenda heal (Track AS S3): a since_seq delta pull, so it runs on
+    // EVERY gap without the bootstrap re-pull's rate limit — the missed
+    // agenda_changed events are exactly what the cursor recovers.
+    if (typeof agendaHeal === 'function') {
+      try {
+        const healed = agendaHeal('event_gap');
+        if (healed && typeof healed.catch === 'function') {
+          healed.catch(err => console.warn('[server-msg] event_gap agenda heal failed', err));
+        }
+      } catch (err) { console.warn('[server-msg] event_gap agenda heal failed', err); }
     }
     const now = Date.now();
     if (

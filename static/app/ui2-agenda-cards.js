@@ -1438,9 +1438,12 @@ function agendaRenderTab() {
   const bellDot = document.getElementById('ag2-bell-dot');
   if (bellDot) bellDot.hidden = !agendaQuietNow();
 
-  // Ledger + load/loading states.
+  // Ledger + load/loading states. A failed refresh with data in hand
+  // renders the DATA plus a stale notice — never a blank over a live
+  // cache (Track AS S3, the abort-resilience bridge: the since_seq
+  // healing lane retries on the next gap/wake/reconnect signal).
   const ledger = document.getElementById('ag2-ledger');
-  if (agendaLoadError) {
+  if (agendaLoadError && agendaItems === null) {
     agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
     ledger.textContent = '';
@@ -1455,10 +1458,13 @@ function agendaRenderTab() {
   const skipped = agendaSkippedLines > 0
     ? ` · ${agendaSkippedLines} newer-build line${agendaSkippedLines === 1 ? '' : 's'} preserved unfolded (an older binary never destroys history it can’t read)`
     : '';
+  const stale = agendaLoadError
+    ? ` · last refresh failed (showing last-known data): ${agendaLoadError}`
+    : '';
   // Real ops truth from GET /api/agenda/ops (slice D, ui2-agenda-hood.js):
   // the segment renders once fetched; the sync fetches only while this
   // tab is visible and the data signature moved.
-  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}`;
+  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}${stale}`;
   agendaLedgerOpsSync();
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
