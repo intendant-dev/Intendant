@@ -1249,6 +1249,69 @@ attention-flagged notes are your only agenda writes; park nothing
 beyond those; propose-don't-dispose governs every write.
 ```
 
+### The serving grain (Track AS)
+
+The op log stays the only durable truth and the daemon the only folder;
+what evolved is the **serving grain** — versioned, summary-capable,
+delta-capable serving with a per-item full fetch. Every capability is an
+additive parameter or response field: the BARE calls (`GET /api/agenda`,
+bare tunnel `api_agenda_list`, bare MCP `agenda_list`, `ctl agenda list
+--all --json`) keep the full-ledger shape forever, pinned by the
+`bare_agenda_lanes_serve_the_full_ledger` freeze tests — editing those
+tests is the tripwire, not a refactor.
+
+- **`seq` (the resume cursor).** Every list response carries `seq` — the
+  fold's position in the exact 0-based op-log line space `GET
+  /api/agenda/ops` serves as `log_len` — and every `agenda_changed`
+  event carries the seq of the op that produced it. A client holds
+  `max(cursor, event seq + 1)` and can prove it is current.
+- **`since_seq` (the delta/healing lane).** `?since_seq=<cursor>`
+  returns only items changed by ops at or after the cursor (plus fresh
+  whole-ledger counts and `seq`). Complete because items only change by
+  ops; idempotent because responses carry whole items keyed by id; no
+  tombstones because retirement is a status, never a deletion. The
+  dashboard heals through it on event gaps, transport reconnects, and
+  tab wake — the full refetch is bootstrap-only. A cursor from the
+  future (a shrunk log) serves the full set: resync is the honest
+  repair. Foreign appends from a co-homed daemon advance the shared
+  file's seq, so the delta lane heals them too — with no broadcast.
+- **Decoration freshness (the honest limit).** Planner decorations
+  (`effects[].next_fire_ms`, `deferred_until`, `watched_by`) and the
+  served flags are read-time values computed at the serving seam. A
+  delta refreshes them only on returned items; untouched items'
+  decorations age between reads exactly as they always have. Clients
+  re-pull summaries on lens interaction and on wake; there is no
+  composite version vector unless live staleness ever bites.
+- **`shape=summary` (the projection).** The summary DTO carries exactly
+  what the dashboard's cards render ungated: identity, chips, instants,
+  who-line session ids, answer text on answered questions, UNCLEARED
+  blocker criteria, the `part_of`/`relies_on`/`relates_to` edge lists,
+  slim refs and effect state (digests included — digest-prefix search
+  keeps resolving), annotation counts, and the serving-seam flags.
+  Bodies and annotation threads never ride it — the inspector fetches
+  the item route. Parity with the full DTO is pinned
+  (`summary_fields_derive_from_the_full_dto`).
+- **Served flags, one implementation.** `blocked` (uncleared blocker,
+  or a `relies_on` target not Done) and `frontier` (the triage
+  mandate's un-triaged scope) are computed once at the serving seam
+  against the full fold — the ctl/SPA/skill re-derivations are deleted
+  in favor of the served values. The triage rank/note convention is
+  likewise served (`triage.rank` / `triage.note`).
+- **`q=` (server search).** Case-insensitive substring over title,
+  body, tags, and id, plus ≥8-hex-char digest-prefix resolution across
+  effect, approval, and ref digests — the client search's exact reach,
+  server-side, so summary clients keep body-search without body bytes.
+- **`GET /api/agenda/items/{id}` (the item route).** One item at full
+  decorated grain with its own sessions join: `{id}` is an exact id
+  (always wins) or a unique prefix; an ambiguous prefix refuses by name
+  with a bounded `{id, title}` candidate list. Tooling resolves ids
+  here instead of pulling the ledger.
+
+In-process consumers — the reminder/effect scheduler, trigger
+evaluation, the PR scanner, session-catalog envelopes, boot re-announce
+— keep whole-fold access forever; no serving window or shape ever
+filters the fold they see.
+
 ### Surfaces and permissions
 
 Agenda is available in the dashboard, through `intendant ctl agenda`, through
@@ -1257,7 +1320,8 @@ routes:
 
 | Route | Permission | Purpose |
 |---|---|---|
-| `GET /api/agenda` | `agenda.read` | Items, status counts, skipped-line count, and the session-resolution join map |
+| `GET /api/agenda` | `agenda.read` | Items, status counts, skipped-line count, `seq`, and the session-resolution join map; additive `since_seq` / `shape=summary` / `q=` |
+| `GET /api/agenda/items/{id}` | `agenda.read` | One item, full + decorated, by exact id or unique prefix (+ its sessions join) |
 | `GET /api/agenda/ops` | `agenda.read` | Raw op-log page: `since` line cursor, `item` filter, unfoldable lines served verbatim |
 | `GET /api/agenda/occurrences` | `agenda.read` | Raw occurrence-journal page: same cursor and verbatim-honesty rules |
 | `POST /api/agenda/op` | `agenda.write` | Apply one validated Agenda command |
