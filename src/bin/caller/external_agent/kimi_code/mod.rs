@@ -87,7 +87,19 @@ impl KimiServerEntrypoint {
                 "--log-level",
                 "silent",
             ],
-            Self::Web => &["web", "--no-open", "--port", "0", "--log-level", "silent"],
+            Self::Web => &[
+                "web",
+                "--no-open",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+                // Kimi 0.28+ moved its authenticated service dispatcher to
+                // this opt-in surface. Kimi itself also requires a loopback
+                // bind; Intendant independently validates the registered host
+                // and confines every typed RPC call to that origin.
+                "--debug-endpoints",
+            ],
         }
     }
 }
@@ -1609,7 +1621,11 @@ impl ExternalAgent for KimiCodeAgent {
                 return Err(error);
             }
         };
-        let rpc = match KimiRpcApi::new(origin.clone(), token.clone()) {
+        let rpc_result = match entrypoint {
+            KimiServerEntrypoint::ServerRun => KimiRpcApi::new(origin.clone(), token.clone()),
+            KimiServerEntrypoint::Web => KimiRpcApi::new_debug(origin.clone(), token.clone()),
+        };
+        let mut rpc = match rpc_result {
             Ok(api) => api,
             Err(error) => {
                 terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
@@ -3432,7 +3448,15 @@ mod tests {
         );
         assert_eq!(
             KimiServerEntrypoint::Web.args(),
-            &["web", "--no-open", "--port", "0", "--log-level", "silent"]
+            &[
+                "web",
+                "--no-open",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+                "--debug-endpoints",
+            ]
         );
         assert!(legacy_server_entrypoint_removed_text(
             "`kimi server` has been deprecated and no longer works.\n\

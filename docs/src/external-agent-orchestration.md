@@ -147,8 +147,8 @@ adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 | | **Codex** (reference impl) | **Claude Code** | **Kimi Code** | **Pi** |
 |---|---|---|---|---|
 | Module | `external_agent/codex/` (mod, threads, wire, context_trace, reader) | `external_agent/claude_code.rs` | `external_agent/kimi_code/` (mod, bridge, events, review, rpc, runtime, websocket, wire) | `external_agent/pi.rs` |
-| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28+: `kimi web --no-open --port 0 --log-level silent` | `pi --mode rpc --no-extensions --no-approve --extension <private> --append-system-prompt <bootstrap>` plus session/model/thinking/tool flags |
-| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over authenticated reflected v2 RPCs | documented LF-delimited JSON RPC over stdio |
+| Spawn command | `codex app-server` | `claude -p --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio --permission-mode <mode>` | Kimi 0.27: `kimi server run --foreground --port 0 --log-level silent`; Kimi 0.28+: `kimi web --no-open --port 0 --log-level silent --debug-endpoints` | `pi --mode rpc --no-extensions --no-approve --extension <private> --append-system-prompt <bootstrap>` plus session/model/thinking/tool flags |
+| Wire protocol | JSON-RPC over JSONL (`app-server`) | stream-json over stdio | bearer-authenticated loopback REST + reconnecting cursor/snapshot WebSocket (`server-v1`), plus a typed allowlist over the authenticated reflected dispatcher (`/api/v2` on 0.27; opt-in `/api/v1/debug` on 0.28+) | documented LF-delimited JSON RPC over stdio |
 | Intendant capability injection | Per-process `-c mcp_servers.intendant.{type,url,bearer_token_env_var}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON with an environment-expanded Authorization header | Per-session bridge home containing generated `mcp.json`; scoped bearer stays in the child environment | No MCP. Scoped `$INTENDANT`, `INTENDANT_MCP_URL`, and session authority support on-demand `intendant ctl` calls |
 | Multi-thread | Yes — many threads per process | No | Yes — the main session plus native `:btw` and swarm agents | No — one Pi RPC process/session per wrapper |
 | Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) | Yes — returned at create/resume before the first prompt | Yes — `get_state.sessionId` before the first prompt |
@@ -782,11 +782,24 @@ pre-registry server origin is still parsed from stdout. The bearer is read
 from `server.token`; neither origin nor bearer is put on argv or emitted as an
 Intendant event. Startup waits for the child-owned registration, token, and
 authenticated health while detecting early child exit. Once metadata and the
-typed v2 method catalog have also been authenticated, Intendant unlinks
+typed reflected-method catalog have also been authenticated, Intendant unlinks
 `server.token`; the bearer remains only inside the supervisor's in-memory
 REST/RPC clients. Those loopback clients explicitly disable
 environment/system proxies so neither the bearer nor private control traffic
 can be redirected through an egress proxy.
+
+Kimi 0.28+ mounts the reflected dispatcher only when `--debug-endpoints` is
+passed and the server is loopback-bound; the normal bearer check still applies.
+Intendant additionally requires the PID-bound registry entry to declare
+`127.0.0.1`, validates the origin again in both HTTP clients, and never offers a
+generic reflection primitive to a model or frontend. The authenticated channel
+catalog is used only to fail closed and select typed equivalents across Kimi
+generations. In 0.29, active-tool replacement moved from
+`agentRPCService.setActiveTools` to `agentProfileService.update`, native context
+clear moved from `agentRPCService.clearContext` to the exact delegated
+`agentPromptService.clear`, and model enumeration moved from
+`modelCatalogService.listModels` to `modelResolver.listModels`; 0.27-0.28 retain
+their original targets.
 
 Kimi keeps its server lock, token, journal, and MCP config under
 `KIMI_CODE_HOME`. Sharing the user's primary home among simultaneous

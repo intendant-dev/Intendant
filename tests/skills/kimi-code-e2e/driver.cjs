@@ -83,6 +83,7 @@ const logLines = [];
 const checks = [];
 const skips = [];
 let kimiAuthSnapshot = null;
+const loopbackTokens = new Map();
 
 function ts() {
   return `${((Date.now() - t0) / 1000).toFixed(1).padStart(7)}s`;
@@ -270,6 +271,38 @@ function credentialDigest(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
+function requireUsableKimiCredential(bytes, label) {
+  if (bytes.length === 0 || bytes.length > 64 * 1024) {
+    throw new Error(`${label} must be between 1 byte and 64 KiB`);
+  }
+  let credential;
+  try {
+    credential = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new Error(`${label} must contain valid JSON`);
+  }
+  const scalarString = (name) =>
+    typeof credential?.[name] === "string" &&
+    credential[name].trim().length > 0;
+  let expiresAt = credential?.expires_at;
+  if (typeof expiresAt === "string" && /^-?\d+$/.test(expiresAt)) {
+    expiresAt = Number(expiresAt);
+  }
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) {
+    if (expiresAt > 10_000_000_000) expiresAt /= 1_000;
+  } else {
+    expiresAt = null;
+  }
+  const accessValid =
+    scalarString("access_token") &&
+    (expiresAt === null || expiresAt > Math.floor(Date.now() / 1_000));
+  if (!scalarString("refresh_token") && !accessValid) {
+    throw new Error(
+      `${label} is logged out or expired; refusing to treat it as authenticated OAuth state`,
+    );
+  }
+}
+
 function requirePrivateRegularCredential(credential, label) {
   const stat = fs.lstatSync(credential);
   if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -293,11 +326,15 @@ function copyKimiAuthState() {
   }
   requirePrivateRegularCredential(credential, "Kimi source credential");
   const sourceBytes = fs.readFileSync(credential);
-  kimiAuthSnapshot = {
-    credential,
-    initialDigest: credentialDigest(sourceBytes),
-  };
-  sourceBytes.fill(0);
+  try {
+    requireUsableKimiCredential(sourceBytes, "Kimi source credential");
+    kimiAuthSnapshot = {
+      credential,
+      initialDigest: credentialDigest(sourceBytes),
+    };
+  } finally {
+    sourceBytes.fill(0);
+  }
 
   fs.mkdirSync(KIMI_HOME, { recursive: true, mode: 0o700 });
   for (const name of [
@@ -351,6 +388,10 @@ function syncKimiAuthState() {
         "Kimi source credential changed during E2E; refusing to overwrite a concurrent login or refresh",
       );
     }
+    requireUsableKimiCredential(
+      isolatedBytes,
+      "rotated Kimi isolated credential",
+    );
 
     const parent = path.dirname(kimiAuthSnapshot.credential);
     const temporary = path.join(
@@ -364,6 +405,20 @@ function syncKimiAuthState() {
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = undefined;
+      requirePrivateRegularCredential(
+        kimiAuthSnapshot.credential,
+        "Kimi source credential confirmation",
+      );
+      const confirmation = fs.readFileSync(kimiAuthSnapshot.credential);
+      try {
+        if (credentialDigest(confirmation) !== kimiAuthSnapshot.initialDigest) {
+          throw new Error(
+            "Kimi source credential changed during E2E; refusing to overwrite a concurrent login or refresh",
+          );
+        }
+      } finally {
+        confirmation.fill(0);
+      }
       fs.renameSync(temporary, kimiAuthSnapshot.credential);
       fs.chmodSync(kimiAuthSnapshot.credential, 0o600);
       const parentFd = fs.openSync(parent, "r");
@@ -417,21 +472,32 @@ function runAuthSyncSelfTest() {
   });
 
   const install = (source, isolated) => {
-    fs.writeFileSync(sourceCredential, source, { mode: 0o600 });
+    const encodedSource = JSON.stringify({
+      access_token: `${source}-access`,
+      refresh_token: `${source}-refresh`,
+      expires_at: 1,
+    });
+    const encodedIsolated = JSON.stringify({
+      access_token: `${isolated}-access`,
+      refresh_token: `${isolated}-refresh`,
+      expires_at: 2,
+    });
+    fs.writeFileSync(sourceCredential, encodedSource, { mode: 0o600 });
     fs.chmodSync(sourceCredential, 0o600);
-    fs.writeFileSync(isolatedCredential, isolated, { mode: 0o600 });
+    fs.writeFileSync(isolatedCredential, encodedIsolated, { mode: 0o600 });
     fs.chmodSync(isolatedCredential, 0o600);
     kimiAuthSnapshot = {
       credential: sourceCredential,
-      initialDigest: credentialDigest(Buffer.from(source)),
+      initialDigest: credentialDigest(Buffer.from(encodedSource)),
     };
+    return { encodedSource, encodedIsolated };
   };
 
-  install("synthetic-initial", "synthetic-rotated");
+  const first = install("synthetic-initial", "synthetic-rotated");
   syncKimiAuthState();
   check(
     "auth-refresh-copyback",
-    fs.readFileSync(sourceCredential, "utf8") === "synthetic-rotated",
+    fs.readFileSync(sourceCredential, "utf8") === first.encodedIsolated,
   );
 
   install("synthetic-second", "synthetic-second-rotated");
@@ -448,6 +514,56 @@ function runAuthSyncSelfTest() {
     refusedConcurrent &&
       fs.readFileSync(sourceCredential, "utf8") === "synthetic-concurrent",
   );
+
+  const loggedOut = install("synthetic-third", "synthetic-third-rotated");
+  fs.writeFileSync(
+    isolatedCredential,
+    JSON.stringify({
+      access_token: "",
+      refresh_token: "",
+      expires_at: 0,
+    }),
+    { mode: 0o600 },
+  );
+  fs.chmodSync(isolatedCredential, 0o600);
+  let refusedLoggedOut = false;
+  try {
+    syncKimiAuthState();
+  } catch (error) {
+    refusedLoggedOut = /logged out or expired/.test(String(error));
+  }
+  check(
+    "auth-refresh-logged-out-state-refused",
+    refusedLoggedOut &&
+      fs.readFileSync(sourceCredential, "utf8") === loggedOut.encodedSource,
+  );
+
+  let refreshOnlyAccepted = true;
+  try {
+    requireUsableKimiCredential(
+      Buffer.from(JSON.stringify({ refresh_token: "synthetic-refresh" })),
+      "synthetic refresh-only credential",
+    );
+  } catch {
+    refreshOnlyAccepted = false;
+  }
+  check("auth-refresh-only-credential-accepted", refreshOnlyAccepted);
+
+  let expiredAccessRefused = false;
+  try {
+    requireUsableKimiCredential(
+      Buffer.from(
+        JSON.stringify({
+          access_token: "synthetic-access",
+          expires_at: 1,
+        }),
+      ),
+      "synthetic expired credential",
+    );
+  } catch (error) {
+    expiredAccessRefused = /logged out or expired/.test(String(error));
+  }
+  check("auth-expired-access-only-state-refused", expiredAccessRefused);
 }
 
 function descendantsOf(rootPid) {
@@ -493,6 +609,39 @@ async function freePort() {
       server.close((error) => (error ? reject(error) : resolve(port)));
     });
   });
+}
+
+async function admitLoopbackClient(port, stateHome, timeoutMs = 30_000) {
+  const tokenPath = path.join(
+    stateHome,
+    "loopback-tokens",
+    `${port}.token`,
+  );
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const stat = fs.lstatSync(tokenPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("token path is not a regular file");
+      }
+      if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+        throw new Error("token file is not private");
+      }
+      const token = fs.readFileSync(tokenPath, "utf8").trim();
+      if (!/^[0-9a-f]{64}$/.test(token)) {
+        throw new Error("token file is malformed");
+      }
+      loopbackTokens.set(port, token);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(50);
+  }
+  throw new Error(
+    `loopback admission token did not appear at ${tokenPath}: ${lastError}`,
+  );
 }
 
 function intendantEnv(stateHome) {
@@ -743,9 +892,18 @@ async function httpJson(port, pathname, options = {}, timeoutMs = 30_000) {
   let lastError;
   while (Date.now() < deadline) {
     try {
+      const headers = { ...(options.headers || {}) };
+      if (
+        loopbackTokens.has(port) &&
+        !Object.keys(headers).some(
+          (name) => name.toLowerCase() === "x-intendant-loopback-token",
+        )
+      ) {
+        headers["x-intendant-loopback-token"] = loopbackTokens.get(port);
+      }
       const response = await fetch(
         `http://127.0.0.1:${port}${pathname}`,
-        options,
+        { ...options, headers },
       );
       const text = await response.text();
       let body;
@@ -1273,8 +1431,10 @@ async function exerciseVaultSigninCeremonyOnIdleDaemon() {
     });
   });
   try {
+    await admitLoopbackClient(port, VAULT_STATE_HOME);
     await exerciseVaultSigninCeremony(port, VAULT_STATE_HOME);
   } finally {
+    loopbackTokens.delete(port);
     if (!exited) child.kill("SIGTERM");
     let result = await Promise.race([
       exitPromise,
@@ -2786,8 +2946,10 @@ async function main() {
   const port = REQUESTED_PORT || (await freePort());
   const run = new IntendantRun(port);
   try {
+    await admitLoopbackClient(port, STATE_HOME);
     await scenario(run, port, version);
   } finally {
+    loopbackTokens.delete(port);
     try {
       await run.stop();
     } finally {
