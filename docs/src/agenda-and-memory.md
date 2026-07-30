@@ -1309,7 +1309,21 @@ tests is the tripwire, not a refactor.
   decorated grain with its own sessions join: `{id}` is an exact id
   (always wins) or a unique prefix; an ambiguous prefix refuses by name
   with a bounded `{id, title}` candidate list. Tooling resolves ids
-  here instead of pulling the ledger.
+  here instead of pulling the ledger — `ctl agenda show ID` and the MCP
+  `agenda_item` tool ride it.
+- **`window=live|archive` (the serving window).** `live` — the
+  dashboard's default feed — serves every OPEN item unconditionally
+  (open items never age off) plus closed items updated within the last
+  14 days (a fixed, owner-ratified daemon constant; no knob). `archive`
+  is the paged complement: closed items older than the window, newest
+  first, FULL grain (archive pages render answer text and bodies),
+  `before`/`before_id`/`limit` paging with the compound cursor riding
+  back as `next_page`. Summaries carry `children` roll-up counts
+  (open/done/retired per parent, computed against the whole fold) so
+  By-hub totals stay honest while the window trims child rows. The
+  window is wire vocabulary only: the fold and every in-process
+  consumer keep the whole ledger, and the bare lanes stay `window=all`
+  forever.
 
 In-process consumers — the reminder/effect scheduler, trigger
 evaluation, the PR scanner, session-catalog envelopes, boot re-announce

@@ -1002,7 +1002,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaRead,
         BodyPolicy::None,
         RouteHandlerId::AgendaList,
-        "Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search) — the bare call serves the full ledger forever",
+        "Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search), window=live|archive (+before/before_id/limit paging) — the bare call serves the full ledger forever",
     )
     .with_tunnel(tunnel_method("api_agenda_list")),
     // One item at full grain, by id or unique prefix (Track AS S4): the
