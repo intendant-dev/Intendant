@@ -953,6 +953,24 @@ pub(crate) async fn agenda_ref_drift_api_response(
                 "status": crate::agenda::file_ref_drift(&r.locator, digest),
             }))
         })
+        // Attestation refs (Track AO): the current run's self-report
+        // pointers ride the same expand-time honesty check — verify-only
+        // pins, re-hashed against the attest-time sha256; nothing is
+        // sealed and nothing is stored (Q3/OPEN-3).
+        .chain(
+            item.effects
+                .iter()
+                .filter_map(|effect| effect.last_run.as_ref())
+                .filter_map(|run| run.attestation.as_ref())
+                .flat_map(|attestation| attestation.refs.iter())
+                .map(|r| {
+                    serde_json::json!({
+                        "ref_type": "file",
+                        "locator": r.locator,
+                        "status": crate::agenda::attestation_ref_drift(&r.locator, &r.sha256),
+                    })
+                }),
+        )
         .collect();
     // The manifests' sealed binding refs get the same expand-time honesty
     // check (Track AW §2.4), plus the live hash/mtime the Review-&-adopt

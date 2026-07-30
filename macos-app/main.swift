@@ -192,7 +192,9 @@ class BackendTrustDelegate: NSObject, URLSessionDelegate {
 /// status while the proxy can still speak HTTP or HTTPS to the spawned daemon.
 class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
     let launchPlan: BackendLaunchPlan
-    let port: Int
+    /// Mutable: a one-click update swap re-points the proxy at the
+    /// promoted successor's port (main-thread writes; per-request reads).
+    var port: Int
     private var stopped = Set<Int>()
     private let lock = NSLock()
     private let session: URLSession
@@ -276,6 +278,7 @@ final class AppMessageBridge: NSObject, WKScriptMessageHandler {
         switch message.name {
         case "activate": appDelegate?.activateDashboard()
         case "restart": appDelegate?.restartBackend()
+        case "updateSwap": appDelegate?.beginUpdateSwapFromDashboard()
         default: break
         }
     }
@@ -288,6 +291,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     let messageBridge = AppMessageBridge()
     var window: NSWindow!
     var webView: WKWebView!
+    /// Retained so an update swap can re-point the `intendant://` proxy
+    /// at the promoted successor's port.
+    var schemeHandler: BackendSchemeHandler!
     /// Owns the daemon child process, restart/backoff policy, readiness
     /// polling, health checks, and the backend log (see
     /// macos-app/BackendSupervisor.swift). State changes come back through
@@ -787,8 +793,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// process lifecycle, restart backoff, readiness polling, health
     /// checks, and the backend log live in BackendSupervisor.
     func makeBackendSupervisor() -> BackendSupervisor {
-        // Forward any extra CLI arguments (e.g. --agent codex) to the backend
-        var args = ["--web", String(port)]
+        // Forward any extra CLI arguments (e.g. --agent codex) to the
+        // backend. The `--web <port>` pair is composed per spawn by the
+        // supervisor, so an update swap can boot the successor on a
+        // fresh port with the same policy args.
+        var args: [String] = []
         if launchPlan.autoMtls {
             args.append("--mtls")
         } else if launchPlan.autoNoTls {
@@ -797,7 +806,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         args.append(contentsOf: launchPlan.extraArgs)
         let supervisor = BackendSupervisor(
             binaryPath: Bundle.main.bundlePath + "/Contents/MacOS/intendant-bin",
-            arguments: args,
+            baseArguments: args,
             port: port,
             scheme: launchPlan.scheme,
             session: backendSession
@@ -844,45 +853,81 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         }
     }
 
+    // MARK: - One-click update swap (HS6/P3)
+
+    /// The dashboard's update chip asked for the one-click update
+    /// (bridge message `updateSwap`): pick a fresh port and let the
+    /// supervisor run the spawn → readiness → swap → drain sequence.
+    /// Failure feedback rides `window.__intendantAppSwapFailed` back
+    /// into the chip; success repaints through `didSwapToPort`.
+    func beginUpdateSwapFromDashboard() {
+        guard let fresh = findAvailablePort(startingAt: port + 1) else {
+            NSLog("Update swap: no free port near \(port)")
+            notifySwapFailed("no free port for the new daemon")
+            return
+        }
+        NSLog("Update swap requested from the dashboard — successor on port \(fresh)")
+        backendSupervisor.beginUpdateSwap(newPort: fresh) { [weak self] ok, detail in
+            if !ok {
+                self?.notifySwapFailed(detail)
+            }
+        }
+    }
+
+    func notifySwapFailed(_ detail: String) {
+        let literal: String
+        if let data = try? JSONSerialization.data(withJSONObject: detail, options: .fragmentsAllowed),
+           let encoded = String(data: data, encoding: .utf8) {
+            literal = encoded
+        } else {
+            literal = "\"update swap failed\""
+        }
+        webView?.evaluateJavaScript(
+            "window.__intendantAppSwapFailed && window.__intendantAppSwapFailed(\(literal))",
+            completionHandler: nil
+        )
+    }
+
+    /// The supervisor promoted the successor: re-point the proxy and the
+    /// injected port script, then reload whatever surface is up so the
+    /// tab attaches to the new daemon (fresh boot_id, fresh token). The
+    /// drained predecessor keeps serving its in-flight sessions until it
+    /// exits on its own.
+    func backendSupervisor(_ supervisor: BackendSupervisor, didSwapToPort newPort: Int) {
+        NSLog("Update swap: dashboard re-pointing to port \(newPort)")
+        port = newPort
+        schemeHandler?.port = newPort
+        if let controller = webView?.configuration.userContentController {
+            installUserScripts(controller, port: newPort)
+        }
+        window?.title = newPort == 8765 ? "Intendant" : "Intendant (port \(newPort))"
+        if dashboardActive {
+            dashboardActive = false
+            activateDashboard()
+        } else {
+            showPlaceholder(paused: false)
+        }
+    }
+
     // MARK: - Window
 
-    func createWindow() {
-        let config = WKWebViewConfiguration()
-        config.preferences.setValue(true, forKey: "developerExtrasEnabled")
-
-        // Allow media autoplay (for voice features)
-        config.mediaTypesRequiringUserActionForPlayback = []
-
-        // Use a non-persistent data store so WKWebView never caches WASM/JS
-        // across app launches. Without this, recompiled WASM may not load.
-        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
-
-        // Serve pages from a custom scheme so WKWebView grants a secure
-        // context (required for navigator.mediaDevices / getUserMedia).
-        config.setURLSchemeHandler(
-            BackendSchemeHandler(port: port, launchPlan: launchPlan, session: backendSession),
-            forURLScheme: "intendant"
-        )
-
-        // Inject backend port so JS can build WebSocket URLs (WebSocket
-        // connections bypass the scheme handler and need the real address).
+    /// (Re-)install the injected user scripts for `port`. The port and
+    /// TLS flag ride a document-start script (WebSocket connections
+    /// bypass the scheme handler and need the real address), and
+    /// `__intendantAppSupervisor` marks the supervisor's presence so the
+    /// dashboard's update chip renders the one-click action instead of
+    /// the CLI-daemon hand-off. Re-run at update swap with the new port
+    /// (scripts are fixed strings, so a swap must replace them).
+    func installUserScripts(_ controller: WKUserContentController, port: Int) {
+        controller.removeAllUserScripts()
         let tlsLiteral = launchPlan.usesTLS ? "true" : "false"
-        let script = WKUserScript(
-            source: "window.__intendantPort = \(port); window.__intendantBackendTls = \(tlsLiteral);",
+        let portScript = WKUserScript(
+            source: "window.__intendantPort = \(port); window.__intendantBackendTls = \(tlsLiteral); "
+                + "window.__intendantAppSupervisor = true;",
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
-        config.userContentController.addUserScript(script)
-
-        // Forward page console output to NSLog so `Console.app` and
-        // terminal launches can see what the dashboard is doing — the
-        // WKWebView inspector is rarely attached when it matters.
-        config.userContentController.add(consoleBridge, name: "log")
-
-        // Placeholder "Activate Dashboard" + crash-screen "Restart".
-        messageBridge.appDelegate = self
-        config.userContentController.add(messageBridge, name: "activate")
-        config.userContentController.add(messageBridge, name: "restart")
+        controller.addUserScript(portScript)
         let consoleScript = WKUserScript(
             source: """
             (() => {
@@ -904,7 +949,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
-        config.userContentController.addUserScript(consoleScript)
+        controller.addUserScript(consoleScript)
+    }
+
+    func createWindow() {
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+
+        // Allow media autoplay (for voice features)
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        // Use a non-persistent data store so WKWebView never caches WASM/JS
+        // across app launches. Without this, recompiled WASM may not load.
+        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+
+        // Serve pages from a custom scheme so WKWebView grants a secure
+        // context (required for navigator.mediaDevices / getUserMedia).
+        schemeHandler = BackendSchemeHandler(port: port, launchPlan: launchPlan, session: backendSession)
+        config.setURLSchemeHandler(schemeHandler, forURLScheme: "intendant")
+
+        // Forward page console output to NSLog so `Console.app` and
+        // terminal launches can see what the dashboard is doing — the
+        // WKWebView inspector is rarely attached when it matters.
+        config.userContentController.add(consoleBridge, name: "log")
+
+        // Placeholder "Activate Dashboard" + crash-screen "Restart" +
+        // the update chip's one-click swap.
+        messageBridge.appDelegate = self
+        config.userContentController.add(messageBridge, name: "activate")
+        config.userContentController.add(messageBridge, name: "restart")
+        config.userContentController.add(messageBridge, name: "updateSwap")
+        installUserScripts(config.userContentController, port: port)
 
         webView = WKWebView(frame: .zero, configuration: config)
         webView.uiDelegate = self

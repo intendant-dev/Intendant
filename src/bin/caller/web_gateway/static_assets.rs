@@ -1830,4 +1830,54 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 500"));
         assert!(head.ends_with("\r\n\r\n"));
     }
+
+    /// Track AO — the Q8 labeling law plus R6's negative, asserted where
+    /// chip/tooltip copy is generated (the agenda fragments riding the
+    /// assembled artifact). Binding: every attestation surface says
+    /// self-reported and hovers not-verified; the transport verdict and
+    /// the self-report never share a glyph (attested-achieved is sky —
+    /// never the transport-success green chip); blocked/abandoned render
+    /// amber-class, never rose (rose stays transport-failure);
+    /// unattested is a hollow neutral "no self-report" — absence, never
+    /// anomaly styling. R6: the transport note stays the transport's
+    /// last-words line — never rendered as, beside, or styled like a
+    /// self-report, tooltips included.
+    #[test]
+    fn attestation_chips_follow_the_labeling_law() {
+        // The one attestation tone map: achieved = sky, everything else
+        // amber — an exhaustive ternary, so no outcome can reach rose or
+        // the transport green.
+        assert!(APP_HTML.contains("return outcome === 'achieved' ? 'sky' : 'amber';"));
+        // Every chip label carries the self-report word, ◆-marked.
+        assert!(APP_HTML.contains("`◆ self-reported: ${att.outcome}`"));
+        assert!(APP_HTML.contains("◆ self-reported: ${escapeHtml(last.attestation.outcome)}"));
+        // The not-verified hover, on every attestation surface.
+        assert!(APP_HTML.contains("The session’s own report — not verified."));
+        // Unattested: hollow (dashed) neutral, absence copy — never
+        // anomaly styling.
+        assert!(APP_HTML.contains(
+            "agendaChipHtml('◇ no self-report', 'neutral', AGENDA_UNATTESTED_HOVER, true)"
+        ));
+        assert!(APP_HTML
+            .contains("No self-report exists for this run — the session ended without attesting."));
+        // The hood's op rows: attest ops are first-class, labeled
+        // self-report, achieved sky / the rest amber (never rose).
+        assert!(APP_HTML.contains("attested ${op.outcome || '—'} — self-report"));
+        assert!(APP_HTML.contains("return op.outcome === 'achieved' ? 'sky' : 'amber';"));
+        // The CSS side of the hue law.
+        assert!(APP_HTML.contains(".ag2-auto-attest.att-achieved { color: var(--sky); }"));
+        assert!(APP_HTML.contains(".ag2-auto-attest.att-abandoned { color: var(--amber); }"));
+        // R6's negative: the strip's transport tip stays state + last
+        // words only (no self-report wording can enter the template),
+        // and the inspector's transport-note tooltip names it the
+        // transport record, not a self-report.
+        assert!(
+            APP_HTML.contains("const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;")
+        );
+        assert!(APP_HTML
+            .contains("The session’s final message as the run ended — the transport record, not a self-report"));
+        // Regeneration legibility rides the same surfaces: the run line
+        // names the bounded auto-retry.
+        assert!(APP_HTML.contains("attempt ${e.last_run_attempt} (auto-retry)"));
+    }
 }

@@ -720,6 +720,39 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
+// The self-report axis renders BESIDE the transport verdict, never as
+// it: every attestation surface says "self-reported" and carries the
+// not-verified hover; the ◆ self-report mark is the axis's own glyph,
+// never the transport palette's meaning (attested-achieved is sky —
+// never the transport-success green or its chip), and
+// blocked/abandoned/partial wear amber-class warning hues — never
+// rose, which stays transport-failure. Unattested is the DERIVED
+// absence state: a hollow neutral ◇ chip, "no self-report" — absence,
+// never anomaly styling, never synthesized into achieved.
+function agendaAttestTone(outcome) {
+  return outcome === 'achieved' ? 'sky' : 'amber';
+}
+
+function agendaAttestHover(att) {
+  const base = 'The session’s own report — not verified.';
+  if (!att || !att.note) return base;
+  const note = att.note.length > 200 ? `${att.note.slice(0, 200)}…` : att.note;
+  return `${base} “${note}”`;
+}
+
+function agendaAttestChipHtml(att) {
+  return agendaChipHtml(`◆ self-reported: ${att.outcome}`, agendaAttestTone(att.outcome),
+    agendaAttestHover(att));
+}
+
+const AGENDA_UNATTESTED_HOVER =
+  'No self-report exists for this run — the session ended without attesting. Absence, not failure.';
+
+function agendaUnattestedChipHtml() {
+  return agendaChipHtml('◇ no self-report', 'neutral', AGENDA_UNATTESTED_HOVER, true);
+}
+
 function agendaCardChips(item) {
   const chips = [];
   const st = agendaEffectState(item);
@@ -897,6 +930,14 @@ function agendaCardEffectStrip(item) {
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
+    // The last self-reported reason, when one exists (Track AO): the
+    // owner sees WHY it kept failing, not just that it did.
+    const rep = e.last_run && e.last_run.attestation;
+    if (rep && (rep.outcome === 'blocked' || rep.outcome === 'abandoned')) {
+      const repNote = rep.note
+        ? ` — ${rep.note.length > 140 ? `${rep.note.slice(0, 140)}…` : rep.note}` : '';
+      line += ` · last self-report: ${rep.outcome}${repNote}`;
+    }
     actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
       + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
@@ -935,11 +976,21 @@ function agendaAutomationStripHtml(item) {
     : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
+    // The transport tip stays the transport's own line — state + last
+    // words — never labeled or styled as a self-report (R6).
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
     const sess = last.session_id && agendaSessionInfo(last.session_id);
     const jump = sess && sess.key
       ? ` <a class="ag2-auto-run" data-jump-session="${escapeHtml(sess.key)}">open run</a>` : '';
     meta.push(`<span class="ag2-auto-last st-${escapeHtml(last.state)}" title="${escapeHtml(tip)}">last: ${escapeHtml(last.state)} ${escapeHtml(agendaRelTime(last.at_ms))}${jump}</span>`);
+    if (last.attestation) {
+      meta.push(`<span class="ag2-auto-attest att-${escapeHtml(last.attestation.outcome)}" title="${escapeHtml(agendaAttestHover(last.attestation))}">◆ self-reported: ${escapeHtml(last.attestation.outcome)}</span>`);
+    } else if (last.state !== 'started') {
+      meta.push(`<span class="ag2-auto-attest att-none" title="${escapeHtml(AGENDA_UNATTESTED_HOVER)}">◇ no self-report</span>`);
+    }
+    if ((e.last_run_attempt || 0) > 0) {
+      meta.push(`<span title="A bounded auto-retry of the same spent cause — the cooldown floor spaces attempts, the failure streak suspends the series">attempt ${e.last_run_attempt} (auto-retry)</span>`);
+    }
   }
   if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);

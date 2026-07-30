@@ -1748,13 +1748,17 @@ function agentSigninProviderState() {
   return {
     // Last daemon status payload ({phase, url?, user_code?, account?,
     // error?…}; at success it carries reload_candidates — the daemon's
-    // LIVE session registry, riding the same body as the phase).
+    // LIVE session registry, riding the same body as the phase, each row
+    // carrying the daemon-owned reload lifecycle it renders from. There
+    // is deliberately NO client-side reload-request memory: the served
+    // state is the only state, so nothing here can go stale and latch a
+    // row (the old page-lifetime request Set blocked re-reloads for
+    // days).
     status: null,
     fetchedAt: 0,
     busy: false,
     lastError: '',
     pollTimer: null,
-    reloadRequested: new Set(),
   };
 }
 const agentSigninState = {
@@ -1782,7 +1786,8 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
   const state = agentSigninState[provider];
   const avail = daemonApi.availability(spec.statusMethod);
   if (avail.reason === 'denied' || avail.reason === 'unsupported') return;
-  const freshFor = agentSigninActive(provider) ? 1500 : 15000;
+  const freshFor =
+    agentSigninActive(provider) || agentSigninReloadInFlight(provider) ? 1500 : 15000;
   if (!force && Date.now() - state.fetchedAt < freshFor) return;
   state.fetchedAt = Date.now();
   try {
@@ -1805,12 +1810,24 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
   renderAgentSigninSection();
 }
 
-/* 2s poll while a ceremony is in flight and the page is looking at it;
-   self-clearing on terminal/idle phases (the render-time refresh with a
-   15s freshness guard covers the rest). */
+/* Whether any served candidate row's reload lifecycle is still moving
+   (requested/respawning). Terminal states (done/failed) and absent
+   lifecycles are settled — the daemon will not change them until the
+   next request. */
+function agentSigninReloadInFlight(provider) {
+  return agentSigninReloadCandidates(provider).some(candidate => {
+    const state = String(candidate?.reload?.state || '');
+    return state === 'requested' || state === 'respawning';
+  });
+}
+
+/* 2s poll while a ceremony — or a served reload lifecycle — is in
+   flight and the page is looking at it; self-clearing once everything
+   is terminal/idle (the render-time refresh with a 15s freshness guard
+   covers the rest). */
 function agentSigninEnsurePoll(provider) {
   const state = agentSigninState[provider];
-  if (agentSigninActive(provider)) {
+  if (agentSigninActive(provider) || agentSigninReloadInFlight(provider)) {
     if (state.pollTimer) return;
     state.pollTimer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
@@ -1957,26 +1974,102 @@ function agentSigninSessionStateChip(candidate) {
   return { label: key || 'live', cls: '' };
 }
 
+/* After dispatching a reload intent, pull the status once shortly so the
+   daemon's `requested` stamp lands and the 2s in-flight poll takes over.
+   No optimistic client state: until the served lifecycle arrives the row
+   keeps its button — the daemon accepts repeats, so the worst case of a
+   double click is a second harmless respawn request. */
+function agentSigninNudgeReloadPoll(provider) {
+  window.setTimeout(() => {
+    agentSigninRefresh(provider, { force: true }).catch(() => {});
+  }, 400);
+}
+
 function agentSigninReloadSession(provider, sessionId) {
-  const state = agentSigninState[provider];
-  state.reloadRequested.add(sessionId);
-  renderAgentSigninSection();
   const sent = dispatchSessionControlMsg(
     { action: 'reload_credentials', session_id: sessionId },
     {
-      onError: err => {
-        state.reloadRequested.delete(sessionId);
-        showControlToast?.('error', `Reload failed: ${err?.message || err}`);
-        renderAgentSigninSection();
-      },
+      onError: err => showControlToast?.('error', `Reload failed: ${err?.message || err}`),
     }
   );
-  if (sent === false) {
-    state.reloadRequested.delete(sessionId);
-    renderAgentSigninSection();
-    return;
-  }
+  if (sent === false) return;
   showControlToast?.('success', 'Reload requested — the session restarts on the new account');
+  agentSigninNudgeReloadPoll(provider);
+}
+
+/* One gesture, every served row: the daemon fans out over its own live
+   registry (the exact candidate set it serves), so a stale client list
+   can neither miss a fresh session nor target a dead one. The `source`
+   rides off the served candidates rather than a client-side
+   provider→backend map. */
+function agentSigninReloadAllSessions(provider) {
+  const candidates = agentSigninReloadCandidates(provider);
+  const source = String(candidates[0]?.source || '');
+  if (!source) return;
+  const sent = dispatchSessionControlMsg(
+    { action: 'reload_credentials_all', source },
+    {
+      onError: err => showControlToast?.('error', `Reload all failed: ${err?.message || err}`),
+    }
+  );
+  if (sent === false) return;
+  showControlToast?.(
+    'success',
+    `Reload requested for all ${candidates.length} live sessions — each restarts on the new account`
+  );
+  agentSigninNudgeReloadPoll(provider);
+}
+
+function agentSigninAgo(unixMs) {
+  const ms = Number(unixMs) || 0;
+  if (!ms) return '';
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+/* Chip copy for a row's served reload lifecycle. In-flight states
+   (requested/respawning) replace the button; terminal states (done /
+   failed) render as history BESIDE the button — the button always comes
+   back, so a reload can always be re-requested. */
+function agentSigninReloadLifecycleChip(reload) {
+  const state = String(reload?.state || '');
+  const ago = agentSigninAgo(reload?.at_unix_ms);
+  if (state === 'requested') {
+    return {
+      label: 'reload requested…',
+      cls: 'warn',
+      title: `Reload accepted by the daemon ${ago || 'just now'} — waiting for the backend to pick it up`,
+      inFlight: true,
+    };
+  }
+  if (state === 'respawning') {
+    return {
+      label: 'respawning…',
+      cls: 'warn',
+      title: `The backend is restarting on the fresh credential store (started ${ago || 'just now'})`,
+      inFlight: true,
+    };
+  }
+  if (state === 'done') {
+    return {
+      label: `reloaded ${ago || 'just now'}`.trim(),
+      cls: 'ok',
+      title: 'Credential reload complete — the backend restarted on the fresh credential store',
+      inFlight: false,
+    };
+  }
+  if (state === 'failed') {
+    return {
+      label: 'reload failed',
+      cls: 'err',
+      title: `Credential reload failed ${ago || 'just now'}: ${String(reload?.error || 'the backend could not be respawned')}`,
+      inFlight: false,
+    };
+  }
+  return null;
 }
 
 function renderAgentSigninSection() {
@@ -2274,6 +2367,16 @@ function agentSigninProviderCard(provider) {
     reloadTitle.style.fontWeight = '600';
     reloadTitle.textContent = spec.sessionsTitle;
     reloadHead.appendChild(reloadTitle);
+    if (reloadCandidates.length > 1) {
+      const allActions = document.createElement('span');
+      allActions.className = 'vault-entry-actions';
+      allActions.appendChild(
+        vaultButton(`Reload all ${reloadCandidates.length}`, () =>
+          agentSigninReloadAllSessions(provider)
+        )
+      );
+      reloadHead.appendChild(allActions);
+    }
     card.appendChild(reloadHead);
     if (!reloadCandidates.length) {
       note(spec.noSessionsNote);
@@ -2285,9 +2388,17 @@ function agentSigninProviderCard(provider) {
         const sessionId = String(session.session_id || '');
         const row = document.createElement('div');
         row.className = 'vault-entry-row';
+        row.title = sessionId;
         const lbl = document.createElement('span');
         lbl.className = 'lbl';
-        lbl.textContent = session.name || sessionId.slice(0, 12) || 'session';
+        lbl.textContent = session.name || 'session';
+        // The short-id chip (the session grid's first-8 dialect): with
+        // derived names, duplicate labels are otherwise unidentifiable —
+        // the id is what `intendant ctl` and the grid speak.
+        const idChip = document.createElement('span');
+        idChip.className = 'vault-chip';
+        idChip.textContent = sessionId.slice(0, 8) || '—';
+        idChip.title = sessionId;
         const kindChip = document.createElement('span');
         kindChip.className = 'vault-chip';
         kindChip.textContent = spec.sessionKind;
@@ -2301,17 +2412,25 @@ function agentSigninProviderCard(provider) {
             : 'Session state — alive sessions stay on the old account until reloaded';
         const actions = document.createElement('span');
         actions.className = 'vault-entry-actions';
-        if (state.reloadRequested.has(sessionId)) {
-          const done = document.createElement('span');
-          done.className = 'vault-chip ok';
-          done.textContent = 'reload requested';
-          actions.appendChild(done);
-        } else {
+        // The actions cell renders the daemon's served lifecycle, and
+        // ONLY that: in-flight states stand in for the button; terminal
+        // states (done/failed) sit beside it as history. The button is
+        // therefore always available again the moment the daemon stops
+        // working — nothing client-side can latch a row.
+        const lifecycle = agentSigninReloadLifecycleChip(session.reload);
+        if (lifecycle) {
+          const chip = document.createElement('span');
+          chip.className = 'vault-chip' + (lifecycle.cls ? ` ${lifecycle.cls}` : '');
+          chip.textContent = lifecycle.label;
+          chip.title = lifecycle.title;
+          actions.appendChild(chip);
+        }
+        if (!lifecycle || !lifecycle.inFlight) {
           actions.appendChild(
             vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
           );
         }
-        row.append(lbl, kindChip, stateChip, actions);
+        row.append(lbl, idChip, kindChip, stateChip, actions);
         list.appendChild(row);
       }
       card.appendChild(list);
@@ -4071,8 +4190,10 @@ function applyGatewayConfig(config) {
   }
   // Every lane's config lands here (boot fetch, tunnel config RPC,
   // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
-  // a stale tab learns the daemon now serves a newer bundle.
+  // a stale tab learns the daemon now serves a newer bundle, or that a
+  // NEW daemon process answers on this origin (HS6 boot-id nudge).
   if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
+  if (typeof maybeNudgeDaemonBoot === 'function') maybeNudgeDaemonBoot(cfg.boot_id);
   applyMainBackendStatus();
 }
 

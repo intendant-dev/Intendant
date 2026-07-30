@@ -534,6 +534,7 @@ html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
 }
+html.ui-v2 .ag2-chip.t-neutral.dashed { border-color: var(--line-2); }
 html.ui-v2 .ag2-chip.t-green.dashed { border-color: rgba(var(--green-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-amber.dashed { border-color: rgba(var(--amber-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-rose.dashed { border-color: rgba(var(--rose-rgb), 0.45); }
@@ -729,6 +730,15 @@ html.ui-v2 .ag2-auto-last.st-unknown,
 html.ui-v2 .ag2-auto-streak { color: var(--rose); font-weight: 600; }
 html.ui-v2 .ag2-auto-last.st-completed { color: var(--green); }
 html.ui-v2 .ag2-auto-run { cursor: pointer; text-decoration: underline; }
+/* Attestation (Track AO) — the self-report axis, never the transport
+   palette: achieved sky (never transport-success green), the rest
+   amber-class (never rose = transport failure); unattested is neutral
+   absence, no anomaly styling. */
+html.ui-v2 .ag2-auto-attest.att-achieved { color: var(--sky); }
+html.ui-v2 .ag2-auto-attest.att-partial,
+html.ui-v2 .ag2-auto-attest.att-blocked,
+html.ui-v2 .ag2-auto-attest.att-abandoned { color: var(--amber); }
+html.ui-v2 .ag2-auto-attest.att-none { color: var(--text-2); opacity: 0.85; }
 
 /* ---- Inline question answering ---- */
 

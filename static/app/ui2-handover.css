@@ -24,3 +24,56 @@ html.ui-v2 .handover-banner a {
   color: var(--accent, #62a0ea);
   font-weight: 600;
 }
+
+/* ── update-available chip (HS6): a quiet bottom-corner card — the fact
+   of a newer on-disk build, its provenance, and (macOS unsigned builds)
+   the keychain/TCC honesty line. Distinct from the drain banner: an
+   update waits; a drain is in motion. ─────────────────────────────── */
+html.ui-v2 .handover-update-chip {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 239;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #e6e6e6);
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--accent, #62a0ea);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+html.ui-v2 .handover-update-chip code {
+  font-size: 11px;
+}
+html.ui-v2 .handover-update-honesty {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--warning, #e5a50a);
+}
+html.ui-v2 .handover-update-actions {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .handover-update-actions button {
+  align-self: flex-start;
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .handover-update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+html.ui-v2 .handover-update-reach,
+html.ui-v2 .handover-update-note {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}

@@ -873,9 +873,11 @@ html {
   vertical-align: middle;
 }
 
-/* Stale-build reload nudge + event-lane staleness banner: slim fixed
-   strips at the top of the viewport, above everything, never blocking. */
+/* Stale-build / daemon-boot reload nudges + event-lane staleness banner:
+   slim fixed strips at the top of the viewport, above everything, never
+   blocking. */
 #ui-stale-build-banner,
+#ui-daemon-boot-banner,
 #ui-event-lane-banner {
   position: fixed;
   top: 8px;
@@ -893,7 +895,8 @@ html {
   font-size: 12.5px;
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
-#ui-stale-build-banner button {
+#ui-stale-build-banner button,
+#ui-daemon-boot-banner button {
   border: 1px solid var(--blue);
   background: transparent;
   color: var(--blue);
@@ -1481,6 +1484,8 @@ html {
 }
 .vault-chip.ok { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
 .vault-chip.warn { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+.vault-chip.err { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
+.vault-status-line .vault-entry-actions { margin-left: auto; display: flex; gap: 6px; }
 .vault-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .vault-error { font-size: 11px; color: var(--red); line-height: 1.5; }
 .vault-warning {
@@ -17864,6 +17869,11 @@ html.ui-v2 #agent-signin-section .vault-status-line > .vault-chip.warn {
   border-color: rgba(var(--amber-rgb), .26);
   color: var(--amber);
 }
+html.ui-v2 #agent-signin-section .vault-status-line .vault-entry-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
 html.ui-v2 #agent-signin-section .vault-entry-list { gap: 10px; }
 html.ui-v2 #agent-signin-section .vault-entry-row {
   gap: 10px;
@@ -17894,6 +17904,14 @@ html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip {
 html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.ok {
   background: rgba(var(--green-rgb), .12);
   color: var(--green);
+}
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.warn {
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--amber);
+}
+html.ui-v2 #agent-signin-section .vault-entry-row .vault-chip.err {
+  background: rgba(var(--rose-rgb), .12);
+  color: var(--red);
 }
 html.ui-v2 #agent-signin-section .vault-entry-row .vault-entry-actions {
   margin-left: auto;
@@ -24004,6 +24022,7 @@ html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
 }
+html.ui-v2 .ag2-chip.t-neutral.dashed { border-color: var(--line-2); }
 html.ui-v2 .ag2-chip.t-green.dashed { border-color: rgba(var(--green-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-amber.dashed { border-color: rgba(var(--amber-rgb), 0.45); }
 html.ui-v2 .ag2-chip.t-rose.dashed { border-color: rgba(var(--rose-rgb), 0.45); }
@@ -24199,6 +24218,15 @@ html.ui-v2 .ag2-auto-last.st-unknown,
 html.ui-v2 .ag2-auto-streak { color: var(--rose); font-weight: 600; }
 html.ui-v2 .ag2-auto-last.st-completed { color: var(--green); }
 html.ui-v2 .ag2-auto-run { cursor: pointer; text-decoration: underline; }
+/* Attestation (Track AO) — the self-report axis, never the transport
+   palette: achieved sky (never transport-success green), the rest
+   amber-class (never rose = transport failure); unattested is neutral
+   absence, no anomaly styling. */
+html.ui-v2 .ag2-auto-attest.att-achieved { color: var(--sky); }
+html.ui-v2 .ag2-auto-attest.att-partial,
+html.ui-v2 .ag2-auto-attest.att-blocked,
+html.ui-v2 .ag2-auto-attest.att-abandoned { color: var(--amber); }
+html.ui-v2 .ag2-auto-attest.att-none { color: var(--text-2); opacity: 0.85; }
 
 /* ---- Inline question answering ---- */
 
@@ -25641,6 +25669,33 @@ html.ui-v2 .ag2-eff-note {
   border-left: 2px solid var(--line);
   padding-left: 9px;
 }
+/* The self-report block (Track AO): its own labeled lane under the
+   transport row — amber-edged so the axis never blends into the
+   transport note above it. */
+html.ui-v2 .ag2-eff-attest {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .ag2-eff-attest-note {
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid rgba(var(--amber-rgb), 0.45);
+  padding-left: 9px;
+}
+html.ui-v2 .ag2-attest-ref {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+html.ui-v2 .ag2-attest-ref-loc {
+  font-family: var(--mono);
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
 html.ui-v2 .ag2-insp-noeff {
   display: flex;
   align-items: center;
@@ -26749,6 +26804,59 @@ html.ui-v2 .handover-banner[data-kind='predecessor'] {
 html.ui-v2 .handover-banner a {
   color: var(--accent, #62a0ea);
   font-weight: 600;
+}
+
+/* ── update-available chip (HS6): a quiet bottom-corner card — the fact
+   of a newer on-disk build, its provenance, and (macOS unsigned builds)
+   the keychain/TCC honesty line. Distinct from the drain banner: an
+   update waits; a drain is in motion. ─────────────────────────────── */
+html.ui-v2 .handover-update-chip {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 239;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #e6e6e6);
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--accent, #62a0ea);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+}
+html.ui-v2 .handover-update-chip code {
+  font-size: 11px;
+}
+html.ui-v2 .handover-update-honesty {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--warning, #e5a50a);
+}
+html.ui-v2 .handover-update-actions {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+html.ui-v2 .handover-update-actions button {
+  align-self: flex-start;
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .handover-update-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+html.ui-v2 .handover-update-reach,
+html.ui-v2 .handover-update-note {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
 }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
@@ -37293,7 +37401,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '65f28f55982d3ee5';
+const INTENDANT_APP_BUILD = '9538617bb7dc4992';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -37317,6 +37425,46 @@ function maybeNudgeStaleBuild(serverBuild) {
   banner.id = 'ui-stale-build-banner';
   const text = document.createElement('span');
   text.textContent = 'The daemon updated — this dashboard is from an older build.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reload';
+  btn.addEventListener('click', () => location.reload());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && reloadSafe()) location.reload();
+  });
+}
+
+// ── Daemon boot identity / "daemon updated — reload" nudge (HS6) ──
+//
+// The config payload carries the daemon process's boot_id, and every
+// config lane lands on the applyGatewayConfig chokepoint (boot fetch,
+// tunnel config RPC, reconnect hydration) — plus the handover status
+// poll feeds it independently. A tab that hears a DIFFERENT boot_id
+// than it first recorded is talking to a NEW daemon process on the same
+// origin (a handover successor, or a plain restart after an update):
+// state the fact and offer the reload instead of letting the tab lie —
+// the same stale-photograph class as the bundle stamp, one level up.
+let daemonBootId = '';
+let daemonBootNudged = false;
+function maybeNudgeDaemonBoot(bootId) {
+  const boot = String(bootId || '').trim();
+  if (!boot) return;
+  if (!daemonBootId) { daemonBootId = boot; return; }
+  if (boot === daemonBootId || daemonBootNudged) return;
+  daemonBootNudged = true;
+  console.info(`[dashboard] daemon boot ${boot} is answering; this tab attached to ${daemonBootId} — reload to reattach`);
+  const reloadSafe = () =>
+    !(document.getElementById('new-session-input')?.value || '').trim();
+  if (document.hidden && reloadSafe()) {
+    location.reload();
+    return;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'ui-daemon-boot-banner';
+  const text = document.createElement('span');
+  text.textContent = 'The daemon updated — a new process is serving this dashboard.';
   const btn = document.createElement('button');
   btn.textContent = 'Reload';
   btn.addEventListener('click', () => location.reload());
@@ -37357,8 +37505,10 @@ const INTENDANT_TAB_ID = (() => {
 // lane-verify harness drive it with a synthetic server stamp instead.
 window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  bootInfo: () => ({ bootId: daemonBootId, nudged: daemonBootNudged }),
   tabId: () => INTENDANT_TAB_ID,
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
+  __testNudgeDaemonBoot: (v) => maybeNudgeDaemonBoot(v),
 });
 
 // ── Legacy federation auth compatibility ──
@@ -38387,6 +38537,7 @@ const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
   'stop_session',
   'restart_session',
   'reload_credentials',
+  'reload_credentials_all',
   'create_session',
   'start_task',
   'resume_session',
@@ -42728,13 +42879,17 @@ function agentSigninProviderState() {
   return {
     // Last daemon status payload ({phase, url?, user_code?, account?,
     // error?…}; at success it carries reload_candidates — the daemon's
-    // LIVE session registry, riding the same body as the phase).
+    // LIVE session registry, riding the same body as the phase, each row
+    // carrying the daemon-owned reload lifecycle it renders from. There
+    // is deliberately NO client-side reload-request memory: the served
+    // state is the only state, so nothing here can go stale and latch a
+    // row (the old page-lifetime request Set blocked re-reloads for
+    // days).
     status: null,
     fetchedAt: 0,
     busy: false,
     lastError: '',
     pollTimer: null,
-    reloadRequested: new Set(),
   };
 }
 const agentSigninState = {
@@ -42762,7 +42917,8 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
   const state = agentSigninState[provider];
   const avail = daemonApi.availability(spec.statusMethod);
   if (avail.reason === 'denied' || avail.reason === 'unsupported') return;
-  const freshFor = agentSigninActive(provider) ? 1500 : 15000;
+  const freshFor =
+    agentSigninActive(provider) || agentSigninReloadInFlight(provider) ? 1500 : 15000;
   if (!force && Date.now() - state.fetchedAt < freshFor) return;
   state.fetchedAt = Date.now();
   try {
@@ -42785,12 +42941,24 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
   renderAgentSigninSection();
 }
 
-/* 2s poll while a ceremony is in flight and the page is looking at it;
-   self-clearing on terminal/idle phases (the render-time refresh with a
-   15s freshness guard covers the rest). */
+/* Whether any served candidate row's reload lifecycle is still moving
+   (requested/respawning). Terminal states (done/failed) and absent
+   lifecycles are settled — the daemon will not change them until the
+   next request. */
+function agentSigninReloadInFlight(provider) {
+  return agentSigninReloadCandidates(provider).some(candidate => {
+    const state = String(candidate?.reload?.state || '');
+    return state === 'requested' || state === 'respawning';
+  });
+}
+
+/* 2s poll while a ceremony — or a served reload lifecycle — is in
+   flight and the page is looking at it; self-clearing once everything
+   is terminal/idle (the render-time refresh with a 15s freshness guard
+   covers the rest). */
 function agentSigninEnsurePoll(provider) {
   const state = agentSigninState[provider];
-  if (agentSigninActive(provider)) {
+  if (agentSigninActive(provider) || agentSigninReloadInFlight(provider)) {
     if (state.pollTimer) return;
     state.pollTimer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
@@ -42937,26 +43105,102 @@ function agentSigninSessionStateChip(candidate) {
   return { label: key || 'live', cls: '' };
 }
 
+/* After dispatching a reload intent, pull the status once shortly so the
+   daemon's `requested` stamp lands and the 2s in-flight poll takes over.
+   No optimistic client state: until the served lifecycle arrives the row
+   keeps its button — the daemon accepts repeats, so the worst case of a
+   double click is a second harmless respawn request. */
+function agentSigninNudgeReloadPoll(provider) {
+  window.setTimeout(() => {
+    agentSigninRefresh(provider, { force: true }).catch(() => {});
+  }, 400);
+}
+
 function agentSigninReloadSession(provider, sessionId) {
-  const state = agentSigninState[provider];
-  state.reloadRequested.add(sessionId);
-  renderAgentSigninSection();
   const sent = dispatchSessionControlMsg(
     { action: 'reload_credentials', session_id: sessionId },
     {
-      onError: err => {
-        state.reloadRequested.delete(sessionId);
-        showControlToast?.('error', `Reload failed: ${err?.message || err}`);
-        renderAgentSigninSection();
-      },
+      onError: err => showControlToast?.('error', `Reload failed: ${err?.message || err}`),
     }
   );
-  if (sent === false) {
-    state.reloadRequested.delete(sessionId);
-    renderAgentSigninSection();
-    return;
-  }
+  if (sent === false) return;
   showControlToast?.('success', 'Reload requested — the session restarts on the new account');
+  agentSigninNudgeReloadPoll(provider);
+}
+
+/* One gesture, every served row: the daemon fans out over its own live
+   registry (the exact candidate set it serves), so a stale client list
+   can neither miss a fresh session nor target a dead one. The `source`
+   rides off the served candidates rather than a client-side
+   provider→backend map. */
+function agentSigninReloadAllSessions(provider) {
+  const candidates = agentSigninReloadCandidates(provider);
+  const source = String(candidates[0]?.source || '');
+  if (!source) return;
+  const sent = dispatchSessionControlMsg(
+    { action: 'reload_credentials_all', source },
+    {
+      onError: err => showControlToast?.('error', `Reload all failed: ${err?.message || err}`),
+    }
+  );
+  if (sent === false) return;
+  showControlToast?.(
+    'success',
+    `Reload requested for all ${candidates.length} live sessions — each restarts on the new account`
+  );
+  agentSigninNudgeReloadPoll(provider);
+}
+
+function agentSigninAgo(unixMs) {
+  const ms = Number(unixMs) || 0;
+  if (!ms) return '';
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+/* Chip copy for a row's served reload lifecycle. In-flight states
+   (requested/respawning) replace the button; terminal states (done /
+   failed) render as history BESIDE the button — the button always comes
+   back, so a reload can always be re-requested. */
+function agentSigninReloadLifecycleChip(reload) {
+  const state = String(reload?.state || '');
+  const ago = agentSigninAgo(reload?.at_unix_ms);
+  if (state === 'requested') {
+    return {
+      label: 'reload requested…',
+      cls: 'warn',
+      title: `Reload accepted by the daemon ${ago || 'just now'} — waiting for the backend to pick it up`,
+      inFlight: true,
+    };
+  }
+  if (state === 'respawning') {
+    return {
+      label: 'respawning…',
+      cls: 'warn',
+      title: `The backend is restarting on the fresh credential store (started ${ago || 'just now'})`,
+      inFlight: true,
+    };
+  }
+  if (state === 'done') {
+    return {
+      label: `reloaded ${ago || 'just now'}`.trim(),
+      cls: 'ok',
+      title: 'Credential reload complete — the backend restarted on the fresh credential store',
+      inFlight: false,
+    };
+  }
+  if (state === 'failed') {
+    return {
+      label: 'reload failed',
+      cls: 'err',
+      title: `Credential reload failed ${ago || 'just now'}: ${String(reload?.error || 'the backend could not be respawned')}`,
+      inFlight: false,
+    };
+  }
+  return null;
 }
 
 function renderAgentSigninSection() {
@@ -43254,6 +43498,16 @@ function agentSigninProviderCard(provider) {
     reloadTitle.style.fontWeight = '600';
     reloadTitle.textContent = spec.sessionsTitle;
     reloadHead.appendChild(reloadTitle);
+    if (reloadCandidates.length > 1) {
+      const allActions = document.createElement('span');
+      allActions.className = 'vault-entry-actions';
+      allActions.appendChild(
+        vaultButton(`Reload all ${reloadCandidates.length}`, () =>
+          agentSigninReloadAllSessions(provider)
+        )
+      );
+      reloadHead.appendChild(allActions);
+    }
     card.appendChild(reloadHead);
     if (!reloadCandidates.length) {
       note(spec.noSessionsNote);
@@ -43265,9 +43519,17 @@ function agentSigninProviderCard(provider) {
         const sessionId = String(session.session_id || '');
         const row = document.createElement('div');
         row.className = 'vault-entry-row';
+        row.title = sessionId;
         const lbl = document.createElement('span');
         lbl.className = 'lbl';
-        lbl.textContent = session.name || sessionId.slice(0, 12) || 'session';
+        lbl.textContent = session.name || 'session';
+        // The short-id chip (the session grid's first-8 dialect): with
+        // derived names, duplicate labels are otherwise unidentifiable —
+        // the id is what `intendant ctl` and the grid speak.
+        const idChip = document.createElement('span');
+        idChip.className = 'vault-chip';
+        idChip.textContent = sessionId.slice(0, 8) || '—';
+        idChip.title = sessionId;
         const kindChip = document.createElement('span');
         kindChip.className = 'vault-chip';
         kindChip.textContent = spec.sessionKind;
@@ -43281,17 +43543,25 @@ function agentSigninProviderCard(provider) {
             : 'Session state — alive sessions stay on the old account until reloaded';
         const actions = document.createElement('span');
         actions.className = 'vault-entry-actions';
-        if (state.reloadRequested.has(sessionId)) {
-          const done = document.createElement('span');
-          done.className = 'vault-chip ok';
-          done.textContent = 'reload requested';
-          actions.appendChild(done);
-        } else {
+        // The actions cell renders the daemon's served lifecycle, and
+        // ONLY that: in-flight states stand in for the button; terminal
+        // states (done/failed) sit beside it as history. The button is
+        // therefore always available again the moment the daemon stops
+        // working — nothing client-side can latch a row.
+        const lifecycle = agentSigninReloadLifecycleChip(session.reload);
+        if (lifecycle) {
+          const chip = document.createElement('span');
+          chip.className = 'vault-chip' + (lifecycle.cls ? ` ${lifecycle.cls}` : '');
+          chip.textContent = lifecycle.label;
+          chip.title = lifecycle.title;
+          actions.appendChild(chip);
+        }
+        if (!lifecycle || !lifecycle.inFlight) {
           actions.appendChild(
             vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
           );
         }
-        row.append(lbl, kindChip, stateChip, actions);
+        row.append(lbl, idChip, kindChip, stateChip, actions);
         list.appendChild(row);
       }
       card.appendChild(list);
@@ -45051,8 +45321,10 @@ function applyGatewayConfig(config) {
   }
   // Every lane's config lands here (boot fetch, tunnel config RPC,
   // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
-  // a stale tab learns the daemon now serves a newer bundle.
+  // a stale tab learns the daemon now serves a newer bundle, or that a
+  // NEW daemon process answers on this origin (HS6 boot-id nudge).
   if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
+  if (typeof maybeNudgeDaemonBoot === 'function') maybeNudgeDaemonBoot(cfg.boot_id);
   applyMainBackendStatus();
 }
 
@@ -93419,6 +93691,39 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
+// The self-report axis renders BESIDE the transport verdict, never as
+// it: every attestation surface says "self-reported" and carries the
+// not-verified hover; the ◆ self-report mark is the axis's own glyph,
+// never the transport palette's meaning (attested-achieved is sky —
+// never the transport-success green or its chip), and
+// blocked/abandoned/partial wear amber-class warning hues — never
+// rose, which stays transport-failure. Unattested is the DERIVED
+// absence state: a hollow neutral ◇ chip, "no self-report" — absence,
+// never anomaly styling, never synthesized into achieved.
+function agendaAttestTone(outcome) {
+  return outcome === 'achieved' ? 'sky' : 'amber';
+}
+
+function agendaAttestHover(att) {
+  const base = 'The session’s own report — not verified.';
+  if (!att || !att.note) return base;
+  const note = att.note.length > 200 ? `${att.note.slice(0, 200)}…` : att.note;
+  return `${base} “${note}”`;
+}
+
+function agendaAttestChipHtml(att) {
+  return agendaChipHtml(`◆ self-reported: ${att.outcome}`, agendaAttestTone(att.outcome),
+    agendaAttestHover(att));
+}
+
+const AGENDA_UNATTESTED_HOVER =
+  'No self-report exists for this run — the session ended without attesting. Absence, not failure.';
+
+function agendaUnattestedChipHtml() {
+  return agendaChipHtml('◇ no self-report', 'neutral', AGENDA_UNATTESTED_HOVER, true);
+}
+
 function agendaCardChips(item) {
   const chips = [];
   const st = agendaEffectState(item);
@@ -93596,6 +93901,14 @@ function agendaCardEffectStrip(item) {
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
+    // The last self-reported reason, when one exists (Track AO): the
+    // owner sees WHY it kept failing, not just that it did.
+    const rep = e.last_run && e.last_run.attestation;
+    if (rep && (rep.outcome === 'blocked' || rep.outcome === 'abandoned')) {
+      const repNote = rep.note
+        ? ` — ${rep.note.length > 140 ? `${rep.note.slice(0, 140)}…` : rep.note}` : '';
+      line += ` · last self-report: ${rep.outcome}${repNote}`;
+    }
     actions = agendaDigestChipHtml(e.digest, 'Re-arm re-approves exactly this unchanged manifest revision')
       + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
@@ -93634,11 +93947,21 @@ function agendaAutomationStripHtml(item) {
     : st.rec ? `every ${agendaCadenceLabel(st.rec.every_ms)}` : 'once')}</span>`);
   const last = e.last_run;
   if (last) {
+    // The transport tip stays the transport's own line — state + last
+    // words — never labeled or styled as a self-report (R6).
     const tip = `${last.state}${last.note ? ` — ${last.note}` : ''}`;
     const sess = last.session_id && agendaSessionInfo(last.session_id);
     const jump = sess && sess.key
       ? ` <a class="ag2-auto-run" data-jump-session="${escapeHtml(sess.key)}">open run</a>` : '';
     meta.push(`<span class="ag2-auto-last st-${escapeHtml(last.state)}" title="${escapeHtml(tip)}">last: ${escapeHtml(last.state)} ${escapeHtml(agendaRelTime(last.at_ms))}${jump}</span>`);
+    if (last.attestation) {
+      meta.push(`<span class="ag2-auto-attest att-${escapeHtml(last.attestation.outcome)}" title="${escapeHtml(agendaAttestHover(last.attestation))}">◆ self-reported: ${escapeHtml(last.attestation.outcome)}</span>`);
+    } else if (last.state !== 'started') {
+      meta.push(`<span class="ag2-auto-attest att-none" title="${escapeHtml(AGENDA_UNATTESTED_HOVER)}">◇ no self-report</span>`);
+    }
+    if ((e.last_run_attempt || 0) > 0) {
+      meta.push(`<span title="A bounded auto-retry of the same spent cause — the cooldown floor spaces attempts, the failure streak suspends the series">attempt ${e.last_run_attempt} (auto-retry)</span>`);
+    }
   }
   if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);
@@ -94712,13 +95035,39 @@ function agendaInspEffectHtml(item) {
       const sessionLink = s && s.key
         ? ` <a class="ag2-linkbtn" data-jump-session="${escapeHtml(s.key)}">view session ›</a>`
         : '';
+      const attempt = (e.last_run_attempt || 0) > 0
+        ? ` · attempt ${e.last_run_attempt} (auto-retry after failure)` : '';
+      // The self-report axis (Track AO): rendered as its own labeled
+      // block BESIDE the transport verdict — never sharing its glyph
+      // or palette. The transport note above it stays the transport's
+      // last-words line (R6), tooltip included.
+      const att = run.attestation || null;
+      let attestHtml = '';
+      if (att) {
+        const refs = (att.refs || []).map((r) => `<div class="ag2-attest-ref">
+            <span class="ag2-attest-ref-loc">${escapeHtml(r.locator)}</span>
+            <span class="ag2-hint" title="The pin the session stated at attest time — hash-verified at intake, re-checked on demand; a pointer, never inlined content">pin ${escapeHtml((r.sha256 || '').slice(0, 8))}</span>
+            <span class="agenda-ref-drift" data-item="${escapeHtml(item.id)}" data-locator="${escapeHtml(r.locator)}"></span>
+          </div>`).join('');
+        attestHtml = `<div class="ag2-eff-attest">
+          <div class="ag2-eff-lastrun-head">
+            ${agendaAttestChipHtml(att)}
+            <span class="ag2-hint">${escapeHtml(agendaRelTime(att.at_ms))}</span>
+          </div>
+          ${att.note ? `<div class="ag2-eff-attest-note">${escapeHtml(att.note)}</div>` : ''}
+          ${refs}
+        </div>`;
+      } else if (run.state !== 'started') {
+        attestHtml = `<div class="ag2-eff-attest">${agendaUnattestedChipHtml()}</div>`;
+      }
       lastRun = `<div class="ag2-eff-lastrun">
         <div class="ag2-eff-lastrun-head">
           ${agendaChipHtml(`last run · ${run.state}`, runTone)}
-          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}`)}</span>
+          <span class="ag2-hint">${escapeHtml(agendaDepthCalm() ? agendaRelTime(run.at_ms) : `${agendaRelTime(run.at_ms)} · occurrence ${run.occurrence_id}${attempt}`)}</span>
           ${sessionLink}
         </div>
-        ${run.note ? `<div class="ag2-eff-note">${escapeHtml(run.note)}</div>` : ''}
+        ${run.note ? `<div class="ag2-eff-note" title="The session’s final message as the run ended — the transport record, not a self-report">${escapeHtml(run.note)}</div>` : ''}
+        ${attestHtml}
       </div>`;
     }
     const acts = [];
@@ -97398,6 +97747,12 @@ function agendaHoodOccurrenceLine(item, effect) {
   if (!run) return '';
   let state = run.state;
   let source = 'journal synced before dispatch';
+  // Track AO decorations: the regeneration ordinal (journal display
+  // field, fold-decorated fallback) and the run's self-report — always
+  // labeled as such, never blended into the transport state word.
+  let attempt = effect.last_run_attempt || 0;
+  const attest = run.attestation
+    ? ` · self-reported ${run.attestation.outcome} (the session’s own report — not verified)` : '';
   if (agendaHoodOcc && agendaHoodOcc.itemId !== item.id) {
     // Cache from a previous selection (only reachable when this item's
     // fetch is gated): claim nothing from it.
@@ -97408,7 +97763,9 @@ function agendaHoodOccurrenceLine(item, effect) {
       .filter((entry) => entry && entry.record
         && entry.record.occurrence_id === run.occurrence_id);
     if (records.length) {
-      state = records[records.length - 1].record.state || state;
+      const last = records[records.length - 1].record;
+      state = last.state || state;
+      attempt = records.reduce((n, entry) => entry.record.attempt || n, attempt);
     } else {
       source = 'fold view — the journal page holds no record for it';
     }
@@ -97417,9 +97774,10 @@ function agendaHoodOccurrenceLine(item, effect) {
   } else if (agendaHoodOcc && agendaHoodOcc.error) {
     source = 'fold view — journal read unavailable';
   }
+  const attemptPart = attempt > 0 ? ` · attempt ${attempt} (auto-retry)` : '';
   const requested = (effect.requested || []).length;
   const tail = requested ? ` · ${requested} owner run-request${requested > 1 ? 's' : ''}` : '';
-  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state} · ${source}${tail}`)}</div>`;
+  return `<div class="ag2-hood-occ">${escapeHtml(`occurrence ${run.occurrence_id} · ${state}${attemptPart} · ${source}${tail}${attest}`)}</div>`;
 }
 
 function agendaHoodManifestHtml(item) {
@@ -97548,6 +97906,7 @@ function agendaHoodOpVerb(op, envelope) {
     case 'revoke_effect': return 'approval revoked';
     case 'request_occurrence': return 'run requested';
     case 'record_occurrence': return `run ${op.state || '—'}`;
+    case 'attest': return `attested ${op.outcome || '—'} — self-report`;
     case 'record_ask_delivery':
       return op.delivered === false ? 'delivery pending — no live asker' : 'answer delivered';
     default: return `op · ${type || '—'}`;
@@ -97566,6 +97925,11 @@ function agendaHoodOpDot(op, known) {
       return op.state === 'completed' || op.state === 'delivered' ? 'green'
         : op.state === 'failed' ? 'rose'
           : op.state === 'started' ? 'iris' : 'amber';
+    // Self-report hues (Q8): achieved is sky — never the transport
+    // green; blocked/abandoned/partial are amber — never rose, which
+    // stays transport-failure.
+    case 'attest':
+      return op.outcome === 'achieved' ? 'sky' : 'amber';
     default: return 'neutral';
   }
 }
@@ -98846,19 +99210,168 @@ async function memoryProposeFromForm(button) {
   else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }
 /* ── static/app/ui2-handover.js ── */
-// ── ui2-handover — drain banner + successor chip (Track HS5) ─────────────
+// ── ui2-handover — drain banner + successor chip (HS5) + update chip
+// (HS6) ──────────────────────────────────────────────────────────────
 // Polls GET /api/daemon/handover (tunnel twin api_daemon_handover): the
-// scheduler-lease status block. Two renders, one element:
+// scheduler-lease status block. Renders:
 //   - THIS daemon draining: a persistent banner — in-flight sessions
 //     finish here; new work continues on the successor (linked once the
 //     lease sidecar names it).
 //   - another co-homed daemon draining: a compact predecessor chip with
 //     its remaining session count.
-// Removed when neither applies; transient poll failures keep the last
-// honest render rather than flapping.
+//   - a newer/changed binary on disk (the daemon's update watch): the
+//     bottom-corner update chip with both builds' provenance and the
+//     keychain/TCC honesty line where it applies. Suppressed while
+//     draining — a drain in motion outranks the waiting update.
+// The payload's boot_id also feeds the "daemon updated — reload" nudge
+// (maybeNudgeDaemonBoot), beside the config-lane chokepoint.
+// Elements are removed when nothing applies; transient poll failures
+// keep the last honest render rather than flapping.
 (() => {
   const HANDOVER_POLL_MS = 30000;
   let bannerEl = null;
+  let updateEl = null;
+
+  function updateChip() {
+    if (!updateEl) {
+      updateEl = document.createElement('div');
+      updateEl.id = 'handover-update-chip';
+      updateEl.className = 'handover-update-chip';
+      document.body.appendChild(updateEl);
+    }
+    return updateEl;
+  }
+
+  function updateChipClear() {
+    if (updateEl) { updateEl.remove(); updateEl = null; }
+  }
+
+  // The one action's client state (the button must never double-fire and
+  // its feedback must survive the 30s poll cadence).
+  const updateAction = { inFlight: false, note: '' };
+  let lastHandoverBody = null;
+  // The app supervisor reports a failed swap here (the success path
+  // reloads the tab against the promoted successor instead).
+  window.__intendantAppSwapFailed = (detail) => {
+    updateAction.inFlight = false;
+    updateAction.note = `Update failed: ${detail || 'see the app log'}. The running daemon is untouched.`;
+    if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
+  };
+
+  // The co-homed daemon a hand-off would drain toward: live, not this
+  // boot, not already on its way out. Prefer one whose build matches the
+  // on-disk update.
+  function handoverSuccessorCandidate(body, disk) {
+    const daemons = Array.isArray(body && body.daemons) ? body.daemons : [];
+    const live = daemons.filter((d) =>
+      d && d.live && d.boot_id !== body.boot_id && d.state !== 'draining' && d.state !== 'exited');
+    if (disk && disk.git_sha) {
+      const matching = live.find((d) => d.version && d.version.git_sha === disk.git_sha);
+      if (matching) return matching;
+    }
+    return live[0] || null;
+  }
+
+  // The chip's action row. Inside the macOS app (__intendantAppSupervisor)
+  // the supervisor owns the spawn, so the chip offers the real one-click.
+  // On a CLI-launched daemon the chip is honest about its reach: it can
+  // ask THIS daemon to drain toward an already-running newer daemon; it
+  // cannot launch one, and it says so instead of pointing at a terminal.
+  function handoverUpdateActions(body, disk) {
+    const actions = document.createElement('div');
+    actions.className = 'handover-update-actions';
+    if (window.__intendantAppSupervisor === true) {
+      const btn = document.createElement('button');
+      btn.textContent = updateAction.inFlight ? 'Updating…' : 'Update now';
+      btn.disabled = updateAction.inFlight;
+      btn.addEventListener('click', () => {
+        if (updateAction.inFlight) return;
+        updateAction.inFlight = true;
+        updateAction.note = 'Starting the new daemon — this dashboard reloads when it takes over; in-flight sessions finish on the old one.';
+        try {
+          window.webkit.messageHandlers.updateSwap.postMessage(null);
+        } catch (_) {
+          updateAction.inFlight = false;
+          updateAction.note = 'Could not reach the app supervisor.';
+        }
+        handoverUpdateRender(body);
+      });
+      actions.appendChild(btn);
+    } else {
+      const successor = handoverSuccessorCandidate(body, disk);
+      if (successor) {
+        const matches = disk && successor.version && successor.version.git_sha === disk.git_sha;
+        const btn = document.createElement('button');
+        btn.textContent = `Hand off to :${successor.port}${matches ? ' (runs the on-disk build)' : ''}`;
+        btn.disabled = updateAction.inFlight;
+        btn.addEventListener('click', async () => {
+          if (updateAction.inFlight) return;
+          updateAction.inFlight = true;
+          updateAction.note = `Asking this daemon to drain — :${successor.port} takes over.`;
+          handoverUpdateRender(body);
+          try {
+            const resp = await authedFetch('/api/daemon/takeover', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ requested_by: 'dashboard update chip' }),
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            updateAction.note = 'Draining — in-flight sessions finish here, then this daemon exits.';
+          } catch (err) {
+            updateAction.note = `Hand-off failed from this surface: ${(err && err.message) || err}`;
+          } finally {
+            updateAction.inFlight = false;
+            if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
+          }
+        });
+        actions.appendChild(btn);
+      } else {
+        const reach = document.createElement('div');
+        reach.className = 'handover-update-reach';
+        reach.textContent = 'No other daemon is running to hand off to — this daemon cannot launch one itself. The macOS app (and a service-managed install) can do this in one click.';
+        actions.appendChild(reach);
+      }
+    }
+    if (updateAction.note) {
+      const note = document.createElement('div');
+      note.className = 'handover-update-note';
+      note.textContent = updateAction.note;
+      actions.appendChild(note);
+    }
+    return actions;
+  }
+
+  // textContent construction throughout: the on-disk provenance strings
+  // come from probing a binary the daemon merely observed — never markup.
+  function handoverUpdateRender(body) {
+    lastHandoverBody = body;
+    const update = body && body.update;
+    if (!update || body.draining) { updateChipClear(); return; }
+    const disk = update.on_disk;
+    const running = update.running || {};
+    const el = updateChip();
+    el.textContent = '';
+    const strong = document.createElement('strong');
+    el.appendChild(strong);
+    if (disk) {
+      strong.textContent = 'Update on disk: ';
+      el.appendChild(document.createTextNode(
+        `commit ${disk.git_sha || '?'} · built ${disk.built_at || '?'} — running ${running.git_sha || '?'}`
+      ));
+      if (update.honesty) {
+        const honesty = document.createElement('div');
+        honesty.className = 'handover-update-honesty';
+        honesty.textContent = update.honesty;
+        el.appendChild(honesty);
+      }
+    } else {
+      strong.textContent = 'Binary changed on disk';
+      el.appendChild(document.createTextNode(
+        ` — provenance unreadable${update.probe_error ? ` (${update.probe_error})` : ''}`
+      ));
+    }
+    el.appendChild(handoverUpdateActions(body, disk));
+  }
 
   function handoverBanner() {
     if (!bannerEl) {
@@ -98882,7 +99395,11 @@ async function memoryProposeFromForm(button) {
   }
 
   function handoverRender(body) {
-    if (!body || body.available === false) { handoverClear(); return; }
+    if (!body || body.available === false) { handoverClear(); updateChipClear(); return; }
+    if (body.boot_id && typeof maybeNudgeDaemonBoot === 'function') {
+      maybeNudgeDaemonBoot(body.boot_id);
+    }
+    handoverUpdateRender(body);
     if (body.draining) {
       const port = handoverSuccessorPort(body);
       const link = port
@@ -98892,7 +99409,7 @@ async function memoryProposeFromForm(button) {
       el.dataset.kind = 'draining';
       el.innerHTML = link
         ? `<strong>This daemon is draining.</strong> In-flight sessions finish here — continue new work on the successor at ${link}.`
-        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — the successor has not acquired yet (retry shortly, or start a daemon with --takeover).';
+        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — no successor has acquired the lease yet.';
       return;
     }
     const others = Array.isArray(body.daemons)

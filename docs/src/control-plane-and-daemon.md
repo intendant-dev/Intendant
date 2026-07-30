@@ -435,6 +435,42 @@ successor without kill-and-relaunch:
 `intendant ctl status` shows the whole story under `scheduler_lease`
 (role, drain state, and every co-homed boot with probed liveness).
 
+### The update-available surface
+
+The daemon watches its **own binary image on disk**: a boot-time identity
+stamp (length + mtime, plus dev/inode on Unix) beside the compiled-in
+build provenance, a 60 s stat poll, and — when the image changes — one
+bounded, environment-scrubbed `<binary> --version` probe that reads the
+NEW build's provenance. The daemon never execs a successor daemon;
+takeover stays an explicit gesture. What the watch produces:
+
+- An `update` block on the handover status payload (`GET
+  /api/daemon/handover`, its `api_daemon_handover` tunnel twin, and
+  `ctl status` under `scheduler_lease`): the running and on-disk builds
+  side by side (`git_sha`, `built_at`, versions), or an honest
+  `probe_error` when the changed image's provenance is unreadable.
+- **One** info-urgency notification per distinct on-disk commit sha
+  (in-memory dedup; a restarted daemon states the fact once more).
+- The dashboard's **update chip** (bottom corner, suppressed while a
+  drain banner is up). Inside the packaged macOS app the chip offers
+  **Update now**: the app's BackendSupervisor spawns the successor from
+  the on-disk binary on a fresh port, waits for readiness, re-points the
+  webview, and only then asks the predecessor to drain — the old child
+  is never killed; it finishes its in-flight sessions and exits on its
+  own. On a CLI-launched daemon the chip is honest about its reach: it
+  can offer **Hand off to :PORT** when a live co-homed daemon is already
+  running (draining this daemon toward it), and when none is running it
+  says it cannot launch one itself.
+- On macOS, a non-Developer-ID on-disk build carries the keychain/TCC
+  honesty line: item ACLs and TCC grants key on the signing identity, so
+  the new build's first custody or capture access may re-prompt.
+
+The SPA also learns the daemon's `boot_id` from every config lane and
+the handover poll; a tab that hears a **new** daemon process answering
+on its origin offers "The daemon updated — Reload" (auto-reloading only
+when hidden and composer-safe), so a stale tab can no longer
+misrepresent a replaced daemon.
+
 ## Where to Go Next
 
 - [Architecture](./architecture.md) — the EventBus, the execution shapes, and

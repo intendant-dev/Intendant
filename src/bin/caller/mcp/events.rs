@@ -247,6 +247,7 @@ pub fn spawn_event_listener(
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::ReloadBackendCredentials { .. }
+                    | AppEvent::BackendCredentialsReloadProgress { .. }
                     | AppEvent::BackendCredentialAccount { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionForkResult { .. }

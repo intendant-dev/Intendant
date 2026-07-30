@@ -6975,3 +6975,106 @@ async fn drainer_exits_at_last_session_end() {
     assert_eq!(presence["state"], "exited");
     drop(daemon_b);
 }
+
+/// A probe-able fake "binary": a shell script printing exactly
+/// `build_info::version_line`'s shape with the given sha. Unix-only —
+/// the update watch execs it for `--version`.
+#[cfg(unix)]
+fn write_fake_watched_binary(path: &std::path::Path, sha: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\necho \"intendant 9.9.9 (commit {sha}, built \
+             2026-07-29T00:00:00Z, e2e-fake-triple)\"\n"
+        ),
+    )
+    .expect("write fake watched binary");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("mark fake watched binary executable");
+}
+
+/// HS6 (intake §4): the update-surface stat→provenance flow against a
+/// swapped binary file, end to end — the daemon stats its watched
+/// image on the poll cadence, probes the change with a bounded
+/// `--version`, and serves the `update` block on GET
+/// /api/daemon/handover (running + on-disk provenance side by side).
+/// The watched path rides the mock-gated `INTENDANT_UPDATE_WATCH_PATH`
+/// override: the real `current_exe` is the suite's SHARED test binary,
+/// which must never be swapped under concurrent tests. Unix-gated —
+/// the probe-able fake needs shebang exec.
+#[cfg(unix)]
+#[tokio::test]
+async fn update_surface_probes_swapped_binary_and_serves_the_chip_block() {
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The fake watched image sits in place BEFORE boot: its stamp is
+    // the boot baseline, so nothing reads as an update until it changes.
+    let fake = rig.home.path().join("fake-intendant.sh");
+    write_fake_watched_binary(&fake, "fakesha1");
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                fake.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_POLL_MS", "300"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let url = format!("http://127.0.0.1:{}/api/daemon/handover", daemon.port);
+
+    // The unchanged boot image: no update block, ever.
+    let body = http_get_json(&authed, &url)
+        .await
+        .expect("handover status body");
+    assert!(
+        body.get("update").is_none(),
+        "no update chip may render before the image changes: {body}"
+    );
+
+    // Swap the image: the stat flips within a poll tick, the probe
+    // reads the NEW provenance, and the block serves both builds.
+    write_fake_watched_binary(&fake, "fakesha2");
+    let body = poll_until(
+        "the update block naming the swapped on-disk sha",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &url).await?;
+            (body["update"]["on_disk"]["git_sha"] == "fakesha2").then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    assert_eq!(
+        body["update"]["on_disk"]["built_at"],
+        "2026-07-29T00:00:00Z"
+    );
+    assert!(
+        body["update"]["running"]["git_sha"].is_string(),
+        "the running provenance rides beside the on-disk build: {body}"
+    );
+}
