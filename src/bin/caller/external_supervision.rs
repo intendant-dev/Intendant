@@ -1446,6 +1446,28 @@ pub(crate) enum DrainOutcome {
         message: Option<String>,
         turn_had_started: bool,
     },
+    /// A fatal backend error whose cause classifies as a TEMPORARY
+    /// service condition ([`transient_service_condition`]) ended the
+    /// round — the provider-incident class the interruption family was
+    /// missing (2026-07-29 specimens 24f01636/13e53300: API-500
+    /// round-deaths rode a DoneSignal and stranded both commissions
+    /// fake-idle for over an hour, invisible to the credential-reload
+    /// lane and every wake clock). The backend process stays usable and
+    /// its conversation holds whatever the round delivered; the caller
+    /// must count no round and arm the service-condition error park
+    /// ([`transient_round_death_error_park`]) — bounded widening wakes,
+    /// visible suspension when the schedule exhausts — instead of
+    /// completing or failing the round. `turn_had_started` is the same
+    /// delivery awareness as [`DrainOutcome::LimitRejected`]'s: whether
+    /// the primary thread demonstrably engaged this round's driving
+    /// message. Permanent-cause deaths never take this shape — they keep
+    /// their terminal outcomes ([`DrainOutcome::TurnFailed`] at zero
+    /// turns, the completion shape after real work).
+    TransientRoundDeath {
+        reason: String,
+        turns_in_round: usize,
+        turn_had_started: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,13 +1518,65 @@ pub(crate) fn limit_park_delay(
     Duration::from_secs(secs)
 }
 
-/// One armed rate-limit park in an external-session lane: the lane sleeps
-/// until `resume_at`, then re-sends `pending` (if still uncancelled).
-/// User messages arriving while parked queue behind it instead of burning
-/// against the rejected backend.
+/// What a park is waiting out. Both kinds ride the SAME armed-park state,
+/// wake timer, queue-while-parked, cancel, and reload-preserve machinery —
+/// the kind only decides the wake clock's policy at arm time and the
+/// honest wording of the shared lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkKind {
+    /// A provider usage limit rejected the turn; the wake clock is the
+    /// limit's reset time (plus jitter; backoff when untimed).
+    ProviderLimit,
+    /// A temporary service condition (the provider-incident class:
+    /// repeated 5xx after the backend's own transport retries, gateway
+    /// drops, stream cuts) killed the round; the wake clock is the
+    /// bounded widening [`ERROR_PARK_BACKOFF_SCHEDULE_SECS`] schedule.
+    ServiceCondition,
+}
+
+impl ParkKind {
+    /// The park's display noun for the shared log lines ("<noun>
+    /// elapsed/cancelled/…"), so an error park never claims to be
+    /// rate-limited (the display-lie class the 2026-07-29 diagnosis
+    /// stacked three of).
+    pub(crate) fn noun(&self) -> &'static str {
+        match self {
+            ParkKind::ProviderLimit => "Rate-limit park",
+            ParkKind::ServiceCondition => "Service-recovery pause",
+        }
+    }
+
+    /// The queued-while-parked row for a user message held during a park.
+    pub(crate) fn queued_log(&self) -> &'static str {
+        match self {
+            ParkKind::ProviderLimit => LIMIT_PARK_QUEUED_MESSAGE_LOG,
+            ParkKind::ServiceCondition => {
+                "Message queued — delivers when the service-recovery pause elapses"
+            }
+        }
+    }
+
+    /// The follow-up status detail for a message queued behind the park.
+    pub(crate) fn queued_status_detail(&self) -> &'static str {
+        match self {
+            ParkKind::ProviderLimit => "rate-limited; delivers when the limit resets",
+            ParkKind::ServiceCondition => {
+                "waiting out a service condition; delivers when the recovery pause elapses"
+            }
+        }
+    }
+}
+
+/// One armed park in an external-session lane: the lane sleeps until
+/// `resume_at`, then re-sends `pending` (if still uncancelled). User
+/// messages arriving while parked queue behind it instead of burning
+/// against the unavailable backend. `kind` says what the park waits out
+/// (a provider limit's reset, or a temporary service condition's
+/// recovery schedule) — one slot, one wake timer, honest wording.
 pub(crate) struct LimitParkState {
     pub(crate) resume_at: tokio::time::Instant,
     pub(crate) pending: Option<FollowUpMessage>,
+    pub(crate) kind: ParkKind,
 }
 
 /// A continuation for a turn the backend had already STARTED when it was
@@ -1547,7 +1621,27 @@ pub(crate) fn limit_park_pending(
     rejected: FollowUpMessage,
     turn_had_started: bool,
 ) -> FollowUpMessage {
-    match midturn_continuation(LIMIT_MIDTURN_CONTINUATION_TEXT, turn_had_started) {
+    delivery_aware_park_pending(rejected, turn_had_started, LIMIT_MIDTURN_CONTINUATION_TEXT)
+}
+
+/// The one delivery-aware pending decision every park lane rides
+/// (never copies): a round whose driving message never reached the
+/// backend parks the message itself for a verbatim re-send (true
+/// at-least-once); a round the backend had started parks a resume nudge
+/// carrying the interruption's cause instead — inheriting the driving
+/// message's follow-up/steer ids so a user cancel during the park
+/// cancels the resume exactly like it cancels a full re-send, and
+/// deliberately carrying none of its attachments or edit/rewind
+/// directives (those were already applied when the turn started).
+/// `midturn_text` names the cause: the rate-limit park passes
+/// [`LIMIT_MIDTURN_CONTINUATION_TEXT`], the service-condition error park
+/// [`ERROR_MIDTURN_CONTINUATION_TEXT`].
+pub(crate) fn delivery_aware_park_pending(
+    rejected: FollowUpMessage,
+    turn_had_started: bool,
+    midturn_text: &str,
+) -> FollowUpMessage {
+    match midturn_continuation(midturn_text, turn_had_started) {
         Some(mut nudge) => {
             nudge.follow_up_id = rejected.follow_up_id;
             nudge.steer_id = rejected.steer_id;
@@ -1610,6 +1704,188 @@ pub(crate) fn backend_started_limit_park(
         LimitParkState {
             resume_at: now + delay,
             pending,
+            kind: ParkKind::ProviderLimit,
+        },
+        park_line,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Service-condition error park (recovery scheduling for early round endings)
+// ---------------------------------------------------------------------------
+
+/// The bounded widening wake schedule for a round killed by a temporary
+/// service condition, indexed by consecutive-death `attempt` (1-based):
+/// short first (a provider blip recovers in seconds), then longer, so a
+/// real incident is retried patiently. Past the last entry the schedule
+/// is EXHAUSTED and the lane suspends visibly instead of parking again
+/// ([`error_park_attempts_exhausted`]). Integers deliberately tunable.
+pub(crate) const ERROR_PARK_BACKOFF_SCHEDULE_SECS: [u64; 5] = [30, 120, 300, 900, 1800];
+/// Jitter cap stacked on each schedule step so a fleet whose sessions
+/// all died on the same provider incident doesn't wake in lockstep.
+/// Deliberately smaller than the rate-limit park's 30–90s band — the
+/// first schedule step is only 30s.
+pub(crate) const ERROR_PARK_JITTER_MAX_SECS: u64 = 15;
+
+/// Random error-park jitter in `0..=ERROR_PARK_JITTER_MAX_SECS`. Tests
+/// inject a fixed value into [`error_park_delay`] instead of calling this.
+pub(crate) fn error_park_jitter_secs() -> u64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0..=ERROR_PARK_JITTER_MAX_SECS)
+}
+
+/// The wake delay for recovery `attempt` (1-based). Attempts past the
+/// schedule clamp to its last step — but callers gate on
+/// [`error_park_attempts_exhausted`] first, so the clamp only matters if
+/// a caller deliberately keeps retrying past exhaustion.
+pub(crate) fn error_park_delay(attempt: u32, jitter_secs: u64) -> Duration {
+    let index = (attempt.max(1) as usize - 1).min(ERROR_PARK_BACKOFF_SCHEDULE_SECS.len() - 1);
+    Duration::from_secs(ERROR_PARK_BACKOFF_SCHEDULE_SECS[index].saturating_add(jitter_secs))
+}
+
+/// Whether recovery `attempt` (1-based) lies past the bounded schedule.
+/// The first exhausted attempt is `len + 1`: every entry in the schedule
+/// buys one real wake before the lane gives up visibly.
+pub(crate) fn error_park_attempts_exhausted(attempt: u32) -> bool {
+    attempt as usize > ERROR_PARK_BACKOFF_SCHEDULE_SECS.len()
+}
+
+/// The resume nudge a service-condition error park re-sends at wake when
+/// the killed round had already started at the backend (the delivery-aware
+/// twin of [`LIMIT_MIDTURN_CONTINUATION_TEXT`], through the same
+/// [`delivery_aware_park_pending`] seam).
+pub(crate) const ERROR_MIDTURN_CONTINUATION_TEXT: &str =
+    "A temporary service error interrupted the previous turn (the provider returned repeated \
+     server errors); the recovery pause has elapsed — continue where you left off. Do not \
+     expect the interrupted message to be re-sent: it is already in this conversation.";
+
+/// Classify a fatal round-ending backend error: `true` means a TEMPORARY
+/// service condition — the provider-incident class (HTTP 5xx after the
+/// backend's own transport retries gave up, gateway drops, stream cuts) —
+/// whose round death should arm the error park instead of ending the
+/// round's story. Everything else (auth problems, refusals, invalid
+/// pins, budget stops, deliberate exits) is PERMANENT: those endings
+/// keep today's terminal shapes. Matching is deliberately conservative
+/// and marker-based; the observed shapes:
+///
+/// - Claude Code surfaces provider errors as a result whose text starts
+///   "API Error: <status>" (the 2026-07-29 specimens: "API Error: 500",
+///   sessions 24f01636/13e53300) — `api error: 5` covers the 5xx band
+///   without matching auth statuses (401/403) or limits (429).
+/// - Anthropic 529s carry "overloaded"; generic 5xx bodies carry
+///   "internal server error" / "bad gateway" / "service unavailable" /
+///   "gateway timeout".
+/// - Codex labels stream cuts `streamDisconnected` with "stream
+///   disconnected before completion" prose; raw socket deaths surface
+///   "connection reset" / "fetch failed".
+pub(crate) fn transient_service_condition(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "api error: 5",
+        "overloaded",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "stream disconnected",
+        "streamdisconnected",
+        "connection reset",
+        "fetch failed",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+}
+
+/// The cause of a fatal, non-recoverable backend error buffered while the
+/// drain waits out the post-turn grace window. `reason` is the formatted
+/// announcement (agent name + code + message — what logs and outcomes
+/// carry); `raw_message` is the adapter's verbatim error text, kept so
+/// the drain can recognize the error's OWN synthesized turn completion
+/// (Claude Code pushes `TurnCompleted` carrying the same text right after
+/// the fatal `BackendError`, one wire line) and not mistake it for a real
+/// completion superseding the cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FatalRoundError {
+    pub(crate) reason: String,
+    pub(crate) raw_message: String,
+}
+
+/// First line of a (possibly multi-line, JSON-bearing) backend error,
+/// truncated for one-row announcements. The full cause is already in the
+/// session log as the drain's own error row.
+fn error_reason_preview(reason: &str) -> String {
+    let first_line = reason.lines().next().unwrap_or("").trim();
+    truncate_string_copy(first_line, 160)
+}
+
+/// The session-log/activity row announcing a service-condition park —
+/// the error-park twin of [`limit_park_log_line`], one place so the
+/// lanes cannot drift.
+pub(crate) fn error_park_log_line(
+    reason: &str,
+    attempt: u32,
+    delay: Duration,
+    has_pending: bool,
+) -> String {
+    let tail = if has_pending {
+        "will auto-resume and continue the interrupted work (messages arriving meanwhile queue)"
+    } else {
+        "messages arriving meanwhile queue until the pause elapses"
+    };
+    format!(
+        "Temporary service condition ended the round ({}) — parked; recovery attempt {attempt} of {} wakes in ~{}m{}s; {tail}",
+        error_reason_preview(reason),
+        ERROR_PARK_BACKOFF_SCHEDULE_SECS.len(),
+        delay.as_secs() / 60,
+        delay.as_secs() % 60,
+    )
+}
+
+/// The visible-suspension announcement when the widening schedule is
+/// exhausted: the lane stops parking and ends/reports FAILED so the
+/// outage surfaces (agenda occurrences journal `failed` and count on the
+/// suspension streak) instead of waiting unattended.
+pub(crate) fn error_park_exhausted_line(reason: &str, attempts_made: u32) -> String {
+    format!(
+        "Temporary service condition persisted through {attempts_made} recovery attempts — \
+         suspending instead of waiting unattended: {}",
+        error_reason_preview(reason),
+    )
+}
+
+/// The armed service-condition park PLUS its announcement line — the
+/// error-park twin of [`backend_started_limit_park`]'s (park, line)
+/// unity: a caller cannot log the park without holding the state it
+/// announces, and the line's flavor derives from the pending it ships
+/// with. `rejected` is the round's driving message when this side sent
+/// one (the follow-up lane; delivery-aware verbatim re-send when the
+/// backend never started the turn) and `None` for backend-started
+/// rounds (nothing of ours to re-send; the pending is the resume nudge
+/// exactly when the turn had started). Both shapes ride the one
+/// [`delivery_aware_park_pending`] / [`midturn_continuation`] seam.
+pub(crate) fn transient_round_death_error_park(
+    reason: &str,
+    now: tokio::time::Instant,
+    attempt: u32,
+    jitter_secs: u64,
+    turn_had_started: bool,
+    rejected: Option<FollowUpMessage>,
+) -> (LimitParkState, String) {
+    let delay = error_park_delay(attempt, jitter_secs);
+    let pending = match rejected {
+        Some(rejected) => Some(delivery_aware_park_pending(
+            rejected,
+            turn_had_started,
+            ERROR_MIDTURN_CONTINUATION_TEXT,
+        )),
+        None => midturn_continuation(ERROR_MIDTURN_CONTINUATION_TEXT, turn_had_started),
+    };
+    let park_line = error_park_log_line(reason, attempt, delay, pending.is_some());
+    (
+        LimitParkState {
+            resume_at: now + delay,
+            pending,
+            kind: ParkKind::ServiceCondition,
         },
         park_line,
     )
@@ -1640,10 +1916,15 @@ pub(crate) fn compact_deferred_by_limit_park(
     let park = limit_park.as_ref()?;
     let resets_at_epoch =
         now_epoch.saturating_add(park.resume_at.saturating_duration_since(now).as_secs());
-    Some(format!(
-        "Compaction deferred — rate-limited; {}; request it again after the limit resets",
-        external_agent::limit_reset_phrase(Some(resets_at_epoch), now_epoch)
-    ))
+    let phrase = external_agent::limit_reset_phrase(Some(resets_at_epoch), now_epoch);
+    Some(match park.kind {
+        ParkKind::ProviderLimit => format!(
+            "Compaction deferred — rate-limited; {phrase}; request it again after the limit resets",
+        ),
+        ParkKind::ServiceCondition => format!(
+            "Compaction deferred — waiting out a service condition; {phrase}; request it again after the pause elapses",
+        ),
+    })
 }
 
 /// Pop the next still-deliverable message off a rate-limit park queue,
@@ -2500,5 +2781,198 @@ new file mode 100644
         let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
         assert!(popped.is_none());
         assert_eq!(skipped, 0);
+    }
+
+    /// PIN `transient_round_death_arms_error_park`: a round death whose
+    /// cause classifies as a temporary service condition (the 2026-07-29
+    /// specimens: "API Error: 500" round-deaths that rode a DoneSignal
+    /// and stranded both commissions fake-idle) arms a REAL park through
+    /// the (park, line) unity constructor — armed timer, service kind,
+    /// delivery-aware pending, and an announcement that cannot exist
+    /// without the state it announces.
+    #[tokio::test]
+    async fn transient_round_death_arms_error_park() {
+        let specimen =
+            "Claude Code backend error (error_during_execution): API Error: 500 \
+             {\"type\":\"api_error\",\"message\":\"Internal server error\"}";
+        assert!(transient_service_condition(specimen));
+
+        let now = tokio::time::Instant::now();
+        // The specimen shape: a backend-started/mid-commission round the
+        // backend had engaged — the pending is the resume nudge.
+        let (park, line) =
+            transient_round_death_error_park(specimen, now, 1, 0, true, None);
+        assert_eq!(park.kind, ParkKind::ServiceCondition);
+        assert_eq!(park.resume_at, now + error_park_delay(1, 0));
+        let pending = park.pending.as_ref().expect("started turn parks a nudge");
+        assert_eq!(pending.text, ERROR_MIDTURN_CONTINUATION_TEXT);
+        assert!(line.contains("parked"), "announcement names the park: {line}");
+        assert!(
+            line.contains("recovery attempt 1 of 5"),
+            "announcement names the schedule position: {line}"
+        );
+
+        // A backend-started death observed before any work parks
+        // pending-less — the timer still wakes the lane and messages
+        // arriving meanwhile queue instead of burning.
+        let (park, _line) =
+            transient_round_death_error_park(specimen, now, 1, 0, false, None);
+        assert!(park.pending.is_none());
+        assert_eq!(park.kind, ParkKind::ServiceCondition);
+    }
+
+    /// PIN `error_park_wakes_on_backoff_expiry`: the error park's wake
+    /// clock is the bounded widening schedule — short first, then longer
+    /// — indexed by consecutive-death attempt, and the armed park's
+    /// `resume_at` is exactly that delay out (the shared park timer
+    /// branch re-sends the pending when it fires, same slot as the
+    /// limit park's reset wake).
+    #[tokio::test]
+    async fn error_park_wakes_on_backoff_expiry() {
+        // Widening: each schedule step is at least the previous one.
+        let mut previous = 0u64;
+        for (index, step) in ERROR_PARK_BACKOFF_SCHEDULE_SECS.iter().enumerate() {
+            assert!(
+                *step >= previous,
+                "schedule must widen monotonically at step {index}"
+            );
+            previous = *step;
+            assert_eq!(
+                error_park_delay(index as u32 + 1, 0),
+                Duration::from_secs(*step)
+            );
+        }
+        // Short first: the first wake is prompt (a provider blip
+        // recovers in seconds, not an hour).
+        assert!(ERROR_PARK_BACKOFF_SCHEDULE_SECS[0] <= 60);
+        // Jitter stacks on the step; attempts past the schedule clamp
+        // to the last step.
+        assert_eq!(
+            error_park_delay(1, 7),
+            Duration::from_secs(ERROR_PARK_BACKOFF_SCHEDULE_SECS[0] + 7)
+        );
+        assert_eq!(
+            error_park_delay(99, 0),
+            Duration::from_secs(*ERROR_PARK_BACKOFF_SCHEDULE_SECS.last().unwrap())
+        );
+        // The armed park wakes exactly on the schedule.
+        let now = tokio::time::Instant::now();
+        let (park, _line) = transient_round_death_error_park(
+            "API Error: 503 Service Unavailable",
+            now,
+            3,
+            5,
+            true,
+            None,
+        );
+        assert_eq!(park.resume_at, now + error_park_delay(3, 5));
+
+        for _ in 0..32 {
+            assert!(error_park_jitter_secs() <= ERROR_PARK_JITTER_MAX_SECS);
+        }
+    }
+
+    /// PIN `exhausted_error_parks_suspend_visibly`: the schedule is
+    /// attempt-capped — one wake per schedule step, and the first
+    /// attempt PAST the schedule is exhausted. The lanes map exhaustion
+    /// to a FAILED terminal (`TaskOutcome::Failed`) with this
+    /// announcement instead of parking again, so a lasting outage
+    /// journals `failed` on the scheduled occurrence — counting on the
+    /// agenda's suspension streak and surfacing to the owner — rather
+    /// than waiting unattended (the specimens waited over an hour,
+    /// invisible to every wake clock).
+    #[test]
+    fn exhausted_error_parks_suspend_visibly() {
+        let attempts = ERROR_PARK_BACKOFF_SCHEDULE_SECS.len() as u32;
+        for attempt in 1..=attempts {
+            assert!(
+                !error_park_attempts_exhausted(attempt),
+                "attempt {attempt} is within the schedule"
+            );
+        }
+        assert!(error_park_attempts_exhausted(attempts + 1));
+
+        let line = error_park_exhausted_line("API Error: 500 internal server error", attempts);
+        assert!(
+            line.contains("suspending"),
+            "exhaustion announces a suspension, not a wait: {line}"
+        );
+        assert!(
+            line.contains(&format!("{attempts} recovery attempts")),
+            "exhaustion counts the schedule it burned: {line}"
+        );
+        assert!(line.contains("API Error: 500"));
+    }
+
+    /// PIN `error_park_shares_the_delivery_aware_seam`: the error park's
+    /// pending decision IS the limit park's — one
+    /// [`delivery_aware_park_pending`] / [`midturn_continuation`] seam,
+    /// never a copy. Never-delivered → the driving message verbatim
+    /// (ids, attachments, edit/rewind directives intact); started → a
+    /// resume nudge naming the service condition, inheriting the
+    /// follow-up/steer ids (a user cancel during the park cancels the
+    /// resume) and carrying none of the applied directives.
+    #[tokio::test]
+    async fn error_park_shares_the_delivery_aware_seam() {
+        // Never delivered: verbatim re-send, exactly like the limit twin.
+        let rejected = rejected_park_message();
+        let pending = delivery_aware_park_pending(
+            rejected.clone(),
+            false,
+            ERROR_MIDTURN_CONTINUATION_TEXT,
+        );
+        assert_eq!(pending.text, rejected.text);
+        assert_eq!(pending.follow_up_id, rejected.follow_up_id);
+        assert_eq!(pending.edit_user_turn_index, Some(3));
+        assert_eq!(
+            pending.claude_inplace_rewind_targets,
+            vec!["uuid-1".to_string()]
+        );
+
+        // Started: the nudge, with inherited ids and nothing else.
+        let pending = delivery_aware_park_pending(
+            rejected_park_message(),
+            true,
+            ERROR_MIDTURN_CONTINUATION_TEXT,
+        );
+        assert_eq!(pending.text, ERROR_MIDTURN_CONTINUATION_TEXT);
+        assert_eq!(pending.follow_up_id.as_deref(), Some("f-goal"));
+        assert_eq!(pending.steer_id.as_deref(), Some("s-goal"));
+        assert!(pending.attachments.items.is_empty());
+        assert_eq!(pending.edit_user_turn_index, None);
+        assert!(pending.claude_inplace_rewind_targets.is_empty());
+        let mut cancelled: HashSet<String> = HashSet::from(["f-goal".to_string()]);
+        assert!(crate::external_events::follow_up_message_was_cancelled(
+            &mut cancelled,
+            &pending
+        ));
+
+        // The limit park rides the identical seam — same function, its
+        // own cause text — so the two lanes cannot drift.
+        let limit_twin = limit_park_pending(rejected_park_message(), true);
+        let shared = delivery_aware_park_pending(
+            rejected_park_message(),
+            true,
+            LIMIT_MIDTURN_CONTINUATION_TEXT,
+        );
+        assert_eq!(limit_twin.text, shared.text);
+        assert_eq!(limit_twin.follow_up_id, shared.follow_up_id);
+        assert_eq!(limit_twin.steer_id, shared.steer_id);
+
+        // The full-message re-send inherits the error text through the
+        // constructor too: a never-started follow-up round parks the
+        // driving message itself.
+        let (park, _line) = transient_round_death_error_park(
+            "API Error: 502 Bad Gateway",
+            tokio::time::Instant::now(),
+            1,
+            0,
+            false,
+            Some(rejected_park_message()),
+        );
+        assert_eq!(
+            park.pending.expect("driving message parks verbatim").text,
+            "the whole goal, re-merged"
+        );
     }
 }

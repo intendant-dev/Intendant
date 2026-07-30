@@ -3529,6 +3529,23 @@ pub(crate) async fn drain_external_child_turn(
             });
             emit_child_turn_complete(&child_config, conversation_kind, message);
         }
+        DrainOutcome::TransientRoundDeath { reason, .. } => {
+            // A temporary service condition killed the child turn. Child
+            // conversations have no park machinery — report honestly and
+            // end the child turn like a completion; the primary lane owns
+            // recovery scheduling.
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "warn".to_string(),
+                source: external_agent_log_source(child_config.agent_source.as_deref()),
+                content: format!(
+                    "Temporary service condition ended the {} conversation turn: {}",
+                    conversation_kind, reason
+                ),
+                turn: None,
+            });
+            emit_child_turn_complete(&child_config, conversation_kind, Some(reason));
+        }
         DrainOutcome::ContextRewindRequested { request, .. } => {
             emit_context_rewind_failure(
                 &request,
