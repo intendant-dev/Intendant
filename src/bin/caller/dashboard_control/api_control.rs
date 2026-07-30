@@ -1725,6 +1725,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::StopSession { .. }
             | ControlMsg::RestartSession { .. }
             | ControlMsg::ReloadCredentials { .. }
+            | ControlMsg::ReloadCredentialsAll { .. }
             | ControlMsg::CreateSession { .. }
             | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
@@ -1804,6 +1805,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ReloadCredentials { .. } => "reload_credentials",
+        ControlMsg::ReloadCredentialsAll { .. } => "reload_credentials_all",
         ControlMsg::ResumeSession { .. } => "resume_session",
         ControlMsg::ForkSessionAtAnchor { .. } => "fork_session_at_anchor",
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
@@ -3999,6 +4001,28 @@ mod tests {
         }))
         .expect("reload_credentials parses");
         assert_eq!(dashboard_control_msg_action(&msg), "reload_credentials");
+        assert!(dashboard_session_control_msg_allowed(&msg));
+        assert!(!dashboard_action_msg_allowed(&msg));
+        assert_eq!(
+            crate::access::access_policy::control_msg_operation(&msg),
+            crate::peer::access_policy::PeerOperation::SessionManage,
+        );
+    }
+
+    /// The Vault card's "Reload all" fan-out rides the same lane and
+    /// classification as the per-session reload it multiplies.
+    #[test]
+    fn reload_credentials_all_control_msg_wires_like_reload_credentials() {
+        let msg: ControlMsg = serde_json::from_value(serde_json::json!({
+            "action": "reload_credentials_all",
+            "source": "claude-code",
+        }))
+        .expect("reload_credentials_all parses");
+        let ControlMsg::ReloadCredentialsAll { source } = &msg else {
+            unreachable!("reload_credentials_all parsed as another action");
+        };
+        assert_eq!(source, "claude-code");
+        assert_eq!(dashboard_control_msg_action(&msg), "reload_credentials_all");
         assert!(dashboard_session_control_msg_allowed(&msg));
         assert!(!dashboard_action_msg_allowed(&msg));
         assert_eq!(

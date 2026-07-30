@@ -536,6 +536,7 @@ mod tests {
                     source: "intendant".to_string(),
                     name: None,
                     phase: "idle".to_string(),
+                    reload: None,
                     project_root: project_dir.path().to_path_buf(),
                     session_dir: PathBuf::from("/tmp/session"),
                     follow_up_tx,
