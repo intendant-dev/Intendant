@@ -2,13 +2,13 @@
 name: kimi-code-e2e
 description: >
   Reproducible live end-to-end acceptance test for Intendant's Kimi Code
-  external-agent backend. Exercises the real authenticated Kimi 0.27-0.28
-  server-v1/v2 adapter with K2.7 Coding, including approvals/questions,
+  external-agent backend. Exercises the real authenticated Kimi 0.27-0.29
+  server-v1/reflected-RPC adapter with K2.7 Coding, including approvals/questions,
   attachments, streaming/usage/tools/diffs, native lifecycle and goal
   actions, exact historical fork/undo, side and background agents, search,
   interrupt/steer, and resume. Not for CI.
 compatibility: >
-  Requires an authenticated Kimi Code 0.27.x or 0.28.x installation and a
+  Requires an authenticated Kimi Code 0.27.x, 0.28.x, or 0.29.x installation and a
   release intendant build from this checkout. Makes real K2.7 Coding model
   calls.
 allowed-tools: Bash Read
@@ -19,9 +19,9 @@ disable-model-invocation: false
 
 This acceptance scenario catches protocol and orchestration drift that mock
 tests cannot: Intendant starts a private foreground Kimi server (`kimi server
-run` on 0.27, or `kimi web --no-open` on 0.28), uses its real
+run` on 0.27, or `kimi web --no-open` on 0.28+), uses its real
 bearer-authenticated REST/WebSocket server-v1 surface plus its allowlisted
-server-v2 agent RPCs, and drives it through the same control socket and
+reflected agent RPCs, and drives it through the same control socket and
 dashboard HTTP routes used by frontends.
 
 It is test documentation and a runnable harness, not an operational Intendant
@@ -47,9 +47,12 @@ proven descendants, removes its Unix socket, and deletes the disposable root.
 Because Kimi's OAuth provider can rotate its refresh grant during a successful
 call, the stopped harness first compare-and-swap publishes a changed isolated
 credential back to the source file with an atomic 0600 replacement. It refuses
-to overwrite a source changed by a concurrent `kimi login` or direct refresh;
-without that copy-back, deleting the isolated home would strand the only valid
-rotated grant and make the machine login unusable.
+to overwrite a source changed by a concurrent `kimi login` or direct refresh,
+and refuses to publish an empty/logged-out credential record. The source
+credential must itself contain a non-empty refresh grant or an unexpired access
+grant before the run starts. Without guarded copy-back, deleting the isolated
+home could either strand the only valid rotated grant or replace the machine
+login with failed refresh state.
 Use `--keep` only when inspecting a failure; that root contains copied Kimi
 credentials and must be deleted securely afterward.
 
@@ -61,7 +64,9 @@ credentials and must be deleted securely afterward.
 - Kimi's distinct structured `AskUserQuestion` request/answer rail, including
   a one-choice answer that must remain typed as multi-select.
 - The generated bearer-authenticated Intendant MCP bridge, through a real
-  read-only `list_displays` call, Kimi 0.28's native MCP approval request, and
+  read-only `list_displays` call selected by its concrete collision-renamed
+  native tool name, Kimi's native MCP approval request when the selected
+  release requires one, and
   correlated tool output while a project MCP declaration deliberately
   occupies the default server name.
 - Dashboard-staged ordinary-file and image attachments delivered through
@@ -122,7 +127,7 @@ Options:
 --quick           Skip long steer/interrupt/background-agent phases
 --background-only Run only startup plus the background-agent acceptance phase
 --auth-sync-self-test
-                  Hermetically test OAuth rotation copy-back and CAS refusal
+                  Hermetically test OAuth copy-back, CAS, and logout refusal
 ```
 
 The full run can take several minutes because it intentionally waits on live
@@ -156,11 +161,11 @@ pass/fail table and exits non-zero on any failed assertion. With `--keep`,
   cursors, or the live indexer sweep regressed.
 - Resume binds a different native id: wrapper identity/overlay persistence or
   Kimi resume selection regressed.
-- Exact/empty/all tool checks fail: the v2 active-tool profile mutation or
+- Exact/empty/all tool checks fail: the negotiated active-tool profile mutation or
   readback diverged.
 - A model response appears between the two fast toggles: work ran on the
   temporary Highspeed alias instead of canonical K2.7 Coding.
-- Goal completion still leaves an active goal: the v2 goal terminal snapshot
+- Goal completion still leaves an active goal: the reflected goal terminal snapshot
   was not translated before Kimi cleared its standing goal.
-- Post-clear context still contains the attachment token: native
-  `clearContext` did not clear the live agent journal.
+- Post-clear context still contains the attachment token: the negotiated native
+  context-clear operation did not clear the live agent journal.

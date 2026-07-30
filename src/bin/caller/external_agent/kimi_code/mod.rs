@@ -1,11 +1,13 @@
 //! Kimi Code external-agent adapter.
 //!
 //! The adapter supervises Kimi's local web server rather than the narrower ACP
-//! facade. Kimi 0.27 exposes it as `kimi server run`; 0.28 replaced that
-//! entrypoint with foreground `kimi web --no-open`. The authenticated REST/WS
-//! surface exposes native fork/undo/compaction, true queued-prompt steering,
-//! goals, side agents, background tasks, structured approvals/questions,
-//! multimodal files, live profile switches, and full sub-agent telemetry.
+//! facade. Kimi 0.27 exposes it as `kimi server run`; 0.28+ replaced that
+//! entrypoint with foreground `kimi web --no-open`. Web-server readiness is
+//! discovered through Kimi's PID-bound instance registry, not its
+//! token-bearing presentation banner. The authenticated REST/WS surface
+//! exposes native fork/undo/compaction, true queued-prompt steering, goals,
+//! side agents, background tasks, structured approvals/questions, multimodal
+//! files, live profile switches, and full sub-agent telemetry.
 
 mod bridge;
 mod events;
@@ -54,7 +56,7 @@ use super::{
     AutonomousGoalPauseResult, ExternalAgent,
 };
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(25);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const KIMI_MAIN_AGENT_ID: &str = "main";
 const KIMI_MCP_TOOL_WILDCARD: &str = "mcp__*";
 const REVIEW_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -85,7 +87,19 @@ impl KimiServerEntrypoint {
                 "--log-level",
                 "silent",
             ],
-            Self::Web => &["web", "--no-open", "--port", "0", "--log-level", "silent"],
+            Self::Web => &[
+                "web",
+                "--no-open",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+                // Kimi 0.28+ moved its authenticated service dispatcher to
+                // this opt-in surface. Kimi itself also requires a loopback
+                // bind; Intendant independently validates the registered host
+                // and confines every typed RPC call to that origin.
+                "--debug-endpoints",
+            ],
         }
     }
 }
@@ -242,7 +256,7 @@ impl KimiCodeAgent {
             ));
         }
 
-        // Kimi 0.27-0.28's fork response is returned only after the child
+        // Kimi 0.27-0.29's fork response is returned only after the child
         // session and its agents have been materialized from copied wire
         // history.
         // `:undo` prechecks the entire count before mutating that history, so
@@ -492,7 +506,7 @@ impl KimiCodeAgent {
         if let Some(prompt_id) = self.shared.prompt_id(&session_id, &agent_id) {
             return Ok(Some(prompt_id));
         }
-        // Kimi 0.27-0.28's prompt-list route exposes only the main agent.
+        // Kimi 0.27-0.29's prompt-list route exposes only the main agent.
         // Falling back to it while a child thread is selected could make a
         // child interrupt/steer target the parent's prompt.
         if agent_id != KIMI_MAIN_AGENT_ID {
@@ -1505,6 +1519,10 @@ impl ExternalAgent for KimiCodeAgent {
         let bootstrap_url = self.web_port.map(|port| self.intendant_mcp_url(port, true));
         let mut entrypoint = KimiServerEntrypoint::ServerRun;
         let (mut child, child_pid, origin, stdout_reader, stderr) = loop {
+            let instance_baseline = match entrypoint {
+                KimiServerEntrypoint::ServerRun => HashSet::new(),
+                KimiServerEntrypoint::Web => capture_server_instance_baseline(&bridge_home).await?,
+            };
             let mut command = crate::platform::spawn_command(&self.command);
             command
                 .args(entrypoint.args())
@@ -1555,12 +1573,23 @@ impl ExternalAgent for KimiCodeAgent {
                     return Err(external("failed to capture Kimi server stderr"));
                 }
             };
-            match wait_for_server_origin(stdout).await {
+            let readiness = match entrypoint {
+                KimiServerEntrypoint::ServerRun => wait_for_server_origin(stdout).await,
+                KimiServerEntrypoint::Web => wait_for_registered_server_origin(
+                    &bridge_home,
+                    &instance_baseline,
+                    child_pid,
+                    &mut child,
+                )
+                .await
+                .map(|origin| (origin, BufReader::new(stdout))),
+            };
+            match readiness {
                 Ok((origin, stdout_reader)) => {
                     break (child, child_pid, origin, stdout_reader, stderr);
                 }
                 Err(error) => {
-                    // Kimi 0.28 closes the deprecated entrypoint's stdout a
+                    // Kimi 0.28+ closes the deprecated entrypoint's stdout a
                     // few scheduler ticks before its process becomes
                     // reapable. An immediate `try_wait` therefore made the
                     // `kimi web` compatibility fallback intermittent.
@@ -1584,14 +1613,19 @@ impl ExternalAgent for KimiCodeAgent {
                 }
             }
         };
-        let token = match wait_for_server_token(&bridge_home.join("server.token")).await {
+        let token = match wait_for_server_token(&bridge_home.join("server.token"), &mut child).await
+        {
             Ok(token) => token,
             Err(error) => {
                 terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
                 return Err(error);
             }
         };
-        let rpc = match KimiRpcApi::new(origin.clone(), token.clone()) {
+        let rpc_result = match entrypoint {
+            KimiServerEntrypoint::ServerRun => KimiRpcApi::new(origin.clone(), token.clone()),
+            KimiServerEntrypoint::Web => KimiRpcApi::new_debug(origin.clone(), token.clone()),
+        };
+        let mut rpc = match rpc_result {
             Ok(api) => api,
             Err(error) => {
                 terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
@@ -1605,7 +1639,7 @@ impl ExternalAgent for KimiCodeAgent {
                 return Err(error);
             }
         };
-        if let Err(error) = api.health().await {
+        if let Err(error) = wait_for_server_health(&api, &mut child).await {
             terminate_spawned_child(child_pid, &mut child, &bridge_home).await;
             return Err(error);
         }
@@ -1701,7 +1735,7 @@ impl ExternalAgent for KimiCodeAgent {
                 ));
             }
         }
-        // Kimi 0.27-0.28 validate `agent_config` on session creation but their
+        // Kimi 0.27-0.29 validate `agent_config` on session creation but their
         // create route does not apply the field. The profile route is the
         // authoritative live mutation path, so apply launch pins here for new,
         // resumed, and forked sessions before publication/subscription.
@@ -2041,7 +2075,7 @@ impl ExternalAgent for KimiCodeAgent {
             )
         {
             return Err(external(format!(
-                "Kimi 0.27-0.28 cannot apply /{op} to one :btw agent; target the parent session"
+                "Kimi 0.27-0.29 cannot apply /{op} to one :btw agent; target the parent session"
             )));
         }
         match op {
@@ -2199,7 +2233,7 @@ impl ExternalAgent for KimiCodeAgent {
     ) -> Result<AgentThread, CallerError> {
         if split_child_thread_id(thread_id).is_some() {
             return Err(external(
-                "Kimi 0.27-0.28 cannot fork one composite :btw conversation",
+                "Kimi 0.27-0.29 cannot fork one composite :btw conversation",
             ));
         }
         if let Some(cwd) = cwd {
@@ -2292,7 +2326,7 @@ impl ExternalAgent for KimiCodeAgent {
             return Err(external("Kimi fission charter must not be empty"));
         }
         self.api()?.get_session(thread_id).await?;
-        // Kimi 0.27-0.28 have no public developer-role append. A fission
+        // Kimi 0.27-0.29 have no public developer-role append. A fission
         // branch is supposed to begin work immediately, so submit Intendant's
         // delimited charter as its first user-origin prompt. The branch's
         // resumed supervisor attaches to that live turn and does not enqueue a
@@ -2342,7 +2376,7 @@ impl ExternalAgent for KimiCodeAgent {
     ) -> Result<(), CallerError> {
         if split_child_thread_id(thread_id).is_some() {
             return Err(external(
-                "Kimi 0.27-0.28 cannot target undo at one :btw agent",
+                "Kimi 0.27-0.29 cannot target undo at one :btw agent",
             ));
         }
         self.api()?
@@ -3414,7 +3448,15 @@ mod tests {
         );
         assert_eq!(
             KimiServerEntrypoint::Web.args(),
-            &["web", "--no-open", "--port", "0", "--log-level", "silent"]
+            &[
+                "web",
+                "--no-open",
+                "--port",
+                "0",
+                "--log-level",
+                "silent",
+                "--debug-endpoints",
+            ]
         );
         assert!(legacy_server_entrypoint_removed_text(
             "`kimi server` has been deprecated and no longer works.\n\

@@ -30,7 +30,7 @@ const path = require("path");
 const MODEL = "kimi-code/kimi-for-coding";
 const HIGHSPEED_MODEL = "kimi-code/kimi-for-coding-highspeed";
 const MODEL_DISPLAY = "K2.7 Coding";
-const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28)\./;
+const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28|29)\./;
 const args = process.argv.slice(2);
 const USAGE = `Usage:
   node driver.cjs [--binary <path>] [--workdir <path>] [--port <n>]
@@ -83,6 +83,7 @@ const logLines = [];
 const checks = [];
 const skips = [];
 let kimiAuthSnapshot = null;
+const loopbackTokens = new Map();
 
 function ts() {
   return `${((Date.now() - t0) / 1000).toFixed(1).padStart(7)}s`;
@@ -270,6 +271,38 @@ function credentialDigest(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
+function requireUsableKimiCredential(bytes, label) {
+  if (bytes.length === 0 || bytes.length > 64 * 1024) {
+    throw new Error(`${label} must be between 1 byte and 64 KiB`);
+  }
+  let credential;
+  try {
+    credential = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new Error(`${label} must contain valid JSON`);
+  }
+  const scalarString = (name) =>
+    typeof credential?.[name] === "string" &&
+    credential[name].trim().length > 0;
+  let expiresAt = credential?.expires_at;
+  if (typeof expiresAt === "string" && /^-?\d+$/.test(expiresAt)) {
+    expiresAt = Number(expiresAt);
+  }
+  if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) {
+    if (expiresAt > 10_000_000_000) expiresAt /= 1_000;
+  } else {
+    expiresAt = null;
+  }
+  const accessValid =
+    scalarString("access_token") &&
+    (expiresAt === null || expiresAt > Math.floor(Date.now() / 1_000));
+  if (!scalarString("refresh_token") && !accessValid) {
+    throw new Error(
+      `${label} is logged out or expired; refusing to treat it as authenticated OAuth state`,
+    );
+  }
+}
+
 function requirePrivateRegularCredential(credential, label) {
   const stat = fs.lstatSync(credential);
   if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -293,11 +326,15 @@ function copyKimiAuthState() {
   }
   requirePrivateRegularCredential(credential, "Kimi source credential");
   const sourceBytes = fs.readFileSync(credential);
-  kimiAuthSnapshot = {
-    credential,
-    initialDigest: credentialDigest(sourceBytes),
-  };
-  sourceBytes.fill(0);
+  try {
+    requireUsableKimiCredential(sourceBytes, "Kimi source credential");
+    kimiAuthSnapshot = {
+      credential,
+      initialDigest: credentialDigest(sourceBytes),
+    };
+  } finally {
+    sourceBytes.fill(0);
+  }
 
   fs.mkdirSync(KIMI_HOME, { recursive: true, mode: 0o700 });
   for (const name of [
@@ -351,6 +388,10 @@ function syncKimiAuthState() {
         "Kimi source credential changed during E2E; refusing to overwrite a concurrent login or refresh",
       );
     }
+    requireUsableKimiCredential(
+      isolatedBytes,
+      "rotated Kimi isolated credential",
+    );
 
     const parent = path.dirname(kimiAuthSnapshot.credential);
     const temporary = path.join(
@@ -364,6 +405,20 @@ function syncKimiAuthState() {
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = undefined;
+      requirePrivateRegularCredential(
+        kimiAuthSnapshot.credential,
+        "Kimi source credential confirmation",
+      );
+      const confirmation = fs.readFileSync(kimiAuthSnapshot.credential);
+      try {
+        if (credentialDigest(confirmation) !== kimiAuthSnapshot.initialDigest) {
+          throw new Error(
+            "Kimi source credential changed during E2E; refusing to overwrite a concurrent login or refresh",
+          );
+        }
+      } finally {
+        confirmation.fill(0);
+      }
       fs.renameSync(temporary, kimiAuthSnapshot.credential);
       fs.chmodSync(kimiAuthSnapshot.credential, 0o600);
       const parentFd = fs.openSync(parent, "r");
@@ -417,21 +472,32 @@ function runAuthSyncSelfTest() {
   });
 
   const install = (source, isolated) => {
-    fs.writeFileSync(sourceCredential, source, { mode: 0o600 });
+    const encodedSource = JSON.stringify({
+      access_token: `${source}-access`,
+      refresh_token: `${source}-refresh`,
+      expires_at: 1,
+    });
+    const encodedIsolated = JSON.stringify({
+      access_token: `${isolated}-access`,
+      refresh_token: `${isolated}-refresh`,
+      expires_at: 2,
+    });
+    fs.writeFileSync(sourceCredential, encodedSource, { mode: 0o600 });
     fs.chmodSync(sourceCredential, 0o600);
-    fs.writeFileSync(isolatedCredential, isolated, { mode: 0o600 });
+    fs.writeFileSync(isolatedCredential, encodedIsolated, { mode: 0o600 });
     fs.chmodSync(isolatedCredential, 0o600);
     kimiAuthSnapshot = {
       credential: sourceCredential,
-      initialDigest: credentialDigest(Buffer.from(source)),
+      initialDigest: credentialDigest(Buffer.from(encodedSource)),
     };
+    return { encodedSource, encodedIsolated };
   };
 
-  install("synthetic-initial", "synthetic-rotated");
+  const first = install("synthetic-initial", "synthetic-rotated");
   syncKimiAuthState();
   check(
     "auth-refresh-copyback",
-    fs.readFileSync(sourceCredential, "utf8") === "synthetic-rotated",
+    fs.readFileSync(sourceCredential, "utf8") === first.encodedIsolated,
   );
 
   install("synthetic-second", "synthetic-second-rotated");
@@ -448,6 +514,56 @@ function runAuthSyncSelfTest() {
     refusedConcurrent &&
       fs.readFileSync(sourceCredential, "utf8") === "synthetic-concurrent",
   );
+
+  const loggedOut = install("synthetic-third", "synthetic-third-rotated");
+  fs.writeFileSync(
+    isolatedCredential,
+    JSON.stringify({
+      access_token: "",
+      refresh_token: "",
+      expires_at: 0,
+    }),
+    { mode: 0o600 },
+  );
+  fs.chmodSync(isolatedCredential, 0o600);
+  let refusedLoggedOut = false;
+  try {
+    syncKimiAuthState();
+  } catch (error) {
+    refusedLoggedOut = /logged out or expired/.test(String(error));
+  }
+  check(
+    "auth-refresh-logged-out-state-refused",
+    refusedLoggedOut &&
+      fs.readFileSync(sourceCredential, "utf8") === loggedOut.encodedSource,
+  );
+
+  let refreshOnlyAccepted = true;
+  try {
+    requireUsableKimiCredential(
+      Buffer.from(JSON.stringify({ refresh_token: "synthetic-refresh" })),
+      "synthetic refresh-only credential",
+    );
+  } catch {
+    refreshOnlyAccepted = false;
+  }
+  check("auth-refresh-only-credential-accepted", refreshOnlyAccepted);
+
+  let expiredAccessRefused = false;
+  try {
+    requireUsableKimiCredential(
+      Buffer.from(
+        JSON.stringify({
+          access_token: "synthetic-access",
+          expires_at: 1,
+        }),
+      ),
+      "synthetic expired credential",
+    );
+  } catch (error) {
+    expiredAccessRefused = /logged out or expired/.test(String(error));
+  }
+  check("auth-expired-access-only-state-refused", expiredAccessRefused);
 }
 
 function descendantsOf(rootPid) {
@@ -493,6 +609,39 @@ async function freePort() {
       server.close((error) => (error ? reject(error) : resolve(port)));
     });
   });
+}
+
+async function admitLoopbackClient(port, stateHome, timeoutMs = 30_000) {
+  const tokenPath = path.join(
+    stateHome,
+    "loopback-tokens",
+    `${port}.token`,
+  );
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const stat = fs.lstatSync(tokenPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("token path is not a regular file");
+      }
+      if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+        throw new Error("token file is not private");
+      }
+      const token = fs.readFileSync(tokenPath, "utf8").trim();
+      if (!/^[0-9a-f]{64}$/.test(token)) {
+        throw new Error("token file is malformed");
+      }
+      loopbackTokens.set(port, token);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(50);
+  }
+  throw new Error(
+    `loopback admission token did not appear at ${tokenPath}: ${lastError}`,
+  );
 }
 
 function intendantEnv(stateHome) {
@@ -743,9 +892,18 @@ async function httpJson(port, pathname, options = {}, timeoutMs = 30_000) {
   let lastError;
   while (Date.now() < deadline) {
     try {
+      const headers = { ...(options.headers || {}) };
+      if (
+        loopbackTokens.has(port) &&
+        !Object.keys(headers).some(
+          (name) => name.toLowerCase() === "x-intendant-loopback-token",
+        )
+      ) {
+        headers["x-intendant-loopback-token"] = loopbackTokens.get(port);
+      }
       const response = await fetch(
         `http://127.0.0.1:${port}${pathname}`,
-        options,
+        { ...options, headers },
       );
       const text = await response.text();
       let body;
@@ -860,10 +1018,32 @@ async function pollActiveTools(
     ) {
       return lastResult;
     }
-    await sleep(250);
+    await sleep(750);
   }
   throw new Error(
     `active tools did not converge to ${JSON.stringify(expected)}; last=` +
+      `${lastResult?.message || "none"}`,
+  );
+}
+
+async function pollRegisteredToolName(
+  run,
+  sessionId,
+  predicate,
+  timeoutMs = 30_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastResult;
+  while (Date.now() < deadline) {
+    lastResult = await threadAction(run, sessionId, "tools", {}, 15_000);
+    if (lastResult.success === true) {
+      const match = registeredToolNames(lastResult.message).find(predicate);
+      if (match) return { name: match, result: lastResult };
+    }
+    await sleep(750);
+  }
+  throw new Error(
+    "registered Kimi tool did not appear; last=" +
       `${lastResult?.message || "none"}`,
   );
 }
@@ -1273,8 +1453,10 @@ async function exerciseVaultSigninCeremonyOnIdleDaemon() {
     });
   });
   try {
+    await admitLoopbackClient(port, VAULT_STATE_HOME);
     await exerciseVaultSigninCeremony(port, VAULT_STATE_HOME);
   } finally {
+    loopbackTokens.delete(port);
     if (!exited) child.kill("SIGTERM");
     let result = await Promise.race([
       exitPromise,
@@ -1467,6 +1649,34 @@ async function scenario(run, port, kimiVersion) {
   // Exercise the generated, bearer-authenticated MCP bridge itself. This is
   // intentionally a read-only deterministic tool, but it proves Kimi loaded
   // the scoped server declaration and can reach Intendant through it.
+  //
+  // Discover the concrete collision-renamed tool from Kimi's native inventory
+  // rather than asking the model to infer the generated server suffix. Make it
+  // the only active tool for this turn so a stochastic EnterPlanMode or other
+  // built-in call cannot hide an otherwise healthy MCP bridge.
+  const managedMcp = await pollRegisteredToolName(
+    run,
+    sessionId,
+    (name) =>
+      /^mcp__intendant_managed_[a-f0-9]{8}(?:_\d+)?__list_displays$/.test(
+        name,
+      ),
+  );
+  check(
+    "injected-intendant-mcp-collision-name",
+    !managedMcp.name.startsWith("mcp__intendant__"),
+    managedMcp.name,
+  );
+  await expectAction(run, sessionId, "tools-set", {
+    names: [managedMcp.name],
+  });
+  const mcpOnlyTools = await pollActiveTools(run, sessionId, [managedMcp.name]);
+  check(
+    "injected-intendant-mcp-only-active-tool",
+    sameStrings(activeToolNames(mcpOnlyTools.message), [managedMcp.name]),
+    mcpOnlyTools.message || "",
+  );
+
   const mcpMark = run.mark();
   let mcpApproval = null;
   run.approvalResponder = (event) => {
@@ -1484,8 +1694,9 @@ async function scenario(run, port, kimiVersion) {
     session_id: sessionId,
     direct: true,
     text:
-      "Use the injected Intendant MCP server's list_displays tool exactly " +
-      "once. Do not use Bash or any other tool. After it succeeds, reply " +
+      `Call the exact registered tool named ${managedMcp.name} exactly once. ` +
+      "It is the only active tool; do not enter plan mode or call anything " +
+      "else. After it succeeds, reply " +
       "with exactly INTENDANT_MCP_OK and do nothing else.",
   });
   const mcpToolStart = await run.waitFor(
@@ -1538,6 +1749,7 @@ async function scenario(run, port, kimiVersion) {
       !/denied|forbidden|unauthorized/i.test(mcpToolOutput.stdout || ""),
     `${mcpToolStart.commands_preview || ""} ${(mcpToolOutput.stdout || "").slice(0, 300)}`,
   );
+  await expectAction(run, sessionId, "tools-all");
 
   // Upload one ordinary file and one image through the real dashboard route,
   // then target the live external session with StartTask attachments.
@@ -1571,11 +1783,13 @@ async function scenario(run, port, kimiVersion) {
     action: "start_task",
     session_id: sessionId,
     task:
-      `The attached text file contains a token. Remember both that token and ` +
-      `the conversation codeword ${KEEP_CODEWORD}. The attached image is red. ` +
-      "Use the Write tool (not Bash) to create probe.txt containing exactly " +
-      `${ATTACHMENT_TOKEN}. Then reply with exactly ` +
-      `ATTACHMENT_OK=${ATTACHMENT_TOKEN}; COLOR=red; CODEWORD=${KEEP_CODEWORD}.`,
+      "First call Read exactly once on the attached text file and remember " +
+      "the token you read. Call ReadMediaFile exactly once on the attached " +
+      "image and identify its color; do not infer either value from this " +
+      `instruction. Remember the conversation codeword ${KEEP_CODEWORD}. ` +
+      "Then use Write exactly once (not Bash) to create probe.txt containing " +
+      "exactly the token you read. Reply with exactly ATTACHMENT_OK=<the token " +
+      `you read>; COLOR=<the color you observed>; CODEWORD=${KEEP_CODEWORD}.`,
     direct: true,
     attachments: [`upload:${textUpload.id}`, `upload:${imageUpload.id}`],
   });
@@ -1592,8 +1806,28 @@ async function scenario(run, port, kimiVersion) {
   run.approvalResponder = null;
   check(
     "native-file-and-image-attachments",
-    /red/i.test(responseText(attachmentResponse)),
+    responseText(attachmentResponse).includes(ATTACHMENT_TOKEN) &&
+      /red/i.test(responseText(attachmentResponse)),
     responseText(attachmentResponse).slice(0, 300),
+  );
+  const attachmentToolStarts = run.events
+    .slice(attachmentMark)
+    .filter((event) => event.event === "agent_started")
+    .map((event) => event.commands_preview || "");
+  check(
+    "ordinary-attachment-read-natively",
+    attachmentToolStarts.some(
+      (preview) => /^Read:/i.test(preview) && /e2e-token\.txt/i.test(preview),
+    ),
+    attachmentToolStarts.join(" | ").slice(0, 500),
+  );
+  check(
+    "image-attachment-read-natively",
+    attachmentToolStarts.some(
+      (preview) =>
+        /ReadMediaFile/i.test(preview) && /red-pixel\.png/i.test(preview),
+    ),
+    attachmentToolStarts.join(" | ").slice(0, 500),
   );
   const probePath = path.join(WORKDIR, "probe.txt");
   check(
@@ -2137,14 +2371,20 @@ async function scenario(run, port, kimiVersion) {
     "/api/sessions",
     (body) => {
       const row = sessionRowForId(body, sessionId);
-      return Boolean(
-        row?.kimi_model &&
-          row?.kimi_thinking === expectedKimiThinking &&
-          row?.kimi_permission_mode &&
-          Array.isArray(row?.kimi_allowed_tools),
+      const tools = [...(row?.kimi_allowed_tools || [])]
+        .filter((value) => typeof value === "string")
+        .sort();
+      return (
+        row?.kimi_model === MODEL &&
+        row?.kimi_thinking === expectedKimiThinking &&
+        row?.kimi_permission_mode === "yolo" &&
+        row?.kimi_plan_mode === false &&
+        row?.kimi_swarm_mode === false &&
+        sameStrings(tools, restoredTools)
       );
     },
     60_000,
+    (body) => JSON.stringify(kimiProfileRowsForId(body, sessionId)),
   );
   const parentProfileRow = sessionRowForId(parentProfileSessions, sessionId);
   const parentConfiguredTools = [
@@ -2786,8 +3026,10 @@ async function main() {
   const port = REQUESTED_PORT || (await freePort());
   const run = new IntendantRun(port);
   try {
+    await admitLoopbackClient(port, STATE_HOME);
     await scenario(run, port, version);
   } finally {
+    loopbackTokens.delete(port);
     try {
       await run.stop();
     } finally {

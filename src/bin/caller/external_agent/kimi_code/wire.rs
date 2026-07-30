@@ -1,4 +1,4 @@
-//! Authenticated REST helpers for Kimi server 0.27-0.28's `/api/v1` contract.
+//! Authenticated REST helpers for Kimi server 0.27-0.29's `/api/v1` contract.
 
 use std::collections::HashSet;
 use std::io;

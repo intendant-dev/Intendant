@@ -2,6 +2,17 @@
 
 use super::*;
 
+const MAX_SERVER_INSTANCE_FILES: usize = 256;
+const MAX_SERVER_INSTANCE_BYTES: u64 = 16 * 1024;
+
+#[derive(serde::Deserialize)]
+struct KimiServerInstanceRegistration {
+    pid: u64,
+    host: String,
+    port: u64,
+    started_at: u64,
+}
+
 pub(super) async fn wait_for_server_origin(
     stdout: tokio::process::ChildStdout,
 ) -> Result<(String, BufReader<tokio::process::ChildStdout>), CallerError> {
@@ -30,7 +41,145 @@ pub(super) async fn wait_for_server_origin(
     Ok((origin, reader))
 }
 
-/// Kimi 0.28 removed the 0.27 `server run` entrypoint. Detect only its bounded,
+/// Kimi 0.28+ publishes each foreground web server under its private
+/// `<KIMI_CODE_HOME>/server/instances` registry. Discover the actually-bound
+/// ephemeral port from the entry owned by the exact child we spawned. This is
+/// stronger than parsing the presentation banner (which carries the bearer and
+/// has changed independently of the API) and avoids a reserve/release port
+/// race.
+pub(super) async fn wait_for_registered_server_origin(
+    bridge_home: &Path,
+    baseline: &HashSet<PathBuf>,
+    child_pid: Option<u32>,
+    child: &mut Child,
+) -> Result<String, CallerError> {
+    let child_pid = child_pid.ok_or_else(|| external("Kimi server process has no PID"))?;
+    let instances = bridge_home.join("server").join("instances");
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        ensure_server_child_running(child, "publishing its instance registration")?;
+        if let Some(origin) = registered_server_origin(&instances, baseline, child_pid).await? {
+            return Ok(origin);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(external(
+                "timed out waiting for Kimi server instance registration",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub(super) async fn capture_server_instance_baseline(
+    bridge_home: &Path,
+) -> Result<HashSet<PathBuf>, CallerError> {
+    let instances = bridge_home.join("server").join("instances");
+    let mut entries = match tokio::fs::read_dir(instances).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(_) => return Err(external("failed to inspect Kimi server instance registry")),
+    };
+    let mut baseline = HashSet::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| external("failed to enumerate Kimi server instance registry"))?
+    {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if baseline.len() >= MAX_SERVER_INSTANCE_FILES {
+            return Err(external(
+                "Kimi server instance registry is unreasonably large",
+            ));
+        }
+        baseline.insert(entry.path());
+    }
+    Ok(baseline)
+}
+
+async fn registered_server_origin(
+    instances: &Path,
+    baseline: &HashSet<PathBuf>,
+    child_pid: u32,
+) -> Result<Option<String>, CallerError> {
+    let mut entries = match tokio::fs::read_dir(instances).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(external("failed to inspect Kimi server instance registry")),
+    };
+    let mut seen = 0usize;
+    let mut newest: Option<KimiServerInstanceRegistration> = None;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|_| external("failed to enumerate Kimi server instance registry"))?
+    {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if baseline.contains(&entry.path()) {
+            continue;
+        }
+        seen += 1;
+        if seen > MAX_SERVER_INSTANCE_FILES {
+            return Err(external(
+                "Kimi server instance registry is unreasonably large",
+            ));
+        }
+        let metadata = match tokio::fs::symlink_metadata(entry.path()).await {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(external("failed to inspect Kimi server instance entry")),
+        };
+        if metadata.len() > MAX_SERVER_INSTANCE_BYTES {
+            continue;
+        }
+        let bytes = match tokio::fs::read(entry.path()).await {
+            Ok(bytes) if bytes.len() as u64 <= MAX_SERVER_INSTANCE_BYTES => bytes,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(external("failed to read Kimi server instance entry")),
+        };
+        let Ok(registration) = serde_json::from_slice::<KimiServerInstanceRegistration>(&bytes)
+        else {
+            // Kimi deliberately retains unparseable entries because another
+            // process may own them. They cannot identify our exact child.
+            continue;
+        };
+        if registration.pid != u64::from(child_pid) {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|current| registration.started_at > current.started_at)
+        {
+            newest = Some(registration);
+        }
+    }
+
+    let Some(registration) = newest else {
+        return Ok(None);
+    };
+    if registration.port == 0 {
+        // The initial atomic registry write precedes the listen call; Kimi
+        // rewrites it with the kernel-selected port once binding succeeds.
+        return Ok(None);
+    }
+    if registration.host != "127.0.0.1" {
+        return Err(external(
+            "refusing non-loopback Kimi server instance registration",
+        ));
+    }
+    let port = u16::try_from(registration.port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| external("Kimi server instance registration has an invalid port"))?;
+    Ok(Some(format!("http://127.0.0.1:{port}")))
+}
+
+/// Kimi 0.28+ removed the 0.27 `server run` entrypoint. Detect only its bounded,
 /// post-exit diagnostic and retry the same configured executable with the new
 /// foreground `web --no-open` entrypoint. The captured stderr is never logged:
 /// future Kimi builds may include sensitive startup material there.
@@ -74,9 +223,13 @@ pub(super) fn extract_loopback_origin(line: &str) -> Option<String> {
     None
 }
 
-pub(super) async fn wait_for_server_token(path: &Path) -> Result<String, CallerError> {
+pub(super) async fn wait_for_server_token(
+    path: &Path,
+    child: &mut Child,
+) -> Result<String, CallerError> {
     let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
     loop {
+        ensure_server_child_running(child, "publishing its token file")?;
         match tokio::fs::read_to_string(path).await {
             Ok(token) => {
                 validate_token_permissions(path).await?;
@@ -96,6 +249,38 @@ pub(super) async fn wait_for_server_token(path: &Path) -> Result<String, CallerE
             return Err(external("timed out waiting for Kimi server token file"));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub(super) async fn wait_for_server_health(
+    api: &KimiApi,
+    child: &mut Child,
+) -> Result<(), CallerError> {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        ensure_server_child_running(child, "passing its health check")?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(external("timed out waiting for Kimi server health"));
+        }
+        let attempt_timeout = std::cmp::min(deadline - now, Duration::from_secs(2));
+        if matches!(
+            tokio::time::timeout(attempt_timeout, api.health()).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn ensure_server_child_running(child: &mut Child, phase: &str) -> Result<(), CallerError> {
+    match child.try_wait() {
+        Ok(Some(status)) => Err(external(format!(
+            "Kimi server exited before {phase} ({status})"
+        ))),
+        Ok(None) => Ok(()),
+        Err(_) => Err(external("failed to inspect Kimi server process")),
     }
 }
 
@@ -435,5 +620,84 @@ pub(super) async fn monitor_review_prompt(
             }
         }
         tokio::time::sleep(REVIEW_PROMPT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn write_registration(
+        directory: &Path,
+        name: &str,
+        pid: u64,
+        host: &str,
+        port: u64,
+        started_at: u64,
+    ) {
+        tokio::fs::write(
+            directory.join(name),
+            serde_json::json!({
+                "server_id": name,
+                "pid": pid,
+                "host": host,
+                "port": port,
+                "started_at": started_at,
+                "heartbeat_at": started_at,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registered_origin_is_bound_to_the_newest_exact_child_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let instances = temp.path().join("server").join("instances");
+        tokio::fs::create_dir_all(&instances).await.unwrap();
+        tokio::fs::write(instances.join("malformed.json"), b"{")
+            .await
+            .unwrap();
+        write_registration(&instances, "sibling.json", 41, "127.0.0.1", 49_999, 9_000).await;
+        write_registration(&instances, "stale.json", 42, "127.0.0.1", 41_000, 1_000).await;
+        let baseline = capture_server_instance_baseline(temp.path()).await.unwrap();
+        write_registration(&instances, "current.json", 42, "127.0.0.1", 0, 2_000).await;
+
+        assert_eq!(
+            registered_server_origin(&instances, &baseline, 42)
+                .await
+                .unwrap(),
+            None
+        );
+
+        write_registration(&instances, "current.json", 42, "127.0.0.1", 42_000, 2_000).await;
+        assert_eq!(
+            registered_server_origin(&instances, &baseline, 42)
+                .await
+                .unwrap(),
+            Some("http://127.0.0.1:42000".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_origin_rejects_non_loopback_and_invalid_ports() {
+        let temp = tempfile::tempdir().unwrap();
+        let instances = temp.path().join("instances");
+        tokio::fs::create_dir_all(&instances).await.unwrap();
+        let baseline = HashSet::new();
+        write_registration(&instances, "current.json", 42, "0.0.0.0", 42_000, 2_000).await;
+        assert!(registered_server_origin(&instances, &baseline, 42)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("non-loopback"));
+
+        write_registration(&instances, "current.json", 42, "127.0.0.1", 70_000, 2_000).await;
+        assert!(registered_server_origin(&instances, &baseline, 42)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid port"));
     }
 }

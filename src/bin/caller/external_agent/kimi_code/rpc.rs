@@ -1,11 +1,12 @@
-//! Authenticated helpers for Kimi 0.27-0.28's reflected `/api/v2` agent RPCs.
+//! Authenticated helpers for Kimi 0.27-0.29's reflected agent RPCs.
 //!
 //! Kimi's v1 REST facade intentionally exposes a conservative subset of the
-//! underlying agent services. The bearer-authenticated v2 dispatcher exposes
-//! registered services directly at
-//! `/api/v2/session/{session}/agent/{agent}/{service}/{method}`. Keep that
-//! reflection boundary private here: callers get typed, allowlisted helpers
-//! rather than a user-controlled service or method name.
+//! underlying agent services. Kimi 0.27 exposes its bearer-authenticated
+//! dispatcher at `/api/v2`; 0.28+ moved reflection behind the loopback-only,
+//! opt-in `/api/v1/debug` surface. Keep that boundary private here: callers get
+//! typed, allowlisted helpers rather than a user-controlled service or method
+//! name. The authenticated channel catalog negotiates the small service moves
+//! made by Kimi 0.29 without weakening any capability.
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -17,12 +18,62 @@ use super::wire::{component, external};
 
 const MAIN_AGENT_ID: &str = "main";
 const AGENT_GOAL_SERVICE: &str = "agentGoalService";
+const AGENT_PROMPT_SERVICE: &str = "agentPromptService";
 const AGENT_PROFILE_SERVICE: &str = "agentProfileService";
 const AGENT_RPC_SERVICE: &str = "agentRPCService";
 const MODEL_CATALOG_SERVICE: &str = "modelCatalogService";
+const MODEL_RESOLVER_SERVICE: &str = "modelResolver";
 const KIMI_RPC_RESPONSE_LIMIT: usize = 32 * 1024 * 1024;
 
-/// Native Kimi goal limits. Kimi 0.27-0.28 enforce all three in the goal
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KimiRpcSurface {
+    LegacyV2,
+    DebugV1,
+}
+
+impl KimiRpcSurface {
+    fn base_path(self) -> &'static str {
+        match self {
+            Self::LegacyV2 => "/api/v2",
+            Self::DebugV1 => "/api/v1/debug",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetActiveToolsCall {
+    AgentRpc,
+    ProfileUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearContextCall {
+    AgentRpc,
+    PromptService,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListModelsCall {
+    ModelCatalog,
+    ModelResolver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KimiRpcMethodSet {
+    set_active_tools: SetActiveToolsCall,
+    clear_context: ClearContextCall,
+    list_models: ListModelsCall,
+}
+
+impl KimiRpcMethodSet {
+    const LEGACY: Self = Self {
+        set_active_tools: SetActiveToolsCall::AgentRpc,
+        clear_context: ClearContextCall::AgentRpc,
+        list_models: ListModelsCall::ModelCatalog,
+    };
+}
+
+/// Native Kimi goal limits. Kimi 0.27-0.29 enforce all three in the goal
 /// service; omitted fields leave the corresponding existing limit unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,10 +164,26 @@ pub(crate) struct KimiRpcApi {
     client: reqwest::Client,
     origin: String,
     token: String,
+    surface: KimiRpcSurface,
+    methods: KimiRpcMethodSet,
 }
 
 impl KimiRpcApi {
+    /// Kimi 0.27's always-mounted `/api/v2` surface.
     pub(crate) fn new(origin: String, token: String) -> Result<Self, CallerError> {
+        Self::with_surface(origin, token, KimiRpcSurface::LegacyV2)
+    }
+
+    /// Kimi 0.28+'s opt-in, loopback-only `/api/v1/debug` surface.
+    pub(crate) fn new_debug(origin: String, token: String) -> Result<Self, CallerError> {
+        Self::with_surface(origin, token, KimiRpcSurface::DebugV1)
+    }
+
+    fn with_surface(
+        origin: String,
+        token: String,
+        surface: KimiRpcSurface,
+    ) -> Result<Self, CallerError> {
         let origin = normalize_loopback_origin(&origin)?;
         let client = reqwest::Client::builder()
             // Never send the private loopback bearer or RPC payloads through
@@ -126,62 +193,75 @@ impl KimiRpcApi {
             .timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|error| external(format!("failed to build Kimi v2 HTTP client: {error}")))?;
+            .map_err(|error| external(format!("failed to build Kimi RPC HTTP client: {error}")))?;
         Ok(Self {
             client,
             origin,
             token,
+            surface,
+            methods: KimiRpcMethodSet::LEGACY,
         })
     }
 
-    /// Fail closed when the reflected service surface is not the 0.27-0.28
-    /// shape this adapter was built against.
-    pub(crate) async fn validate_required_methods(&self) -> Result<(), CallerError> {
+    /// Fail closed unless the reflected service surface contains every typed
+    /// operation this adapter uses. Kimi 0.29 kept the semantics but moved
+    /// three operations to their owning domain services, so choose those
+    /// targets from the authenticated catalog rather than from a version
+    /// string.
+    pub(crate) async fn validate_required_methods(&mut self) -> Result<(), CallerError> {
+        let catalog_path = format!("{}/channels", self.surface.base_path());
         let channels = self
-            .request_path(Method::GET, "/api/v2/channels", None, "channels")
+            .request_path(Method::GET, &catalog_path, None, "channels")
             .await?;
         let channels = channels
             .as_array()
-            .ok_or_else(|| external("Kimi /api/v2/channels returned a malformed catalog"))?;
+            .ok_or_else(|| external("Kimi RPC channels returned a malformed catalog"))?;
         for (service, methods) in [
             (
                 AGENT_GOAL_SERVICE,
                 &["getGoal", "markComplete", "setBudgetLimits"][..],
             ),
-            (
-                AGENT_RPC_SERVICE,
-                &["setActiveTools", "getTools", "getContext", "clearContext"][..],
-            ),
+            (AGENT_RPC_SERVICE, &["getTools", "getContext"][..]),
             (AGENT_PROFILE_SERVICE, &["data", "setModel"][..]),
-            (MODEL_CATALOG_SERVICE, &["listModels"][..]),
         ] {
-            let Some(channel) = channels
-                .iter()
-                .find(|channel| channel.get("name").and_then(Value::as_str) == Some(service))
-            else {
-                return Err(external(format!(
-                    "Kimi v2 RPC catalog omitted required service {service}"
-                )));
-            };
-            let advertised = channel
-                .get("methods")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    external(format!(
-                        "Kimi v2 RPC catalog returned malformed methods for {service}"
-                    ))
-                })?;
             for method in methods {
-                if !advertised.iter().any(|candidate| {
-                    candidate.get("name").and_then(Value::as_str) == Some(*method)
-                        && candidate.get("kind").and_then(Value::as_str) == Some("method")
-                }) {
-                    return Err(external(format!(
-                        "Kimi v2 RPC catalog omitted required method {service}.{method}"
-                    )));
-                }
+                require_catalog_method(channels, service, method)?;
             }
         }
+
+        let set_active_tools = if catalog_has_method(channels, AGENT_RPC_SERVICE, "setActiveTools")?
+        {
+            SetActiveToolsCall::AgentRpc
+        } else if catalog_has_method(channels, AGENT_PROFILE_SERVICE, "update")? {
+            SetActiveToolsCall::ProfileUpdate
+        } else {
+            return Err(external(
+                "Kimi RPC catalog omitted an active-tool mutation method",
+            ));
+        };
+        let clear_context = if catalog_has_method(channels, AGENT_RPC_SERVICE, "clearContext")? {
+            ClearContextCall::AgentRpc
+        } else if catalog_has_method(channels, AGENT_PROMPT_SERVICE, "clear")? {
+            // Kimi's former AgentRPC.clearContext delegated to this exact
+            // method, which clears pending/active prompts and model context.
+            ClearContextCall::PromptService
+        } else {
+            return Err(external("Kimi RPC catalog omitted a context-clear method"));
+        };
+        let list_models = if catalog_has_method(channels, MODEL_CATALOG_SERVICE, "listModels")? {
+            ListModelsCall::ModelCatalog
+        } else if catalog_has_method(channels, MODEL_RESOLVER_SERVICE, "listModels")? {
+            ListModelsCall::ModelResolver
+        } else {
+            return Err(external(
+                "Kimi RPC catalog omitted a configured-model listing method",
+            ));
+        };
+        self.methods = KimiRpcMethodSet {
+            set_active_tools,
+            clear_context,
+            list_models,
+        };
         Ok(())
     }
 
@@ -285,15 +365,21 @@ impl KimiRpcApi {
         agent_id: &str,
         names: &[String],
     ) -> Result<(), CallerError> {
-        self.call_agent(
-            session_id,
-            agent_id,
-            AGENT_RPC_SERVICE,
-            "setActiveTools",
-            serde_json::json!({ "names": names }),
-        )
-        .await
-        .and_then(expect_null_rpc_result)
+        let (service, method, argument) = match self.methods.set_active_tools {
+            SetActiveToolsCall::AgentRpc => (
+                AGENT_RPC_SERVICE,
+                "setActiveTools",
+                serde_json::json!({ "names": names }),
+            ),
+            SetActiveToolsCall::ProfileUpdate => (
+                AGENT_PROFILE_SERVICE,
+                "update",
+                serde_json::json!({ "activeToolNames": names }),
+            ),
+        };
+        self.call_agent(session_id, agent_id, service, method, argument)
+            .await
+            .and_then(expect_null_rpc_result)
     }
 
     /// Read the active/inactive state of every registered tool for one agent.
@@ -364,14 +450,15 @@ impl KimiRpcApi {
     /// The catalog lets `/fast` discover a real `*-highspeed` companion for
     /// the current model rather than guessing or silently changing providers.
     pub(crate) async fn models(&self) -> Result<Vec<KimiRpcModel>, CallerError> {
+        let (service, method) = match self.methods.list_models {
+            ListModelsCall::ModelCatalog => (MODEL_CATALOG_SERVICE, "listModels"),
+            ListModelsCall::ModelResolver => (MODEL_RESOLVER_SERVICE, "listModels"),
+        };
         let value = self
-            .call_core(MODEL_CATALOG_SERVICE, "listModels", serde_json::json!([]))
+            .call_core(service, method, serde_json::json!([]))
             .await?;
-        serde_json::from_value(value).map_err(|error| {
-            external(format!(
-                "Kimi modelCatalogService.listModels malformed: {error}"
-            ))
-        })
+        serde_json::from_value(value)
+            .map_err(|error| external(format!("Kimi {service}.{method} malformed: {error}")))
     }
 
     /// Switch one live Kimi agent to an already configured model alias.
@@ -420,15 +507,17 @@ impl KimiRpcApi {
         session_id: &str,
         agent_id: &str,
     ) -> Result<(), CallerError> {
-        self.call_agent(
-            session_id,
-            agent_id,
-            AGENT_RPC_SERVICE,
-            "clearContext",
-            serde_json::json!({}),
-        )
-        .await
-        .and_then(expect_null_rpc_result)
+        let (service, method, argument) = match self.methods.clear_context {
+            ClearContextCall::AgentRpc => {
+                (AGENT_RPC_SERVICE, "clearContext", serde_json::json!({}))
+            }
+            ClearContextCall::PromptService => {
+                (AGENT_PROMPT_SERVICE, "clear", serde_json::json!([]))
+            }
+        };
+        self.call_agent(session_id, agent_id, service, method, argument)
+            .await
+            .and_then(expect_null_rpc_result)
     }
 
     async fn call_agent(
@@ -439,9 +528,10 @@ impl KimiRpcApi {
         method: &'static str,
         argument: Value,
     ) -> Result<Value, CallerError> {
+        let base = self.surface.base_path();
         self.call_path(
             &format!(
-                "/api/v2/session/{}/agent/{}/{}/{}",
+                "{base}/session/{}/agent/{}/{}/{}",
                 component(session_id),
                 component(agent_id),
                 component(service),
@@ -460,8 +550,9 @@ impl KimiRpcApi {
         method: &'static str,
         argument: Value,
     ) -> Result<Value, CallerError> {
+        let base = self.surface.base_path();
         self.call_path(
-            &format!("/api/v2/{}/{}", component(service), component(method)),
+            &format!("{base}/{}/{}", component(service), component(method)),
             service,
             method,
             argument,
@@ -506,8 +597,47 @@ impl KimiRpcApi {
         let response = request
             .send()
             .await
-            .map_err(|error| external(format!("Kimi v2 RPC request failed: {error}")))?;
+            .map_err(|error| external(format!("Kimi RPC request failed: {error}")))?;
         decode_rpc_response(response, operation).await
+    }
+}
+
+fn catalog_has_method(
+    channels: &[Value],
+    service: &str,
+    method: &str,
+) -> Result<bool, CallerError> {
+    let Some(channel) = channels
+        .iter()
+        .find(|channel| channel.get("name").and_then(Value::as_str) == Some(service))
+    else {
+        return Ok(false);
+    };
+    let advertised = channel
+        .get("methods")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            external(format!(
+                "Kimi RPC catalog returned malformed methods for {service}"
+            ))
+        })?;
+    Ok(advertised.iter().any(|candidate| {
+        candidate.get("name").and_then(Value::as_str) == Some(method)
+            && candidate.get("kind").and_then(Value::as_str) == Some("method")
+    }))
+}
+
+fn require_catalog_method(
+    channels: &[Value],
+    service: &str,
+    method: &str,
+) -> Result<(), CallerError> {
+    if catalog_has_method(channels, service, method)? {
+        Ok(())
+    } else {
+        Err(external(format!(
+            "Kimi RPC catalog omitted required method {service}.{method}"
+        )))
     }
 }
 
@@ -529,7 +659,7 @@ async fn decode_rpc_response(
         .is_some_and(|length| length > KIMI_RPC_RESPONSE_LIMIT as u64)
     {
         return Err(external(format!(
-            "Kimi v2 RPC response for {operation} exceeds the {} byte limit",
+            "Kimi RPC response for {operation} exceeds the {} byte limit",
             KIMI_RPC_RESPONSE_LIMIT
         )));
     }
@@ -543,11 +673,11 @@ async fn decode_rpc_response(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| external(format!("failed to read Kimi v2 RPC response: {error}")))?
+        .map_err(|error| external(format!("failed to read Kimi RPC response: {error}")))?
     {
         if bytes.len().saturating_add(chunk.len()) > KIMI_RPC_RESPONSE_LIMIT {
             return Err(external(format!(
-                "Kimi v2 RPC response for {operation} exceeds the {} byte limit",
+                "Kimi RPC response for {operation} exceeds the {} byte limit",
                 KIMI_RPC_RESPONSE_LIMIT
             )));
         }
@@ -555,7 +685,7 @@ async fn decode_rpc_response(
     }
     let envelope: Value = serde_json::from_slice(&bytes).map_err(|error| {
         external(format!(
-            "Kimi v2 RPC returned non-JSON for {operation} (HTTP {status}): {error}"
+            "Kimi RPC returned non-JSON for {operation} (HTTP {status}): {error}"
         ))
     })?;
     if status.is_success() && envelope.get("code").and_then(Value::as_i64) == Some(0) {
@@ -747,13 +877,196 @@ mod tests {
             serde_json::json!({"code": 0, "msg": "success", "data": channels}),
         )
         .await;
-        let api = KimiRpcApi::new(origin, "handshake-token".into()).unwrap();
+        let mut api = KimiRpcApi::new(origin, "handshake-token".into()).unwrap();
         api.validate_required_methods().await.unwrap();
         let request = request.await.unwrap();
         let (line, headers, body) = request_parts(&request);
         assert_eq!(line, "GET /api/v2/channels HTTP/1.1");
         assert!(headers.contains("\r\nauthorization: bearer handshake-token\r\n"));
         assert_eq!(body, Value::Null);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn debug_handshake_keeps_kimi_028_legacy_method_layout() {
+        let channels = serde_json::json!([
+            {
+                "name": "agentGoalService",
+                "methods": [
+                    {"name": "getGoal", "kind": "method"},
+                    {"name": "markComplete", "kind": "method"},
+                    {"name": "setBudgetLimits", "kind": "method"}
+                ]
+            },
+            {
+                "name": "agentRPCService",
+                "methods": [
+                    {"name": "setActiveTools", "kind": "method"},
+                    {"name": "getTools", "kind": "method"},
+                    {"name": "getContext", "kind": "method"},
+                    {"name": "clearContext", "kind": "method"}
+                ]
+            },
+            {
+                "name": "agentProfileService",
+                "methods": [
+                    {"name": "data", "kind": "method"},
+                    {"name": "setModel", "kind": "method"}
+                ]
+            },
+            {
+                "name": "modelCatalogService",
+                "methods": [{"name": "listModels", "kind": "method"}]
+            }
+        ]);
+        let (origin, request, server) = mock_server(
+            "200 OK",
+            serde_json::json!({"code": 0, "msg": "success", "data": channels}),
+        )
+        .await;
+        let mut api = KimiRpcApi::new_debug(origin, "debug-token".into()).unwrap();
+        api.validate_required_methods().await.unwrap();
+        assert_eq!(api.surface, KimiRpcSurface::DebugV1);
+        assert_eq!(api.methods, KimiRpcMethodSet::LEGACY);
+
+        let request = request.await.unwrap();
+        let (line, headers, body) = request_parts(&request);
+        assert_eq!(line, "GET /api/v1/debug/channels HTTP/1.1");
+        assert!(headers.contains("\r\nauthorization: bearer debug-token\r\n"));
+        assert_eq!(body, Value::Null);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn debug_handshake_negotiates_kimi_029_service_moves() {
+        let channels = serde_json::json!([
+            {
+                "name": "agentGoalService",
+                "methods": [
+                    {"name": "getGoal", "kind": "method"},
+                    {"name": "markComplete", "kind": "method"},
+                    {"name": "setBudgetLimits", "kind": "method"}
+                ]
+            },
+            {
+                "name": "agentRPCService",
+                "methods": [
+                    {"name": "getTools", "kind": "method"},
+                    {"name": "getContext", "kind": "method"}
+                ]
+            },
+            {
+                "name": "agentProfileService",
+                "methods": [
+                    {"name": "data", "kind": "method"},
+                    {"name": "setModel", "kind": "method"},
+                    {"name": "update", "kind": "method"}
+                ]
+            },
+            {
+                "name": "agentPromptService",
+                "methods": [{"name": "clear", "kind": "method"}]
+            },
+            {
+                "name": "modelResolver",
+                "methods": [{"name": "listModels", "kind": "method"}]
+            }
+        ]);
+        let (origin, request, server) = mock_server(
+            "200 OK",
+            serde_json::json!({"code": 0, "msg": "success", "data": channels}),
+        )
+        .await;
+        let mut api = KimiRpcApi::new_debug(origin, "debug-token".into()).unwrap();
+        api.validate_required_methods().await.unwrap();
+        assert_eq!(api.surface, KimiRpcSurface::DebugV1);
+        assert_eq!(
+            api.methods,
+            KimiRpcMethodSet {
+                set_active_tools: SetActiveToolsCall::ProfileUpdate,
+                clear_context: ClearContextCall::PromptService,
+                list_models: ListModelsCall::ModelResolver,
+            }
+        );
+
+        let request = request.await.unwrap();
+        let (line, headers, body) = request_parts(&request);
+        assert_eq!(line, "GET /api/v1/debug/channels HTTP/1.1");
+        assert!(headers.contains("\r\nauthorization: bearer debug-token\r\n"));
+        assert_eq!(body, Value::Null);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn kimi_029_replacements_keep_typed_operations_and_debug_scope() {
+        let methods = KimiRpcMethodSet {
+            set_active_tools: SetActiveToolsCall::ProfileUpdate,
+            clear_context: ClearContextCall::PromptService,
+            list_models: ListModelsCall::ModelResolver,
+        };
+
+        let (origin, request, server) = mock_server(
+            "200 OK",
+            serde_json::json!({"code": 0, "msg": "success", "data": null}),
+        )
+        .await;
+        let mut api = KimiRpcApi::new_debug(origin, "token".into()).unwrap();
+        api.methods = methods;
+        api.set_active_tools(
+            "session/x",
+            "agent:a/b",
+            &["Read".to_string(), "Bash".to_string()],
+        )
+        .await
+        .unwrap();
+        let request = request.await.unwrap();
+        let (line, _, body) = request_parts(&request);
+        assert_eq!(
+            line,
+            "POST /api/v1/debug/session/session%2Fx/agent/agent%3Aa%2Fb/agentProfileService/update HTTP/1.1"
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({"activeToolNames": ["Read", "Bash"]})
+        );
+        server.await.unwrap();
+
+        let (origin, request, server) = mock_server(
+            "200 OK",
+            serde_json::json!({"code": 0, "msg": "success", "data": null}),
+        )
+        .await;
+        let mut api = KimiRpcApi::new_debug(origin, "token".into()).unwrap();
+        api.methods = methods;
+        api.clear_context("session-1", "main").await.unwrap();
+        let request = request.await.unwrap();
+        let (line, _, body) = request_parts(&request);
+        assert_eq!(
+            line,
+            "POST /api/v1/debug/session/session-1/agent/main/agentPromptService/clear HTTP/1.1"
+        );
+        assert_eq!(body, serde_json::json!([]));
+        server.await.unwrap();
+
+        let response = serde_json::json!({
+            "code": 0,
+            "msg": "success",
+            "data": [{
+                "provider": "kimi-code",
+                "model": "kimi-code/kimi-for-coding",
+                "display_name": "K2.7 Coding",
+                "max_context_size": 262144
+            }]
+        });
+        let (origin, request, server) = mock_server("200 OK", response).await;
+        let mut api = KimiRpcApi::new_debug(origin, "token".into()).unwrap();
+        api.methods = methods;
+        let models = api.models().await.unwrap();
+        assert_eq!(models[0].model, "kimi-code/kimi-for-coding");
+        let request = request.await.unwrap();
+        let (line, _, body) = request_parts(&request);
+        assert_eq!(line, "POST /api/v1/debug/modelResolver/listModels HTTP/1.1");
+        assert_eq!(body, serde_json::json!([]));
         server.await.unwrap();
     }
 
@@ -793,7 +1106,7 @@ mod tests {
             serde_json::json!({"code": 0, "msg": "success", "data": channels}),
         )
         .await;
-        let api = KimiRpcApi::new(origin, "handshake-token".into()).unwrap();
+        let mut api = KimiRpcApi::new(origin, "handshake-token".into()).unwrap();
         let error = api.validate_required_methods().await.unwrap_err();
         assert!(error.to_string().contains("agentRPCService.getContext"));
         server.await.unwrap();
