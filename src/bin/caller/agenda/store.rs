@@ -267,16 +267,6 @@ impl AgendaStore {
             log_lines: fold.lines,
             ops: fold.ops,
         };
-        // The Q9 gauge: one line per open, so the daemon log carries the
-        // trend that decides whether a fold-snapshot sidecar is ever
-        // worth building (threshold prose: ~250 ms).
-        eprintln!(
-            "[agenda] boot fold: {} ops / {} lines / {} B in {:.1} ms",
-            boot_fold.ops,
-            boot_fold.log_lines,
-            boot_fold.log_bytes,
-            boot_fold.fold_micros as f64 / 1000.0
-        );
         let mut folded_len = bytes.len() as u64;
 
         let mut log = std::fs::File::options()

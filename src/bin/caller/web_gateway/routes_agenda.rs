@@ -15,13 +15,24 @@ use super::*;
 /// (Track AS — the op-log line count, `read_ops`' space), and the
 /// reminder policy (read-only here — mutations ride the Settings-gated
 /// policy route).
+///
+/// `since_seq` (additive, Track AS S2) turns the same shape into a
+/// delta: only items whose last folding op seq is `>= since_seq` ride
+/// `items` — the healing lane for event gaps, reconnects, and foreign
+/// (other-daemon) appends. The BARE call keeps the full-ledger shape
+/// forever (ruling R-AS1); the sibling joins always cover exactly the
+/// served set (Q10), so they shrink with the delta automatically.
 pub(crate) async fn agenda_list_api_response(
+    since_seq: Option<u64>,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let Some(agenda) = agenda_handle(mcp_server).await else {
         return ApiResponse::json_error(503, "agenda unavailable on this daemon");
     };
-    let snapshot = agenda.snapshot();
+    let snapshot = match since_seq {
+        Some(cursor) => agenda.changed_since(cursor),
+        None => agenda.snapshot(),
+    };
     let (items, counts, skipped_lines, seq) = (
         snapshot.items,
         snapshot.counts,
@@ -428,11 +439,13 @@ fn agenda_error_status(err: &crate::agenda::AgendaError) -> u16 {
 
 pub(crate) async fn handle_agenda_list(
     stream: DemuxStream,
+    request_line: &str,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = agenda_list_api_response(mcp_server.as_ref()).await;
+    let since_seq = query_param(request_line, "since_seq").and_then(|v| v.parse().ok());
+    let response = agenda_list_api_response(since_seq, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -666,7 +679,7 @@ mod tests {
             .unwrap();
         agenda.apply(add("open row", "live"), owner).unwrap();
 
-        let body = json_of(&agenda_list_api_response(Some(&server)).await);
+        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
         let items = body["items"].as_array().expect("items array");
         assert_eq!(items.len(), 3, "every item, closed included");
         let served_done = items
@@ -703,6 +716,51 @@ mod tests {
         assert_eq!(body["seq"], 6);
     }
 
+    /// Track AS S2: `since_seq` on the list core (HTTP `?since_seq=` and
+    /// the tunnel twin's `{since_seq}` params both land here) serves the
+    /// same response shape as a delta — changed items only, whole-ledger
+    /// counts, fresh seq — and the sessions join covers exactly the
+    /// served set (Q10). Exactness semantics are pinned at the handle
+    /// (`since_seq_returns_exactly_the_changed_items`); this pins the
+    /// param plumbing and the shape.
+    #[tokio::test]
+    async fn since_seq_param_serves_a_delta_of_the_same_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        agenda
+            .apply(add("before the cursor"), owner.clone())
+            .unwrap();
+        let cursor = json_of(&agenda_list_api_response(None, Some(&server)).await)["seq"]
+            .as_u64()
+            .unwrap();
+        let changed = agenda.apply(add("after the cursor"), owner).unwrap();
+
+        let delta = json_of(&agenda_list_api_response(Some(cursor), Some(&server)).await);
+        let items = delta["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(changed.id));
+        assert_eq!(delta["counts"]["open"], 2, "counts stay whole-ledger");
+        assert_eq!(delta["seq"], cursor + 1);
+        // An at-frontier pull is an empty delta with the same shape.
+        let empty = json_of(&agenda_list_api_response(Some(cursor + 1), Some(&server)).await);
+        assert!(empty["items"].as_array().unwrap().is_empty());
+        assert_eq!(empty["counts"]["open"], 2);
+    }
+
     /// Tier 1 rides the snapshot as a sibling map keyed by served
     /// anchors' locators — items without joined refs produce no key at
     /// all, and the item DTO itself never grows a state field.
@@ -719,7 +777,7 @@ mod tests {
             .unwrap();
         crate::github_pr::join::tier1().update_repo("o/r", &open);
 
-        let body = json_of(&agenda_list_api_response(Some(&server)).await);
+        let body = json_of(&agenda_list_api_response(None, Some(&server)).await);
         let joined = &body["pull_requests"][locator];
         assert_eq!(joined["draft"], true);
         assert_eq!(joined["title"], "live");

@@ -200,7 +200,13 @@ impl IntendantServer {
                 .map_err(|_| format!("unknown status '{s}' (open, done, or retired)"))
             })
             .transpose()?;
-        let snapshot = agenda.snapshot();
+        // Delta first, status second: the two filters compose (a delta
+        // pull may still want only open items). Absent both = the frozen
+        // bare full-ledger shape (ruling R-AS1).
+        let snapshot = match params.since_seq {
+            Some(cursor) => agenda.changed_since(cursor),
+            None => agenda.snapshot(),
+        };
         let (mut items, counts, skipped_lines, seq) = (
             snapshot.items,
             snapshot.counts,
@@ -3420,7 +3426,10 @@ pub(crate) mod tests {
             .unwrap();
 
         let body = server
-            .agenda_list_inner(AgendaListParams { status: None })
+            .agenda_list_inner(AgendaListParams {
+                status: None,
+                since_seq: None,
+            })
             .await
             .expect("bare agenda_list");
         let items = body["items"].as_array().expect("items array");
@@ -3438,6 +3447,73 @@ pub(crate) mod tests {
         assert_eq!(body["counts"]["done"], 1);
         // S1: additive seq cursor on the bare tool response too.
         assert_eq!(body["seq"], 3);
+    }
+
+    /// Track AS S2: MCP `agenda_list`'s `since_seq` is a delta over the
+    /// same shape and composes with `status`. Exactness semantics are
+    /// pinned at the handle; this pins the tool-param plumbing. (The
+    /// bare-lane freeze pin above stays untouched by design — it is the
+    /// R-AS1 tripwire.)
+    #[tokio::test]
+    async fn mcp_agenda_list_since_seq_is_a_delta_and_composes_with_status() {
+        let dir = tempdir().expect("agenda dir");
+        let bus = EventBus::new();
+        let state = test_state();
+        let handle = std::sync::Arc::new(crate::agenda::AgendaHandle::new(
+            crate::agenda::AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        ));
+        state.write().await.agenda = Some(handle.clone());
+        let server = IntendantServer::new(state, bus);
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        handle.apply(add("before"), owner.clone()).unwrap(); // seq 0
+        let after = handle.apply(add("after"), owner.clone()).unwrap(); // seq 1
+        handle
+            .apply(
+                crate::agenda::AgendaCommand::Complete {
+                    id: after.id.clone(),
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap(); // seq 2
+
+        let delta = server
+            .agenda_list_inner(AgendaListParams {
+                status: None,
+                since_seq: Some(1),
+            })
+            .await
+            .expect("delta agenda_list");
+        let items = delta["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], serde_json::json!(after.id));
+        assert_eq!(delta["seq"], 3);
+        let composed = server
+            .agenda_list_inner(AgendaListParams {
+                status: Some("open".into()),
+                since_seq: Some(1),
+            })
+            .await
+            .expect("composed filters");
+        assert!(
+            composed["items"].as_array().unwrap().is_empty(),
+            "status=open composes with the delta: the changed item is done"
+        );
     }
 
     pub(crate) fn test_state_with_log_dir(log_dir: std::path::PathBuf) -> SharedMcpState {

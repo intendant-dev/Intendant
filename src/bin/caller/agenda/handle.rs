@@ -117,6 +117,15 @@ impl AgendaHandle {
         &self.dir
     }
 
+    /// The boot-fold gauge the store recorded when it opened (design
+    /// gate Q9): fold duration + log size/lines/ops. The daemon wiring
+    /// logs it once per boot; the trend line decides whether a
+    /// fold-snapshot sidecar (S9, unscheduled) ever becomes worth
+    /// building.
+    pub(crate) fn boot_fold_vital(&self) -> super::store::AgendaFoldVital {
+        self.lock().boot_fold_vital()
+    }
+
     pub(crate) fn bus(&self) -> &EventBus {
         &self.bus
     }
@@ -746,6 +755,61 @@ impl AgendaHandle {
             )
         };
         self.decorate_items(&mut items);
+        AgendaSnapshot {
+            items,
+            counts,
+            skipped_lines,
+            seq,
+        }
+    }
+
+    /// Delta read (Track AS S2): every item whose last folding op seq is
+    /// `>= since_seq`, plus full counts and the fold's frontier seq —
+    /// complete because items only ever change by ops, so a client that
+    /// upserts the returned items over a snapshot taken at `since_seq`
+    /// holds the same fold state a fresh full snapshot would give it.
+    ///
+    /// Two honest limits, both ruled (Q4/R-AS4): decorations are
+    /// read-time values — this refreshes them only on RETURNED items;
+    /// untouched items' decorations age exactly as they do between any
+    /// two reads today. And the filter is fold-state grain: items are
+    /// decorated against the FULL fold before filtering (a subset
+    /// context starves cross-item decorations — the #649 lesson), but
+    /// an item whose only change is another item's op (a watcher armed
+    /// elsewhere) is NOT returned — `watched_by` freshness rides lens
+    /// interaction re-pulls, never this lane.
+    ///
+    /// A cursor from the future (`since_seq > seq`: a shrunk/tampered
+    /// log, or a cursor minted by a longer foreign log this daemon has
+    /// not converged with) serves the FULL set — resync is the honest
+    /// repair when the cursor space itself is in doubt.
+    pub(crate) fn changed_since(&self, since_seq: u64) -> AgendaSnapshot {
+        let (mut items, counts, skipped_lines, seq, seq_by_id) = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before read failed: {err}");
+            }
+            let items = store.snapshot();
+            let seq_by_id: std::collections::HashMap<String, u64> = items
+                .iter()
+                .filter_map(|item| store.item_seq(&item.id).map(|seq| (item.id.clone(), seq)))
+                .collect();
+            (
+                items,
+                store.counts(),
+                store.skipped_lines(),
+                store.seq(),
+                seq_by_id,
+            )
+        };
+        self.decorate_items(&mut items);
+        if since_seq <= seq {
+            // Missing map entries (unreachable by construction — every
+            // folded item got there via an op that recorded its seq)
+            // INCLUDE rather than drop: this is a healing lane, and
+            // over-returning is safe where under-returning loses data.
+            items.retain(|item| seq_by_id.get(&item.id).copied().unwrap_or(u64::MAX) >= since_seq);
+        }
         AgendaSnapshot {
             items,
             counts,
@@ -1586,6 +1650,88 @@ mod tests {
         );
         assert_eq!(snapshot.counts.open, 1);
         assert_eq!(snapshot.counts.done, 1);
+    }
+
+    /// Track AS S2 pin (ruling R-AS4): a `since_seq` delta returns
+    /// exactly the items changed by ops at or after the cursor —
+    /// including changes another daemon appended to the shared log
+    /// (converged by `refresh_if_stale`, no broadcast ever fired here) —
+    /// and nothing else. At the frontier the delta is empty; a cursor
+    /// from the future serves the full set (resync as honest repair).
+    #[test]
+    fn since_seq_returns_exactly_the_changed_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
+        let owner = Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: None,
+        });
+        let add = |title: &str| AgendaCommand::Add {
+            refs: Vec::new(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+        };
+        let untouched = handle.apply(add("untouched"), owner.clone()).unwrap(); // seq 0
+        let touched = handle.apply(add("touched later"), owner.clone()).unwrap(); // seq 1
+        let cursor = handle.snapshot().seq; // 2 — the client is current here
+        handle
+            .apply(
+                AgendaCommand::Annotate {
+                    id: touched.id.clone(),
+                    text: "changed after the cursor".into(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap(); // seq 2
+
+        let delta = handle.changed_since(cursor);
+        assert_eq!(delta.seq, 3);
+        assert_eq!(
+            delta
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![touched.id.as_str()],
+            "exactly the changed item — the untouched one stays home"
+        );
+        assert_eq!(delta.counts.open, 2, "counts stay whole-ledger");
+
+        // Foreign-append leg: another daemon on the same home appends;
+        // no local broadcast fires, but the delta pull heals it because
+        // seq is a property of the shared file, not the process.
+        let foreign_handle =
+            AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let foreign = foreign_handle.apply(add("foreign"), owner).unwrap(); // seq 3
+
+        let healed = handle.changed_since(delta.seq);
+        assert_eq!(healed.seq, 4);
+        assert_eq!(
+            healed
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![foreign.id.as_str()],
+            "the foreign append is exactly what the delta returns"
+        );
+
+        // Current cursor → empty delta; future cursor → full resync.
+        assert!(handle.changed_since(healed.seq).items.is_empty());
+        let resync = handle.changed_since(healed.seq + 100);
+        assert_eq!(resync.items.len(), 3);
+        assert!(resync.items.iter().any(|item| item.id == untouched.id));
     }
 
     /// The sealed-serving pin (Track AW slice 2): the read lane serves
