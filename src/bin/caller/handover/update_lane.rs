@@ -232,8 +232,18 @@ pub(crate) fn fold_source_check(
         tip_sha,
         behind,
         behind_capped: behind >= BEHIND_COUNT_CAP,
-        dirty: !status_porcelain.trim().is_empty(),
+        dirty: tracked_dirty(status_porcelain),
     })
+}
+
+/// TRACKED modifications only (`git status --porcelain` lines whose
+/// status is not `??`): untracked files — a checkout's `target/`,
+/// scratch notes — never block a fast-forward pull, and a genuine
+/// path collision fails the pull child itself with git's own words.
+pub(crate) fn tracked_dirty(status_porcelain: &str) -> bool {
+    status_porcelain
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.starts_with("??"))
 }
 
 /// Is the latest logged release newer than the running package version?
@@ -993,10 +1003,10 @@ impl UpdateLane {
 
         self.set_phase("pull");
         let status = self.git(repo_root, &["status", "--porcelain"]).await?;
-        if !status.trim().is_empty() {
+        if tracked_dirty(&status) {
             return Err(
-                "the checkout has local changes — not pulling over them; commit or stash by \
-                 hand, then retry"
+                "the checkout has local changes to tracked files — not pulling over them; \
+                 commit or stash by hand, then retry"
                     .to_string(),
             );
         }
@@ -1409,19 +1419,24 @@ mod tests {
 
     /// Commission pin: the behind-main compare folds the bounded git
     /// observations — tip, capped count, dirtiness — and refuses
-    /// unparseable output instead of guessing.
+    /// unparseable output instead of guessing. Dirty means TRACKED
+    /// modifications: an untracked `target/` or scratch file never
+    /// blocks the lane.
     #[test]
     fn source_compare_folds_bounded_git_observations() {
-        let check = fold_source_check("3e4c79f8aa", "3\n", "").expect("clean fold");
+        let check = fold_source_check("3e4c79f8aa", "3\n", "?? target/\n?? notes.txt\n")
+            .expect("clean fold");
         assert_eq!(check.tip_sha, "3e4c79f8aa");
         assert_eq!(check.behind, 3);
         assert!(!check.behind_capped);
-        assert!(!check.dirty);
+        assert!(!check.dirty, "untracked files are not dirtiness");
 
-        let capped = fold_source_check("abcdef012345", "500\n", " M src/main.rs\n").unwrap();
+        let capped =
+            fold_source_check("abcdef012345", "500\n", "?? target/\n M src/main.rs\n").unwrap();
         assert_eq!(capped.behind, BEHIND_COUNT_CAP);
         assert!(capped.behind_capped, "cap reached reads as 500+");
-        assert!(capped.dirty);
+        assert!(capped.dirty, "a tracked modification is");
+        assert!(tracked_dirty("A  staged.rs\n"), "staged changes count too");
 
         assert!(fold_source_check("fatal: bad revision", "0", "").is_err());
         assert!(fold_source_check("abcdef012345", "many", "").is_err());

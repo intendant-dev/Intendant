@@ -7141,6 +7141,7 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
         &["clone", origin.to_str().expect("utf8"), "checkout"],
     );
     std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").expect("seed Cargo.toml");
+    std::fs::write(checkout.join(".gitignore"), "/target\n").expect("seed gitignore");
     std::fs::create_dir_all(checkout.join("scripts")).expect("seed scripts dir");
     std::fs::write(
         checkout.join("scripts").join("bundle-macos.sh"),
