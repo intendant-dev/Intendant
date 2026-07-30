@@ -1152,7 +1152,12 @@ function hideDoneSessionWindows() {
 function sessionWindowClosableClaim(claim = {}) {
   const stop = typeof claim.stop === 'string' ? claim.stop : '';
   if (stop === 'kills_live_run' || stop === 'owed_work') return false;
-  const quiet = !!claim.hardDone || normalizeSessionPhase(claim.phase || '') === 'idle';
+  // An ABSENT phase is no claim (normalizeSessionPhase defaults '' to
+  // 'idle', which would read wider than the ×'s raw win.phase === 'idle'
+  // check — positive-only forbids that): a phase-less window is quiet
+  // only on hard done evidence.
+  const quiet = !!claim.hardDone
+    || (!!claim.phase && normalizeSessionPhase(claim.phase) === 'idle');
   if (stop === 'settled') return quiet;
   if (stop || claim.linked) return false;
   return quiet;

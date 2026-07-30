@@ -43,6 +43,7 @@ node scripts/validate-dashboard.cjs --launch-dashboard --port 8931 \
     thinkingSuppressed: c({phase:'thinking'}) === false,
     hardDoneLinkless: c({hardDone:true}) === true,
     unknownClaim: c({stop:'someday_new_claim'}) === false,
+    phaselessClaimsNothing: c({}) === false && c({phase:''}) === false,
   }; })()" \
   --probe-json "lens=(() => { const sw = window.qa.sessionWindowSweeps, L = window.qa.closableLens;
     const mk = (sid, meta) => { sw.build(sid, meta); sw.build(sid, meta); };
