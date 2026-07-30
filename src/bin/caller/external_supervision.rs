@@ -2267,6 +2267,7 @@ mod tests {
         let parked = Some(LimitParkState {
             resume_at: now + Duration::from_secs(10 * 60),
             pending: None,
+            kind: ParkKind::ProviderLimit,
         });
 
         let deferral = compact_deferred_by_limit_park("compact", &parked, now, 1_000)
@@ -2276,6 +2277,20 @@ mod tests {
             "deferral: {deferral}"
         );
         assert!(deferral.contains("in ~10m"), "deferral: {deferral}");
+
+        // A service-condition park defers the same compact with its own
+        // honest wording (never "rate-limited").
+        let error_parked = Some(LimitParkState {
+            resume_at: now + Duration::from_secs(120),
+            pending: None,
+            kind: ParkKind::ServiceCondition,
+        });
+        let deferral = compact_deferred_by_limit_park("compact", &error_parked, now, 1_000)
+            .expect("error-parked compact must defer");
+        assert!(
+            deferral.starts_with("Compaction deferred — waiting out a service condition"),
+            "deferral: {deferral}"
+        );
 
         // Not a compact: the park does not block other thread actions here.
         assert_eq!(
