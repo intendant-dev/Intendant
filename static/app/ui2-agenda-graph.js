@@ -59,6 +59,38 @@ let agendaGraphChosen = null; // null = auto ('hubs' past the cap, else 'all')
 let agendaGraphTerritory = false;
 let agendaGraphSubtreeTerr = new Map();
 let agendaGraphTerrStats = { shown: 0, total: 0 };
+let agendaGraphFullscreen = false;
+let agendaGraphEscHook = null;
+
+// Theater-mode fullscreen: CSS-only (`position: fixed` on the panel) —
+// the packaged app's WKWebView does not reliably grant the
+// element-fullscreen API, and the CSS route behaves identically on
+// every frontend. The draw loop re-measures the canvas per frame, so
+// no canvas code changes; the wire pass re-applies the state across
+// re-renders. ESC exits (deferring to overlays that already consumed
+// the key).
+function agendaGraphSetFullscreen(on) {
+  agendaGraphFullscreen = on;
+  if (!on) agendaGraphRemoveEsc();
+  agendaRenderTab();
+}
+
+function agendaGraphEnsureEsc() {
+  if (agendaGraphEscHook) return;
+  agendaGraphEscHook = (e) => {
+    if (e.key === 'Escape' && !e.defaultPrevented) {
+      agendaGraphSetFullscreen(false);
+    }
+  };
+  document.addEventListener('keydown', agendaGraphEscHook);
+}
+
+function agendaGraphRemoveEsc() {
+  if (agendaGraphEscHook) {
+    document.removeEventListener('keydown', agendaGraphEscHook);
+    agendaGraphEscHook = null;
+  }
+}
 let agendaGraphMouse = { x: -1e4, y: -1e4, down: false, moved: 0 };
 let agendaGraphHover = null;
 let agendaGraphPalCache = null;
@@ -142,6 +174,7 @@ function agendaGraphRenderLens(host) {
     }
   }
   if (!items.length) {
+    agendaGraphFullscreen = false;
     agendaGraphTeardown();
     host.innerHTML = `<div class="ag2-empty">
       <div class="ag2-empty-glyph">◍</div>
@@ -152,7 +185,9 @@ function agendaGraphRenderLens(host) {
   }
   if (!overCapAll && items.length > AGENDA_GRAPH_NODE_CAP) {
     // A focused subtree past the cap has no cheaper projection to
-    // degrade to — the flat refusal names the way out.
+    // degrade to — the flat refusal names the way out (and drops any
+    // fullscreen so the refusal never fills the window).
+    agendaGraphFullscreen = false;
     agendaGraphTeardown();
     host.innerHTML = `<div class="ag2-graph-panel empty">
       <div class="ag2-empty">
@@ -181,6 +216,10 @@ function agendaGraphRenderLens(host) {
 // and the hint line. Static strings only — no item text ever lands in
 // this markup (the painted badge carries titles as inert pixels).
 function agendaGraphWireChrome(host, overCapAll) {
+  const panel = host.querySelector('.ag2-graph-panel');
+  if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  if (agendaGraphFullscreen) agendaGraphEnsureEsc();
+  else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
   if (hintLine) {
     hintLine.textContent = overCapAll
@@ -237,6 +276,16 @@ function agendaGraphWireChrome(host, overCapAll) {
         agendaGraphFocus = null;
         agendaRenderTab();
       };
+    } else if (kind === 'full') {
+      chip.textContent = agendaGraphFullscreen ? '✕ exit full' : '⛶ full';
+      chip.classList.toggle('active', agendaGraphFullscreen);
+      chip.disabled = false;
+      chip.title = agendaGraphFullscreen
+        ? 'exit fullscreen (esc works too)'
+        : 'fill the window with the map';
+      chip.onclick = () => {
+        agendaGraphSetFullscreen(!agendaGraphFullscreen);
+      };
     }
   });
 }
@@ -261,6 +310,7 @@ function agendaGraphPanelHtml() {
       <button type="button" class="ag2-graph-projchip" data-proj="all">everything</button>
       <button type="button" class="ag2-graph-projchip" data-proj="terr">territory</button>
       <button type="button" class="ag2-graph-projchip" data-proj="clearfocus" hidden>focused ✕</button>
+      <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
     </div>
     <div class="ag2-graph-capnote" id="ag2-graph-capnote" hidden>
       past the ${AGENDA_GRAPH_NODE_CAP}-node cap — the hubs projection or a focused hub keeps the map legible
@@ -442,6 +492,7 @@ function agendaGraphTeardown() {
     agendaGraphPaneObserver = null;
   }
   agendaGraphUnbindCanvas();
+  agendaGraphRemoveEsc();
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
