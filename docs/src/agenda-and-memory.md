@@ -314,17 +314,28 @@ terminal occurrences, mid-turn interruptions, and limit-parked wrappers
 with pending work — under fresh wrappers with a continuation nudge, on the
 automatic resume lane (owner-stopped and retired lineages refuse; a live
 successor is never doubled; suspended series stay down; only the lease
-holder readopts). The scheduler watches each fail-closed occurrence's
-durable resume lineage for a bounded window: when a successor is admitted
-(the readopt pass's, or a manual post-crash resume), it journals a fresh
-`started` row naming the successor — a later `started` **re-opens** a
-terminaled occurrence in the fold — re-arming the item's no-overlap hold
-and letting the successor's terminal close the occurrence normally. Each
-crash cycle still costs one `unknown` on the effect's failure streak until
-a completion resets it, so a crash-looping series suspends and the readopt
-pass respects the suspension — the existing streak law is the crash-loop
+holder readopts). Dispatches are not outcomes: an admitted successor in
+the lineage is evaluated, never trusted as terminal — a live tip refuses
+the resume, a concluded tip ends the lineage, and a tip that itself died
+mid-work (a signal shutdown marks open mid-turn sessions `interrupted`,
+and that marker survives the killed wrapper's own teardown) leaves the
+lineage re-eligible: the pass resumes the tip's newest conversation
+instead of skipping the original as "already continued". Each dispatched
+resume is verified after a short window and reclassified honestly if the
+continuation died on arrival. The scheduler watches each fail-closed
+occurrence's durable resume lineage for a bounded window: when a
+successor is admitted (the readopt pass's, or a manual post-crash
+resume), it journals a fresh `started` row naming the successor — a later
+`started` **re-opens** a terminaled occurrence in the fold — re-arming
+the item's no-overlap hold and letting the successor's terminal close the
+occurrence normally. Each crash cycle still costs one `unknown` on the
+effect's failure streak until a completion resets it, so a crash-looping
+series suspends and the readopt pass respects the suspension across the
+whole lineage (a suspended series' dead continuation is never stood back
+up through its own candidacy) — the existing streak law is the crash-loop
 brake. The pass is visible: one summary notification per boot with
-anything mid-work, naming what was resumed and what was left dead and why.
+anything mid-work, reporting confirmed-alive, died-after-dispatch, and
+left-dead separately, with reasons.
 
 ### Scheduled sessions
 

@@ -31,6 +31,11 @@ protocol BackendSupervisorDelegate: AnyObject {
     /// alive and health checks run (the app layer uses it for dashboard
     /// idle-unload).
     func backendSupervisorHealthTick(_ supervisor: BackendSupervisor)
+    /// A one-click update swap promoted a successor child on `newPort`
+    /// (HS6/P3): the app layer re-points the scheme handler, injected
+    /// scripts, and webview. Deliberately NOT a `didChangeState` screen —
+    /// the working dashboard must never be painted over mid-swap.
+    func backendSupervisor(_ supervisor: BackendSupervisor, didSwapToPort newPort: Int)
 }
 
 /// Supervises the bundled Rust daemon: spawn, readiness polling, health
@@ -48,14 +53,24 @@ final class BackendSupervisor {
     weak var delegate: BackendSupervisorDelegate?
 
     private let binaryPath: String
-    private let arguments: [String]
-    private let port: Int
+    /// Arguments WITHOUT the `--web <port>` pair — composed per spawn, so
+    /// an update swap can launch the successor on a fresh port with the
+    /// same policy args.
+    private let baseArguments: [String]
+    /// The port the CURRENT backend serves; flips at update-swap promote.
+    private(set) var port: Int
     private let scheme: String
     /// Trust-configured session shared with the app layer (pins the
     /// installed access server cert / presents the mTLS client identity).
     private let session: URLSession
 
     private var backendProcess: Process?
+    /// The swapped-out predecessor, draining toward its own exit (HS6/P3).
+    /// The swap NEVER terminates it — it serves its in-flight sessions and
+    /// exits at the last one (`app_supervisor_one_click_swaps_without_kill`);
+    /// only app quit tears it down along with everything else.
+    private var drainingProcess: Process?
+    private var swapInFlight = false
     private var healthTimer: Timer?
     private var healthProbeFailures = 0
     // Backend auto-restart: exponential backoff on abnormal exits, reset
@@ -72,9 +87,9 @@ final class BackendSupervisor {
     /// Rotate `app-backend.log` at launch once it exceeds this many bytes.
     private static let maxLogBytes: UInt64 = 10 * 1024 * 1024
 
-    init(binaryPath: String, arguments: [String], port: Int, scheme: String, session: URLSession) {
+    init(binaryPath: String, baseArguments: [String], port: Int, scheme: String, session: URLSession) {
         self.binaryPath = binaryPath
-        self.arguments = arguments
+        self.baseArguments = baseArguments
         self.port = port
         self.scheme = scheme
         self.session = session
@@ -86,14 +101,34 @@ final class BackendSupervisor {
     /// launchd), wiring stdout/stderr into the append-mode backend log.
     @discardableResult
     func startBackend() -> Bool {
+        guard let process = spawnChild(onPort: port) else { return false }
+        backendProcess = process
+        backendLastStart = Date()
+        // React to backend death immediately (the 5s health tick stays
+        // as the belt for a missed handler). Remote dashboards have no
+        // crash screen — without a restart this machine just goes dark.
+        process.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                self?.backendDidExit(proc)
+            }
+        }
+        NSLog("Started intendant-bin (PID \(process.processIdentifier)) on port \(port)")
+        return true
+    }
+
+    /// Spawn one daemon child on `childPort` (shared by the normal boot
+    /// and the update swap's successor): environment, working directory,
+    /// and the append-mode backend log, but NO lifecycle wiring — the
+    /// caller owns handlers and slots.
+    private func spawnChild(onPort childPort: Int) -> Process? {
         guard FileManager.default.fileExists(atPath: binaryPath) else {
             NSLog("intendant-bin not found at \(binaryPath)")
-            return false
+            return nil
         }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binaryPath)
-        process.arguments = arguments
+        process.arguments = ["--web", String(childPort)] + baseArguments
 
         // Inherit environment + ensure Homebrew PATH
         var env = ProcessInfo.processInfo.environment
@@ -139,22 +174,144 @@ final class BackendSupervisor {
 
         do {
             try process.run()
-            backendProcess = process
-            backendLastStart = Date()
-            // React to backend death immediately (the 5s health tick stays
-            // as the belt for a missed handler). Remote dashboards have no
-            // crash screen — without a restart this machine just goes dark.
-            process.terminationHandler = { [weak self] proc in
-                DispatchQueue.main.async {
-                    self?.backendDidExit(proc)
-                }
-            }
-            NSLog("Started intendant-bin (PID \(process.processIdentifier)) on port \(port)")
-            return true
+            return process
         } catch {
             NSLog("Failed to start intendant-bin: \(error)")
-            return false
+            return nil
         }
+    }
+
+    // MARK: - One-click update swap (HS6/P3)
+
+    /// One-click update (the owner directive on HS6): spawn a SECOND
+    /// child from the (updated) on-disk binary on `newPort`, poll
+    /// readiness THERE, and only once the successor answers: promote it,
+    /// ask the predecessor to drain (the HS3 takeover lane on its own
+    /// port), and report `didSwapToPort` so the app layer re-points the
+    /// webview. Ordering is the intake sketch's — spawn → readiness →
+    /// swap → drain — so a successor that never comes up is simply
+    /// terminated (it acquired nothing and drained nothing) and the
+    /// running daemon is left exactly as it was; the predecessor is
+    /// NEVER terminated by the swap — it serves its in-flight sessions
+    /// and exits on its own at the last one.
+    func beginUpdateSwap(newPort: Int, completion: @escaping (Bool, String) -> Void) {
+        guard !swapInFlight else {
+            completion(false, "an update swap is already in flight")
+            return
+        }
+        guard let old = backendProcess, old.isRunning else {
+            completion(false, "no running backend to swap from")
+            return
+        }
+        guard let successor = spawnChild(onPort: newPort) else {
+            completion(false, "could not start the new daemon — see ~/.intendant/app-backend.log")
+            return
+        }
+        swapInFlight = true
+        NSLog("Update swap: successor spawned (PID \(successor.processIdentifier)) on port \(newPort)")
+        pollSwapReadiness(successor: successor, newPort: newPort, attempts: 0, completion: completion)
+    }
+
+    private func pollSwapReadiness(successor: Process, newPort: Int, attempts: Int,
+                                   completion: @escaping (Bool, String) -> Void) {
+        // A successor that died mid-boot (the broken-new-binary case)
+        // fails the swap fast and leaves the running daemon untouched.
+        if !successor.isRunning {
+            finishFailedSwap(successor: successor, completion: completion,
+                             detail: "the new daemon exited during startup — the running daemon is untouched (see ~/.intendant/app-backend.log)")
+            return
+        }
+        if attempts > 30 {
+            finishFailedSwap(successor: successor, completion: completion,
+                             detail: "the new daemon never became ready — the running daemon is untouched (see ~/.intendant/app-backend.log)")
+            return
+        }
+        var request = URLRequest(url: URL(string: "\(scheme)://127.0.0.1:\(newPort)/")!, timeoutInterval: 1)
+        request.httpMethod = "HEAD"
+        session.dataTask(with: request) { _, response, _ in
+            DispatchQueue.main.async {
+                if let http = response as? HTTPURLResponse, http.statusCode == 200 {
+                    self.promoteSuccessor(successor, newPort: newPort, completion: completion)
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.pollSwapReadiness(successor: successor, newPort: newPort,
+                                               attempts: attempts + 1, completion: completion)
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    /// The successor answered: swap roles, then ask the predecessor to
+    /// drain. The predecessor keeps running (never terminated here) with
+    /// a log-only exit handler — its clean drain exit must paint no
+    /// crash/stopped screen and schedule no restart.
+    private func promoteSuccessor(_ successor: Process, newPort: Int,
+                                  completion: @escaping (Bool, String) -> Void) {
+        guard swapInFlight else { return }
+        swapInFlight = false
+        let oldPort = port
+        if let old = backendProcess {
+            old.terminationHandler = { [weak self] proc in
+                DispatchQueue.main.async {
+                    NSLog("Drained predecessor exited (status \(proc.terminationStatus))")
+                    self?.writeExitMarker(status: proc.terminationStatus,
+                                          signalled: proc.terminationReason == .uncaughtSignal)
+                    if self?.drainingProcess === proc {
+                        self?.drainingProcess = nil
+                    }
+                }
+            }
+            drainingProcess = old
+        }
+        backendProcess = successor
+        port = newPort
+        backendLastStart = Date()
+        backendRestartAttempts = 0
+        healthProbeFailures = 0
+        successor.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                self?.backendDidExit(proc)
+            }
+        }
+        startHealthCheck()
+        NSLog("Update swap: promoted successor on port \(newPort); asking :\(oldPort) to drain")
+        requestDrain(ofPort: oldPort)
+        delegate?.backendSupervisor(self, didSwapToPort: newPort)
+        completion(true, "")
+    }
+
+    private func finishFailedSwap(successor: Process, completion: @escaping (Bool, String) -> Void,
+                                  detail: String) {
+        swapInFlight = false
+        successor.terminationHandler = nil
+        if successor.isRunning {
+            // The successor acquired nothing and drained nothing — a
+            // plain secondary; terminating it is clean recovery.
+            successor.terminate()
+        }
+        NSLog("Update swap failed: \(detail)")
+        completion(false, detail)
+    }
+
+    /// The HS3 takeover lane against the predecessor's own port: ask it
+    /// to drain so the promoted successor's lease poll acquires. Rides
+    /// the same per-port loopback admission token every owner surface
+    /// uses; the request is logged, never fatal — the drain banner and
+    /// the Q4 successor watch carry the story from here.
+    private func requestDrain(ofPort oldPort: Int) {
+        guard let url = URL(string: "\(scheme)://127.0.0.1:\(oldPort)/api/daemon/takeover") else { return }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = loopbackAdmissionToken(port: oldPort), !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "x-intendant-loopback-token")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["requested_by": "app update swap"])
+        session.dataTask(with: request) { _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            NSLog("Update swap: drain request to :\(oldPort) answered \(status)\(error.map { " error: \($0.localizedDescription)" } ?? "")")
+        }.resume()
     }
 
     /// Manual (crash-screen Restart button) or auto-restart-timer restart:
@@ -177,21 +334,26 @@ final class BackendSupervisor {
         return started
     }
 
-    /// Quit teardown: kill the child on purpose without letting the exit
-    /// handler paint a crash screen or schedule a restart mid-teardown.
+    /// Quit teardown: kill the children on purpose without letting exit
+    /// handlers paint a crash screen or schedule a restart mid-teardown.
+    /// Quit is the explicit "stop everything" gesture, so a mid-drain
+    /// predecessor goes down with the promoted successor.
     func shutdown() {
         isTerminating = true
         backendAutoRestartTimer?.invalidate()
         healthTimer?.invalidate()
-        guard let proc = backendProcess, proc.isRunning else { return }
-        proc.terminationHandler = nil
-        proc.terminate()
+        let children = [backendProcess, drainingProcess].compactMap { $0 }.filter { $0.isRunning }
+        guard !children.isEmpty else { return }
+        for proc in children {
+            proc.terminationHandler = nil
+            proc.terminate()
+        }
         // Wait up to 3 seconds, then force-kill to avoid hanging on quit
         let deadline = Date().addingTimeInterval(3.0)
-        while proc.isRunning && Date() < deadline {
+        while children.contains(where: { $0.isRunning }) && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.1)
         }
-        if proc.isRunning {
+        for proc in children where proc.isRunning {
             kill(proc.processIdentifier, SIGKILL)
         }
     }

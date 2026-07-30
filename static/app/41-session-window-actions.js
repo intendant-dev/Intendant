@@ -520,6 +520,18 @@ function ensureSessionWindow(sessionId, meta = {}) {
 // only for live sessions; an ended session's stale vitals claim nothing.
 function sessionWindowPhaseDisplayLabel(sessionId, phase) {
   const p = normalizeSessionPhase(phase);
+  // A corpse never advertises activity: when the served boot block says
+  // ghost, the pill states the terminal fact however stale the frozen
+  // phase was (the 2026-07-29 census: five dead readopt-lineage cards
+  // wearing "Running Agent"). Display-only — phase state is untouched.
+  const ghostSid = String(sessionId || '').trim();
+  const ghostBoot = ghostSid ? (sessionMetadataById.get(ghostSid) || {}).boot : null;
+  if (ghostBoot && ghostBoot.ghost && !ghostBoot.liveWrapper) {
+    const ghostTerminal = ghostBoot.terminal
+      || (sessionMetadataById.get(ghostSid) || {}).terminal
+      || null;
+    return ghostTerminal?.outcome ? 'Ended' : 'Died';
+  }
   const canDerive = typeof deriveSessionActivity === 'function'
     && typeof sessionWireActivity === 'function';
   if (canDerive && (p === 'idle' || p === 'done')
@@ -689,6 +701,10 @@ function updateSessionWindow(sessionId, meta = {}) {
   if (bootEra !== undefined) {
     win.el.classList.toggle('session-window-ghost', !!(bootEra && bootEra.ghost));
   }
+  // Terminal honesty rides the same resolved store: a dead window states
+  // how it ended (and where its lineage continued) instead of freezing on
+  // a mid-execution look.
+  renderSessionWindowTerminalNote(win, sid);
   // Track AO safe-to-stop: the × affordance claims exactly what the
   // machine knows — the served stop derivation for agenda-linked
   // sessions; for linkless sessions, "safe" only as the ruled

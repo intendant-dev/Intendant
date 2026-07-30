@@ -51,6 +51,13 @@ impl SessionSupervisor {
             } => {
                 self.update_session_phase(Some(session_id), phase).await;
             }
+            AppEvent::BackendCredentialsReloadProgress {
+                session_id,
+                progress,
+            } => {
+                self.update_reload_lifecycle(session_id.as_deref(), progress)
+                    .await;
+            }
             AppEvent::SessionCapabilities {
                 session_id,
                 capabilities,
@@ -120,6 +127,39 @@ impl SessionSupervisor {
         };
         if let Some(session) = state.sessions.get_mut(&target_id) {
             session.phase = phase;
+        }
+    }
+
+    /// Advance a session's served reload lifecycle from the loop's typed
+    /// progress event — the same targeted-only resolution as
+    /// [`Self::update_session_phase`]: an explicitly targeted event only
+    /// updates the session it names (through aliases), and an id that
+    /// resolves to nothing updates nothing.
+    pub(crate) async fn update_reload_lifecycle(
+        &self,
+        session_id: Option<&str>,
+        progress: &event::CredentialReloadProgress,
+    ) {
+        let mut state = self.state.lock().await;
+        let target_id = match session_id {
+            Some(id) => state.resolve_session_id(id),
+            None => state.active_session_id.clone(),
+        };
+        let Some(target_id) = target_id else {
+            return;
+        };
+        if let Some(session) = state.sessions.get_mut(&target_id) {
+            session.reload = Some(match progress {
+                event::CredentialReloadProgress::Respawning => {
+                    ReloadLifecycle::stamped_now(ReloadLifecycleState::Respawning, None)
+                }
+                event::CredentialReloadProgress::Done => {
+                    ReloadLifecycle::stamped_now(ReloadLifecycleState::Done, None)
+                }
+                event::CredentialReloadProgress::Failed { error } => {
+                    ReloadLifecycle::stamped_now(ReloadLifecycleState::Failed, Some(error.clone()))
+                }
+            });
         }
     }
 
@@ -233,6 +273,7 @@ impl SessionSupervisor {
                 source,
                 name,
                 phase,
+                reload: None,
                 project_root,
                 session_dir,
                 follow_up_tx,

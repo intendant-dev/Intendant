@@ -316,23 +316,50 @@ mod tests {
         assert!(status_wants_reload_candidates(&success));
         let merged = status_with_reload_candidates(
             success,
-            vec![crate::session_supervisor::ReloadCandidate {
-                session_id: "wrapper-1".to_string(),
-                source: "claude-code".to_string(),
-                name: Some("steward pass".to_string()),
-                phase: "waiting_rate_limit".to_string(),
-            }],
+            vec![
+                crate::session_supervisor::ReloadCandidate {
+                    session_id: "wrapper-1".to_string(),
+                    source: "claude-code".to_string(),
+                    name: Some("steward pass".to_string()),
+                    phase: "waiting_rate_limit".to_string(),
+                    reload: None,
+                },
+                crate::session_supervisor::ReloadCandidate {
+                    session_id: "wrapper-2".to_string(),
+                    source: "claude-code".to_string(),
+                    name: None,
+                    phase: "running".to_string(),
+                    reload: Some(crate::session_supervisor::ReloadLifecycle {
+                        state: crate::session_supervisor::ReloadLifecycleState::Failed,
+                        at_unix_ms: 1_785_365_411_029,
+                        error: Some("could not respawn claude-code: exec failed".to_string()),
+                    }),
+                },
+            ],
         );
         assert_eq!(merged["phase"], "success");
         assert_eq!(
             merged["reload_candidates"],
-            serde_json::json!([{
-                "session_id": "wrapper-1",
-                "source": "claude-code",
-                "name": "steward pass",
-                "phase": "waiting_rate_limit",
-            }]),
-            "candidates and the success phase share one body"
+            serde_json::json!([
+                {
+                    "session_id": "wrapper-1",
+                    "source": "claude-code",
+                    "name": "steward pass",
+                    "phase": "waiting_rate_limit",
+                },
+                {
+                    "session_id": "wrapper-2",
+                    "source": "claude-code",
+                    "phase": "running",
+                    "reload": {
+                        "state": "failed",
+                        "at_unix_ms": 1_785_365_411_029u64,
+                        "error": "could not respawn claude-code: exec failed",
+                    },
+                },
+            ]),
+            "candidates and the success phase share one body; the daemon's \
+             reload lifecycle rides each row verbatim"
         );
 
         // An alive daemon with nothing to reload states that explicitly.
@@ -358,14 +385,7 @@ mod tests {
     /// blur the pin.
     #[test]
     fn sign_in_again_always_refreshes() {
-        let app = include_str!("../../../../static/app.html");
-        let banner = "/* ── static/app/32-vault-custody.js ── */";
-        let start = app
-            .find(banner)
-            .expect("vault fragment banner not found in app.html");
-        let rest = &app[start + banner.len()..];
-        let end = rest.find("/* ── static/app/").unwrap_or(rest.len());
-        let fragment = &rest[..end];
+        let fragment = vault_fragment();
 
         assert!(
             fragment.contains("reload_candidates"),
@@ -381,6 +401,85 @@ mod tests {
                 "the vault sign-in lane must not rebuild its own session list ({legacy} found)"
             );
         }
+    }
+
+    fn vault_fragment() -> &'static str {
+        let app = include_str!("../../../../static/app.html");
+        let banner = "/* ── static/app/32-vault-custody.js ── */";
+        let start = app
+            .find(banner)
+            .expect("vault fragment banner not found in app.html");
+        let rest = &app[start + banner.len()..];
+        let end = rest.find("/* ── static/app/").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// The Vault card holds NO reload-request memory of its own: the
+    /// page-lifetime request Set that latched delivered requests forever
+    /// (blocking re-reload at the button level while the daemon would
+    /// happily accept a repeat) is gone entirely, and the row chips
+    /// render the candidate's served `reload` lifecycle instead.
+    #[test]
+    fn stale_requests_never_block_a_fresh_ceremony() {
+        let fragment = vault_fragment();
+        assert!(
+            !fragment.contains("reloadRequested"),
+            "no client-side reload-request memory may exist — the served lifecycle is the only state"
+        );
+        assert!(
+            fragment.contains("session.reload"),
+            "row chips must render the candidate's served reload lifecycle"
+        );
+    }
+
+    /// The Reload button is gated ONLY by an in-flight served state:
+    /// terminal states (done/failed) and rows with no lifecycle always
+    /// render it — re-reload is always available, and a lingering
+    /// request can never block a fresh ceremony.
+    #[test]
+    fn terminal_states_always_restore_the_button() {
+        let fragment = vault_fragment();
+        assert!(
+            fragment.contains("!lifecycle || !lifecycle.inFlight"),
+            "the button must render for every terminal or absent lifecycle state"
+        );
+        assert!(
+            fragment.contains("'Reload credentials'"),
+            "the per-row reload button must exist"
+        );
+    }
+
+    /// Every row renders the session grid's short-id dialect (first 8)
+    /// beside the name, with the full id on the tooltip — duplicate
+    /// derived names stay distinguishable with data the payload already
+    /// serves.
+    #[test]
+    fn rows_render_short_session_ids() {
+        let fragment = vault_fragment();
+        assert!(
+            fragment.contains("sessionId.slice(0, 8)"),
+            "rows must render the first-8 short-id chip"
+        );
+        assert!(
+            fragment.contains("idChip.title = sessionId"),
+            "the id chip must carry the full session id as its tooltip"
+        );
+    }
+
+    /// "Reload all" dispatches the daemon fan-out (never a client loop),
+    /// and takes its `source` off the served candidate rows rather than
+    /// a client-side provider→backend map.
+    #[test]
+    fn reload_all_rides_the_served_candidate_set() {
+        let fragment = vault_fragment();
+        assert!(
+            fragment.contains("reload_credentials_all"),
+            "reload-all must dispatch the daemon fan-out intent"
+        );
+        assert!(
+            fragment.contains("candidates[0]?.source"),
+            "the fan-out source must derive from the served candidates"
+        );
     }
 
     #[test]

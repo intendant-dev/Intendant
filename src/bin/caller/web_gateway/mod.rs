@@ -258,6 +258,13 @@ pub struct WebGatewayConfig {
     /// constant and nudges stale tabs to reload after a daemon upgrade.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app_build: String,
+    /// This daemon process's boot id (the handover runtime identity),
+    /// set at wiring. Every config lane carries it so a tab that hears
+    /// a NEW process answering on the same origin — a handover
+    /// successor or a plain restart — can offer "daemon updated —
+    /// reload" (HS6), one level up from the bundle stamp above.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_id: String,
     /// Public peer access-request hardening. This is gateway runtime state,
     /// not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
@@ -292,6 +299,7 @@ impl Default for WebGatewayConfig {
             ice_servers: Vec::new(),
             federation_allow_h264: false,
             app_build: String::new(),
+            boot_id: String::new(),
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
             connect: crate::project::ConnectConfig::default(),
             hosted_control_identity_path: None,
@@ -3112,12 +3120,13 @@ mod tests {
             "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
         )
         .await;
-        // Auth passed; handler returned its 503 (no registry).
+        // Auth passed; handler returned its 503 (no registry). Status-line
+        // assert, never a whole-response substring scan — the app-build
+        // fingerprint header can contain any three digits.
         assert!(
-            resp.contains("503"),
+            resp.starts_with("HTTP/1.1 503"),
             "expected 503 (auth passed, registry missing), got: {resp}"
         );
-        assert!(!resp.contains("401"));
         handle.abort();
     }
 
@@ -3130,11 +3139,14 @@ mod tests {
     async fn test_config_endpoint_unauthenticated_when_bearer_set() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        // Status-line assert, never a whole-response substring scan: the
+        // `x-intendant-app-build` fingerprint header can legitimately
+        // contain any three digits ("401" included) for some app.html
+        // builds.
         assert!(
-            resp.contains("200 OK"),
+            resp.starts_with("HTTP/1.1 200"),
             "config should serve unauthenticated, got: {resp}"
         );
-        assert!(!resp.contains("401"));
         assert!(
             resp.contains("Cache-Control: no-store"),
             "TURN-bearing config must never be stored: {resp}"
