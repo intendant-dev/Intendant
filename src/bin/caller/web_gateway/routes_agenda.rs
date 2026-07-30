@@ -11,15 +11,23 @@ use super::*;
 
 /// Transport-neutral core of `GET /api/agenda` (tunnel twin
 /// `api_agenda_list`): every item oldest-first plus status counts, the
-/// count of preserved-but-unfolded log lines, and the reminder policy
-/// (read-only here — mutations ride the Settings-gated policy route).
+/// count of preserved-but-unfolded log lines, the fold's `seq` cursor
+/// (Track AS — the op-log line count, `read_ops`' space), and the
+/// reminder policy (read-only here — mutations ride the Settings-gated
+/// policy route).
 pub(crate) async fn agenda_list_api_response(
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let Some(agenda) = agenda_handle(mcp_server).await else {
         return ApiResponse::json_error(503, "agenda unavailable on this daemon");
     };
-    let (items, counts, skipped_lines) = agenda.snapshot();
+    let snapshot = agenda.snapshot();
+    let (items, counts, skipped_lines, seq) = (
+        snapshot.items,
+        snapshot.counts,
+        snapshot.skipped_lines,
+        snapshot.seq,
+    );
     let sessions = agenda_sessions_join(&crate::platform::home_dir(), &items);
     // Tier-1 PR state for the anchors this snapshot serves — the same
     // sibling discipline as `sessions`: keyed by the anchors' url-ref
@@ -36,6 +44,7 @@ pub(crate) async fn agenda_list_api_response(
         "items": items,
         "counts": counts,
         "skipped_lines": skipped_lines,
+        "seq": seq,
         "reminder_policy": agenda.reminder_policy(),
         "sessions": sessions,
     });
@@ -584,6 +593,114 @@ mod tests {
             }
             _ => panic!("expected the JSON lane"),
         }
+    }
+
+    /// Track AS freeze pin (ruling R-AS1, §6.3): the BARE list lane —
+    /// `GET /api/agenda` and its tunnel twin `api_agenda_list`, which
+    /// delegates to this exact core (`dashboard_control/api_sessions.rs::
+    /// api_agenda_list_response`) — serves the FULL ledger forever:
+    /// closed items present, multi-KB bodies present verbatim, effects
+    /// with digests present. Every Track AS capability is an additive
+    /// parameter or field, never a changed default. Editing this test is
+    /// the tripwire the ruling names: a "cleanup" that windows, slims,
+    /// or summarizes the bare shape is the §8 failure mode, not progress.
+    #[tokio::test]
+    async fn bare_agenda_lanes_serve_the_full_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let big_body = "archive freight ".repeat(300); // ~4.8 KB
+        let add = |title: &str, body: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: body.into(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let done = agenda
+            .apply(add("closed with body", &big_body), owner.clone())
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::ProposeEffect {
+                    id: done.id.clone(),
+                    goal: "the digest-bound goal".into(),
+                    fire_at_ms: 4_102_444_800_000,
+                    orchestrate: false,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: Vec::new(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Complete {
+                    id: done.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let retired = agenda
+            .apply(add("retired row", "gone but present"), owner.clone())
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::Retire {
+                    id: retired.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda.apply(add("open row", "live"), owner).unwrap();
+
+        let body = json_of(&agenda_list_api_response(Some(&server)).await);
+        let items = body["items"].as_array().expect("items array");
+        assert_eq!(items.len(), 3, "every item, closed included");
+        let served_done = items
+            .iter()
+            .find(|item| item["id"] == serde_json::json!(done.id))
+            .expect("the closed item is served");
+        assert_eq!(served_done["status"], "done");
+        assert_eq!(
+            served_done["body"].as_str().expect("body served"),
+            big_body,
+            "multi-KB bodies ride the bare lane verbatim"
+        );
+        assert!(
+            !served_done["effects"][0]["digest"]
+                .as_str()
+                .expect("effect digest served")
+                .is_empty(),
+            "effects ride with their digests"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["status"] == "retired")
+                .count(),
+            1,
+            "retired items stay reachable on the bare lane"
+        );
+        assert_eq!(body["counts"]["open"], 1);
+        assert_eq!(body["counts"]["done"], 1);
+        assert_eq!(body["counts"]["retired"], 1);
+        // S1: the bare response now also carries the fold's seq cursor —
+        // additive, and exactly the ops route's line count (6 ops here:
+        // three adds, one propose, one complete, one retire).
+        assert_eq!(body["seq"], 6);
     }
 
     /// Tier 1 rides the snapshot as a sibling map keyed by served

@@ -1278,10 +1278,14 @@ pub enum AppEvent {
 
     /// The agenda ledger changed (item added, patched, or transitioned).
     /// Carries the item as it now stands plus fresh counts so frontends
-    /// update live without refetching.
+    /// update live without refetching, and the op-log seq of the op that
+    /// produced it — the same cursor space list responses report — so a
+    /// client can advance its resume cursor (`max(cursor, seq + 1)`)
+    /// instead of guessing (Track AS).
     AgendaChanged {
         item: crate::agenda::AgendaItem,
         counts: crate::agenda::AgendaCounts,
+        seq: u64,
     },
 
     /// A recorded outcome on an agenda-backed rich ask: an answer resolved
@@ -3772,9 +3776,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             backend: backend.clone(),
             method: method.clone(),
         }),
-        AppEvent::AgendaChanged { item, counts } => Some(OutboundEvent::AgendaChanged {
+        AppEvent::AgendaChanged { item, counts, seq } => Some(OutboundEvent::AgendaChanged {
             item: Box::new(item.clone()),
             counts: *counts,
+            seq: *seq,
         }),
         // Supervisor-internal delivery signal: browsers already see the
         // resolution via AgendaChanged + ApprovalResolved.
