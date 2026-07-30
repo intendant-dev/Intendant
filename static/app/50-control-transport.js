@@ -1587,6 +1587,17 @@ function dashboardHandleEventGap(msg, lane = 'tunnel') {
     if (typeof refreshHistory === 'function') {
       try { refreshHistory(); } catch (err) { console.warn('[server-msg] event_gap history refresh failed', err); }
     }
+    // Agenda heal (Track AS S3): a since_seq delta pull, so it runs on
+    // EVERY gap without the bootstrap re-pull's rate limit — the missed
+    // agenda_changed events are exactly what the cursor recovers.
+    if (typeof agendaHeal === 'function') {
+      try {
+        const healed = agendaHeal('event_gap');
+        if (healed && typeof healed.catch === 'function') {
+          healed.catch(err => console.warn('[server-msg] event_gap agenda heal failed', err));
+        }
+      } catch (err) { console.warn('[server-msg] event_gap agenda heal failed', err); }
+    }
     const now = Date.now();
     if (
       typeof hydrateDashboardFromControl === 'function' &&

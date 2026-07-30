@@ -25,6 +25,13 @@ pub(crate) const INSTALL_SH_ASSET_URL: &str =
     "https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh";
 pub(crate) const INSTALL_PS1_ASSET_URL: &str =
     "https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1";
+/// The PGP public key that signs every release artifact (the repo-root
+/// `RELEASE-SIGNING-KEY.asc`, published byte-identical beside each
+/// release). TWINNED with `bin/caller/pgp_identity.rs::RELEASE_SIGNING_KEY_ASSET`
+/// (this URL's tail) and `transparency.rs::RELEASE_SIGNING_KEY_ASSET`;
+/// the golden test below pins the literal.
+pub(crate) const RELEASE_KEY_ASSET_URL: &str =
+    "https://github.com/intendant-dev/Intendant/releases/latest/download/RELEASE-SIGNING-KEY.asc";
 
 /// The redirect body doubles as the fail-safe for a pipe that does not
 /// follow redirects (`curl` without `-L` piped straight to `sh`): it is
@@ -1012,6 +1019,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <nav>
         <a href="/trust">Trust</a>
         <a href="{INSTALL_SH_ASSET_URL}">install.sh</a>
+        <a href="{RELEASE_KEY_ASSET_URL}">release key</a>
         <a href="{DOCS_URL}">Docs</a>
         <a href="{REPO_URL}">GitHub</a>
       </nav>
@@ -2646,6 +2654,7 @@ mod tests {
         // release assets, with the origin as an explicit connect flag.
         assert!(html.contains(INSTALL_SH_ASSET_URL));
         assert!(html.contains(INSTALL_PS1_ASSET_URL));
+        assert!(html.contains(RELEASE_KEY_ASSET_URL));
         assert!(html.contains("--connect ' + location.origin"));
         assert!(html.contains("-Connect ' + location.origin"));
         assert!(html.contains("--service"));
@@ -2860,6 +2869,21 @@ mod tests {
         );
         assert!(INSTALL_SH_ASSET_URL.starts_with(REPO_URL));
         assert!(INSTALL_PS1_ASSET_URL.starts_with(REPO_URL));
+        // The release signing key ships beside the installers, under the
+        // same repo-anchored release path; the asset name is the twinned
+        // literal (caller pgp_identity.rs / transparency.rs).
+        assert_eq!(
+            RELEASE_KEY_ASSET_URL,
+            "https://github.com/intendant-dev/Intendant/releases/latest/download/RELEASE-SIGNING-KEY.asc"
+        );
+        assert!(RELEASE_KEY_ASSET_URL.starts_with(REPO_URL));
+        assert_eq!(
+            RELEASE_KEY_ASSET_URL,
+            format!(
+                "{REPO_URL}/releases/latest/download/{}",
+                crate::transparency::RELEASE_SIGNING_KEY_ASSET
+            )
+        );
 
         for (url, body) in [
             (INSTALL_SH_ASSET_URL, install_sh_redirect_body()),

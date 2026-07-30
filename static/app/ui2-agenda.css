@@ -704,6 +704,35 @@ html.ui-v2 .ag2-digest-chip:hover {
   color: var(--text);
 }
 
+/* Changed-since: the manifest was revised after the owner last looked —
+   amber beside the digest chip, click acknowledges. The one-shot pulse
+   rides the digest chip itself on the render after the owner's own edit,
+   so the in-place update is visible, not silent. */
+html.ui-v2 .ag2-revised-chip {
+  display: inline-flex;
+  align-items: center;
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--amber) 55%, transparent);
+  border-radius: var(--r-inset);
+  padding: 1px 7px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--amber);
+  white-space: nowrap;
+}
+html.ui-v2 .ag2-revised-chip:hover {
+  border-style: solid;
+}
+html.ui-v2 .ag2-digest-chip.is-pulse {
+  animation: ag2-digest-pulse 1.4s ease-out 2;
+}
+@keyframes ag2-digest-pulse {
+  0% { border-color: var(--amber); color: var(--text); box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber) 25%, transparent); }
+  100% { border-color: var(--line); box-shadow: 0 0 0 0 transparent; }
+}
+
 /* ---- Automations lens rows (Track AU) ---- */
 
 html.ui-v2 .ag2-auto-meta {

@@ -18,16 +18,30 @@ use crate::event::{AppEvent, EventBus};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// One serving read of the whole fold: every item oldest-first
-/// (decorated by the caller), status counts, preserved-but-unfolded
-/// line count, and the fold's `seq` — the op-log line cursor
-/// ([`AgendaStore::read_ops`]'s `log_len` space) a client can hold to
-/// resume from later without refetching the world (Track AS).
-pub(crate) struct AgendaSnapshot {
-    pub(crate) items: Vec<AgendaItem>,
+/// A serving read at both grains (Track AS): `all` = the full decorated
+/// fold (cross-item derivation context), `served` = the delta-selected
+/// subset actually leaving the daemon (= `all` without a cursor), plus
+/// status counts, the preserved-but-unfolded line count, and the fold's
+/// `seq` — the op-log line cursor ([`AgendaStore::read_ops`]'s `log_len`
+/// space) a client can hold to resume from later without refetching the
+/// world. See [`AgendaHandle::serving_read`].
+pub(crate) struct AgendaServingRead {
+    pub(crate) all: Vec<AgendaItem>,
+    pub(crate) served: Vec<AgendaItem>,
     pub(crate) counts: AgendaCounts,
     pub(crate) skipped_lines: u64,
     pub(crate) seq: u64,
+}
+
+/// Resolution of a user-supplied item id or unique prefix (Track AS S4,
+/// ruling Q5): an EXACT id match always wins; otherwise a unique prefix
+/// resolves; an ambiguous prefix refuses by name with a bounded
+/// candidate list (ids + titles only) so the caller can disambiguate
+/// without refetching the world.
+pub(crate) enum AgendaPrefixResolution {
+    One(Box<AgendaItem>),
+    Ambiguous(Vec<(String, String)>),
+    None,
 }
 
 /// The seq riding an `agenda_changed` broadcast: the seq of the last op
@@ -661,6 +675,48 @@ impl AgendaHandle {
         self.lock().item(item_id)
     }
 
+    /// Resolve a full id or unique id-prefix to one DECORATED item
+    /// (Track AS S4, ruling Q5): exact match always wins, then a unique
+    /// prefix; an ambiguous prefix returns the bounded candidate list
+    /// (ids + titles). The single-item route and tooling (`ctl agenda
+    /// show`, prefix-resolving write verbs) ride this instead of
+    /// full-ledger fetches.
+    pub(crate) fn resolve_prefix(&self, prefix: &str) -> AgendaPrefixResolution {
+        if prefix.is_empty() {
+            return AgendaPrefixResolution::None;
+        }
+        let matches: Vec<AgendaItem> = {
+            let mut store = self.lock();
+            if let Err(err) = store.refresh_if_stale() {
+                eprintln!("[agenda] refresh before read failed: {err}");
+            }
+            if let Some(exact) = store.item(prefix) {
+                vec![exact]
+            } else {
+                store
+                    .snapshot()
+                    .into_iter()
+                    .filter(|item| item.id.starts_with(prefix))
+                    .collect()
+            }
+        };
+        match matches.len() {
+            0 => AgendaPrefixResolution::None,
+            1 => {
+                let mut item = matches.into_iter().next().expect("len checked");
+                self.decorate_item(&mut item);
+                AgendaPrefixResolution::One(Box::new(item))
+            }
+            _ => AgendaPrefixResolution::Ambiguous(
+                matches
+                    .into_iter()
+                    .take(16)
+                    .map(|item| (item.id, item.title))
+                    .collect(),
+            ),
+        }
+    }
+
     /// Boot re-announcement (loud-badges guardrail): re-emit the rail
     /// announcement for every OPEN agenda-backed ask so the state-line
     /// cache, the attention nudge, and every connecting rail repopulate
@@ -673,7 +729,7 @@ impl AgendaHandle {
     /// way back, and answer/reopen clears the marker (the log keeps the
     /// dismissal as history). Returns how many were announced.
     pub(crate) fn announce_open_asks(&self) -> usize {
-        let items = self.snapshot().items;
+        let items = self.snapshot();
         let mut announced = 0;
         for item in &items {
             if item.status == super::types::AgendaStatus::Open
@@ -737,54 +793,22 @@ impl AgendaHandle {
         Ok(item)
     }
 
-    /// Fresh snapshot: every item oldest-first, counts, how many log
-    /// lines this build preserved but could not fold, and the fold's
-    /// seq cursor. Items carry the display-only planner decorations,
-    /// computed with this read's clock.
-    pub(crate) fn snapshot(&self) -> AgendaSnapshot {
-        let (mut items, counts, skipped_lines, seq) = {
-            let mut store = self.lock();
-            if let Err(err) = store.refresh_if_stale() {
-                eprintln!("[agenda] refresh before read failed: {err}");
-            }
-            (
-                store.snapshot(),
-                store.counts(),
-                store.skipped_lines(),
-                store.seq(),
-            )
-        };
-        self.decorate_items(&mut items);
-        AgendaSnapshot {
-            items,
-            counts,
-            skipped_lines,
-            seq,
-        }
+    /// Fresh full snapshot: every item oldest-first, decorated with this
+    /// read's clock — the in-process consumers' view (scheduler,
+    /// triggers, PR scanner, boot re-announce; ruling R-AS5: no serving
+    /// window ever filters what they see). Serving lanes that also need
+    /// counts/seq/delta grain use [`Self::serving_read`].
+    pub(crate) fn snapshot(&self) -> Vec<AgendaItem> {
+        self.serving_read(None).all
     }
 
-    /// Delta read (Track AS S2): every item whose last folding op seq is
-    /// `>= since_seq`, plus full counts and the fold's frontier seq —
-    /// complete because items only ever change by ops, so a client that
-    /// upserts the returned items over a snapshot taken at `since_seq`
-    /// holds the same fold state a fresh full snapshot would give it.
-    ///
-    /// Two honest limits, both ruled (Q4/R-AS4): decorations are
-    /// read-time values — this refreshes them only on RETURNED items;
-    /// untouched items' decorations age exactly as they do between any
-    /// two reads today. And the filter is fold-state grain: items are
-    /// decorated against the FULL fold before filtering (a subset
-    /// context starves cross-item decorations — the #649 lesson), but
-    /// an item whose only change is another item's op (a watcher armed
-    /// elsewhere) is NOT returned — `watched_by` freshness rides lens
-    /// interaction re-pulls, never this lane.
-    ///
-    /// A cursor from the future (`since_seq > seq`: a shrunk/tampered
-    /// log, or a cursor minted by a longer foreign log this daemon has
-    /// not converged with) serves the FULL set — resync is the honest
-    /// repair when the cursor space itself is in doubt.
-    pub(crate) fn changed_since(&self, since_seq: u64) -> AgendaSnapshot {
-        let (mut items, counts, skipped_lines, seq, seq_by_id) = {
+    /// One serving read carrying BOTH grains (Track AS S4): the full
+    /// decorated fold (`all` — cross-item derivations and the summary
+    /// projection's served flags need it even when only a subset is
+    /// served) and the `served` subset a delta cursor selects (equal to
+    /// `all` without a cursor). Decorated once, against the whole fold.
+    pub(crate) fn serving_read(&self, since_seq: Option<u64>) -> AgendaServingRead {
+        let (mut all, counts, skipped_lines, seq, seq_by_id) = {
             let mut store = self.lock();
             if let Err(err) = store.refresh_if_stale() {
                 eprintln!("[agenda] refresh before read failed: {err}");
@@ -802,16 +826,23 @@ impl AgendaHandle {
                 seq_by_id,
             )
         };
-        self.decorate_items(&mut items);
-        if since_seq <= seq {
+        self.decorate_items(&mut all);
+        let served = match since_seq {
             // Missing map entries (unreachable by construction — every
             // folded item got there via an op that recorded its seq)
             // INCLUDE rather than drop: this is a healing lane, and
             // over-returning is safe where under-returning loses data.
-            items.retain(|item| seq_by_id.get(&item.id).copied().unwrap_or(u64::MAX) >= since_seq);
-        }
-        AgendaSnapshot {
-            items,
+            // A future cursor serves the full set — resync as repair.
+            Some(cursor) if cursor <= seq => all
+                .iter()
+                .filter(|item| seq_by_id.get(&item.id).copied().unwrap_or(u64::MAX) >= cursor)
+                .cloned()
+                .collect(),
+            _ => all.clone(),
+        };
+        AgendaServingRead {
+            all,
+            served,
             counts,
             skipped_lines,
             seq,
@@ -1163,6 +1194,7 @@ mod tests {
                     goal: "run it".into(),
                     fire_at_ms: 1_000,
                     orchestrate: false,
+                    interactive: None,
                     recurrence: None,
                     agent_config: None,
                     trigger: None,
@@ -1293,6 +1325,7 @@ mod tests {
                     goal: "run it".into(),
                     fire_at_ms: 1_000,
                     orchestrate: false,
+                    interactive: None,
                     recurrence: None,
                     agent_config: None,
                     trigger: None,
@@ -1672,13 +1705,13 @@ mod tests {
             }
         }
         assert_eq!(seqs, vec![0, 1, 2], "each broadcast names its op's line");
-        let snapshot = handle.snapshot();
+        let read = handle.serving_read(None);
         assert_eq!(
-            snapshot.seq, 3,
-            "the snapshot reports the fold's frontier — last broadcast seq + 1"
+            read.seq, 3,
+            "the serving read reports the fold's frontier — last broadcast seq + 1"
         );
-        assert_eq!(snapshot.counts.open, 1);
-        assert_eq!(snapshot.counts.done, 1);
+        assert_eq!(read.counts.open, 1);
+        assert_eq!(read.counts.done, 1);
     }
 
     /// Track AS S2 pin (ruling R-AS4): a `since_seq` delta returns
@@ -1712,7 +1745,7 @@ mod tests {
         };
         let untouched = handle.apply(add("untouched"), owner.clone()).unwrap(); // seq 0
         let touched = handle.apply(add("touched later"), owner.clone()).unwrap(); // seq 1
-        let cursor = handle.snapshot().seq; // 2 — the client is current here
+        let cursor = handle.serving_read(None).seq; // 2 — the client is current here
         handle
             .apply(
                 AgendaCommand::Annotate {
@@ -1724,11 +1757,11 @@ mod tests {
             )
             .unwrap(); // seq 2
 
-        let delta = handle.changed_since(cursor);
+        let delta = handle.serving_read(Some(cursor));
         assert_eq!(delta.seq, 3);
         assert_eq!(
             delta
-                .items
+                .served
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
@@ -1744,11 +1777,11 @@ mod tests {
             AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
         let foreign = foreign_handle.apply(add("foreign"), owner).unwrap(); // seq 3
 
-        let healed = handle.changed_since(delta.seq);
+        let healed = handle.serving_read(Some(delta.seq));
         assert_eq!(healed.seq, 4);
         assert_eq!(
             healed
-                .items
+                .served
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
@@ -1757,10 +1790,10 @@ mod tests {
         );
 
         // Current cursor → empty delta; future cursor → full resync.
-        assert!(handle.changed_since(healed.seq).items.is_empty());
-        let resync = handle.changed_since(healed.seq + 100);
-        assert_eq!(resync.items.len(), 3);
-        assert!(resync.items.iter().any(|item| item.id == untouched.id));
+        assert!(handle.serving_read(Some(healed.seq)).served.is_empty());
+        let resync = handle.serving_read(Some(healed.seq + 100));
+        assert_eq!(resync.served.len(), 3);
+        assert!(resync.served.iter().any(|item| item.id == untouched.id));
     }
 
     /// The sealed-serving pin (Track AW slice 2): the read lane serves
@@ -1920,6 +1953,7 @@ mod tests {
                     goal: "run the cert sweep and report".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    interactive: None,
                     agent_config: None,
                     source: None,
                     trigger: None,
@@ -2229,7 +2263,7 @@ mod tests {
         // The resolver runs async off the bus: poll the fold briefly.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let items = handle.snapshot().items;
+            let items = handle.snapshot();
             let answered = items
                 .iter()
                 .find(|item| item.id == answered_item.id)
@@ -2766,7 +2800,7 @@ mod tests {
             }
             other => panic!("expected the named no-project refusal, got {other:?}"),
         }
-        let items = handle.snapshot().items;
+        let items = handle.snapshot();
         let orphan_now = items.iter().find(|i| i.id == orphan.id).unwrap();
         assert!(orphan_now.effects.is_empty(), "refusal mints nothing");
     }
@@ -2801,6 +2835,7 @@ mod tests {
                     goal: "summarize the week".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    interactive: None,
                     agent_config: None,
                     source: None,
                     trigger: None,
@@ -2843,6 +2878,7 @@ mod tests {
                     goal: "summarize the week AND email it".into(),
                     fire_at_ms: 4_000_000_000_000,
                     orchestrate: false,
+                    interactive: None,
                     agent_config: None,
                     source: None,
                     trigger: None,
@@ -2995,6 +3031,7 @@ mod tests {
                     goal: "summarize the week".into(),
                     fire_at_ms: fire_at,
                     orchestrate: false,
+                    interactive: None,
                     agent_config: None,
                     source: None,
                     trigger: None,
@@ -3029,7 +3066,7 @@ mod tests {
             Some(fire_at)
         );
         // …and so does every snapshot read.
-        let items = handle.snapshot().items;
+        let items = handle.snapshot();
         assert_eq!(items[0].effects[0].next_fire_ms, Some(fire_at));
         // No quiet hours configured: the reminder field stays absent.
         assert_eq!(items[0].deferred_until, None);
@@ -3070,6 +3107,7 @@ mod tests {
                     goal: "rule on gate questions".into(),
                     fire_at_ms: now_ms() - 60_000,
                     orchestrate: false,
+                    interactive: None,
                     agent_config: None,
                     source: None,
                     trigger: Some(super::super::types::TriggerSpec::OnItemMatch {
@@ -3149,7 +3187,7 @@ mod tests {
             "pickup = the planner's batching-window instant"
         );
         // …snapshot reads carry the same derivation…
-        let items = handle.snapshot().items;
+        let items = handle.snapshot();
         let served = items.iter().find(|item| item.id == question.id).unwrap();
         assert_eq!(served.watched_by, question.watched_by);
         // …and the fold product itself never does.

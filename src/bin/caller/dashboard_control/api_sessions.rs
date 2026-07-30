@@ -252,6 +252,7 @@ pub(crate) async fn control_request_frame(
         }
         "api_codex_cloud_submit" => api_codex_cloud_submit_response(id, params.as_ref()).await,
         "api_agenda_list" => api_agenda_list_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_item" => api_agenda_item_response(id, params.as_ref(), &runtime).await,
         "api_agenda_ops" => api_agenda_ops_response(id, params.as_ref(), &runtime).await,
         "api_agenda_occurrences" => {
             api_agenda_occurrences_response(id, params.as_ref(), &runtime).await
@@ -1328,8 +1329,9 @@ pub(crate) async fn api_session_agent_output_response_from_home(
 }
 
 /// Tunnel twin of `GET /api/agenda` — reuses the transport-neutral core.
-/// `{since_seq}` rides `params` (Track AS S2, same semantics as the
-/// query string); absent = the frozen bare full-ledger shape.
+/// `{since_seq, shape, q}` ride `params` (Track AS S2/S4, same
+/// semantics as the query string); absent = the frozen bare full-ledger
+/// shape.
 pub(crate) async fn api_agenda_list_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -1338,10 +1340,54 @@ pub(crate) async fn api_agenda_list_response(
     let since_seq = params
         .and_then(|p| p.get("since_seq"))
         .and_then(serde_json::Value::as_u64);
+    let shape_raw = params
+        .and_then(|p| p.get("shape"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let shape = match crate::web_gateway::AgendaListShape::parse(shape_raw.as_deref()) {
+        Ok(shape) => shape,
+        Err(err) => {
+            return frame_api_response(
+                id,
+                crate::web_gateway::ApiResponse::json_error(400, err),
+                "agenda list",
+            )
+        }
+    };
+    let q = params
+        .and_then(|p| p.get("q"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
     frame_api_response(
         id,
-        crate::web_gateway::agenda_list_api_response(since_seq, runtime.mcp_server.as_ref()).await,
+        crate::web_gateway::agenda_list_api_response(
+            since_seq,
+            shape,
+            q.as_deref(),
+            runtime.mcp_server.as_ref(),
+        )
+        .await,
         "agenda list",
+    )
+}
+
+/// Tunnel twin of `GET /api/agenda/items/{item_id}` (Track AS S4) —
+/// `{item_id}` rides `params`; id or unique prefix, exact wins.
+pub(crate) async fn api_agenda_item_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let item_id = params
+        .and_then(|p| p.get("item_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_item_api_response(&item_id, runtime.mcp_server.as_ref()).await,
+        "agenda item",
     )
 }
 

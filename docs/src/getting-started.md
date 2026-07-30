@@ -291,25 +291,77 @@ INSTALL_APP=0 ./scripts/bundle-macos.sh   # build the bundle without installing
 
 ### macOS releases: signing and notarization
 
-The repository contains a tag-triggered release workflow, but the current
-setup has no Developer ID/notarization credentials and no signed/notarized app
-release has been published. Pushing a `v*` tag runs
-`.github/workflows/release.yml` on the self-hosted macOS runner: it
-release-builds the binaries, runs `scripts/bundle-macos.sh`, and publishes a
-GitHub Release carrying `Intendant-<version>-macos-<arch>.zip` plus a `.sha256`
-checksum file. Without the complete signing configuration, the artifact is
-explicitly suffixed `-unsigned-dev` and is not a distribution trust anchor.
+The repository ships a tag-triggered release workflow with two independent
+signing lanes. The **PGP lane is required**: pushing a `v*` tag runs
+`.github/workflows/release.yml` on the self-hosted macOS runner, which
+release-builds the binaries, runs `scripts/bundle-macos.sh`, detach-signs
+every artifact it will publish with the Intendant release signing key
+(`scripts/release-pgp-sign.sh`), publishes a GitHub Release — the app
+archive `Intendant-<version>-macos-<arch>*.zip`, the stamped `install.sh` /
+`install.ps1`, the `.sha256` sidecars, a detached armored `.asc` signature
+per artifact, and the public key itself — and commits the release manifest
+(every artifact's hash plus the signing-key fingerprint) to the public
+transparency log. A tag build without the PGP secrets goes red before
+building anything, and the sign step self-verifies every signature against
+the repo-committed public key before anything publishes, so a release
+whose own verify ritual would fail can never ship.
 
-**Installing a release:** download the zip and checksum from
-[GitHub releases](https://github.com/intendant-dev/Intendant/releases),
-verify with `shasum -a 256 -c <zip>.sha256`, unzip, and drag `Intendant.app`
-to `/Applications`. On first launch macOS asks for the TCC permissions
-(Screen Recording, Accessibility, Microphone) exactly as with a local build.
-The app checks GitHub for a newer release at launch (silently, release builds
-only) and via **Intendant → Check for Updates…**; updating is always manual —
-the prompt only opens the release page in your browser.
+The **Apple Developer ID lane is deliberately dormant** for this alpha
+(owner-ratified distribution lane, 2026-07-29): no Developer ID or
+notarization credentials are provisioned and no signed/notarized app
+release has been published, so the app archive keeps its explicit
+`-unsigned-dev` suffix, Gatekeeper warns on first open, and the artifact
+is not a distribution trust anchor — authenticity rides the PGP
+signatures and the transparency log. The lane is parked, not deleted:
+once its secrets are provisioned, a tag build engages it fully (signed
+AND notarized, or the run goes red) on top of the PGP lane.
 
-**What a future signed release would mean.** With all signing and notarization
+#### Verifying a release
+
+The release signing key is committed at the repo root as
+`RELEASE-SIGNING-KEY.asc`, published byte-identical beside every release,
+linked from intendant.dev, and pinned at compile time by
+`intendant hosted-verify` (`src/bin/caller/pgp_identity.rs`; a unit test
+derives the pin from the committed bytes). Primary fingerprint (Ed25519,
+certify-only primary + signing subkey):
+
+```
+A9B3 89C0 58DD 177B 3303 A135 22FC 08F0 A26D 3D18
+```
+
+```bash
+# once — import the key (from a repo checkout, or the release's own assets)
+gpg --import RELEASE-SIGNING-KEY.asc
+gpg --fingerprint release@intendant.dev   # compare against the fingerprint above
+
+# per download — the signature proves the bytes, the log proves the history
+gpg --verify Intendant-<version>-macos-arm64-unsigned-dev.zip.asc \
+             Intendant-<version>-macos-arm64-unsigned-dev.zip
+intendant hosted-verify --releases <tag>
+```
+
+`gpg --verify` proves the artifact bytes were signed by the release key.
+`hosted-verify --releases` proves the rest out of band: the release is
+committed to the append-only transparency log under a tree head consistent
+with the local pin, the logged signing-key fingerprint equals the binary's
+compiled-in pin, the published key asset hashes to exactly the committed
+key bytes, every artifact carries its `.asc`, and GitHub's asset metadata
+matches the log (`--download` upgrades to re-hashing the artifacts;
+`shasum -a 256 -c <zip>.sha256` still works as a quick checksum).
+Cryptographic signature verification deliberately stays gpg's job — the
+binary pins *which key*, gpg proves *these bytes*.
+
+**Installing a release:** download the zip with its `.asc` and checksum
+from [GitHub releases](https://github.com/intendant-dev/Intendant/releases),
+verify as above, unzip, and drag `Intendant.app` to `/Applications`. On
+first launch macOS asks for the TCC permissions (Screen Recording,
+Accessibility, Microphone) exactly as with a local build — and, the alpha
+being Apple-unsigned, Gatekeeper warns once on open. The app checks GitHub
+for a newer release at launch (silently, release builds only) and via
+**Intendant → Check for Updates…**; updating is always manual — the prompt
+only opens the release page in your browser.
+
+**What the dormant Apple lane would add.** With all signing and notarization
 secrets provisioned, a release bundle is signed with a `Developer ID
 Application` certificate under the hardened runtime with a secure timestamp,
 notarized by Apple, and stapled — Gatekeeper opens it without warnings, and a
@@ -321,19 +373,44 @@ All executables carry the minimal entitlements in
 voice), camera (`device.camera`, presence video input), and Apple Events
 (`automation.apple-events`, the daemon's osascript paths); the rationale for
 what is present *and absent* is commented in that file. The app bundle stamps
-its version (`CFBundleShortVersionString`) from the tag; dev builds get a
-`git describe` stamp and an artifact suffixed `-unsigned-dev` so the two can
-never be confused. Versions are visible in **Intendant → About Intendant**.
+its version (`CFBundleShortVersionString`) from the tag; local dev builds get
+a `git describe` stamp, so a release archive and a local build are told apart
+by version string, signatures, and the log — not by the shared
+`-unsigned-dev` suffix. Versions are visible in **Intendant → About
+Intendant**.
 
 **Provisioning the release secrets** (repo → Settings → Secrets and
-variables → Actions). Official tag builds fail closed without them: a `v*`
-tag must be signed, notarized, and committed to the transparency log, or the
+variables → Actions). Official tag builds fail closed on the PGP pair: a
+`v*` tag must be PGP-signed and committed to the transparency log, or the
 run goes red before anything is published. A `workflow_dispatch` dry-run
-without secrets still exercises the pipeline end to end and keeps an
-unsigned dev artifact on the workflow run. Each secret group is
-all-or-nothing and a partial group fails the run.
+without secrets still exercises the pipeline end to end and keeps only the
+explicitly `-unsigned-dev` artifact on the workflow run (with the PGP pair
+configured, the dry-run's workflow artifact is signed too). Each secret
+group is all-or-nothing and a partial group fails the run.
 
-Signing identity — `MACOS_SIGN_P12_B64`, `MACOS_SIGN_P12_PASSWORD`:
+PGP signing key — `PGP_SIGN_KEY_B64`, `PGP_SIGN_KEY_PASSPHRASE`
+(required for tag releases):
+
+1. The release key lives in the operator escrow on the release owner's
+   machine (`~/.intendant/release-signing/`; its README documents the
+   mint, rotation, and revocation ceremonies). The certify-only primary
+   key never enters CI — only the signing subkey does, and it carries a
+   two-year expiry as a dead-man switch.
+2. `base64 -i ~/.intendant/release-signing/secret-subkey-ci.asc | pbcopy`
+   → `PGP_SIGN_KEY_B64`; the escrow's `passphrase` file content →
+   `PGP_SIGN_KEY_PASSPHRASE`.
+3. The release runner needs `gpg` on PATH (`brew install gnupg` on the
+   fleet Mac); the workflow imports the subkey into a throwaway
+   `GNUPGHOME` under `RUNNER_TEMP` and removes it in an `always()`
+   cleanup step.
+4. Before cutting a release, `scripts/release-pgp-dryrun.sh` rehearses
+   the whole lane locally — sign with the escrowed subkey, submit to a
+   local rendezvous (including the log door's refusal of an unsigned
+   manifest), `hosted-verify --releases --download` against it, and the
+   gpg ritual — with no tag, GitHub, or fleet involvement.
+
+Signing identity — `MACOS_SIGN_P12_B64`, `MACOS_SIGN_P12_PASSWORD`
+(dormant Apple lane):
 
 1. In your Apple Developer account (Certificates → `+`), create a
    **Developer ID Application** certificate, or use Xcode → Settings →

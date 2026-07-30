@@ -233,6 +233,7 @@ function agendaWireScaffold() {
   });
   document.getElementById('ag2-search').addEventListener('input', (e) => {
     agendaSearch = e.target.value;
+    agendaServerSearchKick();
     agendaRenderTab();
   });
   document.getElementById('ag2-f-blocked').addEventListener('click', () => {
@@ -387,8 +388,45 @@ function agendaItemDigests(item) {
   return out;
 }
 
+// Track AS S5 — server-reach search. Summaries carry no bodies, so the
+// body reach moved to the daemon's `q=` (which also covers digests and
+// everything local matching covers): a debounced fetch resolves the
+// current query to an id set; local field matching stays as the
+// instant-feedback lane and the union renders. A failed/stale server
+// pass degrades to local-only — never a blank.
+let agendaServerSearch = { q: '', ids: null };
+let agendaServerSearchTimer = null;
+function agendaServerSearchKick() {
+  if (agendaServerSearchTimer) clearTimeout(agendaServerSearchTimer);
+  const q = agendaSearch.trim().toLowerCase();
+  if (!q) {
+    agendaServerSearch = { q: '', ids: null };
+    return;
+  }
+  agendaServerSearchTimer = setTimeout(async () => {
+    agendaServerSearchTimer = null;
+    try {
+      const resp = await daemonApi.request('api_agenda_list', { shape: 'summary', q });
+      if (resp.ok && resp.body && Array.isArray(resp.body.items)) {
+        // Only adopt if the query is still current (races drop stale).
+        if (agendaSearch.trim().toLowerCase() === q) {
+          agendaServerSearch = { q, ids: new Set(resp.body.items.map((x) => x.id)) };
+          agendaRenderTab();
+        }
+      }
+    } catch (e) {
+      console.warn('[agenda] server search failed', e);
+    }
+  }, 250);
+}
+
 function agendaSearchMatch(item, q) {
   if (!q) return true;
+  // Server-resolved hits for the live query (body + digest reach).
+  if (agendaServerSearch.ids && agendaServerSearch.q === q
+    && agendaServerSearch.ids.has(item.id)) {
+    return true;
+  }
   // Digest-prefix search: >=8 hex chars (case-insensitive — q arrives
   // lowercased) match any digest the item owns, resolving to the
   // owning item exactly like an id search. The 8-char floor sits under
@@ -404,25 +442,12 @@ function agendaSearchMatch(item, q) {
     || String(item.id || '').toLowerCase().includes(q);
 }
 
-// The un-triaged frontier — the triage mandate's declared scope: open
-// items newer than the newest triage summary (`triage:summary` tag), or
-// unplaced with no triage annotation; summaries themselves excluded, and
-// so are daemon-parked items that are currently placed (Track PR ruling
-// 2, the mirror-writer exemption: a PR anchor the scanner parked and
-// filed arrives already placed and described — "untriaged" is false of
-// it; unfiling one re-admits it). A render-side convention over ordinary
-// data, like the rank parse; the ctl twin is `agenda_item_in_frontier`
-// and the four expressions (ctl, this, docs, the triage definition)
-// move together.
+// The un-triaged frontier — the triage mandate's declared scope.
+// Track AS S5: `frontier` is SERVED (the daemon's serving-seam
+// predicate — one implementation replacing the ctl/SPA/triage-definition
+// prose triple; ruling §4.4). Event-lane rows age per the Q4 contract.
 function agendaFrontierPredicate() {
-  const newestSummary = Math.max(0, ...(agendaItems || [])
-    .filter((x) => (x.tags || []).includes('triage:summary'))
-    .map((x) => (x.provenance && x.provenance.created_ms) || 0));
-  return (x) => x.status === 'open'
-    && !(x.tags || []).includes('triage:summary')
-    && !(x.part_of && x.provenance && x.provenance.kind === 'daemon')
-    && (((x.provenance && x.provenance.created_ms) || 0) > newestSummary
-      || (!x.part_of && !(x.annotations || []).some((a) => a.source === 'triage')));
+  return (x) => x.frontier === true;
 }
 
 function agendaFilteredPool() {
@@ -925,8 +950,11 @@ function agendaCardEffectStrip(item) {
     line = `${proposer}: runs ${agendaAbsTime(st.manifest.fire_at_ms)}`
       + (st.rec ? ` · every ${agendaCadenceLabel(st.rec.every_ms)}` : ' · once')
       + ' — needs your approval';
-    actions = agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision')
+    actions = agendaEffectRevisionChipHtml(e)
+      + agendaDigestChipHtml(e.digest, 'Approve binds exactly this manifest revision',
+        agendaDigestPulseClass(e.effect_id))
       + `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — shape, executor, project, goal, cadence. Saving mints a new digest for you to approve">Edit…</button>`
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'suspended') {
     line = `Standing run suspended after ${e.consecutive_failures} failures — never silently re-fired`;
@@ -1012,16 +1040,20 @@ function agendaAutomationStripHtml(item) {
   // The manifest digest, always visible where the gesture lives — the
   // one thing depth never folds away, because it is what Approve signs
   // (and what a recorded approval covers once bound).
+  const revised = agendaEffectRevisionChipHtml(e);
+  if (revised) meta.push(revised);
   meta.push(agendaDigestChipHtml(e.digest,
     st.kind === 'pending' ? 'Approve binds exactly this manifest revision'
       : st.kind === 'suspended' ? 'Re-arm re-approves exactly this unchanged manifest revision'
         : e.approval && e.approval.digest === e.digest
           ? 'Your recorded approval covers exactly this manifest revision'
-          : 'The manifest revision this row describes'));
+          : 'The manifest revision this row describes',
+    agendaDigestPulseClass(e.effect_id)));
   let actions = '';
   const digest = escapeHtml(e.digest || '');
   if (st.kind === 'pending') {
-    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`;
+    actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`;
   } else if (st.kind === 'suspended') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`;
   } else if (st.kind === 'running') {
@@ -1448,9 +1480,12 @@ function agendaRenderTab() {
   const bellDot = document.getElementById('ag2-bell-dot');
   if (bellDot) bellDot.hidden = !agendaQuietNow();
 
-  // Ledger + load/loading states.
+  // Ledger + load/loading states. A failed refresh with data in hand
+  // renders the DATA plus a stale notice — never a blank over a live
+  // cache (Track AS S3, the abort-resilience bridge: the since_seq
+  // healing lane retries on the next gap/wake/reconnect signal).
   const ledger = document.getElementById('ag2-ledger');
-  if (agendaLoadError) {
+  if (agendaLoadError && agendaItems === null) {
     agendaLensSurfacesDeactivate(null);
     groupsHost.innerHTML = `<div class="ui-empty">${escapeHtml(agendaLoadError)}</div>`;
     ledger.textContent = '';
@@ -1465,10 +1500,13 @@ function agendaRenderTab() {
   const skipped = agendaSkippedLines > 0
     ? ` · ${agendaSkippedLines} newer-build line${agendaSkippedLines === 1 ? '' : 's'} preserved unfolded (an older binary never destroys history it can’t read)`
     : '';
+  const stale = agendaLoadError
+    ? ` · last refresh failed (showing last-known data): ${agendaLoadError}`
+    : '';
   // Real ops truth from GET /api/agenda/ops (slice D, ui2-agenda-hood.js):
   // the segment renders once fetched; the sync fetches only while this
   // tab is visible and the data signature moved.
-  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}`;
+  ledger.textContent = `agenda.jsonl · append-only op log · ${agendaCounts.open || 0} open · ${agendaCounts.done || 0} done · ${agendaCounts.retired || 0} retired${agendaLedgerOpsSegment()}${skipped}${stale}`;
   agendaLedgerOpsSync();
 
   const lens = AGENDA_LENSES.find((l) => l.id === agendaLens) || AGENDA_LENSES[0];
@@ -1549,6 +1587,13 @@ function agendaGroupsClick(e) {
     agendaSendOp(params, opBtn).then((item) => {
       if (item && params.op === 'approve_effect') agendaApprovalMoment(item);
     });
+    return;
+  }
+  const editSched = e.target.closest('[data-edit-sched]');
+  if (editSched) {
+    // The card's edit affordance OPENS the one editor — the schedule
+    // sheet — whose save is the one re-propose emitter. No op here.
+    agendaOpenSchedSheet(editSched.dataset.editSched);
     return;
   }
   const jump = e.target.closest('[data-jump-session]');
