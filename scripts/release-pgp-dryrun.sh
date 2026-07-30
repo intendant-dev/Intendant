@@ -47,6 +47,7 @@ done
 WORK="$(mktemp -d)"
 CONNECT_PID="" MOCK_PID=""
 cleanup() {
+    # disown'd at spawn, so the kills stay silent in the transcript
     [ -n "$CONNECT_PID" ] && kill "$CONNECT_PID" 2> /dev/null || true
     [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2> /dev/null || true
     gpgconf --homedir "$WORK/pgp-home" --kill gpg-agent 2> /dev/null || true
@@ -94,6 +95,7 @@ RELEASE_TOKEN="dryrun-$(date +%s)"
     --data-file "$WORK/connect-data.json" \
     --release-token "$RELEASE_TOKEN" > "$WORK/connect.log" 2>&1 &
 CONNECT_PID=$!
+disown "$CONNECT_PID"
 for _ in $(seq 1 50); do
     curl -fsS "http://127.0.0.1:$CONNECT_PORT/api/log/sth" > /dev/null 2>&1 && break
     kill -0 "$CONNECT_PID" 2> /dev/null || { echo "error: intendant-connect died:" >&2; cat "$WORK/connect.log" >&2; exit 1; }
@@ -192,6 +194,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 PY
 MOCK_PID=$!
+disown "$MOCK_PID"
 sleep 0.5
 INTENDANT_HOME="$WORK/ihome" "$INTENDANT_BIN" hosted-verify --releases "$TAG" --download \
     --connect "http://127.0.0.1:$CONNECT_PORT" \
