@@ -2091,14 +2091,17 @@ mod tests {
     /// lens adds a glance layer without rewriting those claims.
     #[test]
     fn closable_lens_is_positive_only() {
-        assert!(APP_HTML.contains("if (stop === 'kills_live_run' || stop === 'owed_work') return false;"));
+        assert!(APP_HTML
+            .contains("if (stop === 'kills_live_run' || stop === 'owed_work') return false;"));
         assert!(APP_HTML.contains("if (stop === 'settled') return quiet;"));
         assert!(APP_HTML.contains("if (stop || claim.linked) return false;"));
         assert!(APP_HTML.contains("id=\"ui2-closable-lens-btn\" hidden"));
         assert!(APP_HTML.contains(
             "html[data-ui2-closable-lens=\"on\"] .session-window:not(.session-window-closable)"
         ));
-        assert!(APP_HTML.contains("if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);"));
+        assert!(
+            APP_HTML.contains("if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);")
+        );
         assert!(APP_HTML.contains("win.el.classList.toggle('session-window-closable', closable)"));
     }
 }
