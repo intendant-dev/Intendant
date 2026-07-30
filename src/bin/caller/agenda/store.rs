@@ -2624,6 +2624,7 @@ fn validate_park_refs(
 /// Validate one typed-ref spec (G1). Per-type locator rules with named
 /// rejections; file refs must exist, be regular files within the digest
 /// bound, and are hashed HERE — attach-time truth, recorded in the op.
+/// Dir refs must exist and stay digestless pointers.
 fn validate_ref(
     ref_type: AgendaRefType,
     locator: &str,
@@ -2634,6 +2635,19 @@ fn validate_ref(
     if locator.is_empty() {
         return Err(AgendaError::Invalid("ref locator must not be empty".into()));
     }
+    // Dir refs: trailing slashes are display sugar — store the one
+    // slashless spelling so `(type, locator)` addressing cannot mint two
+    // addresses for one directory.
+    let locator = if ref_type == AgendaRefType::Dir {
+        let trimmed = locator.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/"
+        } else {
+            trimmed
+        }
+    } else {
+        locator
+    };
     let label = match label {
         None => None,
         Some(label) => {
@@ -2684,6 +2698,32 @@ fn validate_ref(
             Some(digest_file(path).map_err(|err| {
                 AgendaError::Invalid(format!("cannot digest file ref {locator}: {err}"))
             })?)
+        }
+        AgendaRefType::Dir => {
+            if locator.chars().count() > MAX_REF_FILE_LOCATOR_CHARS {
+                return Err(AgendaError::Invalid(format!(
+                    "dir ref path exceeds {MAX_REF_FILE_LOCATOR_CHARS} characters"
+                )));
+            }
+            let path = Path::new(locator);
+            if !path.is_absolute() {
+                return Err(AgendaError::Invalid("dir ref path must be absolute".into()));
+            }
+            let meta = std::fs::metadata(path).map_err(|err| {
+                AgendaError::Invalid(format!(
+                    "cannot attach a dir ref: {locator} is not readable ({err})"
+                ))
+            })?;
+            if !meta.is_dir() {
+                return Err(AgendaError::Invalid(format!(
+                    "cannot attach a dir ref: {locator} is not a directory \
+                     (attach a file ref instead)"
+                )));
+            }
+            // Deliberately digestless: a directory has no attach-time
+            // byte identity without a priced tree-hash scheme (future
+            // vocabulary); presence is its only honest drift signal.
+            None
         }
         AgendaRefType::Memory | AgendaRefType::Session => {
             if locator.chars().count() > MAX_REF_ID_LOCATOR_CHARS {
@@ -4317,6 +4357,22 @@ mod tests {
                 "not a regular file",
             ),
             (
+                add_ref_cmd(&id, AgendaRefType::Dir, "relative/dir"),
+                "absolute",
+            ),
+            (
+                add_ref_cmd(
+                    &id,
+                    AgendaRefType::Dir,
+                    &files.path().join("gone-dir").to_string_lossy(),
+                ),
+                "not readable",
+            ),
+            (
+                add_ref_cmd(&id, AgendaRefType::Dir, &brief_loc),
+                "not a directory",
+            ),
+            (
                 add_ref_cmd(&id, AgendaRefType::Url, "ftp://example.com/x"),
                 "http:// or https://",
             ),
@@ -4387,6 +4443,24 @@ mod tests {
             assert_eq!(r.ref_type, rt);
             assert!(r.digest.is_none());
         }
+
+        // dir refs: absolute existing directories attach as digestless
+        // pointers, trailing slashes normalized to one spelling.
+        let dir_loc = files.path().to_string_lossy().into_owned();
+        let item = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::Dir, &format!("{dir_loc}/")),
+                owner(),
+                1006,
+            )
+            .unwrap();
+        let r = item
+            .refs
+            .iter()
+            .find(|r| r.ref_type == AgendaRefType::Dir)
+            .unwrap();
+        assert_eq!(r.locator, dir_loc, "trailing slash normalized away");
+        assert!(r.digest.is_none());
 
         // Remove is an op: the view drops the ref, the log keeps history.
         let ops_before = store.ops();
