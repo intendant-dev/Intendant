@@ -1492,6 +1492,10 @@ function agendaRenderTab() {
   lensesHost.querySelectorAll('button[data-lens]').forEach((btn) => {
     btn.addEventListener('click', () => {
       agendaLens = btn.dataset.lens;
+      // Lens interaction re-pulls the summaries (throttled) so served
+      // cross-item flags on untouched items refresh — the ruled Q4
+      // freshness affordance (gate fix F-AS1).
+      agendaSummariesRepull('lens');
       agendaRenderTab();
     });
   });

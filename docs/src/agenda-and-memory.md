@@ -1283,9 +1283,11 @@ tests is the tripwire, not a refactor.
   (`effects[].next_fire_ms`, `deferred_until`, `watched_by`) and the
   served flags are read-time values computed at the serving seam. A
   delta refreshes them only on returned items; untouched items'
-  decorations age between reads exactly as they always have. Clients
-  re-pull summaries on lens interaction and on wake; there is no
-  composite version vector unless live staleness ever bites.
+  decorations age between reads exactly as they always have. The dashboard
+  re-pulls the full summary feed on lens interaction and on a
+  minutes-scale idle timer while visible (both throttled); wake and
+  event gaps heal by delta. There is no composite version vector unless
+  live staleness ever bites.
 - **`shape=summary` (the projection).** The summary DTO carries exactly
   what the dashboard's cards render ungated: identity, chips, instants,
   who-line session ids, answer text on answered questions, UNCLEARED

@@ -182,6 +182,7 @@ async function agendaRefresh() {
         agendaSessionLookupsAttempted = new Set(
           agendaItems.flatMap(agendaItemSessionIds));
         agendaLoadError = '';
+        agendaLastFullPullAt = Date.now();
         agendaAnnounceParkedAsks();
       } else {
         agendaLoadError = (resp.body && resp.body.error) || `agenda unavailable (${resp.status})`;
@@ -332,6 +333,28 @@ async function agendaHeal(reason) {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && agendaItems !== null) agendaHeal('tab-wake');
 });
+
+// The ruled Q4 freshness mitigation (gate fix F-AS1): served cross-item
+// flags (blocked/frontier/watched_by) on UNTOUCHED items age between
+// reads — deltas refresh only changed items by design. Two affordances
+// keep them honest: a FULL summary re-pull on lens interaction, and a
+// minutes-scale idle re-pull while the tab is visible. Both throttle
+// through one gate so lens-hopping never hammers the daemon.
+const AGENDA_REPULL_MIN_INTERVAL_MS = 15000;
+const AGENDA_IDLE_REPULL_MS = 5 * 60 * 1000;
+let agendaLastFullPullAt = 0;
+
+function agendaSummariesRepull(reason) {
+  if (agendaItems === null) return; // bootstrap owns the first fetch
+  const now = Date.now();
+  if (now - agendaLastFullPullAt < AGENDA_REPULL_MIN_INTERVAL_MS) return;
+  agendaLastFullPullAt = now;
+  agendaRefresh().catch((e) => console.warn('[agenda] summary re-pull failed', reason, e));
+}
+
+setInterval(() => {
+  if (!document.hidden && agendaItems !== null) agendaSummariesRepull('idle');
+}, AGENDA_IDLE_REPULL_MS);
 
 // Track AS S6 — the archive store: closed items OLDER than the live
 // window, paged from the server at FULL grain (ruling R-AS2 — these
