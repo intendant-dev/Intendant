@@ -267,11 +267,59 @@ fn agenda_sessions_join(
     out
 }
 
+/// The session-join resolution cache (Track AS S8, ruling Q10): the
+/// per-id resolution pays file I/O — `session_meta.json` reads,
+/// wrapper-index lookups, and on a miss a full `read_dir` scan of the
+/// logs root (~18 ms warm on a 3,600-entry box, once per id per
+/// request before this). Entries are keyed by `(home, id)` (hermetic
+/// tests inject tempdir homes) and validated by FILE IDENTITY — the
+/// session dir's mtime, or the logs root's mtime for unresolved ids
+/// (a new session dir bumps it, re-admitting the lookup). A cache
+/// entry is never authoritative: any identity change recomputes.
+type SessionJoinKey = (std::path::PathBuf, String);
+type SessionJoinEntry = (Option<std::time::SystemTime>, Option<serde_json::Value>);
+static SESSION_JOIN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<SessionJoinKey, SessionJoinEntry>>,
+> = std::sync::OnceLock::new();
+
+fn session_join_identity(
+    home: &std::path::Path,
+    recorded_id: &str,
+) -> Option<std::time::SystemTime> {
+    let session_dir = home.join("logs").join(recorded_id);
+    std::fs::metadata(&session_dir)
+        .or_else(|_| std::fs::metadata(home.join("logs")))
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
 /// One recorded session id → its display identity, or `None` when nothing
 /// on this daemon resolves it anymore. `project_root` (additive) is the
 /// session's recorded project root — the Start-now sheet's provenance
 /// prefill and the follow-up resume's launch root derive from it.
+/// Cached by file identity (see [`SESSION_JOIN_CACHE`]).
 fn agenda_session_join_entry(
+    home: &std::path::Path,
+    recorded_id: &str,
+) -> Option<serde_json::Value> {
+    let identity = session_join_identity(home, recorded_id);
+    let key = (home.to_path_buf(), recorded_id.to_string());
+    let cache = SESSION_JOIN_CACHE.get_or_init(Default::default);
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_identity, value)) = cache.get(&key) {
+            if *cached_identity == identity {
+                return value.clone();
+            }
+        }
+    }
+    let value = agenda_session_join_entry_uncached(home, recorded_id);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, (identity, value.clone()));
+    }
+    value
+}
+
+fn agenda_session_join_entry_uncached(
     home: &std::path::Path,
     recorded_id: &str,
 ) -> Option<serde_json::Value> {
