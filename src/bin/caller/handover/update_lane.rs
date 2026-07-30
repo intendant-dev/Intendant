@@ -22,10 +22,10 @@
 //!   the latest release manifest via the transparency-log ritual
 //!   (`hosted_verify::verify_hosted_release` — inclusion proof, signed
 //!   tree head, append-only pin, PGP identity/coverage), then download
-//!   + sha256 against the LOG + `gpg --verify` against the compiled-in
-//!   release signing key in a throwaway GNUPGHOME, then install beside
-//!   the running app. FAIL CLOSED on every verify step: unverified
-//!   bytes are deleted, never installed.
+//!   with sha256 checked against the LOG, `gpg --verify` against the
+//!   compiled-in release signing key in a throwaway GNUPGHOME, then
+//!   install beside the running app. FAIL CLOSED on every verify step:
+//!   unverified bytes are deleted, never installed.
 //!
 //! Boundary (the commission's first-class gate line): the daemon never
 //! self-execs the build or fetch and NEVER execs a successor daemon —
