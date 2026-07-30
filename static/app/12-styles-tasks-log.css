@@ -2395,6 +2395,33 @@ a.vx-pr-row:focus-visible { outline: 2px solid var(--lavender); outline-offset: 
   font-size: 13px;
   line-height: 1.35;
 }
+/* GFM tables (renderMarkdownTable). The wrap div owns horizontal overflow
+   so a wide table scrolls inside the bubble instead of stretching it. */
+.log-markdown .md-table-wrap {
+  margin: 4px 0 7px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.log-markdown .md-table-wrap:last-child { margin-bottom: 0; }
+.log-markdown table {
+  border-collapse: collapse;
+  line-height: 1.4;
+}
+.log-markdown th,
+.log-markdown td {
+  padding: 3px 9px;
+  border: 1px solid var(--surface1);
+  text-align: left;
+  vertical-align: top;
+}
+.log-markdown th {
+  color: var(--text);
+  font-weight: 700;
+  background: color-mix(in srgb, var(--surface0) 55%, transparent);
+}
+.log-markdown tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--surface0) 30%, transparent);
+}
 .log-command {
   white-space: normal;
 }
