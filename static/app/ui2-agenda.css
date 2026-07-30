@@ -1071,6 +1071,18 @@ html.ui-v2 .ag2-graph-projchip:disabled {
   opacity: 0.45;
   cursor: default;
 }
+html.ui-v2 .ag2-graph-panel.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 600;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
+html.ui-v2 .ag2-graph-panel.fullscreen canvas {
+  height: 100vh;
+  height: 100dvh;
+}
 html.ui-v2 .ag2-graph-capnote {
   position: absolute;
   inset: 0;
