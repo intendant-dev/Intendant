@@ -1840,25 +1840,10 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
         map.insert("wait_seconds".to_string(), Value::from(seconds));
     }
     if !options.is_empty() {
-        let options: Vec<Value> = options
-            .iter()
-            .map(|option| {
-                let (label, description) = match option.split_once(':') {
-                    Some((label, description)) => (label.trim(), Some(description.trim())),
-                    None => (option.trim(), None),
-                };
-                let mut entry = Map::new();
-                entry.insert("label".to_string(), Value::String(label.to_string()));
-                if let Some(description) = description.filter(|d| !d.is_empty()) {
-                    entry.insert(
-                        "description".to_string(),
-                        Value::String(description.to_string()),
-                    );
-                }
-                Value::Object(entry)
-            })
-            .collect();
-        map.insert("options".to_string(), Value::Array(options));
+        map.insert(
+            "options".to_string(),
+            Value::Array(ask_option_entries(&options)),
+        );
     }
     let previews = collect_preview_args(&args)?;
     if !previews.is_empty() {
@@ -1868,6 +1853,30 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
         return Ok(ask_park_command(map));
     }
     Ok(Value::Object(map))
+}
+
+/// Parse repeatable `--option "Label[:desc]"` values into the ask-rail
+/// option entries — ONE splitter for `ctl ask` and `ctl agenda ask`, so
+/// the two lanes can never drift on the label grammar.
+fn ask_option_entries(options: &[&str]) -> Vec<Value> {
+    options
+        .iter()
+        .map(|option| {
+            let (label, description) = match option.split_once(':') {
+                Some((label, description)) => (label.trim(), Some(description.trim())),
+                None => (option.trim(), None),
+            };
+            let mut entry = Map::new();
+            entry.insert("label".to_string(), Value::String(label.to_string()));
+            if let Some(description) = description.filter(|d| !d.is_empty()) {
+                entry.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            Value::Object(entry)
+        })
+        .collect()
 }
 
 /// Turn built `ask_user` arguments (flat or `questions` form) into the
@@ -2173,11 +2182,22 @@ async fn run_agenda(
         }
         "ask" => {
             // Sugar for `add --kind question`: a durable, non-blocking ask
-            // the owner answers later (`agenda answer`).
-            let mut args = raw[1..].to_vec();
-            args.push("--kind".to_string());
-            args.push("question".to_string());
-            let response = call_tool(client, config, "agenda_op", agenda_add_args(&args)?).await?;
+            // the owner answers later (`agenda answer`). With --option
+            // (the decision-card lane) it parks through the rich-ask op
+            // instead, so the choices ride the ask-rail vocabulary on the
+            // same item and render as one-click answers, not prose.
+            let structured = ["--option", "--multi", "--pick", "--header"]
+                .iter()
+                .any(|flag| raw[1..].iter().any(|arg| arg == flag));
+            let params = if structured {
+                agenda_ask_args(&raw[1..])?
+            } else {
+                let mut args = raw[1..].to_vec();
+                args.push("--kind".to_string());
+                args.push("question".to_string());
+                agenda_add_args(&args)?
+            };
+            let response = call_tool(client, config, "agenda_op", params).await?;
             print_tool_response(response, config, None)?;
         }
         "answer" => {
@@ -2952,6 +2972,17 @@ fn agenda_add_args(raw: &[String]) -> Result<Value, String> {
     // Refs riding the parking gesture (G1): `--label` and `--must-read`
     // apply to every `--ref` of this add — attach separately via
     // `agenda ref` when they differ.
+    let refs = agenda_park_ref_entries(&args)?;
+    if !refs.is_empty() {
+        map.insert("refs".to_string(), Value::Array(refs));
+    }
+    insert_string(&mut map, "source", args.one("--source"));
+    Ok(Value::Object(map))
+}
+
+/// The park-time `--ref`/`--must-read`/`--label` sugar shared by
+/// `agenda add` and the structured `agenda ask` lane.
+fn agenda_park_ref_entries(args: &CommandArgs) -> Result<Vec<Value>, String> {
     let mut refs: Vec<Value> = Vec::new();
     for spec in args.all("--ref") {
         let (ref_type, locator) = agenda_ref_spec(spec, None)?;
@@ -2967,6 +2998,73 @@ fn agenda_add_args(raw: &[String]) -> Result<Value, String> {
     if refs.is_empty() && (args.has("--must-read") || args.one("--label").is_some()) {
         return Err("--must-read/--label describe refs: pass --ref too".to_string());
     }
+    Ok(refs)
+}
+
+/// Build the structured `agenda ask` park (`{"op":"ask",…}`) — the
+/// decision-card lane: the SAME `--option "Label[:desc]"` / `--multi` /
+/// `--pick` vocabulary as `ctl ask`, plus the agenda park fields
+/// (`--body/--tag/--due/--ref/--source`), so a gate-tagged owner
+/// decision renders as one-click choices instead of prose. The question
+/// text doubles as the item title (daemon-clipped).
+fn agenda_ask_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(
+        raw,
+        &[
+            "--body", "--tag", "--due", "--source", "--ref", "--label", "--option", "--pick",
+            "--header",
+        ],
+        &["--multi", "--must-read"],
+    )?;
+    if args.positional.is_empty() {
+        return Err("agenda ask requires question text".to_string());
+    }
+    let options: Vec<&str> = args.all("--option").collect();
+    if options.is_empty() {
+        return Err("--multi/--pick/--header describe options: pass --option too".to_string());
+    }
+    if options.len() > crate::mcp::ASK_USER_MAX_OPTIONS {
+        return Err(format!(
+            "too many options: {} (max {}; omit --option for free-text only)",
+            options.len(),
+            crate::mcp::ASK_USER_MAX_OPTIONS
+        ));
+    }
+    let mut question = Map::new();
+    question.insert(
+        "question".to_string(),
+        Value::String(args.positional.join(" ")),
+    );
+    insert_string(&mut question, "header", args.one("--header"));
+    question.insert(
+        "options".to_string(),
+        Value::Array(ask_option_entries(&options)),
+    );
+    // The park wire speaks precise pick bounds only (ask_park_command's
+    // rule): --pick verbatim; --multi = any subset of the options.
+    if let Some(pick) = args.one("--pick") {
+        if args.has("--multi") {
+            return Err("--pick replaces --multi — provide one or the other".into());
+        }
+        let (min, max) = parse_pick_spec(pick)?;
+        question.insert("pick_min".to_string(), Value::from(min));
+        question.insert("pick_max".to_string(), Value::from(max));
+    } else if args.has("--multi") {
+        question.insert("pick_min".to_string(), Value::from(1));
+        question.insert("pick_max".to_string(), Value::from(options.len()));
+    }
+    let mut map = Map::new();
+    map.insert("op".to_string(), Value::String("ask".to_string()));
+    map.insert(
+        "questions".to_string(),
+        Value::Array(vec![Value::Object(question)]),
+    );
+    insert_string(&mut map, "body", args.one("--body"));
+    insert_string_array(&mut map, "tags", args.all("--tag"));
+    if let Some(due) = args.one("--due") {
+        map.insert("due_ms".to_string(), Value::from(parse_due_ms(due)?));
+    }
+    let refs = agenda_park_ref_entries(&args)?;
     if !refs.is_empty() {
         map.insert("refs".to_string(), Value::Array(refs));
     }
@@ -5352,6 +5450,11 @@ fn help_agenda() {
   intendant ctl agenda add TITLE... [--note|--task|--kind question] [--body TEXT] [--tag TAG]... [--due WHEN]\n\
       [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT] [--source LABEL]\n\
   intendant ctl agenda ask QUESTION... [--body TEXT] [--tag TAG]... [--due WHEN] [--source LABEL]\n\
+      [--option \"Label[:desc]\"]... [--multi | --pick MIN[-MAX]] [--header TEXT]\n\
+      [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT]\n\
+      # --option parks a STRUCTURED question (the ask-rail vocabulary): the dashboard\n\
+      # renders the choices as one-click answers; append \" (Recommended)\" to the label\n\
+      # you endorse and the detail panel highlights it\n\
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
   intendant ctl agenda annotate ID_PREFIX NOTE... [--source LABEL]\n\
@@ -5981,6 +6084,76 @@ mod tests {
         assert!(err.contains("--park doesn't wait"), "{err}");
         let err = ask_args(&args(&["Q", "--park", "--session", "sess-1"])).unwrap_err();
         assert!(err.contains("drop --session"), "{err}");
+    }
+
+    /// `agenda ask --option` (the decision-card lane): the ask-rail
+    /// option vocabulary plus the agenda park fields ride ONE structured
+    /// park command; option-modifier flags without `--option` refuse.
+    #[test]
+    fn agenda_ask_args_builds_structured_park() {
+        let value = agenda_ask_args(&args(&[
+            "Live-window",
+            "width?",
+            "--option",
+            "14 days (Recommended):fixed daemon-side constant",
+            "--option",
+            "30 days",
+            "--multi",
+            "--header",
+            "Window",
+            "--body",
+            "ORIENTATION: pick one.",
+            "--tag",
+            "gate",
+            "--tag",
+            "track-as",
+            "--ref",
+            "/tmp/findings.md",
+            "--must-read",
+            "--source",
+            "steward",
+        ]))
+        .expect("structured park args");
+        assert_eq!(value["op"], "ask");
+        let q = &value["questions"][0];
+        assert_eq!(q["question"], "Live-window width?");
+        assert_eq!(q["header"], "Window");
+        let options = q["options"].as_array().unwrap();
+        assert_eq!(options[0]["label"], "14 days (Recommended)");
+        assert_eq!(options[0]["description"], "fixed daemon-side constant");
+        assert_eq!(options[1]["label"], "30 days");
+        // --multi became precise bounds (the park wire's rule).
+        assert_eq!(q["pick_min"], 1);
+        assert_eq!(q["pick_max"], 2);
+        assert_eq!(value["body"], "ORIENTATION: pick one.");
+        assert_eq!(
+            value["tags"].as_array().unwrap(),
+            &vec![
+                serde_json::Value::from("gate"),
+                serde_json::Value::from("track-as")
+            ]
+        );
+        assert_eq!(value["source"], "steward");
+        let refs = value["refs"].as_array().unwrap();
+        assert_eq!(refs[0]["ref_type"], "file");
+        assert_eq!(refs[0]["locator"], "/tmp/findings.md");
+        assert_eq!(refs[0]["must_read"], true);
+
+        // --pick rides verbatim and excludes --multi.
+        let value =
+            agenda_ask_args(&args(&["Q", "--option", "A", "--option", "B", "--pick", "0-2"]))
+                .unwrap();
+        assert_eq!(value["questions"][0]["pick_min"], 0);
+        assert_eq!(value["questions"][0]["pick_max"], 2);
+        let err = agenda_ask_args(&args(&[
+            "Q", "--option", "A", "--pick", "1", "--multi",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--pick replaces --multi"), "{err}");
+
+        // Modifier flags without options refuse by name.
+        let err = agenda_ask_args(&args(&["Q", "--multi"])).unwrap_err();
+        assert!(err.contains("pass --option too"), "{err}");
     }
 
     #[test]

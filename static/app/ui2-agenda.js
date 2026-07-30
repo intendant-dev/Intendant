@@ -604,6 +604,31 @@ function agendaCadenceLabel(everyMs) {
   return `${minutes}m`;
 }
 
+// Explicit recommendation lines surfaced from a prose question body
+// (decision-card UX). Deliberately literal — NOT a markdown engine: a
+// sentence starting "Recommendation:" / "Recommended:" / "Disposition:"
+// at a line start or after a sentence boundary is surfaced up to its own
+// sentence end (the next ". " opening a new sentence, a newline, or the
+// end of the body), clipped for the strip. Prose without the markers
+// renders untouched; the body itself stays the readable truth. Returns
+// [{kind, text}] — plain TEXT, the caller escapes.
+function agendaBodyRecommendations(body) {
+  const text = String(body || '');
+  if (!text) return [];
+  const out = [];
+  const marker = /(^|\n|\.\s|;\s|—\s|\)\s)\s*(Recommendation|Recommended|Disposition)\s*:\s*/g;
+  let m;
+  while ((m = marker.exec(text)) && out.length < 4) {
+    const rest = text.slice(marker.lastIndex);
+    const end = rest.search(/\.\s+(?=[A-Z0-9“"(])|\n/);
+    let sentence = (end === -1 ? rest : rest.slice(0, end + 1)).trim();
+    if (!sentence) continue;
+    if (sentence.length > 280) sentence = `${sentence.slice(0, 277)}…`;
+    out.push({ kind: m[2], text: sentence });
+  }
+  return out;
+}
+
 // The dismissal chip's tooltip (marker on a still-open question whose
 // rail card was skipped/denied). Plain TEXT — the caller escapes.
 function agendaDismissedTip(dismissed) {

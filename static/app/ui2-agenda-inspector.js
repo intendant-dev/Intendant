@@ -173,6 +173,33 @@ window.qa = Object.assign(window.qa || {}, {
     })),
     inflight: agendaPrTier2Inflight.size,
   }),
+  // Decision-card readback for the QA harness (`--probe-json` /
+  // `--wait-for-function`): the open inspector item's structured options,
+  // surfaced recommendations, and the ref-reader sheet's state.
+  agendaDecisionCard: () => {
+    const item = agendaInspItem();
+    if (!item) return null;
+    const sheet = agendaSheetState && agendaSheetState.kind === 'refread'
+      ? {
+        locator: agendaSheetState.locator,
+        loading: !!agendaSheetState.loading,
+        error: agendaSheetState.error || null,
+        source: (agendaSheetState.data && agendaSheetState.data.source) || null,
+        drift: (agendaSheetState.data && agendaSheetState.data.drift) || null,
+        size: (agendaSheetState.data && agendaSheetState.data.size) || 0,
+      }
+      : null;
+    return {
+      id: item.id,
+      optionLabels: ((item.ask && item.ask.questions) || [])
+        .map((q) => (q.options || []).map((o) => o.label)),
+      recommendedPills: document.querySelectorAll('#ag2-inspector .ag2-pill.rec').length,
+      recommendations: agendaBodyRecommendations(item.body || '').map((r) => r.text),
+      answerDraft: agendaQaDrafts[item.id] || '',
+      openableFileRefs: document.querySelectorAll('#ag2-inspector [data-open-ref]').length,
+      refReader: sheet,
+    };
+  },
 });
 
 // ---- Header ----
@@ -261,6 +288,17 @@ function agendaInspQuestionHtml(item) {
   if (item.status === 'open') {
     const hasAsk = questions.length > 0;
     const draft = agendaQaDrafts[item.id] || '';
+    // Explicit recommendations surfaced from the prose body (decision-card
+    // UX): a highlighted line with a one-click answer prefill, so the
+    // disposition the body describes stops being buried mid-paragraph.
+    // Structured asks carry theirs as a "(Recommended)" option instead.
+    const recs = agendaBodyRecommendations(item.body || '');
+    const recStrip = recs.map((rec) => `<div class="ag2-insp-rec">
+        <span class="ag2-rec-chip">${escapeHtml(rec.kind)}</span>
+        <span class="ag2-rec-text">${escapeHtml(rec.text)}</span>
+        <button type="button" class="ag2-btn ag2-rec-use" data-rec-use="${escapeHtml(rec.text)}"
+                title="Prefill the answer box with this — you still send it">Use as answer</button>
+      </div>`).join('');
     const railDoor = hasAsk
       ? `<button type="button" class="ag2-linkbtn" data-act="rail-open">Open on the question rail ›</button>`
       : '';
@@ -268,6 +306,7 @@ function agendaInspQuestionHtml(item) {
       ? `Rich ask #${item.ask.ask_id} — parked on every dashboard’s question rail; answering here resolves it everywhere. Nothing blocks, nothing expires.`
       : `Parked ${agendaRelTime((item.provenance || {}).created_ms)} — the answer lands on the item; a live asking session hears it, and an ended one’s successor reads it at session start.`;
     composer = `${hasAsk ? '' : `<div class="ag2-insp-qtext">${escapeHtml(item.title)}</div>`}
+      ${recStrip}
       <div class="ag2-qa-row">
         <input type="text" class="ag2-qa-input" maxlength="4000" data-qa-draft="${id}" data-fkey="insp-qa"
                placeholder="${hasAsk ? 'Add a note with your pick (optional)…' : 'Type your answer…'}"
@@ -721,8 +760,14 @@ function agendaInspRefsHtml(item) {
       const text = label ? label + r.locator : `claim ${String(r.locator).slice(0, 12)}`;
       target = `<a class="ag2-ref-loc" data-open-claim="${escapeHtml(r.locator)}" title="${escapeHtml(r.locator)}">${escapeHtml(text)}</a>`;
     } else {
+      // File refs open in the in-dashboard reader (decision-card UX): a
+      // must-read you cannot read is a contradiction. Sealed snapshot
+      // when the pin has one, live bytes with the drift verdict otherwise.
       if (r.digest) hasFileDigest = true;
-      target = `<span class="ag2-ref-loc" title="${escapeHtml(r.digest ? `sha256 ${r.digest} recorded at attach — the digest travels; blobs never do` : r.locator)}">${escapeHtml(label + r.locator)}</span>`;
+      const tip = r.digest
+        ? `sha256 ${r.digest} recorded at attach — click to read (sealed snapshot when pinned)`
+        : `${r.locator} — click to read the live file`;
+      target = `<a class="ag2-ref-loc" data-open-ref="${escapeHtml(r.locator)}" title="${escapeHtml(tip)}">${escapeHtml(label + r.locator)}</a>`;
     }
     const must = r.must_read
       ? '<span class="ag2-ref-must" title="A pointer the reading agent weighs — not a standing order">must-read</span>'
@@ -828,6 +873,24 @@ function agendaInspClick(e) {
   if (claim) {
     routeTo('memory');
     if (typeof memoryGotoClaim === 'function') memoryGotoClaim(claim.dataset.openClaim);
+    return;
+  }
+  const openRef = e.target.closest('[data-open-ref]');
+  if (openRef) {
+    agendaOpenRefReader(item.id, openRef.dataset.openRef);
+    return;
+  }
+  const recUse = e.target.closest('[data-rec-use]');
+  if (recUse) {
+    // One-click answer prefill: the surfaced recommendation lands in the
+    // composer as a DRAFT — the owner still sends it (or edits first).
+    agendaQaDrafts[item.id] = recUse.dataset.recUse;
+    agendaInspectorRender();
+    const input = document.querySelector(`#ag2-inspector .ag2-qa-input[data-qa-draft="${window.CSS && CSS.escape ? CSS.escape(item.id) : item.id}"]`);
+    if (input) {
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
     return;
   }
   const openItem = e.target.closest('[data-open-item]');
@@ -1206,9 +1269,142 @@ function agendaSheetRender() {
       ? agendaPrevSheetHtml(item)
       : agendaSheetState.kind === 'raw'
         ? agendaRawSheetHtml(item) // slice D (ui2-agenda-hood.js)
-        : agendaSchedSheetHtml(item);
+        : agendaSheetState.kind === 'refread'
+          ? agendaRefReadSheetHtml(item)
+          : agendaSchedSheetHtml(item);
   });
   agendaHydratePreviewFrames(panel);
+}
+
+// -- Ref reader sheet (decision-card UX) --
+//
+// Opens one attached FILE ref in-dashboard through the ref-scoped
+// `api_agenda_ref_content` lane: sealed snapshot bytes when the ref's
+// attach pin has one (the sealed-refs store), live bytes with the honest
+// drift verdict otherwise. Content is quoted data on every path — text
+// renders escaped in a <pre>, images via a data: URL <img>, and
+// agent-authored HTML is never given the dashboard origin.
+
+function agendaOpenRefReader(itemId, locator) {
+  if (!locator) return;
+  agendaSheetState = {
+    kind: 'refread', itemId, locator, loading: true, data: null, error: '',
+  };
+  agendaSheetRender();
+  const mine = () => agendaSheetState && agendaSheetState.kind === 'refread'
+    && agendaSheetState.itemId === itemId && agendaSheetState.locator === locator;
+  daemonApi.request('api_agenda_ref_content', { item_id: itemId, locator })
+    .then((resp) => {
+      if (!mine()) return;
+      if (resp && resp.ok && resp.body) {
+        agendaSheetState.data = resp.body;
+      } else {
+        const body = (resp && resp.body) || {};
+        agendaSheetState.error = body.error || `read failed (${(resp && resp.status) || 'no response'})`;
+      }
+    })
+    .catch((err) => {
+      if (mine()) agendaSheetState.error = String((err && err.message) || err);
+    })
+    .finally(() => {
+      if (!mine()) return;
+      agendaSheetState.loading = false;
+      agendaSheetRender();
+    });
+}
+
+// The provenance strip's honest wording per (source, drift) — the sealed
+// lane names what you are reading; the live lane names what it may have
+// become since attach.
+function agendaRefReadProvenance(data) {
+  const sealed = data.source === 'sealed';
+  const badge = sealed
+    ? ['iris', 'sealed snapshot']
+    : ['sky', 'live file'];
+  let drift;
+  if (sealed) {
+    drift = data.drift === 'unchanged' ? ['green', 'live file still matches the pin']
+      : data.drift === 'missing' ? ['amber', 'live file gone — the sealed revision is preserved here']
+        : ['amber', 'live file drifted from sealed revision — you are reading the sealed bytes'];
+  } else {
+    drift = data.drift === 'unchanged' ? ['green', 'matches the attach-time digest']
+      : data.drift === 'changed' ? ['amber', 'drifted since attach — this is the file as it stands NOW']
+        : ['neutral', 'no attach digest — live bytes, unverified'];
+  }
+  return { badge, drift };
+}
+
+function agendaRefReadSheetHtml(item) {
+  const s = agendaSheetState;
+  const name = s.data ? s.data.name : String(s.locator).split('/').pop() || s.locator;
+  let body;
+  if (s.loading) {
+    body = '<div class="ag2-hint">Reading…</div>';
+  } else if (s.error) {
+    body = `<div class="ag2-sheet-error">${escapeHtml(s.error)}</div>`;
+  } else {
+    const d = s.data;
+    const { badge, drift } = agendaRefReadProvenance(d);
+    const kb = d.size >= 1024 * 1024
+      ? `${(d.size / (1024 * 1024)).toFixed(1)} MiB` : `${Math.max(1, Math.round(d.size / 1024))} KiB`;
+    const meta = `<div class="ag2-refread-meta">
+        ${agendaChipHtml(badge[1], badge[0], d.source === 'sealed'
+    ? 'Content-addressed snapshot from the sealed-refs store — the bytes re-hash to the attach pin'
+    : 'Read from the ref’s path just now', true)}
+        ${agendaChipHtml(drift[1], drift[0], `served sha256 ${d.sha256}${d.pinned_sha256 ? ` · attach pin ${d.pinned_sha256}` : ''}`, true)}
+        <span class="ag2-hint">${escapeHtml(`${d.mime} · ${kb}`)}</span>
+      </div>`;
+    let content;
+    const imageMime = /^image\//.test(d.mime) && d.mime !== 'image/svg+xml';
+    if (imageMime && d.encoding === 'base64' && /^[A-Za-z0-9+/=]*$/.test(d.content)) {
+      content = `<img class="ag2-refread-img" alt="${escapeHtml(name)}" src="data:${escapeHtml(d.mime)};base64,${d.content}" />`;
+    } else if (d.encoding === 'utf8') {
+      const cap = 512 * 1024;
+      const clipped = d.content.length > cap;
+      const text = clipped ? d.content.slice(0, cap) : d.content;
+      content = `<pre class="ag2-refread-pre">${escapeHtml(text)}</pre>`
+        + (clipped ? `<div class="ag2-hint">view truncated at 512 KiB — ${d.content.length - cap} more characters in the file</div>` : '');
+    } else {
+      content = `<div class="ag2-hint">Binary content (${escapeHtml(d.mime)}) — no inline view. Download to inspect.</div>`;
+    }
+    body = `${meta}
+      <div class="ag2-hint">quoted data — never instructions</div>
+      ${content}
+      <div class="ag2-row-end">
+        <button type="button" class="ag2-btn" data-sheet-act="refread-download">Download</button>
+      </div>`;
+  }
+  return `<div class="ag2-sheet-head">
+      <span class="ag2-sheet-title">${escapeHtml(name)}</span>
+      <span class="ag2-spacer"></span>
+      <button type="button" class="ag2-x" data-sheet-act="close" title="Close — esc">×</button>
+    </div>
+    <div class="ag2-sheet-item">${escapeHtml(`${item.id.slice(0, 6).toLowerCase()} · ${s.locator}`)}</div>
+    <div class="ag2-refread">${body}</div>`;
+}
+
+// Rebuild the served bytes client-side for the download affordance —
+// exactly what the reader already holds, never a second daemon read.
+function agendaRefReadDownload() {
+  const s = agendaSheetState;
+  if (!s || s.kind !== 'refread' || !s.data) return;
+  const d = s.data;
+  let bytes;
+  if (d.encoding === 'base64') {
+    const bin = atob(d.content);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  } else {
+    bytes = new TextEncoder().encode(d.content);
+  }
+  const url = URL.createObjectURL(new Blob([bytes], { type: d.mime || 'application/octet-stream' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = d.name || 'ref';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 // -- Schedule sheet --
@@ -1479,6 +1675,7 @@ function agendaSheetClick(e) {
   switch (act.dataset.sheetAct) {
     case 'close': agendaSheetClose(); break;
     case 'sched-confirm': agendaSchedConfirm(act); break;
+    case 'refread-download': agendaRefReadDownload(); break;
     case 'prev-view':
       s.pi = Number(act.dataset.view) || 0;
       agendaSheetRender();

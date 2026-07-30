@@ -895,7 +895,7 @@ impl IntendantServer {
             let questions = park_questions(&params)?;
             let item = agenda
                 .apply(
-                    crate::agenda::AgendaCommand::Ask { questions },
+                    crate::agenda::AgendaCommand::ask(questions),
                     Some(park_actor(actor, &session_id)),
                 )
                 .map_err(|e| e.to_string())?;

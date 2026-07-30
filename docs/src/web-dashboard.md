@@ -427,6 +427,25 @@ park-vs-block doctrine and delivery semantics; **Start now**'s confirm
 sheet and the origin-conversation follow-up affordances are covered there
 too.
 
+**Decision cards.** The detail panel renders an open question as a
+decision, not a wall of prose. Structured options (parked with
+`ctl agenda ask --option`, or `ctl ask --park`) render as one-click
+choice pills in the ask-rail vocabulary, with the `(Recommended)` label
+convention highlighted; a prose body's explicit `Recommendation:` /
+`Recommended:` / `Disposition:` sentences surface as a highlighted strip
+whose **Use as answer** button prefills the answer box (the owner still
+sends). Bodies honor their own paragraph breaks (`white-space: pre-wrap`
+— no markdown engine). Attached **file refs open in-dashboard**: clicking
+one fetches `GET /api/agenda/items/{item_id}/refs/content` — ref-scoped
+to exactly the locators attached to the item, never a generic file
+server — and the reader sheet shows the bytes with honest provenance:
+the **sealed snapshot** from the sealed-refs store when the ref's attach
+pin has one (corruption refuses by name rather than silently serving
+live bytes), otherwise the **live file** with its drift verdict against
+the attach digest (`unchanged` / `changed` / `unpinned`). Text renders
+escaped, images inline, anything else offers a download; content stays
+quoted data on every path.
+
 Agenda also carries proposed scheduled-session effects. Agents may propose a
 goal and fire time, but no work runs until an owner surface approves the exact
 manifest digest shown in the tab; revising a proposal invalidates the prior
@@ -1925,6 +1944,7 @@ response omits the header.
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs against their attach digests (expand-time drift check) |
+| GET | `/api/agenda/items/{item_id}/refs/content` | AgendaRead | own origin | none | One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise) |
 | GET | `/api/agenda/items/{item_id}/pr-state` | AgendaRead | own origin | none | Live PR state for one anchor (expand-time render join; cached daemon-side) |
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |

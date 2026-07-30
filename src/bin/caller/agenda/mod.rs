@@ -49,6 +49,7 @@ pub(crate) use reminders::{
     AGENDA_OCCURRENCES_DEFAULT_LIMIT,
 };
 pub(crate) use scheduler::spawn_reminder_scheduler;
+pub(crate) use sealed_blobs::digest_bytes;
 pub(crate) use spawn_project::{recorded_session_project_root, SessionSpawnContext};
 pub(crate) use store::{
     attestation_ref_drift, digest_file, file_ref_drift, AgendaError, AgendaOpsPage, AgendaStore,
@@ -63,6 +64,8 @@ pub(crate) use types::{
 // with structured content.
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
+#[cfg(test)]
+pub(crate) use sealed_blobs::seal_content;
 #[cfg(test)]
 pub(crate) use reminders::OccurrenceState;
 #[cfg(test)]
