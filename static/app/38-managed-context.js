@@ -1821,6 +1821,10 @@ function clearLogs(options = {}) {
   updateLogEmptyState();
   activeCommandOutputGroups.clear();
   commandOutputGroups.clear();
+  // The main feed's reasoning-dedupe registry tracks what the feed SHOWS
+  // — emptied feed, emptied registry (41b-reasoning-log.js), or a
+  // reconnect replay's rows would be skipped as already-rendered.
+  resetLiveFeedReasoningDedupe();
   if (clearSessionWindows) {
     for (const win of sessionWindows.values()) {
       resetSessionWindowLog(win);
