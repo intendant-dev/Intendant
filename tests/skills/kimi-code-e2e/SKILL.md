@@ -2,13 +2,13 @@
 name: kimi-code-e2e
 description: >
   Reproducible live end-to-end acceptance test for Intendant's Kimi Code
-  external-agent backend. Exercises the real authenticated Kimi 0.27-0.28
+  external-agent backend. Exercises the real authenticated Kimi 0.27-0.29
   server-v1/v2 adapter with K2.7 Coding, including approvals/questions,
   attachments, streaming/usage/tools/diffs, native lifecycle and goal
   actions, exact historical fork/undo, side and background agents, search,
   interrupt/steer, and resume. Not for CI.
 compatibility: >
-  Requires an authenticated Kimi Code 0.27.x or 0.28.x installation and a
+  Requires an authenticated Kimi Code 0.27.x, 0.28.x, or 0.29.x installation and a
   release intendant build from this checkout. Makes real K2.7 Coding model
   calls.
 allowed-tools: Bash Read
@@ -19,7 +19,7 @@ disable-model-invocation: false
 
 This acceptance scenario catches protocol and orchestration drift that mock
 tests cannot: Intendant starts a private foreground Kimi server (`kimi server
-run` on 0.27, or `kimi web --no-open` on 0.28), uses its real
+run` on 0.27, or `kimi web --no-open` on 0.28+), uses its real
 bearer-authenticated REST/WebSocket server-v1 surface plus its allowlisted
 server-v2 agent RPCs, and drives it through the same control socket and
 dashboard HTTP routes used by frontends.
@@ -61,7 +61,8 @@ credentials and must be deleted securely afterward.
 - Kimi's distinct structured `AskUserQuestion` request/answer rail, including
   a one-choice answer that must remain typed as multi-select.
 - The generated bearer-authenticated Intendant MCP bridge, through a real
-  read-only `list_displays` call, Kimi 0.28's native MCP approval request, and
+  read-only `list_displays` call, Kimi's native MCP approval request when the
+  selected release requires one, and
   correlated tool output while a project MCP declaration deliberately
   occupies the default server name.
 - Dashboard-staged ordinary-file and image attachments delivered through

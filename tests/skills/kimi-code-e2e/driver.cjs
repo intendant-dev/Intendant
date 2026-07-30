@@ -30,7 +30,7 @@ const path = require("path");
 const MODEL = "kimi-code/kimi-for-coding";
 const HIGHSPEED_MODEL = "kimi-code/kimi-for-coding-highspeed";
 const MODEL_DISPLAY = "K2.7 Coding";
-const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28)\./;
+const SUPPORTED_KIMI_VERSION = /^0\.(?:27|28|29)\./;
 const args = process.argv.slice(2);
 const USAGE = `Usage:
   node driver.cjs [--binary <path>] [--workdir <path>] [--port <n>]
