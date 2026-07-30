@@ -6087,7 +6087,10 @@ mod tests {
         let out = reader.process_line(
             r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"sig-s"}]},"session_id":"s1"}"#,
         );
-        assert_eq!(reasoning_texts(&out), vec!["Opening thought. Then a delta."]);
+        assert_eq!(
+            reasoning_texts(&out),
+            vec!["Opening thought. Then a delta."]
+        );
         assert!(reader.thinking_buffers.is_empty());
     }
 
