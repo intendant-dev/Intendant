@@ -1473,12 +1473,13 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3_600;
-        let joins = crate::web_gateway::session_catalog::grid_envelope::GridEnvelopeJoins::for_tests(
-            Some(watershed),
-            Some(live),
-            None,
-            None,
-        );
+        let joins =
+            crate::web_gateway::session_catalog::grid_envelope::GridEnvelopeJoins::for_tests(
+                Some(watershed),
+                Some(live),
+                None,
+                None,
+            );
         let mut row = serde_json::json!({});
         joins.attach(&mut row, "rsg-wrapper-dir", &dir);
         assert_eq!(

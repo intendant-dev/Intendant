@@ -194,8 +194,8 @@ impl GridEnvelopeJoins {
                     // Live bit resolved per build, never memoized: the
                     // registry keys post-identity entries by backend id
                     // and aliases the wrapper dir id, so check both.
-                    let successor_live = live.contains(&wrapper_session_id)
-                        || live.contains(&backend_session_id);
+                    let successor_live =
+                        live.contains(&wrapper_session_id) || live.contains(&backend_session_id);
                     boot_block["continued_as"] = serde_json::json!({
                         "source": source,
                         "session_id": wrapper_session_id,
