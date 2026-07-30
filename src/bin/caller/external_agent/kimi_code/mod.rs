@@ -1509,9 +1509,7 @@ impl ExternalAgent for KimiCodeAgent {
         let (mut child, child_pid, origin, stdout_reader, stderr) = loop {
             let instance_baseline = match entrypoint {
                 KimiServerEntrypoint::ServerRun => HashSet::new(),
-                KimiServerEntrypoint::Web => {
-                    capture_server_instance_baseline(&bridge_home).await?
-                }
+                KimiServerEntrypoint::Web => capture_server_instance_baseline(&bridge_home).await?,
             };
             let mut command = crate::platform::spawn_command(&self.command);
             command
@@ -1565,16 +1563,14 @@ impl ExternalAgent for KimiCodeAgent {
             };
             let readiness = match entrypoint {
                 KimiServerEntrypoint::ServerRun => wait_for_server_origin(stdout).await,
-                KimiServerEntrypoint::Web => {
-                    wait_for_registered_server_origin(
-                        &bridge_home,
-                        &instance_baseline,
-                        child_pid,
-                        &mut child,
-                    )
-                    .await
-                    .map(|origin| (origin, BufReader::new(stdout)))
-                }
+                KimiServerEntrypoint::Web => wait_for_registered_server_origin(
+                    &bridge_home,
+                    &instance_baseline,
+                    child_pid,
+                    &mut child,
+                )
+                .await
+                .map(|origin| (origin, BufReader::new(stdout))),
             };
             match readiness {
                 Ok((origin, stdout_reader)) => {

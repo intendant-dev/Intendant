@@ -76,9 +76,7 @@ pub(super) async fn capture_server_instance_baseline(
     let instances = bridge_home.join("server").join("instances");
     let mut entries = match tokio::fs::read_dir(instances).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HashSet::new())
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(_) => return Err(external("failed to inspect Kimi server instance registry")),
     };
     let mut baseline = HashSet::new();
