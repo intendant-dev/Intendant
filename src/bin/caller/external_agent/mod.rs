@@ -1857,6 +1857,22 @@ pub trait ExternalAgent: Send + Sync {
         None
     }
 
+    /// Whether the session's NEXT round is guaranteed to start under the
+    /// credential store's current state: no live backend process is
+    /// holding an older credential read (backends re-read credentials
+    /// only at process start). Gates the rate-limit park's turn-free era
+    /// re-announce (`session_vitals` account-era membership): when true,
+    /// the reset wake may re-key the session into the current credential
+    /// era without burning a turn — the announce the next process start
+    /// would make anyway. When a live process exists, its spawn-time
+    /// credentials still govern the next round, and a re-key would
+    /// relabel that account's numbers as the current one (the chimera
+    /// the era keying exists to prevent) — so the conservative default
+    /// is `false`; only adapters that can check their process override.
+    fn next_round_reads_fresh_credentials(&mut self) -> bool {
+        false
+    }
+
     /// Send a user message into an existing thread (starts a turn).
     async fn send_message(
         &mut self,

@@ -325,6 +325,7 @@ impl ChatProvider for MockProvider {
                     status: step.limit_status.clone(),
                     observed_at_epoch: Some(now_epoch),
                     account: None,
+                    account_prior: false,
                 }]
             })
             .unwrap_or_default();

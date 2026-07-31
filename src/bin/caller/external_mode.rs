@@ -857,6 +857,30 @@ pub(crate) async fn run_external_agent_mode(
                                 });
                             }
                         }
+                        // A pending-less wake runs no turn, so nothing
+                        // re-announces identity until the next message —
+                        // after an account switch the idle session would
+                        // wear the superseded era's limit chips
+                        // indefinitely. When no live backend process holds
+                        // an older credential read, re-announce now: the
+                        // vitals hub re-keys membership into the CURRENT
+                        // era (the same announce the next process start
+                        // would make) without burning a turn.
+                        if agent.next_round_reads_fresh_credentials() {
+                            slog(&session_log, |l| {
+                                l.debug(
+                                    "Reset wake refreshed account-era membership without a turn (no live backend process)",
+                                )
+                            });
+                            emit_external_session_identity(
+                                &bus,
+                                intendant_session_id
+                                    .clone()
+                                    .or_else(|| session_log_id(&session_log)),
+                                backend.as_short_str(),
+                                live_session_id.as_deref().unwrap_or_default(),
+                            );
+                        }
                     }
                     maybe_event = event_rx.recv() => {
                         match maybe_event {

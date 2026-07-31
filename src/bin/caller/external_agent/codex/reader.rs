@@ -1217,8 +1217,10 @@ pub(crate) fn codex_rate_limit_windows(
             status: None,
             observed_at_epoch: Some(now_epoch),
             // The wire carries no account identity; the vitals hub stamps
-            // the reporting session's credential era at the fold.
+            // the reporting session's credential era at the fold (and
+            // prior-ness only on the per-session mirror).
             account: None,
+            account_prior: false,
         });
     }
     windows
@@ -6166,6 +6168,7 @@ error: build failed
                 status: None,
                 observed_at_epoch: None,
                 account: None,
+                account_prior: false,
             },
             crate::types::SessionLimitWindow {
                 label: "7d".into(),
@@ -6174,6 +6177,7 @@ error: build failed
                 status: None,
                 observed_at_epoch: None,
                 account: None,
+                account_prior: false,
             },
         ];
         let none = serde_json::Value::Null;
