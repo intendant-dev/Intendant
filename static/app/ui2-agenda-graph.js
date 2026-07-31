@@ -28,7 +28,13 @@
 // module-level visibilitychange listener below is the stop/resume
 // conduit itself and must outlive any one activation to resume it.
 
-const AGENDA_GRAPH_NODE_CAP = 180;
+// Owner-raised 2026-07-31 (from the original 180): the O(n²) cost only
+// bites during the brief settle window and the per-frame budget tiers
+// keep that window's frame work roughly constant as n grows, so the
+// honest bound is legibility — and legibility is what the hubs/focus
+// projections and arrangement modes are for. Past THIS cap the settle
+// window itself stops fitting a frame budget worth defending.
+const AGENDA_GRAPH_NODE_CAP = 420;
 // Design-parity settle budget, amortized: the prototype ran 260
 // synchronous O(n²) relaxation iterations per relayout; here the same
 // total is spread over frames (agendaGraphSettleBudget per rAF) so a
@@ -167,9 +173,8 @@ function agendaGraphProjectionItems() {
 function agendaGraphRenderLens(host) {
   // Resolve the projection: an explicit chip choice wins; focus
   // overrides the pool; auto degrades an over-cap ledger to the hub
-  // overview (the ratified cap still bounds every projection — the
-  // O(n²) relaxation and the label field stop earning their keep
-  // beyond it).
+  // overview (the cap still bounds every projection; past it the
+  // settle window's O(n²) relaxation stops fitting the frame budget).
   let items = agendaGraphPoolItems();
   let overCapAll = false;
   if (agendaGraphFocus) {
@@ -762,7 +767,11 @@ function agendaGraphBuild() {
 function agendaGraphSettleBudget(count) {
   if (count <= 60) return 30;
   if (count <= 120) return 12;
-  return 6;
+  if (count <= 240) return 6;
+  // Keeps per-frame settle work roughly constant as n² grows: 420
+  // nodes at 4 iterations/frame ≈ 240 at 6 (the settle just takes a
+  // few more frames to spend its 260-iteration total).
+  return 4;
 }
 
 function agendaGraphRelax(iterations) {
