@@ -1740,6 +1740,33 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
     )
 }
 
+/// Derived allowlist for session-lifecycle `ControlMsg`s routable to a
+/// federated peer (`api_peer_session_control` →
+/// `PeerOp::SessionControl`): the session RPC lane's own allowlist
+/// intersected with the operation classes that cover session work
+/// (Message / Task / Approval / SessionManage). The class filter — not
+/// a second name list — is what keeps the doctrine-closed planes
+/// closed to peer routing: Settings-classified actions
+/// (`configure_session_agent`, the `set_*` config family), credential
+/// ceremonies, and access administration fall out of the intersection
+/// automatically. Both inputs are existing single declarations
+/// (`dashboard_session_control_msg_allowed`, `control_msg_operation`),
+/// so this cannot drift from either. The peer re-authorizes whatever
+/// passes against the profile it granted this daemon; this filter
+/// exists to fail closed locally with an honest error instead of
+/// spending a doomed remote round-trip.
+pub(crate) fn peer_session_control_allowed(ctrl: &ControlMsg) -> bool {
+    use crate::access::access_policy::{control_msg_operation, PeerOperation};
+    dashboard_session_control_msg_allowed(ctrl)
+        && matches!(
+            control_msg_operation(ctrl),
+            PeerOperation::Message
+                | PeerOperation::Task
+                | PeerOperation::Approval
+                | PeerOperation::SessionManage
+        )
+}
+
 /// The "dashboard action" RPC lane's allowlist, by wire action name. Single
 /// declaration: `dashboard_action_msg_allowed` gates against it, and the
 /// parity test below pins the SPA's `DASHBOARD_ACTION_MSG_RPC_ACTIONS`
@@ -2247,6 +2274,25 @@ pub(crate) async fn api_peer_approval_response(
     let (status, body) =
         crate::web_gateway::peers_resolve_approval(registry, &peer_id, &body_text).await;
     http_body_response(id, status, body, "peer approval")
+}
+
+pub(crate) async fn api_peer_session_control_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(registry) = runtime.peer_registry.as_ref() else {
+        return peer_registry_unavailable_response(id);
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let peer_id = string_param(&params, &["peer_id", "peerId", "host_id", "hostId", "id"]);
+    if peer_id.is_empty() {
+        return missing_param_response(id, "peer_id");
+    }
+    let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let (status, body) =
+        crate::web_gateway::peers_session_control(registry, &peer_id, &body_text).await;
+    http_body_response(id, status, body, "peer session control")
 }
 
 pub(crate) async fn api_peer_webrtc_signal_response(

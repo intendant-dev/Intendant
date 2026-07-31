@@ -37994,7 +37994,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'f8120a46aa6316d7';
+const INTENDANT_APP_BUILD = '5cd3a10d20a93aec';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40735,6 +40735,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_peer_message: { verb: 'POST', path: '/api/peers/{peer_id}/message' },
   api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
   api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
+  api_peer_session_control: { verb: 'POST', path: '/api/peers/{peer_id}/session-control' },
   api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
   api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
   api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },

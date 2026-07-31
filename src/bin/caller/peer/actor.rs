@@ -27,7 +27,7 @@ use crate::peer::event::{
     MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo,
     TaggedPeerEvent, TaskId,
 };
-use crate::peer::handle::{ConnectionState, PeerCommand};
+use crate::peer::handle::{ConnectionState, PeerCommand, PeerGrantInfo, PeerLinkInfo};
 use crate::peer::id::PeerId;
 use crate::peer::log_writer::EnqueuedPeerEvent;
 use crate::peer::traits::PeerTransport;
@@ -164,6 +164,17 @@ pub(crate) struct PeerActor {
     pub displays_tx: watch::Sender<Arc<Vec<PeerDisplayInfo>>>,
     /// Fold backing `displays_tx`, keyed by display id.
     pub displays: BTreeMap<u32, PeerDisplayInfo>,
+    /// Published view of the connected transport candidate (URL +
+    /// reachability class), recorded after every successful connect
+    /// and cleared while disconnected. `MultiTransport` re-walks
+    /// candidates each reconnect, so the value can change across the
+    /// link's lifetime.
+    pub link_tx: watch::Sender<Option<PeerLinkInfo>>,
+    /// Published view of the grant the peer advertised for this
+    /// daemon's identity, folded from [`PeerEvent::GrantAdvertised`].
+    /// Connection-scoped like `sessions_tx` — cleared on disconnect;
+    /// re-advertised by the peer on every connect.
+    pub grant_tx: watch::Sender<Option<PeerGrantInfo>>,
     /// Published delegation-receipt ledger, folded from
     /// [`PeerEvent::TaskReceipt`]: delegation id → the peer's local
     /// identity for the accepted task. `PeerHandle::delegate_task`
@@ -252,6 +263,14 @@ impl PeerActor {
                     self.apply_operator_overrides(&mut new_card);
                     let card_arc = Arc::new(new_card.clone());
                     let _ = self.card_tx.send(card_arc);
+                    // Record which candidate won this connect. Post-
+                    // connect, `MultiTransport::spec()` returns the
+                    // active candidate's spec (not the preferred one),
+                    // so this is the live link — the one fact the
+                    // dashboard's reachability honesty derives from.
+                    let _ = self
+                        .link_tx
+                        .send(PeerLinkInfo::from_spec(self.transport.spec()));
                     let _ = self.connection_tx.send(ConnectionState::Connected);
                     let _ = self.status_tx.send(PeerStatus::Idle);
                     self.emit_event(PeerEvent::Connected { card: new_card })
@@ -262,6 +281,7 @@ impl PeerActor {
                         MainLoopExit::Disconnect => {
                             let _ = self.connection_tx.send(ConnectionState::Disconnecting);
                             let _ = self.transport.disconnect().await;
+                            let _ = self.link_tx.send(None);
                             let _ = self.connection_tx.send(ConnectionState::Disconnected);
                             self.emit_event(PeerEvent::Disconnected {
                                 reason: "explicit disconnect".to_string(),
@@ -496,6 +516,15 @@ impl PeerActor {
                     }
                 }
             }
+            PeerEvent::GrantAdvertised {
+                profile,
+                operations,
+            } => {
+                let _ = self.grant_tx.send(Some(PeerGrantInfo {
+                    profile: profile.clone(),
+                    operations: operations.clone(),
+                }));
+            }
             PeerEvent::Disconnected { .. } => {
                 if !self.sessions.is_empty() {
                     self.sessions.clear();
@@ -505,6 +534,19 @@ impl PeerActor {
                     self.displays.clear();
                     self.publish_displays();
                 }
+                // Link + grant are connection-scoped like the folds
+                // above: the next connect re-records the winning
+                // candidate, and the peer re-advertises its grant.
+                self.link_tx.send_if_modified(|link| {
+                    let had = link.is_some();
+                    *link = None;
+                    had
+                });
+                self.grant_tx.send_if_modified(|grant| {
+                    let had = grant.is_some();
+                    *grant = None;
+                    had
+                });
                 // Interrupted replies: land each accumulated fold as one
                 // coalesced durable record before the Disconnected event
                 // itself is logged.
@@ -786,6 +828,8 @@ mod tests {
         let (sessions_tx, _sessions_rx) = watch::channel(Arc::new(Vec::new()));
         let (displays_tx, _displays_rx) = watch::channel(Arc::new(Vec::new()));
         let (receipts_tx, _receipts_rx) = watch::channel(Arc::new(HashMap::new()));
+        let (link_tx, _link_rx) = watch::channel(None);
+        let (grant_tx, _grant_rx) = watch::channel(None);
         let actor = PeerActor {
             peer_id,
             transport: Box::new(StubTransport(
@@ -804,6 +848,8 @@ mod tests {
             sessions: BTreeMap::new(),
             displays_tx,
             displays: BTreeMap::new(),
+            link_tx,
+            grant_tx,
             receipts_tx,
             receipts: HashMap::new(),
             receipt_order: VecDeque::new(),

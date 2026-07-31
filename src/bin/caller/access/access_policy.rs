@@ -343,6 +343,21 @@ pub const ALL_OPERATIONS: [PeerOperation; 26] = [
     PeerOperation::MemoryWrite,
 ];
 
+/// The operation permission ids a profile allows, derived from
+/// [`profile_allows_operation`] over the frozen operation set and
+/// rendered in the stable `operation_permission_id` vocabulary. This
+/// is the payload of the `peer_grant` bootstrap advertisement on
+/// peer-identified `/ws` connections — a derived catalog, never a
+/// hand-kept list, so profile changes can't drift out of the echo.
+pub fn profile_operation_permission_ids(profile: &str) -> Vec<String> {
+    ALL_OPERATIONS
+        .iter()
+        .copied()
+        .filter(|op| profile_allows_operation(profile, *op))
+        .map(|op| crate::access::iam::operation_permission_id(op).to_string())
+        .collect()
+}
+
 /// True when `granted` allows no operation that `cap` does not. Profiles
 /// are not a strict ladder (file-reader and session-reader are siblings),
 /// so the cap relation is operation-set containment, mirroring how role
@@ -1213,6 +1228,7 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
                         | "message"
                         | "task"
                         | "approval"
+                        | "session-control"
                 )
             {
                 return Some(PeerOperation::PeerUse);

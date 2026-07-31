@@ -2666,6 +2666,20 @@ pub(crate) static ROUTES: &[Route] = &[
             "/api/peers",
             &[
                 SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("session-control"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Forward a session-lifecycle action to a connected peer's session",
+    )
+    .with_tunnel(tunnel_method("api_peer_session_control")),
+    federation_route(
+        RouteMethod::Post,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
                 SegmentSpec::Literal("webrtc"),
             ],
         ),

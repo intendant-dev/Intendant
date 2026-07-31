@@ -185,6 +185,12 @@ pub(crate) fn dashboard_targets_response_value(
                 "ws_url": snapshot.ws_url,
                 "browser_tcp_via_url": snapshot.browser_tcp_via_url,
                 "capabilities": snapshot.capabilities,
+                // Reachability honesty (RC-C1): the live link's candidate
+                // URL + transport class, and the peer-advertised grant for
+                // this daemon's identity. Both None while disconnected;
+                // grant is None for peers that predate the echo.
+                "link": snapshot.link,
+                "grant": snapshot.grant,
             }));
         }
     }

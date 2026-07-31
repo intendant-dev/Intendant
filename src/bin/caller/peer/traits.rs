@@ -98,6 +98,11 @@ pub struct TransportFeatures {
     /// Transport supports sending an authenticated hosted-certificate
     /// observation to the peer daemon.
     pub certificate_witness: bool,
+    /// Transport supports [`PeerOp::SessionControl`] — forwarding a
+    /// session-lifecycle `ControlMsg` (interrupt, resume, rename,
+    /// follow-up, …) for the peer to authorize against this daemon's
+    /// granted profile.
+    pub session_control: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +157,20 @@ pub enum PeerOp {
     HostedCertificateWitness {
         report: crate::access::hosted_control::HostedCertificateWitnessReport,
     },
+    /// A session-lifecycle control message targeted at one of the
+    /// peer's sessions (host-scoped session actions: interrupt,
+    /// resume, rename, stop/restart, follow-up, approvals, …). The
+    /// message is written to the peer verbatim; the peer authorizes
+    /// it per-action against the profile it granted this daemon
+    /// (`control_msg_operation` → `profile_allows_operation`), so
+    /// this op carries no authority of its own. Callers are expected
+    /// to pre-filter through
+    /// `dashboard_control::peer_session_control_allowed` — the
+    /// derived allowlist that keeps Settings/credentials/access
+    /// planes closed to peer routing.
+    SessionControl {
+        message: Box<crate::event::ControlMsg>,
+    },
 }
 
 impl PeerOp {
@@ -168,6 +187,7 @@ impl PeerOp {
             Self::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
             Self::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
             Self::HostedCertificateWitness { .. } => "hosted_certificate_witness",
+            Self::SessionControl { .. } => "session_control",
         }
     }
 }
@@ -251,6 +271,7 @@ pub fn check_feature(features: &TransportFeatures, op: &PeerOp) -> Result<(), Pe
         PeerOp::PeerFileTransferSignal { .. } => features.file_transfer_signal,
         PeerOp::PeerDashboardControlSignal { .. } => features.dashboard_control_signal,
         PeerOp::HostedCertificateWitness { .. } => features.certificate_witness,
+        PeerOp::SessionControl { .. } => features.session_control,
     };
     if !supported {
         return Err(PeerError::UnsupportedCapability(op.name().to_string()));

@@ -221,6 +221,16 @@ pub(crate) struct ResolveApprovalRequest {
     pub(crate) decision: crate::peer::ApprovalDecision,
 }
 
+/// Body of `POST /api/peers/{id}/session-control`: one session-lifecycle
+/// `ControlMsg` in its wire form (`{"action": "...", ...}`), same shape
+/// the local `api_session_control_msg` RPC lane takes. Session ids
+/// inside the message are the PEER's session ids — the handler forwards
+/// them verbatim; nothing resolves them locally.
+#[derive(Deserialize)]
+pub(crate) struct PeerSessionControlRequest {
+    pub(crate) message: serde_json::Value,
+}
+
 /// Slice 3b: rewrite an outgoing federated `WebRtcSignal::Answer` to
 /// (a) register the peer's ICE ufrag in the relay registry and
 /// (b) inject a TCP candidate pointing at the primary's own address

@@ -167,6 +167,7 @@ fn union_features(candidates: &[Box<dyn PeerTransport>]) -> TransportFeatures {
         u.file_transfer_signal |= f.file_transfer_signal;
         u.dashboard_control_signal |= f.dashboard_control_signal;
         u.certificate_witness |= f.certificate_witness;
+        u.session_control |= f.session_control;
     }
     u
 }

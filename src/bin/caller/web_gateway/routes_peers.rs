@@ -224,6 +224,7 @@ pub(crate) async fn peers_sub_router_api_response(
                     "message" => peers_send_message(registry, &id, body_text).await,
                     "task" => peers_delegate_task(registry, &id, body_text).await,
                     "approval" => peers_resolve_approval(registry, &id, body_text).await,
+                    "session-control" => peers_session_control(registry, &id, body_text).await,
                     "webrtc" => peers_webrtc_signal(registry, &id, body_text, bus).await,
                     "file-transfer-webrtc" => {
                         peers_file_transfer_signal(registry, &id, body_text, bus).await
@@ -2384,6 +2385,62 @@ pub(crate) async fn peers_delegate_task(
             })
             .to_string(),
         ),
+        Err(e) => peer_error_response(e),
+    }
+}
+
+/// Handle `POST /api/peers/{id}/session-control`: forward one
+/// session-lifecycle `ControlMsg` to a connected peer (host-scoped
+/// session actions — interrupt, resume, rename, stop/restart,
+/// follow-up, approvals). The action is validated against the derived
+/// `peer_session_control_allowed` set (session-lane allowlist ∩
+/// session-work operation classes) so the doctrine-closed planes
+/// (Settings, credentials, access/IAM) fail closed locally with an
+/// honest error; the peer then re-authorizes whatever passes against
+/// the profile it granted this daemon's identity.
+pub(crate) async fn peers_session_control(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+) -> (u16, String) {
+    let req: PeerSessionControlRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    let ctrl: crate::event::ControlMsg = match serde_json::from_value(req.message) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid control message: {e}")}).to_string(),
+            );
+        }
+    };
+    if !crate::dashboard_control::peer_session_control_allowed(&ctrl) {
+        let action = crate::dashboard_control::dashboard_control_msg_action(&ctrl);
+        return (
+            403,
+            serde_json::json!({
+                "error": format!(
+                    "action '{action}' is not routable to a peer session \
+                     (peer session control covers message/task/approval/\
+                     session-lifecycle actions only)"
+                )
+            })
+            .to_string(),
+        );
+    }
+    let handle = match peer_handle_or_404(registry, id) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    match handle.session_control(ctrl).await {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
         Err(e) => peer_error_response(e),
     }
 }

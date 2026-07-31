@@ -587,6 +587,8 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let mut conn_rx = handle.connection_updates();
         let mut status_rx = handle.status_updates();
         let mut card_rx = handle.card_updates();
+        let mut link_rx = handle.link_updates();
+        let mut grant_rx = handle.grant_updates();
 
         // Mark current values as observed so we only react to *changes*
         // from this point forward — the initial values are already
@@ -594,12 +596,16 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let _ = conn_rx.borrow_and_update();
         let _ = status_rx.borrow_and_update();
         let _ = card_rx.borrow_and_update();
+        let _ = link_rx.borrow_and_update();
+        let _ = grant_rx.borrow_and_update();
 
         loop {
             let changed = tokio::select! {
                 r = conn_rx.changed() => r,
                 r = status_rx.changed() => r,
                 r = card_rx.changed() => r,
+                r = link_rx.changed() => r,
+                r = grant_rx.changed() => r,
             };
             if changed.is_err() {
                 // One of the watch senders dropped — peer actor has
