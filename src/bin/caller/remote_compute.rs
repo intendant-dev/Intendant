@@ -1210,6 +1210,10 @@ mod tests {
     #[tokio::test]
     async fn worker_refuses_revision_drift_and_dirty_source() {
         let (repo, revision) = clean_git_repo();
+        // Production enters through `WorkerRemoteCommands::new`, which
+        // canonicalizes the repository root. Mirror that invariant here:
+        // macOS temp paths commonly traverse /var -> /private/var.
+        let project_root = repo.path().canonicalize().unwrap();
         let command = RemoteCommandSpec {
             argv: vec!["git".into(), "rev-parse".into(), "HEAD".into()],
             cwd: None,
@@ -1220,9 +1224,9 @@ mod tests {
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(repo.path(), command.clone(), cancel_rx).await;
+        let result = run_worker_command(&project_root, command.clone(), cancel_rx).await;
         drop(cancel_tx);
-        assert_eq!(result.state, RemoteCommandState::Succeeded);
+        assert_eq!(result.state, RemoteCommandState::Succeeded, "{result:#?}");
         assert_eq!(result.stdout.trim(), revision);
         assert_eq!(result.worker_revision.as_deref(), Some(revision.as_str()));
         assert_eq!(result.workspace_dirty_after, Some(false));
@@ -1230,7 +1234,7 @@ mod tests {
         let mut wrong_revision = command.clone();
         wrong_revision.expected_revision = "deadbee".into();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(repo.path(), wrong_revision, cancel_rx).await;
+        let result = run_worker_command(&project_root, wrong_revision, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result
@@ -1240,7 +1244,7 @@ mod tests {
 
         std::fs::write(repo.path().join("uncommitted.txt"), "not selected\n").unwrap();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(repo.path(), command, cancel_rx).await;
+        let result = run_worker_command(&project_root, command, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result
