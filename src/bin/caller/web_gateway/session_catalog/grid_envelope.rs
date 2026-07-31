@@ -327,8 +327,7 @@ fn dead_row_lineage_tip(
         return LineageTip::NoWrapperHistory;
     };
     let transcript = transcript_fingerprint(dir);
-    let epoch =
-        lineage_epoch.unwrap_or_else(|| crate::external_wrapper_index::lineage_epoch(home));
+    let epoch = lineage_epoch.unwrap_or_else(|| crate::external_wrapper_index::lineage_epoch(home));
     if let Ok(memo) = lineage_tip_memo().lock() {
         if let Some(entry) = memo.get(session_id) {
             if entry.transcript_fingerprint == transcript && entry.lineage_epoch == epoch {

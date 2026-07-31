@@ -330,8 +330,12 @@ mod tests {
         );
         assert_eq!(hinted.stopped_by_user, probed.stopped_by_user);
         assert_eq!(
-            hinted.successor_tip(&["hint-old"]).map(|r| r.intendant_session_id.clone()),
-            probed.successor_tip(&["hint-old"]).map(|r| r.intendant_session_id.clone()),
+            hinted
+                .successor_tip(&["hint-old"])
+                .map(|r| r.intendant_session_id.clone()),
+            probed
+                .successor_tip(&["hint-old"])
+                .map(|r| r.intendant_session_id.clone()),
         );
     }
 

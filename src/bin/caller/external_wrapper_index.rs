@@ -1456,9 +1456,11 @@ mod tests {
     fn lineage_epoch_tracks_walk_relevant_content_only() {
         let home = tempfile::tempdir().unwrap();
         let mut index = ExternalWrapperIndex::default();
-        index
-            .wrappers
-            .push(epoch_record("wrap-epoch-1", "b-epoch-1", "/tmp/wrap-epoch-1"));
+        index.wrappers.push(epoch_record(
+            "wrap-epoch-1",
+            "b-epoch-1",
+            "/tmp/wrap-epoch-1",
+        ));
         write_index_for_tests(home.path(), &index);
         let base = lineage_epoch(home.path());
 
@@ -1499,9 +1501,11 @@ mod tests {
         assert_ne!(retired, stopped, "a retirement edge must move the epoch");
 
         // A new wrapper generation: moves.
-        index
-            .wrappers
-            .push(epoch_record("wrap-epoch-2", "b-epoch-2", "/tmp/wrap-epoch-2"));
+        index.wrappers.push(epoch_record(
+            "wrap-epoch-2",
+            "b-epoch-2",
+            "/tmp/wrap-epoch-2",
+        ));
         write_index_for_tests(home.path(), &index);
         assert_ne!(
             lineage_epoch(home.path()),
@@ -1526,7 +1530,15 @@ mod tests {
         let codex_id = "019ea8b9-0000-7000-8000-000000000011";
         let claude_id = "0caf4660-7345-4f3b-b8e7-407e59aefa11";
         upsert(home.path(), "codex", codex_id, wrapper_a, &dir_a, None).unwrap();
-        upsert(home.path(), "claude-code", claude_id, wrapper_a, &dir_a, None).unwrap();
+        upsert(
+            home.path(),
+            "claude-code",
+            claude_id,
+            wrapper_a,
+            &dir_a,
+            None,
+        )
+        .unwrap();
         upsert(home.path(), "codex", codex_id, wrapper_b, &dir_b, None).unwrap();
 
         let direct = wrapper_records_for_wrapper_id(home.path(), wrapper_a);
