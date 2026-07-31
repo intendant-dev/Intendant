@@ -6814,8 +6814,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(dep_of("rollups"), Vec::<String>::new());
-        assert_eq!(dep_of("synthesis"), vec![by_node("rollups").item.id.clone()]);
-        assert_eq!(dep_of("products"), vec![by_node("synthesis").item.id.clone()]);
+        assert_eq!(
+            dep_of("synthesis"),
+            vec![by_node("rollups").item.id.clone()]
+        );
+        assert_eq!(
+            dep_of("products"),
+            vec![by_node("synthesis").item.id.clone()]
+        );
         // The executor stack rides the node manifests: rollups fold at
         // opus/HIGH (the rollup bulk never enters a fable lane);
         // synthesis and products run fable/max.
@@ -6834,7 +6840,11 @@ mod tests {
                 .as_deref()
                 .expect("fable pins");
             assert_eq!(config.agent.as_deref(), Some("claude-code"), "{id}");
-            assert_eq!(config.claude_model.as_deref(), Some("claude-fable-5"), "{id}");
+            assert_eq!(
+                config.claude_model.as_deref(),
+                Some("claude-fable-5"),
+                "{id}"
+            );
             assert_eq!(config.claude_effort.as_deref(), Some("max"), "{id}");
             assert_eq!(
                 by_node(id).item.effects[0].manifest.trigger,
