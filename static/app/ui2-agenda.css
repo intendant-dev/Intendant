@@ -1039,10 +1039,62 @@ html.ui-v2 .ag2-graph-swatch.s-line.t-rel { border-top: 2px dashed var(--text-3)
 html.ui-v2 .ag2-graph-swatch.s-line.t-typed { border-top: 2px solid var(--text-2); }
 html.ui-v2 .ag2-graph-swatch.s-line.t-dep { border-top: 2px solid rgba(var(--rose-rgb), 0.6); }
 html.ui-v2 .ag2-graph-swatch.s-ring.t-terr { border: 1.5px dotted var(--text-2); }
-html.ui-v2 .ag2-graph-clear {
+html.ui-v2 .ag2-graph-swatch.s-sq { width: 7px; height: 7px; }
+html.ui-v2 .ag2-graph-swatch.s-sq.t-file { background: var(--text-3); }
+html.ui-v2 .ag2-graph-swatch.s-sq.t-dir {
+  border: 1.5px solid var(--text-2);
+  box-sizing: border-box;
+}
+html.ui-v2 .ag2-graph-projrow {
   position: absolute;
   top: 38px;
   right: 14px;
+  display: flex;
+  gap: 5px;
+}
+html.ui-v2 .ag2-graph-projchip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 2px 9px;
+  cursor: pointer;
+}
+html.ui-v2 .ag2-graph-projchip:hover:not(:disabled) { color: var(--text); }
+html.ui-v2 .ag2-graph-projchip.active {
+  color: var(--iris);
+  border-color: var(--iris);
+}
+html.ui-v2 .ag2-graph-projchip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+html.ui-v2 .ag2-graph-panel.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 600;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
+html.ui-v2 .ag2-graph-panel.fullscreen canvas {
+  height: 100vh;
+  height: 100dvh;
+}
+html.ui-v2 .ag2-graph-capnote {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  pointer-events: none;
+  padding: 0 40px;
+  text-align: center;
 }
 
 /* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows

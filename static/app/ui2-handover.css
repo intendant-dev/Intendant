@@ -77,3 +77,84 @@ html.ui-v2 .handover-update-note {
   font-size: 11px;
   color: var(--muted, #7e8896);
 }
+
+/* ── self-update panel (Access → Daemons): the PRODUCE half — flavor,
+   behind-ness, the consent buttons, and the job's live log tail. Same
+   family as the update chip above; the chip stays the SWAP surface. ── */
+html.ui-v2 .update-lane-card {
+  margin: 10px 0 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+html.ui-v2 .update-lane-flavor {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-body {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+html.ui-v2 .update-lane-status {
+  color: var(--text, #e6e6e6);
+  font-weight: 600;
+}
+html.ui-v2 .update-lane-note {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-done {
+  font-size: 11px;
+  color: var(--success, #57e389);
+}
+html.ui-v2 .update-lane-error {
+  font-size: 11px;
+  color: var(--error, #ff7b63);
+}
+html.ui-v2 .update-lane-log {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 140px;
+  overflow-y: auto;
+  border-radius: 6px;
+  background: var(--surface0, rgba(24, 24, 30, 0.9));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted, #9aa4b2);
+}
+html.ui-v2 .update-lane-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+html.ui-v2 .update-lane-btn {
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .update-lane-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}

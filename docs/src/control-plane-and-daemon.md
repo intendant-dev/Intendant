@@ -471,6 +471,62 @@ on its origin offers "The daemon updated — Reload" (auto-reloading only
 when hidden and composer-safe), so a stale tab can no longer
 misrepresent a replaced daemon.
 
+#### Producing the update: the self-update lane
+
+Everything above assumes a newer binary already ON disk. The
+**self-update lane** produces one, on the owner's explicit click, from
+the **Daemon update** panel in Access → Daemons (beside the daemons
+list's provenance rows). It classifies the install once at boot from
+the watched binary path:
+
+- **Source install** — the binary is a checkout's `target/release`
+  output, or the app bundle carries the `source-checkout` stamp
+  `scripts/bundle-macos.sh` writes (a stamp whose recorded path no
+  longer exists, e.g. a release app built on CI, falls down to the
+  consumer lane). The panel runs a **bounded behind-`origin/main`
+  compare** (a timeout-bounded fetch, `rev-list --count` capped at 500,
+  and a dirtiness probe) at boot, every 12 h, and on **Check now**. The
+  click then runs `git pull --ff-only` plus `cargo build --release`
+  (plain binary) or `scripts/bundle-macos.sh` (app shape — builds,
+  signs with the stable local identity, installs to /Applications) as
+  supervised child processes. The build **rides the machine's rustc
+  governor** (the child env never sets `RUSTC_WRAPPER`, so the box-wide
+  cargo-config wrapper stays engaged) and is **headroom-gated**: under
+  memory pressure (macOS `kern.memorystatus_vm_pressure_level` > 1,
+  Linux `MemAvailable` under a 3 GiB floor) the job refuses to start
+  instead of joining an OOM spiral. A dirty checkout or a
+  non-fast-forwardable branch refuses honestly — the lane never
+  stashes, resets, or merges over local work.
+- **Consumer install** — an installed release app with no reachable
+  checkout. The automatic cadence only runs when Connect is configured
+  (the tripwire's posture — an unprompted check reaches the rendezvous
+  and GitHub); **Check now** always may. The check verifies the
+  **latest logged release** through
+  the transparency-log ritual (`hosted_verify`: inclusion proof, signed
+  tree head, append-only pin, the compiled-in PGP identity and
+  signature-coverage checks) and compares versions. The click then
+  downloads the platform's app zip and its detached `.asc`, verifies
+  **sha256 against the log's committed digests**, verifies the
+  signature with **`gpg --verify` in a throwaway GNUPGHOME that trusts
+  only the compiled-in release signing key** (gpg absent = the lane
+  refuses; it never installs unverified bytes), probes the new app's
+  provenance, and swaps it in beside the running one (the old bundle
+  stays as `Intendant.app.previous`). **Fail closed everywhere**: any
+  verify failure deletes the staging bytes and reports the reason.
+
+Both lanes end the same way: a newer binary sits at the watched path,
+the update watch above announces it, and the **existing chip/one-click
+swap lane performs the actual handover** — produce and swap stay two
+honest phases, and the daemon never execs a build, a fetch ritual, or
+a successor into its own process. Progress and failure render live on
+the panel (phase, a bounded child-process log tail, and the outcome)
+served inside the `update_lane` block of `GET /api/daemon/handover`;
+the two actions (`POST /api/daemon/update-lane/{check,produce}`) are
+owner-grade and deliberately **HTTP-only** — remote tunnel-primary
+surfaces watch progress but cannot click a build onto the box.
+Checking is automatic and read-only; producing only ever happens on
+the click — there is no auto-update.
+
 ## Where to Go Next
 
 - [Architecture](./architecture.md) — the EventBus, the execution shapes, and

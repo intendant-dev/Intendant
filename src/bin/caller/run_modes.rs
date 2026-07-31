@@ -324,6 +324,12 @@ pub(crate) async fn run_with_presence(
     // rejections (backoff input when the wire carries no reset time).
     let mut persistent_limit_park: Option<LimitParkState> = None;
     let mut persistent_limit_park_streak: u32 = 0;
+    // Consecutive transient-service-condition round deaths (the error
+    // park's recovery-attempt counter). Past the bounded widening
+    // schedule the lane stops parking and reports the outage instead of
+    // waiting unattended; a completed turn or an explicit intervention
+    // resets it.
+    let mut persistent_error_park_streak: u32 = 0;
     let mut persistent_parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
     let mut persistent_managed_context_recovery_kickstarts_without_rewind = 0u8;
@@ -484,8 +490,9 @@ pub(crate) async fn run_with_presence(
                     Some(e) => OuterSignal::Task(e),
                     None => OuterSignal::Done,
                 },
-                // Rate-limit park timer: at the reset (plus jitter), queue
-                // the rejected message back at the front and let the
+                // Park timer (both kinds ride this one slot): at the
+                // limit's reset or the recovery schedule's next step,
+                // queue what the park held back at the front and let the
                 // parked-flush preamble above dispatch the queue FIFO.
                 _ = tokio::time::sleep_until(
                     persistent_limit_park
@@ -496,6 +503,7 @@ pub(crate) async fn run_with_presence(
                     let park = persistent_limit_park
                         .take()
                         .expect("branch guarded by is_some");
+                    let noun = park.kind.noun();
                     let resumed = match park.pending {
                         Some(pending)
                             if !follow_up_message_was_cancelled(
@@ -503,14 +511,15 @@ pub(crate) async fn run_with_presence(
                                 &pending,
                             ) =>
                         {
-                            let line =
-                                "Rate-limit park elapsed — re-sending the parked message";
-                            slog(&session_log, |l| l.info(line));
+                            let line = format!(
+                                "{noun} elapsed — re-sending the parked message"
+                            );
+                            slog(&session_log, |l| l.info(&line));
                             bus.send(AppEvent::LogEntry {
                                 session_id: session_log_id(&session_log),
                                 level: "info".to_string(),
                                 source: "Intendant".to_string(),
-                                content: line.to_string(),
+                                content: line,
                                 turn: None,
                             });
                             persistent_parked_follow_ups.push_front(pending);
@@ -518,15 +527,15 @@ pub(crate) async fn run_with_presence(
                         }
                         Some(_) => {
                             slog(&session_log, |l| {
-                                l.info(
-                                    "Rate-limit park elapsed — the parked message was cancelled; awaiting input",
-                                )
+                                l.info(&format!(
+                                    "{noun} elapsed — the parked message was cancelled; awaiting input",
+                                ))
                             });
                             false
                         }
                         None => {
                             slog(&session_log, |l| {
-                                l.info("Rate-limit park elapsed — awaiting input")
+                                l.info(&format!("{noun} elapsed — awaiting input"))
                             });
                             false
                         }
@@ -616,17 +625,19 @@ pub(crate) async fn run_with_presence(
                         // queued and flush normally).
                         if let Some(park) = persistent_limit_park.take() {
                             persistent_limit_park_streak = 0;
+                            persistent_error_park_streak = 0;
+                            let noun = park.kind.noun();
                             let line = if park.pending.is_some() {
-                                "Rate-limit park cancelled by interrupt — dropped the pending re-send"
+                                format!("{noun} cancelled by interrupt — dropped the pending re-send")
                             } else {
-                                "Rate-limit park cancelled by interrupt"
+                                format!("{noun} cancelled by interrupt")
                             };
-                            slog(&session_log, |l| l.info(line));
+                            slog(&session_log, |l| l.info(&line));
                             bus.send(AppEvent::LogEntry {
                                 session_id: session_log_id(&session_log),
                                 level: "info".to_string(),
                                 source: "Intendant".to_string(),
-                                content: line.to_string(),
+                                content: line,
                                 turn: None,
                             });
                         }
@@ -1002,6 +1013,34 @@ pub(crate) async fn run_with_presence(
                                             turn: None,
                                         });
                                     }
+                                    Ok(DrainOutcome::TransientRoundDeath {
+                                        reason,
+                                        turns_in_round,
+                                        ..
+                                    }) => {
+                                        // A temporary service condition
+                                        // killed the resumed rewind turn.
+                                        // Like this lane's limit arm:
+                                        // report only, no park claim — the
+                                        // session idles and the next user
+                                        // message re-drives it.
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                            project_root: round_session_root.clone(),
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "Temporary service condition ended the resumed context-rewind turn ({}); send a message to resume",
+                                                reason
+                                            ),
+                                            level: Some(types::LogLevel::Warn),
+                                            turn: None,
+                                        });
+                                    }
                                     Ok(DrainOutcome::ContextRewindRequested {
                                         request, ..
                                     }) => {
@@ -1067,6 +1106,27 @@ pub(crate) async fn run_with_presence(
                                                     level: "warn".to_string(),
                                                     source: "Intendant".to_string(),
                                                     content: park_line,
+                                                    turn: None,
+                                                });
+                                            }
+                                            Ok(Some(DrainOutcome::TransientRoundDeath {
+                                                reason,
+                                                ..
+                                            })) => {
+                                                // Report only, no park
+                                                // claim — the chained
+                                                // rewind lane idles and
+                                                // the next user message
+                                                // re-drives it.
+                                                let line = format!(
+                                                    "Temporary service condition ended the chained context-rewind turn ({reason}); send a message to resume"
+                                                );
+                                                slog(&session_log, |l| l.warn(&line));
+                                                bus.send(AppEvent::LogEntry {
+                                                    session_id: session_log_id(&session_log),
+                                                    level: "warn".to_string(),
+                                                    source: "Intendant".to_string(),
+                                                    content: line,
                                                     turn: None,
                                                 });
                                             }
@@ -1286,15 +1346,25 @@ pub(crate) async fn run_with_presence(
                     // A fresh thread is an explicit reset: cancel a live
                     // rate-limit park and drop what it held — those
                     // messages targeted the discarded conversation.
-                    if persistent_limit_park.take().is_some()
-                        || !persistent_parked_follow_ups.is_empty()
-                    {
+                    if let Some(park) = persistent_limit_park.take() {
                         persistent_limit_park_streak = 0;
+                        persistent_error_park_streak = 0;
                         let dropped = persistent_parked_follow_ups.len();
                         persistent_parked_follow_ups.clear();
                         slog(&session_log, |l| {
                             l.info(&format!(
-                                "Rate-limit park cancelled by /new; dropped {dropped} queued message(s)"
+                                "{} cancelled by /new; dropped {dropped} queued message(s)",
+                                park.kind.noun()
+                            ))
+                        });
+                    } else if !persistent_parked_follow_ups.is_empty() {
+                        persistent_limit_park_streak = 0;
+                        persistent_error_park_streak = 0;
+                        let dropped = persistent_parked_follow_ups.len();
+                        persistent_parked_follow_ups.clear();
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Parked queue cleared by /new; dropped {dropped} queued message(s)"
                             ))
                         });
                     }
@@ -2035,15 +2105,19 @@ pub(crate) async fn run_with_presence(
                             level: Some(types::LogLevel::Warn),
                             turn: None,
                         });
-                        // Session end cancels a live rate-limit park (the
-                        // parked re-send targeted the dead conversation);
-                        // queued user messages stay queued like any other
-                        // post-termination follow-up and run against the
-                        // next agent build.
-                        if persistent_limit_park.take().is_some() {
+                        // Session end cancels a live park of either kind
+                        // (the parked re-send targeted the dead
+                        // conversation); queued user messages stay queued
+                        // like any other post-termination follow-up and
+                        // run against the next agent build.
+                        if let Some(park) = persistent_limit_park.take() {
                             persistent_limit_park_streak = 0;
+                            persistent_error_park_streak = 0;
                             slog(&session_log, |l| {
-                                l.info("Rate-limit park cancelled — the agent terminated")
+                                l.info(&format!(
+                                    "{} cancelled — the agent terminated",
+                                    park.kind.noun()
+                                ))
                             });
                         }
                         persistent_agent = None;
@@ -2220,6 +2294,75 @@ pub(crate) async fn run_with_presence(
                                     )
                                     .await;
                                     persistent_limit_park = Some(park);
+                                }
+                                DrainOutcome::TransientRoundDeath {
+                                    reason,
+                                    turns_in_round,
+                                    turn_had_started,
+                                } => {
+                                    // A spontaneous round died on a
+                                    // temporary service condition: arm
+                                    // the error park (nothing of ours to
+                                    // re-send; the pending is the resume
+                                    // nudge exactly when the turn had
+                                    // started). Past the widening
+                                    // schedule, report the outage and
+                                    // stop parking — the persistent lane
+                                    // never exits, so visibility is the
+                                    // error row and the presence surface;
+                                    // the next user message re-drives.
+                                    persistent_error_park_streak =
+                                        persistent_error_park_streak.saturating_add(1);
+                                    if error_park_attempts_exhausted(persistent_error_park_streak) {
+                                        cumulative_stats.rounds = round;
+                                        let line = error_park_exhausted_line(
+                                            &reason,
+                                            persistent_error_park_streak.saturating_sub(1),
+                                        );
+                                        slog(&session_log, |l| l.error(&line));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                            project_root: round_session_root.clone(),
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: line,
+                                            level: Some(types::LogLevel::Error),
+                                            turn: None,
+                                        });
+                                    } else {
+                                        let (park, park_line) = transient_round_death_error_park(
+                                            &reason,
+                                            tokio::time::Instant::now(),
+                                            persistent_error_park_streak,
+                                            error_park_jitter_secs(),
+                                            turn_had_started,
+                                            None,
+                                        );
+                                        slog(&session_log, |l| l.warn(&park_line));
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: session_log_id(&session_log),
+                                            level: "warn".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content: park_line,
+                                            turn: None,
+                                        });
+                                        emit_external_turn_status(
+                                            &bus,
+                                            &autonomy,
+                                            session_log_id(&session_log).as_deref(),
+                                            round,
+                                            "waiting-service-recovery",
+                                            format!(
+                                                "{} waiting out a temporary service condition; parked for recovery",
+                                                agent.name()
+                                            ),
+                                        )
+                                        .await;
+                                        persistent_limit_park = Some(park);
+                                    }
                                 }
                                 DrainOutcome::RecoveryRequired {
                                     message,
@@ -2781,18 +2924,19 @@ pub(crate) async fn run_with_presence(
             initial_followup.steer_id = envelope.steer_id.clone();
             let initial_followup_is_real = !initial_followup.text.trim().is_empty()
                 || !initial_followup.attachments.is_empty();
-            // Rate-limit park: while parked, a new task queues (visibly)
-            // instead of burning against the rejected backend. The resume
-            // path dispatches the queue FIFO through the synthesized
-            // flush task — pending re-send first, then what queued.
-            if persistent_limit_park.is_some() {
+            // Armed park (either kind): while parked, a new task queues
+            // (visibly) instead of burning against the unavailable
+            // backend. The resume path dispatches the queue FIFO through
+            // the synthesized flush task — pending re-send first, then
+            // what queued.
+            if let Some(park) = persistent_limit_park.as_ref() {
                 if initial_followup_is_real {
-                    slog(&session_log, |l| l.info(LIMIT_PARK_QUEUED_MESSAGE_LOG));
+                    slog(&session_log, |l| l.info(park.kind.queued_log()));
                     bus.send(AppEvent::LogEntry {
                         session_id: session_log_id(&session_log),
                         level: "info".to_string(),
                         source: "Intendant".to_string(),
-                        content: LIMIT_PARK_QUEUED_MESSAGE_LOG.to_string(),
+                        content: park.kind.queued_log().to_string(),
                         turn: None,
                     });
                     persistent_parked_follow_ups.push_back(initial_followup);
@@ -3102,6 +3246,7 @@ pub(crate) async fn run_with_presence(
                         // A completed turn proves the provider is serving
                         // again.
                         persistent_limit_park_streak = 0;
+                        persistent_error_park_streak = 0;
                         if codex_managed_context_enabled {
                             match refresh_external_context_usage_snapshot(agent, &drain_config)
                                 .await
@@ -3488,7 +3633,78 @@ pub(crate) async fn run_with_presence(
                         persistent_limit_park = Some(LimitParkState {
                             resume_at: tokio::time::Instant::now() + delay,
                             pending: Some(limit_park_pending(pending, turn_had_started)),
+                            kind: ParkKind::ProviderLimit,
                         });
+                    }
+                    DrainOutcome::TransientRoundDeath {
+                        reason,
+                        turns_in_round,
+                        turn_had_started,
+                    } => {
+                        // The task-driven round died on a temporary
+                        // service condition: count nothing, arm the error
+                        // park with the delivery-aware pending (the
+                        // driving message verbatim when the backend never
+                        // started the turn, the resume nudge when it
+                        // did), and let the outer-select timer wake it on
+                        // the widening schedule. Past the schedule,
+                        // report the outage and stop parking — the
+                        // persistent lane never exits; the next user
+                        // message re-drives.
+                        persistent_error_park_streak =
+                            persistent_error_park_streak.saturating_add(1);
+                        if error_park_attempts_exhausted(persistent_error_park_streak) {
+                            cumulative_stats.rounds += 1;
+                            let line = error_park_exhausted_line(
+                                &reason,
+                                persistent_error_park_streak.saturating_sub(1),
+                            );
+                            slog(&session_log, |l| l.error(&line));
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: session_log_id(&session_log),
+                                round: cumulative_stats.rounds,
+                                turns_in_round,
+                                native_message_count: None,
+                                project_root: round_session_root.clone(),
+                            });
+                            bus.send(AppEvent::PresenceLog {
+                                message: line,
+                                level: Some(types::LogLevel::Error),
+                                turn: None,
+                            });
+                        } else {
+                            let mut pending = active_followup;
+                            pending.text = merged_text.clone();
+                            let (park, park_line) = transient_round_death_error_park(
+                                &reason,
+                                tokio::time::Instant::now(),
+                                persistent_error_park_streak,
+                                error_park_jitter_secs(),
+                                turn_had_started,
+                                Some(pending),
+                            );
+                            slog(&session_log, |l| l.warn(&park_line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: session_log_id(&session_log),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content: park_line,
+                                turn: None,
+                            });
+                            emit_external_turn_status(
+                                &bus,
+                                &autonomy,
+                                session_log_id(&session_log).as_deref(),
+                                round,
+                                "waiting-service-recovery",
+                                format!(
+                                    "{} waiting out a temporary service condition; parked for recovery",
+                                    backend
+                                ),
+                            )
+                            .await;
+                            persistent_limit_park = Some(park);
+                        }
                     }
                     DrainOutcome::RecoveryRequired {
                         message,

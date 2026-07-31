@@ -138,6 +138,7 @@ async fn apply_backend_credentials_reload(
     stats: &LoopStats,
     limit_park: &mut Option<LimitParkState>,
     limit_park_streak: &mut u32,
+    error_park_streak: &mut u32,
     parked_follow_ups: &mut std::collections::VecDeque<FollowUpMessage>,
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -167,15 +168,17 @@ async fn apply_backend_credentials_reload(
     };
     if let Some(park) = limit_park.take() {
         *limit_park_streak = 0;
+        *error_park_streak = 0;
         slog(session_log, |l| l.set_limit_park(None));
+        let noun = park.kind.noun();
         if let Some(pending) = park.pending {
             // Front of the queue: the parked re-send delivers first, then
             // everything queued while parked, oldest first.
             parked_follow_ups.push_front(pending);
         }
-        announce(
-            "Rate-limit park cancelled for the credential reload — parked messages deliver after the respawn",
-        );
+        announce(&format!(
+            "{noun} cancelled for the credential reload — parked messages deliver after the respawn",
+        ));
     }
     let resume_id = stats
         .announced_native_session_id
@@ -549,6 +552,12 @@ pub(crate) async fn run_external_agent_mode(
     // the wire carries no reset time) and clears on any completed turn.
     let mut limit_park: Option<LimitParkState> = None;
     let mut limit_park_streak: u32 = 0;
+    // Consecutive transient-service-condition round deaths (the error
+    // park's recovery-attempt counter): +1 each death, reset by a
+    // completed turn or an explicit intervention (interrupt, reload) —
+    // past the bounded widening schedule the session suspends visibly
+    // instead of parking again.
+    let mut error_park_streak: u32 = 0;
     let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
@@ -676,6 +685,7 @@ pub(crate) async fn run_external_agent_mode(
                 &stats,
                 &mut limit_park,
                 &mut limit_park_streak,
+                &mut error_park_streak,
                 &mut parked_follow_ups,
                 &mut agent,
                 &mut event_rx,
@@ -800,10 +810,11 @@ pub(crate) async fn run_external_agent_mode(
                             }
                         }
                     }
-                    // Rate-limit park timer: at the reset (plus jitter),
-                    // re-send the message the limit rejected. Messages
-                    // queued meanwhile flush right after via the
-                    // parked-flush preamble above.
+                    // Park timer (both kinds ride this one slot): at the
+                    // limit's reset or the recovery schedule's next step,
+                    // re-send what the park held. Messages queued
+                    // meanwhile flush right after via the parked-flush
+                    // preamble above.
                     _ = tokio::time::sleep_until(
                         limit_park
                             .as_ref()
@@ -812,6 +823,7 @@ pub(crate) async fn run_external_agent_mode(
                     ), if limit_park.is_some() => {
                         let park = limit_park.take().expect("branch guarded by is_some");
                         slog(&session_log, |l| l.set_limit_park(None));
+                        let noun = park.kind.noun();
                         match park.pending {
                             Some(pending)
                                 if !follow_up_message_was_cancelled(
@@ -819,28 +831,29 @@ pub(crate) async fn run_external_agent_mode(
                                     &pending,
                                 ) =>
                             {
-                                let line =
-                                    "Rate-limit park elapsed — re-sending the parked message";
-                                slog(&session_log, |l| l.info(line));
+                                let line = format!(
+                                    "{noun} elapsed — re-sending the parked message"
+                                );
+                                slog(&session_log, |l| l.info(&line));
                                 bus.send(AppEvent::LogEntry {
                                     session_id: live_session_id.clone(),
                                     level: "info".to_string(),
                                     source: "Intendant".to_string(),
-                                    content: line.to_string(),
+                                    content: line,
                                     turn: None,
                                 });
                                 break pending;
                             }
                             Some(_) => {
                                 slog(&session_log, |l| {
-                                    l.info(
-                                        "Rate-limit park elapsed — the parked message was cancelled; awaiting input",
-                                    )
+                                    l.info(&format!(
+                                        "{noun} elapsed — the parked message was cancelled; awaiting input",
+                                    ))
                                 });
                             }
                             None => {
                                 slog(&session_log, |l| {
-                                    l.info("Rate-limit park elapsed — awaiting input")
+                                    l.info(&format!("{noun} elapsed — awaiting input"))
                                 });
                             }
                         }
@@ -1339,6 +1352,102 @@ pub(crate) async fn run_external_agent_mode(
                                                     l.set_limit_park(Some(
                                                         crate::session_log::SessionLimitParkMeta {
                                                             resets_at_epoch,
+                                                            has_pending,
+                                                        },
+                                                    ))
+                                                });
+                                            }
+                                            DrainOutcome::TransientRoundDeath {
+                                                reason,
+                                                turns_in_round,
+                                                turn_had_started,
+                                            } => {
+                                                // A backend-started round
+                                                // died on a temporary
+                                                // service condition: arm
+                                                // the error park (no
+                                                // driving message from
+                                                // this side — the pending
+                                                // is the resume nudge
+                                                // exactly when the turn
+                                                // had started), or
+                                                // suspend visibly once
+                                                // the widening schedule
+                                                // is exhausted.
+                                                error_park_streak =
+                                                    error_park_streak.saturating_add(1);
+                                                if error_park_attempts_exhausted(error_park_streak)
+                                                {
+                                                    stats.rounds = round;
+                                                    let line = error_park_exhausted_line(
+                                                        &reason,
+                                                        error_park_streak.saturating_sub(1),
+                                                    );
+                                                    slog(&session_log, |l| l.error(&line));
+                                                    record_external_round_inline(
+                                                        &session_log,
+                                                        persist_model_responses_inline,
+                                                        round,
+                                                        turns_in_round,
+                                                    );
+                                                    bus.send(AppEvent::RoundComplete {
+                                                        session_id: live_session_id.clone(),
+                                                        round,
+                                                        turns_in_round,
+                                                        native_message_count: None,
+                                                        project_root: round_session_root.clone(),
+                                                    });
+                                                    bus.send(AppEvent::TaskComplete {
+                                                        session_id: live_session_id.clone(),
+                                                        reason: line.clone(),
+                                                        summary: None,
+                                                        outcome: crate::event::TaskOutcome::Failed,
+                                                    });
+                                                    stats.terminal_outcome = Some(line);
+                                                    break 'outer;
+                                                }
+                                                round = round.saturating_sub(1);
+                                                let (park, park_line) =
+                                                    transient_round_death_error_park(
+                                                        &reason,
+                                                        tokio::time::Instant::now(),
+                                                        error_park_streak,
+                                                        error_park_jitter_secs(),
+                                                        turn_had_started,
+                                                        None,
+                                                    );
+                                                let has_pending = park.pending.is_some();
+                                                slog(&session_log, |l| l.warn(&park_line));
+                                                bus.send(AppEvent::LogEntry {
+                                                    session_id: live_session_id.clone(),
+                                                    level: "warn".to_string(),
+                                                    source: "Intendant".to_string(),
+                                                    content: park_line,
+                                                    turn: None,
+                                                });
+                                                emit_external_turn_status(
+                                                    &bus,
+                                                    &autonomy,
+                                                    live_session_id.as_deref(),
+                                                    round.saturating_add(1),
+                                                    "waiting-service-recovery",
+                                                    format!(
+                                                        "{} waiting out a temporary service condition; parked for recovery",
+                                                        agent.name()
+                                                    ),
+                                                )
+                                                .await;
+                                                limit_park = Some(park);
+                                                // Durable marker: like the
+                                                // limit arms, so a daemon
+                                                // death mid-park leaves
+                                                // the boot auto-readopt
+                                                // trace (no reset clock —
+                                                // the schedule is ours).
+                                                slog(&session_log, |l| {
+                                                    l.set_limit_park(Some(
+                                                        crate::session_log::SessionLimitParkMeta {
+                                                            resets_at_epoch: None,
                                                             has_pending,
                                                         },
                                                     ))
@@ -1851,18 +1960,20 @@ pub(crate) async fn run_external_agent_mode(
                                 // park stay queued and flush normally).
                                 if let Some(park) = limit_park.take() {
                                     limit_park_streak = 0;
+                                    error_park_streak = 0;
                                     slog(&session_log, |l| l.set_limit_park(None));
+                                    let noun = park.kind.noun();
                                     let line = if park.pending.is_some() {
-                                        "Rate-limit park cancelled by interrupt — dropped the pending re-send"
+                                        format!("{noun} cancelled by interrupt — dropped the pending re-send")
                                     } else {
-                                        "Rate-limit park cancelled by interrupt"
+                                        format!("{noun} cancelled by interrupt")
                                     };
-                                    slog(&session_log, |l| l.info(line));
+                                    slog(&session_log, |l| l.info(&line));
                                     bus.send(AppEvent::LogEntry {
                                         session_id: live_session_id.clone(),
                                         level: "info".to_string(),
                                         source: "Intendant".to_string(),
-                                        content: line.to_string(),
+                                        content: line,
                                         turn: None,
                                     });
                                 }
@@ -1890,6 +2001,7 @@ pub(crate) async fn run_external_agent_mode(
                                     &stats,
                                     &mut limit_park,
                                     &mut limit_park_streak,
+                                    &mut error_park_streak,
                                     &mut parked_follow_ups,
                                     &mut agent,
                                     &mut event_rx,
@@ -1922,17 +2034,17 @@ pub(crate) async fn run_external_agent_mode(
             });
             continue;
         }
-        if limit_park.is_some() {
-            // Rate-limit park: never burn input against the rejected
-            // backend (a delivered message would be consumed with zero
-            // work). Queue it and return to the idle wait; the flush
-            // preamble delivers it after the pending re-send.
-            slog(&session_log, |l| l.info(LIMIT_PARK_QUEUED_MESSAGE_LOG));
+        if let Some(park) = limit_park.as_ref() {
+            // Armed park (either kind): never burn input against the
+            // unavailable backend (a delivered message would be consumed
+            // with zero work). Queue it and return to the idle wait; the
+            // flush preamble delivers it after the pending re-send.
+            slog(&session_log, |l| l.info(park.kind.queued_log()));
             bus.send(AppEvent::LogEntry {
                 session_id: live_session_id.clone(),
                 level: "info".to_string(),
                 source: "Intendant".to_string(),
-                content: LIMIT_PARK_QUEUED_MESSAGE_LOG.to_string(),
+                content: park.kind.queued_log().to_string(),
                 turn: None,
             });
             emit_follow_up_status(
@@ -1941,7 +2053,7 @@ pub(crate) async fn run_external_agent_mode(
                 &followup.follow_up_id,
                 Some(&followup.text),
                 "queued",
-                Some("rate-limited; delivers when the limit resets"),
+                Some(park.kind.queued_status_detail()),
             );
             parked_follow_ups.push_back(followup);
             continue;
@@ -2796,6 +2908,28 @@ pub(crate) async fn run_external_agent_mode(
                                 turn: None,
                             });
                         }
+                        DrainOutcome::TransientRoundDeath { reason, .. } => {
+                            // The in-flight turn died on a temporary
+                            // service condition mid-edit. Like the limit
+                            // arm above: no park — the edit rewinds past
+                            // the dead turn, so a parked continuation
+                            // would re-drive work the user just
+                            // superseded. The edited message delivers
+                            // next and parks through the primary arm if
+                            // the condition still holds.
+                            let line = format!(
+                                "Temporary service condition ended the in-flight turn ({}); proceeding with the edit rollback",
+                                reason
+                            );
+                            slog(&session_log, |l| l.warn(&line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content: line,
+                                turn: None,
+                            });
+                        }
                         DrainOutcome::ContextRewindRequested {
                             request,
                             message,
@@ -3157,6 +3291,7 @@ pub(crate) async fn run_external_agent_mode(
                 stats.rounds = round;
                 // A completed turn proves the provider is serving again.
                 limit_park_streak = 0;
+                error_park_streak = 0;
                 if codex_managed_context_enabled {
                     match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
@@ -3574,6 +3709,7 @@ pub(crate) async fn run_external_agent_mode(
                 limit_park = Some(LimitParkState {
                     resume_at: tokio::time::Instant::now() + delay,
                     pending: Some(limit_park_pending(pending, turn_had_started)),
+                    kind: ParkKind::ProviderLimit,
                 });
                 // Durable park marker: the in-memory park dies with the
                 // daemon, and the boot auto-readopt pass needs to know a
@@ -3582,6 +3718,94 @@ pub(crate) async fn run_external_agent_mode(
                     l.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
                         resets_at_epoch,
                         has_pending: true,
+                    }))
+                });
+            }
+            DrainOutcome::TransientRoundDeath {
+                reason,
+                turns_in_round,
+                turn_had_started,
+            } => {
+                // The round this side drove died on a temporary service
+                // condition (the 2026-07-29 specimen shape: an API-500
+                // round-death that rode a DoneSignal and stranded the
+                // commission fake-idle). Hand the round number back,
+                // count nothing, and arm the error park with the
+                // delivery-aware pending — the driving message verbatim
+                // when the backend never started the turn, the resume
+                // nudge when it did. Past the widening schedule the
+                // session ends FAILED so the outage surfaces (agenda
+                // occurrences journal `failed` and count on the
+                // suspension streak) instead of waiting unattended.
+                error_park_streak = error_park_streak.saturating_add(1);
+                if error_park_attempts_exhausted(error_park_streak) {
+                    stats.rounds = round;
+                    let line =
+                        error_park_exhausted_line(&reason, error_park_streak.saturating_sub(1));
+                    slog(&session_log, |l| l.error(&line));
+                    record_external_round_inline(
+                        &session_log,
+                        persist_model_responses_inline,
+                        round,
+                        turns_in_round,
+                    );
+                    bus.send(AppEvent::RoundComplete {
+                        session_id: live_session_id.clone(),
+                        round,
+                        turns_in_round,
+                        native_message_count: None,
+                        project_root: round_session_root.clone(),
+                    });
+                    bus.send(AppEvent::TaskComplete {
+                        session_id: live_session_id.clone(),
+                        reason: line.clone(),
+                        summary: None,
+                        outcome: crate::event::TaskOutcome::Failed,
+                    });
+                    stats.terminal_outcome = Some(line);
+                    break;
+                }
+                round = round.saturating_sub(1);
+                let mut pending = active_followup_for_rewind_replay.clone();
+                pending.text = merged.clone();
+                let (park, park_line) = transient_round_death_error_park(
+                    &reason,
+                    tokio::time::Instant::now(),
+                    error_park_streak,
+                    error_park_jitter_secs(),
+                    turn_had_started,
+                    Some(pending),
+                );
+                let has_pending = park.pending.is_some();
+                slog(&session_log, |l| l.warn(&park_line));
+                bus.send(AppEvent::LogEntry {
+                    session_id: live_session_id.clone(),
+                    level: "warn".to_string(),
+                    source: "Intendant".to_string(),
+                    content: park_line,
+                    turn: None,
+                });
+                emit_external_turn_status(
+                    &bus,
+                    &autonomy,
+                    live_session_id.as_deref(),
+                    round.saturating_add(1),
+                    "waiting-service-recovery",
+                    format!(
+                        "{} waiting out a temporary service condition; parked for recovery",
+                        agent.name()
+                    ),
+                )
+                .await;
+                limit_park = Some(park);
+                // Durable park marker, like the limit arm — the boot
+                // auto-readopt pass must see a dead boot's wrapper still
+                // owed its parked continuation (no reset clock: the
+                // widening schedule is the wrapper's own).
+                slog(&session_log, |l| {
+                    l.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
+                        resets_at_epoch: None,
+                        has_pending,
                     }))
                 });
             }
