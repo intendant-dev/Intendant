@@ -74,6 +74,18 @@ pub(crate) const HOUSE_DEFINITIONS: &[(&str, &str)] = &[
         "reconcile-backlog",
         include_str!("../../../../automations/reconcile-backlog/SKILL.md"),
     ),
+    (
+        "narrative-backfill",
+        include_str!("../../../../automations/narrative-backfill/SKILL.md"),
+    ),
+    (
+        "session-digest",
+        include_str!("../../../../automations/session-digest/SKILL.md"),
+    ),
+    (
+        "narrative-pyramid",
+        include_str!("../../../../automations/narrative-pyramid/SKILL.md"),
+    ),
 ];
 
 /// Where a resolved definition came from — catalog provenance chips.
@@ -1279,13 +1291,256 @@ mod tests {
             );
             for node in &def.nodes {
                 if let Some(model) = node.model.as_deref() {
-                    assert!(
-                        crate::project::claude_model_is_recognized(model),
-                        "house model prefill {model:?} is not a CLI-accepted shape"
-                    );
+                    match node.agent.as_deref() {
+                        Some("codex") => assert!(
+                            crate::project::codex_model_catalog_entry(model).is_some(),
+                            "house codex model prefill {model:?} is not in the catalog"
+                        ),
+                        _ => assert!(
+                            crate::project::claude_model_is_recognized(model),
+                            "house model prefill {model:?} is not a CLI-accepted shape"
+                        ),
+                    }
                 }
             }
         }
+    }
+
+    /// Card 01KYTW64HX: the three narrative definitions are
+    /// TRANSLATIONS of the live armed NS schedules (their goal texts
+    /// ride the commissioning gate as sealed refs). The hard-won laws
+    /// must survive translation — every fragment below is a distinctive
+    /// carry from the live goal texts, compared whitespace-normalized
+    /// so prose re-wrapping never masks a dropped law. Losing one in an
+    /// edit fails here instead of shipping a defanged mandate.
+    #[test]
+    fn ns_definitions_carry_the_live_laws_verbatim() {
+        fn squash(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        let defs = house_definitions();
+        let by_name = |name: &str| defs.iter().find(|d| d.name == name).expect("house def");
+        let carries = |text: &str, label: &str, laws: &[&str]| {
+            let squashed = squash(text);
+            for law in laws {
+                assert!(
+                    squashed.contains(&squash(law)),
+                    "{label} lost the live-law fragment {law:?}"
+                );
+            }
+        };
+
+        // narrative-backfill: the backfill arc's dispatch/quota/patience/
+        // never-detach/cap discipline, translated one-shot.
+        let backfill = by_name("narrative-backfill");
+        carries(
+            &backfill.nodes[0].goal,
+            "narrative-backfill",
+            &[
+                // Dispatch law (owner-directed 2026-07-26).
+                "SYNCHRONOUS ROLLING `codex exec` pool targeting 22 attached workers",
+                "YOU remain the sole estate/journal writer",
+                "NO BATCH BARRIER: reap, validate, and commit each completion immediately",
+                "self-caps at 3 concurrent subagents",
+                "Wait on every worker PID — no detaching, no daemons, no survivors",
+                // Quota law: quota is a pool condition, never a skip.
+                "never consumes a session's retry and never journals 'stalled'",
+                "pause refilling and back off via shell sleeps (sleeping costs no quota)",
+                // Patience law.
+                "NEVER kill a live digest child",
+                "can exceed 15 minutes even on tiny inputs",
+                "journal {skipped:'stalled'} with a note and move to the NEXT target",
+                // Never-detach law.
+                "ITSELF IS THE ORCHESTRATOR",
+                "never build your own survivor",
+                // Auth + estimate laws (OAuth-always, caps are estimates).
+                "Codex subscription OAuth ONLY — NEVER an API key or direct API billing",
+                "ESTIMATES (API-equivalent arithmetic serving the cap",
+                "observed:false",
+                // Owner-set cap parameter, fail-closed, live enforcement.
+                "NS CAP: $<amount>",
+                "STOP REFILLING, wait out attached workers",
+                "NS CAP REACHED",
+                // Enumeration + digest + journal discipline.
+                "(newest_mtime_ms,total_bytes)",
+                "idle >6h",
+                "OLDEST-first",
+                "1-3K tokens",
+                "(4K hard cap)",
+                "cites ORIGINAL anchors",
+                "<=240 chars VERBATIM",
+                "anchor:{locator,ts_ms,role}",
+                "prompt_version:'ns1-v2'",
+                "exporter_version:'pr609'",
+                "tmp+rename",
+                "{skipped:'wrapper'|'empty'}",
+                "{skipped:'trivial'}",
+                "redaction stays ON; NEVER pass --redact off",
+                // Chunking rides the pool; merges are worker tasks.
+                "MERGE runs as a worker task in a slot",
+                "a stated hole beats losing a giant session to one bad chunk",
+                // The stalled sweep + completion handoff.
+                "re-attempt every journal entry {skipped:'stalled'} exactly once each",
+                "this sweep is their only second chance",
+                "NS BACKFILL COMPLETE",
+                // Product quarantine.
+                "create agenda items or memory proposals from this mandate",
+            ],
+        );
+
+        // session-digest: the daily mandate's compressed form of the
+        // same conduct, plus the guard and the territory addendum.
+        let daily = by_name("session-digest");
+        carries(
+            &daily.nodes[0].goal,
+            "session-digest",
+            &[
+                "never double-digest",
+                "SYNCHRONOUS ROLLING `codex exec` pool targeting up to 22 attached workers",
+                "you the sole estate/journal writer",
+                "self-caps at 3 — live incident 2026-07-26",
+                "Wait on every worker PID — no detaching, daemons, or survivors",
+                "Never kill a healthy worker; retry self-failures once in the same slot",
+                "pause refilling pool-wide, back off via shell sleeps (they cost no quota)",
+                "the cadence resurrects you",
+                "a hard cap surfaces to the owner via the suspension breaker by design",
+                "chunks are slot work units, the merge runs as a worker task in a slot (never in you)",
+                "a chunk failing its retry merges as a stated hole, never a stalled session",
+                "candidates = journal-absent or watermark-advanced sessions idle >6h",
+                "1-3K tokens, [n] markers",
+                "<=240-char VERBATIM quotes",
+                "{locator,ts_ms,role}",
+                "prompt_version:'ns1-v2'",
+                "skipped:'wrapper'|'empty'",
+                "skipped:'trivial'",
+                "NS daily: <n> digested, <m> skipped, ~$<cost>",
+                "redaction stays ON",
+                // Territory addendum (the v2 extraction contract).
+                "verbatim-observable from the transcript (tool calls, diffs, explicit reads/writes)",
+                "{path, kind:'file'|'dir', anchor}",
+                "empty array when none",
+                "cap 24; never inferred, never normalized beyond trimming",
+                "no extra model calls — extraction rides the digest pass",
+            ],
+        );
+
+        // narrative-pyramid: the weekly manifest's laws — executor law,
+        // safeguards law with the opus exception, audit, ruled caps.
+        let pyramid = by_name("narrative-pyramid");
+        carries(
+            &pyramid.orientation,
+            "narrative-pyramid orientation",
+            &[
+                "NS weekly: waiting on digests",
+                "prior-lane episodes, staged-work notes, and defects",
+                "episodes marked for the owner brief go IN the owner brief",
+                "Absorb staged work from prior lanes",
+                "rollup bulk NEVER enters a fable lane",
+            ],
+        );
+        let node_goal = |id: &str| {
+            pyramid
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .expect("pyramid node")
+                .goal
+                .as_str()
+        };
+        carries(
+            node_goal("rollups"),
+            "narrative-pyramid/rollups",
+            &[
+                "reasoning effort HIGH — owner directive 2026-07-26",
+                "per-house narrative first, per-project sections inside",
+                "3-8K tokens, EVERY claim citing digest locators (sessions/<source>/<id>)",
+                "heavy weeks fold day-partitions first",
+                "Atomic writes",
+            ],
+        );
+        carries(
+            node_goal("synthesis"),
+            "narrative-pyramid/synthesis",
+            &[
+                "from ALL rollups (input budget <=300K tokens)",
+                "arcs, decisions, reversals, unresolved threads",
+                "every claim cites rollup locators (rollups/<week>)",
+                "layered for both the context-switching and the deeply-focused reader",
+                // The safeguards law, incl. the opus exception, verbatim.
+                "NEVER build one giant synthesis request",
+                "Work by PARTS: draft per-arc sections across separate turns",
+                "DELEGATE security-heavy weeks' content to claude-opus-5 subagents",
+                "distilled narrative-safe prose with citations preserved",
+                "integrate the distilled parts in this lane so the final voice stays fable",
+                "never resend those bytes from this lane — split smaller and delegate",
+                "Keep each turn's added payload modest",
+                "A context that re-flags on every request is DEAD: stand down cleanly",
+                // Fidelity audit.
+                "sample 5 random key_claims",
+                "verify the quote appears VERBATIM at the anchor",
+                "NS AUDIT FAILURE",
+            ],
+        );
+        carries(
+            node_goal("products"),
+            "narrative-pyramid/products",
+            &[
+                // Owner brief per the briefing standard.
+                "situate (one plain sentence), what changed this week (3-6 lines), depth pointer",
+                "committed recommendation if any decision is pending",
+                "Silence does nothing",
+                // Product lanes: propose-only, ruled caps.
+                "kind observation|decision",
+                "'derived:track-ns'",
+                "Propose-only; judgments are the owner's",
+                "not bulk",
+                "<=3 proposals per week",
+                "tagged recovered-intent + track-ns",
+                "one-line intent + <=240-char verbatim quote + plain context",
+                "place under the intent hub if it exists",
+                "'NS BACKFILL COMPLETE' annotation",
+                "rank ALL digest intent-candidates by recency x explicitness",
+                "propose the top <=25 under it (same shape as b)",
+                "NEVER exceed 25; overflow stays greppable in digests",
+                "exceed the caps",
+            ],
+        );
+
+        // The executor stack is structural, not just prose: digests ride
+        // codex sol/xhigh; rollups opus/HIGH; synthesis + products
+        // fable/max (the owner-directed 2026-07-26 stack).
+        for def in [backfill, daily] {
+            let node = &def.nodes[0];
+            assert_eq!(node.agent.as_deref(), Some("codex"), "{}", def.name);
+            assert_eq!(node.model.as_deref(), Some("gpt-5.6-sol"), "{}", def.name);
+            assert_eq!(node.effort.as_deref(), Some("xhigh"), "{}", def.name);
+        }
+        let rollups = pyramid.nodes.iter().find(|n| n.id == "rollups").unwrap();
+        assert_eq!(rollups.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(rollups.effort.as_deref(), Some("high"));
+        for id in ["synthesis", "products"] {
+            let node = pyramid.nodes.iter().find(|n| n.id == id).unwrap();
+            assert_eq!(node.agent.as_deref(), Some("claude-code"), "{id}");
+            assert_eq!(node.model.as_deref(), Some("claude-fable-5"), "{id}");
+            assert_eq!(node.effort.as_deref(), Some("max"), "{id}");
+        }
+        // Arity-derived shapes: one-shot bootstrap (no cadence, no
+        // trigger), cadenced daily (1d, suspend after 3), three-lane
+        // weekly workflow chained rollups -> synthesis -> products.
+        assert!(!backfill.is_workflow());
+        assert!(backfill.nodes[0].cadence.is_none() && backfill.nodes[0].trigger.is_none());
+        assert!(!daily.is_workflow());
+        let cadence = daily.nodes[0].cadence.as_ref().expect("daily cadence");
+        assert_eq!(cadence.every_ms, 24 * 60 * 60 * 1000);
+        assert_eq!(cadence.suspend_after, Some(3));
+        assert!(pyramid.is_workflow());
+        assert_eq!(
+            pyramid.edges(),
+            vec![
+                ("synthesis".to_string(), "rollups".to_string()),
+                ("products".to_string(), "synthesis".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1448,7 +1703,7 @@ mod tests {
             block_after("### The steward-gate mandate"),
             by_name("steward-gate").nodes[0].goal
         );
-        for workflow in ["fix-task", "reconcile-backlog"] {
+        for workflow in ["fix-task", "reconcile-backlog", "narrative-pyramid"] {
             let def = by_name(workflow);
             let header = format!("### The {workflow} workflow");
             let blocks = blocks_after(&header, 1 + def.nodes.len());
@@ -1456,6 +1711,15 @@ mod tests {
             for (node, block) in def.nodes.iter().zip(&blocks[1..]) {
                 assert_eq!(*block, node.goal, "node {} goal drifted", node.id);
             }
+        }
+        // The NS actions pin orientation AND goal — their orientation
+        // carries the stamp guidance (cap parameter, evening anchor).
+        for action in ["narrative-backfill", "session-digest"] {
+            let def = by_name(action);
+            let header = format!("### The {action} mandate");
+            let blocks = blocks_after(&header, 2);
+            assert_eq!(blocks[0], def.orientation, "{action} orientation drifted");
+            assert_eq!(blocks[1], def.nodes[0].goal, "{action} goal drifted");
         }
         // The steward honesty note stays verbatim in the docs prose (the
         // T3 pin, carried through the walkthrough retarget).

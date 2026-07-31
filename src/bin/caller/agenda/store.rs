@@ -6759,6 +6759,89 @@ mod tests {
                 );
             }
         }
+
+        // Card 01KYTW64HX: the three narrative definitions stamp with the
+        // shapes their live NS source schedules carry — a one-shot
+        // bootstrap, a cadenced daily on the codex sol/xhigh pins, and a
+        // three-lane weekly chain with the owner-directed executor stack.
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("narrative-backfill"), owner(), 5000)
+            .unwrap();
+        assert!(outcome.hub.is_none(), "the bootstrap is an action");
+        let effect = &outcome.nodes[0].item.effects[0];
+        assert!(effect.manifest.recurrence.is_none(), "backfill is one-shot");
+        assert!(effect.manifest.trigger.is_none());
+        let config = effect.manifest.agent_config.as_deref().expect("codex pins");
+        assert_eq!(config.agent.as_deref(), Some("codex"));
+        assert_eq!(config.codex_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.codex_reasoning_effort.as_deref(), Some("xhigh"));
+
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("session-digest"), owner(), 5000)
+            .unwrap();
+        let effect = &outcome.nodes[0].item.effects[0];
+        let recurrence = effect.manifest.recurrence.expect("cadenced daily");
+        assert_eq!(recurrence.every_ms, 24 * 60 * 60 * 1000);
+        assert_eq!(recurrence.suspend_after_failures, Some(3));
+        assert!(effect.manifest.trigger.is_none());
+        let config = effect.manifest.agent_config.as_deref().expect("codex pins");
+        assert_eq!(config.agent.as_deref(), Some("codex"));
+        assert_eq!(config.codex_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.codex_reasoning_effort.as_deref(), Some("xhigh"));
+
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("narrative-pyramid"), owner(), 5000)
+            .unwrap();
+        let hub = outcome.hub.as_ref().expect("workflow stamps a hub");
+        assert_eq!(hub.title, "Narrative pyramid");
+        assert_eq!(outcome.nodes.len(), 3);
+        let by_node = |id: &str| {
+            outcome
+                .nodes
+                .iter()
+                .find(|n| n.node_id == id)
+                .expect("stamped node")
+        };
+        let dep_of = |id: &str| -> Vec<String> {
+            by_node(id)
+                .item
+                .relies_on
+                .iter()
+                .map(|d| d.target_id.clone())
+                .collect()
+        };
+        assert_eq!(dep_of("rollups"), Vec::<String>::new());
+        assert_eq!(dep_of("synthesis"), vec![by_node("rollups").item.id.clone()]);
+        assert_eq!(dep_of("products"), vec![by_node("synthesis").item.id.clone()]);
+        // The executor stack rides the node manifests: rollups fold at
+        // opus/HIGH (the rollup bulk never enters a fable lane);
+        // synthesis and products run fable/max.
+        let rollups = by_node("rollups").item.effects[0]
+            .manifest
+            .agent_config
+            .as_deref()
+            .expect("opus pins");
+        assert_eq!(rollups.agent.as_deref(), Some("claude-code"));
+        assert_eq!(rollups.claude_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(rollups.claude_effort.as_deref(), Some("high"));
+        for id in ["synthesis", "products"] {
+            let config = by_node(id).item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .expect("fable pins");
+            assert_eq!(config.agent.as_deref(), Some("claude-code"), "{id}");
+            assert_eq!(config.claude_model.as_deref(), Some("claude-fable-5"), "{id}");
+            assert_eq!(config.claude_effort.as_deref(), Some("max"), "{id}");
+            assert_eq!(
+                by_node(id).item.effects[0].manifest.trigger,
+                Some(super::super::types::TriggerSpec::OnUnblock),
+                "{id}"
+            );
+        }
     }
 
     #[test]
