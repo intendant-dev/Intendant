@@ -1069,6 +1069,7 @@ mod tests {
                     holder,
                     true,
                     spacing,
+                    None,
                 )
                 .await;
                 start.elapsed()
