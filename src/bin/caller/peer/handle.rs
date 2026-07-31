@@ -1141,6 +1141,43 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// Snapshots from daemons predating the link/grant fields (and the
+    /// wire the dashboard round-trips) must keep parsing: both fields
+    /// are `serde(default)` and elided when absent.
+    #[test]
+    fn peer_snapshot_backcompat_without_link_and_grant() {
+        let json = r#"{
+            "id": "intendant:old-peer",
+            "label": "old",
+            "version": "0.0.9",
+            "connection_state": {"state": "connected"},
+            "status": "idle",
+            "capabilities": []
+        }"#;
+        let snap: PeerSnapshot = serde_json::from_str(json).expect("old snapshot parses");
+        assert!(snap.link.is_none());
+        assert!(snap.grant.is_none());
+
+        // And the new fields round-trip when present.
+        let mut snap = snap;
+        snap.link = Some(PeerLinkInfo {
+            url: "wss://peer.example/ws".into(),
+            transport_class: PeerTransportClass::Relayed,
+        });
+        snap.grant = Some(PeerGrantInfo {
+            profile: "peer-operator".into(),
+            operations: vec!["message.send".into()],
+        });
+        let round = serde_json::to_string(&snap).unwrap();
+        assert!(
+            round.contains(r#""transport_class":"relayed""#),
+            "snake_case wire form for the class: {round}"
+        );
+        let back: PeerSnapshot = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.link, snap.link);
+        assert_eq!(back.grant, snap.grant);
+    }
+
     #[test]
     fn connection_state_is_copy_and_equatable() {
         let a = ConnectionState::Reconnecting { attempt: 3 };

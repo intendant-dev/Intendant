@@ -237,13 +237,59 @@ view (cleared on disconnect — the fold is connection-scoped, and stale entries
 would ghost if the peer restarted), and `PeerSnapshot` carries it as
 `sessions`, so `GET /api/peers` seeds a late-joining dashboard and every
 pushed `peer_state_changed` snapshot replaces the row's list losslessly (same
-source of truth as the live events). The dashboard renders them as
-display-only nodes orbiting the peer's host in the Station scene (capped per
-peer — the scene is a bounded constellation; the peer's own dashboard is the
-exhaustive list). Action pills stay off peer session nodes in v1: the
-session-action handlers assume local session ids. None of this changes what a
-peer exposes — the sessions rail is derived entirely from the event stream the
-peer already sends under its access profile.
+source of truth as the live events). The dashboard renders them as nodes
+orbiting the peer's host in the Station scene (capped per peer — the scene is
+a bounded constellation; the peer's own dashboard is the exhaustive list).
+None of this changes what a peer exposes — the sessions rail is derived
+entirely from the event stream the peer already sends under its access
+profile.
+
+### Host-scoped session actions — `session-control`
+
+Peer sessions are operable, not just visible. `POST
+/api/peers/{peer_id}/session-control` (tunnel twin
+`api_peer_session_control`; dialer-side IAM `peer.use`, like the other
+`/api/peers/{id}/<op>` quick controls) takes one session-lifecycle
+`ControlMsg` in its wire form — `{"message": {"action": "interrupt",
+"session_id": "…"}}` — where every session id is the *peer's* session id,
+forwarded verbatim. The dialer validates the action against a **derived**
+allowlist (the local session RPC lane's set intersected with the
+Message/Task/Approval/SessionManage operation classes — so Settings-,
+credentials-, and access-classified actions fail closed locally with an
+honest 403; agenda, memory, vault/custody, access/IAM, and settings stay
+doctrine-closed to peer routing), then `PeerOp::SessionControl` writes the
+`ControlMsg` to the peer's `/ws` verbatim. The peer authorizes it per-action
+against the profile it granted this daemon — the same
+`control_msg_operation` → profile evaluation every `/ws` client passes — so
+the op carries no authority of its own and works identically for
+direct-dialed and relay-transiting links (it rides the federation control
+WS, never the browser↔peer datachannel). Fire-and-forget like approvals:
+outcomes come back on the event stream.
+
+### The grant echo and the connected link — honesty rails
+
+Two `PeerSnapshot` fields exist so the dashboard renders what a peer row
+can actually do *now*, instead of guessing from the row's existence:
+
+- **`grant`** — on every peer-identified `/ws` connect, the *target*
+  daemon's bootstrap emits a `peer_grant` event: the profile it resolved
+  for the connecting identity plus the operation permission ids that
+  profile allows, derived from `profile_allows_operation` over the frozen
+  operation set (never a hand-kept list). The dialer folds it into
+  `PeerSnapshot.grant` (connection-scoped; cleared on disconnect;
+  re-advertised each connect, so profile edits land on the next
+  reconnect). Display metadata only: the peer's per-request gates enforce
+  authority regardless. `None` means *unknown* (older peer) — dashboards
+  treat unknown as "act and report", never as denial.
+- **`link`** — after each successful connect the actor records which
+  transport candidate won (`MultiTransport` re-walks candidates per
+  reconnect) as `{url, transport_class}`. `transport_class` is `direct`
+  for every candidate built today; the Stage-B relay candidate (RC-B2)
+  classifies `relayed`. Media and datachannel affordances — live display,
+  file-transfer bytes, the browser↔peer dashboard-control tunnel — are
+  rendered from this class: a relay-only link carries signaling and
+  request/response but nothing ICE-borne without a direct route or
+  provisioned TURN. Cleared while disconnected.
 
 ### Per-peer displays — the folded availability rail
 

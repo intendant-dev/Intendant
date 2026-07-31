@@ -1960,6 +1960,46 @@ mod tests {
         ));
     }
 
+    /// Golden derivation for the `peer_grant` bootstrap echo: the
+    /// operation-id sets for the two profiles peers commonly hold, plus
+    /// the fail-closed shape for an unknown profile. If a profile's
+    /// operation set changes, this test names the delta — the echo
+    /// itself can't drift because it derives from the same predicate.
+    #[test]
+    fn profile_operation_permission_ids_golden() {
+        assert_eq!(
+            profile_operation_permission_ids("peer-operator"),
+            vec![
+                "presence.read",
+                "stats.read",
+                "display.view",
+                "display.input",
+                "message.send",
+                "task.run",
+                "approval.resolve",
+                "session.inspect",
+            ]
+        );
+
+        let root = profile_operation_permission_ids("peer-root");
+        assert!(root.contains(&"session.manage".to_string()));
+        assert!(root.contains(&"settings.manage".to_string()));
+        assert!(
+            !root.contains(&"access.manage".to_string()),
+            "peer-root must never carry access administration"
+        );
+        assert!(
+            !root.contains(&"credentials.manage".to_string()),
+            "peer-root must never carry credential administration"
+        );
+
+        // Unknown profiles fail closed to presence-only.
+        assert_eq!(
+            profile_operation_permission_ids("made-up-profile"),
+            vec!["presence.read"]
+        );
+    }
+
     #[test]
     fn peer_signal_relays_classify_as_peer_use() {
         // Acting through a connected peer — the three signaling relays and
@@ -1971,6 +2011,7 @@ mod tests {
             "message",
             "task",
             "approval",
+            "session-control",
         ] {
             assert_eq!(
                 federation_http_operation("POST", &format!("/api/peers/intendant:peer-b/{op}")),

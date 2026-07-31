@@ -2540,6 +2540,62 @@ pub(crate) async fn api_coordinator_route_response(
 mod tests {
     use super::*;
 
+    /// The peer session-control allowlist is the session RPC lane's
+    /// set intersected with the session-work operation classes
+    /// (Message / Task / Approval / SessionManage). Pin the doctrine
+    /// boundary: every Settings-, credentials-, or access-classified
+    /// action must refuse peer routing even when the session lane
+    /// itself allows it locally, and actions outside the session lane
+    /// never pass regardless of class.
+    #[test]
+    fn peer_session_control_allowlist_keeps_closed_planes_closed() {
+        let msg = |json: &str| -> ControlMsg {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse {json}: {e}"))
+        };
+
+        // Session lifecycle + conversation + approvals: routable.
+        for allowed in [
+            r#"{"action":"interrupt","session_id":"s"}"#,
+            r#"{"action":"follow_up","text":"hi","session_id":"s"}"#,
+            r#"{"action":"start_task","task":"do a thing"}"#,
+            r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+            r#"{"action":"rename_session","session_id":"s","name":"x"}"#,
+            r#"{"action":"stop_session","session_id":"s"}"#,
+            r#"{"action":"approve","id":7}"#,
+            r#"{"action":"steer","text":"go left"}"#,
+        ] {
+            assert!(
+                peer_session_control_allowed(&msg(allowed)),
+                "expected routable: {allowed}"
+            );
+        }
+
+        // Settings-classified (doctrine-closed to peer routing) —
+        // in the local session lane, refused for peers by class.
+        assert!(!peer_session_control_allowed(&msg(
+            r#"{"action":"configure_session_agent","session_id":"s"}"#
+        )));
+
+        // Outside the session lane entirely: refused regardless of
+        // how their operation classifies (settings, credentials,
+        // display, runtime).
+        for refused in [
+            r#"{"action":"set_autonomy","mode":"auto"}"#,
+            r#"{"action":"set_codex_command","command":"evil"}"#,
+            r#"{"action":"set_external_agent","agent":"codex"}"#,
+            r#"{"action":"take_display","display_id":1}"#,
+            r#"{"action":"status"}"#,
+        ] {
+            let parsed: Result<ControlMsg, _> = serde_json::from_str(refused);
+            if let Ok(ctrl) = parsed {
+                assert!(
+                    !peer_session_control_allowed(&ctrl),
+                    "expected refused: {refused}"
+                );
+            }
+        }
+    }
+
     // ── S4b tunnel/HTTP parity: worktrees (design §8) ──
     //
     // Extends the S4a enumeration (api_sessions.rs). The S4b-specific

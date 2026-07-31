@@ -878,6 +878,47 @@ mod tests {
     /// on interruption salvage) ahead of the Disconnected record, while
     /// the deltas themselves stay off the durable log.
     #[tokio::test]
+    async fn grant_advertised_folds_and_clears_on_disconnect() {
+        let (log_tx, _log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        let grant_rx = actor.grant_tx.subscribe();
+        let link_rx = actor.link_tx.subscribe();
+
+        actor
+            .handle_event(PeerEvent::GrantAdvertised {
+                profile: "peer-operator".into(),
+                operations: vec!["message.send".into(), "task.run".into()],
+            })
+            .await;
+        {
+            let grant = grant_rx.borrow();
+            let grant = grant.as_ref().expect("grant folded");
+            assert_eq!(grant.profile, "peer-operator");
+            assert_eq!(grant.operations, vec!["message.send", "task.run"]);
+        }
+
+        // Simulate a recorded link so the disconnect clear is observable.
+        let _ = actor.link_tx.send(Some(PeerLinkInfo {
+            url: "wss://peer.example/ws".into(),
+            transport_class: crate::peer::PeerTransportClass::Direct,
+        }));
+
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+        assert!(
+            grant_rx.borrow().is_none(),
+            "grant is connection-scoped and must clear on disconnect"
+        );
+        assert!(
+            link_rx.borrow().is_none(),
+            "link is connection-scoped and must clear on disconnect"
+        );
+    }
+
+    #[tokio::test]
     async fn interrupted_streaming_reply_lands_one_coalesced_log_record() {
         let (log_tx, mut log_rx) = mpsc::channel(64);
         let (mut actor, _guards) = test_actor(log_tx);

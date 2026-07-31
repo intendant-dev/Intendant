@@ -6388,6 +6388,7 @@ mod tests {
             "api_peer_message",
             "api_peer_task",
             "api_peer_approval",
+            "api_peer_session_control",
             "api_peer_webrtc_signal",
             "api_peer_file_transfer_signal",
             "api_peer_dashboard_control_signal",
