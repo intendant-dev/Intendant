@@ -264,7 +264,7 @@ pub fn check_feature(features: &TransportFeatures, op: &PeerOp) -> Result<(), Pe
 
 /// Low-level wire handler for one peer connection.
 ///
-/// Single trait, six methods. All role-specific ergonomics live on
+/// Single trait, seven methods. All role-specific ergonomics live on
 /// [`crate::peer::handle::PeerHandle`] — transports just move bytes.
 #[async_trait]
 pub trait PeerTransport: Send + Sync {
@@ -289,4 +289,17 @@ pub trait PeerTransport: Send + Sync {
     /// Execute one operation. Must call [`check_feature`] at the top
     /// as the invariant guard.
     async fn send(&mut self, op: PeerOp) -> Result<PeerOpAck, PeerError>;
+
+    /// Emit one wire-level liveness probe on the live connection.
+    ///
+    /// The actor calls this on a jittered ~30 s cadence
+    /// (`peer::actor` pins the constants) so relayed federation links
+    /// survive the Connect relay's 120 s splice idle teardown and
+    /// half-open direct links surface as write errors instead of
+    /// hanging silently. An error means the connection is unusable —
+    /// the actor treats it like a stream end and walks reconnect.
+    /// Default: no-op for transports without a persistent wire.
+    async fn keepalive(&mut self) -> Result<(), PeerError> {
+        Ok(())
+    }
 }

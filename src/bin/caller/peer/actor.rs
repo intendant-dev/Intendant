@@ -134,6 +134,35 @@ fn backoff_seed(peer_id: &PeerId) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Keepalive
+// ---------------------------------------------------------------------------
+
+/// Dialer-originated keepalive cadence for the peer control link. The
+/// Connect relay tears down splices idle for
+/// [`crate::relay_tunnel::SPLICE_IDLE`] (120 s, enforced on both relay
+/// sides), so without traffic an idle relayed federation link dies by
+/// construction; on direct links, half-open detection is otherwise
+/// TCP-timeout-only. One wire ping per jittered ~30 s keeps both alive.
+/// Pinned by `keepalive_cadence_is_pinned_comfortably_under_relay_idle`:
+/// base + max jitter must stay at or under half the relay idle window.
+const KEEPALIVE_BASE: Duration = Duration::from_secs(30);
+/// Upper bound on the deterministic per-tick jitter added to
+/// [`KEEPALIVE_BASE`], decorrelating peer actors like the backoff jitter.
+const KEEPALIVE_JITTER_MAX: Duration = Duration::from_secs(5);
+
+/// Next keepalive delay: base plus deterministic jitter in
+/// `[0, KEEPALIVE_JITTER_MAX]`, stepped per tick and phase-shifted per
+/// actor — the same reproducible-jitter approach as [`Backoff`].
+fn keepalive_delay(seed: u32, tick: u32) -> Duration {
+    let span_ms = KEEPALIVE_JITTER_MAX.as_millis() as u64 + 1;
+    let jitter_ms = u64::from(tick)
+        .wrapping_mul(137)
+        .wrapping_add(u64::from(seed))
+        % span_ms;
+    KEEPALIVE_BASE + Duration::from_millis(jitter_ms)
+}
+
+// ---------------------------------------------------------------------------
 // The actor
 // ---------------------------------------------------------------------------
 
@@ -366,8 +395,28 @@ impl PeerActor {
     ///    narrative, then trip `StreamEnded` so the outer run
     ///    loop transitions to Reconnecting.
     async fn main_loop(&mut self) -> MainLoopExit {
+        // Dialer-originated liveness (see the keepalive constants above).
+        // The deadline is absolute, so serving events or commands does
+        // not defer the next ping — a receive-active link still writes
+        // bytes inside the relay's idle window.
+        let keepalive_seed = backoff_seed(&self.peer_id);
+        let mut keepalive_tick: u32 = 0;
+        let mut keepalive_at =
+            tokio::time::Instant::now() + keepalive_delay(keepalive_seed, keepalive_tick);
         loop {
             tokio::select! {
+                _ = tokio::time::sleep_until(keepalive_at) => {
+                    if self.transport.keepalive().await.is_err() {
+                        // The wire refused a ping: the connection is
+                        // unusable. Same exit as a drain-task disconnect —
+                        // the run loop emits Disconnected and walks the
+                        // reconnect backoff.
+                        return MainLoopExit::StreamEnded;
+                    }
+                    keepalive_tick = keepalive_tick.wrapping_add(1);
+                    keepalive_at = tokio::time::Instant::now()
+                        + keepalive_delay(keepalive_seed, keepalive_tick);
+                }
                 maybe_event = self.events_in_rx.recv() => {
                     match maybe_event {
                         Some(event) => {
@@ -725,6 +774,102 @@ mod tests {
                 "seed {seed}: got {d:?}, expected between {min:?} and {max:?}"
             );
         }
+    }
+
+    /// The relay tears down idle splices at `SPLICE_IDLE`; the dialer's
+    /// keepalive cadence must sit comfortably under it — pinned here at
+    /// half the window even at maximum jitter — and stay deterministic
+    /// and bounded like the backoff jitter.
+    #[test]
+    fn keepalive_cadence_is_pinned_comfortably_under_relay_idle() {
+        assert_eq!(KEEPALIVE_BASE, Duration::from_secs(30));
+        let ceiling = KEEPALIVE_BASE + KEEPALIVE_JITTER_MAX;
+        assert!(
+            ceiling * 2 <= crate::relay_tunnel::SPLICE_IDLE,
+            "keepalive ceiling {ceiling:?} must stay at or under half the relay idle \
+             teardown {:?}",
+            crate::relay_tunnel::SPLICE_IDLE,
+        );
+        for seed in [0, 1, 137, u32::MAX] {
+            for tick in 0..64 {
+                let delay = keepalive_delay(seed, tick);
+                assert!(
+                    delay >= KEEPALIVE_BASE && delay <= ceiling,
+                    "seed {seed} tick {tick}: {delay:?} outside [{KEEPALIVE_BASE:?}, {ceiling:?}]"
+                );
+                assert_eq!(delay, keepalive_delay(seed, tick), "jitter must be deterministic");
+            }
+        }
+    }
+
+    /// While connected, the main loop originates one wire ping per
+    /// jittered keepalive period, and a refused ping ends the loop like
+    /// a stream end (the run loop then walks reconnect).
+    #[tokio::test(start_paused = true)]
+    async fn main_loop_pings_on_the_keepalive_cadence_and_exits_on_ping_failure() {
+        struct KeepaliveProbeTransport {
+            spec: crate::peer::card::TransportSpec,
+            pings: Arc<std::sync::atomic::AtomicU32>,
+            fail_on: u32,
+        }
+
+        #[async_trait::async_trait]
+        impl PeerTransport for KeepaliveProbeTransport {
+            fn spec(&self) -> &crate::peer::card::TransportSpec {
+                &self.spec
+            }
+            fn features(&self) -> crate::peer::traits::TransportFeatures {
+                crate::peer::traits::TransportFeatures::default()
+            }
+            async fn connect(&mut self) -> Result<AgentCard, PeerError> {
+                Err(PeerError::NotConnected)
+            }
+            async fn disconnect(&mut self) -> Result<(), PeerError> {
+                Ok(())
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+            async fn send(
+                &mut self,
+                _op: crate::peer::traits::PeerOp,
+            ) -> Result<crate::peer::traits::PeerOpAck, PeerError> {
+                Err(PeerError::NotConnected)
+            }
+            async fn keepalive(&mut self) -> Result<(), PeerError> {
+                let count = self
+                    .pings
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if count >= self.fail_on {
+                    Err(PeerError::Transport("wire gone".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let (mut actor, (_commands_tx, _events_in_tx, _events_out_rx)) = test_actor(log_tx);
+        let pings = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        actor.transport = Box::new(KeepaliveProbeTransport {
+            spec: crate::peer::card::TransportSpec::IntendantWs {
+                url: "ws://127.0.0.1:1/ws".into(),
+            },
+            pings: Arc::clone(&pings),
+            fail_on: 3,
+        });
+
+        let started = tokio::time::Instant::now();
+        let exit = actor.main_loop().await;
+        assert!(matches!(exit, MainLoopExit::StreamEnded));
+        assert_eq!(pings.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let elapsed = started.elapsed();
+        let ceiling = KEEPALIVE_BASE + KEEPALIVE_JITTER_MAX;
+        assert!(
+            elapsed >= KEEPALIVE_BASE * 3 && elapsed <= ceiling * 3,
+            "three keepalive periods expected, got {elapsed:?}"
+        );
     }
 
     struct StubTransport(crate::peer::card::TransportSpec);

@@ -145,6 +145,15 @@ impl PeerTransport for MultiTransport {
             None => Err(PeerError::NotConnected),
         }
     }
+
+    async fn keepalive(&mut self) -> Result<(), PeerError> {
+        match self.active {
+            Some(i) => self.candidates[i].keepalive().await,
+            // No live connection to keep alive; the actor is between
+            // connects and the reconnect walk owns liveness there.
+            None => Ok(()),
+        }
+    }
 }
 
 /// Union of all candidates' features. Used by `MultiTransport::features`

@@ -602,6 +602,19 @@ impl PeerTransport for IntendantWsTransport {
         self.ws_write.is_some()
     }
 
+    /// One WebSocket `Ping` on the control link. The peer's tungstenite
+    /// answers the pong automatically (see `drain_ws`), so this needs no
+    /// application-level reply handling: the point is bytes on the wire
+    /// in both directions inside the relay's idle window, and a prompt
+    /// write error when the connection is half-open.
+    async fn keepalive(&mut self) -> Result<(), PeerError> {
+        let write = self.ws_write.as_mut().ok_or(PeerError::NotConnected)?;
+        write
+            .send(Message::Ping(Vec::new().into()))
+            .await
+            .map_err(|e| PeerError::Transport(format!("ws keepalive ping: {e}")))
+    }
+
     async fn send(&mut self, op: PeerOp) -> Result<PeerOpAck, PeerError> {
         check_feature(&self.features(), &op)?;
         if self.ws_write.is_none() {
