@@ -373,6 +373,40 @@ brake. The pass is visible: one summary notification per boot with
 anything mid-work, reporting confirmed-alive, died-after-dispatch, and
 left-dead separately, with reasons.
 
+After the mid-work loop, the same pass runs the **unfinished-commission
+sweep** — once per boot, same `[readopt]` knob, holder-gated. The
+mid-work lens is idle-in-idle-out by ruled design, but "idle" and
+"finished" are different claims: a commissioned seat that paused between
+turns with its arc open looks exactly like a finished one, so a
+crash-boot used to strand it silently. The sweep keys on **unfinished
+commissions, never idleness** — the AO safe-to-stop conjunction read at
+boot: an open item's effect whose `last_run` recovery left `unknown`,
+**unattested** (any attested outcome — even `blocked` — is a delivered
+self-report, and the seat stays down: the idle-done exclusion), with no
+live wrapper anywhere in its resume lineage. Everything derives from the
+item store's fold, the occurrence journal, and the shared lineage
+walker — the sweep keeps no bookkeeping of its own. Occurrences THIS
+boot's recovery fail-closed get the standard continue-where-you-left-off
+resume through the same guard ladder (owner stop, staleness, live-tip
+refusal, admission CAS, the per-boot cap), differing in exactly one
+rung: a concluded/idle lineage tip resumes instead of staying down,
+because the commission — not the session status — is the question; the
+scheduler's readopt watch then re-keys the occurrence onto the admitted
+successor so the woken seat can still attest. Everything the sweep must
+not or cannot wake goes to the owner instead of into silence, listed in
+ONE needs-you agenda task (tag `commission-sweep`, found or created,
+annotated once per boot — identical consecutive lists are not
+re-stacked) beside one attention notification: `failed` runs are
+**listed, never re-fired** (a deliberate terminal; the owner re-arms by
+re-approving the unchanged digest — the re-approval lane), suspended
+series stay down (the streak brake bounds the wake exactly as it bounds
+the mid-work pass), strandings older than this boot's classification,
+spawnless fail-closes, and wakes that were refused or died inside the
+verify window. Effects the planner will fire again (`next_fire_ms`: an
+armed standing series, a trigger walk's bounded regeneration) are
+settled silently — machinery already carries their continuity, and a
+wake would race the next fire.
+
 ### Scheduled sessions
 
 Scheduled work is a separate effect object that references an agenda item.

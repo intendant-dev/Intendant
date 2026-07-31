@@ -917,6 +917,10 @@ impl SessionVitalsHub {
         self.retire_era_if_orphaned(source, &previous);
         // The current-era registry changed regardless of retirement.
         self.persist_account_limits();
+        // Members that stay on the superseded era must gain their
+        // `account_prior` cue NOW — at the switch, not at their era's
+        // next report (which, for an idle stale era, never comes).
+        self.remirror_source(source);
     }
 
     /// Drop `era`'s window bucket for `source` when it has no member
@@ -949,14 +953,21 @@ impl SessionVitalsHub {
     }
 
     /// Deliver every member session of `source` its own era's window
-    /// view. The `account` stamp on delivered windows is the multi-era
-    /// cue: present only while more than one era has live members, so the
-    /// frontends label ambiguous chips apart and a single-era steady
+    /// view. The `account` stamp on delivered windows is the ambiguity
+    /// cue: present while more than one era has live members, so the
+    /// frontends label ambiguous chips apart, and a single-era steady
     /// state renders exactly as before (the unattributed era never
     /// stamps — the daemon has no truthful label to give it). A member
-    /// whose era holds no windows gets an EMPTY view: after a re-key the
-    /// alternative is the old era's chips lingering on a session that no
-    /// longer runs those credentials.
+    /// whose LABELED era is no longer the source's current era
+    /// additionally carries `account_prior` — and always its label, even
+    /// as the only live era: its backend has not announced (= re-read
+    /// credentials) since a newer sign-in, and an unlabeled chip would
+    /// read as the current account's truth (the 2026-07-30 grid: two
+    /// sessions wearing red limited chips of the switched-out account
+    /// beside fresh-era sessions wearing none, nothing explaining the
+    /// split). A member whose era holds no windows gets an EMPTY view:
+    /// after a re-key the alternative is the old era's chips lingering
+    /// on a session that no longer runs those credentials.
     fn remirror_source(&self, source: &str) {
         let members: Vec<(String, AccountEra)> = {
             let sources = self.session_sources.lock().expect("vitals source lock");
@@ -972,7 +983,9 @@ impl SessionVitalsHub {
         let live_eras: std::collections::BTreeSet<&AccountEra> =
             members.iter().map(|(_, era)| era).collect();
         let multiple = live_eras.len() > 1;
+        let current = self.current_era(source);
         for (member, era) in &members {
+            let prior = era.is_some() && *era != current;
             let view: Vec<SessionLimitWindow> = {
                 let accounts = self.account_limits.lock().expect("vitals account lock");
                 accounts
@@ -983,7 +996,8 @@ impl SessionVitalsHub {
                             .values()
                             .map(|window| {
                                 let mut window = window.clone();
-                                window.account = if multiple { era.clone() } else { None };
+                                window.account = if multiple || prior { era.clone() } else { None };
+                                window.account_prior = prior;
                                 window
                             })
                             .collect()
@@ -1026,6 +1040,10 @@ impl SessionVitalsHub {
                 .into_iter()
                 .map(|mut window| {
                     window.account = account.clone();
+                    // Store rows are era truth, not a view: prior-ness is
+                    // relative to the CURRENT era and stamps only on the
+                    // per-session mirror (`remirror_source`).
+                    window.account_prior = false;
                     window
                 })
                 .collect();
@@ -3414,6 +3432,7 @@ mod tests {
             status: None,
             observed_at_epoch: Some(1_783_800_000),
             account: None,
+            account_prior: false,
         }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
@@ -3477,6 +3496,7 @@ mod tests {
             status: Some("allowed_warning".into()),
             observed_at_epoch: Some(observed_at),
             account: None,
+            account_prior: false,
         }
     }
 
@@ -3827,8 +3847,13 @@ mod tests {
     /// era has live members — the single-era steady state renders exactly
     /// as before, and the unattributed era never stamps (the daemon has
     /// no truthful label to give it; its chips stay plain and the LABELED
-    /// era's suffix is what tells them apart). The SPA half renders the
-    /// suffix whenever `account` is present — pinned against the fragment
+    /// era's suffix is what tells them apart). Amended 2026-07-30 (card
+    /// 01KYRPSG3D9FHVAS2N4RF2A9S4): a SUPERSEDED era also stamps its
+    /// label regardless of the member count — see
+    /// `prior_era_members_carry_labeled_staleness_cue`; every era in
+    /// this test is current when it is the only live one, so the
+    /// original claims hold unchanged. The SPA half renders the suffix
+    /// whenever `account` is present — pinned against the fragment
     /// beside the wire-parity test.
     #[test]
     fn chips_suffix_account_only_when_multiple_eras() {
@@ -3870,6 +3895,173 @@ mod tests {
         assert!(
             catalog.contains("vitalsLimitAccountShort(v.account)"),
             "the limit chip grammar renders the account suffix from the single map"
+        );
+    }
+
+    /// THE COMMISSIONED RE-ANNOUNCE-GAP PIN (2026-07-30, card
+    /// 01KYRPSG3D9FHVAS2N4RF2A9S4): announce-based era membership is
+    /// deliberate — after an account switch a member that has not
+    /// re-announced keeps its birth era — but its mirrored windows must
+    /// SAY so. A superseded labeled era stamps `account_prior` and its
+    /// label even as the only live era (an unlabeled chip reads as the
+    /// current sign-in's truth — the 2026-07-30 grid confusion), the cue
+    /// lands AT the switch rather than at the era's next report (an idle
+    /// stale era never reports again), the current era never claims
+    /// prior, and a re-announce — the next process start, or the
+    /// pending-less park wake's turn-free announce riding the same
+    /// `SessionIdentity` path — re-keys membership and clears the cue.
+    #[test]
+    fn prior_era_members_carry_labeled_staleness_cue() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.observe_backend_account("claude-code", Some("a@x".into()));
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows("native-a", vec![warn_window(1_000)]);
+        // Current era, single: unlabeled, no cue — steady state.
+        let view = limits_of(&hub, "wrapper-a");
+        assert_eq!(view[0].account, None);
+        assert!(!view[0].account_prior);
+
+        // The switch. The member keeps era A (announce-based membership),
+        // but its chips gain label + cue IMMEDIATELY — era A is the only
+        // live era, and no report of its own ever arrives again.
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        let view = limits_of(&hub, "wrapper-a");
+        assert_eq!(
+            view[0].account.as_deref(),
+            Some("a@x"),
+            "a superseded era's numbers never render unlabeled"
+        );
+        assert!(
+            view[0].account_prior,
+            "the superseded era must carry the staleness cue"
+        );
+
+        // A member announces under the new era: both labeled (multi-era
+        // ambiguity), only the superseded one prior.
+        hub.link_identity("native-b", "wrapper-b", "claude-code");
+        hub.apply_rate_limit_windows("native-b", vec![warn_window(2_000)]);
+        assert!(limits_of(&hub, "wrapper-a")[0].account_prior);
+        let b = limits_of(&hub, "wrapper-b");
+        assert_eq!(b[0].account.as_deref(), Some("b@x"));
+        assert!(!b[0].account_prior, "the current era never claims prior");
+
+        // The stale member re-announces (a respawn's process start, or
+        // the park wake's turn-free announce): membership re-keys into
+        // the current era, era A retires with its last member, and the
+        // cue clears everywhere.
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        let a = limits_of(&hub, "wrapper-a");
+        assert_eq!(a[0].account, None, "single CURRENT era — suffix-free");
+        assert!(!a[0].account_prior);
+        assert!(!limits_of(&hub, "wrapper-b")[0].account_prior);
+    }
+
+    /// The unattributed era never claims prior: the daemon has no
+    /// truthful account to anchor "still ‹account›" to, and the
+    /// pre-ceremony credentials may well BE the account the owner then
+    /// signed into (same-label re-login keeps its era for the same
+    /// reason). Its chips stay plain through a switch.
+    #[test]
+    fn unattributed_era_never_carries_prior_cue() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.link_identity("native-u", "wrapper-u", "claude-code");
+        hub.apply_rate_limit_windows("native-u", vec![warn_window(1_000)]);
+        hub.observe_backend_account("claude-code", Some("b@x".into()));
+        let view = limits_of(&hub, "wrapper-u");
+        assert_eq!(view[0].account, None);
+        assert!(!view[0].account_prior);
+    }
+
+    /// The bucket-mate caveat, delivery half (the store half — a bucket
+    /// with any live window survives whole — is pinned in
+    /// session_vitals_restore::lapsed_resets_expire_at_load_and_persist):
+    /// a reset-passed row beside a live bucket-mate is neither deduped
+    /// into its mate nor dropped from the member's mirror. Both rows
+    /// deliver, label-keyed, so the frontend renders the lapsed one as
+    /// "reset" until the next report replaces it — 7d base and
+    /// 7d-overage stay two real windows (the 01KYKA22 lesson).
+    #[test]
+    fn lapsed_row_beside_live_mate_stays_delivered() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+
+        hub.observe_backend_account("claude-code", Some("a@x".into()));
+        hub.link_identity("native-a", "wrapper-a", "claude-code");
+        hub.apply_rate_limit_windows(
+            "native-a",
+            vec![
+                // Reset already passed (epoch 1_000).
+                crate::types::SessionLimitWindow {
+                    resets_at_epoch: Some(1_000),
+                    status: Some("rejected".into()),
+                    ..warn_window(900)
+                },
+                // Live mate, far-future reset.
+                crate::types::SessionLimitWindow {
+                    label: "7d-overage".into(),
+                    used_pct: Some(79),
+                    resets_at_epoch: Some(4_000_000_000),
+                    ..warn_window(950)
+                },
+            ],
+        );
+        let view = limits_of(&hub, "wrapper-a");
+        assert_eq!(view.len(), 2, "lapsed row and live mate both deliver");
+        let lapsed = view.iter().find(|w| w.label == "5h").expect("lapsed row");
+        assert_eq!(lapsed.resets_at_epoch, Some(1_000));
+        assert_eq!(lapsed.status.as_deref(), Some("rejected"));
+        let mate = view
+            .iter()
+            .find(|w| w.label == "7d-overage")
+            .expect("live mate");
+        assert_eq!(mate.used_pct, Some(79));
+    }
+
+    /// SPA half of the re-announce-gap pin: the fragment's chip grammar
+    /// carries the "still ‹acct›" cue on both text twins, the
+    /// tap-to-explain sentence rides the live AND reset-passed paths,
+    /// the reset-passed row keeps its neutral "reset" wording composed
+    /// with the account suffix (the bucket-mate caveat's display half —
+    /// beside a live mate it reads "reset", never a live claim), and a
+    /// rolled window can never elevate.
+    #[test]
+    fn prior_and_rolled_chip_grammar_pinned_in_fragment() {
+        let catalog = vitals_catalog_slice();
+        assert_eq!(
+            catalog
+                .matches("v.accountPrior ? ` · still ${acct}` : ` · ${acct}`")
+                .count(),
+            2,
+            "chip and fact-line twins lost the still-cue suffix grammar"
+        );
+        assert!(
+            catalog.contains("function vitalsLimitPriorAccountLine"),
+            "the fragment lost the prior-era explainer sentence"
+        );
+        assert_eq!(
+            catalog
+                .matches("vitalsLimitPriorAccountLine(v.account)")
+                .count(),
+            2,
+            "the prior-era explainer must ride the live and reset-passed explain paths"
+        );
+        assert_eq!(
+            catalog.matches("`${label} reset${suffix}`").count(),
+            2,
+            "the reset-passed row lost its neutral grammar (chip + fact-line twins)"
+        );
+        assert!(
+            catalog.contains("if (limitWindowRolled(w)) return '';"),
+            "a reset-passed window must never elevate (severity none)"
+        );
+        // The wire field feeding the cue is consumed inside the catalog.
+        assert!(
+            catalog.contains("w?.accountPrior"),
+            "the catalog stopped consuming accountPrior"
         );
     }
 
@@ -4118,9 +4310,12 @@ mod tests {
             "status",
             "observedAtEpoch",
             "label",
-            // Credential-era attribution (present only under multi-era
-            // ambiguity — the chip-suffix cue).
+            // Credential-era attribution (present under multi-era
+            // ambiguity and on superseded eras — the chip-suffix cue).
             "account",
+            // The superseded-era staleness cue ("still ‹account›"): the
+            // backend hasn't announced since a newer sign-in.
+            "accountPrior",
             "state",
             "sinceEpoch",
             "lastStreamByteEpoch",

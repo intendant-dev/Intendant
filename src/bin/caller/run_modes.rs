@@ -504,7 +504,7 @@ pub(crate) async fn run_with_presence(
                         .take()
                         .expect("branch guarded by is_some");
                     let noun = park.kind.noun();
-                    match park.pending {
+                    let resumed = match park.pending {
                         Some(pending)
                             if !follow_up_message_was_cancelled(
                                 &mut persistent_cancelled_follow_ups,
@@ -523,6 +523,7 @@ pub(crate) async fn run_with_presence(
                                 turn: None,
                             });
                             persistent_parked_follow_ups.push_front(pending);
+                            true
                         }
                         Some(_) => {
                             slog(&session_log, |l| {
@@ -530,11 +531,44 @@ pub(crate) async fn run_with_presence(
                                     "{noun} elapsed — the parked message was cancelled; awaiting input",
                                 ))
                             });
+                            false
                         }
                         None => {
                             slog(&session_log, |l| {
                                 l.info(&format!("{noun} elapsed — awaiting input"))
                             });
+                            false
+                        }
+                    };
+                    // A wake that re-queues nothing runs no turn, so
+                    // nothing re-announces identity until the next
+                    // message — after an account switch the idle session
+                    // would wear the superseded era's limit chips
+                    // indefinitely. When no live backend process holds an
+                    // older credential read, re-announce now: the vitals
+                    // hub re-keys membership into the CURRENT era (the
+                    // same announce the next process start would make)
+                    // without burning a turn.
+                    if !resumed
+                        && persistent_agent
+                            .as_mut()
+                            .is_some_and(|agent| agent.next_round_reads_fresh_credentials())
+                    {
+                        if let Some(backend) = persistent_agent_backend.as_ref() {
+                            slog(&session_log, |l| {
+                                l.debug(
+                                    "Reset wake refreshed account-era membership without a turn (no live backend process)",
+                                )
+                            });
+                            emit_external_session_identity(
+                                &bus,
+                                session_log_id(&session_log),
+                                backend.as_short_str(),
+                                persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.as_str())
+                                    .unwrap_or_default(),
+                            );
                         }
                     }
                     continue;
