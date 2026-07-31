@@ -900,7 +900,7 @@ mod tests {
         // Simulate a recorded link so the disconnect clear is observable.
         let _ = actor.link_tx.send(Some(PeerLinkInfo {
             url: "wss://peer.example/ws".into(),
-            transport_class: crate::peer::PeerTransportClass::Direct,
+            transport_class: crate::peer::handle::PeerTransportClass::Direct,
         }));
 
         actor

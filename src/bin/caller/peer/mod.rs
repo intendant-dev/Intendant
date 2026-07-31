@@ -116,9 +116,7 @@ pub use event::{
     MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent, PeerMessage,
     PeerStatus, SessionInfo, TaskId, UsageSnapshot, WebRtcSessionId, WebRtcSignal,
 };
-pub use handle::{
-    ConnectionState, PeerGrantInfo, PeerHandle, PeerLinkInfo, PeerSnapshot, PeerTransportClass,
-};
+pub use handle::{ConnectionState, PeerHandle, PeerSnapshot};
 pub use id::PeerId;
 // LOG_CHANNEL_CAPACITY and EnqueuedPeerEvent have cfg(test) consumers only
 // (the mcp_http / mcp tools_peer / gateway peer rigs build their log sinks
