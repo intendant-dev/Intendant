@@ -50,4 +50,4 @@ Prefer `display_id` when known. Use `display_target` otherwise:
 - `user_session` **only when the user has explicitly opted into sharing their own screen** (they asked you to work on or look at their desktop). Never default to it, and never treat auto-detection landing there as consent.
 - Omit both only when auto-detection of the agent's display is acceptable.
 
-The shared view is a dashboard coordination layer. For actual computer-use actions, continue using `read_screen`, `take_screenshot`, and `execute_cu_actions`; for archived stream frames, use `list_frames` and `read_frame`.
+The shared view is a dashboard coordination layer. For actual computer-use actions, continue using `read_screen`, `take_screenshot`, and `execute_cu_actions`; for archived stream frames, use `list_frames` and `read_frame`. Drive the desktop only through those Intendant tools — never `cliclick`/`osascript`/`xdotool` or ad-hoc scripts — so every action runs under the owner's approval settings.

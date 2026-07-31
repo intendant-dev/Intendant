@@ -1108,7 +1108,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set settle=true (or a cap in ms, max 5000) to wait until the display stops changing after the last input action before observing — use it instead of guessed wait actions; the result reports settled/still_loading with elapsed ms. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Desktop actions go through this tool — never cliclick/osascript/xdotool or ad-hoc scripts — so they run under the owner's approval settings. Returns per-action statuses — ok (effect verified, e.g. typed text read back from the focused field), injected (events dispatched to the OS, effect unverified — verify from the observation), failed — plus a post-action observation chosen by `observe`: \"pixels\" (default, an MCP image content block with a clean screenshot), \"ax\" (the frontmost UI element tree as text — far cheaper than an image; user-session targets only), \"auto\" (element tree when usable, screenshot fallback), or \"none\". The result names the observation it carries and why. Set settle=true (or a cap in ms, max 5000) to wait until the display stops changing after the last input action before observing — use it instead of guessed wait actions; the result reports settled/still_loading with elapsed ms. Set annotate=true to draw click markers on captured screenshots; set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     pub(crate) async fn execute_cu_actions(
         &self,
@@ -1703,7 +1703,8 @@ mod tests {
     /// A fragment unique to the user-session opt-in refusal
     /// (`computer_use::user_session_denied_message`, which both gated MCP
     /// paths return verbatim). Deliberately NOT "explicit opt-in": that
-    /// phrase also lives in tool descriptions and the supervision prompt,
+    /// phrase also lives in tool descriptions and historical supervised
+    /// transcripts (the retired first-prompt addendum),
     /// which external-agent transcripts render in the dashboard — i.e. it
     /// can be literally visible on screen, and a granted read_screen
     /// faithfully returns screen text, so asserting its absence flaked on

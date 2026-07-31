@@ -18,29 +18,14 @@ use super::{
     ExternalAgent, GoalActionOutcome, GoalEngine, SubAgentState, ToolCompletionStatus,
 };
 
-/// Appended to the first user message when an Intendant web port is
-/// available: the capability bootstrap (Claude Code's equivalent of the
-/// Codex managed developer instructions) plus the dashboard-validation
-/// pointer. This is the gradual-discovery entry point — the small MCP
-/// bootstrap set is named directly, everything else routes through
-/// `"$INTENDANT" ctl --help`.
-const CLAUDE_CODE_BOOTSTRAP_ADDENDUM: &str = r#"
-
-### Intendant Supervision
-This session runs under Intendant, which adds desktop and display capabilities beyond your own tools:
-- The connected `intendant` MCP server carries the bootstrap set: `read_screen` for the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame), `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `clear_shared_view_focus`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for giving the user live dashboard visibility into agent-owned displays (sandboxes, VMs, virtual displays). Sharing the user's own screen (`user_session`) is an explicit opt-in the user initiates; input authority is only ever granted by the user from the dashboard.
-- The broad control surface (browser workspaces, frames, approvals, tasks, audio) is discovered lazily through the CLI: run `"$INTENDANT" ctl --help`, then focused help like `"$INTENDANT" ctl cu actions --help`. `ctl tools list` / `ctl tools schema TOOL` / `ctl tools call TOOL` cover anything not wrapped.
-- When the user should visually stay in the loop (demoing a result, watching you operate a GUI or browser, an auth handoff), open the shared view with `show_shared_view` before acting and `hide_shared_view` when the moment is over.
-- Do not drive the desktop with `cliclick`/`osascript`/`xdotool` or ad-hoc scripts — go through the Intendant tools so actions run under the user's approval settings.
-
-### Dashboard Validation
-For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` and prefer its named probes such as `--station-probe rendered` over ad-hoc Chromium/CDP scripts; its `--help` is the authoritative flag reference, and docs/src/external-agent-orchestration.md has the full Station QA recipes. For a temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in the foreground while separate CU/browser steps run against the printed URL, then interrupted for helper-owned cleanup. Do not start a separate foreground/nohup/setsid dashboard just so another tool can connect.
-"#;
-
-/// First heading of [`CLAUDE_CODE_BOOTSTRAP_ADDENDUM`]. Consumers deriving
-/// task labels from a supervised session's first user message strip
-/// everything from this marker on — the addendum rides the first prompt and
-/// otherwise leaks supervision boilerplate into session titles.
+/// First heading of the supervision addendum that used to be appended to a
+/// supervised session's first user prompt (retired — the materialized
+/// skill catalog and the MCP server's self-describing schemas teach
+/// capabilities; nothing is injected into prompts). Historical session
+/// JSONLs carry the addendum forever, so consumers deriving task labels
+/// or pairing transcript lanes from a supervised session's first user
+/// message still strip everything from this marker on — this const and
+/// every strip site stay, serving history.
 pub const CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER: &str = "### Intendant Supervision";
 
 /// Claude models currently ship a 200k context window; the authoritative
@@ -3717,8 +3702,6 @@ pub struct ClaudeCodeAgent {
     /// first turn), leaving the parent thread untouched. The resume id is
     /// the fork source, not this session's identity.
     fork_resume: bool,
-    /// Whether the first prompt (carrying the bootstrap addendum) was sent.
-    prompt_sent: bool,
     /// Goal notice queued while idle; prepended to the next user message so
     /// an idle goal update never burns a turn of its own (a mid-turn update
     /// is written immediately instead — the running turn absorbs it).
@@ -3765,7 +3748,6 @@ impl ClaudeCodeAgent {
             resume_session: None,
             fork_resume: false,
             pending_goal_notice: None,
-            prompt_sent: false,
             mcp_auth_token: None,
             mcp_session_id: None,
             shared: Arc::new(CcShared::new(None)),
@@ -4481,14 +4463,6 @@ impl ExternalAgent for ClaudeCodeAgent {
             Some(notice) => format!("{notice}\n\n{message}"),
             None => message.to_string(),
         };
-        // Claude Code has no separate developer-instructions channel here, so
-        // Intendant-specific guidance rides on the first prompt.
-        let augmented = if self.web_port.is_some() && !self.prompt_sent {
-            self.prompt_sent = true;
-            format!("{}{}", message, CLAUDE_CODE_BOOTSTRAP_ADDENDUM)
-        } else {
-            message
-        };
         self.shared.turn_active.store(true, Ordering::SeqCst);
         // Turn dispatch is a first-hand wire fact from our side of the
         // pipe: the honest "awaiting model" claim starts here (and the
@@ -4504,7 +4478,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         // approval flow uses the same stdout stream (control_request), not
         // a blocking request/response pair.
         let mut content = Vec::with_capacity(images.len() + 1);
-        content.push(CcContentBlock::text(augmented));
+        content.push(CcContentBlock::text(message));
         content.extend(images.iter().map(CcContentBlock::image));
         self.write_user_message_blocks(content).await
     }
@@ -8872,31 +8846,6 @@ mod tests {
         assert_eq!(thread.thread_id, "f00d-1234");
         assert!(crate::external_agent::AgentBackend::ClaudeCode
             .thread_id_is_canonical(&thread.thread_id));
-    }
-
-    #[test]
-    fn bootstrap_addendum_names_ctl_and_bootstrap_tools() {
-        // The addendum is Claude Code's capability-discovery entry point;
-        // keep the load-bearing pointers present.
-        for needle in [
-            "\"$INTENDANT\" ctl --help",
-            "read_screen",
-            "take_screenshot",
-            "execute_cu_actions",
-            "show_shared_view",
-            "validate-dashboard.cjs",
-        ] {
-            assert!(
-                CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(needle),
-                "bootstrap addendum lost its pointer to {needle}"
-            );
-        }
-        // Task-label stripping keys off the marker being the addendum's
-        // first heading.
-        assert!(
-            CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
-            "bootstrap addendum no longer contains its strip marker"
-        );
     }
 
     /// The rate-limit park wake's turn-free era-refresh gate: with no

@@ -215,7 +215,11 @@ available) before comparing runs.
 ## Cleanup And Etiquette
 
 `--launch-dashboard` owns its temporary dashboard and Chromium profile and tears both
-down (add `--keep-browser`/`--keep-artifacts` to debug). Check ports before launching;
+down (add `--keep-browser`/`--keep-artifacts` to debug). Never start a separate
+foreground/nohup/setsid dashboard just so another tool can connect — use
+`--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard`
+kept in the foreground while separate CU/browser steps run against the printed URL,
+then interrupt it for helper-owned cleanup. Check ports before launching;
 never target 8765 and never kill Intendant instances you did not spawn:
 
 ```sh
