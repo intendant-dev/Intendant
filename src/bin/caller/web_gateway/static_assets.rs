@@ -1024,6 +1024,54 @@ mod tests {
         );
     }
 
+    /// The blocked-chip honesty law: the chip is a tappable BUTTON that
+    /// names each gate (no hover-only reveal), the per-gate rows join
+    /// `relies_on` client-side within the served window, and the
+    /// delivered-awaiting-Complete distinction derives from exactly the
+    /// served run truth — `last_run.state === 'completed'` AND a
+    /// self-reported `achieved` — never from transport state alone.
+    /// Advisory throughout: nothing here gates approval or firing.
+    #[test]
+    fn blocked_chip_explains_every_gate_and_the_delivered_wait() {
+        let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");
+        let shared = include_str!("../../../../static/app/ui2-agenda.js");
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(
+            cards.contains("data-blocked-toggle="),
+            "the blocked chip and its fold affordance are tappable buttons"
+        );
+        assert!(
+            !cards.contains("agendaChipHtml('blocked'"),
+            "no surface renders the old say-nothing blocked chip"
+        );
+        // The delivered derivation reads the served run + attestation
+        // truth (summary.rs serves both at list grain).
+        assert!(
+            shared.contains("run.state === 'completed' && run.attestation")
+                && shared.contains("run.attestation.outcome === 'achieved'"),
+            "delivered-awaiting-Complete = completed AND self-reported achieved"
+        );
+        assert!(
+            shared.contains("'delivered · awaiting Complete'"),
+            "the all-delivered chip face names the actionable wait"
+        );
+        // Both the card rows and the inspector's Blocked-on section read
+        // the ONE shared judgment — no second derivation to drift.
+        assert!(
+            cards.contains("agendaBlockedExplain(item)")
+                && inspector.contains("agendaPrereqStates(item)"),
+            "cards and inspector render the shared prerequisite judgment"
+        );
+        // The honest out-of-window degrade: an absent target on an
+        // unblocked item is provably done; only a blocked one shows the
+        // id-only unknown row.
+        assert!(
+            shared.contains("'outside this live window'")
+                && shared.contains("'done · archived'"),
+            "absent targets degrade honestly instead of rendering 'missing'"
+        );
+    }
+
     /// The serving-grain law for the editor (Track AS × the manifest
     /// editor): list rows are summaries — the manifest MINUS `goal` and
     /// the sealed refs — but the edit sheet round-trips the WHOLE

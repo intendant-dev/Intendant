@@ -414,6 +414,93 @@ window.qa = Object.assign(window.qa || {}, {
     await agendaHeal('qa-probe');
     return window.qa.agendaServing();
   },
+  // Blocked-chip honesty: the live derivation for one item — chip face,
+  // per-gate rows, and the depth fold plans — read through the same
+  // functions the renderer uses (advisory throughout; gates nothing).
+  agendaBlockedHonesty(itemId) {
+    const item = agendaFindItem(itemId);
+    if (!item) return null;
+    const explain = agendaBlockedExplain(item);
+    const card = document.querySelector(`#ag2-groups .ag2-card[data-item-id="${itemId}"]`);
+    return {
+      blocked: agendaItemIsBlocked(item),
+      chip: agendaBlockedChipSpec(explain),
+      tip: agendaBlockedTip(explain),
+      blockers: explain.blockers.map((b) => b.criterion),
+      prereqs: explain.prereqs.map((p) => ({
+        id: p.id, title: p.title, kind: p.kind, status: p.status, inWindow: !!p.target,
+      })),
+      allDelivered: explain.allDelivered,
+      unexplained: explain.unexplained,
+      dom: card ? {
+        chipButton: !!card.querySelector('[data-blocked-toggle]'),
+        detailRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row').length,
+        deliveredRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row.delivered').length,
+        foldedWaits: !!card.querySelector('.ag2-blk-more'),
+      } : null,
+      plans: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => [d, {
+        folded: agendaBlockedDetailPlan(explain, d, false),
+        tapped: agendaBlockedDetailPlan(explain, d, true),
+      }])),
+    };
+  },
+  // The synthetic depth × derivation matrix: fixture prerequisites in a
+  // local fold (never the live store) driven through the exact renderer
+  // derivations — the delivered distinction, the fold matrix, the
+  // honest out-of-window degrade, and the chip face for each shape.
+  agendaBlockedVectors() {
+    const fold = new Map();
+    const put = (it) => fold.set(it.id, it);
+    put({ id: 'P-run', title: 'running prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, last_run: { state: 'started', at_ms: 1 } }] });
+    put({ id: 'P-delivered', title: 'delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'achieved' } } }] });
+    put({ id: 'P-partial', title: 'partially delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'partial' } } }] });
+    put({ id: 'P-unattested', title: 'ran without a self-report', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1 } }] });
+    put({ id: 'P-retired', title: 'retired prerequisite', status: 'retired' });
+    const find = (id) => fold.get(id) || null;
+    const item = (extra) => ({ id: 'C', title: 'dependent', status: 'open', blocked: true, ...extra });
+    const cases = {
+      explicit_blocker: item({ blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }] }),
+      in_flight_wait: item({ relies_on: [{ target_id: 'P-run' }] }),
+      delivered_wait: item({ relies_on: [{ target_id: 'P-delivered' }] }),
+      partial_is_not_delivered: item({ relies_on: [{ target_id: 'P-partial' }] }),
+      unattested_is_not_delivered: item({ relies_on: [{ target_id: 'P-unattested' }] }),
+      mixed_delivered_and_in_flight: item({
+        relies_on: [{ target_id: 'P-delivered' }, { target_id: 'P-run' }] }),
+      blocker_beside_delivered: item({
+        blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }],
+        relies_on: [{ target_id: 'P-delivered' }] }),
+      retired_prereq: item({ relies_on: [{ target_id: 'P-retired' }] }),
+      outside_window_while_blocked: item({ relies_on: [{ target_id: '01GONE' }] }),
+      outside_window_unblocked: item({ blocked: false, relies_on: [{ target_id: '01GONE' }] }),
+      served_flag_without_visible_gate: item({}),
+    };
+    return Object.fromEntries(Object.entries(cases).map(([name, fixture]) => {
+      const explain = agendaBlockedExplain(fixture, find);
+      return [name, {
+        chip: agendaBlockedChipSpec(explain),
+        allDelivered: explain.allDelivered,
+        unexplained: explain.unexplained,
+        rows: explain.prereqs.map((p) => ({ kind: p.kind, status: p.status, inWindow: !!p.target })),
+        depths: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => {
+          const folded = agendaBlockedDetailPlan(explain, d, false);
+          const tapped = agendaBlockedDetailPlan(explain, d, true);
+          return [d, {
+            visible: folded.visible,
+            hiddenWaits: folded.rows.hiddenWaits,
+            tappedVisible: tapped.visible,
+            tappedHiddenWaits: tapped.rows.hiddenWaits,
+          }];
+        })),
+      }];
+    }));
+  },
 });
 
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
@@ -686,7 +773,9 @@ function agendaItemIsBlocked(item) {
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
-// callers escape.
+// callers escape. The cards now render the structured per-gate story
+// (agendaBlockedExplain + agendaBlockedDetailHtml below); this one-liner
+// remains for surfaces that want a single sentence.
 function agendaBlockedLine(item) {
   if (item.status !== 'open') return null;
   const blocker = (item.blockers || []).find((b) => !b.cleared);
@@ -698,6 +787,148 @@ function agendaBlockedLine(item) {
     if (target.status === 'open') return `Waits on “${target.title}” — still open`;
   }
   return null;
+}
+
+// ---- The blocked story (chip honesty) ----
+
+// Per-prerequisite render judgment for the blocked chip, the card's
+// per-gate rows, and the inspector's Blocked-on section: each
+// `relies_on` link joined client-side against the loaded window
+// (summaries already serve `relies_on[].target_id`, uncleared
+// `blockers`, and `effects[].last_run.attestation` — no second
+// server-side join). `kind` vocabulary:
+//   'satisfied'  target done — the link no longer waits
+//   'delivered'  target open, but its effect's last run COMPLETED and
+//                the session self-reported achieved — everything ran;
+//                only the owner's Complete tap is missing (an
+//                actionable wait, distinct from in-flight work)
+//   'waiting'    target open — genuinely in flight or parked; `status`
+//                carries the live word from the effect derivation
+//   'retired'    target retired — the link needs review
+//   'unknown'    target outside the live window while the served
+//                verdict says blocked — id-only, degrade honestly
+// A target absent from the window on an UNBLOCKED item is provably
+// done (the daemon's verdict is computed against the full ledger), so
+// it reads satisfied — never the old "missing — review" lie.
+// Advisory throughout: none of this gates approval or firing.
+function agendaPrereqStates(item, findItem) {
+  const find = findItem || agendaFindItem;
+  return (item.relies_on || []).map((link) => {
+    const target = find(link.target_id) || null;
+    if (!target) {
+      const short = `${String(link.target_id).slice(0, 10)}…`;
+      return item.blocked === true
+        ? { id: link.target_id, target: null, title: short, kind: 'unknown',
+          tone: 'neutral', status: 'outside this live window',
+          detail: 'The daemon’s blocked verdict comes from the full ledger; this window carries open items plus the last 14 days.' }
+        : { id: link.target_id, target: null, title: short, kind: 'satisfied',
+          tone: 'green', status: 'done · archived',
+          detail: 'Nothing blocks this item, so this prerequisite completed — its row has aged out of the live window.' };
+    }
+    const base = { id: link.target_id, target, title: target.title };
+    if (target.status === 'done') {
+      return { ...base, kind: 'satisfied', status: 'satisfied', tone: 'green' };
+    }
+    if (target.status === 'retired') {
+      return { ...base, kind: 'retired', status: 'retired — review', tone: 'amber',
+        detail: 'A retired prerequisite never silently satisfies the link — drop it or reopen the target.' };
+    }
+    const run = ((target.effects || [])[0] || {}).last_run || null;
+    if (run && run.state === 'completed' && run.attestation
+      && run.attestation.outcome === 'achieved') {
+      return { ...base, kind: 'delivered', status: 'delivered — awaiting Complete',
+        tone: 'sky',
+        detail: `Ran ${agendaRelTime(run.at_ms)}, completed, self-reported achieved (not verified) — open it and Mark done to release this wait.` };
+    }
+    const st = agendaEffectState(target);
+    let status = 'still open';
+    let tone = 'neutral';
+    if (st) {
+      if (st.kind === 'running') { status = 'running now'; tone = 'iris'; }
+      else if (st.kind === 'ready') { status = 'fires momentarily'; tone = 'iris'; }
+      else if (st.kind === 'waiting') status = 'waiting on its own prerequisites';
+      else if (st.kind === 'watching') status = 'watching for matches';
+      else if (st.kind === 'pending') { status = 'awaiting approval'; tone = 'amber'; }
+      else if (st.kind === 'suspended') { status = 'suspended'; tone = 'amber'; }
+      else if (st.kind === 'standing') status = 'standing series';
+      else if (st.kind === 'armed') status = 'armed to run';
+      else if (st.kind === 'missed') { status = 'missed its window'; tone = 'amber'; }
+      else if (st.kind === 'withdrawn') status = 'proposal withdrawn';
+      else if (run && run.state === 'completed') {
+        status = run.attestation
+          ? `ran — self-reported ${run.attestation.outcome}` : 'ran — no self-report yet';
+      } else if (run && run.state === 'failed') { status = 'last run failed'; tone = 'amber'; }
+    }
+    return { ...base, kind: 'waiting', status, tone };
+  });
+}
+
+// The whole blocked story for one item, derived at render (never
+// stored): uncleared blockers plus every unsatisfied prerequisite
+// judgment. `allDelivered` marks the actionable-wait shape — nothing is
+// stuck, every unsatisfied prerequisite delivered and self-reported
+// achieved; only Complete taps are missing. `unexplained` is the honest
+// degrade: the served verdict says blocked but no gate is visible in
+// this window (freshness skew between the flag and the joined rows).
+function agendaBlockedExplain(item, findItem) {
+  const blockers = (item.blockers || []).filter((b) => !b.cleared);
+  const prereqs = agendaPrereqStates(item, findItem)
+    .filter((p) => p.kind !== 'satisfied');
+  const delivered = prereqs.filter((p) => p.kind === 'delivered');
+  return {
+    blockers,
+    prereqs,
+    delivered,
+    allDelivered: !blockers.length && prereqs.length > 0
+      && delivered.length === prereqs.length,
+    unexplained: item.blocked === true && !blockers.length && !prereqs.length,
+  };
+}
+
+// The chip face: 'blocked' (rose) — or, when every unsatisfied
+// prerequisite is delivered-and-attested and no blocker is stated,
+// 'delivered · awaiting Complete' (sky, the achieved self-report hue —
+// never transport green; the 'answered · awaiting pickup' twin). Pure
+// spec; the cards render it.
+function agendaBlockedChipSpec(explain) {
+  return explain.allDelivered
+    ? { label: 'delivered · awaiting Complete', tone: 'sky' }
+    : { label: 'blocked', tone: 'rose' };
+}
+
+// The chip's hover lane (the tap reveal is the primary — no
+// hover-only): one line per gate, every depth.
+function agendaBlockedTip(explain) {
+  const lines = [];
+  explain.blockers.forEach((b) => lines.push(`waiting on: “${b.criterion}”`));
+  explain.prereqs.forEach((p) => lines.push(`waits on “${p.title}” — ${p.status}`));
+  if (explain.unexplained) {
+    lines.push('The daemon judges this blocked, but no gate is visible in this window — it may have just changed.');
+  }
+  lines.push('Advisory — it gates neither approval nor firing. Tap to see each wait and jump to it.');
+  return lines.join('\n');
+}
+
+// Which gate rows render at a given depth (the fold matrix, pure — the
+// card renderer and the qa vectors read the same plan): uncleared
+// blockers, delivered-awaiting waits, and the unexplained degrade
+// always render; genuinely in-flight waits fold at calm depth until
+// the chip is tapped (`expanded`). Explicit blockers never fold.
+function agendaBlockedDetailPlan(explain, depth, expanded) {
+  const foldable = explain.prereqs.filter((p) => p.kind !== 'delivered');
+  const foldableVisible = depth !== 'calm' || !!expanded;
+  const always = !!(explain.blockers.length || explain.delivered.length
+    || explain.unexplained);
+  return {
+    always,
+    rows: {
+      blockers: explain.blockers,
+      delivered: explain.delivered,
+      waits: foldableVisible ? foldable : [],
+      hiddenWaits: foldableVisible ? 0 : foldable.length,
+    },
+    visible: always || (foldableVisible && foldable.length > 0),
+  };
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
@@ -1733,7 +1964,8 @@ function agendaRenderCard() {
       ? '<span class="agenda-card-q" aria-label="question">?</span>'
       : '';
     return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
-      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
+      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Mark done"
+        title="Mark done — completes this item; reopen any time">○</button>
       ${q}<span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
     </div>`;
   });
@@ -1742,11 +1974,32 @@ function agendaRenderCard() {
     : '';
   list.innerHTML = rows.join('') + more;
   list.querySelectorAll('.agenda-card-done').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn));
+    btn.addEventListener('click', () => {
+      // No hover-only mysteries: on a hover-less pointer the first tap
+      // names the action in place; the second tap acts. Hover pointers
+      // keep today's immediate action (the tooltip already explains).
+      if (window.matchMedia && window.matchMedia('(hover: none)').matches
+        && !btn.classList.contains('armed')) {
+        btn.classList.add('armed');
+        btn.textContent = 'Mark done';
+        setTimeout(() => {
+          if (btn.isConnected) {
+            btn.classList.remove('armed');
+            btn.textContent = '○';
+          }
+        }, 5000);
+        return;
+      }
+      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn);
+    });
   });
   list.querySelectorAll('.agenda-card-row-title').forEach((el) => {
-    el.addEventListener('click', () => routeTo('agenda'));
+    // Opening the row lands on the ITEM (its panel carries the labeled
+    // Mark done), not just the tab.
+    el.addEventListener('click', () => {
+      routeTo('agenda');
+      agendaOpenInspector(el.closest('[data-id]')?.dataset.id);
+    });
   });
   const moreEl = list.querySelector('.agenda-card-more');
   if (moreEl) moreEl.addEventListener('click', () => routeTo('agenda'));
