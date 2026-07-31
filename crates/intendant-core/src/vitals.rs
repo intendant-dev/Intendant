@@ -124,11 +124,25 @@ pub struct SessionLimitWindow {
     /// or a minted era nonce when the ceremony learned no label). `None` =
     /// the unattributed era: sessions whose credentials predate any
     /// daemon-observed sign-in. Store- and wire-additive; on session
-    /// emissions the field is present only while more than one credential
-    /// era is live for the backend — the frontends' cue to label the
-    /// windows apart (a single-era steady state renders unchanged).
+    /// emissions the field is present while more than one credential era
+    /// is live for the backend (the frontends' cue to label the windows
+    /// apart; a single-era steady state renders unchanged) — and always
+    /// when [`Self::account_prior`] is set, so a superseded era's numbers
+    /// never render unlabeled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// The window belongs to a SUPERSEDED credential era: the daemon has
+    /// observed a newer sign-in for this backend, but the session wearing
+    /// this view last announced (process start = credential read) under
+    /// `account`, so these numbers are still that account's truth — the
+    /// frontends' cue to say "still ‹account›" instead of letting an
+    /// old era's chips read as the current sign-in. Display-shaped and
+    /// emission-only: stamped by the per-session mirror, never persisted
+    /// (`false` never serializes; store rows always carry `false`). Only
+    /// labeled eras stamp it — the unattributed era has no truthful
+    /// account to anchor the claim to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account_prior: bool,
 }
 
 /// What a session's model/backend is verifiably doing right now — the
@@ -505,12 +519,14 @@ mod tests {
             status: Some("allowed_warning".into()),
             observed_at_epoch: Some(1_784_499_000),
             account: Some("owner@example.test".into()),
+            account_prior: true,
         };
         let wire = serde_json::to_value(&window).expect("serializes");
         assert_eq!(wire["observedAtEpoch"], 1_784_499_000u64);
         assert_eq!(wire["resetsAtEpoch"], 1_784_503_200u64);
         assert_eq!(wire["status"], "allowed_warning");
         assert_eq!(wire["account"], "owner@example.test");
+        assert_eq!(wire["accountPrior"], true);
         assert!(
             wire.get("usedPct").is_none(),
             "an unreported percentage must not serialize as a number"
@@ -525,11 +541,16 @@ mod tests {
                 .expect("legacy deserializes");
         assert_eq!(legacy.observed_at_epoch, None);
         assert_eq!(legacy.account, None);
+        assert!(!legacy.account_prior);
         let rewire = serde_json::to_value(&legacy).expect("serializes");
         assert!(rewire.get("observedAtEpoch").is_none());
         assert!(
             rewire.get("account").is_none(),
             "the unattributed era serializes as absence, not null"
+        );
+        assert!(
+            rewire.get("accountPrior").is_none(),
+            "a current-era window serializes the prior stamp as absence"
         );
     }
 
