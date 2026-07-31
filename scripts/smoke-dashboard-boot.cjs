@@ -797,6 +797,59 @@ const CHAPTER_JUMP_PROBE_EXPRESSION = `(async () => {
   return out;
 })()`;
 
+// ---------------------------------------------------------------------------
+// Markdown-table render probe (assertion (f)).
+//
+// Pins GFM table rendering in the message renderer (renderMarkdown,
+// 41-session-window-actions.js): on 2026-07-29 an agent's per-PR status
+// table reached the owner as raw pipe lines — the renderer had no table
+// path, and nothing in CI executes the renderer, so the drop shipped
+// silently. Same admission argument as (d)/(e), with a leaner shape: pure
+// string → string through the window.qa.markdown facade — no DOM, no
+// timing, no daemon state — so it runs on every boot leg. Pins the three
+// load-bearing properties: a GFM table renders as a real <table> (header,
+// alignment, inline markup inside cells); the escape-first sanitizer
+// posture holds through the table path (raw HTML stays text); and
+// non-table markdown is byte-identical to the pre-table renderer on
+// pinned control vectors (bold/italic/code + lone-pipe prose).
+const MARKDOWN_TABLE_PROBE_EXPRESSION = `(() => {
+  const out = { failures: [], steps: [] };
+  const check = (cond, label) => {
+    out.steps.push((cond ? 'pass' : 'FAIL') + ' ' + label);
+    if (!cond) out.failures.push(label);
+  };
+  const qa = window.qa && window.qa.markdown;
+  if (!qa || typeof qa.render !== 'function') {
+    out.failures.push('window.qa.markdown.render missing');
+    return out;
+  }
+  const table = qa.render([
+    'Per-PR status:',
+    '| PR | State | Notes |',
+    '|--|:--:|--:|',
+    '| **#663** | merged | <script>alert(1)</script> |',
+    '| a \\\\| b | \`code\` | [x](https://example.com/x) |',
+  ].join('\\n'));
+  out.steps.push('table html: ' + table.slice(0, 400));
+  check(table.indexOf('<p>Per-PR status:</p><div class="md-table-wrap"><table>') === 0,
+    'table interrupts the paragraph and opens the wrap');
+  check((table.match(/<th[ >]/g) || []).length === 3, 'three header cells');
+  check(table.indexOf('<th style="text-align:center">State</th>') !== -1, 'center alignment on header');
+  check(table.indexOf('<td style="text-align:right">') !== -1, 'right alignment on cells');
+  check(table.indexOf('<td><strong>#663</strong></td>') !== -1, 'bold renders inside a cell');
+  check(table.indexOf('<code>code</code>') !== -1, 'inline code renders inside a cell');
+  check(table.indexOf('href="https://example.com/x"') !== -1, 'link renders inside a cell');
+  check(table.indexOf('a | b') !== -1, 'escaped pipe stays a literal pipe');
+  check(!/<script/i.test(table), 'no script element passes through');
+  check(table.indexOf('&lt;script&gt;alert(1)&lt;/script&gt;') !== -1, 'raw HTML stays escaped text');
+  check(qa.render('**bold** *em* \`code\` plain')
+    === '<p><strong>bold</strong> <em>em</em> <code>code</code> plain</p>',
+    'non-table markdown byte-identical (control vector)');
+  check(qa.render('| a | b |') === '<p>| a | b |</p>',
+    'lone piped line without a delimiter stays prose');
+  return out;
+})()`;
+
 function remoteObjectText(arg) {
   if (!arg || typeof arg !== 'object') return '';
   if (arg.value !== undefined) {
@@ -956,6 +1009,19 @@ async function main() {
     }
 
     await delay(POST_BOOT_SETTLE_MS);
+
+    // Assertion (f): markdown-table rendering — pure page-side function
+    // eval through window.qa.markdown (no DOM, no timing), so it runs on
+    // every boot leg including deep links.
+    const markdown = await evaluate(MARKDOWN_TABLE_PROBE_EXPRESSION);
+    const markdownSteps = Array.isArray(markdown && markdown.steps) ? markdown.steps : [];
+    const markdownFailures = Array.isArray(markdown && markdown.failures) ? markdown.failures : ['probe returned no result'];
+    console.log(`markdown-table probe: ${markdownSteps.length} steps, ${markdownFailures.length} failures`);
+    for (const line of markdownSteps.slice(0, MAX_REPORT_LINES)) console.log(`  ${line}`);
+    if (markdownFailures.length > 0) {
+      for (const line of markdownFailures) ledger.record('markdown-table', line, { fatal: true });
+      throw new Error(`markdown-table probe failed ${markdownFailures.length} assertion(s)`);
+    }
 
     // Assertion (d): drive the jump-button state machine on a synthetic
     // window. Runs before the ledger verdict so any page error the probe

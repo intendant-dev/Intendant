@@ -1669,6 +1669,68 @@ function renderMarkdownList(lines, start) {
   };
 }
 
+// GFM tables. Recognition is the two-line GFM rule: a pipe-bearing header
+// line whose NEXT line is a delimiter row (cells of `:?-+:?` only) with the
+// SAME cell count — the count match is what keeps prose pipes and `---`
+// rules out of the table path. Cell text renders through
+// renderInlineMarkdown, so the escape-first sanitizer posture holds: table
+// syntax never opens a raw-HTML lane.
+function markdownTableCells(line) {
+  // \| is GFM's literal pipe inside a cell — hidden from the split via a
+  // sentinel (no regex lookbehind: older WebKit parses this whole module).
+  let raw = String(line || '').trim().replace(/\\\|/g, '\u0000PIPE\u0000');
+  if (raw.startsWith('|')) raw = raw.slice(1);
+  if (raw.endsWith('|')) raw = raw.slice(0, -1);
+  return raw.split('|').map(cell => cell.replace(/\u0000PIPE\u0000/g, '|').trim());
+}
+
+function markdownTableAlignments(line) {
+  const raw = String(line || '').trim();
+  if (!raw.includes('|') || !raw.includes('-') || !/^[\s|:-]+$/.test(raw)) return null;
+  const aligns = [];
+  for (const cell of markdownTableCells(raw)) {
+    if (!/^:?-+:?$/.test(cell)) return null;
+    const left = cell.startsWith(':');
+    const right = cell.endsWith(':');
+    aligns.push(left && right ? 'center' : right ? 'right' : left ? 'left' : '');
+  }
+  return aligns.length ? aligns : null;
+}
+
+function markdownTableStart(lines, i) {
+  const line = lines[i];
+  if (!line || !line.includes('|')) return null;
+  const aligns = markdownTableAlignments(lines[i + 1]);
+  if (!aligns || markdownTableCells(line).length !== aligns.length) return null;
+  return aligns;
+}
+
+function renderMarkdownTable(lines, start, aligns) {
+  // Alignment values come from the closed set in markdownTableAlignments —
+  // safe as attribute text.
+  const alignAttr = idx => (aligns[idx] ? ` style="text-align:${aligns[idx]}"` : '');
+  const renderRow = (cells, tag) => aligns
+    .map((_, idx) => `<${tag}${alignAttr(idx)}>${renderInlineMarkdown(cells[idx] || '')}</${tag}>`)
+    .join('');
+  let html = '<div class="md-table-wrap"><table>'
+    + `<thead><tr>${renderRow(markdownTableCells(lines[start]), 'th')}</tr></thead>`;
+  let body = '';
+  let i = start + 2;
+  while (i < lines.length) {
+    const line = lines[i];
+    // GFM ends the table at a blank line or a new block; a pipeless line
+    // returns to prose. Rows pad/truncate to the header width (renderRow
+    // maps over aligns).
+    if (!line.trim() || !line.includes('|')) break;
+    if (/^(#{1,3})\s+/.test(line) || /^\s*>/.test(line) || markdownListMarker(line)) break;
+    body += `<tr>${renderRow(markdownTableCells(line), 'td')}</tr>`;
+    i++;
+  }
+  if (body) html += `<tbody>${body}</tbody>`;
+  html += '</table></div>';
+  return { html, next: i };
+}
+
 function renderMarkdownBlocks(text) {
   const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
   let html = '';
@@ -1706,8 +1768,18 @@ function renderMarkdownBlocks(text) {
       continue;
     }
 
+    const tableAligns = markdownTableStart(lines, i);
+    if (tableAligns) {
+      const table = renderMarkdownTable(lines, i, tableAligns);
+      html += table.html;
+      i = table.next;
+      continue;
+    }
+
     const para = [];
-    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+    // A table may interrupt a paragraph (GFM): break on a header+delimiter
+    // pair, not on lone pipe-bearing prose lines.
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i]) && !markdownTableStart(lines, i)) {
       para.push(lines[i]);
       i++;
     }
@@ -1740,6 +1812,17 @@ function renderMarkdown(text) {
   }
   return parts.join('');
 }
+
+// QA readback (window.qa convention): module-scope functions are
+// unreachable from page evals, so the boot smoke's markdown probe
+// (assertion (f) in scripts/smoke-dashboard-boot.cjs) reaches the real
+// renderer through this facade. Pure string → string; no DOM, no state.
+window.qa = Object.assign(window.qa || {}, {
+  markdown: {
+    render: text => renderMarkdown(text),
+    renderInline: text => renderInlineMarkdown(text),
+  },
+});
 
 function detectCommandLog(content) {
   const text = String(content || '').trim();
