@@ -17,6 +17,10 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     pub(crate) custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
     pub(crate) fleet_hosted_control_enabled: bool,
+    /// Boot-pinned `[connect] relay_peer_admission`: stamped from the
+    /// gateway config at spawn like `fleet_hosted_control_enabled`, so a
+    /// live config edit never reclassifies an open connection.
+    pub(crate) relay_peer_admission: bool,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -102,6 +106,7 @@ pub(crate) async fn serve_http_request(
         hosted_control,
         custom_domain,
         fleet_hosted_control_enabled,
+        relay_peer_admission,
         bus,
         config_json,
         session_provider,
@@ -348,6 +353,24 @@ pub(crate) async fn serve_http_request(
     let public_lease_ingress = public_lane.public_lease_ingress;
     let configured_public_control_lane = public_lane.configured;
     let tls_custom_domain = public_lane.live_custom_domain;
+    // Relay peer admission (owner opt-in, boot-pinned, default off): an
+    // Approved, unexpired peer identity record exempts exactly the
+    // fleet/relay transport-provenance refusal below and continues into
+    // the SAME transport-auth ladder every direct-lane peer request
+    // passes (remote client auth, then per-operation profile/IAM). The
+    // discriminator is the resolved ACTIVE record — a daemon-side
+    // credential minted by this daemon's own access CA at pairing, org
+    // grant, or doorbell approval, a class no browser keystore can hold
+    // or be scripted into presenting. Browser-enrolled certificates
+    // resolve no record (`Ok(None)`) and keep the refusal byte-identical;
+    // revoked/expired records were already refused at resolution. The
+    // custom-domain (owner-name) browser lane is deliberately outside the
+    // exemption: peers dial the fleet name, and the owner-name lane stays
+    // lease-only in both key states.
+    let admitted_relay_peer = relay_peer_admission
+        && base_discovery_only_ingress
+        && !custom_domain_selected
+        && peer_connection_identity.is_some();
     // A custom-domain TLS name is itself a live authority decision even
     // before a passkey endpoint mints a lease. Retain that decision at the
     // transport edge now, so body reads, authority-worker awaits, and
@@ -448,7 +471,11 @@ pub(crate) async fn serve_http_request(
     } else {
         None
     };
-    if public_lease_ingress && !authority_free_request && hosted_verified.is_none() {
+    if public_lease_ingress
+        && !authority_free_request
+        && hosted_verified.is_none()
+        && !admitted_relay_peer
+    {
         use tokio::io::AsyncWriteExt;
         let error = if custom_domain_selected {
             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"

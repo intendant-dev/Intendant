@@ -517,6 +517,7 @@ without changing that refusal or the Connect account's `role:none` posture.
 | `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Custom exact-name routes additionally prove possession of their publicly trusted certificate key. Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
 | `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
 | `hosted_control_enabled` | bool | `false` | Enable the daemon-local hosted lease doorbell and exact lease-proof/ticket carve on fleet/relay ingress. Restart-only; deliberately has no environment-variable override |
+| `relay_peer_admission` | bool | `false` | Admit this daemon's paired peer daemons (Approved, unexpired peer identity records) through fleet-name/relay ingress into the ordinary peer transport-auth ladder; peer profiles stay the sole control-depth authority (docs/src/self-hosted-rendezvous.md § Relay peer admission). Independent of `hosted_control_enabled` in both directions. Restart-only; deliberately has no environment-variable override |
 | `custom_domain.enabled` | bool | `false` | Enable the separate user-owned-name lane. Restart-only; no environment-variable override |
 | `custom_domain.name` | string | unset | Exact ASCII/punycode DNS name served by the daemon |
 | `custom_domain.rp_id` | string | `custom_domain.name` | WebAuthn relying-party id; when present it must equal the exact name |
@@ -542,8 +543,9 @@ and passkey enrollment.
 holds no certificate, and grants no authority — a relayed browser connection
 reaches this daemon bearing immutable relay/fleet provenance. It stays
 discovery-only unless `hosted_control_enabled` is true and the request proves
-an active hosted lease; `/mcp`, direct signaling, and trusted-local fallback
-remain unavailable.
+an active hosted lease, or `relay_peer_admission` is true and the connection
+presents an active paired peer identity; for everything else `/mcp`, direct
+signaling, and trusted-local fallback remain unavailable.
 
 No file editing is required for the common case: the dashboard's
 **Access → Intendant Connect** card toggles `enabled` (persisting it

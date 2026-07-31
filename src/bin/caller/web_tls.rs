@@ -189,6 +189,20 @@ pub fn build_acceptor_with_client_auth(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// [`build_acceptor_with_client_auth`] minus the process-global fleet-SNI
+/// resolver: serves only `source`. Concurrent test gateways must not share
+/// the resolver's mutable base certificate, so client-auth test rigs use
+/// this form (the client-auth twin of [`build_single_cert_acceptor`]).
+#[cfg(test)]
+pub fn build_single_cert_acceptor_with_client_auth(
+    source: &TlsCertSource,
+    client_auth: &ClientAuth,
+) -> Result<TlsAcceptor, String> {
+    let (cert_chain, key) = load_cert_source(source)?;
+    let config = server_config_from(cert_chain, key, client_auth, false)?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 fn load_cert_source(
     source: &TlsCertSource,
 ) -> Result<

@@ -2058,6 +2058,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         hosted_control: Arc::clone(&hosted_control),
                         custom_domain: Arc::clone(&custom_domain),
                         fleet_hosted_control_enabled: config.connect.hosted_control_enabled,
+                        relay_peer_admission: config.connect.relay_peer_admission,
                         bus: bus.clone(),
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
@@ -2150,6 +2151,21 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     let public_lease_ws = public_lane.public_lease_ingress;
                     let configured_public_ws = public_lane.configured;
                     let live_tls_custom_domain = public_lane.live_custom_domain;
+                    // Relay peer admission — the WS twin of the HTTP
+                    // exemption in `http_dispatch.rs` (see the comment
+                    // there for the full rationale): under the
+                    // boot-pinned owner opt-in, an Approved, unexpired
+                    // peer identity record passes the fleet/relay
+                    // transport-provenance refusal below into the SAME
+                    // ladder direct-lane peers walk (remote client auth,
+                    // grant minting, per-frame profile authorization).
+                    // Browser-enrolled certificates resolve no record and
+                    // are refused byte-identically; the owner-name
+                    // (custom-domain) lane stays lease-only.
+                    let admitted_relay_peer_ws = config.connect.relay_peer_admission
+                        && base_discovery_only_ws
+                        && !custom_domain_selected
+                        && peer_connection_identity.is_some();
                     let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
@@ -2200,7 +2216,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     } else {
                         None
                     };
-                    if public_lease_ws && hosted_ws_authority.is_none() {
+                    if public_lease_ws && hosted_ws_authority.is_none() && !admitted_relay_peer_ws {
                         use tokio::io::AsyncWriteExt;
                         let error = if custom_domain_selected {
                             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
@@ -3638,6 +3654,227 @@ mod tests {
         connector.connect(server_name, tcp).await.unwrap()
     }
 
+    /// Relay-ingress gateway whose acceptor requests client certificates
+    /// against a real access CA (`ClientAuth::OptionalCa`, the production
+    /// shape from `startup/web.rs`), so tests can present CA-minted peer
+    /// client identities and install identity records beside them.
+    struct PeerAuthRelayGateway {
+        gateway: RelayIngressTestGateway,
+        /// The access CA certificate — the client-side trust root for the
+        /// CA-signed server certificate.
+        ca_der: rustls::pki_types::CertificateDer<'static>,
+    }
+
+    impl PeerAuthRelayGateway {
+        fn access_dir(&self) -> &std::path::Path {
+            self.gateway.access_dir.path()
+        }
+    }
+
+    async fn spawn_relay_ingress_test_gateway_with_peer_auth(
+        mut config: WebGatewayConfig,
+    ) -> PeerAuthRelayGateway {
+        let access_dir = tempfile::tempdir().expect("relay gateway test access store");
+        let hosted_identity_path = access_dir.path().join("hosted-identity.pk8");
+        config.hosted_control_identity_path = Some(hosted_identity_path.clone());
+        let server_names = crate::access::certs::ServerNames::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            [],
+            [],
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(access_dir.path(), &server_names, "relay-test", false)
+            .expect("generate access CA + server certificate");
+        let acceptor = crate::web_tls::build_single_cert_acceptor_with_client_auth(
+            &crate::web_tls::TlsCertSource::Files {
+                cert_path: access_dir.path().join("server.crt"),
+                key_path: access_dir.path().join("server.key"),
+            },
+            &crate::web_tls::ClientAuth::OptionalCa {
+                ca_path: access_dir.path().join("ca.crt"),
+            },
+        )
+        .unwrap();
+        let ca_pem = std::fs::read_to_string(access_dir.path().join("ca.crt")).unwrap();
+        let ca_der = rustls::pki_types::CertificateDer::from(
+            pem::parse(ca_pem.as_bytes()).unwrap().contents().to_vec(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = listener.local_addr().unwrap();
+        let relay_ingress_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_ingress_listener.local_addr().unwrap();
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let task = spawn_web_gateway_from_cert_dir_with_relay_listener(
+            listener,
+            bus.clone(),
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            Some(acceptor),
+            access_dir.path().to_path_buf(),
+            Some(relay_ingress_listener),
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        PeerAuthRelayGateway {
+            gateway: RelayIngressTestGateway {
+                task,
+                direct_addr,
+                relay_addr,
+                server_cert: ca_der.clone(),
+                access_dir,
+                hosted_identity_path,
+                bus,
+            },
+            ca_der,
+        }
+    }
+
+    /// TLS stream presenting a CA-minted client identity — the wire shape
+    /// of a dialing peer daemon (or, without an identity record installed,
+    /// of a browser-enrolled mTLS client).
+    async fn tls_client_identity_stream(
+        tcp: tokio::net::TcpStream,
+        ca_der: rustls::pki_types::CertificateDer<'static>,
+        identity: &crate::access::certs::IssuedClientIdentity,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der).unwrap();
+        let chain = vec![rustls::pki_types::CertificateDer::from(
+            pem::parse(identity.cert_pem.as_bytes())
+                .unwrap()
+                .contents()
+                .to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            pem::parse(identity.key_pem.as_bytes())
+                .unwrap()
+                .contents()
+                .to_vec()
+                .into(),
+        );
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        connector.connect(server_name, tcp).await.unwrap()
+    }
+
+    /// One request over the given lane with a client identity presented.
+    /// `peer_header` mirrors the peer transport's `x-intendant-peer: 1`
+    /// routing hint (a browser-enrolled client sends no such header).
+    /// Reads to connection close — refusal lanes all close.
+    async fn identity_request(
+        addr: std::net::SocketAddr,
+        via_relay: bool,
+        ca_der: rustls::pki_types::CertificateDer<'static>,
+        identity: &crate::access::certs::IssuedClientIdentity,
+        peer_header: bool,
+        request: &str,
+    ) -> String {
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        if via_relay {
+            tcp.write_all(
+                format!(
+                    "{} {}\n",
+                    crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAGIC,
+                    "a".repeat(43)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut tls = tls_client_identity_stream(tcp, ca_der, identity).await;
+        let request = if peer_header {
+            request.replacen("\r\n", "\r\nx-intendant-peer: 1\r\n", 1)
+        } else {
+            request.to_string()
+        };
+        tls.write_all(with_test_loopback_token(&request).as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            tls.read_to_end(&mut response),
+        )
+        .await
+        .expect("identity request response timed out")
+        .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Same as [`identity_request`] but returns as soon as the response
+    /// head is complete — a successful WebSocket upgrade (101) never
+    /// closes the stream, so reading to EOF would hang there.
+    async fn identity_request_head(
+        addr: std::net::SocketAddr,
+        via_relay: bool,
+        ca_der: rustls::pki_types::CertificateDer<'static>,
+        identity: &crate::access::certs::IssuedClientIdentity,
+        peer_header: bool,
+        request: &str,
+    ) -> String {
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        if via_relay {
+            tcp.write_all(
+                format!(
+                    "{} {}\n",
+                    crate::relay_tunnel::GATEWAY_RELAY_SOURCE_MAGIC,
+                    "a".repeat(43)
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut tls = tls_client_identity_stream(tcp, ca_der, identity).await;
+        let request = if peer_header {
+            request.replacen("\r\n", "\r\nx-intendant-peer: 1\r\n", 1)
+        } else {
+            request.to_string()
+        };
+        tls.write_all(with_test_loopback_token(&request).as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            while !response.ends_with(b"\r\n\r\n") {
+                match tls.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => response.extend_from_slice(&byte),
+                    Err(_) => break,
+                }
+            }
+        })
+        .await
+        .expect("identity request head timed out");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    const WS_UPGRADE_REQUEST: &str = "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    const CONFIG_REQUEST: &str =
+        "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    /// The exact fleet-lane refusal string pinned by
+    /// `reachability_relay_ingress_is_discovery_only_not_trusted_local` —
+    /// with the admission key OFF it must stay byte-identical for every
+    /// credential class, active peer identities included.
+    const DISCOVERY_ONLY_REFUSAL: &str = "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control";
+
     fn http_json(response: &str) -> serde_json::Value {
         let body = response
             .split_once("\r\n\r\n")
@@ -4216,6 +4453,302 @@ mod tests {
         assert!(
             closed.is_ok(),
             "live hosted socket did not close after lease revocation"
+        );
+    }
+
+    /// With `[connect] relay_peer_admission` at its default (off), an
+    /// ACTIVE peer identity presented through the relay changes nothing:
+    /// both lanes' refusals stay byte-identical to the anonymous ones the
+    /// discovery-only pin already freezes.
+    #[tokio::test]
+    async fn relay_peer_admission_default_off_keeps_refusals_byte_identical() {
+        let gw = spawn_relay_ingress_test_gateway_with_peer_auth(WebGatewayConfig::default()).await;
+        let identity =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "peer-daemon").unwrap();
+        let fingerprint = crate::peer::access_policy::fingerprint_pem(&identity.cert_pem).unwrap();
+        crate::peer::access_policy::write_approved_identity(
+            gw.access_dir(),
+            &fingerprint,
+            "peer-daemon",
+            "admin-peer",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let with_identity = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &identity,
+            true,
+            CONFIG_REQUEST,
+        )
+        .await;
+        let anonymous = relay_tls_request(
+            gw.gateway.relay_addr,
+            gw.gateway.server_cert.clone(),
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            with_identity.starts_with("HTTP/1.1 403")
+                && with_identity.contains(DISCOVERY_ONLY_REFUSAL),
+            "key off: an active peer identity must not move the relay refusal: {with_identity}"
+        );
+        assert_eq!(
+            with_identity, anonymous,
+            "key off: the peer-identity refusal must be byte-identical to the anonymous one"
+        );
+
+        let ws_with_identity = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &identity,
+            true,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        let ws_anonymous = relay_tls_request(
+            gw.gateway.relay_addr,
+            gw.gateway.server_cert.clone(),
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        assert!(
+            ws_with_identity.starts_with("HTTP/1.1 403")
+                && ws_with_identity.contains(DISCOVERY_ONLY_REFUSAL),
+            "key off: the WS upgrade refusal must hold against a peer identity: {ws_with_identity}"
+        );
+        assert_eq!(
+            ws_with_identity, ws_anonymous,
+            "key off: the WS refusal must be byte-identical to the anonymous one"
+        );
+    }
+
+    /// The `hosted_lease_is_the_only_relay_control_authority` sibling:
+    /// with the admission key ON, an ACTIVE peer identity record is the
+    /// only OTHER relay authority, and it lands in the EXISTING ladder —
+    /// per-operation profile depth answers exactly as on the direct lane
+    /// (org-materialized records admit like pairing-lane ones; every
+    /// mint lane is owner-consented authority), while anonymous callers
+    /// keep the discovery-only refusal.
+    #[tokio::test]
+    async fn relay_peer_admission_admits_active_records_into_the_existing_ladder() {
+        let mut config = WebGatewayConfig::default();
+        config.connect.relay_peer_admission = true;
+        let gw = spawn_relay_ingress_test_gateway_with_peer_auth(config).await;
+
+        // Pairing-lane record at the profile the federation control link
+        // uses (admin-peer passes the legacy /ws observer-set gate).
+        let control_peer =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "control-peer").unwrap();
+        let control_fp =
+            crate::peer::access_policy::fingerprint_pem(&control_peer.cert_pem).unwrap();
+        crate::peer::access_policy::write_approved_identity(
+            gw.access_dir(),
+            &control_fp,
+            "control-peer",
+            "admin-peer",
+            None,
+            None,
+        )
+        .unwrap();
+        // Org-materialized ACTIVE record (P1 admitted-set honesty): same
+        // admission, narrower operator depth.
+        let org_peer =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "org-peer").unwrap();
+        let org_fp = crate::peer::access_policy::fingerprint_pem(&org_peer.cert_pem).unwrap();
+        let mut org_record = crate::peer::access_policy::write_approved_identity_expiring(
+            gw.access_dir(),
+            &org_fp,
+            "org-peer",
+            "operator",
+            None,
+            None,
+            Some(crate::access::client_key::now_unix_ms() / 1000 + 3600),
+        )
+        .unwrap();
+        org_record.source = Some("org:acme".to_string());
+        org_record.org_grant_id = Some("grant-1".to_string());
+        crate::peer::access_policy::write_identity_record(gw.access_dir(), &org_record).unwrap();
+
+        // HTTP through the relay = HTTP on the direct lane, same record.
+        let via_relay = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &org_peer,
+            true,
+            CONFIG_REQUEST,
+        )
+        .await;
+        let via_direct = identity_request(
+            gw.gateway.direct_addr,
+            false,
+            gw.ca_der.clone(),
+            &org_peer,
+            true,
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            via_relay.starts_with("HTTP/1.1 200"),
+            "an active org-materialized peer identity must be admitted through the relay: {via_relay}"
+        );
+        assert_eq!(
+            via_relay.lines().next(),
+            via_direct.lines().next(),
+            "relay admission must land in the direct lane's ladder, not a new one"
+        );
+
+        // The federation control link attaches through the relay.
+        let ws_control = identity_request_head(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &control_peer,
+            true,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        assert!(
+            ws_control.starts_with("HTTP/1.1 101"),
+            "an admin-peer identity must complete the /ws upgrade through the relay: {ws_control}"
+        );
+
+        // Profile depth still answers: an operator-profile record gets the
+        // LADDER's own observer-set refusal — not the transport refusal —
+        // and identically on both lanes.
+        let ws_relay = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &org_peer,
+            true,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        let ws_direct = identity_request(
+            gw.gateway.direct_addr,
+            false,
+            gw.ca_der.clone(),
+            &org_peer,
+            true,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        assert!(
+            ws_relay.starts_with("HTTP/1.1 403")
+                && ws_relay.contains("observer read set")
+                && !ws_relay.contains(DISCOVERY_ONLY_REFUSAL),
+            "an admitted narrow profile must hit the ladder's own refusal: {ws_relay}"
+        );
+        assert_eq!(
+            ws_relay, ws_direct,
+            "profile-depth refusals must be identical on both lanes"
+        );
+
+        // Nothing else got opened: anonymous relay callers keep the
+        // discovery-only refusal even with the key on.
+        let anonymous = relay_tls_request(
+            gw.gateway.relay_addr,
+            gw.gateway.server_cert.clone(),
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            anonymous.starts_with("HTTP/1.1 403") && anonymous.contains(DISCOVERY_ONLY_REFUSAL),
+            "key on: anonymous relay callers must keep the discovery-only refusal: {anonymous}"
+        );
+    }
+
+    /// Even with the admission key ON, the widening admits exactly the
+    /// active-peer-record class: a browser-enrolled certificate (chain
+    /// valid, no record) keeps the discovery-only refusal byte-identical,
+    /// and revoked/expired records die at identity resolution.
+    #[tokio::test]
+    async fn relay_peer_admission_refuses_browser_certs_and_inactive_records() {
+        let mut config = WebGatewayConfig::default();
+        config.connect.relay_peer_admission = true;
+        let gw = spawn_relay_ingress_test_gateway_with_peer_auth(config).await;
+
+        // Browser-enrolled class: CA-minted certificate, NO peer identity
+        // record (`resolve…` returns `Ok(None)`), no peer routing header.
+        let browser =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "browser").unwrap();
+        for request in [CONFIG_REQUEST, WS_UPGRADE_REQUEST] {
+            let response = identity_request(
+                gw.gateway.relay_addr,
+                true,
+                gw.ca_der.clone(),
+                &browser,
+                false,
+                request,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403")
+                    && response.contains(DISCOVERY_ONLY_REFUSAL),
+                "a browser-enrolled certificate must keep the discovery-only refusal with the key ON: {response}"
+            );
+        }
+
+        // Revoked record: refused at resolution, on both lanes.
+        let revoked =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "revoked-peer").unwrap();
+        let revoked_fp = crate::peer::access_policy::fingerprint_pem(&revoked.cert_pem).unwrap();
+        crate::peer::access_policy::write_approved_identity(
+            gw.access_dir(),
+            &revoked_fp,
+            "revoked-peer",
+            "admin-peer",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::peer::access_policy::revoke_identity(gw.access_dir(), &revoked_fp).unwrap();
+        let response = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &revoked,
+            true,
+            CONFIG_REQUEST,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403") && response.contains("peer identity revoked"),
+            "a revoked record must be refused at resolution: {response}"
+        );
+
+        // Expired record: same fate.
+        let expired =
+            crate::access::certs::issue_client_identity(gw.access_dir(), "expired-peer").unwrap();
+        let expired_fp = crate::peer::access_policy::fingerprint_pem(&expired.cert_pem).unwrap();
+        crate::peer::access_policy::write_approved_identity_expiring(
+            gw.access_dir(),
+            &expired_fp,
+            "expired-peer",
+            "admin-peer",
+            None,
+            None,
+            Some(crate::access::client_key::now_unix_ms() / 1000 - 60),
+        )
+        .unwrap();
+        let response = identity_request(
+            gw.gateway.relay_addr,
+            true,
+            gw.ca_der.clone(),
+            &expired,
+            true,
+            WS_UPGRADE_REQUEST,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403") && response.contains("peer identity expired"),
+            "an expired record must be refused at resolution: {response}"
         );
     }
 

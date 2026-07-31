@@ -346,16 +346,57 @@ The relay is **availability-only**: it terminates no TLS, holds no
 certificate, mints no authority, and logs no plaintext. The gateway
 records which listener accepted each connection before it parses TLS or
 HTTP. Connections from the relay-only ingress remain anonymous `role:none`
-unless the optional hosted-control lane validates a fresh lease proof. That
-carve admits only explicitly classified HTTPS routes, while `/mcp`, direct
-signaling, trusted-local fallback, unknown routes, and every unproved request
-remain refused. WebSocket upgrade additionally consumes a seconds-lived
-one-use ticket minted by a proof-bound HTTPS request. The tunnel's loopback
+unless one of two independent per-daemon opt-ins validates its own
+credential class. The optional hosted-control lane validates a fresh lease
+proof: that carve admits only explicitly classified HTTPS routes, while
+`/mcp`, direct signaling, trusted-local fallback, unknown routes, and every
+unproved request remain refused, and WebSocket upgrade additionally consumes
+a seconds-lived one-use ticket minted by a proof-bound HTTPS request. The
+optional peer-admission lane (`[connect] relay_peer_admission`, below)
+admits Approved, unexpired peer identity records into the ordinary peer
+transport-auth ladder. The tunnel's loopback
 last hop therefore cannot qualify for trusted-local authority even when the
 encrypted request contains `Host: localhost`; fleet-SNI classification is an
 independent second gate. Non-TLS bytes are dropped before the gateway's raw
 ICE-TCP and cleartext-MCP demultiplexer, so the relay-only listener cannot
 reach either local lane.
+
+### Relay peer admission (daemon-to-daemon federation through the relay)
+
+`[connect] relay_peer_admission = true` (default false; boot-pinned — read
+once at gateway spawn, restart to apply; deliberately no environment
+override) lets **this daemon's own paired peer daemons** reach it through
+the relay and, equivalently, through any fleet-name dial. The admitted
+class is exactly a TLS client certificate that resolves to an Approved,
+unexpired **peer identity record** — a daemon-side credential the target's
+own access CA minted through an owner-consented lane (pairing invite,
+doorbell approval, or org-grant materialization). The record check runs
+per request, so revoking or expiring an identity kills its next request.
+Admission converts transport provenance only: the connection proceeds into
+the same remote-client-auth, grant-minting, and per-operation profile/IAM
+ladder a direct-lane peer walks, and the peer profile the owner granted
+remains the sole control-depth authority. Browser-enrolled mTLS
+certificates resolve no peer record and keep the discovery-only refusal
+byte-identical in both key states; the hosted-control browser lane and its
+switch are independent in both directions. Connect needs no changes and
+learns nothing — under TLS 1.3 the client certificate crosses the relay
+inside the encrypted handshake.
+
+Relayed federation links are **episodic by design**, not permanent: the
+relay tears down splices idle for 120 s in either direction, caps each
+splice at 512 MiB per direction, and drops everything on a relay restart.
+Two daemon-side mechanisms make that livable. The dialing peer's control
+link originates a WebSocket ping every ~30–35 s (jittered per peer), so an
+idle-but-healthy link never hits the idle teardown and a half-open link
+surfaces as a prompt write error instead of a silent hang. When a splice
+does die — byte cap, relay restart, network blip — the peer actor walks
+its ordinary jittered reconnect backoff (0.5 s–30 s) and re-probes every
+transport candidate, so the link self-heals at the cost of a fresh
+dial-back. Consumers should treat a relayed peer as a
+session-with-reconnects, exactly like a direct peer on a flaky network.
+Control operations and signaling ride this link; display media and
+file-transfer bytes ride WebRTC and need a direct route or provisioned
+TURN — a relay-only-reachable peer has no media path.
 
 Enable it with the all-or-nothing `--relay-*` group (both flags or
 neither; default off, mirroring `--dns-*`):
@@ -449,7 +490,13 @@ The Rust gateway E2E
 then covers the opt-in carve end to end: signed doorbell creation through the
 real relay ingress, trusted-local approval, proof-bound HTTP, proof replay
 refusal, `/mcp` refusal, one-use ticketed WebSocket admission, preset action
-denial, ticket-reuse refusal, and live socket closure after revocation.
+denial, ticket-reuse refusal, and live socket closure after revocation. Its
+peer-lane siblings (`relay_peer_admission_*`, same module) pin the admission
+key's whole contract: key off, refusals stay byte-identical with an active
+peer identity presented; key on, active records (org-materialized included)
+land in the existing per-profile ladder with direct-lane parity while
+browser-enrolled certificates, revoked/expired records, and anonymous
+callers keep today's refusals.
 
 ```bash
 cargo build --bin intendant --bin intendant-runtime --bin intendant-connect

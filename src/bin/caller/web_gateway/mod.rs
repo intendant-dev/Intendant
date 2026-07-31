@@ -488,7 +488,7 @@ async fn handle_diagnostics_visual_freshness(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub(crate) struct EnvVarGuard {
@@ -500,6 +500,12 @@ mod tests {
         pub(crate) fn unset(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
             std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
             Self { key, previous }
         }
     }

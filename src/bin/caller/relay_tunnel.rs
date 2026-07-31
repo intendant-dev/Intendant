@@ -75,7 +75,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// fleet name keeps resolving to the relay (the DNS record TTL is short).
 const DNS_REASSERT_INTERVAL: Duration = Duration::from_secs(240);
 /// Idle teardown + per-direction byte cap on a spliced dial-back connection.
-const SPLICE_IDLE: Duration = Duration::from_secs(120);
+/// `pub(crate)` so the peer actor's keepalive cadence pin asserts against
+/// the real teardown window instead of a mirrored literal.
+pub(crate) const SPLICE_IDLE: Duration = Duration::from_secs(120);
 const SPLICE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DIALBACK_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_DIALBACKS: usize = 64;

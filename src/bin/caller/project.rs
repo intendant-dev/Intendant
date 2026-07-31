@@ -1221,6 +1221,20 @@ pub struct ConnectConfig {
     /// behavior. There is intentionally no environment-variable override.
     #[serde(default)]
     pub hosted_control_enabled: bool,
+    /// Optional relay peer admission: admit this daemon's paired peer
+    /// daemons — TLS client certificates that resolve to an Approved,
+    /// unexpired peer identity record, a daemon-side credential class
+    /// minted by this daemon's own access CA that no browser keystore can
+    /// hold — through fleet-name/relay ingress into the ordinary peer
+    /// transport-auth ladder (peer profiles remain the sole control-depth
+    /// authority). Deliberately independent from `hosted_control_enabled`
+    /// in both directions, and default-off: when false, fleet/relay
+    /// ingress keeps the discovery-only `role:none` refusal for every
+    /// credential class, byte-identical to today. Boot-pinned: read once
+    /// at gateway spawn; restart to apply. There is intentionally no
+    /// environment-variable override.
+    #[serde(default)]
+    pub relay_peer_admission: bool,
     /// Opt-in user-owned-name control lane.
     #[serde(default)]
     pub custom_domain: CustomDomainConfig,
@@ -1294,6 +1308,7 @@ impl Default for ConnectConfig {
             relay_enabled: false,
             relay_endpoint: None,
             hosted_control_enabled: false,
+            relay_peer_admission: false,
             custom_domain: CustomDomainConfig::default(),
         }
     }
@@ -2130,6 +2145,34 @@ pub fn root_has_project_marker(root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relay-peer-admission opt-in is default-off, parses from the
+    /// `[connect]` table, and — mirroring `hosted_control_enabled` —
+    /// deliberately has no environment-variable override: an env name
+    /// shaped like the other Connect overrides must not flip it. The
+    /// gateway boot-pins the value at spawn, so this key changing at
+    /// runtime is a restart, never a live mutation.
+    #[test]
+    fn relay_peer_admission_defaults_off_with_no_env_override() {
+        assert!(!ConnectConfig::default().relay_peer_admission);
+        let empty: ProjectConfig = toml::from_str("[connect]\nenabled = true\n").unwrap();
+        assert!(!empty.connect.relay_peer_admission);
+        let on: ProjectConfig = toml::from_str("[connect]\nrelay_peer_admission = true\n").unwrap();
+        assert!(on.connect.relay_peer_admission);
+
+        let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let guard = crate::web_gateway::tests::EnvVarGuard::set(
+            "INTENDANT_CONNECT_RELAY_PEER_ADMISSION",
+            "1",
+        );
+        assert!(
+            !ConnectConfig::default()
+                .effective_with_env()
+                .relay_peer_admission,
+            "relay peer admission is owner-file opt-in only — no env override exists"
+        );
+        drop(guard);
+    }
 
     #[test]
     fn codex_effective_command_prefers_the_fork_only_for_managed_sessions() {
