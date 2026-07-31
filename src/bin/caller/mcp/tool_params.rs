@@ -170,6 +170,56 @@ pub struct FollowUpCodexCloudTaskParams {
     pub prompt: String,
 }
 
+/// Provider-neutral remote command job operations. `cloud:<task-id>` is the
+/// first host backend; the contract intentionally does not expose Codex Cloud
+/// concepts beyond that opaque host locator.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RemoteCommandParams {
+    /// Start a non-interactive argv command and return its job id immediately.
+    Start {
+        /// Remote compute host. This release accepts `cloud:<codex-task-id>`.
+        host: String,
+        /// Executable followed by its arguments. This is never parsed by a shell.
+        argv: Vec<String>,
+        /// Repository-relative working directory; omitted means repository root.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Explicit environment additions for the child process.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Expected Git commit (7-64 hexadecimal characters). The worker refuses
+        /// a different checkout instead of validating stale source.
+        #[serde(alias = "expectedRevision")]
+        expected_revision: String,
+        /// Refuse a checkout with tracked or untracked source changes before
+        /// execution. Defaults to true.
+        #[serde(default)]
+        require_clean: Option<bool>,
+        /// Command timeout in seconds (1-3600, default 900).
+        #[serde(default)]
+        timeout_s: Option<u64>,
+    },
+    /// Read the latest state/result without waiting.
+    Status {
+        #[serde(alias = "jobId")]
+        job_id: String,
+    },
+    /// Wait briefly for a state change or terminal result.
+    Wait {
+        #[serde(alias = "jobId")]
+        job_id: String,
+        /// Maximum wait for this call in seconds (1-60, default 30).
+        #[serde(default)]
+        wait_s: Option<u64>,
+    },
+    /// Request cancellation. The terminal result appears through status/wait.
+    Cancel {
+        #[serde(alias = "jobId")]
+        job_id: String,
+    },
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionNoteImageParams {
     /// Image MIME type: image/png, image/jpeg, image/gif, image/webp, or image/bmp.

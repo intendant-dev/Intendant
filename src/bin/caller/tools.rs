@@ -23,7 +23,7 @@ static EXTRA_TOOLS: Mutex<ExtraToolsRegistry> = Mutex::new(ExtraToolsRegistry {
 /// allocations) just to hand the provider an identical list.
 static ALL_TOOLS_CACHE: Mutex<Option<(u64, Arc<Vec<ToolDefinition>>)>> = Mutex::new(None);
 
-const BUILT_IN_TOOL_COUNT: usize = 17;
+const BUILT_IN_TOOL_COUNT: usize = 18;
 
 /// Provider-agnostic tool definition.
 #[derive(Debug, Clone, Serialize)]
@@ -580,7 +580,68 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
         }),
     });
 
-    // 18. peer (caller-handled, federated peer daemons)
+    // 18. remote_command (caller-handled, attached remote workers)
+    tools.push(ToolDefinition {
+        name: "remote_command".to_string(),
+        description: "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Commands are argv arrays (never shell strings), require an expected Git revision, and run only on an already-attached remote host; this release supports cloud:<codex-task-id>. If no host is attached, acquire/attach one through the Codex Cloud controls or report remote compute unavailable instead of silently running a heavy local fallback. Start returns immediately, then status/wait returns bounded stdout/stderr and the exact exit state.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["start", "status", "wait", "cancel"],
+                    "description": "Job operation."
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Attached remote host. This release accepts cloud:<codex-task-id>."
+                },
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Executable followed by arguments; never parsed by a shell."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Repository-relative working directory; omit for repository root."
+                },
+                "env": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Explicit environment additions for the child process."
+                },
+                "expected_revision": {
+                    "type": "string",
+                    "pattern": "^[0-9A-Fa-f]{7,64}$",
+                    "description": "Expected Git commit; the worker refuses a different checkout."
+                },
+                "require_clean": {
+                    "type": "boolean",
+                    "description": "Refuse a dirty worker checkout before execution (default true)."
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "description": "Command timeout in seconds (default 900)."
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Job id returned by start; required for status, wait, and cancel."
+                },
+                "wait_s": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60,
+                    "description": "Maximum wait for a wait operation (default 30 seconds)."
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+    });
+
+    // 19. peer (caller-handled, federated peer daemons)
     tools.push(ToolDefinition {
         name: "peer".to_string(),
         description: "Interact with federated peer daemons. Actions: list enumerates peers with their connection state, capabilities, visible sessions, and available displays; message sends text to a peer's agent; task delegates work that the peer's own agent executes on its machine under its own autonomy and approval policy (returns a task id; progress streams to the dashboard's peers rail); displays lists a peer's displays; screenshot captures a peer display (the image comes back in the tool result so you can see the peer's screen); cu executes computer-use actions on a peer display and returns the peer's post-action observation (a clean screenshot by default; optional observe: \"ax\"/\"auto\"/\"none\" for the peer's element-tree/no-capture policies). Peers are siblings, not subordinates: the receiving daemon authorizes every action against the IAM profile it granted this daemon — screenshots need a profile with display view, cu needs display input (peer-operator or peer-root). Requires peer federation to be configured.".to_string(),
@@ -694,6 +755,7 @@ mod tests {
         "submit_result",
         "peer",
         "workflow_checkpoint",
+        "remote_command",
     ];
 
     #[test]

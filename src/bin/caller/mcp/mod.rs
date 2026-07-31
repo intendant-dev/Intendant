@@ -74,6 +74,7 @@ mod tools_codex_cloud;
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
+mod tools_remote_compute;
 mod tools_whoami;
 pub(crate) use tools_notes::{
     note_image_extension, SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES,
@@ -843,6 +844,13 @@ impl IntendantServer {
                 let params = parse_params::<FollowUpCodexCloudTaskParams>(args)?;
                 Ok(text_tool_result(
                     self.follow_up_codex_cloud_task(params).await,
+                ))
+            }
+            "remote_command" => {
+                let Parameters(params) = parse_params::<RemoteCommandParams>(args)?;
+                Ok(text_tool_result(
+                    self.remote_command_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
                 ))
             }
             "browser_workspace_providers" => {
