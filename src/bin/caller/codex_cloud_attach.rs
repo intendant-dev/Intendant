@@ -28,10 +28,10 @@ use crate::codex_cloud::{record_attachment_state, state_path, AttachmentState, S
 const BROKER_VERSION: u32 = 1;
 /// Enrollment tokens are delivery secrets for one attach ceremony:
 /// minutes, not hours.
-const DEFAULT_TOKEN_TTL_S: u64 = 900;
+pub(crate) const DEFAULT_TOKEN_TTL_S: u64 = 900;
 /// The issued identity's record expiry (independent of cert validity —
 /// the record is what the gateway enforces on every connection).
-const DEFAULT_IDENTITY_TTL_S: u64 = 3600;
+pub(crate) const DEFAULT_IDENTITY_TTL_S: u64 = 3600;
 /// The public redemption doorbell's path — the one spelling shared by the
 /// route table, the certless carve-out predicate, and the worker's dial.
 pub(crate) const ENROLL_PATH: &str = "/api/codex-cloud/enroll";
@@ -71,7 +71,11 @@ impl Default for BrokerStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEnrollment {
-    pub task_id: String,
+    /// Bound after `codex cloud exec` returns its provider task id. Manual
+    /// attach ceremonies mint already bound; automatic acquisition mints
+    /// first, delivers the token over stdin, then binds it before redemption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     /// TTL for the identity record minted at redemption.
@@ -155,9 +159,37 @@ pub fn mint_enrollment(
     identity_ttl_s: u64,
     now_ms: u64,
 ) -> Result<(String, PendingEnrollment), String> {
+    mint_enrollment_for(
+        broker_store_path,
+        Some(task_id),
+        token_ttl_s,
+        identity_ttl_s,
+        now_ms,
+    )
+}
+
+/// Mint the automatic-acquisition ceremony before the provider task id
+/// exists. A correct token presented during that small window receives a
+/// retryable "binding pending" refusal and is not burned.
+pub(crate) fn mint_unbound_enrollment(
+    broker_store_path: &Path,
+    token_ttl_s: u64,
+    identity_ttl_s: u64,
+    now_ms: u64,
+) -> Result<(String, PendingEnrollment), String> {
+    mint_enrollment_for(broker_store_path, None, token_ttl_s, identity_ttl_s, now_ms)
+}
+
+fn mint_enrollment_for(
+    broker_store_path: &Path,
+    task_id: Option<&str>,
+    token_ttl_s: u64,
+    identity_ttl_s: u64,
+    now_ms: u64,
+) -> Result<(String, PendingEnrollment), String> {
     let token = random_token()?;
     let pending = PendingEnrollment {
-        task_id: task_id.to_string(),
+        task_id: task_id.map(str::to_string),
         created_at_unix_ms: now_ms,
         expires_at_unix_ms: now_ms.saturating_add(token_ttl_s.saturating_mul(1000)),
         identity_ttl_s,
@@ -168,6 +200,40 @@ pub fn mint_enrollment(
     store.pending.insert(token_hash(&token), pending.clone());
     save_broker(broker_store_path, &store)?;
     Ok((token, pending))
+}
+
+const ENROLLMENT_BINDING_PENDING: &str =
+    "automatic enrollment is waiting for its provider task id; retry shortly";
+
+pub(crate) fn enrollment_binding_pending(error: &str) -> bool {
+    error == ENROLLMENT_BINDING_PENDING
+}
+
+/// Bind a still-pending automatic token to the provider task returned by
+/// `codex cloud exec`. The plaintext token remains only in the acquiring
+/// task; the broker continues to store its hash.
+pub(crate) fn bind_enrollment(
+    broker_store_path: &Path,
+    token: &str,
+    task_id: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    if task_id.trim().is_empty() || task_id.len() > 256 {
+        return Err("provider returned an invalid task id for enrollment".to_string());
+    }
+    let _lock = broker_lock(broker_store_path)?;
+    let mut store = load_broker(broker_store_path)?;
+    prune_expired(&mut store, now_ms);
+    let pending = store
+        .pending
+        .get_mut(&token_hash(token))
+        .ok_or_else(|| "automatic enrollment expired before its task was created".to_string())?;
+    match pending.task_id.as_deref() {
+        None => pending.task_id = Some(task_id.to_string()),
+        Some(existing) if existing == task_id => {}
+        Some(_) => return Err("automatic enrollment was already bound to another task".to_string()),
+    }
+    save_broker(broker_store_path, &store)
 }
 
 /// Atomically burn a token. Unknown, already-used, and expired tokens are
@@ -181,10 +247,16 @@ fn consume_enrollment(
     let _lock = broker_lock(broker_store_path)?;
     let mut store = load_broker(broker_store_path)?;
     prune_expired(&mut store, now_ms);
+    let hash = token_hash(token);
     let pending = store
         .pending
-        .remove(&token_hash(token))
+        .get(&hash)
+        .cloned()
         .ok_or_else(|| REFUSED.to_string())?;
+    if pending.task_id.is_none() {
+        return Err(ENROLLMENT_BINDING_PENDING.to_string());
+    }
+    store.pending.remove(&hash);
     save_broker(broker_store_path, &store)?;
     if pending.expires_at_unix_ms <= now_ms {
         return Err(REFUSED.to_string());
@@ -336,9 +408,12 @@ pub fn redeem_enrollment(
 
     let broker = broker_path(lease_store_path);
     let pending = consume_enrollment(&broker, token, now_ms)?;
+    let task_id = pending
+        .task_id
+        .expect("consume_enrollment refuses an unbound automatic token");
 
     let profile = crate::access::access_policy::CLOUD_WORKER_PROFILE;
-    let label = format!("{profile} {}", pending.task_id);
+    let label = format!("{profile} {task_id}");
     let cert_pem = crate::access::certs::issue_client_certificate_for_public_key(
         cert_dir,
         &label,
@@ -363,7 +438,7 @@ pub fn redeem_enrollment(
         &broker,
         &fingerprint,
         WorkerBinding {
-            task_id: pending.task_id.clone(),
+            task_id: task_id.clone(),
             label,
             issued_at_unix_ms: now_ms,
             identity_expires_at_unix,
@@ -372,17 +447,13 @@ pub fn redeem_enrollment(
     // The ceremony is under way: the lease shows `awaiting` until the
     // socket actually opens. Best-effort — an untracked task still
     // enrolls (the lease may live on another store generation).
-    let _ = record_attachment_state(
-        lease_store_path,
-        &pending.task_id,
-        AttachmentState::Awaiting,
-    );
+    let _ = record_attachment_state(lease_store_path, &task_id, AttachmentState::Awaiting);
     if let Some(worker) = &request.worker {
-        record_worker_json(lease_store_path, &pending.task_id, worker);
+        record_worker_json(lease_store_path, &task_id, worker);
     }
     Ok(EnrollResponse {
         version: 1,
-        task_id: pending.task_id,
+        task_id,
         profile: profile.to_string(),
         client_cert_pem: cert_pem,
         identity_expires_at_unix,
@@ -419,6 +490,7 @@ const WORKER_REPLY_KINDS: &[&str] = &[
     "display_error",
     "cu_result",
     crate::remote_compute::REMOTE_COMMAND_RESULT_KIND,
+    crate::remote_compute::source::REMOTE_SOURCE_RESULT_KIND,
 ];
 
 /// Host-id prefix that routes a dashboard terminal frame to a connected
@@ -605,7 +677,7 @@ fn attachment_remaining_ms(identity_expires_at_unix: i64, now_ms: u64) -> u64 {
 
 // ── Attach verb (home side) ────────────────────────────────────────────
 
-fn home_url_from(args_value: Option<String>) -> Result<String, String> {
+pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String> {
     let url = args_value
         .or_else(|| std::env::var("INTENDANT_CODEX_CLOUD_HOME_URL").ok())
         .map(|value| value.trim().to_string())
@@ -643,6 +715,27 @@ pub fn attach_prompt(
 INTENDANT_ATTACH_TOKEN\n\
 ```\n\n\
 If the command fails because a destination is blocked by the environment's network allowlist, report the blocked host and stop."
+    )
+}
+
+/// Initial task prompt for automatic acquisition. Unlike a manual follow-up,
+/// the task id is not known yet; the agent learns and verifies it from the
+/// enrollment response after home binds the token.
+pub(crate) fn automatic_attach_prompt(
+    home_url: &str,
+    server_fingerprint: &str,
+    token: &str,
+) -> String {
+    format!(
+        "Run this exact command in the repository root and keep it running in the foreground until home retires the worker. Do not modify repository files, do not run builds on your own, and do not print the token back:\n\n\
+```bash\n\
+\"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/libexec/intendant-cloud/run-worker.sh\" -- \\\n\
+  \"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/bin/intendant\" codex-cloud agent \\\n\
+  --home {home_url} --home-fingerprint {server_fingerprint} --token-stdin <<'INTENDANT_ATTACH_TOKEN'\n\
+{token}\n\
+INTENDANT_ATTACH_TOKEN\n\
+```\n\n\
+If enrollment says its task binding is pending, keep retrying as the agent command instructs. If a destination is blocked by the environment's network allowlist, report the blocked host and stop."
     )
 }
 
@@ -782,10 +875,10 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
             .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
     {
         println!(
-            "Usage:\n  intendant codex-cloud agent --home wss://host:port --home-fingerprint SHA256 --task TASK_ID --token-stdin [--state-dir DIR]"
+            "Usage:\n  intendant codex-cloud agent --home wss://host:port --home-fingerprint SHA256 [--task TASK_ID] --token-stdin [--state-dir DIR]"
         );
         println!(
-            "Runs inside a Codex Cloud worker: generates a task-local keypair, redeems the enrollment token at the home daemon's public enroll route, then dials home over mTLS and holds the attachment socket in the foreground. Launch it through run-worker.sh so all state stays task-local."
+            "Runs inside a Codex Cloud worker: generates a task-local keypair, redeems the enrollment token at the home daemon's public enroll route, then dials home over mTLS and holds the attachment socket in the foreground. --task verifies a manual ceremony; automatic acquisition learns the task id from enrollment. Launch it through run-worker.sh so all state stays task-local."
         );
         return Ok(());
     }
@@ -832,7 +925,6 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     }
     let home_fingerprint = home_fingerprint
         .ok_or("agent requires --home-fingerprint (pin the daemon's TLS identity)")?;
-    let task = task.ok_or("agent requires --task TASK_ID")?;
     if !token_stdin {
         return Err("agent requires --token-stdin (the token never rides argv)".to_string());
     }
@@ -880,25 +972,55 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     )
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
-    let response = client
-        .post(&enroll_url)
-        .json(&serde_json::json!({
-            "version": 1,
-            "token": token,
-            "public_key_pem": key_pair.public_key_pem(),
-            "worker": worker_fingerprint,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("POST {enroll_url}: {e}"))?;
-    let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    if !status.is_success() {
+    let enrollment_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(DEFAULT_TOKEN_TTL_S);
+    let text = loop {
+        let response = client
+            .post(&enroll_url)
+            .json(&serde_json::json!({
+                "version": 1,
+                "token": &token,
+                "public_key_pem": key_pair.public_key_pem(),
+                "worker": &worker_fingerprint,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("POST {enroll_url}: {e}"))?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            break text;
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::CONFLICT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) && tokio::time::Instant::now() < enrollment_deadline
+        {
+            // The public doorbell is deliberately tight per source. A task
+            // can beat its CLI receipt back to home, but retry slowly enough
+            // that one legitimate worker cannot rate-limit itself.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
+        }
         let snippet: String = text.trim().chars().take(200).collect();
         return Err(format!("enrollment refused (HTTP {status}): {snippet}"));
-    }
+    };
     let enrolled: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("parse enrollment response: {e}"))?;
+    let enrolled_task = enrolled
+        .get("task_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|task_id| !task_id.is_empty())
+        .ok_or("enrollment response carried no task_id")?
+        .to_string();
+    if let Some(expected_task) = task.as_deref() {
+        if expected_task != enrolled_task {
+            return Err(format!(
+                "enrollment task mismatch: expected {expected_task}, home bound {enrolled_task}"
+            ));
+        }
+    }
+    let task = enrolled_task;
     let cert_pem = enrolled
         .get("client_cert_pem")
         .and_then(serde_json::Value::as_str)
@@ -954,7 +1076,11 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         // clean.
         display_state.stop_viewer();
         match held {
-            Ok(()) => {
+            Ok(true) => {
+                eprintln!("[cloud-agent] retired by home");
+                return Ok(());
+            }
+            Ok(false) => {
                 attempt = 0;
                 eprintln!("[cloud-agent] attachment closed by home; reconnecting");
             }
@@ -1271,7 +1397,19 @@ fn collect_worker_fingerprint(now_ms: u64) -> crate::codex_cloud::WorkerFingerpr
         boot_id: read_trim("/proc/sys/kernel/random/boot_id"),
         pid1_start,
         unix_ms: Some(now_ms),
-        git_rev: None,
+        git_rev: std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .filter(|revision| !revision.is_empty()),
         rustc: None,
         cpus: std::thread::available_parallelism()
             .ok()
@@ -1289,7 +1427,7 @@ async fn hold_attachment(
     registry: &crate::terminal::TerminalRegistry,
     remote_commands: &crate::remote_compute::WorkerRemoteCommands,
     display: &mut WorkerDisplayState,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
@@ -1355,9 +1493,13 @@ async fn hold_attachment(
                 }
                 None => break,
             },
+            _ = remote_commands.retired() => {
+                let _ = sink.close().await;
+                return Ok(true);
+            }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The worker's terminal server: home's authority over this worker is
@@ -1626,11 +1768,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broker = dir.path().join("attach-broker.json");
         let (token, pending) = mint_enrollment(&broker, "task_e_att", 900, 3600, 1_000).unwrap();
-        assert_eq!(pending.task_id, "task_e_att");
+        assert_eq!(pending.task_id.as_deref(), Some("task_e_att"));
         assert!(!broker_contains_plaintext(&broker, &token));
 
         let consumed = consume_enrollment(&broker, &token, 2_000).unwrap();
-        assert_eq!(consumed.task_id, "task_e_att");
+        assert_eq!(consumed.task_id.as_deref(), Some("task_e_att"));
         // Burned: the same token never redeems twice.
         let again = consume_enrollment(&broker, &token, 2_000).unwrap_err();
         assert!(
@@ -1642,6 +1784,21 @@ mod tests {
         let (token, _) = mint_enrollment(&broker, "task_e_att", 1, 3600, 1_000).unwrap();
         let expired = consume_enrollment(&broker, &token, 10_000).unwrap_err();
         assert_eq!(expired, again);
+    }
+
+    #[test]
+    fn automatic_token_waits_unburned_for_task_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = dir.path().join("attach-broker.json");
+        let (token, pending) = mint_unbound_enrollment(&broker, 900, 3600, 1_000).unwrap();
+        assert!(pending.task_id.is_none());
+        let waiting = consume_enrollment(&broker, &token, 2_000).unwrap_err();
+        assert!(enrollment_binding_pending(&waiting));
+
+        bind_enrollment(&broker, &token, "task_e_auto", 2_100).unwrap();
+        let consumed = consume_enrollment(&broker, &token, 2_200).unwrap();
+        assert_eq!(consumed.task_id.as_deref(), Some("task_e_auto"));
+        assert!(consume_enrollment(&broker, &token, 2_300).is_err());
     }
 
     fn broker_contains_plaintext(path: &Path, token: &str) -> bool {
@@ -1802,6 +1959,11 @@ mod tests {
             r#"{"t":"remote_command_result","host_id":"cloud:x","id":"remote-1","result":{"state":"succeeded","exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"duration_ms":1}}"#,
         );
         assert!(rx.try_recv().is_ok());
+        route_worker_frame(
+            &tx,
+            r#"{"t":"remote_source_result","host_id":"cloud:x","id":"source-a","state":"ready"}"#,
+        );
+        assert!(rx.try_recv().is_ok());
         // The worker cannot inject request kinds, hellos, or junk into
         // home — its inbound authority stays nothing.
         for dropped in [
@@ -1810,6 +1972,7 @@ mod tests {
             r#"{"t":"display_input","host_id":"cloud:x","event":{"t":"mm","x":0.1,"y":0.1}}"#,
             r#"{"t":"remote_command_start","host_id":"cloud:x","id":"remote-1"}"#,
             r#"{"t":"remote_command_cancel","host_id":"cloud:x","id":"remote-1"}"#,
+            r#"{"t":"remote_source_begin","host_id":"cloud:x","id":"source-a"}"#,
             r#"{"v":2,"kind":"cloud-worker-hello","task_id":"x"}"#,
             r#"{"t":"api_sessions"}"#,
             "not json",

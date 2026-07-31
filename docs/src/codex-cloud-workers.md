@@ -333,8 +333,9 @@ resolver rather than guessing.
 
 ## Provider-neutral remote commands
 
-An attached worker can also run a bounded, non-interactive command for any
-supervised agent backend. The public tool is named `remote_command`, not
+An acquired or explicitly attached worker can run a bounded, non-interactive
+command for any supervised agent backend. The public tool is named
+`remote_command`, not
 `codex_cloud_shell`: Codex, Claude Code, Kimi Code, Pi, and native Intendant
 sessions all receive the same job vocabulary in their compact/core tool
 profile. Codex Cloud is only the first host adapter.
@@ -342,13 +343,14 @@ profile. Codex Cloud is only the first host adapter.
 The tool has four operations: `start`, `status`, `wait`, and `cancel`.
 `start` returns immediately with a daemon-local job id; `status` polls it,
 `wait` waits for at most 60 seconds, and `cancel` terminates the worker
-process tree. The initial host form is an already-connected lease,
-`cloud:<task-id>`:
+process tree. Omitted `host` (or `host: "auto"`) reuses a live worker whose
+environment and exact Git revision match, or submits and enrolls one. An
+operator can still select an already-connected lease with
+`host: "cloud:<task-id>"`:
 
 ```bash
 intendant ctl tools call remote_command --args '{
   "op": "start",
-  "host": "cloud:task_e_...",
   "argv": ["cargo", "test", "-p", "intendant-core"],
   "expected_revision": "0123456789abcdef",
   "require_clean": true,
@@ -359,17 +361,58 @@ intendant ctl tools call remote_command \
   --args '{"op":"wait","job_id":"remote-...","wait_s":30}'
 ```
 
+Uncommitted or not-yet-pushed source uses an explicit working-tree snapshot:
+
+```bash
+intendant ctl tools call remote_command --args '{
+  "op": "start",
+  "source": "working_tree",
+  "argv": ["cargo", "check", "--workspace"],
+  "cache": "durable_sccache",
+  "timeout_s": 900
+}'
+```
+
 The contract is intentionally stricter than an interactive terminal:
 
 - Commands are transported as an argv array and are not implicitly parsed by
   a shell. `cwd`, when present, is repository-relative and cannot escape the
   selected checkout. Explicit environment entries are additions to the
   worker's agent-phase environment.
-- `expected_revision` is required. Before spawning, the worker resolves
-  `git rev-parse HEAD` and refuses a different revision; abbreviated object
-  ids are accepted from 7 hexadecimal characters. `require_clean` defaults
-  to true and includes untracked files. This prevents a green remote result
-  from silently describing stale or locally modified source.
+- `source: "git_revision"` is the default and requires
+  `expected_revision`. The worker refuses a different checkout; abbreviated
+  object ids are accepted from 7 hexadecimal characters.
+  `source: "working_tree"` captures a binary Git patch plus non-ignored
+  untracked regular files relative to `expected_revision`, or
+  `INTENDANT_REMOTE_COMPUTE_BASE_REF` (default `origin/main`) when omitted.
+  Capture runs twice and proceeds only when the content-addressed bytes match.
+  Ignored files — notably `.env` and `target/` — do not cross the attachment.
+  The compressed transfer is capped at 64 MiB (128 MiB expanded, 16 MiB per
+  untracked file, 4096 untracked files), chunked over mTLS, and verified by
+  digest before the worker materializes an isolated Git worktree.
+- `require_clean` defaults to true. For a pushed revision it means a clean
+  checkout; for a snapshot it means unchanged from the exact selected
+  snapshot. Commands using one snapshot are serialized. A command that
+  mutates selected source invalidates that prepared workspace; ignored build
+  outputs such as `target/` remain warm and reusable.
+- `cache: "durable_sccache"` is explicit and rejects a local backend at
+  setup. Home maps only
+  dedicated `INTENDANT_REMOTE_CACHE_` settings for sccache and its documented
+  backend credential families (`SCCACHE_*`, `AWS_*`, `ACTIONS_*`,
+  `ALIBABA_CLOUD_*`, and `TENCENTCLOUD_*`) into the mTLS command, requires an
+  external backend (a task-local `SCCACHE_DIR` is refused), configures
+  `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, and a stable
+  `SCCACHE_BASEDIRS`, then reports hit/miss/write/error deltas. Backend
+  configuration is inherited by the requested build/test child because a
+  sccache client automatically restarts a missing server; carrying the same
+  configuration prevents that restart from quietly selecting the default
+  local-disk cache. Startup also rejects a server whose stats identify a
+  local-disk backend. The default is `cache: "none"`. The Cloud environment
+  must provide sccache 0.14 or newer; explicit durable-cache jobs fail before
+  the requested command when it is absent or the server/backend cannot start.
+  During a running build, sccache can still compile uncached after a backend
+  read/write error; the result reports those error counters rather than
+  pretending every compilation was cached.
 - Stdout and stderr are each bounded to 128 KiB. On overflow the result keeps
   the first 32 KiB and the latest tail and marks that stream truncated.
   Timeout, cancellation, and attachment loss terminate the owned process
@@ -384,15 +427,17 @@ The contract is intentionally stricter than an interactive terminal:
   cloud-worker identity still has zero authority over home. MCP call-time IAM
   additionally requires `shell.spawn`.
 
-This first slice does **not** copy an agent's uncommitted worktree, create a
-Cloud task, or perform the attach ceremony. Push the intended commit, select
-that branch/revision when creating the task, and attach it before starting a
-job. Automatic worker acquisition, source snapshot transport, and a reusable
-worker pool are separate scheduling layers over this command contract.
-Until that acquisition layer lands, an agent that has no attachment should
-use the existing Codex Cloud submit/attach controls or report that remote
-compute is unavailable. It should not silently move a heavy platform-neutral
-build back onto the supervised machine.
+Automatic acquisition requires `INTENDANT_CODEX_CLOUD_ENVIRONMENT` and the
+reachable `INTENDANT_CODEX_CLOUD_HOME_URL`; the environment bootstrap must
+install the matching Intendant binary and allow egress to home. Optional
+`INTENDANT_REMOTE_COMPUTE_BRANCH` selects the provider checkout,
+`INTENDANT_REMOTE_COMPUTE_ACQUIRE_TIMEOUT_S` bounds attachment wait, and
+`INTENDANT_REMOTE_COMPUTE_IDLE_TIMEOUT_S` controls retirement. Concurrent
+requests for the same environment/revision/branch coalesce into one
+acquisition. Only workers created by this daemon process are auto-retired;
+manually attached workers are never retired behind their operator's back.
+Acquisition state is process-local, so a daemon restart may leave an acquired
+task until its expiring cloud-worker identity and provider turn end.
 
 ## Attachment lifecycle
 
@@ -541,15 +586,29 @@ an ephemeral hosted CI runner:
 
 - Keep repeated commands on the same attached task while it remains warm.
 - Put stable toolchain/package preparation in the environment setup cache.
-- Use an externally durable `sccache` (or equivalent compiler cache) when
-  cold replacement performance matters. A task-local sccache directory is
-  lost with the same worker as `target/`.
+- Use `cache: "durable_sccache"` with a separately scoped external backend
+  when cold replacement performance matters. A task-local sccache directory
+  is refused because it is lost with the same worker as `target/`.
 - Do not promise a fully warm Rust build from sccache alone. Existing
   cross-worktree measurements show it can repopulate identical dependency
   outputs, but local incremental workspace crates, build scripts,
   non-cacheable crate types, test binaries, and final links still need a
-  fresh target tree. A future acquisition layer may restore a content-keyed
-  target archive, but correctness must never depend on it.
+  fresh target tree. Correctness never depends on cache hits, and the job
+  result exposes the measured cache deltas instead of claiming warmth.
+
+The daemon-side prefixes are a custody boundary, not new sccache option
+names: for example, `INTENDANT_REMOTE_CACHE_SCCACHE_BUCKET` becomes
+`SCCACHE_BUCKET`, and `INTENDANT_REMOTE_CACHE_AWS_ACCESS_KEY_ID` becomes
+`AWS_ACCESS_KEY_ID` only inside the authenticated remote command. Consult
+sccache's upstream [configuration reference](https://github.com/mozilla/sccache/blob/main/docs/Configuration.md)
+for backend-specific variables and its [Rust caveats](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
+for what can and cannot be cached.
+
+The worker container is still a shell-authority boundary, not a credential
+enclave: the requested command inherits the cache configuration, and another
+same-UID process could inspect it too. Use a cache-only principal restricted
+to the one cache namespace, never a general AWS/account credential or any
+daemon/provider credential.
 
 The practical split is therefore: Linux workers run platform-neutral
 `cargo check`, tests, clippy, code generation, and other heavy computation;
@@ -561,14 +620,20 @@ feedback time; it does not replace CI.
 
 ## Current boundary
 
-This integration covers the reliable job/control plane, the safe
-setup/maintenance contract, and the enrollment ceremony that attaches a live
-worker to home over mTLS. The attachment carries terminal, tile display,
-computer-use, and provider-neutral remote-command frames in addition to
-liveness; each direction has a closed allowlist, and worker replies are never
-dispatched as authority on home. Workers are ephemeral enrollments with
-zero-authority expiring identities, not static `[[peer]]` registry entries,
-and home must be reachable from the worker's egress allowlist (there is no
-relay tier). Remote-command scheduling still begins with an already-attached,
-correct-revision task: automatic acquisition/pooling and uncommitted source
-transport are not yet part of this layer.
+This integration covers automatic reuse/acquisition, explicit working-tree
+snapshots, durable compiler-cache configuration, the job/control plane, the
+safe setup/maintenance contract, and the enrollment ceremony that attaches a
+live worker to home over mTLS. The attachment carries terminal, tile display,
+computer-use, bounded source-transfer, and provider-neutral remote-command
+frames in addition to liveness; each direction has a closed allowlist, and
+worker replies are never dispatched as authority on home. Workers are
+ephemeral enrollments with zero-authority expiring identities, not static
+`[[peer]]` registry entries, and home must be reachable from the worker's
+egress allowlist (there is no relay tier).
+
+Two boundaries remain deliberate. Linux results do not replace the
+cross-platform CI matrix or a small macOS-specific check when Apple APIs,
+entitlements, bundles, or deterministic macOS-generated WASM are touched.
+And remote compilation does not reduce the resident RAM used by Claude,
+Codex, Kimi, or Pi themselves on the supervisor; it moves their heavy child
+build/test processes, not their reasoning process.
