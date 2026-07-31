@@ -368,6 +368,8 @@ function agendaHoodOpVerb(op, envelope) {
     case 'propose_effect': return 'manifest proposed';
     case 'approve_effect': return 'approved — digest bound';
     case 'revoke_effect': return 'approval revoked';
+    case 'withdraw_effect':
+      return op.reason ? `proposal withdrawn — ${op.reason}` : 'proposal withdrawn';
     case 'request_occurrence': return 'run requested';
     case 'record_occurrence': return `run ${op.state || '—'}`;
     case 'attest': return `attested ${op.outcome || '—'} — self-report`;
@@ -384,7 +386,7 @@ function agendaHoodOpDot(op, known) {
     case 'set_blocker': return 'rose';
     case 'clear_blocker': case 'approve_effect': case 'answer': case 'complete': return 'green';
     case 'add_ref': case 'remove_ref': case 'record_ask_delivery': return 'sky';
-    case 'propose_effect': case 'revoke_effect': return 'amber';
+    case 'propose_effect': case 'revoke_effect': case 'withdraw_effect': return 'amber';
     case 'record_occurrence':
       return op.state === 'completed' || op.state === 'delivered' ? 'green'
         : op.state === 'failed' ? 'rose'

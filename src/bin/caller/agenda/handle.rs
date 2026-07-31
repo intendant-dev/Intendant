@@ -1079,7 +1079,11 @@ impl AgendaHandle {
             }
             let provenance = item.provenance.session_id.clone();
             for effect in item.effects.iter_mut() {
-                let approvable = effect.approval.is_none() || effect.suspended();
+                // A withdrawn husk offers no Approve/re-arm affordance —
+                // it is never approvable, so it gets no fireability stamp
+                // (the serving decoration reflects no-pending-effect).
+                let approvable = (effect.approval.is_none() || effect.suspended())
+                    && effect.withdrawn.is_none();
                 if !approvable {
                     continue;
                 }

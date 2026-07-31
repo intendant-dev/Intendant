@@ -44,7 +44,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 25] = [
+const KNOWN_OPS: [&str; 26] = [
     "add",
     "patch",
     "complete",
@@ -66,6 +66,7 @@ const KNOWN_OPS: [&str; 25] = [
     "propose_effect",
     "approve_effect",
     "revoke_effect",
+    "withdraw_effect",
     "request_occurrence",
     "record_occurrence",
     "record_ask_delivery",
@@ -2176,6 +2177,15 @@ impl AgendaStore {
                         "{id} has no proposed scheduled session"
                     )));
                 };
+                // A withdrawn husk is fired-history rendering, not a
+                // solicitation: approving it would resurrect bytes nobody
+                // proposes. The lane back is an ordinary re-propose.
+                if effect.withdrawn.is_some() {
+                    return Err(AgendaError::Transition(format!(
+                        "{id}'s proposal was withdrawn — propose a fresh manifest to \
+                         schedule work on it"
+                    )));
+                }
                 // Plain double-approve stays refused; the ONE exception is
                 // the suspended standing effect (G3-pre), where re-approving
                 // the unchanged digest is the ratified one-click re-arm
@@ -2233,6 +2243,47 @@ impl AgendaStore {
                 Ok(AgendaOp::RevokeEffect {
                     id,
                     effect_id: effect.effect_id.clone(),
+                })
+            }
+            AgendaCommand::WithdrawEffect { id, reason, .. } => {
+                // No status gate on purpose: the live specimens are
+                // COMPLETED items carrying inert unapproved revisions —
+                // withdraw must reach them (revoke has no status gate
+                // either). The actor gate is propose-class: not listed
+                // in the handle's owner-surface set, mirroring
+                // ProposeEffect exactly.
+                let item = self.require(&id)?;
+                let Some(effect) = item.effects.first() else {
+                    return Err(AgendaError::NotFound(format!(
+                        "{id} has no proposed scheduled session"
+                    )));
+                };
+                if effect.approval.is_some() {
+                    return Err(AgendaError::Transition(format!(
+                        "{id}'s scheduled session is approved — withdrawing an approval \
+                         is the owner's act: `intendant ctl agenda revoke-schedule {id}` \
+                         or Revoke on the dashboard card"
+                    )));
+                }
+                if effect.withdrawn.is_some() {
+                    return Err(AgendaError::Transition(format!(
+                        "{id}'s proposal is already withdrawn — propose a fresh manifest \
+                         to schedule work on it"
+                    )));
+                }
+                let reason = match reason.as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(reason) if reason.len() > MAX_BODY_BYTES => {
+                        return Err(AgendaError::Invalid(format!(
+                            "reason exceeds {MAX_BODY_BYTES} bytes"
+                        )));
+                    }
+                    Some(reason) => Some(reason.to_string()),
+                };
+                Ok(AgendaOp::WithdrawEffect {
+                    id,
+                    effect_id: effect.effect_id.clone(),
+                    reason,
                 })
             }
         }

@@ -481,6 +481,25 @@ pub struct AgendaApproval {
     pub(crate) kind: Option<String>,
 }
 
+/// A recorded withdrawal of an unapproved manifest revision (the
+/// `withdraw_effect` fold view). Present only on an effect entry kept
+/// for its fired history — a never-fired lineage is removed from the
+/// view instead (the op log keeps both). Attribution mirrors
+/// [`AgendaAnnotation`]; `reason` is the withdrawing actor's stated
+/// why — data, never instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaWithdrawal {
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
 /// The fired session's self-report attached to a run (Track AO: fold
 /// view of the latest `attest` op on the SAME occurrence — the full
 /// history stays in the op log). SELF-REPORT, never verified — every
@@ -562,6 +581,14 @@ pub struct AgendaEffect {
     /// Owner approval of exactly `digest`; cleared by any re-propose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) approval: Option<AgendaApproval>,
+    /// The pending (unapproved) revision was withdrawn — the entry
+    /// survives only as fired-history rendering: never approvable,
+    /// never pending, never planned. Cleared by the wholesale replace
+    /// of any re-propose (the proposal lane revives the lineage).
+    /// Additive + skip-serialized: the DTO stays byte-identical while
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) withdrawn: Option<AgendaWithdrawal>,
     /// Latest occurrence write-back on this effect lineage. A re-propose
     /// clears a settled outcome (a fresh revision shows no stale outcome
     /// view) but carries a `started` run forward — the firing belongs to
@@ -1402,6 +1429,21 @@ pub enum AgendaCommand {
     ApproveEffect { id: String, digest: String },
     /// Withdraw the approval (owner-surface, like granting it).
     RevokeEffect { id: String },
+    /// Take back the item's PENDING (unapproved) manifest proposal — the
+    /// decline gesture the approval rail needs to tell "approve me" from
+    /// "this proposal is dead". Propose-class like [`Self::ProposeEffect`]
+    /// (any actor who may propose may already replace the pending bytes
+    /// wholesale, so replace-with-nothing grants strictly less); an
+    /// APPROVED manifest refuses with a pointer at the owner's revoke.
+    /// Fired history on the effect lineage is untouched. `reason` renders
+    /// in the item thread as attributed data.
+    WithdrawEffect {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     /// Owner "start session now" (F3): mint a manifest from the item —
     /// goal is the item's title + body quoted as data with its id — and
     /// approve it in the same atomic act, firing through the ordinary
@@ -1507,6 +1549,7 @@ impl AgendaCommand {
             | AgendaCommand::AddRef { source, .. }
             | AgendaCommand::RemoveRef { source, .. }
             | AgendaCommand::Stamp { source, .. }
+            | AgendaCommand::WithdrawEffect { source, .. }
             | AgendaCommand::Ask { source, .. } => source.take(),
             AgendaCommand::ApproveEffect { .. }
             | AgendaCommand::RevokeEffect { .. }
@@ -1658,6 +1701,19 @@ pub(crate) enum AgendaOp {
         id: String,
         effect_id: String,
     },
+    /// The pending (unapproved) revision taken back by an attributed
+    /// actor (propose-class — see the command docs). The fold clears the
+    /// approve solicitation and records the act in the item thread; the
+    /// log keeps the withdrawn proposal's history like `RemoveRef`.
+    /// Older builds skip the whole line (unknown variant, the
+    /// `KNOWN_OPS` posture): the proposal stays visible there — honest
+    /// staleness, never a mangled state.
+    WithdrawEffect {
+        id: String,
+        effect_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Owner-requested extra instant of an approved standing manifest
     /// (G3-pre). `digest` names the approved revision the request
     /// exercises; `at_ms` is the instant, minted at intake and read here
@@ -1742,6 +1798,7 @@ impl AgendaOp {
             | AgendaOp::ProposeEffect { id, .. }
             | AgendaOp::ApproveEffect { id, .. }
             | AgendaOp::RevokeEffect { id, .. }
+            | AgendaOp::WithdrawEffect { id, .. }
             | AgendaOp::RequestOccurrence { id, .. }
             | AgendaOp::RecordOccurrence { id, .. }
             | AgendaOp::Attest { id, .. }
@@ -2175,7 +2232,10 @@ pub(crate) fn apply_op(
                 // A new revision voids any standing approval — the owner
                 // approved different bytes. The failure streak and any
                 // pending requests belonged to those bytes too: reset.
+                // A withdrawn husk revives the same way: the fresh
+                // proposal IS the lineage's new pending revision.
                 approval: None,
+                withdrawn: None,
                 last_run: None,
                 consecutive_failures: 0,
                 requested: Vec::new(),
@@ -2244,6 +2304,66 @@ pub(crate) fn apply_op(
             effect.approval = None;
             // A request exists only under an approval.
             effect.requested.clear();
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::WithdrawEffect {
+            id,
+            effect_id,
+            reason,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("withdraw_effect for unknown {id} ignored"));
+            };
+            let Some(pos) = item.effects.iter().position(|e| e.effect_id == *effect_id) else {
+                return Some(format!("withdraw_effect for unknown effect on {id} ignored"));
+            };
+            // Intake refuses this; a foreign log's line must not eat an
+            // approval the owner granted (withdraw is the unapproved
+            // side only — revoke owns the approved side).
+            if item.effects[pos].approval.is_some() {
+                return Some(format!(
+                    "withdraw_effect on approved effect on {id} ignored"
+                ));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            // The act lands in the item thread as attributed data —
+            // whichever arm below applies, the reason must not vanish
+            // from the item view.
+            item.annotations.push(AgendaAnnotation {
+                text: match reason.as_deref() {
+                    Some(reason) => {
+                        format!("withdrew the scheduled-session proposal — {reason}")
+                    }
+                    None => "withdrew the scheduled-session proposal".to_string(),
+                },
+                at_ms,
+                principal: actor.principal.clone(),
+                session_id: actor.session_id.clone(),
+                kind: actor.kind.clone(),
+                source: rec.source.clone(),
+            });
+            // Fired history is sacred: a lineage that ever ran keeps its
+            // entry — manifest, last_run, attestation, streak — as
+            // history rendering, marked withdrawn (never approvable,
+            // never pending, never planned). A never-fired lineage
+            // leaves the view entirely; the op log keeps the proposal's
+            // history like `RemoveRef`.
+            if item.effects[pos].last_run.is_none() {
+                item.effects.remove(pos);
+            } else {
+                let effect = &mut item.effects[pos];
+                effect.withdrawn = Some(AgendaWithdrawal {
+                    at_ms,
+                    principal: actor.principal,
+                    session_id: actor.session_id,
+                    kind: actor.kind,
+                    reason: reason.clone(),
+                });
+                // A request exists only under an approval (and the
+                // withdrawn revision solicits nothing).
+                effect.requested.clear();
+            }
             item.updated_ms = at_ms;
             None
         }

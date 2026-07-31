@@ -1073,7 +1073,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaWrite,
         BodyPolicy::Capped(AGENDA_OP_BODY_CAP_BYTES),
         RouteHandlerId::AgendaOp,
-        "Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
+        "Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke/withdraw)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
     // The automation-definition catalog (Track AW): read-only discovery

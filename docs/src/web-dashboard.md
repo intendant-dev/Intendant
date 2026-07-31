@@ -1992,7 +1992,7 @@ response omits the header.
 | GET | `/api/agenda/items/{item_id}` | AgendaRead | own origin | none | One agenda item, full + decorated, by id or unique prefix (+ its sessions join) |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |
-| POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke) |
+| POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke/withdraw) |
 | GET | `/api/agenda/definitions` | AgendaRead | own origin | none | Automation-definition catalog (house + personal, validation state, full text) |
 | GET | `/api/agenda/sealed/{sha256}` | AgendaRead | own origin | none | One sealed binding-ref snapshot by sha256 pin (read-only, content-addressed) |
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |

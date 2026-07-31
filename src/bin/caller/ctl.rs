@@ -2544,6 +2544,32 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        // Take back a PENDING unapproved proposal (propose-class, so any
+        // session may withdraw — its own mooted proposal included). The
+        // approved side stays the owner's revoke-schedule.
+        "withdraw" => {
+            let args = parse_command_args(&raw[1..], &["--reason"], &[])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda withdraw requires an item id (a unique prefix is enough)",
+            )
+            .await?;
+            let mut map = Map::new();
+            map.insert(
+                "op".to_string(),
+                Value::String("withdraw_effect".to_string()),
+            );
+            map.insert("id".to_string(), Value::String(id));
+            insert_string(&mut map, "reason", args.one("--reason"));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+            println!(
+                "withdrawn — the proposal no longer solicits approval; fired history \
+                 and the item stay (propose again anytime)"
+            );
+        }
         "list" | "ls" => run_agenda_list(client, config, &raw[1..]).await?,
         // Track AS S7: one item at full detail without fetching the
         // ledger — the single-item watcher's lane (an answer poll reads
@@ -3436,6 +3462,7 @@ fn agenda_print_item_detail(item: &Value) {
         for effect in effects {
             let digest = effect.get("digest").and_then(Value::as_str).unwrap_or("");
             let armed = effect.get("approval").is_some_and(|a| !a.is_null());
+            let withdrawn = effect.get("withdrawn").is_some_and(|w| !w.is_null());
             let run = effect
                 .get("last_run")
                 .filter(|r| !r.is_null())
@@ -3444,7 +3471,13 @@ fn agenda_print_item_detail(item: &Value) {
             println!(
                 "  effect {} · {}{}",
                 &digest[..digest.len().min(10)],
-                if armed { "armed" } else { "proposed" },
+                if armed {
+                    "armed"
+                } else if withdrawn {
+                    "withdrawn"
+                } else {
+                    "proposed"
+                },
                 run.map(|r| format!(" · last run {r}")).unwrap_or_default()
             );
         }
@@ -5719,6 +5752,10 @@ fn help_agenda() {
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
+  intendant ctl agenda withdraw ID_PREFIX [--reason TEXT]   # take back a PENDING unapproved\n\
+      # proposal (yours included) — the approve solicitation clears, fired history and the\n\
+      # item stay, the reason lands in the item thread; an APPROVED manifest refuses\n\
+      # (that side is the owner's revoke-schedule)\n\
   intendant ctl agenda start ID_PREFIX [--project DIR] [--goal TEXT] [--goal-run]\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
