@@ -1256,6 +1256,39 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::DaemonUpdateSwapRequest => {
+                return handle_daemon_update_swap(
+                    stream,
+                    UpdateSwapAction::Request,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::DaemonUpdateSwapClaim => {
+                return handle_daemon_update_swap(
+                    stream,
+                    UpdateSwapAction::Claim,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::DaemonUpdateSwapResult => {
+                return handle_daemon_update_swap(
+                    stream,
+                    UpdateSwapAction::Result,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::DaemonUpdateLaneCheck => {
                 return handle_daemon_update_lane(
                     stream,

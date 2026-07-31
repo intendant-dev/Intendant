@@ -7052,6 +7052,17 @@ async fn update_surface_probes_swapped_binary_and_serves_the_chip_block() {
         "no update chip may render before the image changes: {body}"
     );
 
+    // Subscribe BEFORE the swap: the one-per-sha notification must
+    // reach the normal notification lane (/ws → toast + log rail), and
+    // subscribing first means the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        daemon.port,
+        rig_loopback_token(&rig, daemon.port)
+    ))
+    .await
+    .expect("connect /ws");
+
     // Swap the image: the stat flips within a poll tick, the probe
     // reads the NEW provenance, and the block serves both builds.
     write_fake_watched_binary(&fake, "fakesha2");
@@ -7076,6 +7087,235 @@ async fn update_surface_probes_swapped_binary_and_serves_the_chip_block() {
     assert!(
         body["update"]["running"]["git_sha"].is_string(),
         "the running provenance rides beside the on-disk build: {body}"
+    );
+
+    // Card 01KYV4K2EK… (c): the ONE notification per distinct on-disk
+    // sha really fires into the notification surfaces — stable id,
+    // info urgency, provenance in the text (dedup itself is pinned at
+    // the unit level: `one_notification_per_distinct_on_disk_sha`).
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_notification")
+            && json.get("id").and_then(|v| v.as_str()) == Some("update-available-fakesha2")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the update notification never broadcast on /ws:\n{}",
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        )
+    });
+    assert_eq!(event["urgency"], "info", "{event}");
+    assert!(
+        event["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("commit fakesha2")),
+        "the notification names the on-disk build: {event}"
+    );
+}
+
+/// Card 01KYV4K2EK… (a), the live wrapper-parent shape: a daemon whose
+/// SPAWNING SUPERVISOR announced itself (`INTENDANT_APP_SUPERVISOR_PID`
+/// naming this test process, which really is the daemon's parent)
+/// serves `app_supervised: true` on the handover payload — the fact the
+/// chip's one-click gates on beyond the app's own webview — and the
+/// swap relay carries a dashboard click end to end: request parks,
+/// claim consumes exactly once, a failure report lands on the payload
+/// AND the notification lane. A daemon carrying a MISMATCHED claim (the
+/// dead-wrapper / inherited-env shape) stays honestly unsupervised and
+/// refuses the relay — the CLI honest-reach posture unchanged. Unix
+/// scope: the fact itself is parent-pid-verified, which non-unix
+/// platforms answer `None` (no app wrapper ships there).
+#[cfg(unix)]
+#[tokio::test]
+async fn app_supervised_daemon_offers_and_relays_the_one_click_swap() {
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The supervised daemon: the claimed pid IS its live parent (this
+    // test process spawns it directly).
+    let supervisor_pid = std::process::id().to_string();
+    let supervised = spawn_co_daemon(
+        &client,
+        &rig,
+        "supervised.log",
+        &[("INTENDANT_APP_SUPERVISOR_PID", supervisor_pid.as_str())],
+        &[],
+    )
+    .await;
+    // The dead-wrapper / inherited-env shape: a claim that mismatches
+    // the live parent (pid 1 is never this test process).
+    let orphaned = spawn_co_daemon(
+        &client,
+        &rig,
+        "orphaned.log",
+        &[("INTENDANT_APP_SUPERVISOR_PID", "1")],
+        &[],
+    )
+    .await;
+
+    let authed_for = |port: u16| {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&rig, port)
+                .parse()
+                .expect("token header value"),
+        );
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("build token-authed client")
+    };
+    let authed = authed_for(supervised.port);
+    let base = format!("http://127.0.0.1:{}", supervised.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    // (1) The detection fact, positive branch.
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(
+        body["app_supervised"], true,
+        "an app-supervised daemon must say so: {body}"
+    );
+
+    // (2) The relay arc: request parks (idempotently) …
+    let requested: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-swap"))
+        .json(&serde_json::json!({ "requested_by": "dashboard update chip e2e" }))
+        .send()
+        .await
+        .expect("POST update-swap")
+        .error_for_status()
+        .expect("request accepted")
+        .json()
+        .await
+        .expect("request body");
+    assert_eq!(requested["requested"], true, "{requested}");
+    let pending_ms = requested["swap_pending_ms"]
+        .as_u64()
+        .expect("pending instant");
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(
+        body["swap_pending_ms"].as_u64(),
+        Some(pending_ms),
+        "the pending swap rides the payload (surviving surface reloads): {body}"
+    );
+
+    // … the supervisor's claim consumes exactly once …
+    let claim_url = format!("{base}/api/daemon/update-swap/claim");
+    let claimed: serde_json::Value = authed
+        .post(&claim_url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST claim")
+        .error_for_status()
+        .expect("claim accepted")
+        .json()
+        .await
+        .expect("claim body");
+    assert_eq!(claimed["pending"], true, "{claimed}");
+    assert_eq!(
+        claimed["requested_by"], "dashboard update chip e2e",
+        "{claimed}"
+    );
+    let reclaimed: serde_json::Value = authed
+        .post(&claim_url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST second claim")
+        .error_for_status()
+        .expect("second claim accepted")
+        .json()
+        .await
+        .expect("second claim body");
+    assert_eq!(reclaimed["pending"], false, "claim consumes: {reclaimed}");
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert!(
+        body.get("swap_pending_ms").is_none(),
+        "a claimed request no longer reads pending: {body}"
+    );
+
+    // … and a failure report reaches the payload AND the notification
+    // lane (the asking surface may be a browser tab that is gone).
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        supervised.port,
+        rig_loopback_token(&rig, supervised.port)
+    ))
+    .await
+    .expect("connect /ws");
+    let recorded: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-swap/result"))
+        .json(&serde_json::json!({ "ok": false, "detail": "e2e: the new daemon exited during startup" }))
+        .send()
+        .await
+        .expect("POST result")
+        .error_for_status()
+        .expect("result accepted")
+        .json()
+        .await
+        .expect("result body");
+    assert_eq!(recorded["recorded"], true, "{recorded}");
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(body["swap_result"]["ok"], false, "{body}");
+    assert_eq!(
+        body["swap_result"]["detail"], "e2e: the new daemon exited during startup",
+        "{body}"
+    );
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_notification")
+            && json.get("id").and_then(|v| v.as_str()) == Some("update-swap-failed")
+    })
+    .await
+    .unwrap_or_else(|| panic!("the swap-failure notification never broadcast on /ws"));
+    assert_eq!(event["urgency"], "attention", "{event}");
+
+    // (3) The false branch: a mismatched claim is not supervision, and
+    // the relay refuses with the honest reach line's premise intact.
+    let orphaned_authed = authed_for(orphaned.port);
+    let orphaned_base = format!("http://127.0.0.1:{}", orphaned.port);
+    let body = http_get_json(
+        &orphaned_authed,
+        &format!("{orphaned_base}/api/daemon/handover"),
+    )
+    .await
+    .expect("orphaned handover status body");
+    assert_eq!(
+        body["app_supervised"], false,
+        "a mismatched supervisor claim must read unsupervised: {body}"
+    );
+    let refused = orphaned_authed
+        .post(format!("{orphaned_base}/api/daemon/update-swap"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST update-swap on the orphaned daemon");
+    assert_eq!(
+        refused.status().as_u16(),
+        409,
+        "refused without a live supervisor"
+    );
+    let refusal: serde_json::Value = refused.json().await.expect("refusal body");
+    assert_eq!(refusal["error"], "update_swap_refused", "{refusal}");
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no app supervisor")),
+        "{refusal}"
     );
 }
 

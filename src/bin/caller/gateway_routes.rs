@@ -430,6 +430,14 @@ pub(crate) enum RouteHandlerId {
     /// Self-update lane: the owner's click — produce the update
     /// artifact (source build or verified release download).
     DaemonUpdateLaneProduce,
+    /// One-click swap relay: a dashboard surface asks the attached app
+    /// supervisor for the update swap.
+    DaemonUpdateSwapRequest,
+    /// One-click swap relay: the app supervisor's claim poll (consuming).
+    DaemonUpdateSwapClaim,
+    /// One-click swap relay: the app supervisor reports the attempt's
+    /// outcome.
+    DaemonUpdateSwapResult,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1156,6 +1164,38 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateLaneProduce,
         "Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip",
+    ),
+    // The one-click swap relay (the SWAP half, beyond the app's own
+    // webview): a dashboard surface asks the daemon, the daemon parks
+    // the request, and the app supervisor's health tick claims it and
+    // performs the spawn → readiness → promote → drain sequence itself.
+    // The daemon still never execs a successor. All three rows are
+    // owner-grade like takeover (same loopback/own-origin trust class),
+    // and deliberately NO tunnel twins — remote surfaces observe through
+    // the handover status block, they cannot click a swap onto the box.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/update-swap"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonUpdateSwapRequest,
+        "Ask the attached app supervisor for the one-click update swap (refused when no live supervisor is attached)",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/update-swap/claim"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonUpdateSwapClaim,
+        "App supervisor poll: claim the pending one-click swap request (consuming; expired requests evaporate)",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/update-swap/result"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonUpdateSwapResult,
+        "App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane)",
     ),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
@@ -3283,6 +3323,20 @@ mod tests {
         );
         assert_eq!(
             policy("POST", "/api/daemon/update-lane/produce"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        // The swap-relay trio carries at most a small JSON body
+        // (requested_by label / result detail).
+        assert_eq!(
+            policy("POST", "/api/daemon/update-swap"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        assert_eq!(
+            policy("POST", "/api/daemon/update-swap/claim"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        assert_eq!(
+            policy("POST", "/api/daemon/update-swap/result"),
             BodyPolicy::Capped(4 * 1024)
         );
         // The agenda command lane accepts the rich-ask park payload: the

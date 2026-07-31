@@ -156,3 +156,97 @@ pub(crate) async fn handle_daemon_update_lane(
     let response = daemon_update_lane_api_response(produce, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
+
+/// The one-click swap relay's three actions: a dashboard surface asks
+/// (`request`), the app supervisor's health tick claims (`claim`), and
+/// the supervisor reports the attempt's outcome (`result`). The daemon
+/// only parks and serves the request — the supervisor performs the
+/// swap; the daemon never execs a successor (Q8 holds).
+pub(crate) enum UpdateSwapAction {
+    Request,
+    Claim,
+    Result,
+}
+
+/// Transport-neutral core of `POST /api/daemon/update-swap[/claim|/result]`.
+pub(crate) async fn daemon_update_swap_api_response(
+    action: UpdateSwapAction,
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let runtime = match mcp_server {
+        Some(server) => server.handover_runtime().await,
+        None => None,
+    };
+    let Some(runtime) = runtime else {
+        return ApiResponse::json_error(503, "handover unavailable on this daemon");
+    };
+    let body = serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_default();
+    let now_ms = crate::handover::now_ms();
+    match action {
+        UpdateSwapAction::Request => {
+            let requested_by = body
+                .get("requested_by")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            match runtime.request_update_swap(requested_by, now_ms) {
+                Ok(pending_since_ms) => ApiResponse::json(
+                    200,
+                    JsonBody::Value(serde_json::json!({
+                        "requested": true,
+                        "swap_pending_ms": pending_since_ms,
+                    })),
+                ),
+                Err(refusal) => ApiResponse::json(
+                    409,
+                    JsonBody::Value(serde_json::json!({
+                        "error": "update_swap_refused",
+                        "detail": refusal.detail(),
+                    })),
+                ),
+            }
+        }
+        UpdateSwapAction::Claim => match runtime.claim_update_swap(now_ms) {
+            Some(request) => ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({
+                    "pending": true,
+                    "requested_by": request.requested_by,
+                    "requested_ms": request.requested_ms,
+                })),
+            ),
+            None => ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "pending": false })),
+            ),
+        },
+        UpdateSwapAction::Result => {
+            let Some(ok) = body.get("ok").and_then(|value| value.as_bool()) else {
+                return ApiResponse::json_error(400, "result body needs a boolean `ok`");
+            };
+            let detail = body
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            runtime.record_swap_result(ok, detail, now_ms);
+            ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({ "recorded": true })),
+            )
+        }
+    }
+}
+
+/// `POST /api/daemon/update-swap[/claim|/result]` — the HTTP wrappers.
+pub(crate) async fn handle_daemon_update_swap(
+    stream: DemuxStream,
+    action: UpdateSwapAction,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = daemon_update_swap_api_response(action, &body_text, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}

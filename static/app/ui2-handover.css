@@ -47,6 +47,42 @@ html.ui-v2 .handover-update-chip {
 html.ui-v2 .handover-update-chip code {
   font-size: 11px;
 }
+/* The collapsed pill: the same standing fact, sized to never cover
+   content. Click expands; there is deliberately no dismissed state. */
+html.ui-v2 .handover-update-chip.collapsed {
+  max-width: none;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--accent, #62a0ea);
+  cursor: pointer;
+  user-select: none;
+}
+html.ui-v2 .handover-update-chip.collapsed:hover {
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+html.ui-v2 .handover-update-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+html.ui-v2 .handover-update-collapse {
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted, #7e8896);
+  font-size: 14px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+html.ui-v2 .handover-update-collapse:hover {
+  color: var(--accent, #62a0ea);
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
 html.ui-v2 .handover-update-honesty {
   margin-top: 4px;
   font-size: 11px;
