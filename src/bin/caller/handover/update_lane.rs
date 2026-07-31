@@ -2054,23 +2054,34 @@ mod tests {
     }
 
     /// Commission pin: the shipped dashboard bundle carries the Daemon
-    /// update panel — the Access→Daemons mount, both consent buttons,
-    /// and the two action POSTs — so the produce lane cannot be
-    /// silently gutted from the SPA (the HS6 artifact-scan pattern).
+    /// update panel — the Access→Daemons mount, the two-channel
+    /// vocabulary (Releases default, Dev behind Advanced), both consent
+    /// buttons, the action POSTs, and the swap-step composition hook —
+    /// so the front door cannot be silently gutted from the SPA (the
+    /// HS6 artifact-scan pattern).
     #[test]
     fn spa_carries_the_update_lane_panel() {
         let app = include_str!("../../../../static/app.html");
         for needle in [
             "update-lane-card",
-            "Update from main",
-            "Download & verify release",
+            "Releases — verified, signed builds (default)",
+            "Dev — build from main",
+            "Pull & build from main",
+            "Download & install release",
+            "Fetch & compare",
+            "update-lane-advanced",
+            "update-lane-shortlog",
             "/api/daemon/update-lane/produce",
             "/api/daemon/update-lane/check",
             "update_lane",
+            "intendantHandoverUpdate",
+            "renderSwapSection",
+            "Open the update panel",
+            "nothing installs or restarts automatically",
         ] {
             assert!(
                 app.contains(needle),
-                "the dashboard bundle lost the update-lane panel wiring: {needle}"
+                "the dashboard bundle lost the update-channels panel wiring: {needle}"
             );
         }
     }
