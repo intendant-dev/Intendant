@@ -1066,8 +1066,7 @@ mod tests {
         // unblocked item is provably done; only a blocked one shows the
         // id-only unknown row.
         assert!(
-            shared.contains("'outside this live window'")
-                && shared.contains("'done · archived'"),
+            shared.contains("'outside this live window'") && shared.contains("'done · archived'"),
             "absent targets degrade honestly instead of rendering 'missing'"
         );
     }

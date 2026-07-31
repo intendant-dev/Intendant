@@ -813,11 +813,16 @@ function agendaBlockedLine(item) {
 // Advisory throughout: none of this gates approval or firing.
 function agendaPrereqStates(item, findItem) {
   const find = findItem || agendaFindItem;
+  // The served verdict rides list summaries only — a full-grain item
+  // (the inspector's) reads its own window row for the flag.
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
   return (item.relies_on || []).map((link) => {
     const target = find(link.target_id) || null;
     if (!target) {
       const short = `${String(link.target_id).slice(0, 10)}…`;
-      return item.blocked === true
+      return blocked
         ? { id: link.target_id, target: null, title: short, kind: 'unknown',
           tone: 'neutral', status: 'outside this live window',
           detail: 'The daemon’s blocked verdict comes from the full ledger; this window carries open items plus the last 14 days.' }
@@ -871,6 +876,10 @@ function agendaPrereqStates(item, findItem) {
 // degrade: the served verdict says blocked but no gate is visible in
 // this window (freshness skew between the flag and the joined rows).
 function agendaBlockedExplain(item, findItem) {
+  const find = findItem || agendaFindItem;
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
   const blockers = (item.blockers || []).filter((b) => !b.cleared);
   const prereqs = agendaPrereqStates(item, findItem)
     .filter((p) => p.kind !== 'satisfied');
@@ -881,7 +890,7 @@ function agendaBlockedExplain(item, findItem) {
     delivered,
     allDelivered: !blockers.length && prereqs.length > 0
       && delivered.length === prereqs.length,
-    unexplained: item.blocked === true && !blockers.length && !prereqs.length,
+    unexplained: blocked && !blockers.length && !prereqs.length,
   };
 }
 

@@ -1830,10 +1830,11 @@ function agendaGroupsClick(e) {
     }
     // Hover-less pointers: the first tap names the action; the second
     // (circle or pill, while revealed) acts. Hover pointers act at
-    // once, exactly as today.
+    // once, exactly as today; keyboard activations (detail 0 — the
+    // aria-label already names them) always act.
     const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id
       && agendaCtlReveal.until > Date.now();
-    if (agendaCtlPointerType === 'touch' && !revealed) {
+    if (agendaCtlPointerType === 'touch' && !revealed && e.detail !== 0) {
       agendaCtlRevealShow(item.id);
       return;
     }
