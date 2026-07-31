@@ -26,6 +26,14 @@ one in Intendant gives you:
   MCP server over the running gateway. Pi receives the same session-scoped
   authority through `$INTENDANT ctl`; this preserves Pi's intentionally small
   core instead of inventing a fake MCP integration.
+- **Provider-neutral remote compute.** The compact bootstrap advertises
+  `remote_command` to Codex, Claude Code, and Kimi Code; Pi reaches the same
+  job vocabulary through `$INTENDANT ctl tools call remote_command`. When a
+  compute host is attached, heavy platform-neutral builds and tests can run
+  there without changing which backend is doing the reasoning. If no host is
+  attached, the backend acquires/attaches one through the Cloud controls or
+  reports remote compute unavailable instead of silently running the heavy
+  fallback on the supervisor.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents
@@ -320,9 +328,10 @@ own native capabilities where the upstream CLIs provide them.
   core profile keeps a small bootstrap surface: `get_status`, the shared-view
   tools, and the minimal display/CU path (`list_displays`, `grant_user_display`,
   `revoke_user_display`, `read_screen`, `take_screenshot`,
-  `execute_cu_actions`) for managed **and** vanilla sessions; managed context
-  additionally exposes the managed-context/fission tools. Broad or rare
-  Intendant operations should be discovered lazily through
+  `execute_cu_actions`), plus `remote_command` for heavy platform-neutral
+  compute on an attached host, for managed **and** vanilla sessions; managed
+  context additionally exposes the managed-context/fission tools. Broad or
+  rare Intendant operations should be discovered lazily through
   `intendant ctl --help`, `intendant ctl tools list`, and focused subcommand
   help. Supervised Codex sessions receive
   `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
