@@ -110,6 +110,21 @@ the prompt to another live session without leaving the current destination, and
 the conversation peek mirrors the target transcript's latest 12 entries
 read-only, updates live, and links back to the full Activity view.
 
+The target switcher also lists connected **peers** (RC-C1): picking a peer row
+delegates the composed text as a task on that daemon; picking one of its
+sessions sends a session-scoped follow-up — both through this daemon's peer
+grant over the federation link, never a browser lane. One **global operating
+target** backs the per-pane host pickers (Shell, Files, Transfers, Sessions,
+Stats): changing any one moves them all (the Shell's cloud exec hosts stay
+pane-local — they are exec venues, not daemons). Peer session cards and
+Station peer nodes carry host-scoped action pills (resume, message, rename,
+interrupt) routed through `api_peer_session_control` and derived from the
+peer-advertised grant, and media affordances (live display, file transfer,
+the browser↔peer control tunnel) render from the connected link's transport
+class — a relay-only peer gets an honest "no live media" note plus the
+federation-fold session list instead of dead pills. Agenda, Memory,
+Vault/custody, Access/IAM, and Settings never route to a peer.
+
 The section headings below keep the internal pane names (`Video` is the Live
 display destination, `Stats` is Usage) — ids, routes, and deep links are
 unchanged by the redesign.
