@@ -2618,7 +2618,7 @@ mod tests {
         // The name is the thesis, told through the house metaphor — the
         // ambition itself stays understated on the public page.
         assert!(html.contains("Why “Intendant”"));
-        assert!(html.contains("house rules always win"));
+        assert!(html.contains("companies tour on signed contracts"));
         // Custody names both stores and makes the missing bridge explicit.
         assert!(html.contains(r#"class="fuelmap""#));
         assert!(html.contains("account-vault API/storage only"));
