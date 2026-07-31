@@ -28,12 +28,13 @@ one in Intendant gives you:
   core instead of inventing a fake MCP integration.
 - **Provider-neutral remote compute.** The compact bootstrap advertises
   `remote_command` to Codex, Claude Code, and Kimi Code; Pi reaches the same
-  job vocabulary through `$INTENDANT ctl tools call remote_command`. When a
-  compute host is attached, heavy platform-neutral builds and tests can run
-  there without changing which backend is doing the reasoning. If no host is
-  attached, the backend acquires/attaches one through the Cloud controls or
-  reports remote compute unavailable instead of silently running the heavy
-  fallback on the supervisor.
+  job vocabulary through `$INTENDANT ctl tools call remote_command`. Host
+  `auto` reuses or acquires a matching Codex Cloud Linux worker, while
+  `source: working_tree` sends the backend's explicit uncommitted snapshot.
+  Heavy platform-neutral builds and tests therefore move off the supervisor
+  without changing which backend does the reasoning. Platform-specific CI
+  remains authoritative, and the backend never silently falls back to a
+  heavy local build when acquisition fails.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents

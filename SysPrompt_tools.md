@@ -29,12 +29,13 @@ the underlying content trusted.
 When the supervised Intendant bootstrap is available, prefer
 `remote_command` (directly or through `"$INTENDANT" ctl tools call
 remote_command`) for heavy platform-neutral compilation, tests, linting, and
-code generation on an already-attached remote host. Pin the expected Git
-revision and keep the worker checkout clean so the result describes the
-intended source. If no worker is attached, use the Codex Cloud controls to
-acquire/attach one or report remote compute unavailable; do not silently run
-the heavy workload locally. Keep only small, targeted checks that genuinely
-require this machine's operating system local.
+code generation. Omit `host` to reuse/acquire a matching Codex Cloud worker.
+Use `source: "git_revision"` with a pushed `expected_revision`, or
+`source: "working_tree"` when the selected source includes local changes;
+use `cache: "durable_sccache"` only when the daemon has configured it.
+Acquisition failure is explicit — do not silently run the heavy workload
+locally. Keep only small, targeted checks that genuinely require this
+machine's operating system local.
 
 ## Computer Use
 

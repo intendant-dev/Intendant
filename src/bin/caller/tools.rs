@@ -580,10 +580,10 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
         }),
     });
 
-    // 18. remote_command (caller-handled, attached remote workers)
+    // 18. remote_command (caller-handled, acquired/attached remote workers)
     tools.push(ToolDefinition {
         name: "remote_command".to_string(),
-        description: "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Commands are argv arrays (never shell strings), require an expected Git revision, and run only on an already-attached remote host; this release supports cloud:<codex-task-id>. If no host is attached, acquire/attach one through the Codex Cloud controls or report remote compute unavailable instead of silently running a heavy local fallback. Start returns immediately, then status/wait returns bounded stdout/stderr and the exact exit state.".to_string(),
+        description: "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately through acquiring/preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -594,7 +594,7 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
                 },
                 "host": {
                     "type": "string",
-                    "description": "Attached remote host. This release accepts cloud:<codex-task-id>."
+                    "description": "Omit or use auto to reuse/acquire a matching worker; cloud:<codex-task-id> selects an existing attachment."
                 },
                 "argv": {
                     "type": "array",
@@ -612,12 +612,21 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
                 },
                 "expected_revision": {
                     "type": "string",
-                    "pattern": "^[0-9A-Fa-f]{7,64}$",
-                    "description": "Expected Git commit; the worker refuses a different checkout."
+                    "description": "Required hexadecimal commit for git_revision; optional base ref/commit for working_tree."
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["git_revision", "working_tree"],
+                    "description": "Source policy (default git_revision). working_tree sends a bounded explicit snapshot and excludes ignored files."
+                },
+                "cache": {
+                    "type": "string",
+                    "enum": ["none", "durable_sccache"],
+                    "description": "Cache policy (default none). durable_sccache requires dedicated daemon cache settings and reports hit/miss deltas."
                 },
                 "require_clean": {
                     "type": "boolean",
-                    "description": "Refuse a dirty worker checkout before execution (default true)."
+                    "description": "Refuse changes relative to the selected checkout/snapshot before execution (default true)."
                 },
                 "timeout_s": {
                     "type": "integer",

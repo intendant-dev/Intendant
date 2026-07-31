@@ -431,9 +431,12 @@ async fn submit_task_with(
         cloud_args.push("--branch".to_string());
         cloud_args.push(branch.to_string());
     }
-    cloud_args.push(request.prompt);
+    // `codex cloud exec` treats `-` as "read the task prompt from stdin".
+    // Keep prompts (which may carry a one-time cloud-worker enrollment
+    // token) out of argv and therefore out of `ps`/process inventories.
+    cloud_args.push("-".to_string());
 
-    let output = run_codex(codex, &cloud_args).await?;
+    let output = run_codex_with_stdin(codex, &cloud_args, Some(request.prompt.as_bytes())).await?;
     let task_id = extract_task_id(&format!("{}\n{}", output.stdout, output.stderr));
     let lease = if let Some(task_id) = task_id.as_deref() {
         let _lock = StoreLock::acquire(store_path)?;
@@ -2496,14 +2499,45 @@ fn codex_command() -> String {
 }
 
 async fn run_codex(program: &str, args: &[String]) -> Result<CommandOutput, String> {
+    run_codex_with_stdin(program, args, None).await
+}
+
+async fn run_codex_with_stdin(
+    program: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> Result<CommandOutput, String> {
+    use tokio::io::AsyncWriteExt as _;
+
     let working_dir = codex_working_dir()?;
-    let output = crate::platform::spawn_command(program)
+    let mut command = crate::platform::spawn_command(program);
+    command
         .args(args)
         .current_dir(working_dir.path())
-        .stdin(Stdio::null())
-        .output()
-        .await
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("run {program:?}: {e}"))?;
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("{program:?} stdin pipe was unavailable"))?
+            .write_all(stdin)
+            .await
+            .map_err(|e| format!("write {program:?} stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("wait for {program:?}: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if output.status.success() {
@@ -3230,6 +3264,48 @@ EOF
             Some("task_e_example123".into())
         );
         assert_eq!(extract_task_id("no identifier here"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn submit_prompt_uses_stdin_instead_of_process_arguments() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let command = dir.path().join("fake-codex");
+        let args_path = dir.path().join("args.txt");
+        let stdin_path = dir.path().join("stdin.txt");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\ncat > '{}'\necho 'Submitted task task_e_stdin'\n",
+                args_path.display(),
+                stdin_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = dir.path().join("leases.json");
+        let secret_prompt = "one-time-enrollment-secret";
+        let result = submit_task_with(
+            command.to_str().unwrap(),
+            &store,
+            SubmitTaskRequest {
+                environment: "env-test".into(),
+                branch: Some("main".into()),
+                attempts: 1,
+                title: None,
+                prompt: secret_prompt.into(),
+                probe: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.task_id.as_deref(), Some("task_e_stdin"));
+        let args = std::fs::read_to_string(args_path).unwrap();
+        assert!(!args.contains(secret_prompt));
+        assert!(args.ends_with(" main -\n"), "{args:?}");
+        assert_eq!(std::fs::read_to_string(stdin_path).unwrap(), secret_prompt);
     }
 
     #[cfg(unix)]

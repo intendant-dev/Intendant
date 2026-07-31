@@ -212,6 +212,12 @@ async fn codex_cloud_enroll_response(
             Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
             Err(error) => ApiResponse::json_error(500, format!("serialize enrollment: {error}")),
         },
+        Ok(Err(error)) if crate::codex_cloud_attach::enrollment_binding_pending(&error) => {
+            // A correct automatic-acquisition token may beat the provider's
+            // task-id response back to home. It remains unburned; tell the
+            // worker to retry without exposing whether any other token exists.
+            ApiResponse::json_error(409, &error)
+        }
         Ok(Err(error)) => {
             // Uniform refusal class: token problems and validation
             // problems both land 403 without distinguishing detail beyond

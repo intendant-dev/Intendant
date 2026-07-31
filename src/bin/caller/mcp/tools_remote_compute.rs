@@ -4,7 +4,7 @@ use super::*;
 
 impl IntendantServer {
     #[tool(
-        description = "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Commands are argv arrays (never shell strings), require an expected Git revision, and run only on an already-attached remote host; this release supports cloud:<codex-task-id>. If no host is attached, acquire/attach one through the Codex Cloud controls or report remote compute unavailable instead of silently running a heavy local fallback. Start returns immediately, then status/wait returns bounded stdout/stderr and the exact exit state."
+        description = "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately through acquiring/preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local."
     )]
     pub(crate) async fn remote_command(
         &self,
@@ -19,6 +19,26 @@ impl IntendantServer {
         params: RemoteCommandParams,
         scope: McpToolScope<'_>,
     ) -> String {
+        let project_root = match scope {
+            McpToolScope::Unrestricted => self.state.read().await.project_root.clone(),
+            McpToolScope::AgentSession {
+                session_id: Some(session_id),
+            } => {
+                let native = {
+                    let state = self.state.read().await;
+                    (state.session_id == session_id)
+                        .then(|| state.project_root.clone())
+                        .flatten()
+                };
+                native.or_else(|| {
+                    crate::external_wrapper_index::recorded_project_root_for_wrapper(
+                        &self.home, session_id,
+                    )
+                    .map(std::path::PathBuf::from)
+                })
+            }
+            McpToolScope::AgentSession { session_id: None } => None,
+        };
         let caller = match scope {
             McpToolScope::Unrestricted => crate::remote_compute::RemoteCommandCaller::Unrestricted,
             McpToolScope::AgentSession {
@@ -33,7 +53,12 @@ impl IntendantServer {
             }
         };
 
-        let outcome = crate::remote_compute::execute_remote_command_operation(params, caller).await;
+        let outcome = crate::remote_compute::execute_remote_command_operation(
+            params,
+            caller,
+            project_root.as_deref(),
+        )
+        .await;
 
         match outcome {
             Ok(job) => serde_json::json!({
