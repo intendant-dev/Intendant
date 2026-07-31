@@ -985,6 +985,21 @@ body.context-focus-active {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--peach) 22%, transparent);
   filter: saturate(0.65);
 }
+/* Closable-at-a-glance lens (the Activity toolbar chip stamps the html
+   attribute; each window's class derives in ui2-activity.js's Arrange
+   walk from the positive safe-to-stop claims): every card the machine
+   does NOT rule safe recedes, the closable set keeps full presence with
+   a quiet affirmative ring. Positive-only — the dim says "look here",
+   never "unsafe". */
+html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
+  opacity: 0.35;
+  filter: saturate(0.55);
+}
+html[data-ui2-closable-lens="on"] .session-window.session-window-closable {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--green) 45%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--green) 22%, transparent);
+}
 /* Terminal honesty strip: a dead window's plain statement of how it
    ended, with the lineage pointer when the work continued elsewhere. */
 .session-window .session-window-terminal-note {

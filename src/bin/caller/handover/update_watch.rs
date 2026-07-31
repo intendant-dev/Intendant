@@ -339,8 +339,9 @@ fn format_instant_ms(ms: u64) -> String {
 /// The `--version` probe (transport edge): bounded subprocess with a
 /// scrubbed environment — the probe target needs nothing, and the
 /// daemon's provider authority must never leak into an on-disk image we
-/// merely observe.
-async fn run_version_probe(path: &Path) -> Result<ProbedBuild, String> {
+/// merely observe. Shared with the update lane, which probes the
+/// artifact it just produced the same way.
+pub(crate) async fn run_version_probe(path: &Path) -> Result<ProbedBuild, String> {
     let output = tokio::time::timeout(
         PROBE_TIMEOUT,
         tokio::process::Command::new(path)
@@ -404,7 +405,7 @@ async fn developer_id_signed(path: &Path) -> bool {
 /// alongside `PROVIDER=mock` (fail-closed otherwise, mirroring
 /// `INTENDANT_MOCK_DISPLAY`) — the probe execs this path, so a plain
 /// env var must never redirect a real daemon's exec target.
-fn watched_binary_path() -> Option<PathBuf> {
+pub(crate) fn watched_binary_path() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("INTENDANT_UPDATE_WATCH_PATH") {
         if std::env::var("PROVIDER").as_deref() == Ok("mock") {
             return Some(PathBuf::from(override_path));

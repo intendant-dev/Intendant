@@ -154,6 +154,10 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
+                    // Heavy build/test work should leave the daemon host.
+                    // This one provider-neutral job vocabulary is compact
+                    // enough to advertise to every supervised backend.
+                    | "remote_command"
                     // The per-layer CU diagnosis for when those calls fail
                     // (grant held but an OS permission still blocking).
                     | "display_readiness"
@@ -259,6 +263,11 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         "start_task" | "submit_codex_cloud_task" | "follow_up_codex_cloud_task" => {
             PeerOperation::Task
         }
+        // Starting, waiting for, inspecting, and cancelling one remote
+        // process share a single job vocabulary. Results can reveal command
+        // output and cancellation controls process state, so the whole tool
+        // carries the shell-spawn class rather than a weaker read class.
+        "remote_command" => PeerOperation::ShellSpawn,
         // Mutating the supervised session's context/lineage.
         "rewind_context"
         | "rewind_backout"
@@ -607,6 +616,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         ),
     );
     push(
+        "remote_command",
+        manual_http_tool_definition!(
+            "remote_command",
+            "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Commands are argv arrays (never shell strings), require an expected Git revision, and run only on an already-attached remote host; this release supports cloud:<codex-task-id>. If no host is attached, acquire/attach one through the Codex Cloud controls or report remote compute unavailable instead of silently running a heavy local fallback. Start returns immediately, then status/wait returns bounded stdout/stderr and the exact exit state.",
+            RemoteCommandParams
+        ),
+    );
+    push(
         "list_displays",
         manual_http_tool_definition!(
             "list_displays",
@@ -813,6 +830,59 @@ mod tests {
                 )
             }),
             "Codex Cloud provider tools must stay out of the compact profile"
+        );
+    }
+
+    #[test]
+    fn remote_command_is_core_provider_neutral_and_shell_gated() {
+        use crate::peer::access_policy::PeerOperation;
+
+        for profile in [
+            None,
+            Some("full"),
+            Some("core"),
+            Some("codex-core"),
+            Some("cli"),
+            Some("minimal"),
+        ] {
+            assert!(
+                tool_allowed_for_profile("remote_command", false, profile),
+                "remote_command must be available to every supervised-agent profile ({profile:?})"
+            );
+        }
+        assert!(!tool_allowed_for_profile(
+            "remote_command",
+            false,
+            Some("display")
+        ));
+        assert_eq!(
+            mcp_tool_operation("remote_command"),
+            PeerOperation::ShellSpawn
+        );
+
+        let mut core = Vec::new();
+        append_manual_http_tool_definitions(&mut core, false, Some("core"));
+        let definition = core
+            .iter()
+            .find(|tool| tool["name"] == "remote_command")
+            .expect("remote_command must have a core HTTP definition");
+        assert_eq!(
+            definition["description"].as_str(),
+            IntendantServer::remote_command_tool_attr()
+                .description
+                .as_deref(),
+            "remote_command manual HTTP description drifted from its #[tool] attribute"
+        );
+        let native = crate::tools::all_tools()
+            .into_iter()
+            .find(|tool| tool.name == "remote_command")
+            .expect("native agents must receive remote_command");
+        assert_eq!(
+            Some(native.description.as_str()),
+            IntendantServer::remote_command_tool_attr()
+                .description
+                .as_deref(),
+            "native remote_command description drifted from the MCP surface"
         );
     }
 
@@ -1259,6 +1329,10 @@ mod tests {
         assert_eq!(
             mcp_tool_operation("request_shared_view_input"),
             PeerOperation::DisplayInput
+        );
+        assert_eq!(
+            mcp_tool_operation("remote_command"),
+            PeerOperation::ShellSpawn
         );
         // Peer federation: listing inspects topology; message/task and
         // the direct peer-CU trio act through the peer and ride

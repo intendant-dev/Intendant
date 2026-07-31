@@ -3707,6 +3707,40 @@ mod tests {
         assert_eq!(entries[0]["ts_ms"], 1_783_912_976_000_i64);
     }
 
+    /// Print-mode (sdk-cli entrypoint) Claude Code ≥ 2.1.217 writes
+    /// summarized-thinking blocks as empty shells — signature kept for
+    /// resume, text withheld (wire capture 2026-07-30, CC 2.1.220). The
+    /// parser renders honest absence: no reasoning row, never a
+    /// placeholder — and the non-empty (cli-entrypoint) arm keeps the
+    /// live grammar so every lane's dedupe signatures collapse copies.
+    #[test]
+    fn claude_transcript_empty_thinking_shell_renders_no_reasoning_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"CAISpRoK"},{"type":"text","text":"Answer."}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"cli-era full text","signature":"sig2"},{"type":"text","text":"More."}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let entries =
+            parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
+        let reasoning: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["kind"].as_str() == Some("reasoning"))
+            .map(|e| e["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            reasoning,
+            vec!["cli-era full text"],
+            "empty sdk-era shells must render nothing; cli-era text renders as level model + kind reasoning"
+        );
+        assert!(entries
+            .iter()
+            .filter(|e| e["kind"].as_str() == Some("reasoning"))
+            .all(|e| e["level"].as_str() == Some("model")));
+    }
+
     /// `isMeta` synthetic turns and `isCompactSummary` context summaries are
     /// machine-generated — the ground truth
     /// (`message_search::extract_claude::record_from_line`) skips both, and

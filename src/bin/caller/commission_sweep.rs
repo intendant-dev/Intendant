@@ -233,8 +233,7 @@ pub(crate) fn plan_sweep(
                 None => {
                     plan.listed.push((
                         cref,
-                        "wake undispatchable — no session recorded for the occurrence"
-                            .to_string(),
+                        "wake undispatchable — no session recorded for the occurrence".to_string(),
                     ));
                     continue;
                 }
@@ -248,9 +247,8 @@ pub(crate) fn plan_sweep(
             seeds.push(session.clone());
         }
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        let lineage = crate::session_supervisor::resume_lineage::resolve_resume_lineage(
-            home, &seed_refs,
-        );
+        let lineage =
+            crate::session_supervisor::resume_lineage::resolve_resume_lineage(home, &seed_refs);
         let mut members: HashSet<&str> = lineage
             .wrapper_records
             .iter()
@@ -409,7 +407,11 @@ pub(crate) fn sweep_notification(
                 .iter()
                 .take(LIST_DETAIL_CAP)
                 .map(|(cref, session)| {
-                    format!("\u{201c}{}\u{201d} ({})", cref.item_title, short_id(session))
+                    format!(
+                        "\u{201c}{}\u{201d} ({})",
+                        cref.item_title,
+                        short_id(session)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -470,9 +472,9 @@ pub(crate) fn report_sweep(
                     eprintln!("[commission-sweep] {err} — the notification carries the list");
                 }
             },
-            None => eprintln!(
-                "[commission-sweep] agenda handle unavailable — stranded list not parked"
-            ),
+            None => {
+                eprintln!("[commission-sweep] agenda handle unavailable — stranded list not parked")
+            }
         }
     }
     if let Some(notification) =
@@ -628,22 +630,46 @@ mod tests {
             item(
                 "i-completed",
                 "open",
-                effect("occ-completed", "completed", Some("sess-3"), json!({}), json!({})),
+                effect(
+                    "occ-completed",
+                    "completed",
+                    Some("sess-3"),
+                    json!({}),
+                    json!({}),
+                ),
             ),
             item(
                 "i-started",
                 "open",
-                effect("occ-started", "started", Some("sess-4"), json!({}), json!({})),
+                effect(
+                    "occ-started",
+                    "started",
+                    Some("sess-4"),
+                    json!({}),
+                    json!({}),
+                ),
             ),
             item(
                 "i-done",
                 "done",
-                effect("occ-done-item", "unknown", Some("sess-5"), json!({}), json!({})),
+                effect(
+                    "occ-done-item",
+                    "unknown",
+                    Some("sess-5"),
+                    json!({}),
+                    json!({}),
+                ),
             ),
             item(
                 "i-retired",
                 "retired",
-                effect("occ-retired-item", "unknown", Some("sess-6"), json!({}), json!({})),
+                effect(
+                    "occ-retired-item",
+                    "unknown",
+                    Some("sess-6"),
+                    json!({}),
+                    json!({}),
+                ),
             ),
             item(
                 "i-armed",
@@ -687,8 +713,7 @@ mod tests {
     /// not a silent stranding, and the seat stays down.
     #[test]
     fn idle_done_seats_stay_down() {
-        let fresh: HashSet<String> =
-            ["occ-a", "occ-b"].into_iter().map(String::from).collect();
+        let fresh: HashSet<String> = ["occ-a", "occ-b"].into_iter().map(String::from).collect();
         let items = vec![
             item(
                 "i-achieved",
@@ -734,12 +759,14 @@ mod tests {
             effect("occ-f", "failed", Some("sess-1"), json!({}), json!({})),
         )];
         let standings = classify_commissions(&items, &fresh);
-        assert!(wake_occurrences(&standings).is_empty(), "failed never wakes");
+        assert!(
+            wake_occurrences(&standings).is_empty(),
+            "failed never wakes"
+        );
         let listed = listed_occurrences(&standings);
         assert_eq!(listed.len(), 1);
         assert!(
-            listed[0].1.contains("never auto re-fired")
-                && listed[0].1.contains("re-approve"),
+            listed[0].1.contains("never auto re-fired") && listed[0].1.contains("re-approve"),
             "the reason names the re-approval lane: {}",
             listed[0].1
         );
@@ -976,8 +1003,7 @@ mod tests {
                 run_state: "failed".to_string(),
                 session_id: None,
             },
-            "the run failed — never auto re-fired; re-approve the manifest to re-arm"
-                .to_string(),
+            "the run failed — never auto re-fired; re-approve the manifest to re-arm".to_string(),
         )];
         match sweep_notification("boot-1", &woken, &listed, Some("01ITEM")) {
             Some(AppEvent::UserNotification {

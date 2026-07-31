@@ -320,11 +320,18 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     let mut pending_context_rewind_turn_stop = ManagedContextRewindTurnStopTracker::default();
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
     // The cause of a fatal, non-recoverable backend error that ended the
-    // round with no real completion (the launch-refusal class). Cleared by
-    // a real turn completion inside the grace window; consumed at the exit,
-    // where a zero-turn round resolves as `TurnFailed` instead of lying
-    // with a completion.
-    let mut pending_fatal_round_error: Option<String> = None;
+    // round (the launch-refusal class, and the transient
+    // provider-incident class the error park recovers). Cleared by a REAL
+    // turn completion inside the grace window — but not by the error's
+    // own synthesized completion (Claude Code pushes `TurnCompleted`
+    // carrying the same result text right after the fatal `BackendError`,
+    // one wire line; treating that echo as a real completion made the
+    // zero-turn TurnFailed pin unreachable on the CC wire and dropped the
+    // cause the round-outcome classification needs). Consumed at the
+    // exit, where the classification decides: transient service
+    // condition → `TransientRoundDeath`; permanent at zero turns →
+    // `TurnFailed`; permanent after real work → the completion shape.
+    let mut pending_fatal_round_error: Option<FatalRoundError> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
     let managed_context_density_steer_suppressed = managed_context_recovery_kickstart
@@ -1196,6 +1203,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             pending_fatal_round_error.take(),
                             message,
                             turns_in_round,
+                            primary_round_started,
                         );
                     }
                     None => return DrainOutcome::ChannelClosed,
@@ -1219,6 +1227,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     pending_fatal_round_error.take(),
                     message,
                     turns_in_round,
+                    primary_round_started,
                 );
             }
             }
@@ -1646,9 +1655,15 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 });
                 // A fatal error the wrapper deems unrecoverable is the
                 // round's honest cause; recoverable ones resolve through
-                // the recovery precedence at the exit instead.
+                // the recovery precedence at the exit instead. The raw
+                // adapter message rides along so the error's own
+                // synthesized turn completion can be told apart from a
+                // real one.
                 let fatal_round_error = (!will_retry && event_is_primary && !recovery_required)
-                    .then(|| content.clone());
+                    .then(|| FatalRoundError {
+                        reason: content.clone(),
+                        raw_message: message.clone(),
+                    });
                 config.bus.send(AppEvent::LogEntry {
                     session_id: config.session_id.clone(),
                     level: if will_retry || recovery_required {
@@ -1681,8 +1696,8 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     pending_turn_completion = Some((None, turns_in_round));
                     // First cause wins; an already-buffered REAL completion
                     // (the branch guard above) never gets a fatal cause.
-                    if let Some(reason) = fatal_round_error {
-                        pending_fatal_round_error.get_or_insert(reason);
+                    if let Some(cause) = fatal_round_error {
+                        pending_fatal_round_error.get_or_insert(cause);
                     }
                     if active_side_turns.is_empty() {
                         post_turn_sleep_active = true;
@@ -2714,10 +2729,23 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         ))
                     });
                 }
+                // A REAL completion inside the grace window supersedes a
+                // buffered fatal cause — the turn did land after all. The
+                // guard: an error result's own synthesized completion
+                // (Claude Code pushes `TurnCompleted` carrying the SAME
+                // result text right after the fatal `BackendError`, one
+                // wire line) is the error restated, not a recovery — it
+                // must leave the cause standing or the round-outcome
+                // classification never sees it (the 2026-07-29 specimens'
+                // exact silent path) and the zero-turn TurnFailed pin
+                // stays unreachable on the CC wire.
+                let completion_is_the_error_itself = pending_fatal_round_error
+                    .as_ref()
+                    .is_some_and(|fatal| message.as_deref() == Some(fatal.raw_message.as_str()));
                 pending_turn_completion = Some((message, turns_in_round));
-                // A real completion inside the grace window supersedes a
-                // buffered fatal cause — the turn did land after all.
-                pending_fatal_round_error = None;
+                if !completion_is_the_error_itself {
+                    pending_fatal_round_error = None;
+                }
                 if active_side_turns.is_empty() {
                     post_turn_sleep_active = true;
                     post_turn_sleep
@@ -3415,6 +3443,7 @@ mod tests {
         match outcome {
             DrainOutcome::TurnCompleted { .. } => "TurnCompleted",
             DrainOutcome::TurnFailed { .. } => "TurnFailed",
+            DrainOutcome::TransientRoundDeath { .. } => "TransientRoundDeath",
             DrainOutcome::Terminated { .. } => "Terminated",
             DrainOutcome::ChannelClosed => "ChannelClosed",
             DrainOutcome::RecoveryRequired { .. } => "RecoveryRequired",
@@ -3632,6 +3661,162 @@ mod tests {
                  got {}",
                 drain_outcome_name(&outcome)
             );
+        }
+    }
+
+    /// The 2026-07-29 specimen wire shape (sessions 24f01636/13e53300,
+    /// commission seats killed by provider API-500s): Claude Code ends
+    /// an errored turn by emitting the fatal `BackendError` AND a
+    /// synthesized `TurnCompleted` carrying the SAME result text on one
+    /// wire line. That echo must not clear the buffered cause — the
+    /// round drains as `TransientRoundDeath` (the error park's input)
+    /// instead of the completion that rode a DoneSignal and stranded
+    /// both specimens fake-idle. A permanent cause through the same
+    /// echo shape keeps its terminal: zero turns drain `TurnFailed`
+    /// (restoring the 2026-07-26 launch-refusal pin on the CC wire,
+    /// where the echo had made it unreachable).
+    #[tokio::test]
+    async fn api_500_round_death_with_completion_echo_drains_transient() {
+        for (error_text, feed_tool_start, expect) in [
+            (
+                "API Error: 500 {\"type\":\"api_error\",\"message\":\"Internal server error\"}",
+                true,
+                "TransientRoundDeath",
+            ),
+            (
+                "API Error: 500 {\"type\":\"api_error\",\"message\":\"Internal server error\"}",
+                false,
+                "TransientRoundDeath",
+            ),
+            (
+                "There's an issue with the selected model (fable-5). It may not exist or you \
+                 may not have access to it.",
+                false,
+                "TurnFailed",
+            ),
+        ] {
+            let bus = EventBus::new();
+            let mut bus_rx_for_drain = bus.subscribe();
+            let dir = tempfile::tempdir().unwrap();
+            let log_dir = dir.path().join("session");
+            let session_log: SharedSessionLog = Arc::new(Mutex::new(
+                session_log::SessionLog::open(log_dir.clone()).unwrap(),
+            ));
+            let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+            let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+            let config = DrainConfig {
+                bus: &bus,
+                web_port: None,
+                session_id: Some("cc-session".to_string()),
+                alias_session_id: None,
+                backend_thread_id: Some("cc-session".to_string()),
+                autonomy,
+                session_log: &session_log,
+                project_root: dir.path(),
+                log_dir: &log_dir,
+                approval_registry: &approval_registry,
+                json_approval: None,
+                agent_source: Some("Claude Code".to_string()),
+                suppress_agent_started: false,
+                persist_model_responses_inline: true,
+                headless: true,
+                context_injection: &context_injection,
+                reload_credentials: None,
+                coordination_declaration: None,
+            };
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            if feed_tool_start {
+                event_tx
+                    .send(external_agent::AgentEvent::ToolStarted {
+                        item_id: "tool-1".to_string(),
+                        tool_name: "bash".to_string(),
+                        preview: "cargo test".to_string(),
+                        message_uuid: None,
+                    })
+                    .unwrap();
+            }
+            event_tx
+                .send(external_agent::AgentEvent::BackendError {
+                    message: error_text.to_string(),
+                    code: Some("error_during_execution".to_string()),
+                    details: None,
+                    will_retry: false,
+                    likely_generation_starvation: false,
+                    recovery_hint: None,
+                })
+                .unwrap();
+            // The adapter's synthesized completion: the same result text,
+            // pushed by the same `handle_result` call.
+            event_tx
+                .send(external_agent::AgentEvent::TurnCompleted {
+                    message: Some(error_text.to_string()),
+                })
+                .unwrap();
+            drop(event_tx);
+
+            let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let steers = Arc::new(Mutex::new(Vec::new()));
+            let mut agent: Box<dyn external_agent::ExternalAgent> =
+                Box::new(ManagedDrainTestAgent {
+                    interrupts: interrupts.clone(),
+                    steers: steers.clone(),
+                });
+            let mut stats = LoopStats::default();
+            let mut diff_tracker = ExternalDiffDeltaTracker::default();
+            let mut pending_runtime_steers = std::collections::VecDeque::new();
+            let mut handled_steer_ids = std::collections::HashSet::new();
+            let mut cancelled_follow_ups = HashSet::new();
+            let mut dedupe = CodexThreadActionDedupe::default();
+
+            let outcome = drain_external_agent_events(
+                &mut agent,
+                &mut event_rx,
+                &mut bus_rx_for_drain,
+                &config,
+                &mut stats,
+                &mut diff_tracker,
+                &mut pending_runtime_steers,
+                &mut handled_steer_ids,
+                &mut cancelled_follow_ups,
+                &mut dedupe,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .await;
+            match (expect, outcome) {
+                (
+                    "TransientRoundDeath",
+                    DrainOutcome::TransientRoundDeath {
+                        reason,
+                        turns_in_round,
+                        turn_had_started,
+                    },
+                ) => {
+                    assert!(
+                        reason.contains("API Error: 500"),
+                        "reason carries the cause: {reason}"
+                    );
+                    assert_eq!(turns_in_round, usize::from(feed_tool_start));
+                    // The completion echo marks the round started even
+                    // with zero tools — CC persisted the driving message
+                    // to its rollout, so the resume must be a nudge.
+                    assert!(turn_had_started);
+                }
+                ("TurnFailed", DrainOutcome::TurnFailed { reason, .. }) => {
+                    assert!(
+                        reason.contains("fable-5"),
+                        "reason carries the refusal: {reason}"
+                    );
+                }
+                (expect, other) => panic!(
+                    "expected {expect} (tool_start={feed_tool_start}), got {}",
+                    drain_outcome_name(&other)
+                ),
+            }
         }
     }
 

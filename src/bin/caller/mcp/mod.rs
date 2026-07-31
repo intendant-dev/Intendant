@@ -74,6 +74,7 @@ mod tools_codex_cloud;
 mod tools_display;
 mod tools_managed;
 mod tools_notes;
+mod tools_remote_compute;
 mod tools_whoami;
 pub(crate) use tools_notes::{
     note_image_extension, SESSION_NOTE_MAX_IMAGES, SESSION_NOTE_MAX_IMAGE_BYTES,
@@ -265,7 +266,19 @@ impl IntendantServer {
         let id = params.id.trim();
         match agenda.resolve_prefix(id) {
             crate::agenda::AgendaPrefixResolution::One(item) => {
-                Ok(serde_json::json!({ "item": *item }))
+                let mut body = serde_json::json!({ "item": *item });
+                // Derived territory sibling — same block the item route
+                // serves, so `ctl agenda show` (the supervised adoption
+                // lane) sees the working set too.
+                if let Some(working_set) = agenda.working_set(&item.id) {
+                    if working_set.total > 0 {
+                        body.as_object_mut().expect("object body").insert(
+                            "working_set".to_string(),
+                            serde_json::to_value(&working_set).expect("working set serializes"),
+                        );
+                    }
+                }
+                Ok(body)
             }
             crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => Err(format!(
                 "ambiguous agenda id prefix '{id}': {}",
@@ -831,6 +844,13 @@ impl IntendantServer {
                 let params = parse_params::<FollowUpCodexCloudTaskParams>(args)?;
                 Ok(text_tool_result(
                     self.follow_up_codex_cloud_task(params).await,
+                ))
+            }
+            "remote_command" => {
+                let Parameters(params) = parse_params::<RemoteCommandParams>(args)?;
+                Ok(text_tool_result(
+                    self.remote_command_scoped(params, McpToolScope::from_actor(&actor))
+                        .await,
                 ))
             }
             "browser_workspace_providers" => {

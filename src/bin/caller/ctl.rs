@@ -2558,14 +2558,21 @@ async fn run_agenda(
                 .ok_or_else(|| {
                     "agenda show requires an item id (a unique prefix is enough)".to_string()
                 })?;
-            let item = agenda_fetch_item(client, config, raw_id).await?;
+            let body = agenda_fetch_item(client, config, raw_id).await?;
+            let item = body
+                .get("item")
+                .cloned()
+                .ok_or_else(|| "agenda_item response missing item".to_string())?;
             if config.json || config.raw {
+                // The item object verbatim — scripts pin this shape; the
+                // sibling blocks stay a detail-print concern.
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&item).map_err(|e| e.to_string())?
                 );
             } else {
                 agenda_print_item_detail(&item);
+                agenda_print_working_set(&item, &body);
             }
         }
         "ops" => run_agenda_read_page(client, config, &raw[1..], AgendaPageKind::Ops).await?,
@@ -2758,7 +2765,7 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "relates" | "relates-to" => {
-            let args = parse_command_args(&raw[1..], &["--source"], &["--remove"])?;
+            let args = parse_command_args(&raw[1..], &["--source", "--kind"], &["--remove"])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2770,7 +2777,14 @@ async fn run_agenda(
                 return Err("agenda relates requires the related item id second".to_string());
             };
             let target = agenda_resolve_id_str(client, config, target_raw).await?;
-            let op = if args.has("--remove") {
+            let removing = args.has("--remove");
+            if removing && args.one("--kind").is_some() {
+                return Err(
+                    "agenda relates --kind types the link being added; drop it with --remove"
+                        .to_string(),
+                );
+            }
+            let op = if removing {
                 "remove_relates_to"
             } else {
                 "add_relates_to"
@@ -2779,6 +2793,9 @@ async fn run_agenda(
             map.insert("op".to_string(), Value::String(op.to_string()));
             map.insert("id".to_string(), Value::String(id));
             map.insert("target_id".to_string(), Value::String(target));
+            if !removing {
+                insert_string(&mut map, "link_kind", args.one("--kind"));
+            }
             insert_string(&mut map, "source", args.one("--source"));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
@@ -2870,38 +2887,43 @@ async fn run_agenda(
 
 /// Resolve one ctl-side ref spec: `[type:]locator` with a `--type`
 /// override. Inference: http(s) URLs are `url`; a path that exists
-/// locally is `file` (canonicalized to the absolute path the daemon
-/// stores); anything else needs an explicit type. Client-side sugar only —
-/// the daemon re-validates everything at intake (and mints the digest).
+/// locally is `file` — or `dir` when it is a directory (both
+/// canonicalized to the absolute path the daemon stores); anything else
+/// needs an explicit type. Client-side sugar only — the daemon
+/// re-validates everything at intake (and mints file digests).
 fn agenda_ref_spec(raw: &str, explicit: Option<&str>) -> Result<(String, String), String> {
     let (prefixed, rest) = match raw.split_once(':') {
-        Some((t, rest)) if ["file", "memory", "session", "url"].contains(&t) => (Some(t), rest),
+        Some((t, rest)) if ["file", "dir", "memory", "session", "url"].contains(&t) => {
+            (Some(t), rest)
+        }
         _ => (None, raw),
     };
     let ref_type = match explicit.or(prefixed) {
         Some(t) => match t.trim().to_ascii_lowercase().as_str() {
-            t @ ("file" | "memory" | "session" | "url") => t.to_string(),
+            t @ ("file" | "dir" | "memory" | "session" | "url") => t.to_string(),
             other => {
                 return Err(format!(
-                    "unknown ref type '{other}' (file, memory, session, or url)"
+                    "unknown ref type '{other}' (file, dir, memory, session, or url)"
                 ))
             }
         },
         None => {
             if raw.starts_with("http://") || raw.starts_with("https://") {
                 "url".to_string()
+            } else if std::path::Path::new(raw).is_dir() {
+                "dir".to_string()
             } else if std::path::Path::new(raw).exists() {
                 "file".to_string()
             } else {
                 return Err(format!(
                     "cannot infer the ref type of {raw:?} — prefix it \
-                     (file:…, memory:…, session:…, url:https://…) or pass --type"
+                     (file:…, dir:…, memory:…, session:…, url:https://…) or pass --type"
                 ));
             }
         }
     };
     let locator = if prefixed.is_some() { rest } else { raw };
-    let locator = if ref_type == "file" {
+    let locator = if ref_type == "file" || ref_type == "dir" {
         // The daemon stores absolute paths; resolve relative args here. A
         // since-deleted file (removals) passes the stored path verbatim.
         match std::fs::canonicalize(locator) {
@@ -3311,6 +3333,47 @@ fn agenda_item_is_blocked(all_items: &[Value], item: &Value) -> bool {
 /// `agenda show`'s human detail (Track AS S7): the whole item, printed
 /// self-contained — no ledger fetch, so cross-item lookups (dependency
 /// target titles) print as ids. Bodies/notes/answers are quoted data.
+/// The item's derived territory block (the `working_set` sibling):
+/// file/dir refs across the item and its placed subtree, newest first.
+/// Detail print only — `--json` keeps the bare item object.
+fn agenda_print_working_set(item: &Value, body: &Value) {
+    let Some(ws) = body.get("working_set") else {
+        return;
+    };
+    let rows = ws
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+    let total = ws.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let own_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let shown = rows.len() as u64;
+    if total > shown {
+        println!("  territory ({total} distinct, newest {shown} shown):");
+    } else {
+        println!("  territory ({total} distinct):");
+    }
+    for row in &rows {
+        let s = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("");
+        let mut line = format!("    {} {}", s("ref_type"), s("locator"));
+        if row
+            .get("must_read")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            line.push_str(" [must-read]");
+        }
+        let via = s("item_id");
+        if !via.is_empty() && via != own_id {
+            line.push_str(&format!(" — via {}", s("item_title")));
+        }
+        println!("{line}");
+    }
+}
+
 fn agenda_print_item_detail(item: &Value) {
     println!("{}", agenda_render_row(item, false, &[]));
     let s = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
@@ -3628,7 +3691,8 @@ async fn agenda_resolve_id_str(
 ) -> Result<String, String> {
     Ok(agenda_fetch_item(client, config, raw)
         .await?
-        .get("id")
+        .get("item")
+        .and_then(|item| item.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| "agenda_item returned an item without an id".to_string())?
         .to_string())
@@ -3671,10 +3735,10 @@ async fn agenda_fetch_item(
     }
     let value: Value =
         serde_json::from_str(text).map_err(|e| format!("agenda_item returned non-JSON: {e}"))?;
-    value
-        .get("item")
-        .cloned()
-        .ok_or_else(|| "agenda_item response missing item".to_string())
+    if value.get("item").is_none() {
+        return Err("agenda_item response missing item".to_string());
+    }
+    Ok(value)
 }
 
 /// Fetch `(items, counts)` via the `agenda_list` tool.
@@ -5621,10 +5685,11 @@ fn help_agenda() {
   intendant ctl agenda block ID_PREFIX CRITERION... [--source LABEL]\n\
   intendant ctl agenda unblock ID_PREFIX [BLOCKER_PREFIX] [--source LABEL]\n\
   intendant ctl agenda relies-on ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
-  intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|memory|session|url]\n\
+  intendant ctl agenda ref ID_PREFIX [TYPE:]LOCATOR [--type file|dir|memory|session|url]\n\
       [--must-read] [--label TEXT] [--remove] [--source LABEL]\n\
   intendant ctl agenda place ID_PREFIX HUB_PREFIX|--under HUB [--remove] [--source LABEL]\n\
-  intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--remove] [--source LABEL]\n\
+  intendant ctl agenda relates ID_PREFIX TARGET_PREFIX [--kind KIND] [--remove] [--source LABEL]\n\
+      # KIND: duplicates|supersedes|follow_up_of|evidences — optional typed edge, reads ITEM -> TARGET\n\
   intendant ctl agenda list --under HUB_PREFIX   # the hub's placed subtree\n\
   intendant ctl agenda list --frontier           # the un-triaged frontier (triage mandate's scope)\n\
   intendant ctl agenda ops [ID_PREFIX] [--since N] [--limit N]           # raw op-log page\n\
@@ -5695,9 +5760,11 @@ lane — no --peer, and a supervised session's injected lane deliberately\n\
 lacks them (use `agenda list` there).\n\
 \n\
 `ref` attaches a typed POINTER (never content): a file path (digested at\n\
-attach so the detail view can show drift honestly), a Memory claim id, a\n\
+attach so the detail view can show drift honestly), a directory path\n\
+(pointer only — never digested), a Memory claim id, a\n\
 session/conversation id, or an http(s) URL. Type is inferred (URLs,\n\
-existing paths) or explicit via TYPE: prefix / --type; --must-read marks\n\
+existing paths — a directory infers dir) or explicit via TYPE: prefix /\n\
+--type; --must-read marks\n\
 it prominent for whoever picks the item up (a pointer they weigh, not an\n\
 order); --remove drops it (history stays). On `add`, repeat --ref to\n\
 attach at park time — one item, its context, one gesture.\n\
@@ -5708,7 +5775,11 @@ attach at park time — one item, its context, one gesture.\n\
 old placement is touched); --remove unplaces. Placement is pure\n\
 navigation: it NEVER propagates blocking, completion never cascades, and\n\
 a placed item still appears in the flat list (nothing hides). `relates`\n\
-draws an untyped see-also edge, deduped in both directions; `list\n\
+draws a see-also edge, deduped in both directions — one link per pair;\n\
+--kind types it from the closed vocabulary (duplicates, supersedes,\n\
+follow_up_of, evidences; a typed edge reads ITEM -> TARGET, e.g. A\n\
+supersedes B is drawn from A; change a kind by --remove then re-add).\n\
+Typed or not, nothing derives or fires from adjacency. `list\n\
 --under` scopes to a hub's subtree; hub rows show open-children roll-ups\n\
 derived at print time.\n\
 \n\

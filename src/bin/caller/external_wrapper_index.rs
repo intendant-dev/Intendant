@@ -47,12 +47,64 @@ fn index_cache() -> &'static Mutex<HashMap<PathBuf, CachedWrapperIndex>> {
     INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Cheap change fingerprint of the on-disk index (length + mtime nanos).
-/// Serve-time lineage memos key on it: every new wrapper generation writes
-/// an index row (the eager resume identity), so a stale memo cannot
-/// outlive the chain it summarizes.
-pub fn index_fingerprint(home: &Path) -> (u64, u128) {
-    index_file_fingerprint(&index_path(home))
+/// Epoch of the index content the resume-lineage walk consumes: a hash
+/// over exactly the fields that can change a walk's outcome — the
+/// identity triple, `log_path`, `state`, and the two lineage tombstones —
+/// deliberately EXCLUDING `updated_at_secs` (and the cached
+/// `rollout_path` / `project_root`). The session-catalog list pass
+/// backfill-restamps Active rows' recency from live log-dir mtimes, so
+/// while any wrapper session is appending its transcript the raw file
+/// fingerprint (length + mtime) moves on every serve; lineage memos
+/// keyed on that fingerprint therefore invalidated wholesale per serve
+/// and every ghost row re-ran its walk — the 2026-07-30 sessions-list
+/// hot-spin. Equal epochs guarantee identical walk-relevant content; the
+/// accepted blind spot is recency REORDERING between multiple Active
+/// rows of one group (a transient double-active window during resume
+/// handoff, display-only, self-healing on the demotion's state change).
+/// Cached per index-file fingerprint, so an unchanged file costs one
+/// stat and a restamp-only rewrite costs one re-hash, not a re-walk.
+pub fn lineage_epoch(home: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    /// (file fingerprint the epoch was computed from, the epoch).
+    type CachedEpoch = ((u64, u128), u64);
+    static EPOCH_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedEpoch>>> = OnceLock::new();
+    let cache = EPOCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let path = index_path(home);
+    let fingerprint = index_file_fingerprint(&path);
+    if let Some((cached_fingerprint, epoch)) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&path)
+    {
+        if *cached_fingerprint == fingerprint {
+            return *epoch;
+        }
+    }
+    let epoch = {
+        let _guard = INDEX_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        with_index_unlocked(home, |index| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            index.wrappers.len().hash(&mut hasher);
+            for record in &index.wrappers {
+                record.source.hash(&mut hasher);
+                record.backend_session_id.hash(&mut hasher);
+                record.intendant_session_id.hash(&mut hasher);
+                record.log_path.hash(&mut hasher);
+                record.state.hash(&mut hasher);
+                record.stopped_by_user_at_secs.hash(&mut hasher);
+                record.retired_successor.hash(&mut hasher);
+            }
+            hasher.finish()
+        })
+    };
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path, (fingerprint, epoch));
+    epoch
 }
 
 /// Run `f` against the current index without cloning it. Callers must hold
@@ -103,7 +155,9 @@ fn note_index_written(home: &Path, index: &ExternalWrapperIndex) {
 /// no `state`: those rows deserialize as `Active` and their demotions are
 /// still expressed by the legacy `updated_at_secs == 0` sentinel, which the
 /// preference order's timestamp tie-break honors.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WrapperState {
     #[default]
@@ -1161,6 +1215,44 @@ pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperReco
     records
 }
 
+/// Every index record belonging to ONE wrapper session (the reverse of
+/// [`wrappers_for`]'s conversation lookup), matched the way every reader
+/// resolves wrapper identity — by the record's log-dir basename
+/// ([`normalize_log_identity`]) — and preference-sorted. One pass over
+/// the index with existence stats only on the matching rows: the
+/// per-session expansion inside `recorded_backend_conversations_in_home`
+/// previously swept [`wrappers_for_source`] once per backend, which
+/// stat'ed and cloned every source row in the whole index per resolved
+/// session — ruinous × every ghost row of a large session store.
+pub fn wrapper_records_for_wrapper_id(
+    home: &Path,
+    wrapper_session_id: &str,
+) -> Vec<ExternalWrapperRecord> {
+    let wrapper_session_id = wrapper_session_id.trim();
+    if wrapper_session_id.is_empty() {
+        return Vec::new();
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut records: Vec<_> = with_index_unlocked(home, |index| {
+        index
+            .wrappers
+            .iter()
+            .filter_map(|record| {
+                (log_dir_session_id(Path::new(&record.log_path)).as_deref()
+                    == Some(wrapper_session_id)
+                    && Path::new(&record.log_path).is_dir())
+                .then(|| normalize_log_identity(record.clone()))
+                .flatten()
+            })
+            .collect()
+    });
+    records.sort_by(wrapper_preference);
+    records
+}
+
 /// Remember the resolved native backend log (e.g. a Codex rollout file)
 /// for `(source, backend_session_id)`. The path is stamped on EVERY record
 /// of that backend session — the native file is a property of the backend
@@ -1327,6 +1419,171 @@ fn file_mtime_secs(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Direct index write honoring the INDEX_LOCK contract of
+    /// [`write_index_unlocked`].
+    fn write_index_for_tests(home: &Path, index: &ExternalWrapperIndex) {
+        let _guard = INDEX_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_index_unlocked(home, index).unwrap();
+    }
+
+    fn epoch_record(wrapper: &str, backend: &str, log_path: &str) -> ExternalWrapperRecord {
+        ExternalWrapperRecord {
+            source: "claude-code".to_string(),
+            backend_session_id: backend.to_string(),
+            intendant_session_id: wrapper.to_string(),
+            log_path: log_path.to_string(),
+            project_root: None,
+            updated_at_secs: 1,
+            state: WrapperState::Active,
+            rollout_path: None,
+            stopped_by_user_at_secs: None,
+            retired_successor: None,
+        }
+    }
+
+    /// The lineage epoch moves with walk-relevant content ONLY. Recency
+    /// restamps (`updated_at_secs`) and cached-lookup fields
+    /// (`rollout_path`) rewrite the file without moving the epoch — the
+    /// session-catalog backfill restamps live rows every list pass, and
+    /// an epoch that moved with them would re-walk every ghost row per
+    /// serve (the 2026-07-30 hot-spin). Identity, state, and tombstone
+    /// changes all move it.
+    #[test]
+    fn lineage_epoch_tracks_walk_relevant_content_only() {
+        let home = tempfile::tempdir().unwrap();
+        let mut index = ExternalWrapperIndex::default();
+        index.wrappers.push(epoch_record(
+            "wrap-epoch-1",
+            "b-epoch-1",
+            "/tmp/wrap-epoch-1",
+        ));
+        write_index_for_tests(home.path(), &index);
+        let base = lineage_epoch(home.path());
+
+        // Recency restamp: file bytes change, epoch holds.
+        index.wrappers[0].updated_at_secs = 100_000;
+        write_index_for_tests(home.path(), &index);
+        assert_eq!(
+            lineage_epoch(home.path()),
+            base,
+            "a recency-only restamp must not move the epoch"
+        );
+
+        // Cached rollout path: still not walk input.
+        index.wrappers[0].rollout_path = Some("/tmp/rollout.jsonl".to_string());
+        write_index_for_tests(home.path(), &index);
+        assert_eq!(
+            lineage_epoch(home.path()),
+            base,
+            "rollout-path caching must not move the epoch"
+        );
+
+        // State change (a demotion): moves.
+        index.wrappers[0].state = WrapperState::Superseded;
+        write_index_for_tests(home.path(), &index);
+        let demoted = lineage_epoch(home.path());
+        assert_ne!(demoted, base, "a demotion must move the epoch");
+
+        // Owner-stop tombstone: moves.
+        index.wrappers[0].stopped_by_user_at_secs = Some(9);
+        write_index_for_tests(home.path(), &index);
+        let stopped = lineage_epoch(home.path());
+        assert_ne!(stopped, demoted, "a stop tombstone must move the epoch");
+
+        // Retirement edge: moves.
+        index.wrappers[0].retired_successor = Some("b-epoch-2".to_string());
+        write_index_for_tests(home.path(), &index);
+        let retired = lineage_epoch(home.path());
+        assert_ne!(retired, stopped, "a retirement edge must move the epoch");
+
+        // A new wrapper generation: moves.
+        index.wrappers.push(epoch_record(
+            "wrap-epoch-2",
+            "b-epoch-2",
+            "/tmp/wrap-epoch-2",
+        ));
+        write_index_for_tests(home.path(), &index);
+        assert_ne!(
+            lineage_epoch(home.path()),
+            retired,
+            "a new wrapper row must move the epoch"
+        );
+    }
+
+    /// The reverse lookup returns exactly what the per-source sweep +
+    /// wrapper-id filter used to assemble: matched by log-dir basename
+    /// (the identity every reader resolves), existence-filtered,
+    /// preference-sorted — across all sources in one pass.
+    #[test]
+    fn wrapper_records_for_wrapper_id_matches_source_sweep() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_a = "e9532107-8c7f-4c1f-b88d-410d6d365511";
+        let wrapper_b = "ec5865e5-a5af-4b8c-81a1-545a3a6f8b22";
+        let dir_a = home.path().join(".intendant").join("logs").join(wrapper_a);
+        let dir_b = home.path().join(".intendant").join("logs").join(wrapper_b);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let codex_id = "019ea8b9-0000-7000-8000-000000000011";
+        let claude_id = "0caf4660-7345-4f3b-b8e7-407e59aefa11";
+        upsert(home.path(), "codex", codex_id, wrapper_a, &dir_a, None).unwrap();
+        upsert(
+            home.path(),
+            "claude-code",
+            claude_id,
+            wrapper_a,
+            &dir_a,
+            None,
+        )
+        .unwrap();
+        upsert(home.path(), "codex", codex_id, wrapper_b, &dir_b, None).unwrap();
+
+        let direct = wrapper_records_for_wrapper_id(home.path(), wrapper_a);
+        let mut swept: Vec<ExternalWrapperRecord> = ["codex", "claude-code", "kimi"]
+            .iter()
+            .flat_map(|source| wrappers_for_source(home.path(), source))
+            .filter(|record| record.intendant_session_id == wrapper_a)
+            .collect();
+        swept.sort_by(wrapper_preference);
+        assert_eq!(direct, swept, "reverse lookup must equal the source sweep");
+        assert_eq!(direct.len(), 2, "both sources' records found");
+
+        // Matching is by log-dir basename, exactly like every reader: a
+        // stale stored id neither matches nor leaks.
+        let mut index = {
+            let _guard = INDEX_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            with_index_unlocked(home.path(), |index| index.clone())
+        };
+        let stale_pos = index
+            .wrappers
+            .iter()
+            .position(|record| record.intendant_session_id == wrapper_a)
+            .unwrap();
+        index.wrappers[stale_pos].intendant_session_id = "stale-alias".to_string();
+        write_index_for_tests(home.path(), &index);
+        assert!(
+            wrapper_records_for_wrapper_id(home.path(), "stale-alias").is_empty(),
+            "stored-id spelling must not match — the log dir decides"
+        );
+        assert_eq!(
+            wrapper_records_for_wrapper_id(home.path(), wrapper_a).len(),
+            2,
+            "basename matching survives a stale stored id"
+        );
+
+        // A record whose log dir is gone drops out, like the sweep.
+        std::fs::remove_dir_all(&dir_b).unwrap();
+        assert!(
+            wrapper_records_for_wrapper_id(home.path(), wrapper_b).is_empty(),
+            "existence filter parity"
+        );
+    }
 
     #[test]
     fn upsert_demotes_stale_wrapper_for_same_backend_session() {

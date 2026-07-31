@@ -277,6 +277,7 @@ pub(crate) async fn run_daemon(
             readopt_bus,
             readopt_handover,
             readopt_enabled,
+            crate::boot_readopt::READOPT_DISPATCH_SPACING,
             // The commission sweep's item-store lens; resolved here at
             // the wiring edge (tests inject their own handles).
             crate::agenda::published_agenda_handle(),

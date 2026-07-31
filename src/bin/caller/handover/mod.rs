@@ -24,10 +24,12 @@
 
 mod lease;
 mod presence;
+mod update_lane;
 mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
 pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence};
+pub(crate) use update_lane::spawn_update_lane;
 pub(crate) use update_watch::spawn_update_watch;
 
 use std::path::{Path, PathBuf};
@@ -89,6 +91,11 @@ pub(crate) struct HandoverRuntime {
     /// watch task; `status_json` serves it. `None` = the on-disk image
     /// is the running one (no chip).
     update_status: std::sync::Mutex<Option<serde_json::Value>>,
+    /// The self-update lane (the PRODUCE half of the update surface),
+    /// installed at wiring beside the watch. Route handlers reach the
+    /// check/produce actions through it; `status_json` serves its
+    /// `update_lane` block. Unset in bare test constructions.
+    update_lane: std::sync::OnceLock<std::sync::Arc<update_lane::UpdateLane>>,
 }
 
 #[derive(Default)]
@@ -197,6 +204,7 @@ impl HandoverRuntime {
             drain_hooks: std::sync::Mutex::new(Vec::new()),
             bus: std::sync::OnceLock::new(),
             update_status: std::sync::Mutex::new(None),
+            update_lane: std::sync::OnceLock::new(),
         }
     }
 
@@ -233,6 +241,17 @@ impl HandoverRuntime {
         if let Ok(mut slot) = self.update_status.lock() {
             *slot = block;
         }
+    }
+
+    /// Install the self-update lane (wiring, once). First lane wins.
+    pub(crate) fn set_update_lane(&self, lane: std::sync::Arc<update_lane::UpdateLane>) {
+        let _ = self.update_lane.set(lane);
+    }
+
+    /// The self-update lane, when this boot wired one (route handlers'
+    /// entry point for the check/produce actions).
+    pub(crate) fn update_lane(&self) -> Option<std::sync::Arc<update_lane::UpdateLane>> {
+        self.update_lane.get().cloned()
     }
 
     pub(crate) fn boot_id(&self) -> &str {
@@ -600,6 +619,9 @@ impl HandoverRuntime {
             if let Some(update) = update.as_ref() {
                 obj.insert("update".into(), update.clone());
             }
+        }
+        if let Some(lane) = self.update_lane.get() {
+            obj.insert("update_lane".into(), lane.status_block());
         }
         block
     }

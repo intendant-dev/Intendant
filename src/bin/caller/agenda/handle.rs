@@ -686,6 +686,16 @@ impl AgendaHandle {
         self.lock().item(item_id)
     }
 
+    /// The item's served WORKING SET (agenda ontology P3): its own and
+    /// its placed subtree's file/dir refs, newest attach per locator,
+    /// recency-ordered, capped — the territory an adopting session
+    /// starts from instead of cold. Derived on demand from the fold
+    /// exactly like placed-children counts; never stored. `None` when
+    /// no item matches.
+    pub(crate) fn working_set(&self, item_id: &str) -> Option<super::working_set::WorkingSet> {
+        super::working_set::working_set(&self.snapshot(), item_id)
+    }
+
     /// Resolve a full id or unique id-prefix to one DECORATED item
     /// (Track AS S4, ruling Q5): exact match always wins, then a unique
     /// prefix; an ambiguous prefix returns the bounded candidate list

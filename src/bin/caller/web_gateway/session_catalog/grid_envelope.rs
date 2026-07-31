@@ -22,9 +22,15 @@
 //! The successor pointer derives from the ONE shared lineage walker,
 //! [`crate::session_supervisor::resume_lineage::resolve_resume_lineage`]
 //! (never a private re-implementation), memoized on the seed dir's
-//! transcript fingerprint plus the wrapper-index fingerprint — every new
-//! wrapper generation writes the index, so a memo cannot outlive the
-//! chain it summarizes.
+//! transcript fingerprint plus the wrapper index's LINEAGE EPOCH
+//! ([`crate::external_wrapper_index::lineage_epoch`]) — every new
+//! wrapper generation writes an index row, so a memo cannot outlive the
+//! chain it summarizes. The epoch, not the raw file fingerprint: the
+//! list pass's own backfill restamps live rows' recency on every serve,
+//! and keying on the file fingerprint invalidated every memo per serve —
+//! each poll re-walked every ghost row's lineage over the whole store
+//! (the 2026-07-30 boot-storm hot-spin, 871% CPU starving the accept
+//! lane). The epoch moves only when walk-relevant content moves.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -64,6 +70,10 @@ pub(crate) struct GridEnvelopeJoins {
     /// pointers; `None` skips the lineage join (tests that exercise only
     /// the boot matrix).
     home: Option<PathBuf>,
+    /// Wrapper-index lineage epoch, resolved ONCE per build (one stat on
+    /// an unchanged index) and handed to every row's tip memo check —
+    /// never re-derived per row.
+    lineage_epoch: Option<u64>,
 }
 
 impl GridEnvelopeJoins {
@@ -82,6 +92,7 @@ impl GridEnvelopeJoins {
             boot,
             live_wrappers,
             agenda,
+            lineage_epoch: Some(crate::external_wrapper_index::lineage_epoch(home_path)),
             home: Some(home_path.to_path_buf()),
         }
     }
@@ -94,6 +105,7 @@ impl GridEnvelopeJoins {
             live_wrappers: None,
             agenda: None,
             home: None,
+            lineage_epoch: None,
         }
     }
 
@@ -111,6 +123,9 @@ impl GridEnvelopeJoins {
             boot: boot_start_secs.map(|start_secs| CurrentBoot { start_secs }),
             live_wrappers,
             agenda,
+            lineage_epoch: home
+                .as_deref()
+                .map(crate::external_wrapper_index::lineage_epoch),
             home,
         }
     }
@@ -219,7 +234,7 @@ impl GridEnvelopeJoins {
             boot_block["terminal"] = terminal.clone();
         }
         if ghost {
-            match dead_row_lineage_tip(self.home.as_deref(), session_id, dir) {
+            match dead_row_lineage_tip(self.home.as_deref(), session_id, dir, self.lineage_epoch) {
                 LineageTip::NoWrapperHistory => {}
                 LineageTip::SelfTip => {
                     boot_block["lineage_tip"] = serde_json::Value::Bool(true);
@@ -264,11 +279,14 @@ enum LineageTip {
 
 struct LineageTipMemoEntry {
     transcript_fingerprint: (u64, u128),
-    index_fingerprint: (u64, u128),
+    lineage_epoch: u64,
     tip: LineageTip,
 }
 
-const LINEAGE_TIP_MEMO_LIMIT: usize = 4096;
+/// Comfortably above the session-store dir count (~4k on the machine the
+/// hot-spin hit), so clear-on-full stays a corruption backstop instead of
+/// wiping the memo mid-pass right at today's scale.
+const LINEAGE_TIP_MEMO_LIMIT: usize = 16_384;
 
 fn lineage_tip_memo() -> &'static Mutex<HashMap<String, LineageTipMemoEntry>> {
     static MEMO: OnceLock<Mutex<HashMap<String, LineageTipMemoEntry>>> = OnceLock::new();
@@ -293,24 +311,35 @@ fn transcript_fingerprint(dir: &Path) -> (u64, u128) {
 /// walker AND its own tip reduction (`successor_tip` past this row —
 /// only `Active` records qualify; `Superseded` rows are dead
 /// incarnations, never what a card should point at). Memoized on (own
-/// transcript, wrapper index) fingerprints: a dead dir never changes and
-/// every new wrapper generation writes the index, so hits are exact and
-/// misses are one bounded walk.
-fn dead_row_lineage_tip(home: Option<&Path>, session_id: &str, dir: &Path) -> LineageTip {
+/// transcript fingerprint, wrapper-index lineage epoch): a dead dir
+/// never changes and every new wrapper generation writes an index row,
+/// so hits are exact and misses are one bounded walk — seeded with the
+/// row's own dir so the walk never pays the id→dir directory probe for
+/// its seed. The epoch (not the raw index fingerprint — see the module
+/// header) is resolved once per build by the caller.
+fn dead_row_lineage_tip(
+    home: Option<&Path>,
+    session_id: &str,
+    dir: &Path,
+    lineage_epoch: Option<u64>,
+) -> LineageTip {
     let Some(home) = home else {
         return LineageTip::NoWrapperHistory;
     };
     let transcript = transcript_fingerprint(dir);
-    let index = crate::external_wrapper_index::index_fingerprint(home);
+    let epoch = lineage_epoch.unwrap_or_else(|| crate::external_wrapper_index::lineage_epoch(home));
     if let Ok(memo) = lineage_tip_memo().lock() {
         if let Some(entry) = memo.get(session_id) {
-            if entry.transcript_fingerprint == transcript && entry.index_fingerprint == index {
+            if entry.transcript_fingerprint == transcript && entry.lineage_epoch == epoch {
                 return entry.tip.clone();
             }
         }
     }
-    let lineage =
-        crate::session_supervisor::resume_lineage::resolve_resume_lineage(home, &[session_id]);
+    let lineage = crate::session_supervisor::resume_lineage::resolve_resume_lineage_with_dir_hints(
+        home,
+        &[session_id],
+        &[(session_id, dir)],
+    );
     let tip = if let Some(record) = lineage.successor_tip(&[session_id]) {
         LineageTip::ContinuedAs {
             source: record.source.clone(),
@@ -330,7 +359,7 @@ fn dead_row_lineage_tip(home: Option<&Path>, session_id: &str, dir: &Path) -> Li
             session_id.to_string(),
             LineageTipMemoEntry {
                 transcript_fingerprint: transcript,
-                index_fingerprint: index,
+                lineage_epoch: epoch,
                 tip: tip.clone(),
             },
         );
@@ -1018,6 +1047,50 @@ mod tests {
         assert_eq!(
             row["boot"]["continued_as"]["session_id"], "gl4-wrapper-child",
             "the retirement edge must reach the edit-branch child — only the shared resolver walks it"
+        );
+    }
+
+    /// The tip memo's freshness law under its epoch key: a tip memoized
+    /// in one build (here: SelfTip — the chain's only wrapper) must NOT
+    /// be served by a later build once the index gained a walk-relevant
+    /// change (a successor generation demoting the seed). The memo keys
+    /// on the lineage EPOCH — recency restamps hold it steady (pinned in
+    /// `external_wrapper_index::tests::lineage_epoch_tracks_walk_relevant_content_only`),
+    /// so this test pins the other direction: real changes must break
+    /// the memo hit.
+    #[test]
+    fn stale_tip_never_served_across_epoch_change() {
+        let home = tempfile::tempdir().unwrap();
+        let solo_dir = announce(home.path(), "gl5-wrapper-solo", &["gl5-b1"]);
+        let watershed = now_secs() + 3_600;
+
+        let mut row = serde_json::json!({});
+        joins_with_home(Some(watershed), Some(&[]), home.path()).attach(
+            &mut row,
+            "gl5-wrapper-solo",
+            &solo_dir,
+        );
+        assert_eq!(
+            row["boot"]["lineage_tip"], true,
+            "the sole wrapper is its own tip (memoized this build)"
+        );
+
+        // A successor generation announces the same conversation: new
+        // index row + the solo row's demotion — a walk-relevant change.
+        announce(home.path(), "gl5-wrapper-heir", &["gl5-b1"]);
+        let mut row = serde_json::json!({});
+        joins_with_home(Some(watershed), Some(&[]), home.path()).attach(
+            &mut row,
+            "gl5-wrapper-solo",
+            &solo_dir,
+        );
+        assert_eq!(
+            row["boot"]["lineage_tip"], false,
+            "the memoized SelfTip must not survive the epoch change"
+        );
+        assert_eq!(
+            row["boot"]["continued_as"]["session_id"], "gl5-wrapper-heir",
+            "the re-walk must reach the successor generation"
         );
     }
 
