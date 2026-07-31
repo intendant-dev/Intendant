@@ -65,7 +65,9 @@ fn index_cache() -> &'static Mutex<HashMap<PathBuf, CachedWrapperIndex>> {
 /// stat and a restamp-only rewrite costs one re-hash, not a re-walk.
 pub fn lineage_epoch(home: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
-    static EPOCH_CACHE: OnceLock<Mutex<HashMap<PathBuf, ((u64, u128), u64)>>> = OnceLock::new();
+    /// (file fingerprint the epoch was computed from, the epoch).
+    type CachedEpoch = ((u64, u128), u64);
+    static EPOCH_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedEpoch>>> = OnceLock::new();
     let cache = EPOCH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let path = index_path(home);
     let fingerprint = index_file_fingerprint(&path);
