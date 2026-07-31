@@ -51,6 +51,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda patch 01KX --due +3d   # presentation edits (title/body/tags/due)
 "$INTENDANT" ctl agenda schedule 01KX --goal "Run the soak checks and summarize" --at +2d
 "$INTENDANT" ctl agenda schedule 01KX --goal "Weekly housekeeping pass" --at "+1d" --every 7d   # STANDING: one approval covers the series
+"$INTENDANT" ctl agenda withdraw 01KX --reason "superseded by the rewrite"   # take back a PENDING unapproved proposal (yours included); approved = owner's revoke-schedule
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
 "$INTENDANT" ctl agenda attest 01KX --occurrence 98eb14c2... --outcome partial --note "3 of 5 slices landed" --ref file:$HOME/handoff.md   # fired sessions: self-report your occurrence (rider names its id)
 "$INTENDANT" ctl agenda block 01KX "gpt-live-1 available on the API (currently app-only)"
@@ -105,7 +106,11 @@ dashboard, attributed to your session.
   attention rail. Approval is the owner's act alone (dashboard or an
   owner shell) — you may propose, but never attempt `approve` or
   `revoke-schedule`, including on your own manifest: the daemon refuses
-  agent and peer callers by policy. Approval binds the exact manifest
+  agent and peer callers by policy. `withdraw` is the one take-back you
+  DO hold: it clears a still-UNAPPROVED proposal (your own mooted or
+  superseded one — say why with `--reason`; it lands in the item
+  thread), leaves fired history untouched, and refuses on an approved
+  manifest. Approval binds the exact manifest
   digest, so revising the manifest (re-running `schedule`) voids any
   approval. The outcome writes back to the item (`effects[].last_run`
   in `list --json`: state, session id, note) — check it next session.

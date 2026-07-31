@@ -701,14 +701,17 @@ function agendaBlockedLine(item) {
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
-// running | suspended | pending | standing | armed | finished, plus the
-// trigger vocabulary (Track T manifests carry `trigger` INSTEAD of a
-// clock cadence): watching (on_item_match, approved), waiting
-// (on_unblock, prerequisites still open), ready (on_unblock, every
-// prerequisite complete — the scheduler dispatches within the minute).
-// Mirrors the daemon's fold judgments (AgendaEffect::suspended, the
-// scheduler's next-instant derivation, the trigger arm rules) — derived
-// here every paint, never stored.
+// running | withdrawn | suspended | pending | standing | armed |
+// finished, plus the trigger vocabulary (Track T manifests carry
+// `trigger` INSTEAD of a clock cadence): watching (on_item_match,
+// approved), waiting (on_unblock, prerequisites still open), ready
+// (on_unblock, every prerequisite complete — the scheduler dispatches
+// within the minute). withdrawn (the daemon's fold marker) is
+// fired-history rendering only — never pending, never approvable; a
+// still-started run outranks it (the firing is real and settles onto
+// the entry). Mirrors the daemon's fold judgments
+// (AgendaEffect::suspended, the scheduler's next-instant derivation,
+// the trigger arm rules) — derived here every paint, never stored.
 function agendaEffectState(item) {
   const effect = (item.effects || [])[0];
   if (!effect || !effect.manifest) return null;
@@ -730,20 +733,21 @@ function agendaEffectState(item) {
     next = manifest.fire_at_ms + behind * rec.every_ms;
   }
   const kind = running ? 'running'
-    : suspended ? 'suspended'
-      : !effect.approval ? 'pending'
-        : trig ? (trig.kind === 'on_item_match' ? 'watching'
-          : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
-            ? 'ready' : 'waiting')
-          : rec ? 'standing'
-            // The missed-window terminal is its own self-explaining
-            // state, not a silent 'finished': a one-shot whose floor
-            // passed while the daemon was down carries its one-tap
-            // remedy (re-approve to reschedule) on the card. A missed
-            // instant on a standing series stays 'standing' above —
-            // the series continues unaffected.
-            : effect.last_run && effect.last_run.state === 'missed' ? 'missed'
-              : next > Date.now() ? 'armed' : 'finished';
+    : effect.withdrawn ? 'withdrawn'
+      : suspended ? 'suspended'
+        : !effect.approval ? 'pending'
+          : trig ? (trig.kind === 'on_item_match' ? 'watching'
+            : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
+              ? 'ready' : 'waiting')
+            : rec ? 'standing'
+              // The missed-window terminal is its own self-explaining
+              // state, not a silent 'finished': a one-shot whose floor
+              // passed while the daemon was down carries its one-tap
+              // remedy (re-approve to reschedule) on the card. A missed
+              // instant on a standing series stays 'standing' above —
+              // the series continues unaffected.
+              : effect.last_run && effect.last_run.state === 'missed' ? 'missed'
+                : next > Date.now() ? 'armed' : 'finished';
   return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 

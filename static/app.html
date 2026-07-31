@@ -38039,7 +38039,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5e2430347e404cac';
+const INTENDANT_APP_BUILD = '75077ff6c32a322c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -93270,14 +93270,17 @@ function agendaBlockedLine(item) {
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
-// running | suspended | pending | standing | armed | finished, plus the
-// trigger vocabulary (Track T manifests carry `trigger` INSTEAD of a
-// clock cadence): watching (on_item_match, approved), waiting
-// (on_unblock, prerequisites still open), ready (on_unblock, every
-// prerequisite complete — the scheduler dispatches within the minute).
-// Mirrors the daemon's fold judgments (AgendaEffect::suspended, the
-// scheduler's next-instant derivation, the trigger arm rules) — derived
-// here every paint, never stored.
+// running | withdrawn | suspended | pending | standing | armed |
+// finished, plus the trigger vocabulary (Track T manifests carry
+// `trigger` INSTEAD of a clock cadence): watching (on_item_match,
+// approved), waiting (on_unblock, prerequisites still open), ready
+// (on_unblock, every prerequisite complete — the scheduler dispatches
+// within the minute). withdrawn (the daemon's fold marker) is
+// fired-history rendering only — never pending, never approvable; a
+// still-started run outranks it (the firing is real and settles onto
+// the entry). Mirrors the daemon's fold judgments
+// (AgendaEffect::suspended, the scheduler's next-instant derivation,
+// the trigger arm rules) — derived here every paint, never stored.
 function agendaEffectState(item) {
   const effect = (item.effects || [])[0];
   if (!effect || !effect.manifest) return null;
@@ -93299,20 +93302,21 @@ function agendaEffectState(item) {
     next = manifest.fire_at_ms + behind * rec.every_ms;
   }
   const kind = running ? 'running'
-    : suspended ? 'suspended'
-      : !effect.approval ? 'pending'
-        : trig ? (trig.kind === 'on_item_match' ? 'watching'
-          : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
-            ? 'ready' : 'waiting')
-          : rec ? 'standing'
-            // The missed-window terminal is its own self-explaining
-            // state, not a silent 'finished': a one-shot whose floor
-            // passed while the daemon was down carries its one-tap
-            // remedy (re-approve to reschedule) on the card. A missed
-            // instant on a standing series stays 'standing' above —
-            // the series continues unaffected.
-            : effect.last_run && effect.last_run.state === 'missed' ? 'missed'
-              : next > Date.now() ? 'armed' : 'finished';
+    : effect.withdrawn ? 'withdrawn'
+      : suspended ? 'suspended'
+        : !effect.approval ? 'pending'
+          : trig ? (trig.kind === 'on_item_match' ? 'watching'
+            : (item.relies_on || []).every((link) => agendaLinkState(link).satisfied)
+              ? 'ready' : 'waiting')
+            : rec ? 'standing'
+              // The missed-window terminal is its own self-explaining
+              // state, not a silent 'finished': a one-shot whose floor
+              // passed while the daemon was down carries its one-tap
+              // remedy (re-approve to reschedule) on the card. A missed
+              // instant on a standing series stays 'standing' above —
+              // the series continues unaffected.
+              : effect.last_run && effect.last_run.state === 'missed' ? 'missed'
+                : next > Date.now() ? 'armed' : 'finished';
   return { effect, manifest, rec, trig, threshold, suspended, running, next, kind };
 }
 
@@ -95940,6 +95944,10 @@ function agendaCardEffectStrip(item) {
   // affordance becomes fixing the plan, with the named field focused.
   const refusal = e.fireability_refusal || null;
   const fixBtn = (label) => `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml((refusal && refusal.field) || '')}" title="${escapeHtml((refusal && refusal.reason) || 'Fix the plan')}">${label}</button>`;
+  // The recorded "never" beside Approve/Fix-plan (withdraw_effect): the
+  // proposal stops soliciting approval NOW; the item, its thread, and
+  // any fired history stay — a fresh propose revives the lane anytime.
+  const declineBtn = `<button type="button" class="ag2-btn ghost" data-op-btn="withdraw_effect" data-id="${id}" title="Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime">Decline</button>`;
   if (st.kind === 'pending') {
     const proposer = e.proposed_kind === 'dashboard'
       ? 'You proposed'
@@ -95954,6 +95962,7 @@ function agendaCardEffectStrip(item) {
         ? fixBtn('Fix plan…')
         : `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
           + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" data-focus="" title="Small tweaks without ceremony — shape, executor, project, goal, cadence. Saving mints a new digest for you to approve">Edit…</button>`)
+      + declineBtn
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'missed') {
     // The missed-window terminal, self-explaining and carrying its one
@@ -96033,7 +96042,15 @@ function agendaAutomationStripHtml(item) {
   if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);
   }
-  if (st.suspended) {
+  if (st.kind === 'withdrawn') {
+    // The husk the daemon keeps for its fired history: the proposal was
+    // taken back — nothing pends, nothing fires; the run record above
+    // is why the entry still renders at all.
+    const w = e.withdrawn || {};
+    const wTip = `Withdrawn ${w.kind === 'dashboard' ? 'by you' : `by “${agendaActorLabel(w) || 'a session'}”`}`
+      + `${w.reason ? ` — ${w.reason}` : ''} · the reason lives in the item thread; propose again anytime`;
+    meta.push(`<span class="ag2-auto-streak" title="${escapeHtml(wTip)}">proposal withdrawn ${escapeHtml(agendaRelTime(w.at_ms || 0))}</span>`);
+  } else if (st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Suspended — never silently re-fired">suspended after ${e.consecutive_failures}</span>`);
   } else if (e.next_fire_ms) {
     meta.push(`<span title="The planner's real next instant, served with the item">next ${escapeHtml(agendaAbsTime(e.next_fire_ms))}</span>`);
@@ -96064,12 +96081,17 @@ function agendaAutomationStripHtml(item) {
   // Same fireability gating as the inline strip: a served refusal
   // withholds Approve/Re-arm and offers the focused fix instead.
   const refusal = e.fireability_refusal || null;
+  // Same decline lane as the inline strip: the recorded "never" beside
+  // Approve/Fix-plan on every unapproved pending row.
+  const declineBtn = `<button type="button" class="ag2-btn ghost" data-op-btn="withdraw_effect" data-id="${id}" title="Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime">Decline</button>`;
   if (refusal && (st.kind === 'pending' || st.kind === 'suspended')) {
     meta.push(`<span class="ag2-auto-unfireable" title="${escapeHtml(refusal.reason)}">not fireable: ${escapeHtml(refusal.field)}</span>`);
-    actions = `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml(refusal.field)}" title="${escapeHtml(refusal.reason)}">Fix plan…</button>`;
+    actions = `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml(refusal.field)}" title="${escapeHtml(refusal.reason)}">Fix plan…</button>`
+      + (st.kind === 'pending' ? declineBtn : '');
   } else if (st.kind === 'pending') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
-      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`;
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`
+      + declineBtn;
   } else if (st.kind === 'suspended') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`;
   } else if (st.kind === 'missed') {
@@ -96085,8 +96107,9 @@ function agendaAutomationStripHtml(item) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
   const autoTone = ['pending', 'suspended', 'missed'].includes(st.kind) ? 'amber'
-    : st.kind === 'standing' ? 'green'
-      : ['armed', 'watching', 'waiting'].includes(st.kind) ? 'sky' : 'iris';
+    : st.kind === 'withdrawn' ? 'neutral'
+      : st.kind === 'standing' ? 'green'
+        : ['armed', 'watching', 'waiting'].includes(st.kind) ? 'sky' : 'iris';
   const autoSemantic = ['pending', 'suspended', 'missed'].includes(st.kind) ? 'is-attention'
     : ['running', 'ready'].includes(st.kind) ? 'is-progress' : '';
   return `<div class="ag2-eff ag2-auto t-${autoTone}${autoSemantic ? ` ${autoSemantic}` : ''}">
@@ -97058,6 +97081,7 @@ window.qa = Object.assign(window.qa || {}, {
         kind: st.kind,
         refusal: st.effect.fireability_refusal || null,
         hasApprove: !!document.querySelector(`[data-op-btn="approve_effect"][data-id="${sel}"]`),
+        hasDecline: !!document.querySelector(`[data-op-btn="withdraw_effect"][data-id="${sel}"]`),
         hasReschedule: !!document.querySelector(`[data-resched-effect="${sel}"]`),
         hasFixPlan: !!document.querySelector(`[data-edit-sched="${sel}"][data-focus]:not([data-focus=""])`),
       }];
@@ -97289,6 +97313,7 @@ function agendaInspEffectHtml(item) {
       suspended: ['amber', `Suspended — ${e.consecutive_failures} failures in a row`],
       running: ['iris', 'Running now'],
       finished: ['neutral', 'Ran — outcome below'],
+      withdrawn: ['neutral', 'Proposal withdrawn — nothing pends; history below'],
       watching: ['sky', 'Watching for matching items'],
       waiting: ['sky', 'Armed — fires when the prerequisites complete'],
       ready: ['iris', 'Prerequisites complete — fires within the minute'],
@@ -97377,6 +97402,8 @@ function agendaInspEffectHtml(item) {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
       A('Edit schedule…', 'sched');
+      A('Decline', 'eff-withdraw', 'danger',
+        'Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
       A('Revoke approval', 'eff-revoke', 'danger', 'Instant, owner-surface only');
@@ -97914,6 +97941,11 @@ function agendaInspClick(e) {
       break;
     }
     case 'eff-revoke': agendaSendOp({ op: 'revoke_effect', id: item.id }, act); break;
+    // Decline a still-unapproved proposal (withdraw_effect): stops the
+    // approval solicitation now; the item, thread, and fired history
+    // stay. The daemon refuses on an approved manifest (that side is
+    // Revoke) — no digest rides this op, there is nothing to bind.
+    case 'eff-withdraw': agendaSendOp({ op: 'withdraw_effect', id: item.id }, act); break;
     case 'eff-run-now':
       // One extra occurrence of the approved standing manifest — the
       // daemon refuses (named) outside its rules: recurring + approved,
@@ -101299,6 +101331,8 @@ function agendaHoodOpVerb(op, envelope) {
     case 'propose_effect': return 'manifest proposed';
     case 'approve_effect': return 'approved — digest bound';
     case 'revoke_effect': return 'approval revoked';
+    case 'withdraw_effect':
+      return op.reason ? `proposal withdrawn — ${op.reason}` : 'proposal withdrawn';
     case 'request_occurrence': return 'run requested';
     case 'record_occurrence': return `run ${op.state || '—'}`;
     case 'attest': return `attested ${op.outcome || '—'} — self-report`;
@@ -101315,7 +101349,7 @@ function agendaHoodOpDot(op, known) {
     case 'set_blocker': return 'rose';
     case 'clear_blocker': case 'approve_effect': case 'answer': case 'complete': return 'green';
     case 'add_ref': case 'remove_ref': case 'record_ask_delivery': return 'sky';
-    case 'propose_effect': case 'revoke_effect': return 'amber';
+    case 'propose_effect': case 'revoke_effect': case 'withdraw_effect': return 'amber';
     case 'record_occurrence':
       return op.state === 'completed' || op.state === 'delivered' ? 'green'
         : op.state === 'failed' ? 'rose'

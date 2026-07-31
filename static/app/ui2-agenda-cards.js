@@ -977,6 +977,10 @@ function agendaCardEffectStrip(item) {
   // affordance becomes fixing the plan, with the named field focused.
   const refusal = e.fireability_refusal || null;
   const fixBtn = (label) => `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml((refusal && refusal.field) || '')}" title="${escapeHtml((refusal && refusal.reason) || 'Fix the plan')}">${label}</button>`;
+  // The recorded "never" beside Approve/Fix-plan (withdraw_effect): the
+  // proposal stops soliciting approval NOW; the item, its thread, and
+  // any fired history stay — a fresh propose revives the lane anytime.
+  const declineBtn = `<button type="button" class="ag2-btn ghost" data-op-btn="withdraw_effect" data-id="${id}" title="Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime">Decline</button>`;
   if (st.kind === 'pending') {
     const proposer = e.proposed_kind === 'dashboard'
       ? 'You proposed'
@@ -991,6 +995,7 @@ function agendaCardEffectStrip(item) {
         ? fixBtn('Fix plan…')
         : `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${escapeHtml(e.digest || '')}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
           + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" data-focus="" title="Small tweaks without ceremony — shape, executor, project, goal, cadence. Saving mints a new digest for you to approve">Edit…</button>`)
+      + declineBtn
       + `<button type="button" class="ag2-btn ghost" data-open-item="${id}">Review</button>`;
   } else if (st.kind === 'missed') {
     // The missed-window terminal, self-explaining and carrying its one
@@ -1070,7 +1075,15 @@ function agendaAutomationStripHtml(item) {
   if ((e.consecutive_failures || 0) > 0 && !st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Consecutive failed/unknown outcomes — the series suspends at ${st.threshold}">streak ${e.consecutive_failures}/${st.threshold}</span>`);
   }
-  if (st.suspended) {
+  if (st.kind === 'withdrawn') {
+    // The husk the daemon keeps for its fired history: the proposal was
+    // taken back — nothing pends, nothing fires; the run record above
+    // is why the entry still renders at all.
+    const w = e.withdrawn || {};
+    const wTip = `Withdrawn ${w.kind === 'dashboard' ? 'by you' : `by “${agendaActorLabel(w) || 'a session'}”`}`
+      + `${w.reason ? ` — ${w.reason}` : ''} · the reason lives in the item thread; propose again anytime`;
+    meta.push(`<span class="ag2-auto-streak" title="${escapeHtml(wTip)}">proposal withdrawn ${escapeHtml(agendaRelTime(w.at_ms || 0))}</span>`);
+  } else if (st.suspended) {
     meta.push(`<span class="ag2-auto-streak" title="Suspended — never silently re-fired">suspended after ${e.consecutive_failures}</span>`);
   } else if (e.next_fire_ms) {
     meta.push(`<span title="The planner's real next instant, served with the item">next ${escapeHtml(agendaAbsTime(e.next_fire_ms))}</span>`);
@@ -1101,12 +1114,17 @@ function agendaAutomationStripHtml(item) {
   // Same fireability gating as the inline strip: a served refusal
   // withholds Approve/Re-arm and offers the focused fix instead.
   const refusal = e.fireability_refusal || null;
+  // Same decline lane as the inline strip: the recorded "never" beside
+  // Approve/Fix-plan on every unapproved pending row.
+  const declineBtn = `<button type="button" class="ag2-btn ghost" data-op-btn="withdraw_effect" data-id="${id}" title="Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime">Decline</button>`;
   if (refusal && (st.kind === 'pending' || st.kind === 'suspended')) {
     meta.push(`<span class="ag2-auto-unfireable" title="${escapeHtml(refusal.reason)}">not fireable: ${escapeHtml(refusal.field)}</span>`);
-    actions = `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml(refusal.field)}" title="${escapeHtml(refusal.reason)}">Fix plan…</button>`;
+    actions = `<button type="button" class="ag2-btn prim" data-edit-sched="${id}" data-focus="${escapeHtml(refusal.field)}" title="${escapeHtml(refusal.reason)}">Fix plan…</button>`
+      + (st.kind === 'pending' ? declineBtn : '');
   } else if (st.kind === 'pending') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Binds this exact manifest digest — any edit voids it">Approve</button>`
-      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`;
+      + `<button type="button" class="ag2-btn ghost" data-edit-sched="${id}" title="Small tweaks without ceremony — saving mints a new digest for you to approve">Edit…</button>`
+      + declineBtn;
   } else if (st.kind === 'suspended') {
     actions = `<button type="button" class="ag2-btn prim" data-op-btn="approve_effect" data-id="${id}" data-digest="${digest}" title="Re-approve the unchanged digest — resets the streak">Re-arm</button>`;
   } else if (st.kind === 'missed') {
@@ -1122,8 +1140,9 @@ function agendaAutomationStripHtml(item) {
     actions = `<button type="button" class="ag2-btn ghost" data-op-btn="revoke_effect" data-id="${id}" title="Withdraws the approval; the manifest and history stay">Revoke</button>`;
   }
   const autoTone = ['pending', 'suspended', 'missed'].includes(st.kind) ? 'amber'
-    : st.kind === 'standing' ? 'green'
-      : ['armed', 'watching', 'waiting'].includes(st.kind) ? 'sky' : 'iris';
+    : st.kind === 'withdrawn' ? 'neutral'
+      : st.kind === 'standing' ? 'green'
+        : ['armed', 'watching', 'waiting'].includes(st.kind) ? 'sky' : 'iris';
   const autoSemantic = ['pending', 'suspended', 'missed'].includes(st.kind) ? 'is-attention'
     : ['running', 'ready'].includes(st.kind) ? 'is-progress' : '';
   return `<div class="ag2-eff ag2-auto t-${autoTone}${autoSemantic ? ` ${autoSemantic}` : ''}">

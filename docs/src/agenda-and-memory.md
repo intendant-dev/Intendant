@@ -89,8 +89,10 @@ The supported commands are:
   optionally carries a rich-ask breakdown);
 - `annotate`, `set_blocker`, `clear_blocker`, `add_relies_on`, and
   `remove_relies_on` — the item's thread and gates (below);
-- `propose_effect`, `approve_effect`, and `revoke_effect` for a scheduled
-  session.
+- `propose_effect`, `approve_effect`, `revoke_effect`, and
+  `withdraw_effect` for a scheduled session (withdraw takes back a
+  still-unapproved proposal — the decline gesture; revoke stays the
+  owner's withdrawal of a granted approval).
 
 Items use monotonic ULIDs, so lexicographic order is creation order. Titles,
 bodies, tags, and due times have bounded intake. There is no destructive
@@ -425,6 +427,26 @@ Agent sessions and peer daemons may propose manifests but cannot approve or
 revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
+
+**Withdrawing a pending proposal (`withdraw_effect`,
+`ctl agenda withdraw ID [--reason]`, the card's Decline).** A
+still-unapproved proposal can be taken back — the recorded "never" the
+approval rail needs to tell "approve me" from "this proposal is dead"
+(a mooted revision, a re-propose race, a proposal the owner declines).
+Withdraw is **propose-class**, mirroring `propose_effect`'s actor gate
+exactly: any actor who may propose may already replace the pending
+bytes wholesale, so replace-with-nothing grants strictly less — agents
+may withdraw their own mooted proposals. The approved side is untouched:
+withdrawing an approved manifest refuses with a pointer at
+`revoke_effect`, which stays owner-surface. Mechanics: the op is
+append-only and attributed like every act; the reason lands in the item
+thread as attributed data; a never-fired lineage leaves the effects view
+entirely, while a lineage with fired history keeps its entry — manifest,
+`last_run`, attestation, streak — marked `withdrawn` (never approvable,
+never pending, never planned; approve on it refuses with a re-propose
+pointer). An ordinary re-propose revives the lane either way. Older
+builds skip the unknown op line whole: the proposal stays visible there
+— honest staleness, never a mangled state.
 
 **Propose-time fireability (2026-07-30): an approvable manifest IS a
 fireable manifest.** One validator (`agenda/fireability.rs`, derived from

@@ -282,6 +282,7 @@ window.qa = Object.assign(window.qa || {}, {
         kind: st.kind,
         refusal: st.effect.fireability_refusal || null,
         hasApprove: !!document.querySelector(`[data-op-btn="approve_effect"][data-id="${sel}"]`),
+        hasDecline: !!document.querySelector(`[data-op-btn="withdraw_effect"][data-id="${sel}"]`),
         hasReschedule: !!document.querySelector(`[data-resched-effect="${sel}"]`),
         hasFixPlan: !!document.querySelector(`[data-edit-sched="${sel}"][data-focus]:not([data-focus=""])`),
       }];
@@ -513,6 +514,7 @@ function agendaInspEffectHtml(item) {
       suspended: ['amber', `Suspended — ${e.consecutive_failures} failures in a row`],
       running: ['iris', 'Running now'],
       finished: ['neutral', 'Ran — outcome below'],
+      withdrawn: ['neutral', 'Proposal withdrawn — nothing pends; history below'],
       watching: ['sky', 'Watching for matching items'],
       waiting: ['sky', 'Armed — fires when the prerequisites complete'],
       ready: ['iris', 'Prerequisites complete — fires within the minute'],
@@ -601,6 +603,8 @@ function agendaInspEffectHtml(item) {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
       A('Edit schedule…', 'sched');
+      A('Decline', 'eff-withdraw', 'danger',
+        'Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
       A('Edit (voids approval)', 'sched');
       A('Revoke approval', 'eff-revoke', 'danger', 'Instant, owner-surface only');
@@ -1138,6 +1142,11 @@ function agendaInspClick(e) {
       break;
     }
     case 'eff-revoke': agendaSendOp({ op: 'revoke_effect', id: item.id }, act); break;
+    // Decline a still-unapproved proposal (withdraw_effect): stops the
+    // approval solicitation now; the item, thread, and fired history
+    // stay. The daemon refuses on an approved manifest (that side is
+    // Revoke) — no digest rides this op, there is nothing to bind.
+    case 'eff-withdraw': agendaSendOp({ op: 'withdraw_effect', id: item.id }, act); break;
     case 'eff-run-now':
       // One extra occurrence of the approved standing manifest — the
       // daemon refuses (named) outside its rules: recurring + approved,
