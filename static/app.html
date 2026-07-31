@@ -24634,6 +24634,11 @@ html.ui-v2 .ag2-graph-projchip:disabled {
   opacity: 0.45;
   cursor: default;
 }
+html.ui-v2 .ag2-graph-projdiv {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
 html.ui-v2 .ag2-graph-panel.fullscreen {
   position: fixed;
   inset: 0;
@@ -37912,7 +37917,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'b8ee6ed750ff155f';
+const INTENDANT_APP_BUILD = 'a3f3797f78aa3ff0';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -98359,6 +98364,23 @@ let agendaGraphChosen = null; // null = auto ('hubs' past the cap, else 'all')
 let agendaGraphTerritory = false;
 let agendaGraphSubtreeTerr = new Map();
 let agendaGraphTerrStats = { shown: 0, total: 0 };
+// Arrangement mode over the current pool: 'orbit' (the default force
+// constellation) or one of the ontology lenses — 'flow' (relies_on
+// layered left→right), 'time' (age as radius, newest center), 'actor'
+// (clustered by parking provenance), 'attention' (needs-you gravity).
+// Modes bias the layout and emphasis only; pool, links, picking, caps,
+// and card-lens parity are untouched. Build computes the active mode's
+// per-node targets; relax applies them as one extra spring.
+let agendaGraphMode = 'orbit';
+const AGENDA_GRAPH_MODES = [
+  ['flow', 'flow', 'dependency flow — prerequisites left, dependents right'],
+  ['time', 'time', 'age as radius — newest at the center'],
+  ['actor', 'actor', 'clustered by who parked it'],
+  ['attention', 'attention', 'needs-you gravity — attention items pull center'],
+];
+let agendaGraphTimeMarks = [];
+let agendaGraphActorMarks = [];
+let agendaGraphAttnCount = 0;
 let agendaGraphFullscreen = false;
 let agendaGraphEscHook = null;
 
@@ -98522,15 +98544,17 @@ function agendaGraphWireChrome(host, overCapAll) {
   else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
   if (hintLine) {
+    const modeHint = (AGENDA_GRAPH_MODES.find(([m]) => m === agendaGraphMode) || [])[2];
     hintLine.textContent = overCapAll
       ? 'everything exceeds the cap — pick hubs, or focus one hub'
-      : agendaGraphProjection === 'hubs'
-        ? 'hub overview — click a hub to focus its subtree'
-        : agendaGraphProjection === 'focus'
-          ? (agendaGraphTerritory
-            ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
-            : 'focused subtree — double-click empty space to clear')
-          : 'drag to orbit · click a node to open it · double-click a hub to focus';
+      : modeHint
+        || (agendaGraphProjection === 'hubs'
+          ? 'hub overview — click a hub to focus its subtree'
+          : agendaGraphProjection === 'focus'
+            ? (agendaGraphTerritory
+              ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
+              : 'focused subtree — double-click empty space to clear')
+            : 'drag to orbit · click a node to open it · double-click a hub to focus');
   }
   const note = host.querySelector('#ag2-graph-capnote');
   if (note) note.hidden = !overCapAll;
@@ -98576,6 +98600,17 @@ function agendaGraphWireChrome(host, overCapAll) {
         agendaGraphFocus = null;
         agendaRenderTab();
       };
+    } else if (kind && kind.startsWith('mode-')) {
+      const mode = kind.slice(5);
+      chip.classList.toggle('active', agendaGraphMode === mode);
+      chip.disabled = overCapAll;
+      chip.title = agendaGraphMode === mode
+        ? 'back to the orbit arrangement'
+        : (AGENDA_GRAPH_MODES.find(([m]) => m === mode) || [])[2] || mode;
+      chip.onclick = () => {
+        agendaGraphMode = agendaGraphMode === mode ? 'orbit' : mode;
+        agendaRenderTab();
+      };
     } else if (kind === 'full') {
       chip.textContent = agendaGraphFullscreen ? '✕ exit full' : '⛶ full';
       chip.classList.toggle('active', agendaGraphFullscreen);
@@ -98610,6 +98645,10 @@ function agendaGraphPanelHtml() {
       <button type="button" class="ag2-graph-projchip" data-proj="all">everything</button>
       <button type="button" class="ag2-graph-projchip" data-proj="terr">territory</button>
       <button type="button" class="ag2-graph-projchip" data-proj="clearfocus" hidden>focused ✕</button>
+      <span class="ag2-graph-projdiv"></span>
+      ${AGENDA_GRAPH_MODES.map(([mode, label]) =>
+    `<button type="button" class="ag2-graph-projchip" data-proj="mode-${mode}">${label}</button>`).join('\n      ')}
+      <span class="ag2-graph-projdiv"></span>
       <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
     </div>
     <div class="ag2-graph-capnote" id="ag2-graph-capnote" hidden>
@@ -98868,7 +98907,7 @@ function agendaGraphBuild() {
       agendaGraphSubtreeTerr.set(hub.id, sum);
     });
   }
-  const key = `${agendaGraphProjection}|${agendaGraphFocus || ''}|terr:${satellites.map((s) => s.key).join(',')};` + items.map((x) => [
+  const key = `${agendaGraphProjection}|${agendaGraphFocus || ''}|${agendaGraphMode}|terr:${satellites.map((s) => s.key).join(',')};` + items.map((x) => [
     x.id,
     x.status,
     x.part_of ? x.part_of.parent_id : '',
@@ -98907,6 +98946,84 @@ function agendaGraphBuild() {
     });
     idx.set(nodeId, agendaGraphNodes.length - 1);
   });
+  // The active mode's per-node layout targets (item nodes only;
+  // satellites keep riding their carrier springs). Node objects are
+  // rebuilt fresh above, so stale mode fields cannot linger.
+  const byIdBuild = new Map(items.map((x) => [x.id, x]));
+  agendaGraphTimeMarks = [];
+  agendaGraphActorMarks = [];
+  agendaGraphAttnCount = 0;
+  if (agendaGraphMode === 'flow') {
+    // relies_on rank: prerequisites left of dependents. Bounded passes
+    // instead of recursion so a foreign log's cycle stays total.
+    const rank = new Map(items.map((x) => [x.id, 0]));
+    for (let pass = 0; pass < 16; pass++) {
+      let moved = false;
+      items.forEach((x) => (x.relies_on || []).forEach((l) => {
+        if (!rank.has(l.target_id)) return;
+        const want = rank.get(l.target_id) + 1;
+        if (want > rank.get(x.id) && want < 40) {
+          rank.set(x.id, want);
+          moved = true;
+        }
+      }));
+      if (!moved) break;
+    }
+    const maxRank = Math.max(1, ...rank.values());
+    agendaGraphNodes.forEach((n) => {
+      if (!n.sat) n.tx = (rank.get(n.id) - maxRank / 2) * 72;
+    });
+  } else if (agendaGraphMode === 'time') {
+    const born = (x) => (x.provenance && x.provenance.created_ms) || x.updated_ms || 0;
+    const times = items.map(born);
+    const newest = Math.max(...times, 1);
+    const oldest = Math.min(...times, newest);
+    const span = Math.max(1, newest - oldest);
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const x = byIdBuild.get(n.id);
+      n.tr = 36 + ((newest - born(x)) / span) * 150;
+    });
+    const day = (ms) => new Date(ms).toISOString().slice(5, 10);
+    agendaGraphTimeMarks = [
+      { r: 36, label: `newest · ${day(newest)}` },
+      { r: 36 + 75, label: day(oldest + span / 2) },
+      { r: 186, label: `oldest · ${day(oldest)}` },
+    ];
+  } else if (agendaGraphMode === 'actor') {
+    const who = (x) => (x.provenance
+      && (x.provenance.source || x.provenance.kind
+        || (x.provenance.principal || '').split(':').pop())) || 'unknown';
+    const counts = new Map();
+    items.forEach((x) => counts.set(who(x), (counts.get(who(x)) || 0) + 1));
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const anchor = new Map(top.map(([name], i) => [name, (i / top.length) * Math.PI * 2]));
+    agendaGraphActorMarks = top.map(([name, count], i) => ({
+      name, count, angle: (i / top.length) * Math.PI * 2,
+    }));
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const a = anchor.get(who(byIdBuild.get(n.id)));
+      n.anchor = a === undefined
+        ? [0, 0, 0]
+        : [Math.cos(a) * 132, 0, Math.sin(a) * 132];
+    });
+  } else if (agendaGraphMode === 'attention') {
+    const now = Date.now();
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const x = byIdBuild.get(n.id);
+      const st = agendaEffectState(x);
+      const attn = x.status === 'open' && (
+        agendaItemIsBlocked(x)
+        || (x.kind === 'question' && !x.answer && !x.dismissed)
+        || (st && (st.kind === 'pending' || st.kind === 'suspended'))
+        || (x.due_ms && x.due_ms < now));
+      n.attn = !!attn;
+      n.tr = attn ? 28 : 172;
+      if (attn) agendaGraphAttnCount += 1;
+    });
+  }
   const links = [];
   const seenRel = new Set();
   items.forEach((x) => {
@@ -98991,6 +99108,24 @@ function agendaGraphRelax(iterations) {
       n.p[0] *= 0.9965;
       n.p[1] *= 0.994;
       n.p[2] *= 0.9965;
+      // Mode springs (one per node, fields set by the active mode's
+      // build pass): tx = layered x (flow), tr = radial xz target
+      // (time/attention), anchor = cluster point (actor).
+      if (n.tx !== undefined) {
+        n.p[0] += (n.tx - n.p[0]) * 0.03;
+      }
+      if (n.tr !== undefined) {
+        const cur = Math.hypot(n.p[0], n.p[2]) + 0.01;
+        const f = ((n.tr - cur) * 0.035) / cur;
+        n.p[0] += n.p[0] * f;
+        n.p[2] += n.p[2] * f;
+        n.p[1] *= 0.97;
+      }
+      if (n.anchor) {
+        n.p[0] += (n.anchor[0] - n.p[0]) * 0.025;
+        n.p[1] += (n.anchor[1] - n.p[1]) * 0.02;
+        n.p[2] += (n.anchor[2] - n.p[2]) * 0.025;
+      }
     });
   }
 }
@@ -99161,6 +99296,21 @@ function agendaGraphDraw(ts) {
     }
     g.stroke();
     g.setLineDash([]);
+    if (agendaGraphMode === 'flow' && link.t === 'dep') {
+      // Flow mode: the dependency direction becomes explicit — the
+      // arrowhead sits at the PREREQUISITE end ("waits on →").
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      const ax = b.x - Math.cos(ang) * 11;
+      const ay = b.y - Math.sin(ang) * 11;
+      const sz = 3.4 + (hot ? 0.9 : 0);
+      g.beginPath();
+      g.moveTo(ax + Math.cos(ang) * sz, ay + Math.sin(ang) * sz);
+      g.lineTo(ax + Math.cos(ang + 2.5) * sz, ay + Math.sin(ang + 2.5) * sz);
+      g.lineTo(ax + Math.cos(ang - 2.5) * sz, ay + Math.sin(ang - 2.5) * sz);
+      g.closePath();
+      g.fillStyle = `rgba(${pal.rose},${depth * (hot ? 0.85 : 0.5)})`;
+      g.fill();
+    }
     if (link.t === 'rel' && link.k) {
       // A typed link reads storer → target: arrowhead at the target
       // end, the kind labeled at the midpoint while an endpoint is hot.
@@ -99186,6 +99336,28 @@ function agendaGraphDraw(ts) {
       }
     }
   });
+  // Mode orientation marks: painted, inert pixels like every label.
+  if (agendaGraphMode === 'time' && agendaGraphTimeMarks.length) {
+    g.font = '9px "JetBrains Mono", monospace';
+    agendaGraphTimeMarks.forEach((mark) => {
+      const sr = mark.r * 1.28;
+      g.beginPath();
+      g.arc(cx, cyy, sr, 0, Math.PI * 2);
+      g.strokeStyle = `rgba(${pal.text},.07)`;
+      g.lineWidth = 1;
+      g.stroke();
+      g.fillStyle = pal.t3;
+      g.fillText(mark.label, cx + sr * 0.72, cyy - sr * 0.72);
+    });
+  }
+  if (agendaGraphMode === 'actor') {
+    g.font = '600 9.5px "JetBrains Mono", monospace';
+    agendaGraphActorMarks.forEach((mark) => {
+      const q = project([Math.cos(mark.angle) * 172, -34, Math.sin(mark.angle) * 172]);
+      g.fillStyle = pal.t3;
+      g.fillText(`${mark.name} · ${mark.count}`, q.x - 20, q.y);
+    });
+  }
   // Nodes far → near.
   const order = nodes.map((n, i) => i).sort((a, b) => pts[b].z - pts[a].z);
   order.forEach((i) => {
@@ -99202,9 +99374,12 @@ function agendaGraphDraw(ts) {
       : item.kind === 'question' ? pal.amber : pal.iris;
     const hot = hover === node.id;
     const r = (3.4 + Math.min(kids, 4) * 1.3 + (hot ? 1.4 : 0)) * q.s;
-    const alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
+    let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
+    // Attention mode: needs-you items glow, the rest recede.
+    if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
     g.shadowColor = `rgba(${rgb},.8)`;
-    g.shadowBlur = hot ? 20 : 11 * q.s;
+    g.shadowBlur = hot ? 20
+      : (agendaGraphMode === 'attention' && node.attn ? 24 : 11 * q.s);
     g.beginPath();
     g.arc(q.x, q.y, r, 0, Math.PI * 2);
     g.fillStyle = `rgba(${rgb},${alpha})`;
@@ -99274,7 +99449,11 @@ function agendaGraphDraw(ts) {
   const terrBadge = agendaGraphTerrStats.shown
     ? ` · territory ${agendaGraphTerrStats.shown}${agendaGraphTerrStats.total > agendaGraphTerrStats.shown ? ` of ${agendaGraphTerrStats.total}` : ''}`
     : '';
-  if (agendaGraphProjection !== 'all' || terrBadge) {
+  const modeBadge = agendaGraphMode === 'orbit' ? ''
+    : agendaGraphMode === 'attention'
+      ? ` · attention — ${agendaGraphAttnCount} need you`
+      : ` · ${agendaGraphMode}`;
+  if (agendaGraphProjection !== 'all' || terrBadge || modeBadge) {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
     ).length;
@@ -99292,7 +99471,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + terrBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge, 14, 64);
   }
 }
 
