@@ -2103,8 +2103,12 @@ pub(crate) async fn run_agent_loop(
                     .clone()
                     .map(crate::remote_compute::RemoteCommandCaller::AgentSession)
                     .unwrap_or(crate::remote_compute::RemoteCommandCaller::Unrestricted);
-                let outcome =
-                    crate::remote_compute::execute_remote_command_operation(params, caller).await;
+                let outcome = crate::remote_compute::execute_remote_command_operation(
+                    params,
+                    caller,
+                    Some(&project.root),
+                )
+                .await;
                 let response = match outcome {
                     Ok(job) => serde_json::json!({
                         "ok": true,

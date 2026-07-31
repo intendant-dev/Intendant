@@ -426,6 +426,49 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
+**Propose-time fireability (2026-07-30): an approvable manifest IS a
+fireable manifest.** One validator (`agenda/fireability.rs`, derived from
+`SessionManifest`'s own schema plus daemon state — a new manifest field
+fails the suite until its fireability class is declared) runs in the
+`propose_effect` intake arm, which every mint surface routes through —
+`ctl agenda schedule`, the dashboard's automate modal, the approval-time
+editor, and the stamp lane (each stamped node proposes through the same
+arm) — and runs again at `approve_effect`, the arm gate. Three legs,
+each mirroring what the fire path itself would refuse:
+
+- **Project** resolves NOW through the fire path's own chain — explicit
+  pin → the parking session's recorded root → the daemon default — and
+  the *resolution is recorded* on the digest-bound manifest, so the
+  approval covers WHERE. A projectless daemon that resolves nothing
+  refuses the propose by name, telling the caller exactly which flag to
+  add (`--project`; the sheet's Project field says "required" up front
+  from the same source).
+- **Executor** resolves (explicit selection → the daemon's default
+  backend → internal) and is recorded (`agent_config.agent`), with the
+  config validated *as recorded* — a pin contradicting the resolved
+  backend refuses at the mint instead of resolving surprisingly at fire
+  time. The approval names WHO runs, never empty-means-whatever.
+- **Floor** sanity mirrors the planner's missed rule (the reminder
+  policy's staleness bound): a one-shot whose window already passed, or
+  a series with no live instant left, refuses with the remedy named. A
+  triggered manifest's `fire_at_ms` is the arm floor and is never
+  floor-refused.
+
+Refusals carry the machine-readable grammar `unfireable(<field>): …`
+(field ∈ project/executor/floor — a pinned wire contract). The serving
+seam decorates pending and suspended effects with the same verdict
+(`fireability_refusal`, the `next_fire_ms` pattern: display-only, never
+folded), and the dashboard **never offers Approve or Re-arm against
+it** — the card offers **Fix plan…**, which opens the schedule sheet
+focused on the named field. Legacy pin-less manifests parked before the
+validator meet it at their next approve: the refusal surfaces as that
+same edit prompt, never a silent failure (the daemon-side class law is
+enforced in the approve intake regardless of frontend). A **missed
+window** (the floor passed while the daemon was down) is a
+self-explaining card state carrying its one-tap remedy — **Re-approve
+to reschedule** re-proposes the exact manifest with the floor moved to
+now and re-approves the fresh digest in one gesture.
+
 **The approval-time editor (owner-asked, 2026-07-29).** The pending
 card's **Edit…** opens the schedule sheet as a form over the manifest's
 owner-relevant fields — the goal text, the session **shape**

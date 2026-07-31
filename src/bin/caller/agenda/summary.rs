@@ -297,6 +297,11 @@ pub(crate) struct SummaryEffect {
     pub(crate) last_run_attempt: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_run: Option<SummaryRun>,
+    /// The serving-seam fireability verdict (same field path as the full
+    /// DTO): present exactly when an approve/re-arm affordance would
+    /// meet a named refusal — the cards withhold Approve on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fireability_refusal: Option<super::fireability::FireabilityRefusalView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -488,6 +493,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
                 next_fire_ms: effect.next_fire_ms,
                 consecutive_failures: effect.consecutive_failures,
                 last_run_attempt: effect.last_run_attempt,
+                fireability_refusal: effect.fireability_refusal.clone(),
                 last_run: effect.last_run.as_ref().map(|run| SummaryRun {
                     state: run.state.clone(),
                     at_ms: run.at_ms,
@@ -676,6 +682,11 @@ mod tests {
     fn summary_fields_derive_from_the_full_dto() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: dir.path().to_path_buf(),
+            default_project_root: Some(dir.path().to_path_buf()),
+            default_agent: None,
+        });
         let prereq = add(&mut store, "prerequisite", 1000).unwrap();
         let dependent = add(&mut store, "dependent", 2000).unwrap();
         store
@@ -945,6 +956,11 @@ mod tests {
     fn query_reach_matches_the_client_search() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: dir.path().to_path_buf(),
+            default_project_root: Some(dir.path().to_path_buf()),
+            default_agent: None,
+        });
         let item = store
             .apply_command(
                 AgendaCommand::Add {

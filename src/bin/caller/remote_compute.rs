@@ -6,7 +6,11 @@
 //! clean-worktree default keep a caller from accidentally validating a
 //! different source tree than the one it intended to send.
 
+mod scheduler;
+pub(crate) mod source;
+
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -29,12 +33,33 @@ const HOME_JOB_CAP: usize = 128;
 const WORKER_JOB_CAP: usize = 8;
 const WORKER_SEND_TIMEOUT_S: u64 = 5;
 const WORKER_WATCHDOG_GRACE_S: u64 = 60;
+const CACHE_SERVER_IDLE_TIMEOUT_S: u64 = 600;
 
 pub(crate) const REMOTE_COMMAND_START_KIND: &str = "remote_command_start";
 pub(crate) const REMOTE_COMMAND_CANCEL_KIND: &str = "remote_command_cancel";
 pub(crate) const REMOTE_COMMAND_RESULT_KIND: &str = "remote_command_result";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteSourceMode {
+    #[default]
+    GitRevision,
+    WorkingTree,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteCacheMode {
+    #[default]
+    None,
+    DurableSccache,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RemoteCommandSpec {
     pub argv: Vec<String>,
     #[serde(default)]
@@ -42,9 +67,36 @@ pub(crate) struct RemoteCommandSpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub expected_revision: String,
+    /// Content-addressed source prepared through the separate bounded source
+    /// transfer lane. Absent means execute the worker's provider checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub cache: RemoteCacheMode,
+    /// Dedicated cache credentials/config copied from prefixed home
+    /// variables. This is transported over mTLS and never copied into job
+    /// views or result logs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cache_env: BTreeMap<String, String>,
     #[serde(default = "default_require_clean")]
     pub require_clean: bool,
     pub timeout_s: u64,
+}
+
+impl std::fmt::Debug for RemoteCommandSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteCommandSpec")
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("expected_revision", &self.expected_revision)
+            .field("source_id", &self.source_id)
+            .field("cache", &self.cache)
+            .field("cache_env_keys", &self.cache_env.keys().collect::<Vec<_>>())
+            .field("require_clean", &self.require_clean)
+            .field("timeout_s", &self.timeout_s)
+            .finish()
+    }
 }
 
 fn default_require_clean() -> bool {
@@ -88,6 +140,15 @@ impl RemoteCommandSpec {
                 "timeout_s must be between {MIN_TIMEOUT_S} and {MAX_TIMEOUT_S}"
             ));
         }
+        if self.source_id.as_deref().is_some_and(|id| {
+            !id.starts_with("source-")
+                || id.len() != "source-".len() + 64
+                || !id["source-".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("source_id must be a content-addressed source digest".to_string());
+        }
         if let Some(cwd) = self.cwd.as_deref() {
             validate_relative_cwd(cwd)?;
         }
@@ -112,6 +173,30 @@ impl RemoteCommandSpec {
                 "env may contain at most {MAX_ENV_BYTES} bytes in total"
             ));
         }
+        if self.cache == RemoteCacheMode::None && !self.cache_env.is_empty() {
+            return Err("cache configuration was supplied while cache mode is none".to_string());
+        }
+        if self.cache == RemoteCacheMode::DurableSccache && self.cache_env.is_empty() {
+            return Err("durable_sccache requires dedicated cache configuration".to_string());
+        }
+        let cache_env_bytes = self.cache_env.iter().try_fold(
+            0usize,
+            |total, (key, value)| -> Result<usize, String> {
+                if !valid_env_key(key)
+                    || !dedicated_cache_env_key(key)
+                    || managed_cache_env_key(key)
+                    || value.contains('\0')
+                {
+                    return Err(format!("invalid dedicated cache environment key '{key}'"));
+                }
+                total
+                    .checked_add(key.len().saturating_add(value.len()))
+                    .ok_or_else(|| "cache environment is too large".to_string())
+            },
+        )?;
+        if self.cache_env.len() > MAX_ENV_VARS || cache_env_bytes > MAX_ENV_BYTES {
+            return Err("dedicated cache environment exceeds the command limits".to_string());
+        }
         Ok(())
     }
 }
@@ -123,6 +208,30 @@ fn valid_env_key(key: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn dedicated_cache_env_key(key: &str) -> bool {
+    [
+        "SCCACHE_",
+        "AWS_",
+        "ACTIONS_",
+        "ALIBABA_CLOUD_",
+        "TENCENTCLOUD_",
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
+}
+
+fn managed_cache_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "SCCACHE_DIR"
+            | "SCCACHE_SERVER_PORT"
+            | "SCCACHE_SERVER_UDS"
+            | "SCCACHE_IDLE_TIMEOUT"
+            | "SCCACHE_BASEDIRS"
+            | "SCCACHE_IGNORE_SERVER_IO_ERROR"
+    )
 }
 
 fn validate_relative_cwd(raw: &str) -> Result<(), String> {
@@ -147,6 +256,8 @@ fn validate_relative_cwd(raw: &str) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemoteCommandState {
+    Acquiring,
+    Preparing,
     Queued,
     Running,
     Cancelling,
@@ -185,6 +296,8 @@ pub(crate) struct RemoteCommandResult {
     pub worker_revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_dirty_after: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<RemoteCacheReport>,
 }
 
 impl RemoteCommandResult {
@@ -200,8 +313,26 @@ impl RemoteCommandResult {
             error: Some(error.into()),
             worker_revision: None,
             workspace_dirty_after: None,
+            cache: None,
         }
     }
+
+    fn cancelled(error: impl Into<String>, started: Instant) -> Self {
+        let mut result = Self::failed(error, started);
+        result.state = RemoteCommandState::Cancelled;
+        result
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteCacheReport {
+    pub mode: RemoteCacheMode,
+    pub hits_delta: u64,
+    pub misses_delta: u64,
+    pub writes_delta: u64,
+    pub errors_delta: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +347,12 @@ pub(crate) struct RemoteCommandJobView {
     pub expected_revision: String,
     pub require_clean: bool,
     pub timeout_s: u64,
+    pub source: RemoteSourceMode,
+    pub cache: RemoteCacheMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_bytes: Option<u64>,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,6 +437,7 @@ fn insert_home_job(
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_home_job(job_id: &str) {
     let mut registry = home_registry()
         .lock()
@@ -363,41 +501,110 @@ fn subscribe_home_job(
     Ok(job.updates.subscribe())
 }
 
-pub(crate) async fn start_remote_command(
-    host: &str,
+async fn start_remote_command(
+    requested_host: Option<String>,
     spec: RemoteCommandSpec,
+    source_mode: RemoteSourceMode,
+    snapshot: Option<source::HomeSourceSnapshot>,
+    branch_hint: Option<String>,
     caller: RemoteCommandCaller,
 ) -> Result<RemoteCommandJobView, String> {
     spec.validate()?;
-    let task_id = crate::codex_cloud_attach::cloud_host_task_id(host)
-        .ok_or_else(|| {
-            "unsupported remote host; this release accepts cloud:<codex-task-id>".to_string()
-        })?
-        .to_string();
-    let Some((to_worker, from_worker)) = crate::codex_cloud_attach::attachment_channel(&task_id)
-    else {
-        return Err(format!("remote host {host} has no live attachment"));
-    };
+    let requested_host = requested_host
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+    if requested_host != "auto"
+        && crate::codex_cloud_attach::cloud_host_task_id(&requested_host).is_none()
+    {
+        return Err("unsupported remote host; use auto or cloud:<codex-task-id>".to_string());
+    }
 
     let job_id = format!("remote-{}", uuid::Uuid::new_v4());
     let now = crate::codex_cloud::now_unix_ms();
     let view = RemoteCommandJobView {
         job_id: job_id.clone(),
-        host: host.to_string(),
-        state: RemoteCommandState::Queued,
+        host: requested_host.clone(),
+        state: if requested_host == "auto" {
+            RemoteCommandState::Acquiring
+        } else if snapshot.is_some() {
+            RemoteCommandState::Preparing
+        } else {
+            RemoteCommandState::Queued
+        },
         program: spec.argv[0].clone(),
         arg_count: spec.argv.len().saturating_sub(1),
         cwd: spec.cwd.clone(),
         expected_revision: spec.expected_revision.clone(),
         require_clean: spec.require_clean,
         timeout_s: spec.timeout_s,
+        source: source_mode,
+        cache: spec.cache,
+        snapshot_digest: snapshot.as_ref().map(|snapshot| snapshot.digest.clone()),
+        snapshot_bytes: snapshot
+            .as_ref()
+            .map(source::HomeSourceSnapshot::archive_bytes),
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         result: None,
         error: None,
     };
-    insert_home_job(view, caller.owner_session_id())?;
+    insert_home_job(view.clone(), caller.owner_session_id())?;
 
+    tokio::spawn(async move {
+        if let Err(error) =
+            prepare_and_dispatch(job_id.clone(), requested_host, spec, snapshot, branch_hint).await
+        {
+            update_home_job(&job_id, |job| {
+                if !job.state.is_terminal() {
+                    job.state = RemoteCommandState::Failed;
+                    job.error = Some(error);
+                }
+            });
+        }
+    });
+
+    Ok(view)
+}
+
+async fn prepare_and_dispatch(
+    job_id: String,
+    requested_host: String,
+    mut spec: RemoteCommandSpec,
+    snapshot: Option<source::HomeSourceSnapshot>,
+    branch_hint: Option<String>,
+) -> Result<(), String> {
+    let host = if requested_host == "auto" {
+        let acquired = scheduler::acquire_worker(&spec.expected_revision, branch_hint).await?;
+        acquired.host
+    } else {
+        requested_host
+    };
+    let worker_use = scheduler::WorkerUse::begin(&host)?;
+    if !home_job_is_active(&job_id) {
+        return Ok(());
+    }
+    update_home_job(&job_id, |job| {
+        job.host = host.clone();
+        job.state = if snapshot.is_some() {
+            RemoteCommandState::Preparing
+        } else {
+            RemoteCommandState::Queued
+        };
+    });
+
+    if let Some(snapshot) = snapshot.as_ref() {
+        spec.source_id = Some(source::transfer_snapshot(&host, snapshot).await?);
+    }
+    if !home_job_is_active(&job_id) {
+        return Ok(());
+    }
+
+    let task_id = crate::codex_cloud_attach::cloud_host_task_id(&host)
+        .ok_or_else(|| "remote job host became invalid".to_string())?
+        .to_string();
+    let (to_worker, from_worker) = crate::codex_cloud_attach::attachment_channel(&task_id)
+        .ok_or_else(|| format!("remote host {host} has no live attachment"))?;
     let watchdog_s = spec.timeout_s.saturating_add(WORKER_WATCHDOG_GRACE_S);
     let frame = serde_json::json!({
         "t": REMOTE_COMMAND_START_KIND,
@@ -409,35 +616,54 @@ pub(crate) async fn start_remote_command(
         .await
         .is_err()
     {
-        remove_home_job(&job_id);
         return Err(format!(
             "remote host {host} detached or stopped accepting commands before the command started"
         ));
     }
-    let view = update_home_job(&job_id, |job| {
-        job.state = RemoteCommandState::Running;
-    })
-    .expect("job was inserted immediately above");
+    if !home_job_is_active(&job_id) {
+        let _ = send_home_frame(
+            &to_worker,
+            serde_json::json!({
+                "t": REMOTE_COMMAND_CANCEL_KIND,
+                "host_id": host,
+                "id": job_id,
+            })
+            .to_string(),
+        )
+        .await;
+    } else {
+        update_home_job(&job_id, |job| {
+            job.state = RemoteCommandState::Running;
+        });
+    }
 
-    let waiter_job_id = job_id.clone();
-    let waiter_to_worker = to_worker.clone();
     tokio::spawn(async move {
         await_worker_result(
-            waiter_job_id,
+            job_id,
             task_id,
+            worker_use,
             from_worker,
-            waiter_to_worker,
+            to_worker,
             Duration::from_secs(watchdog_s),
         )
         .await;
     });
+    Ok(())
+}
 
-    Ok(view)
+fn home_job_is_active(job_id: &str) -> bool {
+    home_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .jobs
+        .get(job_id)
+        .is_some_and(|job| !job.view.state.is_terminal())
 }
 
 async fn await_worker_result(
     job_id: String,
     task_id: String,
+    _worker_use: scheduler::WorkerUse,
     mut from_worker: tokio::sync::broadcast::Receiver<String>,
     to_worker: mpsc::Sender<String>,
     watchdog: Duration,
@@ -563,6 +789,18 @@ pub(crate) async fn cancel_remote_command(
     if current.state.is_terminal() {
         return Ok(current);
     }
+    if matches!(
+        current.state,
+        RemoteCommandState::Acquiring | RemoteCommandState::Preparing | RemoteCommandState::Queued
+    ) {
+        return update_home_job(job_id, |job| {
+            if !job.state.is_terminal() {
+                job.state = RemoteCommandState::Cancelled;
+                job.error = Some("command was cancelled before remote execution".into());
+            }
+        })
+        .ok_or_else(|| "remote command job was not found".to_string());
+    }
     let task_id = crate::codex_cloud_attach::cloud_host_task_id(&current.host)
         .ok_or_else(|| "remote job host is no longer valid".to_string())?;
     let Some((to_worker, _)) = crate::codex_cloud_attach::attachment_channel(task_id) else {
@@ -619,6 +857,7 @@ async fn send_home_frame(sender: &mpsc::Sender<String>, frame: String) -> Result
 pub(crate) async fn execute_remote_command_operation(
     params: crate::mcp::RemoteCommandParams,
     caller: RemoteCommandCaller,
+    project_root: Option<&Path>,
 ) -> Result<RemoteCommandJobView, String> {
     match params {
         crate::mcp::RemoteCommandParams::Start {
@@ -626,19 +865,54 @@ pub(crate) async fn execute_remote_command_operation(
             argv,
             cwd,
             env,
+            source,
             expected_revision,
             require_clean,
+            cache,
             timeout_s,
         } => {
+            let (expected_revision, snapshot, branch_hint) = match source {
+                RemoteSourceMode::GitRevision => {
+                    let revision = expected_revision
+                        .map(|revision| revision.trim().to_string())
+                        .filter(|revision| !revision.is_empty())
+                        .ok_or("expected_revision is required when source is git_revision")?;
+                    let branch_hint =
+                        project_root.and_then(|root| source::branch_for_revision(root, &revision));
+                    (revision, None, branch_hint)
+                }
+                RemoteSourceMode::WorkingTree => {
+                    let project_root = project_root.ok_or(
+                        "working_tree source requires a supervised session with a recorded project root",
+                    )?;
+                    let root = project_root.to_path_buf();
+                    let requested = expected_revision.clone();
+                    let snapshot = tokio::task::spawn_blocking(move || {
+                        source::capture_working_tree(&root, requested.as_deref())
+                    })
+                    .await
+                    .map_err(|error| format!("working-tree capture task failed: {error}"))??;
+                    let base_revision = snapshot.base_revision.clone();
+                    let branch_hint = snapshot.branch_hint.clone();
+                    (base_revision, Some(snapshot), branch_hint)
+                }
+            };
+            let cache_env = match cache {
+                RemoteCacheMode::None => BTreeMap::new(),
+                RemoteCacheMode::DurableSccache => durable_sccache_env()?,
+            };
             let spec = RemoteCommandSpec {
                 argv,
                 cwd,
                 env,
                 expected_revision,
+                source_id: None,
+                cache,
+                cache_env,
                 require_clean: require_clean.unwrap_or(true),
                 timeout_s: timeout_s.unwrap_or(900),
             };
-            start_remote_command(&host, spec, caller).await
+            start_remote_command(host, spec, source, snapshot, branch_hint, caller).await
         }
         crate::mcp::RemoteCommandParams::Status { job_id } => {
             remote_command_status(&job_id, &caller)
@@ -657,12 +931,65 @@ pub(crate) async fn execute_remote_command_operation(
     }
 }
 
+fn durable_sccache_env() -> Result<BTreeMap<String, String>, String> {
+    const INTENDANT_PREFIX: &str = "INTENDANT_REMOTE_CACHE_";
+    const BACKEND_KEYS: &[&str] = &[
+        "SCCACHE_BUCKET",
+        "SCCACHE_REDIS",
+        "SCCACHE_REDIS_ENDPOINT",
+        "SCCACHE_REDIS_CLUSTER_ENDPOINTS",
+        "SCCACHE_MEMCACHED",
+        "SCCACHE_MEMCACHED_ENDPOINT",
+        "SCCACHE_WEBDAV_ENDPOINT",
+        "SCCACHE_GCS_BUCKET",
+        "SCCACHE_AZURE_BLOB_CONTAINER",
+        "SCCACHE_GHA_CACHE_URL",
+        "SCCACHE_OSS_BUCKET",
+        "SCCACHE_COS_BUCKET",
+    ];
+    let mut mapped = BTreeMap::new();
+    for (key, value) in std::env::vars() {
+        let Some(target) = key.strip_prefix(INTENDANT_PREFIX) else {
+            continue;
+        };
+        if !dedicated_cache_env_key(target) {
+            continue;
+        }
+        if managed_cache_env_key(target) {
+            return Err(format!(
+                "durable_sccache manages {target} itself; remove INTENDANT_REMOTE_CACHE_{target}"
+            ));
+        }
+        if !valid_env_key(target) || value.contains('\0') {
+            return Err(format!("invalid dedicated remote cache setting {key}"));
+        }
+        mapped.insert(target.to_string(), value);
+    }
+    if !BACKEND_KEYS.iter().any(|key| mapped.contains_key(*key)) {
+        return Err(format!(
+            "durable_sccache needs a durable backend configured through {INTENDANT_PREFIX}SCCACHE_* (for example INTENDANT_REMOTE_CACHE_SCCACHE_BUCKET); local cache directories do not qualify"
+        ));
+    }
+    if mapped.len() > MAX_ENV_VARS
+        || mapped
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > MAX_ENV_BYTES
+    {
+        return Err("dedicated remote cache configuration exceeds the command limits".to_string());
+    }
+    Ok(mapped)
+}
+
 type WorkerCancelMap = Arc<tokio::sync::Mutex<HashMap<String, Option<oneshot::Sender<()>>>>>;
 
 #[derive(Clone)]
 pub(crate) struct WorkerRemoteCommands {
     project_root: PathBuf,
     jobs: WorkerCancelMap,
+    sources: source::WorkerSources,
+    retired: tokio_util::sync::CancellationToken,
 }
 
 impl WorkerRemoteCommands {
@@ -670,9 +997,12 @@ impl WorkerRemoteCommands {
         let project_root = project_root
             .canonicalize()
             .map_err(|error| format!("resolve worker repository root: {error}"))?;
+        let sources = source::WorkerSources::new(project_root.clone())?;
         Ok(Self {
             project_root,
             jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sources,
+            retired: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -682,6 +1012,14 @@ impl WorkerRemoteCommands {
         out_tx: &mpsc::Sender<String>,
         host_id: &str,
     ) -> bool {
+        if self.sources.serve_frame(frame, out_tx, host_id).await {
+            return true;
+        }
+        if scheduler::is_retire_frame(frame) {
+            self.cancel_all().await;
+            self.retired.cancel();
+            return true;
+        }
         match frame.get("t").and_then(serde_json::Value::as_str) {
             Some(REMOTE_COMMAND_START_KIND) => {
                 self.start_from_frame(frame, out_tx, host_id).await;
@@ -748,7 +1086,7 @@ impl WorkerRemoteCommands {
                 return;
             }
         };
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
         {
             let mut jobs = self.jobs.lock().await;
             if jobs.contains_key(&id) {
@@ -780,11 +1118,48 @@ impl WorkerRemoteCommands {
         }
 
         let project_root = self.project_root.clone();
+        let sources = self.sources.clone();
         let jobs = Arc::clone(&self.jobs);
         let reply_tx = out_tx.clone();
         let reply_host = host_id.to_string();
         tokio::spawn(async move {
-            let result = run_worker_command(&project_root, spec, cancel_rx).await;
+            let source_lease = match spec.source_id.as_deref() {
+                Some(source_id) => {
+                    let acquired = tokio::select! {
+                        acquired = sources.acquire(source_id) => acquired,
+                        _ = &mut cancel_rx => {
+                            send_worker_result(
+                                &reply_tx,
+                                &reply_host,
+                                &id,
+                                RemoteCommandResult::cancelled(
+                                    "command was cancelled while waiting for its prepared source",
+                                    started,
+                                ),
+                            )
+                            .await;
+                            jobs.lock().await.remove(&id);
+                            return;
+                        }
+                    };
+                    match acquired {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            send_worker_result(
+                                &reply_tx,
+                                &reply_host,
+                                &id,
+                                RemoteCommandResult::failed(error, started),
+                            )
+                            .await;
+                            jobs.lock().await.remove(&id);
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+            let result = run_worker_command(&project_root, spec, source_lease, cancel_rx).await;
             send_worker_result(&reply_tx, &reply_host, &id, result).await;
             jobs.lock().await.remove(&id);
         });
@@ -795,6 +1170,10 @@ impl WorkerRemoteCommands {
         for sender in jobs.values_mut().filter_map(Option::take) {
             let _ = sender.send(());
         }
+    }
+
+    pub(crate) async fn retired(&self) {
+        self.retired.cancelled().await;
     }
 }
 
@@ -820,10 +1199,18 @@ async fn send_worker_result(
 async fn run_worker_command(
     project_root: &Path,
     spec: RemoteCommandSpec,
+    source_lease: Option<source::WorkerSourceLease>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> RemoteCommandResult {
     let started = Instant::now();
-    let revision = match git_text(project_root, &["rev-parse", "HEAD"]).await {
+    let selected_root = source_lease
+        .as_ref()
+        .map(|lease| lease.root.as_path())
+        .unwrap_or(project_root);
+    let baseline_source_digest = source_lease
+        .as_ref()
+        .map(|lease| lease.baseline_source_digest.as_str());
+    let revision = match git_text(selected_root, &["rev-parse", "HEAD"]).await {
         Ok(revision) => revision.trim().to_ascii_lowercase(),
         Err(error) => return RemoteCommandResult::failed(error, started),
     };
@@ -837,22 +1224,51 @@ async fn run_worker_command(
         );
     }
     if spec.require_clean {
-        match workspace_status(project_root).await {
-            Ok(status) if status.is_empty() => {}
-            Ok(status) => {
+        let clean = match baseline_source_digest {
+            Some(expected) => source::workspace_source_digest(selected_root)
+                .await
+                .map(|actual| actual == expected),
+            None => workspace_status(selected_root)
+                .await
+                .map(|status| status.is_empty()),
+        };
+        match clean {
+            Ok(true) => {}
+            Ok(false) => {
                 return RemoteCommandResult::failed(
-                    format!(
-                        "worker checkout is dirty before execution: {}",
-                        status.lines().take(20).collect::<Vec<_>>().join("\n")
-                    ),
+                    "worker source differs from the selected checkout/snapshot before execution",
                     started,
                 )
             }
             Err(error) => return RemoteCommandResult::failed(error, started),
         }
     }
-    let cwd = match resolve_worker_cwd(project_root, spec.cwd.as_deref()) {
+    let cwd = match resolve_worker_cwd(selected_root, spec.cwd.as_deref()) {
         Ok(cwd) => cwd,
+        Err(error) => return RemoteCommandResult::failed(error, started),
+    };
+    // sccache exposes server-wide counters, not per-command counters. Hold a
+    // cache-config + source-root lane through baseline → command → final
+    // stats so reported deltas belong to this job rather than an overlapping
+    // sibling. A root-specific server also lets SCCACHE_BASEDIRS normalize
+    // each ephemeral worktree before cache keys are computed.
+    let _cache_guard = if spec.cache == RemoteCacheMode::DurableSccache {
+        let lock = cache_lock_for(&spec.cache_env, selected_root);
+        let guard = tokio::select! {
+            guard = lock.lock_owned() => guard,
+            _ = &mut cancel_rx => {
+                return RemoteCommandResult::cancelled(
+                    "command was cancelled while waiting for its durable cache lane",
+                    started,
+                )
+            }
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let cache_execution = match prepare_cache(&spec, selected_root).await {
+        Ok(cache) => cache,
         Err(error) => return RemoteCommandResult::failed(error, started),
     };
 
@@ -861,10 +1277,23 @@ async fn run_worker_command(
         .args(&spec.argv[1..])
         .current_dir(cwd)
         .envs(&spec.env)
+        .envs(
+            cache_execution
+                .as_ref()
+                .map(|cache| &cache.command_env)
+                .into_iter()
+                .flatten(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if cache_execution.is_some() {
+        // Do not let either the worker environment or the requested command
+        // opt into bypassing a failed sccache client/server connection.
+        // Keep sccache's default strict client behavior.
+        command.env_remove("SCCACHE_IGNORE_SERVER_IO_ERROR");
+    }
     crate::platform::die_with_parent(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -929,10 +1358,20 @@ async fn run_worker_command(
             Some(format!("command exceeded its {}s timeout", spec.timeout_s)),
         ),
     };
-    let workspace_dirty_after = workspace_status(project_root)
-        .await
-        .ok()
-        .map(|status| !status.is_empty());
+    let workspace_dirty_after = match baseline_source_digest {
+        Some(expected) => source::workspace_source_digest(selected_root)
+            .await
+            .ok()
+            .map(|actual| actual != expected),
+        None => workspace_status(selected_root)
+            .await
+            .ok()
+            .map(|status| !status.is_empty()),
+    };
+    let cache = match cache_execution {
+        Some(cache) => Some(finish_cache(cache).await),
+        None => None,
+    };
     RemoteCommandResult {
         state,
         exit_code,
@@ -944,6 +1383,277 @@ async fn run_worker_command(
         error,
         worker_revision: Some(revision),
         workspace_dirty_after,
+        cache,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CacheStats {
+    hits: u64,
+    misses: u64,
+    writes: u64,
+    errors: u64,
+    location: Option<String>,
+}
+
+struct CacheExecution {
+    command_env: BTreeMap<String, String>,
+    stats_env: BTreeMap<String, String>,
+    before: CacheStats,
+}
+
+type CacheLockMap = HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
+
+static CACHE_LOCKS: OnceLock<Mutex<CacheLockMap>> = OnceLock::new();
+
+fn cache_lock_for(
+    config: &BTreeMap<String, String>,
+    selected_root: &Path,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let key = cache_lane_digest(config, selected_root);
+    let mut locks = CACHE_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn cache_config_digest(config: &BTreeMap<String, String>) -> String {
+    let config_json = serde_json::to_vec(config).unwrap_or_default();
+    sha2::Sha256::digest(config_json)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn cache_lane_digest(config: &BTreeMap<String, String>, selected_root: &Path) -> String {
+    let mut digest = sha2::Sha256::new();
+    digest.update(cache_config_digest(config).as_bytes());
+    digest.update([0]);
+    digest.update(selected_root.to_string_lossy().as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn prepare_cache(
+    spec: &RemoteCommandSpec,
+    selected_root: &Path,
+) -> Result<Option<CacheExecution>, String> {
+    if spec.cache == RemoteCacheMode::None {
+        return Ok(None);
+    }
+    if spec.cache_env.is_empty() {
+        return Err(
+            "durable_sccache carried no dedicated backend configuration; refusing an implicit worker-local cache"
+                .to_string(),
+        );
+    }
+    let mut stats_env = spec.cache_env.clone();
+    let digest = cache_lane_digest(&stats_env, selected_root);
+    let socket = std::env::temp_dir().join(format!("intendant-sccache-{}.sock", &digest[..24]));
+    stats_env.insert(
+        "SCCACHE_SERVER_UDS".into(),
+        socket.to_string_lossy().into_owned(),
+    );
+    stats_env.insert(
+        "SCCACHE_IDLE_TIMEOUT".into(),
+        CACHE_SERVER_IDLE_TIMEOUT_S.to_string(),
+    );
+    stats_env.insert(
+        "SCCACHE_BASEDIRS".into(),
+        selected_root.display().to_string(),
+    );
+
+    let version = run_sccache(&["--version"], &stats_env)
+        .await
+        .map_err(|error| format!("durable_sccache requires sccache on the worker: {error}"))?;
+    if !sccache_supports_basedirs(&version) {
+        return Err(format!(
+            "durable_sccache requires sccache 0.14 or newer; worker reported {:?}",
+            version.trim()
+        ));
+    }
+    if let Err(start_error) = run_sccache(&["--start-server"], &stats_env).await {
+        // Another command may have won the same config-keyed start race. A
+        // successful stats query proves the expected server is available.
+        if run_sccache_stats(&stats_env).await.is_err() {
+            return Err(format!(
+                "start the durable sccache server for this source lane: {start_error}"
+            ));
+        }
+    }
+    let before = run_sccache_stats(&stats_env)
+        .await
+        .map_err(|error| format!("read durable sccache baseline stats: {error}"))?;
+    if !durable_cache_location(before.location.as_deref()) {
+        return Err(
+            "sccache started without an external durable backend; refusing worker-local cache"
+                .to_string(),
+        );
+    }
+    // sccache clients automatically start a missing local server. Carry the
+    // same dedicated backend configuration into the requested build so such
+    // a restart cannot silently become the default local-disk cache. These
+    // values therefore require a cache-only principal; the worker is not a
+    // credential enclave.
+    let mut command_env = stats_env.clone();
+    command_env.insert("RUSTC_WRAPPER".into(), "sccache".into());
+    command_env.insert("CARGO_INCREMENTAL".into(), "0".into());
+    command_env.insert(
+        "SCCACHE_BASEDIRS".into(),
+        selected_root.display().to_string(),
+    );
+    Ok(Some(CacheExecution {
+        command_env,
+        stats_env,
+        before,
+    }))
+}
+
+async fn finish_cache(cache: CacheExecution) -> RemoteCacheReport {
+    match run_sccache_stats(&cache.stats_env).await {
+        Ok(after) => RemoteCacheReport {
+            mode: RemoteCacheMode::DurableSccache,
+            hits_delta: after.hits.saturating_sub(cache.before.hits),
+            misses_delta: after.misses.saturating_sub(cache.before.misses),
+            writes_delta: after.writes.saturating_sub(cache.before.writes),
+            errors_delta: after.errors.saturating_sub(cache.before.errors),
+            stats_error: (!durable_cache_location(after.location.as_deref())).then(|| {
+                "sccache no longer reports an external durable backend after the command"
+                    .to_string()
+            }),
+        },
+        Err(error) => RemoteCacheReport {
+            mode: RemoteCacheMode::DurableSccache,
+            hits_delta: 0,
+            misses_delta: 0,
+            writes_delta: 0,
+            errors_delta: 0,
+            stats_error: Some(format!("read final sccache stats: {error}")),
+        },
+    }
+}
+
+async fn run_sccache(args: &[&str], env: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut command = crate::platform::spawn_command("sccache");
+    command
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .map_err(|_| format!("sccache {} timed out", args.join(" ")))?
+        .map_err(|error| format!("run sccache {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        let detail = redact_cache_values(String::from_utf8_lossy(&output.stderr).trim(), env);
+        return Err(format!(
+            "sccache {} exited with {}: {}",
+            args.join(" "),
+            output.status,
+            detail
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn redact_cache_values(text: &str, env: &BTreeMap<String, String>) -> String {
+    env.values()
+        .filter(|value| value.len() >= 4)
+        .fold(text.to_string(), |redacted, value| {
+            redacted.replace(value, "[redacted-cache-value]")
+        })
+}
+
+async fn run_sccache_stats(env: &BTreeMap<String, String>) -> Result<CacheStats, String> {
+    let text = run_sccache(&["--show-stats", "--stats-format=json"], env).await?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("parse sccache stats JSON: {error}"))?;
+    let errors = [
+        "cache_errors",
+        "cache_read_errors",
+        "cache_write_errors",
+        "cache_timeouts",
+        "dist_errors",
+    ]
+    .iter()
+    .filter_map(|key| cache_metric(&value, key))
+    .fold(0u64, u64::saturating_add);
+    Ok(CacheStats {
+        hits: cache_metric(&value, "cache_hits").unwrap_or(0),
+        misses: cache_metric(&value, "cache_misses").unwrap_or(0),
+        writes: cache_metric(&value, "cache_writes").unwrap_or(0),
+        errors,
+        location: value
+            .get("cache_location")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn durable_cache_location(location: Option<&str>) -> bool {
+    location.is_some_and(|location| !location.trim_start().starts_with("Local disk:"))
+}
+
+fn sccache_supports_basedirs(version: &str) -> bool {
+    version
+        .split_whitespace()
+        .find_map(|word| {
+            let word = word.trim_start_matches('v');
+            let mut parts = word.split('.');
+            let major = parts.next()?.parse::<u64>().ok()?;
+            let minor = parts.next()?.parse::<u64>().ok()?;
+            Some(major > 0 || minor >= 14)
+        })
+        .unwrap_or(false)
+}
+
+fn cache_metric(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .get(key)
+            .map(sum_cache_metric)
+            .or_else(|| map.values().find_map(|value| cache_metric(value, key))),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| cache_metric(value, key))
+        }
+        _ => None,
+    }
+}
+
+fn sum_cache_metric(value: &serde_json::Value) -> u64 {
+    // Current sccache JSON carries the same totals in the human-facing
+    // `counts` and normalized `adv_counts` maps. Prefer `counts` instead of
+    // adding both representations together.
+    match value {
+        serde_json::Value::Object(map) if map.contains_key("counts") => {
+            map.get("counts").map(sum_json_numbers).unwrap_or(0)
+        }
+        _ => sum_json_numbers(value),
+    }
+}
+
+fn sum_json_numbers(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().unwrap_or(0),
+        serde_json::Value::Object(map) => map.values().fold(0u64, |sum, value| {
+            sum.saturating_add(sum_json_numbers(value))
+        }),
+        serde_json::Value::Array(values) => values.iter().fold(0u64, |sum, value| {
+            sum.saturating_add(sum_json_numbers(value))
+        }),
+        _ => 0,
     }
 }
 
@@ -1111,6 +1821,9 @@ mod tests {
             cwd: Some("crates/intendant-core".into()),
             env: BTreeMap::from([("CARGO_INCREMENTAL".into(), "0".into())]),
             expected_revision: "0123456789abcdef".into(),
+            source_id: None,
+            cache: RemoteCacheMode::None,
+            cache_env: BTreeMap::new(),
             require_clean: true,
             timeout_s: 300,
         }
@@ -1160,6 +1873,67 @@ mod tests {
     }
 
     #[test]
+    fn cache_stats_are_summed_without_exposing_cache_values_in_debug() {
+        let stats = serde_json::json!({
+            "stats": {
+                "cache_hits": {
+                    "counts": {"Rust": 7, "C/C++": 2},
+                    "adv_counts": {"rust": 7, "c_cpp": 2}
+                },
+                "cache_misses": {
+                    "counts": {"Rust": 3},
+                    "adv_counts": {"rust": 3}
+                },
+                "cache_writes": 4,
+                "cache_errors": {"timeout": 1},
+                "cache_write_errors": 2
+            }
+        });
+        assert_eq!(cache_metric(&stats, "cache_hits"), Some(9));
+        assert_eq!(cache_metric(&stats, "cache_misses"), Some(3));
+        assert_eq!(cache_metric(&stats, "cache_writes"), Some(4));
+        assert_eq!(cache_metric(&stats, "cache_errors"), Some(1));
+        assert_eq!(cache_metric(&stats, "cache_write_errors"), Some(2));
+        assert!(!durable_cache_location(Some("Local disk: \"/tmp/cache\"")));
+        assert!(durable_cache_location(Some("Redis: redis://cache")));
+        assert!(!durable_cache_location(None));
+        assert!(!sccache_supports_basedirs("sccache 0.13.0"));
+        assert!(sccache_supports_basedirs("sccache 0.14.0"));
+        assert!(sccache_supports_basedirs("sccache v1.0.0"));
+
+        let mut command = spec();
+        command.cache = RemoteCacheMode::DurableSccache;
+        command.cache_env = BTreeMap::from([("SCCACHE_BUCKET".into(), "secret-bucket".into())]);
+        let debug = format!("{command:?}");
+        assert!(debug.contains("SCCACHE_BUCKET"));
+        assert!(!debug.contains("secret-bucket"));
+        assert_eq!(
+            redact_cache_values("backend secret-bucket refused", &command.cache_env,),
+            "backend [redacted-cache-value] refused"
+        );
+        assert_ne!(
+            cache_lane_digest(&command.cache_env, Path::new("source-a")),
+            cache_lane_digest(&command.cache_env, Path::new("source-b"))
+        );
+
+        command.cache_env = BTreeMap::from([
+            ("ALIBABA_CLOUD_ACCESS_KEY_ID".into(), "cache-only-id".into()),
+            ("SCCACHE_OSS_BUCKET".into(), "compiler-cache".into()),
+        ]);
+        command.validate().unwrap();
+        command.cache_env = BTreeMap::from([("PATH".into(), "/not/dedicated".into())]);
+        assert!(command
+            .validate()
+            .unwrap_err()
+            .contains("invalid dedicated cache"));
+        command.cache_env = BTreeMap::from([("SCCACHE_DIR".into(), "/tmp/local".into())]);
+        assert!(command
+            .validate()
+            .unwrap_err()
+            .contains("invalid dedicated cache"));
+    }
+
+    #[test]
     fn session_owned_jobs_are_not_cross_session_visible() {
         let owner = Some("session-a");
         assert!(RemoteCommandCaller::AgentSession("session-a".into()).may_access(owner));
@@ -1183,6 +1957,10 @@ mod tests {
                 expected_revision: "0123456".into(),
                 require_clean: true,
                 timeout_s: 10,
+                source: RemoteSourceMode::GitRevision,
+                cache: RemoteCacheMode::None,
+                snapshot_digest: None,
+                snapshot_bytes: None,
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 result: None,
@@ -1219,12 +1997,15 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             expected_revision: revision.clone(),
+            source_id: None,
+            cache: RemoteCacheMode::None,
+            cache_env: BTreeMap::new(),
             require_clean: true,
             timeout_s: 10,
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, command.clone(), cancel_rx).await;
+        let result = run_worker_command(&project_root, command.clone(), None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Succeeded, "{result:#?}");
         assert_eq!(result.stdout.trim(), revision);
@@ -1234,7 +2015,7 @@ mod tests {
         let mut wrong_revision = command.clone();
         wrong_revision.expected_revision = "deadbee".into();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, wrong_revision, cancel_rx).await;
+        let result = run_worker_command(&project_root, wrong_revision, None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result
@@ -1244,13 +2025,13 @@ mod tests {
 
         std::fs::write(repo.path().join("uncommitted.txt"), "not selected\n").unwrap();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, command, cancel_rx).await;
+        let result = run_worker_command(&project_root, command, None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("dirty before execution")));
+            .is_some_and(|error| error.contains("differs from the selected")));
     }
 
     #[tokio::test]

@@ -178,8 +178,11 @@ pub struct FollowUpCodexCloudTaskParams {
 pub enum RemoteCommandParams {
     /// Start a non-interactive argv command and return its job id immediately.
     Start {
-        /// Remote compute host. This release accepts `cloud:<codex-task-id>`.
-        host: String,
+        /// Remote compute host. Omit or use `auto` to reuse/acquire a matching
+        /// Codex Cloud worker; an explicit `cloud:<codex-task-id>` remains
+        /// available for operator-selected attachments.
+        #[serde(default)]
+        host: Option<String>,
         /// Executable followed by its arguments. This is never parsed by a shell.
         argv: Vec<String>,
         /// Repository-relative working directory; omitted means repository root.
@@ -188,14 +191,26 @@ pub enum RemoteCommandParams {
         /// Explicit environment additions for the child process.
         #[serde(default)]
         env: std::collections::BTreeMap<String, String>,
-        /// Expected Git commit (7-64 hexadecimal characters). The worker refuses
-        /// a different checkout instead of validating stale source.
-        #[serde(alias = "expectedRevision")]
-        expected_revision: String,
-        /// Refuse a checkout with tracked or untracked source changes before
+        /// Source policy. `git_revision` (default) runs a pushed provider
+        /// checkout. `working_tree` sends an explicit bounded snapshot relative
+        /// to the selected base and excludes ignored files such as `.env` and
+        /// `target/`.
+        #[serde(default)]
+        source: crate::remote_compute::RemoteSourceMode,
+        /// Required hexadecimal commit for `git_revision`. For `working_tree`,
+        /// this may be an optional local base ref/commit; omitted resolves
+        /// INTENDANT_REMOTE_COMPUTE_BASE_REF (default `origin/main`).
+        #[serde(default, alias = "expectedRevision")]
+        expected_revision: Option<String>,
+        /// Refuse changes relative to the selected checkout/snapshot before
         /// execution. Defaults to true.
         #[serde(default)]
         require_clean: Option<bool>,
+        /// Cache policy. `durable_sccache` explicitly configures sccache from
+        /// dedicated INTENDANT_REMOTE_CACHE_* variables and reports hit/miss
+        /// deltas; it fails if no durable backend is configured.
+        #[serde(default)]
+        cache: crate::remote_compute::RemoteCacheMode,
         /// Command timeout in seconds (1-3600, default 900).
         #[serde(default)]
         timeout_s: Option<u64>,

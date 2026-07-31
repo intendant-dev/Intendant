@@ -32,6 +32,7 @@
 mod ask;
 mod blobs;
 mod definitions;
+mod fireability;
 mod handle;
 mod reminders;
 mod scheduler;
@@ -68,6 +69,8 @@ pub(crate) use types::{
 // with structured content.
 #[cfg(test)]
 pub(crate) use ask::resolution_from_wire;
+#[cfg(test)]
+pub(crate) use fireability::FIREABILITY_REFUSAL_PREFIX;
 #[cfg(test)]
 pub(crate) use sealed_blobs::seal_content;
 #[cfg(test)]

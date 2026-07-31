@@ -408,24 +408,30 @@ pub struct SessionManifest {
     /// digests their approvals bind — are unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) interactive: bool,
-    /// Additive: the project root the spawned session runs under. `None`
-    /// (the legacy shape) resolves at fire time: the parking session's
-    /// recorded project root, else the daemon default — and the spawn is
-    /// refused with a named failure when neither exists, never launched
-    /// project-less.
+    /// Additive: the project root the spawned session runs under. Since
+    /// propose-time fireability (2026-07-30) every NEW manifest records
+    /// the resolved root at the mint — explicit pick, or the fire-path
+    /// chain's resolution (parking-session root → daemon default) — so
+    /// the approval digest covers WHERE. `None` survives only on legacy
+    /// parked manifests, which keep the fire-time resolution (the same
+    /// chain, consulted at dispatch) and meet the validator at their
+    /// next approve; the spawn is refused with a named failure when
+    /// nothing resolves, never launched project-less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) project_root: Option<String>,
     /// Additive: the agent-launch configuration the spawned session runs
     /// with — exactly the CreateSession vocabulary (backend selection,
-    /// model/effort/permission pins per backend). `None` (the legacy
-    /// shape) inherits every field, so legacy manifest bytes — and the
-    /// digests their approvals bind — are unchanged. Setting it revises
-    /// the manifest and mints a new digest, exactly like any other
-    /// manifest edit: the owner approves the config they reviewed. At
-    /// fire time each field resolves explicit pin → daemon default →
-    /// backend default, through the same launch path every session uses.
-    /// Boxed for enum-size hygiene only — serde and the digest see the
-    /// inner value verbatim.
+    /// model/effort/permission pins per backend). Since propose-time
+    /// fireability (2026-07-30) every NEW manifest records at least the
+    /// resolved backend (`agent`: the explicit selection, else the
+    /// daemon default at the mint, else `internal`) so the approval
+    /// names WHO runs; remaining absent fields inherit backend defaults
+    /// at launch. `None` survives only on legacy parked manifests
+    /// (all-inherit at fire time, bytes and bound digests unchanged).
+    /// Setting or editing it revises the manifest and mints a new
+    /// digest, exactly like any other manifest edit: the owner approves
+    /// the config they reviewed. Boxed for enum-size hygiene only —
+    /// serde and the digest see the inner value verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
     /// Standing cadence (G3-pre). Additive: absent-on-the-wire when
@@ -593,6 +599,16 @@ pub struct AgendaEffect {
     /// never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_run_attempt: Option<u32>,
+    /// Display-only serving-seam decoration (the `next_fire_ms`
+    /// pattern): the fireability refusal an approve of THIS revision
+    /// would meet right now — stamped only on effects whose approve/
+    /// re-arm affordance could render (pending review, or suspended),
+    /// `None` otherwise and always `None` in the fold product. The
+    /// dashboard withholds the Approve affordance on it and opens the
+    /// plan editor on the named field instead (the class law: approve is
+    /// never offered on an unfireable manifest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fireability_refusal: Option<super::fireability::FireabilityRefusalView>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -1178,10 +1194,12 @@ pub enum AgendaCommand {
         /// the digest-bound manifest so the approval covers WHERE.
         /// Validated at intake (absolute, existing directory — the same
         /// contradiction the launch path would refuse at fire time,
-        /// named now). Absent = the legacy resolution: the parking
-        /// session's recorded root, else the daemon default — which a
-        /// picker-stamped manifest on a projectless daemon does not
-        /// have, the live gap this field closes.
+        /// named now). Absent = resolve NOW through the fire path's own
+        /// chain (the parking session's recorded root, else the daemon
+        /// default) and record the resolution; a daemon that resolves
+        /// nothing refuses the propose by name — the fireability mint
+        /// law, closing the approvable-but-unfireable class the
+        /// picker-stamped projectless park exposed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_root: Option<String>,
         /// Hash-pinned binding refs (sealed refs): `{locator, sha256}`
@@ -2163,6 +2181,7 @@ pub(crate) fn apply_op(
                 requested: Vec::new(),
                 next_fire_ms: None,
                 last_run_attempt: None,
+                fireability_refusal: None,
             };
             match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
                 Some(existing) => {

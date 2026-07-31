@@ -1072,6 +1072,16 @@ html.ui-v2 .ag2-sheet-error {
   padding-left: 8px;
   overflow-wrap: anywhere;
 }
+/* Fireability edit prompt: the field a refusal named gets a brief
+   attention ring when the sheet lands on it; the required-project hint
+   matches the start sheet's amber emphasis. */
+html.ui-v2 .ag2-field-attn {
+  outline: 2px solid rgba(var(--amber-rgb), 0.55);
+  outline-offset: 2px;
+  border-radius: 8px;
+  transition: outline-color 0.4s ease;
+}
+html.ui-v2 .ag2-hint.ags-hint-required { color: var(--amber); font-weight: 600; }
 /* Sealed refs on the schedule sheet: read-only rows — locator + the
    pinned hash chip. Deliberately input-less: the edit lane carries them
    verbatim; re-sealing is its own ceremony. */
