@@ -7461,10 +7461,38 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     assert_eq!(body["update_lane"]["flavor"], "source", "{body}");
     assert!(body.get("update").is_none(), "no chip before any change");
 
-    // The bounded compare: behind origin/main by exactly commit B.
+    // The two-channel front door: a produce click on the channel this
+    // install cannot use refuses by name BEFORE touching anything (the
+    // fixture daemon is source-flavored; releases would install an app).
+    let cross: reqwest::Response = authed
+        .post(format!("{base}/api/daemon/update-lane/produce"))
+        .json(&serde_json::json!({"channel": "releases"}))
+        .send()
+        .await
+        .expect("POST cross-channel produce");
+    assert_eq!(cross.status(), 409, "cross-channel produce refuses");
+    let cross: serde_json::Value = cross.json().await.expect("refusal body");
+    assert!(
+        cross["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("packaged macOS app"),
+        "the refusal names the mismatch: {cross}"
+    );
+    // And the vocabulary is exactly two: an unknown channel is a 400.
+    let unknown = authed
+        .post(format!("{base}/api/daemon/update-lane/check"))
+        .json(&serde_json::json!({"channel": "nightly"}))
+        .send()
+        .await
+        .expect("POST unknown-channel check");
+    assert_eq!(unknown.status(), 400, "unknown channel refused by name");
+
+    // The bounded dev compare (named explicitly): behind origin/main by
+    // exactly commit B, with the shortlog riding as data.
     let check: serde_json::Value = authed
         .post(format!("{base}/api/daemon/update-lane/check"))
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({"channel": "dev"}))
         .send()
         .await
         .expect("POST update-lane check")
@@ -7479,7 +7507,7 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
         RUN_TIMEOUT,
         || async {
             let body = http_get_json(&authed, &status_url).await?;
-            (body["update_lane"]["check"]["behind"] == 1).then_some(body)
+            (body["update_lane"]["checks"]["dev"]["behind"] == 1).then_some(body)
         },
         || {
             std::fs::read_to_string(rig.home.path().join("daemon.log"))
@@ -7489,10 +7517,30 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     )
     .await;
     assert_eq!(
-        body["update_lane"]["check"]["tip_sha"], sha_b,
+        body["update_lane"]["checks"]["dev"]["tip_sha"], sha_b,
         "the compare names origin/main's tip: {body}"
     );
-    assert_eq!(body["update_lane"]["check"]["dirty"], false);
+    assert_eq!(body["update_lane"]["checks"]["dev"]["dirty"], false);
+    let shortlog = body["update_lane"]["checks"]["dev"]["shortlog"]
+        .as_array()
+        .expect("shortlog rides the dev check");
+    assert_eq!(shortlog.len(), 1, "{body}");
+    assert!(
+        shortlog[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("commit B"),
+        "the shortlog carries the behind commit's subject: {body}"
+    );
+    assert_eq!(
+        body["update_lane"]["channels"]["dev"]["produce"], true,
+        "the catalog offers dev produce on a source install: {body}"
+    );
+    assert_eq!(
+        body["update_lane"]["channels"]["releases"]["produce"], false,
+        "the catalog withholds releases produce on a source install: {body}"
+    );
+    assert_eq!(body["update_lane"]["default_channel"], "releases");
 
     // The owner's click: pull (real) + build (mock) + verify. The job
     // finishes ok and reports the produced commit.
