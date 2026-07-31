@@ -37,6 +37,15 @@ built-in restart supervisor on systemd-less Linux — no init system is a
 dependency) and prints where the one-time claim code lands. `intendant service
 uninstall|status` manage it afterwards.
 
+The installer stands up its own prerequisites: when `git` is missing (stock
+Debian minimal cloud images ship without it), the pre-flight installs it
+through the platform package manager — apt/dnf/yum/zypper/pacman/apk/brew,
+winget or choco on Windows — announcing the exact command before it runs,
+escalating via `sudo` only where it exists and never silently, and otherwise
+stopping to name the command for you to run. Rust and the native build
+dependencies follow the same law via the per-OS setup scripts from the
+cloned tree.
+
 For reproducibility, pin the tag instead of `latest`:
 `…/releases/download/v0.1.0/install.sh`. Release assets are immutable, and a
 stamped installer double-checks itself: it prints its release identity

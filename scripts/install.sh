@@ -120,7 +120,46 @@ esac
 # Only git is needed this early (for the clone). Rust may legitimately be
 # missing on a fresh box — scripts/setup-linux.sh installs it below, so
 # the hard requirement is enforced after dependency setup, not before it.
-command -v git >/dev/null 2>&1 || die "git is required (install it and re-run)"
+# git lives under the same self-sufficiency law, but the repo's setup
+# scripts cannot carry it — they arrive BY the clone — and stock cloud
+# images (Debian minimal, for one) ship without it. So the pre-flight
+# installs git through the platform package manager, honestly: the exact
+# command is announced before it runs, sudo is used only where it exists
+# (prompting on its own terms), and with no root path the script stops
+# and names the command for you — never a silent escalation.
+if ! command -v git >/dev/null 2>&1; then
+  GIT_NEEDS_ROOT=1
+  if command -v apt-get >/dev/null 2>&1; then
+    GIT_INSTALL="apt-get update && apt-get install -y git"
+  elif command -v dnf >/dev/null 2>&1; then
+    GIT_INSTALL="dnf install -y git"
+  elif command -v yum >/dev/null 2>&1; then
+    GIT_INSTALL="yum install -y git"
+  elif command -v zypper >/dev/null 2>&1; then
+    GIT_INSTALL="zypper --non-interactive install git"
+  elif command -v pacman >/dev/null 2>&1; then
+    GIT_INSTALL="pacman -Sy --noconfirm git"
+  elif command -v apk >/dev/null 2>&1; then
+    GIT_INSTALL="apk add git"
+  elif command -v brew >/dev/null 2>&1; then
+    # brew refuses to run as root and does its own escalation.
+    GIT_INSTALL="brew install git"
+    GIT_NEEDS_ROOT=0
+  else
+    die "git is required, and no supported package manager was found to install it (apt-get, dnf, yum, zypper, pacman, apk, brew) — install git yourself, then re-run this installer"
+  fi
+  if [ "$GIT_NEEDS_ROOT" = "1" ] && [ "$(id -u)" != "0" ]; then
+    command -v sudo >/dev/null 2>&1 || die "git is required, this shell is not root, and there is no sudo — as root, run:
+    $GIT_INSTALL
+then re-run this installer"
+    say "git is missing — installing it now: sudo sh -c '$GIT_INSTALL' (sudo may prompt for your password)"
+    sudo sh -c "$GIT_INSTALL" || die "git install failed — run it yourself: sudo sh -c '$GIT_INSTALL' — then re-run this installer"
+  else
+    say "git is missing — installing it now: $GIT_INSTALL"
+    sh -c "$GIT_INSTALL" || die "git install failed — run it yourself: $GIT_INSTALL — then re-run this installer"
+  fi
+  command -v git >/dev/null 2>&1 || die "the install reported success but git is still not on PATH — install git yourself, then re-run this installer"
+fi
 
 # ── Source ──
 if [ -d "$INSTALL_DIR/.git" ]; then
