@@ -36,6 +36,11 @@ protocol BackendSupervisorDelegate: AnyObject {
     /// scripts, and webview. Deliberately NOT a `didChangeState` screen —
     /// the working dashboard must never be painted over mid-swap.
     func backendSupervisor(_ supervisor: BackendSupervisor, didSwapToPort newPort: Int)
+    /// The daemon relayed a one-click swap request from a dashboard
+    /// surface beyond our webview (the health tick's claim poll picked
+    /// it up): begin the same spawn → readiness → promote → drain
+    /// sequence the bridge message drives.
+    func backendSupervisorUpdateSwapRequested(_ supervisor: BackendSupervisor)
 }
 
 /// Supervises the bundled Rust daemon: spawn, readiness polling, health
@@ -138,6 +143,13 @@ final class BackendSupervisor {
         if !missing.isEmpty {
             env["PATH"] = missing.joined(separator: ":") + ":" + currentPath
         }
+        // Announce this supervisor to the daemon: the handover status
+        // payload carries `app_supervised` (gating the dashboard's
+        // one-click update on EVERY surface, not just our webview) only
+        // while this pid is the daemon's LIVE parent — a stale inherited
+        // var in some grandchild, or a daemon we no longer parent, reads
+        // false on the Rust side.
+        env["INTENDANT_APP_SUPERVISOR_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         process.environment = env
 
         // Working directory: plainly the user's home. Nothing derives from
@@ -292,6 +304,56 @@ final class BackendSupervisor {
         }
         NSLog("Update swap failed: \(detail)")
         completion(false, detail)
+    }
+
+    /// The claim half of the one-click swap relay: take the pending
+    /// request a dashboard surface parked on the daemon, then drive the
+    /// same swap entry the webview bridge uses. Consuming — exactly one
+    /// claimer acts; quiet on the empty/normal path (this runs every
+    /// health tick).
+    private func claimPendingUpdateSwap() {
+        guard !swapInFlight else { return }
+        guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)/api/daemon/update-swap/claim") else { return }
+        var request = URLRequest(url: url, timeoutInterval: 2)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = loopbackAdmissionToken(port: port), !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "x-intendant-loopback-token")
+        }
+        request.httpBody = "{}".data(using: .utf8)
+        session.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self = self,
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let data = data,
+                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  body["pending"] as? Bool == true else { return }
+            DispatchQueue.main.async {
+                guard !self.swapInFlight else { return }
+                let requestedBy = body["requested_by"] as? String ?? "a dashboard surface"
+                NSLog("Update swap requested via the daemon relay by \(requestedBy)")
+                self.delegate?.backendSupervisorUpdateSwapRequested(self)
+            }
+        }.resume()
+    }
+
+    /// Report a relay-requested swap attempt's outcome back to the
+    /// daemon (failure-only in practice: success drains the reporting
+    /// target and the drain banner carries the story). The asking
+    /// surface may be a browser tab we cannot reach — the daemon's
+    /// status payload and notification lane can.
+    func reportSwapFailure(detail: String) {
+        guard let url = URL(string: "\(scheme)://127.0.0.1:\(port)/api/daemon/update-swap/result") else { return }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = loopbackAdmissionToken(port: port), !token.isEmpty {
+            request.setValue(token, forHTTPHeaderField: "x-intendant-loopback-token")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["ok": false, "detail": detail])
+        session.dataTask(with: request) { _, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            NSLog("Update swap: failure report to :\(self.port) answered \(status)\(error.map { " error: \($0.localizedDescription)" } ?? "")")
+        }.resume()
     }
 
     /// The HS3 takeover lane against the predecessor's own port: ask it
@@ -472,6 +534,12 @@ final class BackendSupervisor {
             }
             // Housekeeping hook (dashboard idle-unload lives in the app layer).
             self.delegate?.backendSupervisorHealthTick(self)
+            // One-click swap relay: browser dashboards cannot reach this
+            // process directly, so they park the request on the daemon
+            // and this tick claims it. Skipped while a swap is already
+            // in flight — the daemon-side request outlives one tick, and
+            // an unclaimable stale one expires there.
+            self.claimPendingUpdateSwap()
             // Also ping the HTTP endpoint. Probe failures are logged, never
             // fatal: the process-liveness check above is the only thing
             // allowed to declare a crash — a slow daemon or a stalled TLS

@@ -855,23 +855,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     // MARK: - One-click update swap (HS6/P3)
 
-    /// The dashboard's update chip asked for the one-click update
-    /// (bridge message `updateSwap`): pick a fresh port and let the
-    /// supervisor run the spawn → readiness → swap → drain sequence.
-    /// Failure feedback rides `window.__intendantAppSwapFailed` back
-    /// into the chip; success repaints through `didSwapToPort`.
+    /// The dashboard's update chip asked for the one-click update —
+    /// through the webview bridge (`updateSwap` message) or the daemon
+    /// relay (claim poll): pick a fresh port and let the supervisor run
+    /// the spawn → readiness → swap → drain sequence. Failure feedback
+    /// rides `window.__intendantAppSwapFailed` into our own webview AND
+    /// the daemon's result route (for browser surfaces we cannot reach);
+    /// success repaints through `didSwapToPort`.
     func beginUpdateSwapFromDashboard() {
         guard let fresh = findAvailablePort(startingAt: port + 1) else {
             NSLog("Update swap: no free port near \(port)")
             notifySwapFailed("no free port for the new daemon")
+            backendSupervisor.reportSwapFailure(detail: "no free port for the new daemon")
             return
         }
         NSLog("Update swap requested from the dashboard — successor on port \(fresh)")
         backendSupervisor.beginUpdateSwap(newPort: fresh) { [weak self] ok, detail in
             if !ok {
                 self?.notifySwapFailed(detail)
+                self?.backendSupervisor.reportSwapFailure(detail: detail)
             }
         }
+    }
+
+    /// The daemon relay's claim poll surfaced a swap request from a
+    /// dashboard surface beyond our webview — same entry as the bridge.
+    func backendSupervisorUpdateSwapRequested(_ supervisor: BackendSupervisor) {
+        beginUpdateSwapFromDashboard()
     }
 
     func notifySwapFailed(_ detail: String) {

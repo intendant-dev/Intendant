@@ -96,6 +96,103 @@ pub(crate) struct HandoverRuntime {
     /// check/produce actions through it; `status_json` serves its
     /// `update_lane` block. Unset in bare test constructions.
     update_lane: std::sync::OnceLock<std::sync::Arc<update_lane::UpdateLane>>,
+    /// The pid the spawning app supervisor claimed at boot
+    /// (`INTENDANT_APP_SUPERVISOR_PID`). The claim alone proves nothing —
+    /// [`Self::app_supervised`] re-checks it against the LIVE parent pid,
+    /// so a dead wrapper (child reparented to init) and an inherited env
+    /// var in some grandchild daemon both read false.
+    app_supervisor_pid: Option<u32>,
+    /// A dashboard surface asked the app supervisor for the one-click
+    /// update swap and the supervisor has not yet claimed it (its health
+    /// tick polls the claim route). Unclaimed requests expire at
+    /// [`SWAP_REQUEST_TTL_MS`] so a wedged wrapper cannot pin the chip
+    /// in "Updating…" forever.
+    swap_request: std::sync::Mutex<Option<SwapRequest>>,
+    /// The supervisor's report on its last relay-requested swap attempt
+    /// (failure-only in practice: a successful swap drains this daemon,
+    /// and the chip yields to the drain banner). Cleared when a new
+    /// request arms.
+    swap_result: std::sync::Mutex<Option<SwapResult>>,
+}
+
+/// A pending one-click swap request, parked until the app supervisor's
+/// claim poll picks it up.
+#[derive(Debug, Clone)]
+pub(crate) struct SwapRequest {
+    /// Display currency for logs/status, never authority.
+    pub(crate) requested_by: Option<String>,
+    pub(crate) requested_ms: u64,
+}
+
+/// The app supervisor's report on a relay-requested swap attempt.
+#[derive(Debug, Clone)]
+struct SwapResult {
+    ok: bool,
+    detail: String,
+    at_ms: u64,
+}
+
+/// Unclaimed swap requests expire after this long: the supervisor claim
+/// poll runs on a 5 s cadence, so anything unclaimed for 90 s means the
+/// wrapper is gone or wedged — the chip re-enables instead of spinning.
+const SWAP_REQUEST_TTL_MS: u64 = 90_000;
+
+/// Refusals for [`HandoverRuntime::request_update_swap`], each an honest
+/// sentence for the requesting surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapRefusal {
+    /// No live app supervisor is attached to this daemon.
+    NoSupervisor,
+    /// This daemon is already draining — a swap is already in motion or
+    /// moot.
+    Draining,
+}
+
+impl SwapRefusal {
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            SwapRefusal::NoSupervisor => {
+                "no app supervisor is attached to this daemon — nothing can \
+                 spawn the new daemon on this machine's behalf"
+            }
+            SwapRefusal::Draining => {
+                "this daemon is already draining — the update is already in motion"
+            }
+        }
+    }
+}
+
+/// The spawning supervisor's boot-time claim, read once at initialize
+/// (the transport edge for this fact).
+fn claimed_app_supervisor_pid() -> Option<u32> {
+    std::env::var("INTENDANT_APP_SUPERVISOR_PID")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+}
+
+/// The live parent pid, where the platform can answer. No app wrapper
+/// ships on non-Unix platforms today, so `None` (never supervised) is
+/// the honest degrade there rather than a panic or a stale claim.
+fn current_parent_pid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(std::os::unix::process::parent_id())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The supervisor fact, pure: a boot-time claim counts only while the
+/// claimed pid IS the live parent. A dead wrapper reparents the daemon
+/// (parent becomes init), and an env var inherited down a process tree
+/// lands in a process whose parent is a shell — both mismatch.
+fn app_supervised_for(claimed: Option<u32>, live_parent: Option<u32>) -> bool {
+    match (claimed, live_parent) {
+        (Some(claimed), Some(parent)) => claimed == parent,
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -205,6 +302,98 @@ impl HandoverRuntime {
             bus: std::sync::OnceLock::new(),
             update_status: std::sync::Mutex::new(None),
             update_lane: std::sync::OnceLock::new(),
+            app_supervisor_pid: claimed_app_supervisor_pid(),
+            swap_request: std::sync::Mutex::new(None),
+            swap_result: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Is a live app supervisor attached to this daemon? True only while
+    /// the boot-time pid claim matches the LIVE parent pid — evaluated
+    /// per call so the fact degrades the moment the wrapper dies.
+    pub(crate) fn app_supervised(&self) -> bool {
+        app_supervised_for(self.app_supervisor_pid, current_parent_pid())
+    }
+
+    /// Test-only override for the supervisor claim (production reads the
+    /// env once at [`Self::initialize`]).
+    #[cfg(test)]
+    pub(crate) fn set_app_supervisor_pid_for_test(&mut self, pid: Option<u32>) {
+        self.app_supervisor_pid = pid;
+    }
+
+    /// A dashboard surface asked for the one-click update swap. Arms the
+    /// pending request for the supervisor's claim poll (idempotent while
+    /// one is already pending — the earlier `requested_ms` answers), and
+    /// clears any stale result note: a new attempt supersedes the old
+    /// story. Refuses without a live supervisor or while draining.
+    pub(crate) fn request_update_swap(
+        &self,
+        requested_by: Option<String>,
+        now_ms: u64,
+    ) -> Result<u64, SwapRefusal> {
+        if !self.app_supervised() {
+            return Err(SwapRefusal::NoSupervisor);
+        }
+        if self.is_draining() {
+            return Err(SwapRefusal::Draining);
+        }
+        let mut slot = match self.swap_request.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(pending) = slot
+            .as_ref()
+            .filter(|pending| now_ms.saturating_sub(pending.requested_ms) < SWAP_REQUEST_TTL_MS)
+        {
+            return Ok(pending.requested_ms);
+        }
+        *slot = Some(SwapRequest {
+            requested_by,
+            requested_ms: now_ms,
+        });
+        if let Ok(mut result) = self.swap_result.lock() {
+            *result = None;
+        }
+        Ok(now_ms)
+    }
+
+    /// The supervisor's claim poll: take the pending request (expired
+    /// ones evaporate unclaimed). Consuming is the contract — exactly one
+    /// claimer acts on any request.
+    pub(crate) fn claim_update_swap(&self, now_ms: u64) -> Option<SwapRequest> {
+        let mut slot = match self.swap_request.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let live = slot.as_ref().is_some_and(|pending| {
+            now_ms.saturating_sub(pending.requested_ms) < SWAP_REQUEST_TTL_MS
+        });
+        if !live {
+            *slot = None;
+            return None;
+        }
+        slot.take()
+    }
+
+    /// The supervisor's report on a relay-requested swap attempt. A
+    /// failure also rides the notification lane — the surface that asked
+    /// may be a browser tab that is long gone.
+    pub(crate) fn record_swap_result(&self, ok: bool, detail: String, now_ms: u64) {
+        if let Ok(mut slot) = self.swap_result.lock() {
+            *slot = Some(SwapResult {
+                ok,
+                detail: detail.clone(),
+                at_ms: now_ms,
+            });
+        }
+        if !ok {
+            self.notify_user(
+                "update-swap-failed",
+                Some("Update swap failed"),
+                &format!("{detail} The running daemon is untouched."),
+                crate::types::NotificationUrgency::Attention,
+            );
         }
     }
 
@@ -622,6 +811,31 @@ impl HandoverRuntime {
         }
         if let Some(lane) = self.update_lane.get() {
             obj.insert("update_lane".into(), lane.status_block());
+        }
+        // The supervisor fact + relay state ride TOP-LEVEL, never inside
+        // `update`: the watch task replaces that block wholesale every
+        // tick and would clobber them.
+        obj.insert("app_supervised".into(), self.app_supervised().into());
+        let now = now_ms();
+        if let Ok(slot) = self.swap_request.lock() {
+            if let Some(pending) = slot
+                .as_ref()
+                .filter(|pending| now.saturating_sub(pending.requested_ms) < SWAP_REQUEST_TTL_MS)
+            {
+                obj.insert("swap_pending_ms".into(), pending.requested_ms.into());
+            }
+        }
+        if let Ok(slot) = self.swap_result.lock() {
+            if let Some(result) = slot.as_ref() {
+                obj.insert(
+                    "swap_result".into(),
+                    serde_json::json!({
+                        "ok": result.ok,
+                        "detail": result.detail,
+                        "at_ms": result.at_ms,
+                    }),
+                );
+            }
         }
         block
     }
@@ -1050,10 +1264,129 @@ mod tests {
         }
     }
 
+    /// The detection branch of card 01KYV4K2EK…, pure: the supervisor
+    /// fact requires a LIVE parent-pid match. A claim alone (an
+    /// inherited env var in some grandchild daemon), a dead wrapper
+    /// (the daemon reparented to init), and no claim at all each read
+    /// false; only claim == live parent reads true — the one-click
+    /// gates on this, and the CLI honest-reach posture survives every
+    /// false arm.
+    #[test]
+    fn app_supervised_only_with_live_parent_pid_match() {
+        assert!(!app_supervised_for(None, Some(42)), "no claim, no fact");
+        assert!(
+            !app_supervised_for(Some(42), None),
+            "no live parent answer, no fact"
+        );
+        assert!(
+            !app_supervised_for(Some(42), Some(43)),
+            "a stale or inherited claim mismatches"
+        );
+        assert!(
+            app_supervised_for(Some(42), Some(42)),
+            "claim == live parent"
+        );
+
+        // The runtime end: only a claim matching the REAL live parent
+        // pid flips the status payload's `app_supervised`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = HandoverRuntime::initialize(dir.path(), 8765, 0);
+        runtime.set_app_supervisor_pid_for_test(None);
+        assert_eq!(runtime.status_json()["app_supervised"], false);
+        if let Some(parent) = current_parent_pid() {
+            runtime.set_app_supervisor_pid_for_test(Some(parent));
+            assert_eq!(runtime.status_json()["app_supervised"], true);
+            runtime.set_app_supervisor_pid_for_test(Some(parent.wrapping_add(1)));
+            assert_eq!(runtime.status_json()["app_supervised"], false);
+        }
+    }
+
+    /// The one-click swap relay's lifecycle: request arms only under a
+    /// live supervisor (idempotent while pending), the claim consumes
+    /// exactly one request, unclaimed requests expire at the TTL (a
+    /// wedged wrapper cannot pin the chip in "Updating…"), a failure
+    /// report rides the payload until the next request supersedes it,
+    /// and a draining daemon refuses.
+    #[test]
+    fn swap_relay_arms_claims_expires_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = HandoverRuntime::initialize(dir.path(), 8765, 0);
+
+        // No live supervisor: refused — the CLI-launched posture.
+        runtime.set_app_supervisor_pid_for_test(None);
+        assert_eq!(
+            runtime.request_update_swap(None, 1_000),
+            Err(SwapRefusal::NoSupervisor)
+        );
+
+        let Some(parent) = current_parent_pid() else {
+            // Non-unix: never supervised; the refusal above is the
+            // whole reachable surface.
+            return;
+        };
+        runtime.set_app_supervisor_pid_for_test(Some(parent));
+
+        // Arm once; a re-request while pending answers the SAME
+        // pending instant. (Times ride near the real clock: the status
+        // payload's liveness window is evaluated against now.)
+        let base = now_ms();
+        assert_eq!(
+            runtime.request_update_swap(Some("chip".to_string()), base),
+            Ok(base)
+        );
+        assert_eq!(runtime.request_update_swap(None, base + 1_000), Ok(base));
+        assert_eq!(runtime.status_json()["swap_pending_ms"], base);
+
+        // Claim consumes exactly once.
+        let claimed = runtime
+            .claim_update_swap(base + 2_000)
+            .expect("pending claim");
+        assert_eq!(claimed.requested_by.as_deref(), Some("chip"));
+        assert!(
+            runtime.claim_update_swap(base + 2_500).is_none(),
+            "consumed"
+        );
+        assert!(runtime.status_json().get("swap_pending_ms").is_none());
+
+        // Unclaimed requests expire at the TTL, unclaimed.
+        assert_eq!(
+            runtime.request_update_swap(None, base + 10_000),
+            Ok(base + 10_000)
+        );
+        assert!(runtime
+            .claim_update_swap(base + 10_000 + SWAP_REQUEST_TTL_MS)
+            .is_none());
+
+        // A failure report rides the payload; arming a new request
+        // clears the stale story.
+        runtime.record_swap_result(false, "spawn failed".to_string(), base + 20_000);
+        let status = runtime.status_json();
+        assert_eq!(status["swap_result"]["ok"], false);
+        assert_eq!(status["swap_result"]["detail"], "spawn failed");
+        assert_eq!(
+            runtime.request_update_swap(None, base + 30_000),
+            Ok(base + 30_000)
+        );
+        assert!(runtime.status_json().get("swap_result").is_none());
+
+        // Draining refuses: the update yields to the drain in motion.
+        runtime.attach_scheduler();
+        assert_ne!(
+            runtime.request_drain(Some("test".to_string())),
+            DrainRequest::NotHolder
+        );
+        assert_eq!(
+            runtime.request_update_swap(None, base + 40_000),
+            Err(SwapRefusal::Draining)
+        );
+    }
+
     /// Commission pin `update_chip_offers_action_not_command` (owner
     /// directive on HS6): the update chip carries BUTTONS — the app
-    /// supervisor's one-click and the CLI daemon's hand-off — never a
-    /// command string for the owner to retype.
+    /// supervisor's one-click (bridge in the app's webview, daemon
+    /// relay on every other surface of an app-supervised daemon) and
+    /// the CLI daemon's hand-off — never a command string for the
+    /// owner to retype.
     #[test]
     fn update_chip_offers_action_not_command() {
         let fragment = include_str!("../../../../static/app/ui2-handover.js");
@@ -1063,12 +1396,49 @@ mod tests {
             "Hand off to :",
             "'/api/daemon/takeover'",
             "__intendantAppSupervisor",
+            // The card-01KYV4K2EK… detection fix: the supervisor fact
+            // from the payload (browser surfaces) beside the webview
+            // marker, and the relay route the click rides there.
+            "body.app_supervised === true",
+            "'/api/daemon/update-swap'",
         ] {
             assert!(
                 fragment.contains(needle),
                 "the update chip lost its action affordance: {needle}"
             );
         }
+    }
+
+    /// The presentation half of card 01KYV4K2EK…: the chip collapses to
+    /// a per-sha-persistent pill (small, bottom corner, never covering
+    /// content) and re-expands on click. The standing-fact semantics
+    /// survive — a collapse exists, a dismiss does not, and the stored
+    /// choice keys on the on-disk sha so a NEW build announces itself
+    /// expanded once.
+    #[test]
+    fn update_chip_collapses_to_pill_and_persists() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            // The per-sha storage key + both transitions.
+            "handover-update-chip:",
+            "updateChipStoreState(sha, 'collapsed')",
+            "updateChipStoreState(sha, 'expanded')",
+            "updateChipStoredState(sha) === 'collapsed'",
+            "classList.toggle('collapsed'",
+            // The collapse affordance and the tokenless QA driver.
+            "handover-update-collapse",
+            "qa.handoverUpdateChip",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the update chip lost its collapse machinery: {needle}"
+            );
+        }
+        let styles = include_str!("../../../../static/app/ui2-handover.css");
+        assert!(
+            styles.contains(".handover-update-chip.collapsed"),
+            "the collapsed pill lost its styles"
+        );
     }
 
     /// Commission pin `cli_daemon_button_is_honest_about_its_reach`: on
@@ -1128,6 +1498,13 @@ mod tests {
             "swap → drain",
             "/api/daemon/takeover",
             "didSwapToPort",
+            // Card 01KYV4K2EK…: the supervisor announces itself to the
+            // daemon at spawn, claims relay-parked swap requests on its
+            // health tick, and reports failures back for surfaces it
+            // cannot reach.
+            "INTENDANT_APP_SUPERVISOR_PID",
+            "update-swap/claim",
+            "reportSwapFailure",
         ] {
             assert!(
                 supervisor.contains(needle),
@@ -1140,6 +1517,7 @@ mod tests {
             "__intendantAppSupervisor = true",
             "\"updateSwap\"",
             "didSwapToPort",
+            "backendSupervisorUpdateSwapRequested",
         ] {
             assert!(
                 app_layer.contains(needle),
