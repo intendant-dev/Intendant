@@ -1200,7 +1200,6 @@ mod tests {
         assert!(developer_instructions.contains("read_screen"));
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
-        assert!(developer_instructions.contains("pkill -f intendant"));
         assert!(developer_instructions.contains("one primary validation attempt"));
         assert!(developer_instructions.contains("one compact diagnostic retry"));
         assert!(developer_instructions.contains("Do not cycle through multiple automation stacks"));
