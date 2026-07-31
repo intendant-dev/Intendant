@@ -2621,10 +2621,58 @@ fn validate_park_refs(
     Ok(validated)
 }
 
+/// Re-anchor a path inside a LIVE linked git worktree to the main
+/// checkout (worktree landing normalization). Linked worktrees carry a
+/// `.git` FILE whose `gitdir:` line names `<main>/.git/worktrees/<name>`
+/// — a pure filesystem parse, no git invocation. Returns the same
+/// relative path re-rooted at the main checkout; `None` when the path
+/// is not inside a linked worktree or the marker does not parse
+/// (callers keep the verbatim path). Existence at the landing is the
+/// caller's policy.
+fn worktree_landed_path(path: &Path) -> Option<PathBuf> {
+    let mut probe = Some(path);
+    let wt_root = loop {
+        let dir = probe?;
+        if dir.join(".git").is_file() {
+            break dir;
+        }
+        probe = dir.parent();
+    };
+    let marker = std::fs::read_to_string(wt_root.join(".git")).ok()?;
+    let gitdir = marker.lines().next()?.strip_prefix("gitdir:")?.trim();
+    let gitdir = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        wt_root.join(gitdir)
+    };
+    // <main>/.git/worktrees/<name> → <main>; any other shape is not a
+    // normal checkout's linked worktree — keep verbatim.
+    let worktrees = gitdir.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let dot_git = worktrees.parent()?;
+    if dot_git.file_name()? != ".git" {
+        return None;
+    }
+    let main_root = dot_git.parent()?;
+    let rel = path.strip_prefix(wt_root).ok()?;
+    if rel.as_os_str().is_empty() {
+        Some(main_root.to_path_buf())
+    } else {
+        Some(main_root.join(rel))
+    }
+}
+
 /// Validate one typed-ref spec (G1). Per-type locator rules with named
 /// rejections; file refs must exist, be regular files within the digest
 /// bound, and are hashed HERE — attach-time truth, recorded in the op.
-/// Dir refs must exist and stay digestless pointers.
+/// Dir refs must exist and stay digestless pointers. File/dir paths
+/// inside a live linked worktree re-anchor to the main checkout when
+/// the target already exists there ([`worktree_landed_path`]):
+/// worktree paths die at merge cleanup, and the durable identity of
+/// touched territory is where it landed — work not yet landed keeps
+/// its verbatim path and decays honestly.
 fn validate_ref(
     ref_type: AgendaRefType,
     locator: &str,
@@ -2638,15 +2686,11 @@ fn validate_ref(
     // Dir refs: trailing slashes are display sugar — store the one
     // slashless spelling so `(type, locator)` addressing cannot mint two
     // addresses for one directory.
-    let locator = if ref_type == AgendaRefType::Dir {
+    let mut locator: String = if ref_type == AgendaRefType::Dir {
         let trimmed = locator.trim_end_matches('/');
-        if trimmed.is_empty() {
-            "/"
-        } else {
-            trimmed
-        }
+        if trimmed.is_empty() { "/" } else { trimmed }.to_string()
     } else {
-        locator
+        locator.to_string()
     };
     let label = match label {
         None => None,
@@ -2672,12 +2716,19 @@ fn validate_ref(
                     "file ref path exceeds {MAX_REF_FILE_LOCATOR_CHARS} characters"
                 )));
             }
-            let path = Path::new(locator);
+            let path = Path::new(&locator);
             if !path.is_absolute() {
                 return Err(AgendaError::Invalid(
                     "file ref path must be absolute".into(),
                 ));
             }
+            // Worktree landing normalization: the digest below then
+            // records the LANDED file's bytes — the ref points there.
+            let landed = worktree_landed_path(path).filter(|p| p.is_file());
+            if let Some(landed) = landed {
+                locator = landed.to_string_lossy().into_owned();
+            }
+            let path = Path::new(&locator);
             let meta = std::fs::metadata(path).map_err(|err| {
                 AgendaError::Invalid(format!(
                     "cannot attach a file ref: {locator} is not readable ({err})"
@@ -2705,10 +2756,17 @@ fn validate_ref(
                     "dir ref path exceeds {MAX_REF_FILE_LOCATOR_CHARS} characters"
                 )));
             }
-            let path = Path::new(locator);
+            let path = Path::new(&locator);
             if !path.is_absolute() {
                 return Err(AgendaError::Invalid("dir ref path must be absolute".into()));
             }
+            // Worktree landing normalization (digestless twin of the
+            // file arm's).
+            let landed = worktree_landed_path(path).filter(|p| p.is_dir());
+            if let Some(landed) = landed {
+                locator = landed.to_string_lossy().into_owned();
+            }
+            let path = Path::new(&locator);
             let meta = std::fs::metadata(path).map_err(|err| {
                 AgendaError::Invalid(format!(
                     "cannot attach a dir ref: {locator} is not readable ({err})"
@@ -2750,7 +2808,7 @@ fn validate_ref(
     };
     Ok(ValidatedRef {
         ref_type,
-        locator: locator.to_string(),
+        locator,
         digest,
         must_read,
         label,
@@ -4523,6 +4581,115 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("more than 32 refs"));
+    }
+
+    /// Worktree landing normalization: file/dir refs attached from
+    /// inside a live linked worktree re-anchor to the main checkout
+    /// when the target exists there (the digest records the LANDED
+    /// bytes); unlanded targets and unparseable markers keep the
+    /// verbatim path. The worktree layout is fabricated by hand — the
+    /// helper parses the `.git` marker file, never invokes git.
+    #[test]
+    fn refs_reanchor_from_live_worktrees_to_the_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let main = tree.path().join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), b"landed bytes").unwrap();
+        let wt = tree.path().join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        std::fs::write(wt.join("src/lib.rs"), b"worktree bytes").unwrap();
+        std::fs::write(wt.join("src/new.rs"), b"unlanded").unwrap();
+
+        let mut store = AgendaStore::open(&dir.path().join("agenda")).unwrap();
+        let id = store
+            .apply_command(add_cmd("landing"), owner(), 1000)
+            .unwrap()
+            .id;
+
+        // Landed file: locator re-anchors, digest is of the MAIN bytes.
+        let wt_lib = wt.join("src/lib.rs");
+        let item = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::File, &wt_lib.to_string_lossy()),
+                owner(),
+                1001,
+            )
+            .unwrap();
+        let main_lib = main.join("src/lib.rs");
+        let r = &item.refs[0];
+        assert_eq!(r.locator, main_lib.to_string_lossy(), "re-anchored");
+        assert_eq!(
+            r.digest.as_deref().unwrap(),
+            digest_file(&main_lib).unwrap(),
+            "the ref points at the landing; the digest records landed bytes"
+        );
+
+        // Landed dir: same re-anchor, digestless.
+        let item = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::Dir, &wt.join("src").to_string_lossy()),
+                owner(),
+                1002,
+            )
+            .unwrap();
+        let r = item
+            .refs
+            .iter()
+            .find(|r| r.ref_type == AgendaRefType::Dir)
+            .unwrap();
+        assert_eq!(r.locator, main.join("src").to_string_lossy());
+
+        // Not yet landed: the verbatim worktree path stays (it decays
+        // honestly at merge cleanup; re-attach after landing).
+        let wt_new = wt.join("src/new.rs");
+        let item = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::File, &wt_new.to_string_lossy()),
+                owner(),
+                1003,
+            )
+            .unwrap();
+        let r = item
+            .refs
+            .iter()
+            .find(|r| r.locator.contains("new.rs"))
+            .unwrap();
+        assert_eq!(
+            r.locator,
+            wt_new.to_string_lossy(),
+            "unlanded stays verbatim"
+        );
+
+        // Unparseable marker shape: verbatim.
+        let odd = tree.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join(".git"), "gitdir: /nowhere/thing\n").unwrap();
+        std::fs::write(odd.join("f.txt"), b"x").unwrap();
+        let odd_f = odd.join("f.txt");
+        let item = store
+            .apply_command(
+                add_ref_cmd(&id, AgendaRefType::File, &odd_f.to_string_lossy()),
+                owner(),
+                1004,
+            )
+            .unwrap();
+        let r = item
+            .refs
+            .iter()
+            .find(|r| r.locator.contains("f.txt"))
+            .unwrap();
+        assert_eq!(
+            r.locator,
+            odd_f.to_string_lossy(),
+            "bad marker stays verbatim"
+        );
     }
 
     /// Park-with-refs (the `add` sugar) is all-or-nothing: every spec is
