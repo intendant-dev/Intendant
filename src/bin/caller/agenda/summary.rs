@@ -289,6 +289,12 @@ pub(crate) struct SummaryEffect {
     pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) approval: Option<SummaryApproval>,
+    /// The full DTO's withdrawal marker. Cards need its presence to
+    /// distinguish fired history from a live pending proposal; keeping
+    /// the same field path and shape lets summary/full grains share the
+    /// one render predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) withdrawn: Option<super::types::AgendaWithdrawal>,
     pub(crate) manifest: SummaryManifest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_fire_ms: Option<u64>,
@@ -481,6 +487,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
                     digest: approval.digest.clone(),
                     at_ms: approval.at_ms,
                 }),
+                withdrawn: effect.withdrawn.clone(),
                 manifest: SummaryManifest {
                     fire_at_ms: effect.manifest.fire_at_ms,
                     orchestrate: effect.manifest.orchestrate,
@@ -828,6 +835,35 @@ mod tests {
             "manifest goals stay excluded from the summary shape"
         );
         assert_eq!(eff["state"], "proposed");
+        assert!(
+            eff.get("withdrawn").is_none(),
+            "an active proposal keeps the additive marker absent"
+        );
+
+        // A withdrawn fired-history husk carries the full marker at the
+        // same path on both grains. The SPA's one effect-state predicate
+        // reads only its presence, while the inspector can still render
+        // the attributed reason without a shape fork.
+        let mut withdrawn = full.clone();
+        withdrawn.effects[0].withdrawn = Some(super::super::types::AgendaWithdrawal {
+            at_ms: 9000,
+            principal: Some("principal:agent-session:test".into()),
+            session_id: Some("session-withdrawer".into()),
+            kind: Some("agent_session".into()),
+            reason: Some("work already landed".into()),
+        });
+        let wire = serde_json::to_value(
+            &summarize(
+                std::slice::from_ref(&withdrawn),
+                std::slice::from_ref(&withdrawn),
+            )[0],
+        )
+        .unwrap();
+        assert_eq!(wire["effects"][0]["withdrawn"]["at_ms"], 9000);
+        assert_eq!(
+            wire["effects"][0]["withdrawn"]["reason"],
+            "work already landed"
+        );
     }
 
     /// Live asks carry their question payload on the summary (the rail
