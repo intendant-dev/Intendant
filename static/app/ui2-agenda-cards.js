@@ -1791,6 +1791,12 @@ function agendaLensFooterHtml(lensId) {
 // ---- List event delegation (wired once on #ag2-groups) ----
 
 function agendaGroupsClick(e) {
+  // The click a press-and-hold releases into already did its job (the
+  // reveal) — swallow it whole before any branch can act on it.
+  if (agendaCtlHoldFiredAt && Date.now() - agendaCtlHoldFiredAt < 800) {
+    agendaCtlHoldFiredAt = 0;
+    return;
+  }
   // S6 footer affordances: the Archive pager and the see-archive door.
   if (e.target.closest('[data-archive-more]')) {
     e.preventDefault();
@@ -1818,12 +1824,6 @@ function agendaGroupsClick(e) {
   if (ctl) {
     const item = agendaFindItem(ctl.dataset.ctl);
     if (!item) return;
-    // The click a press-and-hold releases into already did its job
-    // (the reveal) — never let it act too.
-    if (agendaCtlHoldFiredAt && Date.now() - agendaCtlHoldFiredAt < 800) {
-      agendaCtlHoldFiredAt = 0;
-      return;
-    }
     if (item.kind === 'question' && item.status === 'open') {
       agendaOpenInspector(item.id);
       return;
