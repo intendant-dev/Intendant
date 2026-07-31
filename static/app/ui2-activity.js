@@ -134,17 +134,23 @@ function ui2WireLayoutToggle() {
 // Predicates are 41/40's shared boundaries: sessionWindowIsSubagent (the
 // relationship kind the badges use), sessionWindowIsDoneSubagent (the
 // "N sub" active boundary), sessionWindowHasHardDoneEvidence (ended /
-// done / interrupted — never bare idle).
+// done / interrupted — never bare idle), and
+// sessionWindowIsClosableAtAGlance (the positive-only safe-to-stop
+// composition). The closable lens's per-window class rides this same
+// pass — same freshness ticks (badge crossings, the relationship render
+// pass, every sweep) — so the chip's number and the dimmed set can
+// never disagree.
 function ui2ArrangeMenuModel() {
   const model = {
     windows: 0, expanded: 0, minimized: 0,
     subs: 0, subsExpanded: 0, doneSubsExpanded: 0,
-    hardDone: 0, detailsExpanded: 0,
+    hardDone: 0, detailsExpanded: 0, closable: 0,
   };
   if (typeof sessionWindows === 'undefined') return model;
   const isSub = typeof sessionWindowIsSubagent === 'function' ? sessionWindowIsSubagent : null;
   const isDoneSub = typeof sessionWindowIsDoneSubagent === 'function' ? sessionWindowIsDoneSubagent : null;
   const isHardDone = typeof sessionWindowHasHardDoneEvidence === 'function' ? sessionWindowHasHardDoneEvidence : null;
+  const isClosable = typeof sessionWindowIsClosableAtAGlance === 'function' ? sessionWindowIsClosableAtAGlance : null;
   for (const [sid, win] of sessionWindows) {
     if (!win) continue;
     model.windows += 1;
@@ -161,6 +167,11 @@ function ui2ArrangeMenuModel() {
       }
     }
     if (isHardDone && isHardDone(sid)) model.hardDone += 1;
+    if (isClosable) {
+      const closable = isClosable(sid);
+      if (closable) model.closable += 1;
+      if (win.el) win.el.classList.toggle('session-window-closable', closable);
+    }
   }
   return model;
 }
@@ -242,6 +253,9 @@ function ui2RefreshArrangeMenu() {
           : `Collapse header details on all ${m.detailsExpanded} expanded session windows`)
       : 'Expand header details on every session window',
   });
+  // The closable chip rides the same single-pass refresh (and the same
+  // walk already stamped every window's closable class above).
+  ui2RefreshClosableLensChip(m.closable);
 }
 
 // Legacy seam: 40-session-launch.js's relationship-render pass still
@@ -301,6 +315,82 @@ function ui2RunArrangeAction(action, row) {
   }
   ui2RefreshArrangeMenu();
 }
+
+// ── The closable-at-a-glance lens ──────────────────────────────────────
+// A grid lens over the positive safe-to-stop claims
+// (sessionWindowClosableClaim / sessionWindowIsClosableAtAGlance in
+// 41-session-window-actions.js): the chip counts the cards whose close
+// the machine already rules safe and, engaged, dims every other card so
+// the closable set reads at a glance (the dim rules live with the
+// .session-window styles in 12-styles-tasks-log.css, keyed on the html
+// attribute stamped here). Positive-only at the surface too: the chip
+// hides at zero — never "0 closable" — and because an engaged lens with
+// an empty count would strand a fully-dimmed grid behind a hidden
+// toggle, the refresh disengages it the moment the count empties.
+// Transient by design: the lens is a look, not a mode — it never
+// persists across reloads.
+let ui2ClosableLensOn = false;
+
+function ui2SetClosableLens(on) {
+  ui2ClosableLensOn = !!on;
+  const html = document.documentElement;
+  if (ui2ClosableLensOn) html.setAttribute('data-ui2-closable-lens', 'on');
+  else html.removeAttribute('data-ui2-closable-lens');
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (btn) btn.setAttribute('aria-pressed', ui2ClosableLensOn ? 'true' : 'false');
+}
+
+function ui2RefreshClosableLensChip(count) {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  const n = Number(count) || 0;
+  btn.hidden = n === 0;
+  if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);
+  const countEl = document.getElementById('ui2-closable-lens-count');
+  if (countEl) countEl.textContent = String(n);
+  btn.title = n === 1
+    ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
+    : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`;
+}
+
+function ui2WireClosableLens() {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    ui2SetClosableLens(!ui2ClosableLensOn);
+    ui2RefreshArrangeMenu();
+  });
+}
+
+// QA facade (window.qa convention): claim() drives the pure classifier
+// with an explicit matrix (the conjunction is otherwise untestable
+// without a live daemon), set()/state() drive and snapshot the chip +
+// lens surface after a fresh single-pass walk.
+window.qa = Object.assign(window.qa || {}, {
+  closableLens: {
+    claim: (c) => (typeof sessionWindowClosableClaim === 'function'
+      ? sessionWindowClosableClaim(c || {}) : null),
+    isClosable: (sid) => (typeof sessionWindowIsClosableAtAGlance === 'function'
+      ? sessionWindowIsClosableAtAGlance(sid) : null),
+    set: (on) => { ui2SetClosableLens(!!on); ui2RefreshArrangeMenu(); return ui2ClosableLensOn; },
+    state: () => {
+      ui2RefreshArrangeMenu();
+      const btn = document.getElementById('ui2-closable-lens-btn');
+      const ids = typeof sessionWindows === 'undefined' ? [] : [...sessionWindows.keys()];
+      const canClassify = typeof sessionWindowIsClosableAtAGlance === 'function';
+      return {
+        on: ui2ClosableLensOn,
+        lensAttr: document.documentElement.getAttribute('data-ui2-closable-lens') || '',
+        count: Number(document.getElementById('ui2-closable-lens-count')?.textContent || '0'),
+        chipHidden: !btn || !!btn.hidden,
+        closable: canClassify ? ids.filter((sid) => sessionWindowIsClosableAtAGlance(sid)) : [],
+        closableClassed: ids.filter(
+          (sid) => !!sessionWindows.get(sid)?.el?.classList?.contains('session-window-closable')
+        ),
+      };
+    },
+  },
+});
 
 // Popover mechanics copied from the Options wiring below: fixed-position
 // anchor stamped at open, outside-pointerdown + Escape close, resize
@@ -866,6 +956,7 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireArrangeMenu();
+    ui2WireClosableLens();
     ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();

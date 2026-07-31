@@ -85,6 +85,15 @@ const READOPT_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// journal unavailable).
 const AGENDA_SEED_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Spacing between continuation dispatches. Each resume cold-starts a
+/// backend child (process spawn, runtime boot, first API call) on a box
+/// that typically just finished the rebuild that restarted the daemon —
+/// the 2026-07-30 restart dispatched six back-to-back right as the
+/// gateway's first connects arrived, and the stacked cold-starts helped
+/// starve the accept lane. The sessions were dead for hours; twenty more
+/// seconds each is free. The daemon branch passes this; tests pass zero.
+pub(crate) const READOPT_DISPATCH_SPACING: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The post-dispatch verification window: dispatches are not outcomes,
 /// so the pass holds its summary until the resumes have had this long to
 /// spawn, register, and stay up — a healthy continuation admits itself
@@ -944,10 +953,92 @@ mod tests {
             bus.clone(),
             std::sync::Arc::new(secondary),
             true,
+            std::time::Duration::ZERO,
         ));
         assert!(
             events.try_recv().is_err(),
             "a secondary readopts nothing and stays silent"
+        );
+    }
+
+    /// Dispatches are staggered: with a spacing configured the pass
+    /// sleeps it out between continuation dispatches (backend
+    /// cold-starts land one at a time on a just-rebuilt box — the
+    /// 2026-07-30 restart stacked six at once and helped starve the
+    /// gateway), and the stagger never loses work — every dispatchable
+    /// candidate still dispatches. Pinned as the paused-clock elapsed
+    /// DELTA between a zero-spacing pass and a spaced pass over
+    /// identical fixtures: every other await in the pass is identical,
+    /// so the delta is the one inter-dispatch sleep.
+    #[test]
+    fn dispatch_stagger_spaces_but_never_drops() {
+        let home = tempfile::tempdir().unwrap();
+        for (wrapper, backend) in [
+            ("stagger-wrap-a", "b-stagger-a"),
+            ("stagger-wrap-b", "b-stagger-b"),
+        ] {
+            announce(home.path(), wrapper, backend);
+            write_meta(home.path(), wrapper, "running", None);
+            // Backdate the transcript so activity predates the per-run
+            // presence watershed (registration happens below, later).
+            let transcript = logs_root(home.path()).join(wrapper).join("session.jsonl");
+            let file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .unwrap();
+        }
+
+        let run = |spacing: std::time::Duration| -> (usize, std::time::Duration) {
+            let state_root = tempfile::tempdir().unwrap();
+            let holder = std::sync::Arc::new(crate::handover::HandoverRuntime::initialize(
+                state_root.path(),
+                8765,
+                0,
+            ));
+            assert!(holder.is_holder(), "fresh root holds the lease");
+            let bus = crate::event::EventBus::new();
+            let mut events = bus.subscribe();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let elapsed = runtime.block_on(async {
+                tokio::time::pause();
+                let start = tokio::time::Instant::now();
+                run_boot_readopt_pass(
+                    home.path().to_path_buf(),
+                    bus.clone(),
+                    holder,
+                    true,
+                    spacing,
+                )
+                .await;
+                start.elapsed()
+            });
+            let mut resumes = 0;
+            while let Ok(event) = events.try_recv() {
+                if let AppEvent::ControlCommand(ControlMsg::ResumeSession {
+                    auto_attach: true,
+                    ..
+                }) = event
+                {
+                    resumes += 1;
+                }
+            }
+            (resumes, elapsed)
+        };
+
+        let (resumed_zero, elapsed_zero) = run(std::time::Duration::ZERO);
+        assert_eq!(resumed_zero, 2, "both candidates dispatch without spacing");
+        let (resumed_spaced, elapsed_spaced) = run(READOPT_DISPATCH_SPACING);
+        assert_eq!(resumed_spaced, 2, "the stagger never loses a dispatch");
+        let delta = elapsed_spaced.saturating_sub(elapsed_zero);
+        assert!(
+            delta >= std::time::Duration::from_secs(19)
+                && delta <= std::time::Duration::from_secs(21),
+            "exactly one inter-dispatch spacing separates two dispatches; delta={delta:?}"
         );
     }
 
@@ -1313,12 +1404,17 @@ pub(crate) fn readopt_enabled(config_enabled: bool) -> bool {
 /// The boot pass. Spawned by the daemon branch after the session
 /// supervisor is subscribed (sends land in the intent lane, never the
 /// void). Holder-gated: secondaries never readopt; a draining daemon
-/// never spawns work.
+/// never spawns work. `dispatch_spacing` staggers the continuation
+/// dispatches ([`READOPT_DISPATCH_SPACING`] in production, zero in
+/// tests); a drain that begins mid-stagger cuts the pass honestly —
+/// the remainder is recorded left-dead, never spawned into a draining
+/// daemon.
 pub(crate) async fn run_boot_readopt_pass(
     home: PathBuf,
     bus: EventBus,
     handover: std::sync::Arc<HandoverRuntime>,
     enabled: bool,
+    dispatch_spacing: std::time::Duration,
 ) {
     if !enabled {
         eprintln!("[readopt] disabled by configuration — dead-boot sessions stay down");
@@ -1383,7 +1479,15 @@ pub(crate) async fn run_boot_readopt_pass(
     let mut dispatched: Vec<ReadoptDispatch> = Vec::new();
     let mut dispatched_conversations: HashSet<(String, String)> = HashSet::new();
     let mut left_dead: Vec<(String, String)> = Vec::new();
+    let mut draining_cut = false;
     for candidate in candidates {
+        if draining_cut {
+            left_dead.push((
+                candidate.session_id,
+                "daemon began draining mid-pass".to_string(),
+            ));
+            continue;
+        }
         if dispatched.len() >= READOPT_MAX_PER_BOOT {
             left_dead.push((
                 candidate.session_id,
@@ -1411,6 +1515,23 @@ pub(crate) async fn run_boot_readopt_pass(
                             short_id(&candidate.session_id)
                         );
                         left_dead.push((candidate.session_id, reason));
+                        continue;
+                    }
+                }
+                // Stagger: every dispatch after the first waits out the
+                // spacing, so continuation cold-starts land one at a time
+                // on a box that is already hot from the rebuild+boot. A
+                // drain that began during the wait cuts the pass — this
+                // candidate and the rest are honest left-dead outcomes,
+                // never spawns into a draining daemon.
+                if !dispatched.is_empty() && !dispatch_spacing.is_zero() {
+                    tokio::time::sleep(dispatch_spacing).await;
+                    if handover.is_draining() {
+                        draining_cut = true;
+                        left_dead.push((
+                            candidate.session_id,
+                            "daemon began draining mid-pass".to_string(),
+                        ));
                         continue;
                     }
                 }

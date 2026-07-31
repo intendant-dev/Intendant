@@ -1128,6 +1128,59 @@ function hideDoneSessionWindows() {
   return changed;
 }
 
+// ── Closable at a glance (Track AO follow-through) ─────────────────────
+// The POSITIVE half of the safe-to-stop story, composed for the grid
+// lens (ui2-activity.js owns the count chip and the dim toggle; its
+// Arrange walk derives the count and the per-window class). One claim
+// function, matrix-driven by the QA harness; the × affordance and the
+// stop confirms above keep their own copy surfaces untouched. The
+// predicate is strictly a conjunction of claims that ALREADY exist —
+// never a second derivation:
+//   · the served stop claim (grid_envelope.rs, consumed verbatim):
+//     kills_live_run / owed_work veto outright — the durable journal
+//     debt outranks any process look; settled turns positive only once
+//     the window itself is quiet, extending the ruled
+//     suppressed-while-running choice to the lens (a running window
+//     never reads closable, even settled — it may be doing new,
+//     untracked work);
+//   · the × affordance's linkless conjunction: idle ∧ no agenda linkage;
+//   · hard done evidence (ended / done / interrupted) — the "already
+//     ended" positive the stop flow and the Hide-finished sweep already
+//     rule.
+// A linked occurrence with no served stop claim, and any unrecognized
+// claim, stay not-closable: positive-only, absence claims nothing.
+function sessionWindowClosableClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  if (stop === 'kills_live_run' || stop === 'owed_work') return false;
+  // An ABSENT phase is no claim (normalizeSessionPhase defaults '' to
+  // 'idle', which would read wider than the ×'s raw win.phase === 'idle'
+  // check — positive-only forbids that): a phase-less window is quiet
+  // only on hard done evidence.
+  const quiet = !!claim.hardDone
+    || (!!claim.phase && normalizeSessionPhase(claim.phase) === 'idle');
+  if (stop === 'settled') return quiet;
+  if (stop || claim.linked) return false;
+  return quiet;
+}
+
+// The sid boundary over the pure claim above: every input is a fact some
+// shipped surface already trusts — the served envelope in
+// sessionMetadataById, the ×'s win.phase, the sweeps' hard-done
+// predicate. Nothing here looks at the journal or the process directly.
+function sessionWindowIsClosableAtAGlance(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  const occ = (meta.agenda || {}).occurrence;
+  return sessionWindowClosableClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!meta.agenda,
+    phase: win.phase || meta.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+  });
+}
+
 // QA facade (window.qa convention): the dashboard validator's grid-pill
 // probe builds throwaway windows and reads per-window sweep state, and the
 // boot smoke's jump-button probe drives the transcript state machine — the

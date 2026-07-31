@@ -26,6 +26,14 @@ one in Intendant gives you:
   MCP server over the running gateway. Pi receives the same session-scoped
   authority through `$INTENDANT ctl`; this preserves Pi's intentionally small
   core instead of inventing a fake MCP integration.
+- **Provider-neutral remote compute.** The compact bootstrap advertises
+  `remote_command` to Codex, Claude Code, and Kimi Code; Pi reaches the same
+  job vocabulary through `$INTENDANT ctl tools call remote_command`. When a
+  compute host is attached, heavy platform-neutral builds and tests can run
+  there without changing which backend is doing the reasoning. If no host is
+  attached, the backend acquires/attaches one through the Cloud controls or
+  reports remote compute unavailable instead of silently running the heavy
+  fallback on the supervisor.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents
@@ -155,7 +163,7 @@ adapter from `[agent.<backend>]` config, then `run_external_agent_mode()`
 | Mid-turn steer | Yes (`turn/steer`) | Yes — a stdin user message is absorbed into the running turn at the CLI's next checkpoint (verified on 2.1.215; 2.1.207 discarded such lines). No stdout echo, so delivery is inferred at the next model checkpoint; an idle session delivers the steer immediately as its own turn | Yes — Kimi queued prompts plus `prompts::steer`; a completion race becomes an ordinary immediate follow-up without losing text | Yes (`steer`) |
 | Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) | Yes — active prompt abort, with a session abort fallback | Yes (`abort`) |
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) | Yes — usage events plus typed `agentRPCService.getContext` snapshots: Kimi's current post-compaction model history and measured `tokenCount`, scoped to the exact selected main/composite agent, with the configured model catalog's context window | Yes — assistant-message usage/cache fields plus model context window from state/model events |
-| Reasoning trace | Yes | Yes (`thinking` blocks) | Yes — thinking deltas/messages | Yes — thinking deltas/messages |
+| Reasoning trace | Yes | Yes (`thinking` blocks) — but print-mode CC ≥ 2.1.217 withholds summarized-thinking text on spawned seats (see the Usage bullet); adopted/attached interactive sessions keep it | Yes — thinking deltas/messages | Yes — thinking deltas/messages |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset | Yes — native `undo`, including edit-and-rerun of an active historical user turn | No → fork or reset |
 | Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) | Native `compact`, head and exact historical real-user-turn-boundary `fork`, `side`/`:btw`, `undo`, archive/restore/rename, goal get/set/pause/resume/complete/clear with enforced token/turn/wall-clock budgets, live model/thinking/permission/plan/swarm switches, official normal↔highspeed model toggling, supervisor-enforced tool-free read-only review turns over bounded controller-collected workspace evidence, background-task list/output/cancel, exact per-agent active-tool control, model catalog, and destructive per-agent context clear. Kimi has no persistent-memory plane equivalent to Codex `memory-reset`, explicit “mark budget-limited” setter, arbitrary item/message/child fork anchor, or child-only undo | Native compact and rename; fork/side respawn from the parent session; live model and thinking. No native goals/review/fast/memory reset |
 | Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail | Yes — native swarm and `:btw` agents retain their own ids, scoped activity, relationships, status, and results | No — upstream Pi deliberately omits built-in sub-agents |
@@ -320,9 +328,10 @@ own native capabilities where the upstream CLIs provide them.
   core profile keeps a small bootstrap surface: `get_status`, the shared-view
   tools, and the minimal display/CU path (`list_displays`, `grant_user_display`,
   `revoke_user_display`, `read_screen`, `take_screenshot`,
-  `execute_cu_actions`) for managed **and** vanilla sessions; managed context
-  additionally exposes the managed-context/fission tools. Broad or rare
-  Intendant operations should be discovered lazily through
+  `execute_cu_actions`), plus `remote_command` for heavy platform-neutral
+  compute on an attached host, for managed **and** vanilla sessions; managed
+  context additionally exposes the managed-context/fission tools. Broad or
+  rare Intendant operations should be discovered lazily through
   `intendant ctl --help`, `intendant ctl tools list`, and focused subcommand
   help. Supervised Codex sessions receive
   `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
@@ -678,9 +687,32 @@ through Claude Code 2.1.210):
 - **Usage**: per-API-call usage from `message_delta` stream events plus the
   turn `result` feed `AgentEvent::Usage`; the context window comes from the
   result's `modelUsage` map (200k default until the first result).
-  `thinking` blocks surface as `AgentEvent::Reasoning`. Turn `result`s with
-  error subtypes (`error_max_turns`, `error_during_execution`, …) emit
-  `AgentEvent::BackendError` before completing the turn.
+  `thinking` blocks surface as `AgentEvent::Reasoning` — with one upstream
+  limitation the wrapper cannot repair: **print-mode Claude Code
+  (≥ 2.1.217, the `-p`/sdk-cli entrypoint every daemon-spawned seat uses)
+  withholds summarized-thinking text entirely** on summarized-thinking
+  models (e.g. `claude-fable-5`). Raw wire capture (2026-07-30, CC
+  2.1.220, the wrapper's exact spawn args): `thinking_delta` events carry
+  `{"thinking":"","estimated_tokens":N}`, the `content_block_start` and
+  assistant-envelope blocks are signature-only shells, and the same
+  turn's native `~/.claude` transcript stores the same empty shell — so
+  there is no text to render anywhere, and `AgentEvent::Reasoning` never
+  fires. The strip is entrypoint-conditional and upstream-deliberate:
+  interactive (`cli`-entrypoint) sessions at the same versions keep full
+  thinking text, both live and in their transcripts. Intendant renders
+  honest absence (never a fabricated row): spawned print-mode seats show
+  the "Thinking" activity phase (the empty deltas still heartbeat) but no
+  thinking rows, while interactive-born sessions the daemon adopted or
+  attached get their transcript-materialized thinking forwarded into the
+  live Activity feed by the dashboard's transcript-sync parity lane
+  (`static/app/41b-reasoning-log.js`), deduplicated against the live lane
+  by the shared `level model` + `kind reasoning` signature grammar. The
+  wrapper also buffers any initial `content_block_start` thinking text
+  (none shipped today), so a future CLI that restores text in any
+  streamed shape lights the whole live chain back up unchanged. Turn
+  `result`s with error subtypes (`error_max_turns`,
+  `error_during_execution`, …) emit `AgentEvent::BackendError` before
+  completing the turn.
 - **Thread actions**: `compact` writes the native `/compact` user message —
   the CLI answers `status: compacting` → `compact_boundary` (with
   `pre_tokens`) → a free zero-usage `result`, and the session keeps its
@@ -1122,6 +1154,43 @@ marker on the session meta (cleared on release/cancel) so boot auto-readopt
 can tell a daemon died mid-park with work still owed. Activity and
 session-log rows make the pause, queued messages, cancellation, and resend
 visible.
+
+## Service-condition Error Parking
+
+A round can also die early on a **temporary service condition** — the
+provider-incident class: repeated HTTP 5xx after the backend's own transport
+retries gave up, gateway drops, stream cuts. Claude Code surfaces these as an
+errored result ("API Error: 500 …"), which used to end the round "cleanly"
+(error row → done signal → round complete): nothing was armed, so the session
+sat fake-idle, invisible to the credential-reload lane and every wake clock —
+and for a scheduled occurrence the DoneSignal journaled COMPLETED with the
+failure invisible (2026-07-29 specimens, both commission seats, stranded for
+over an hour).
+
+The drain now classifies early round endings at the round-outcome seam
+(`transient_service_condition` in `external_supervision.rs`, conservative
+marker matching): a fatal backend error with a temporary-service cause drains
+as `DrainOutcome::TransientRoundDeath`; **permanent causes — auth problems,
+refusals, invalid model pins, deliberate exits — keep their terminal shapes**
+(`TurnFailed` for the zero-turn round, the completion shape after real work).
+Temporary-class deaths enter the **same armed park** as the limit lanes — one
+`LimitParkState` slot, the same wake timer, queue-while-parked, cancel, and
+reload-preserve machinery, the same delivery-aware pending seam
+(`delivery_aware_park_pending` / `midturn_continuation`), with a
+`ParkKind::ServiceCondition` tag so every shared line says "Service-recovery
+pause", never "rate-limited" — plus a **wake schedule of their own**: limit
+parks wake at the provider's reset time, service-condition parks wake on a
+bounded widening backoff (30s → 2m → 5m → 15m → 30m, small jitter; integers
+tunable in `ERROR_PARK_BACKOFF_SCHEDULE_SECS`), each wake re-driving the
+interrupted work (the continue-where-you-left-off nudge when the turn had
+started, the driving message verbatim when it never did). A completed turn —
+or an explicit intervention (interrupt, reload, `/new`) — resets the attempt
+counter. When the schedule exhausts, the supervised lane ends the session
+with a FAILED terminal carrying the cause, so a scheduled occurrence journals
+`failed` — counting on the agenda's suspension streak and surfacing to the
+owner — instead of waiting unattended; the persistent daemon lane reports the
+outage on the error/presence surfaces and stops parking until the next user
+message re-drives it.
 
 ## Dashboard and Station parity
 

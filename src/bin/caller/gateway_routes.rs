@@ -425,6 +425,11 @@ pub(crate) enum RouteHandlerId {
     /// Handover status: lease role, drain state, co-homed daemons with
     /// probed liveness (the drain banner/successor chip's poll).
     DaemonHandoverStatus,
+    /// Self-update lane: run the bounded behind-ness check now.
+    DaemonUpdateLaneCheck,
+    /// Self-update lane: the owner's click — produce the update
+    /// artifact (source build or verified release download).
+    DaemonUpdateLaneProduce,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1127,6 +1132,31 @@ pub(crate) static ROUTES: &[Route] = &[
         "Handover status: lease role, drain state, and co-homed daemons with probed liveness",
     )
     .with_tunnel(tunnel_method("api_daemon_handover")),
+    // The self-update lane (the PRODUCE half of the update surface):
+    // owner-grade like the takeover row, same loopback/own-origin trust
+    // posture, deliberately NO tunnel twins — remote Connect-mode
+    // surfaces watch progress through the handover status block but
+    // cannot click a build/download onto the box (widening that is a
+    // trust-surface decision the owner has not ratified). The check is
+    // bounded compare only; produce is the consent click, and the
+    // daemon never execs a successor — the shipped chip/one-click lane
+    // performs the swap.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/update-lane/check"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonUpdateLaneCheck,
+        "Self-update lane: run the bounded behind-origin-main / behind-latest-release check now",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/update-lane/produce"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonUpdateLaneProduce,
+        "Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip",
+    ),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
     // dashboard consumes via authenticated fetch. HTTP-only for now — the
@@ -3244,6 +3274,15 @@ mod tests {
         // The takeover request carries only a display label (HS3).
         assert_eq!(
             policy("POST", "/api/daemon/takeover"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        // The update-lane actions carry at most a small JSON body.
+        assert_eq!(
+            policy("POST", "/api/daemon/update-lane/check"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        assert_eq!(
+            policy("POST", "/api/daemon/update-lane/produce"),
             BodyPolicy::Capped(4 * 1024)
         );
         // The agenda command lane accepts the rich-ask park payload: the

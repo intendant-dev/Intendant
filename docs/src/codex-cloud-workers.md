@@ -331,6 +331,69 @@ reply-kind allowlist like every other worker frame. A worker without a
 display capability answers with the named error from the display
 resolver rather than guessing.
 
+## Provider-neutral remote commands
+
+An attached worker can also run a bounded, non-interactive command for any
+supervised agent backend. The public tool is named `remote_command`, not
+`codex_cloud_shell`: Codex, Claude Code, Kimi Code, Pi, and native Intendant
+sessions all receive the same job vocabulary in their compact/core tool
+profile. Codex Cloud is only the first host adapter.
+
+The tool has four operations: `start`, `status`, `wait`, and `cancel`.
+`start` returns immediately with a daemon-local job id; `status` polls it,
+`wait` waits for at most 60 seconds, and `cancel` terminates the worker
+process tree. The initial host form is an already-connected lease,
+`cloud:<task-id>`:
+
+```bash
+intendant ctl tools call remote_command --args '{
+  "op": "start",
+  "host": "cloud:task_e_...",
+  "argv": ["cargo", "test", "-p", "intendant-core"],
+  "expected_revision": "0123456789abcdef",
+  "require_clean": true,
+  "timeout_s": 900
+}'
+
+intendant ctl tools call remote_command \
+  --args '{"op":"wait","job_id":"remote-...","wait_s":30}'
+```
+
+The contract is intentionally stricter than an interactive terminal:
+
+- Commands are transported as an argv array and are not implicitly parsed by
+  a shell. `cwd`, when present, is repository-relative and cannot escape the
+  selected checkout. Explicit environment entries are additions to the
+  worker's agent-phase environment.
+- `expected_revision` is required. Before spawning, the worker resolves
+  `git rev-parse HEAD` and refuses a different revision; abbreviated object
+  ids are accepted from 7 hexadecimal characters. `require_clean` defaults
+  to true and includes untracked files. This prevents a green remote result
+  from silently describing stale or locally modified source.
+- Stdout and stderr are each bounded to 128 KiB. On overflow the result keeps
+  the first 32 KiB and the latest tail and marks that stream truncated.
+  Timeout, cancellation, and attachment loss terminate the owned process
+  tree. The result reports the exact terminal state, exit code when one
+  exists, worker revision, duration, and whether the checkout became dirty.
+- Jobs are owned by the supervised session that started them. Another
+  session receives the same not-found response as an unknown id; an
+  unrestricted local owner surface may inspect them. Jobs are in daemon
+  memory and do not survive a home-daemon restart.
+- The worker accepts command start/cancel frames only from its authenticated
+  home attachment. Home accepts only the correlated result frame back; the
+  cloud-worker identity still has zero authority over home. MCP call-time IAM
+  additionally requires `shell.spawn`.
+
+This first slice does **not** copy an agent's uncommitted worktree, create a
+Cloud task, or perform the attach ceremony. Push the intended commit, select
+that branch/revision when creating the task, and attach it before starting a
+job. Automatic worker acquisition, source snapshot transport, and a reusable
+worker pool are separate scheduling layers over this command contract.
+Until that acquisition layer lands, an agent that has no attachment should
+use the existing Codex Cloud submit/attach controls or report that remote
+compute is unavailable. It should not silently move a heavy platform-neutral
+build back onto the supervised machine.
+
 ## Attachment lifecycle
 
 The enrollment broker above records the attachment state for its workers;
@@ -390,18 +453,24 @@ is remembered locally.
 
 ## MCP tools
 
-The daemon's full MCP tool profile exposes `list_codex_cloud_workers`,
-`submit_codex_cloud_task`, and `follow_up_codex_cloud_task`. This lets an
-Intendant agent refresh worker state, delegate a task, or continue one —
-the full warm-builder loop (submit → probe → follow up → pull) is drivable
-end to end by an agent using the daemon host's authenticated Codex CLI.
-These tools are intentionally omitted from the compact/core tool profile;
-agents can discover and invoke them through `intendant ctl tools list` and
-`intendant ctl tools call`. The list tool reports the same shape as
-`list --json` (window, tracked-active, cursor, transitions) plus how many
-agenda notes it parked; the follow-up tool returns the acceptance receipt
-(parent turn, new turn ids) under the same fail-closed contract as the CLI
-verb.
+The daemon's full MCP tool profile exposes the provider operations
+`list_codex_cloud_workers`, `submit_codex_cloud_task`, and
+`follow_up_codex_cloud_task`. This lets an Intendant agent refresh worker
+state, delegate a Codex task, or continue one — the full warm-builder loop
+(submit → probe → follow up → pull) is drivable end to end by an agent using
+the daemon host's authenticated Codex CLI. These provider operations are
+intentionally omitted from the compact/core tool profile; agents can discover
+and invoke them through `intendant ctl tools list` and `intendant ctl tools
+call`. The list tool reports the same shape as `list --json` (window,
+tracked-active, cursor, transitions) plus how many agenda notes it parked; the
+follow-up tool returns the acceptance receipt (parent turn, new turn ids)
+under the same fail-closed contract as the CLI verb.
+
+`remote_command` is different: it does not create provider work or ask Codex
+to reason. It spends shell authority on an attached compute host, so it is in
+the compact/core profile used by every supervised backend and is IAM-classed
+as `shell.spawn`. Claude Code, Kimi Code, Pi, and Codex therefore use the same
+attached Linux worker without changing which model is doing the reasoning.
 
 ## Environment bootstrap
 
@@ -463,49 +532,43 @@ setup state is the wrong place for a per-task identity or enrollment secret.
 See the official [Codex Cloud environments
 documentation](https://learn.chatgpt.com/docs/environments/cloud-environment).
 
-## Toward visual workers: display streaming and computer use
+## Cache strategy on ephemeral workers
 
-Nothing about a cloud worker changes Intendant's display architecture — it
-only moves the daemon to the far side of an attachment. Once a supervisor
-inside the container starts an Intendant daemon and connects it out through
-the enrollment broker, that daemon is an ordinary (if short-lived) federated
-peer: the [peer display pipeline](./peer-federation.md) can stream a display
-it owns, and [computer use](./computer-use-and-audio.md) can drive that
-display, exactly as on any headless Linux box.
+The 189 s → 2.8 s warm result above came from a surviving task-local
+`target/`; it is valuable but disposable. The cold-resume observation proved
+that a replacement worker can lose the entire ignored tree. Treat this like
+an ephemeral hosted CI runner:
 
-```text
- Codex Cloud container                     your machine
- ┌───────────────────────────────┐        ┌───────────────────────────┐
- │ run-worker.sh (task identity) │        │ Intendant daemon          │
- │  └─ supervisor (foreground)   │        │  ├─ worker lease store    │
- │      ├─ intendant daemon      │◄──────►│  ├─ Agenda (transitions)  │
- │      │   ├─ virtual display   │ tunnel │  └─ dashboard             │
- │      │   │   (Xvfb + CU)      │ (one-  │      └─ Sessions → Cloud  │
- │      │   └─ WebRTC encoder    │  time  │          live tile view   │
- │      └─ outbound transport    │  cred) │          + input          │
- └───────────────────────────────┘        └───────────────────────────┘
-```
+- Keep repeated commands on the same attached task while it remains warm.
+- Put stable toolchain/package preparation in the environment setup cache.
+- Use an externally durable `sccache` (or equivalent compiler cache) when
+  cold replacement performance matters. A task-local sccache directory is
+  lost with the same worker as `target/`.
+- Do not promise a fully warm Rust build from sccache alone. Existing
+  cross-worktree measurements show it can repopulate identical dependency
+  outputs, but local incremental workspace crates, build scripts,
+  non-cacheable crate types, test binaries, and final links still need a
+  fresh target tree. A future acquisition layer may restore a content-keyed
+  target archive, but correctness must never depend on it.
 
-The pieces already exist per-box: virtual display management lives in
-`crates/intendant-platform` (`vision.rs`), capture/encode in
-`intendant-display`, and the cross-machine tile stream plus remote input in
-the peer federation layer. What gates it is the same thing that gates any
-live attachment — the enrollment broker minting one-time credentials and a
-relay route, because a container behind the provider's egress proxy can only
-dial out (agent-phase network is allowlisted, so expect forced-TCP transport
-rather than UDP ICE). Until the broker exists, the lease store, the agenda
-notes, and the dashboard card above are deliberately the shipped surface: the
-job/control plane is reliable today, and the display lane composes onto the
-attachment lane instead of pretending each Cloud task is a static `[[peer]]`.
+The practical split is therefore: Linux workers run platform-neutral
+`cargo check`, tests, clippy, code generation, and other heavy computation;
+the platform CI matrix remains authoritative, including the macOS runner.
+Agents should still run small, targeted macOS checks when a change directly
+touches Apple APIs, entitlements, the app bundle, or the repository's
+macOS-only deterministic WASM artifact path. Remote Linux success reduces
+feedback time; it does not replace CI.
 
 ## Current boundary
 
 This integration covers the reliable job/control plane, the safe
 setup/maintenance contract, and the enrollment ceremony that attaches a live
-worker to home over mTLS. The attachment now carries the terminal frame channel besides
-liveness: home→worker terminal requests and worker→home terminal replies,
-with everything else dropped at both edges — but no display or computer-use
-lane yet. Workers are
-ephemeral enrollments with zero-authority expiring identities, not static
-`[[peer]]` registry entries, and home must be reachable from the worker's
-egress allowlist (there is no relay tier).
+worker to home over mTLS. The attachment carries terminal, tile display,
+computer-use, and provider-neutral remote-command frames in addition to
+liveness; each direction has a closed allowlist, and worker replies are never
+dispatched as authority on home. Workers are ephemeral enrollments with
+zero-authority expiring identities, not static `[[peer]]` registry entries,
+and home must be reachable from the worker's egress allowlist (there is no
+relay tier). Remote-command scheduling still begins with an already-attached,
+correct-revision task: automatic acquisition/pooling and uncommitted source
+transport are not yet part of this layer.

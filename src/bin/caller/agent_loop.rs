@@ -2047,6 +2047,78 @@ pub(crate) async fn run_agent_loop(
                 );
             }
 
+            // Provider-neutral remote commands are controller-owned jobs:
+            // they never enter the local runtime batch. The same operation
+            // enum and job registry back the external-agent MCP/ctl surface,
+            // so native and supervised backends observe identical results.
+            for (call_id, args) in &batch.remote_command_calls {
+                handled_call_ids.insert(call_id.clone());
+                let params =
+                    match serde_json::from_value::<crate::mcp::RemoteCommandParams>(args.clone()) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            conversation.add_tool_result(
+                                call_id,
+                                "remote_command",
+                                &serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("invalid remote_command arguments: {error}"),
+                                })
+                                .to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                let operation = args
+                    .get("op")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                match gate_controller_tool_call(
+                    "remote_command",
+                    &format!("remote_command: {operation}"),
+                    &autonomy::controller_tool_dedup_source("remote_command", args),
+                    &autonomy,
+                    bus,
+                    &session_log,
+                    json_approval,
+                    approval_registry,
+                    headless,
+                    &cancel_token,
+                    &local_session_id,
+                )
+                .await
+                {
+                    ControllerToolGate::Dispatch => {}
+                    ControllerToolGate::Refuse(text) => {
+                        conversation.add_tool_result(call_id, "remote_command", &text);
+                        continue;
+                    }
+                    stop => {
+                        let reason =
+                            controller_gate_stop_exit(&stop, bus, &session_log, &local_session_id);
+                        return Ok((loop_stats, reason));
+                    }
+                }
+                let caller = local_session_id
+                    .clone()
+                    .map(crate::remote_compute::RemoteCommandCaller::AgentSession)
+                    .unwrap_or(crate::remote_compute::RemoteCommandCaller::Unrestricted);
+                let outcome =
+                    crate::remote_compute::execute_remote_command_operation(params, caller).await;
+                let response = match outcome {
+                    Ok(job) => serde_json::json!({
+                        "ok": true,
+                        "job": job,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    }),
+                }
+                .to_string();
+                conversation.add_tool_result(call_id, "remote_command", &response);
+            }
+
             // Workflow checkpoints (coordination files §9 v0).
             // Controller-side file writes: same approval gate as MCP calls.
             for (call_id, args) in &batch.workflow_checkpoints {
