@@ -1155,7 +1155,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateLaneCheck,
-        "Self-update lane: run the bounded behind-origin-main / behind-latest-release check now",
+        "Self-update lane: run the bounded behind-origin-main / behind-latest-release check now (optional body {\"channel\": \"releases\"|\"dev\"}; absent = the install's native lane)",
     ),
     op_route(
         RouteMethod::Post,
@@ -1163,7 +1163,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateLaneProduce,
-        "Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip",
+        "Self-update lane: produce the update artifact on the named channel (dev = source pull+build, releases = verified release download) for the swap chip",
     ),
     // The one-click swap relay (the SWAP half, beyond the app's own
     // webview): a dashboard surface asks the daemon, the daemon parks

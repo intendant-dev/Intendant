@@ -46,6 +46,11 @@ use std::sync::{Arc, Mutex, Weak};
 /// past this the panel says "500+" — a bounded compare, literally.
 const BEHIND_COUNT_CAP: u32 = 500;
 
+/// Bounds on the dev-channel shortlog (newest-first `%h %s` lines the
+/// panel renders as data beside the behind-count).
+const SHORTLOG_MAX_LINES: usize = 20;
+const SHORTLOG_LINE_CAP: usize = 160;
+
 /// Bounded log tail kept per job for the status payload (each line also
 /// goes to the daemon log as it happens).
 const JOB_LOG_TAIL_LINES: usize = 60;
@@ -96,6 +101,131 @@ impl InstallFlavor {
             InstallFlavor::Unmanaged { .. } => "unmanaged",
         }
     }
+
+    /// The channel a request without one means: a source checkout
+    /// updates from main, everything else from releases.
+    pub(crate) fn native_channel(&self) -> UpdateChannel {
+        match self {
+            InstallFlavor::Source { .. } => UpdateChannel::Dev,
+            _ => UpdateChannel::Releases,
+        }
+    }
+}
+
+// ── Channels (the front door's vocabulary) ──────────────────────────
+
+/// The update panel's two-channel vocabulary: **Releases** is the
+/// default lane for everyone — logged, PGP-verified builds, fail closed
+/// on every verify step; **Dev — build from main** sits behind the
+/// panel's Advanced fold and pulls + rebuilds a source checkout.
+/// Exactly two: there is no nightly lane and none is invented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateChannel {
+    Releases,
+    Dev,
+}
+
+/// Parse the optional `{"channel": "releases"|"dev"}` request body.
+/// An absent body/field means the install's native channel; an unknown
+/// channel name is refused by name (the vocabulary is exactly two).
+pub(crate) fn parse_channel_arg(body_text: &str) -> Result<Option<UpdateChannel>, String> {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_text) else {
+        return Ok(None);
+    };
+    let Some(raw) = body.get("channel") else {
+        return Ok(None);
+    };
+    match raw.as_str() {
+        Some("releases") => Ok(Some(UpdateChannel::Releases)),
+        Some("dev") => Ok(Some(UpdateChannel::Dev)),
+        _ => Err(format!(
+            "unknown update channel {} — this daemon has exactly two: \"releases\" and \"dev\"",
+            raw.to_string().chars().take(60).collect::<String>()
+        )),
+    }
+}
+
+/// Why a check on `channel` cannot run for this install (`None` = it
+/// can). The releases check is data about the latest logged release —
+/// honest on every install shape; the dev compare needs a checkout.
+pub(crate) fn check_refusal(flavor: &InstallFlavor, channel: UpdateChannel) -> Option<String> {
+    match (channel, flavor) {
+        (UpdateChannel::Releases, _) => None,
+        (UpdateChannel::Dev, InstallFlavor::Source { .. }) => None,
+        (UpdateChannel::Dev, InstallFlavor::ConsumerApp { .. }) => Some(
+            "no source checkout around this install — the Dev channel compares against and \
+             rebuilds a git checkout"
+                .to_string(),
+        ),
+        (UpdateChannel::Dev, InstallFlavor::Unmanaged { reason }) => Some(reason.clone()),
+    }
+}
+
+/// Why a produce click on `channel` cannot run for this install
+/// (`None` = it can). `macos` is a parameter so the whole matrix stays
+/// hermetic under test on every host.
+pub(crate) fn produce_refusal(
+    flavor: &InstallFlavor,
+    channel: UpdateChannel,
+    macos: bool,
+) -> Option<String> {
+    match (channel, flavor) {
+        (_, InstallFlavor::Unmanaged { reason }) => {
+            Some(format!("no update lane for this install: {reason}"))
+        }
+        (UpdateChannel::Dev, InstallFlavor::Source { .. }) => None,
+        (UpdateChannel::Dev, InstallFlavor::ConsumerApp { .. }) => {
+            check_refusal(flavor, UpdateChannel::Dev)
+        }
+        (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) if !macos => Some(
+            "releases currently ship only the macOS app — rebuild from source on this \
+             platform"
+                .to_string(),
+        ),
+        (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) => None,
+        (
+            UpdateChannel::Releases,
+            InstallFlavor::Source {
+                repo_root,
+                app_bundle,
+            },
+        ) => Some(if *app_bundle {
+            format!(
+                "this app is a source build from {} — its update path rebuilds from main \
+                 (the Dev channel behind Advanced), not the release download",
+                repo_root.display()
+            )
+        } else {
+            format!(
+                "this daemon runs from the checkout at {} — a release would install the \
+                 packaged macOS app, not this binary; updates for this install build from \
+                 main (the Dev channel behind Advanced)",
+                repo_root.display()
+            )
+        }),
+    }
+}
+
+/// The per-channel availability catalog the panel derives its sections
+/// and buttons from — declared here once, never mirrored client-side.
+pub(crate) fn channel_catalog(flavor: &InstallFlavor, macos: bool) -> serde_json::Value {
+    let channel_block = |channel: UpdateChannel| {
+        let check = check_refusal(flavor, channel);
+        let produce = produce_refusal(flavor, channel, macos);
+        let mut block = serde_json::json!({
+            "check": check.is_none(),
+            "produce": produce.is_none(),
+        });
+        let obj = block.as_object_mut().expect("literal object");
+        if let Some(reason) = produce.or(check) {
+            obj.insert("reason".into(), reason.into());
+        }
+        block
+    };
+    serde_json::json!({
+        "releases": channel_block(UpdateChannel::Releases),
+        "dev": channel_block(UpdateChannel::Dev),
+    })
 }
 
 /// The stamp `scripts/bundle-macos.sh` writes into the bundle
@@ -202,17 +332,21 @@ pub(crate) struct SourceCheck {
     /// commit — capped at [`BEHIND_COUNT_CAP`].
     pub(crate) behind: u32,
     pub(crate) behind_capped: bool,
+    /// Newest-first `%h %s` lines for the commits behind — bounded
+    /// data for the panel, never markup.
+    pub(crate) shortlog: Vec<String>,
     /// Tracked files modified in the checkout: the produce step refuses
     /// to touch a dirty tree.
     pub(crate) dirty: bool,
 }
 
-/// Fold the three bounded git observations into the compare verdict.
+/// Fold the bounded git observations into the compare verdict.
 /// Pure — the child outputs come in as text; the pinned compare-seam
 /// tests live on this function.
 pub(crate) fn fold_source_check(
     rev_parse_tip: &str,
     rev_list_count: &str,
+    shortlog: &str,
     status_porcelain: &str,
 ) -> Result<SourceCheck, String> {
     let tip_sha = rev_parse_tip.trim().to_string();
@@ -232,8 +366,39 @@ pub(crate) fn fold_source_check(
         tip_sha,
         behind,
         behind_capped: behind >= BEHIND_COUNT_CAP,
+        shortlog: fold_shortlog(shortlog),
         dirty: tracked_dirty(status_porcelain),
     })
+}
+
+/// Bound the shortlog into displayable data lines: trimmed, width-
+/// capped, at most [`SHORTLOG_MAX_LINES`] (defense in depth beside the
+/// git child's own `--max-count`).
+pub(crate) fn fold_shortlog(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(SHORTLOG_MAX_LINES)
+        .map(|line| {
+            let mut line = line.to_string();
+            truncate_on_boundary(&mut line, SHORTLOG_LINE_CAP);
+            line
+        })
+        .collect()
+}
+
+/// Truncate to at most `cap` bytes on a char boundary
+/// (`String::truncate` panics mid-codepoint, and commit subjects and
+/// child output are arbitrary unicode).
+fn truncate_on_boundary(line: &mut String, cap: usize) {
+    if line.len() <= cap {
+        return;
+    }
+    let mut cut = cap;
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    line.truncate(cut);
 }
 
 /// TRACKED modifications only (`git status --porcelain` lines whose
@@ -529,6 +694,23 @@ struct CheckState {
     outcome: Option<Result<CheckOutcome, String>>,
 }
 
+/// One slot per channel: the panel renders both lanes' last verdicts
+/// side by side, so a dev compare never overwrites the release story.
+#[derive(Debug, Default)]
+struct CheckSlots {
+    releases: CheckState,
+    dev: CheckState,
+}
+
+impl CheckSlots {
+    fn slot_mut(&mut self, channel: UpdateChannel) -> &mut CheckState {
+        match channel {
+            UpdateChannel::Releases => &mut self.releases,
+            UpdateChannel::Dev => &mut self.dev,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct JobState {
     lane: &'static str,
@@ -546,7 +728,7 @@ pub(crate) struct UpdateLane {
     runtime: Weak<super::HandoverRuntime>,
     exe_path: PathBuf,
     flavor: InstallFlavor,
-    check: Mutex<CheckState>,
+    check: Mutex<CheckSlots>,
     job: Mutex<Option<JobState>>,
     job_running: AtomicBool,
 }
@@ -558,7 +740,7 @@ impl UpdateLane {
             runtime: Arc::downgrade(runtime),
             exe_path,
             flavor,
-            check: Mutex::new(CheckState::default()),
+            check: Mutex::new(CheckSlots::default()),
             job: Mutex::new(None),
             job_running: AtomicBool::new(false),
         }
@@ -598,47 +780,20 @@ impl UpdateLane {
                 obj.insert("unavailable".into(), reason.clone().into());
             }
         }
-        if let Ok(check) = self.check.lock() {
-            let mut check_block = serde_json::json!({
-                "in_flight": check.in_flight,
-            });
-            let check_obj = check_block.as_object_mut().expect("literal object");
-            if let Some(at) = check.checked_at_ms {
-                check_obj.insert("checked_at_ms".into(), at.into());
-            }
-            match &check.outcome {
-                Some(Ok(CheckOutcome::Source(source))) => {
-                    check_obj.insert("tip_sha".into(), source.tip_sha.clone().into());
-                    check_obj.insert("behind".into(), source.behind.into());
-                    check_obj.insert("behind_capped".into(), source.behind_capped.into());
-                    check_obj.insert("dirty".into(), source.dirty.into());
-                }
-                Some(Ok(CheckOutcome::Consumer {
-                    tag,
-                    version,
-                    newer,
-                })) => {
-                    check_obj.insert("latest_tag".into(), tag.clone().into());
-                    check_obj.insert("latest_version".into(), version.clone().into());
-                    match newer {
-                        Some(newer) => {
-                            check_obj.insert("behind".into(), u32::from(*newer).into());
-                        }
-                        None => {
-                            check_obj.insert(
-                                "compare_error".into(),
-                                "release and running versions are not comparable".into(),
-                            );
-                        }
-                    }
-                }
-                Some(Err(error)) => {
-                    check_obj.insert("error".into(), error.clone().into());
-                }
-                None => {}
-            }
-            obj.insert("check".into(), check_block);
+        if let Ok(slots) = self.check.lock() {
+            obj.insert(
+                "checks".into(),
+                serde_json::json!({
+                    "releases": check_state_block(&slots.releases),
+                    "dev": check_state_block(&slots.dev),
+                }),
+            );
         }
+        obj.insert(
+            "channels".into(),
+            channel_catalog(&self.flavor, cfg!(target_os = "macos")),
+        );
+        obj.insert("default_channel".into(), "releases".into());
         if let Ok(job) = self.job.lock() {
             if let Some(job) = job.as_ref() {
                 let mut job_block = serde_json::json!({
@@ -669,9 +824,7 @@ impl UpdateLane {
 
     fn job_log(&self, line: impl Into<String>) {
         let mut line = line.into();
-        if line.len() > JOB_LOG_LINE_CAP {
-            line.truncate(JOB_LOG_LINE_CAP);
-        }
+        truncate_on_boundary(&mut line, JOB_LOG_LINE_CAP);
         eprintln!("[update-lane] {line}");
         if let Ok(mut job) = self.job.lock() {
             if let Some(job) = job.as_mut() {
@@ -806,45 +959,51 @@ impl UpdateLane {
 // ── Public entry points (routes + wiring) ───────────────────────────
 
 impl UpdateLane {
-    /// Start a bounded behind-ness check unless one is already running.
-    pub(crate) fn request_check(self: &Arc<Self>) -> serde_json::Value {
+    /// Start a bounded check on `channel` (the install's native lane
+    /// when unnamed) unless that channel's check is already running.
+    /// Refuses (honestly) a channel this install cannot check.
+    pub(crate) fn request_check(
+        self: &Arc<Self>,
+        channel: Option<UpdateChannel>,
+    ) -> Result<serde_json::Value, String> {
+        let channel = channel.unwrap_or_else(|| self.flavor.native_channel());
+        if let Some(refusal) = check_refusal(&self.flavor, channel) {
+            return Err(refusal);
+        }
         {
-            let Ok(mut check) = self.check.lock() else {
-                return self.status_block();
+            let Ok(mut slots) = self.check.lock() else {
+                return Ok(self.status_block());
             };
-            if check.in_flight {
-                return self.status_block();
+            let slot = slots.slot_mut(channel);
+            if slot.in_flight {
+                return Ok(self.status_block());
             }
-            check.in_flight = true;
+            slot.in_flight = true;
         }
         let lane = Arc::clone(self);
         tokio::spawn(async move {
-            let outcome = lane.run_check().await;
-            if let Ok(mut check) = lane.check.lock() {
-                check.in_flight = false;
-                check.checked_at_ms = Some(super::now_ms());
-                check.outcome = Some(outcome);
+            let outcome = lane.run_check(channel).await;
+            if let Ok(mut slots) = lane.check.lock() {
+                let slot = slots.slot_mut(channel);
+                slot.in_flight = false;
+                slot.checked_at_ms = Some(super::now_ms());
+                slot.outcome = Some(outcome);
             }
         });
-        self.status_block()
+        Ok(self.status_block())
     }
 
-    /// The owner's click: start the produce job. Refuses (honestly)
-    /// while one runs, on an unmanaged flavor, and on a consumer flavor
-    /// off macOS.
-    pub(crate) fn request_produce(self: &Arc<Self>) -> Result<serde_json::Value, String> {
-        match &self.flavor {
-            InstallFlavor::Unmanaged { reason } => {
-                return Err(format!("no update lane for this install: {reason}"));
-            }
-            InstallFlavor::ConsumerApp { .. } if !cfg!(target_os = "macos") => {
-                return Err(
-                    "releases currently ship only the macOS app — rebuild from source on this \
-                     platform"
-                        .to_string(),
-                );
-            }
-            _ => {}
+    /// The owner's click: start the produce job on `channel` (the
+    /// install's native lane when unnamed). Refuses (honestly) while one
+    /// runs and on any channel/install mismatch — the guard runs before
+    /// anything touches the network or the checkout.
+    pub(crate) fn request_produce(
+        self: &Arc<Self>,
+        channel: Option<UpdateChannel>,
+    ) -> Result<serde_json::Value, String> {
+        let channel = channel.unwrap_or_else(|| self.flavor.native_channel());
+        if let Some(refusal) = produce_refusal(&self.flavor, channel, cfg!(target_os = "macos")) {
+            return Err(refusal);
         }
         if self
             .job_running
@@ -853,10 +1012,11 @@ impl UpdateLane {
         {
             return Err("an update job is already running".to_string());
         }
-        let lane_kind = match &self.flavor {
-            InstallFlavor::Source { .. } => "source",
-            InstallFlavor::ConsumerApp { .. } => "consumer",
-            InstallFlavor::Unmanaged { .. } => unreachable!("refused above"),
+        // The guard above pins channel↔flavor: Dev only passes on a
+        // Source install, Releases only on a consumer app.
+        let lane_kind = match channel {
+            UpdateChannel::Dev => "source",
+            UpdateChannel::Releases => "consumer",
         };
         if let Ok(mut job) = self.job.lock() {
             *job = Some(JobState {
@@ -884,14 +1044,18 @@ impl UpdateLane {
 
     // ── The check ──
 
-    async fn run_check(self: &Arc<Self>) -> Result<CheckOutcome, String> {
-        match self.flavor.clone() {
-            InstallFlavor::Source { repo_root, .. } => self
-                .source_check(&repo_root)
-                .await
-                .map(CheckOutcome::Source),
-            InstallFlavor::ConsumerApp { .. } => self.consumer_check().await,
-            InstallFlavor::Unmanaged { reason } => Err(reason),
+    async fn run_check(self: &Arc<Self>, channel: UpdateChannel) -> Result<CheckOutcome, String> {
+        match channel {
+            UpdateChannel::Dev => match self.flavor.clone() {
+                InstallFlavor::Source { repo_root, .. } => self
+                    .source_check(&repo_root)
+                    .await
+                    .map(CheckOutcome::Source),
+                // request_check refused already; kept for direct callers.
+                other => Err(check_refusal(&other, UpdateChannel::Dev)
+                    .unwrap_or_else(|| "no source checkout for the Dev channel".to_string())),
+            },
+            UpdateChannel::Releases => self.consumer_check().await,
         }
     }
 
@@ -917,8 +1081,22 @@ impl UpdateLane {
                      {running_sha} in this checkout's history?): {err}"
                 )
             })?;
+        // `--format=%h %s` sidesteps decoration/color config entirely —
+        // the lines are data for the panel, newest first.
+        let shortlog_max = format!("--max-count={SHORTLOG_MAX_LINES}");
+        let shortlog = self
+            .git(
+                repo_root,
+                &[
+                    "log",
+                    "--format=%h %s",
+                    shortlog_max.as_str(),
+                    range.as_str(),
+                ],
+            )
+            .await?;
         let status = self.git(repo_root, &["status", "--porcelain"]).await?;
-        fold_source_check(&tip, &count, &status)
+        fold_source_check(&tip, &count, &shortlog, &status)
     }
 
     /// A bounded git child — check-lane runs skip the job log (no job
@@ -1277,6 +1455,50 @@ impl UpdateLane {
     }
 }
 
+/// Render one channel's check slot for the status payload.
+fn check_state_block(check: &CheckState) -> serde_json::Value {
+    let mut block = serde_json::json!({
+        "in_flight": check.in_flight,
+    });
+    let obj = block.as_object_mut().expect("literal object");
+    if let Some(at) = check.checked_at_ms {
+        obj.insert("checked_at_ms".into(), at.into());
+    }
+    match &check.outcome {
+        Some(Ok(CheckOutcome::Source(source))) => {
+            obj.insert("tip_sha".into(), source.tip_sha.clone().into());
+            obj.insert("behind".into(), source.behind.into());
+            obj.insert("behind_capped".into(), source.behind_capped.into());
+            obj.insert("shortlog".into(), source.shortlog.clone().into());
+            obj.insert("dirty".into(), source.dirty.into());
+        }
+        Some(Ok(CheckOutcome::Consumer {
+            tag,
+            version,
+            newer,
+        })) => {
+            obj.insert("latest_tag".into(), tag.clone().into());
+            obj.insert("latest_version".into(), version.clone().into());
+            match newer {
+                Some(newer) => {
+                    obj.insert("behind".into(), u32::from(*newer).into());
+                }
+                None => {
+                    obj.insert(
+                        "compare_error".into(),
+                        "release and running versions are not comparable".into(),
+                    );
+                }
+            }
+        }
+        Some(Err(error)) => {
+            obj.insert("error".into(), error.clone().into());
+        }
+        None => {}
+    }
+    block
+}
+
 /// Delete the staging tree on drop — a failed job never leaves
 /// unverified bytes behind. Success paths drop it too: the artifact has
 /// been installed; the staging copy is done.
@@ -1397,14 +1619,22 @@ pub(crate) fn spawn_update_lane(runtime: &Arc<super::HandoverRuntime>) {
     tokio::spawn(async move {
         tokio::time::sleep(BOOT_CHECK_DELAY).await;
         loop {
-            // The AUTOMATIC cadence follows the hosted-verify tripwire's
-            // posture: a consumer-flavor check reaches the rendezvous +
-            // GitHub, so it only runs unprompted when the owner has
-            // Connect configured; the panel's "Check now" click always
-            // may. Source-flavor checks fetch the owner's own origin.
-            let consumer = matches!(lane.flavor, InstallFlavor::ConsumerApp { .. });
-            if !consumer || crate::connect_rendezvous::status_snapshot().configured {
-                lane.request_check();
+            // The AUTOMATIC cadence checks the install's NATIVE channel,
+            // following the hosted-verify tripwire's posture: a releases
+            // check reaches the rendezvous + GitHub, so it only runs
+            // unprompted when the owner has Connect configured; a source
+            // install fetches the owner's own origin. An unmanaged
+            // install has nothing to check unprompted — the panel says
+            // why instead. The panel's check click always may.
+            let auto = match &lane.flavor {
+                InstallFlavor::Source { .. } => true,
+                InstallFlavor::ConsumerApp { .. } => {
+                    crate::connect_rendezvous::status_snapshot().configured
+                }
+                InstallFlavor::Unmanaged { .. } => false,
+            };
+            if auto {
+                let _ = lane.request_check(None);
             }
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
@@ -1418,28 +1648,181 @@ mod tests {
     // ── The pinned compare seam ──
 
     /// Commission pin: the behind-main compare folds the bounded git
-    /// observations — tip, capped count, dirtiness — and refuses
-    /// unparseable output instead of guessing. Dirty means TRACKED
-    /// modifications: an untracked `target/` or scratch file never
-    /// blocks the lane.
+    /// observations — tip, capped count, shortlog, dirtiness — and
+    /// refuses unparseable output instead of guessing. Dirty means
+    /// TRACKED modifications: an untracked `target/` or scratch file
+    /// never blocks the lane.
     #[test]
     fn source_compare_folds_bounded_git_observations() {
-        let check = fold_source_check("3e4c79f8aa", "3\n", "?? target/\n?? notes.txt\n")
-            .expect("clean fold");
+        let check = fold_source_check(
+            "3e4c79f8aa",
+            "3\n",
+            "abc1234 fix: one thing\nabc2222 feat: another\n",
+            "?? target/\n?? notes.txt\n",
+        )
+        .expect("clean fold");
         assert_eq!(check.tip_sha, "3e4c79f8aa");
         assert_eq!(check.behind, 3);
         assert!(!check.behind_capped);
+        assert_eq!(
+            check.shortlog,
+            vec!["abc1234 fix: one thing", "abc2222 feat: another"],
+            "the shortlog rides the verdict as data lines"
+        );
         assert!(!check.dirty, "untracked files are not dirtiness");
 
-        let capped =
-            fold_source_check("abcdef012345", "500\n", "?? target/\n M src/main.rs\n").unwrap();
+        let capped = fold_source_check(
+            "abcdef012345",
+            "500\n",
+            "",
+            "?? target/\n M src/main.rs\n",
+        )
+        .unwrap();
         assert_eq!(capped.behind, BEHIND_COUNT_CAP);
         assert!(capped.behind_capped, "cap reached reads as 500+");
         assert!(capped.dirty, "a tracked modification is");
         assert!(tracked_dirty("A  staged.rs\n"), "staged changes count too");
 
-        assert!(fold_source_check("fatal: bad revision", "0", "").is_err());
-        assert!(fold_source_check("abcdef012345", "many", "").is_err());
+        assert!(fold_source_check("fatal: bad revision", "0", "", "").is_err());
+        assert!(fold_source_check("abcdef012345", "many", "", "").is_err());
+    }
+
+    /// The shortlog fold is bounded in count and width, and the width
+    /// cap lands on a char boundary (commit subjects are unicode).
+    #[test]
+    fn shortlog_fold_is_bounded() {
+        let many = (0..40)
+            .map(|n| format!("sha{n} subject {n}\n"))
+            .collect::<String>();
+        assert_eq!(fold_shortlog(&many).len(), SHORTLOG_MAX_LINES);
+
+        let wide = format!("abc1234 {}", "é".repeat(SHORTLOG_LINE_CAP));
+        let folded = fold_shortlog(&wide);
+        assert_eq!(folded.len(), 1);
+        assert!(folded[0].len() <= SHORTLOG_LINE_CAP);
+        assert!(folded[0].starts_with("abc1234 "), "truncated, not mangled");
+
+        assert!(fold_shortlog("\n  \n").is_empty(), "blank lines drop out");
+    }
+
+    // ── The channel vocabulary (the front door) ──
+
+    /// Commission pin: exactly two channels, and the catalog derives
+    /// availability + honest reasons from the install flavor — the
+    /// panel never hardcodes which lane an install can use.
+    #[test]
+    fn channel_catalog_derives_availability_and_reasons() {
+        let source = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: false,
+        };
+        let catalog = channel_catalog(&source, true);
+        assert_eq!(catalog["dev"]["check"], true);
+        assert_eq!(catalog["dev"]["produce"], true);
+        assert_eq!(catalog["releases"]["check"], true, "release data is honest anywhere");
+        assert_eq!(catalog["releases"]["produce"], false);
+        assert!(
+            catalog["releases"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("packaged macOS app"),
+            "{catalog}"
+        );
+
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/Applications/Intendant.app"),
+        };
+        let catalog = channel_catalog(&consumer, true);
+        assert_eq!(catalog["releases"]["produce"], true);
+        assert_eq!(catalog["dev"]["check"], false);
+        assert_eq!(catalog["dev"]["produce"], false);
+        assert!(
+            catalog["dev"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no source checkout"),
+            "{catalog}"
+        );
+        let off_macos = channel_catalog(&consumer, false);
+        assert_eq!(off_macos["releases"]["produce"], false);
+        assert!(
+            off_macos["releases"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("only the macOS app"),
+            "{off_macos}"
+        );
+
+        let unmanaged = InstallFlavor::Unmanaged {
+            reason: "stray binary".to_string(),
+        };
+        let catalog = channel_catalog(&unmanaged, true);
+        assert_eq!(catalog["releases"]["produce"], false);
+        assert_eq!(catalog["dev"]["produce"], false);
+        assert!(
+            catalog["dev"]["reason"].as_str().unwrap().contains("stray binary"),
+            "{catalog}"
+        );
+    }
+
+    /// The channel argument parser: absent means the native lane,
+    /// the two names parse, anything else is refused by name.
+    #[test]
+    fn channel_arg_parses_the_two_channel_vocabulary() {
+        assert_eq!(parse_channel_arg(""), Ok(None));
+        assert_eq!(parse_channel_arg("{}"), Ok(None));
+        assert_eq!(parse_channel_arg("not json"), Ok(None));
+        assert_eq!(
+            parse_channel_arg("{\"channel\":\"releases\"}"),
+            Ok(Some(UpdateChannel::Releases))
+        );
+        assert_eq!(
+            parse_channel_arg("{\"channel\":\"dev\"}"),
+            Ok(Some(UpdateChannel::Dev))
+        );
+        let refusal = parse_channel_arg("{\"channel\":\"nightly\"}").unwrap_err();
+        assert!(refusal.contains("nightly"), "{refusal}");
+        assert!(refusal.contains("exactly two"), "{refusal}");
+    }
+
+    /// A produce click on the wrong channel for the install refuses by
+    /// name BEFORE any network or checkout touch, and the native
+    /// channel resolves per flavor.
+    #[test]
+    fn produce_refusals_pin_channel_to_flavor() {
+        let source = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: false,
+        };
+        assert_eq!(source.native_channel(), UpdateChannel::Dev);
+        assert!(produce_refusal(&source, UpdateChannel::Dev, true).is_none());
+        let cross = produce_refusal(&source, UpdateChannel::Releases, true).unwrap();
+        assert!(cross.contains("/checkout"), "{cross}");
+
+        let bundle = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: true,
+        };
+        let cross = produce_refusal(&bundle, UpdateChannel::Releases, true).unwrap();
+        assert!(cross.contains("source build"), "{cross}");
+
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/Applications/Intendant.app"),
+        };
+        assert_eq!(consumer.native_channel(), UpdateChannel::Releases);
+        assert!(produce_refusal(&consumer, UpdateChannel::Releases, true).is_none());
+        assert!(produce_refusal(&consumer, UpdateChannel::Dev, true)
+            .unwrap()
+            .contains("no source checkout"));
+
+        let unmanaged = InstallFlavor::Unmanaged {
+            reason: "stray".to_string(),
+        };
+        for channel in [UpdateChannel::Releases, UpdateChannel::Dev] {
+            assert!(produce_refusal(&unmanaged, channel, true)
+                .unwrap()
+                .contains("no update lane"));
+        }
     }
 
     /// Commission pin: release-vs-running is a semver compare that
@@ -1710,11 +2093,21 @@ mod tests {
         assert_eq!(block["flavor"], "unmanaged");
         assert!(block["unavailable"].is_string(), "{block}");
         assert!(block["running"]["git_sha"].is_string());
-        let refusal = lane.request_produce().unwrap_err();
+        assert_eq!(block["default_channel"], "releases");
+        assert_eq!(block["channels"]["dev"]["produce"], false, "{block}");
+        assert_eq!(block["checks"]["releases"]["in_flight"], false, "{block}");
+        let refusal = lane.request_produce(None).unwrap_err();
         assert!(refusal.contains("no update lane"), "{refusal}");
         assert!(
             !lane.job_running.load(Ordering::Acquire),
             "a refused click leaves the single-flight latch free"
+        );
+        let refusal = lane
+            .request_check(Some(UpdateChannel::Dev))
+            .unwrap_err();
+        assert!(
+            refusal.contains("no source checkout or app bundle"),
+            "a dev check on an unmanaged install refuses with the flavor's reason: {refusal}"
         );
     }
 
