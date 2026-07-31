@@ -521,6 +521,7 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_message"
         | "api_peer_task"
         | "api_peer_approval"
+        | "api_peer_session_control"
         | "api_peer_webrtc_signal"
         | "api_peer_file_transfer_signal"
         | "api_peer_dashboard_control_signal"
@@ -5901,6 +5902,7 @@ mod tests {
             ("api_peer_message", Row, Some(Op::PeerUse)),
             ("api_peer_task", Row, Some(Op::PeerUse)),
             ("api_peer_approval", Row, Some(Op::PeerUse)),
+            ("api_peer_session_control", Row, Some(Op::PeerUse)),
             ("api_peer_add", Row, Some(Op::PeerManage)),
             ("api_peer_remove", Row, Some(Op::PeerManage)),
             ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
@@ -6388,6 +6390,7 @@ mod tests {
             "api_peer_message",
             "api_peer_task",
             "api_peer_approval",
+            "api_peer_session_control",
             "api_peer_webrtc_signal",
             "api_peer_file_transfer_signal",
             "api_peer_dashboard_control_signal",
@@ -6580,7 +6583,12 @@ mod tests {
             Some(PeerOperation::PresenceRead)
         );
         // Peer quick controls ride peer.use, not peer administration.
-        for method in ["api_peer_message", "api_peer_task", "api_peer_approval"] {
+        for method in [
+            "api_peer_message",
+            "api_peer_task",
+            "api_peer_approval",
+            "api_peer_session_control",
+        ] {
             assert_eq!(
                 method_operation(method),
                 Some(PeerOperation::PeerUse),

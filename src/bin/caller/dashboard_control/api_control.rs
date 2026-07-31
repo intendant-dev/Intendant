@@ -1740,6 +1740,33 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
     )
 }
 
+/// Derived allowlist for session-lifecycle `ControlMsg`s routable to a
+/// federated peer (`api_peer_session_control` →
+/// `PeerOp::SessionControl`): the session RPC lane's own allowlist
+/// intersected with the operation classes that cover session work
+/// (Message / Task / Approval / SessionManage). The class filter — not
+/// a second name list — is what keeps the doctrine-closed planes
+/// closed to peer routing: Settings-classified actions
+/// (`configure_session_agent`, the `set_*` config family), credential
+/// ceremonies, and access administration fall out of the intersection
+/// automatically. Both inputs are existing single declarations
+/// (`dashboard_session_control_msg_allowed`, `control_msg_operation`),
+/// so this cannot drift from either. The peer re-authorizes whatever
+/// passes against the profile it granted this daemon; this filter
+/// exists to fail closed locally with an honest error instead of
+/// spending a doomed remote round-trip.
+pub(crate) fn peer_session_control_allowed(ctrl: &ControlMsg) -> bool {
+    use crate::access::access_policy::{control_msg_operation, PeerOperation};
+    dashboard_session_control_msg_allowed(ctrl)
+        && matches!(
+            control_msg_operation(ctrl),
+            PeerOperation::Message
+                | PeerOperation::Task
+                | PeerOperation::Approval
+                | PeerOperation::SessionManage
+        )
+}
+
 /// The "dashboard action" RPC lane's allowlist, by wire action name. Single
 /// declaration: `dashboard_action_msg_allowed` gates against it, and the
 /// parity test below pins the SPA's `DASHBOARD_ACTION_MSG_RPC_ACTIONS`
@@ -2249,6 +2276,25 @@ pub(crate) async fn api_peer_approval_response(
     http_body_response(id, status, body, "peer approval")
 }
 
+pub(crate) async fn api_peer_session_control_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(registry) = runtime.peer_registry.as_ref() else {
+        return peer_registry_unavailable_response(id);
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let peer_id = string_param(&params, &["peer_id", "peerId", "host_id", "hostId", "id"]);
+    if peer_id.is_empty() {
+        return missing_param_response(id, "peer_id");
+    }
+    let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let (status, body) =
+        crate::web_gateway::peers_session_control(registry, &peer_id, &body_text).await;
+    http_body_response(id, status, body, "peer session control")
+}
+
 pub(crate) async fn api_peer_webrtc_signal_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -2493,6 +2539,62 @@ pub(crate) async fn api_coordinator_route_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The peer session-control allowlist is the session RPC lane's
+    /// set intersected with the session-work operation classes
+    /// (Message / Task / Approval / SessionManage). Pin the doctrine
+    /// boundary: every Settings-, credentials-, or access-classified
+    /// action must refuse peer routing even when the session lane
+    /// itself allows it locally, and actions outside the session lane
+    /// never pass regardless of class.
+    #[test]
+    fn peer_session_control_allowlist_keeps_closed_planes_closed() {
+        let msg = |json: &str| -> ControlMsg {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("parse {json}: {e}"))
+        };
+
+        // Session lifecycle + conversation + approvals: routable.
+        for allowed in [
+            r#"{"action":"interrupt","session_id":"s"}"#,
+            r#"{"action":"follow_up","text":"hi","session_id":"s"}"#,
+            r#"{"action":"start_task","task":"do a thing"}"#,
+            r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+            r#"{"action":"rename_session","session_id":"s","name":"x"}"#,
+            r#"{"action":"stop_session","session_id":"s"}"#,
+            r#"{"action":"approve","id":7}"#,
+            r#"{"action":"steer","text":"go left"}"#,
+        ] {
+            assert!(
+                peer_session_control_allowed(&msg(allowed)),
+                "expected routable: {allowed}"
+            );
+        }
+
+        // Settings-classified (doctrine-closed to peer routing) —
+        // in the local session lane, refused for peers by class.
+        assert!(!peer_session_control_allowed(&msg(
+            r#"{"action":"configure_session_agent","session_id":"s"}"#
+        )));
+
+        // Outside the session lane entirely: refused regardless of
+        // how their operation classifies (settings, credentials,
+        // display, runtime).
+        for refused in [
+            r#"{"action":"set_autonomy","mode":"auto"}"#,
+            r#"{"action":"set_codex_command","command":"evil"}"#,
+            r#"{"action":"set_external_agent","agent":"codex"}"#,
+            r#"{"action":"take_display","display_id":1}"#,
+            r#"{"action":"status"}"#,
+        ] {
+            let parsed: Result<ControlMsg, _> = serde_json::from_str(refused);
+            if let Ok(ctrl) = parsed {
+                assert!(
+                    !peer_session_control_allowed(&ctrl),
+                    "expected refused: {refused}"
+                );
+            }
+        }
+    }
 
     // ── S4b tunnel/HTTP parity: worktrees (design §8) ──
     //

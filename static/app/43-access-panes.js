@@ -2718,4 +2718,10 @@ function setShellHost(hostId) {
   if (activeTab === 'terminal' && activeTermSubtab === 'shell') {
     openShellSessionIfPossible(true);
   }
+  // Publish into the global operating target. Daemon targets move the
+  // whole dashboard; the Shell's cloud exec hosts are pane-local (the
+  // setter refuses non-daemon ids) and leave the global untouched.
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(next === SHELL_HOST_ID ? '' : next, { source: 'shell' });
+  }
 }

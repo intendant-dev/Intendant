@@ -1288,6 +1288,21 @@ pub enum OutboundEvent {
     PeerStateChanged {
         peer: crate::peer::PeerSnapshot,
     },
+    /// Emitted once per peer-identified `/ws` connection at bootstrap:
+    /// the federation grant this daemon resolved for the connecting
+    /// peer's mTLS identity — the profile name plus the operation
+    /// permission ids that profile allows, derived from
+    /// `profile_allows_operation` over the frozen operation set (never
+    /// a hand-kept list). Display metadata for honest dashboards; the
+    /// per-request gates enforce authority regardless of what this
+    /// event said. The dialing daemon folds it into
+    /// [`crate::peer::PeerSnapshot::grant`]; browsers on the local
+    /// `/ws` never see it (it rides the peer connection's direct
+    /// lane only).
+    PeerGrant {
+        profile: String,
+        operations: Vec<String>,
+    },
     /// A peer-emitted [`crate::peer::PeerEvent`] forwarded by the
     /// local registry's translator. Lets the dashboard subscribe to
     /// per-peer activity (logs, model output, approval requests,

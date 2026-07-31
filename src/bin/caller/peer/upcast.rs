@@ -2123,6 +2123,18 @@ impl WireEventUpcaster {
             | OutboundEvent::PeerStateChanged { .. }
             | OutboundEvent::PeerEventForwarded { .. } => vec![],
 
+            // The peer's bootstrap advertisement of the grant it
+            // resolved for OUR identity on this connection. Folded by
+            // the actor into `PeerSnapshot.grant` so dashboards render
+            // honest affordances; carries no authority either way.
+            OutboundEvent::PeerGrant {
+                profile,
+                operations,
+            } => vec![PeerEvent::GrantAdvertised {
+                profile: profile.clone(),
+                operations: operations.clone(),
+            }],
+
             OutboundEvent::UserMessageEditStatus {
                 user_turn_index,
                 status,

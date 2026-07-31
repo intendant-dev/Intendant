@@ -1011,7 +1011,59 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (!sessionId) return;
-  const session = stationFindSessionById(sessionId) || { session_id: sessionId };
+  // Host-scoped routing (RC-C1): scene nodes for a PEER's sessions
+  // carry the peer's raw session ids. When the id resolves to a peer
+  // fold and not to anything local, actions route through
+  // api_peer_session_control instead of assuming a local session id.
+  const localSession = stationFindSessionById(sessionId);
+  const peerHostId = !localSession && !sessionWindows.has(sessionId)
+    && typeof peerEntryForHost === 'function'
+    ? (Array.isArray(daemons)
+      ? (daemons.find(d => Array.isArray(d.sessions)
+          && d.sessions.some(s => String(s.session_id) === sessionId))?.host_id || '')
+      : '')
+    : '';
+  if (peerHostId) {
+    const peerName = peerEntryForHost(peerHostId)?.label || peerHostId;
+    if (op === 'focus' || op === 'target' || op === 'steer') {
+      if (setPromptTargetPeer(peerHostId, sessionId)) {
+        showControlToast?.('info', `Composer targets ${shortSessionId(sessionId)} on ${peerName}`);
+        if (stationRenderedPrimaryActive()) {
+          station?.set_composer?.(true, 'send');
+          stationHandleComposerEvent({ op: 'focus' });
+        }
+      }
+      return;
+    }
+    if (op === 'interrupt') {
+      daemonApi
+        .request('api_peer_session_control', {
+          peer_id: peerHostId,
+          message: { action: 'interrupt', session_id: sessionId },
+        })
+        .then(resp => {
+          if (resp.ok) {
+            showControlToast?.('info', `Interrupt sent to ${shortSessionId(sessionId)} on ${peerName}`);
+          } else {
+            const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+            showControlToast?.('error', `${peerName} refused interrupt (${resp.status})${detail}`);
+          }
+        })
+        .catch(err => showControlToast?.('error', `Could not reach ${peerName}: ${err?.message || err}`));
+      return;
+    }
+    if (op === 'copy') {
+      copyTextToClipboard(sessionId)
+        .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sessionId)}`))
+        .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+      return;
+    }
+    // Anything else (transcript, thread ops, config) still lives on the
+    // peer's own dashboard — no silent no-ops.
+    showControlToast?.('info', `${op} for peer sessions happens on ${peerName}'s own dashboard.`);
+    return;
+  }
+  const session = localSession || { session_id: sessionId };
   const live = stationExternalLiveThreadDescriptor(session) || stationExternalLiveThreadDescriptor(sessionId);
   if (op === 'focus' || op === 'target') {
     focusSessionWindow(live?.liveId || sessionId);

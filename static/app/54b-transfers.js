@@ -45,6 +45,9 @@ function peerFileTransferSignalAvailable(peerId = filesDownloadSelectedPeerId())
   if (!window.RTCPeerConnection) return false;
   const peer = daemons.find(d => d.host_id === id);
   if (!peer || peer.connected === false) return false;
+  // File-transfer bytes ride a browser↔peer datachannel — nothing
+  // ICE-borne survives a relay-only link (RC-C1 honesty rail).
+  if (!peerLinkSupportsMedia(id)) return false;
   if (dashboardConnectModeEnabled()) {
     return Boolean(
       dashboardTransport?.canUseRpc?.() &&
@@ -83,6 +86,9 @@ function refreshFilesDownloadHostOptions() {
 function onFilesDownloadHostChanged(options = {}) {
   const browse = document.getElementById('files-download-browse-btn');
   const selectedPeer = filesDownloadSelectedPeerId();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(selectedPeer, { source: 'files-download' });
+  }
   if (browse) {
     // Peer browsing rides the fs-picker's api_fs_list target lane (55);
     // gate on reachability, not on peer-ness.

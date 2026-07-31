@@ -2552,6 +2552,31 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         let _ = direct_tx.send(bootstrap.to_string());
                     }
 
+                    // Peer-identified connections (a federated daemon on
+                    // its mTLS identity) get the grant echo: the profile
+                    // this daemon resolved for that identity plus the
+                    // operation permission ids derived from it. Display
+                    // metadata for the dialer's dashboard honesty (no
+                    // dead pills) — every request is still gated by the
+                    // per-op evaluators regardless. Re-advertised on
+                    // every connect, so a profile edit lands at the
+                    // dialer on its next reconnect.
+                    if let crate::dashboard_control::DashboardControlGrant::Peer {
+                        profile, ..
+                    } = &dashboard_control_grant_for_ws
+                    {
+                        let operations =
+                            crate::access::access_policy::profile_operation_permission_ids(profile);
+                        if let Ok(line) =
+                            serde_json::to_string(&crate::types::OutboundEvent::PeerGrant {
+                                profile: profile.clone(),
+                                operations,
+                            })
+                        {
+                            let _ = direct_tx.send(line);
+                        }
+                    }
+
                     // Send cached usage data so late-connecting browsers
                     // populate the Usage tab without sending ControlMsg.
                     if let Ok(guard) = last_usage_json.lock() {

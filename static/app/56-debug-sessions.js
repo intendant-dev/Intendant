@@ -462,6 +462,9 @@ function setSessionsHost(hostId) {
   // Message lane (flagged): the tunnel twin serves the selected peer's own
   // index, so a host switch re-keys the search. No-op with the flag off.
   scheduleSessionMessageSearch();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(next, { source: 'sessions' });
+  }
 }
 
 // Whole-card action while browsing a peer: hand off to the peer's own

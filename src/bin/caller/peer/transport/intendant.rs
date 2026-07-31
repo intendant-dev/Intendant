@@ -562,6 +562,7 @@ impl PeerTransport for IntendantWsTransport {
             file_transfer_signal: true,
             dashboard_control_signal: true,
             certificate_witness: true,
+            session_control: true,
         }
     }
 
@@ -625,7 +626,10 @@ impl PeerTransport for IntendantWsTransport {
             PeerOp::SendMessage { message } => {
                 let text = message_text(&message.content)?;
                 self.write_control_msg(&ControlMsg::FollowUp {
-                    session_id: None,
+                    // Scope to the caller's target session when given
+                    // (peer session targeting); None routes to the
+                    // peer's primary session as before.
+                    session_id: message.session.clone(),
                     text,
                     direct: None,
                     follow_up_id: None,
@@ -731,6 +735,16 @@ impl PeerTransport for IntendantWsTransport {
             PeerOp::HostedCertificateWitness { report } => {
                 self.write_control_msg(&ControlMsg::HostedCertificateWitness { report })
                     .await?;
+                Ok(PeerOpAck::Ok)
+            }
+            PeerOp::SessionControl { message } => {
+                // The ControlMsg goes out verbatim — the peer's /ws
+                // gate re-authorizes it per-action against the profile
+                // granted to this daemon's identity, exactly as if a
+                // local client of the peer had sent it. Fire-and-forget
+                // like approvals: outcomes come back on the event
+                // stream (session_updated / approval_resolved / …).
+                self.write_control_msg(&message).await?;
                 Ok(PeerOpAck::Ok)
             }
             // check_feature rejects the other variants before they
@@ -1106,6 +1120,89 @@ mod tests {
         assert!(
             event.is_some(),
             "follow-up ControlMsg did not land on the bus"
+        );
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `SendMessage` with a target session carries it into
+    /// `FollowUp.session_id` — peer session targeting. (Regression:
+    /// the session was silently dropped and every peer message went
+    /// to the primary session.)
+    #[tokio::test]
+    async fn send_message_with_session_scopes_followup() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
+        let _ = transport.connect().await.unwrap();
+
+        transport
+            .send(PeerOp::SendMessage {
+                message: PeerMessage {
+                    session: Some("sess-42".into()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text {
+                        text: "scoped hello".into(),
+                    },
+                },
+            })
+            .await
+            .expect("send_message succeeds");
+
+        let event = wait_for_event(&mut bus_rx, |e| {
+            matches!(
+                e,
+                AppEvent::ControlCommand(ControlMsg::FollowUp { session_id: Some(sid), .. })
+                    if sid == "sess-42"
+            )
+        })
+        .await;
+        assert!(
+            event.is_some(),
+            "session-scoped follow-up did not land on the bus"
+        );
+
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// `SessionControl` writes the inner `ControlMsg` verbatim; the
+    /// peer's `/ws` dispatches it as an ordinary control command
+    /// (which its gates authorize per-action). Fire-and-forget ack.
+    #[tokio::test]
+    async fn session_control_writes_control_msg_verbatim() {
+        let (port, gateway, mut bus_rx) = spawn_test_peer_with_bus().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut transport =
+            IntendantWsTransport::with_credentials(url, tx, test_loopback_credentials());
+        let _ = transport.connect().await.unwrap();
+
+        let ack = transport
+            .send(PeerOp::SessionControl {
+                message: Box::new(ControlMsg::Interrupt {
+                    session_id: Some("sess-9".into()),
+                    expected_turn: None,
+                }),
+            })
+            .await
+            .expect("session_control succeeds");
+        assert!(matches!(ack, PeerOpAck::Ok), "fire-and-forget ack");
+
+        let event = wait_for_event(&mut bus_rx, |e| {
+            matches!(
+                e,
+                AppEvent::ControlCommand(ControlMsg::Interrupt { session_id: Some(sid), .. })
+                    if sid == "sess-9"
+            )
+        })
+        .await;
+        assert!(
+            event.is_some(),
+            "interrupt ControlMsg did not land on the bus"
         );
 
         transport.disconnect().await.unwrap();

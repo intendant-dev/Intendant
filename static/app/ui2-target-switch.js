@@ -31,6 +31,27 @@
     return ids;
   }
 
+  const PEER_SESSION_ROWS = 6; // newest-first cap per peer (fold order)
+
+  // Connected peers are composer targets too (RC-C1): the peer row
+  // delegates a new task; a peer session row scopes a follow-up to
+  // that session. Both spend this daemon's peer grant on the target.
+  function targetablePeers() {
+    if (typeof daemons === 'undefined' || !Array.isArray(daemons)) return [];
+    return daemons.filter(d => d && d.host_id && d.connected !== false);
+  }
+
+  function peerSessionRowsFor(d) {
+    const sessions = Array.isArray(d.sessions) ? d.sessions : [];
+    return sessions.slice(0, PEER_SESSION_ROWS);
+  }
+
+  function activePeerKey() {
+    const t = typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+    if (!t) return '';
+    return t.sessionId ? `ps:${t.hostId} ${t.sessionId}` : `p:${t.hostId}`;
+  }
+
   function rowPhase(sid) {
     if (hasPendingActiveSessionWindow(sid)) return 'active';
     const win = sessionWindows.get(sid);
@@ -44,10 +65,17 @@
     const parts = [
       resolvePromptTargetSessionId(),
       explicitForegroundSessionId() ? 'E' : 'A',
+      activePeerKey(),
       filterQuery,
     ];
     for (const sid of usableSessionIds()) {
       parts.push(sid, sessionIdentityParts(sid).name, rowPhase(sid));
+    }
+    for (const d of targetablePeers()) {
+      parts.push(d.host_id, d.label || '', d.connected === false ? 'off' : 'on');
+      for (const s of peerSessionRowsFor(d)) {
+        parts.push(s.session_id, s.label || '', s.phase || '');
+      }
     }
     return parts.join('\u0000');
   }
@@ -112,6 +140,44 @@
     return el;
   }
 
+  function buildPeerRow(d, activeKey) {
+    const key = `p:${d.host_id}`;
+    const row = makeRow(key, 'ui2-tsw-peer');
+    const label = d.label || d.host_id;
+    const badge = document.createElement('span');
+    badge.className = 'ui2-tsw-badge ui2-tsw-peer-badge';
+    badge.textContent = label;
+    const sub = document.createElement('span');
+    sub.className = 'ui2-tsw-row-sub';
+    sub.textContent = 'delegates a task';
+    row.append(badge, sub);
+    row.title = `Delegate the composed task to ${label} (runs there under this daemon's peer grant)`;
+    row.setAttribute('aria-label', `Peer ${label}: delegate a task`);
+    if (key === activeKey) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
+  function buildPeerSessionRow(d, s, activeKey) {
+    const key = `ps:${d.host_id} ${s.session_id}`;
+    const row = makeRow(key, 'ui2-tsw-peer-session');
+    const label = d.label || d.host_id;
+    const name = s.label || s.session_id.slice(0, 8);
+    const nameEl = document.createElement('span');
+    nameEl.className = 'ui2-tsw-row-name';
+    nameEl.textContent = name;
+    const phase = (s.phase === 'working' || s.phase === 'thinking')
+      ? 'active'
+      : (s.needs_approval || s.phase === 'waiting_approval') ? 'waiting' : 'done';
+    const dot = document.createElement('span');
+    dot.className = `ui2-tsw-dot ${phase}`;
+    dot.setAttribute('aria-hidden', 'true');
+    row.append(nameEl, dot);
+    row.title = `Send the composed text as a follow-up to session ${s.session_id} on ${label}`;
+    row.setAttribute('aria-label', `Session ${name} on peer ${label}: send a follow-up`);
+    if (key === activeKey) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
   function renderRows() {
     const usable = usableSessionIds();
     const target = resolvePromptTargetSessionId();
@@ -143,7 +209,34 @@
     if (usable.length) children.push(buildAutoRow(autoActive));
     for (const sid of list) children.push(buildSessionRow(sid, target));
     if (!usable.length) children.push(buildEmpty('No targetable sessions'));
-    else if (!list.length) children.push(buildEmpty('No matches'));
+    else if (!list.length && !q) children.push(buildEmpty('No matches'));
+
+    // Peers section: connected peer daemons and their known sessions.
+    const activeKey = activePeerKey();
+    const peers = targetablePeers();
+    let peerRows = [];
+    for (const d of peers) {
+      const label = d.label || d.host_id;
+      const peerMatches = !q || ui2FuzzyScore(q, label) >= 0 || ui2FuzzyScore(q, d.host_id) >= 0;
+      if (peerMatches) peerRows.push(buildPeerRow(d, activeKey));
+      for (const s of peerSessionRowsFor(d)) {
+        const sessionMatches = !q
+          || peerMatches
+          || ui2FuzzyScore(q, s.label || '') >= 0
+          || ui2FuzzyScore(q, s.session_id) >= 0;
+        if (sessionMatches) peerRows.push(buildPeerSessionRow(d, s, activeKey));
+      }
+    }
+    if (peerRows.length) {
+      const divider = document.createElement('div');
+      divider.className = 'ui2-tsw-eyebrow ui2-tsw-peers-eyebrow';
+      divider.textContent = 'Peers';
+      divider.setAttribute('aria-hidden', 'true');
+      children.push(divider, ...peerRows);
+    }
+    if (usable.length && !list.length && !peerRows.length && q) {
+      children.push(buildEmpty('No matches'));
+    }
     rowsEl.replaceChildren(...children);
     lastSig = currentSignature();
 
@@ -203,6 +296,7 @@
       // The explicit pick lives in two refs (foreground + current), possibly
       // holding different ids — discard until the explicit lane is empty so
       // the resolver takes over.
+      clearPromptTargetPeer({ skipChip: true });
       for (let i = 0; i < 4 && explicitForegroundSessionId(); i++) {
         discardPromptTargetReference(explicitForegroundSessionId());
       }
@@ -211,6 +305,7 @@
     } else if (key === 'new') {
       // Close without refocus: openNewSessionFromPrompt focuses the
       // new-session input on the next frame and must win.
+      clearPromptTargetPeer();
       openNewSessionFromPrompt();
       closePopover();
     } else if (key.startsWith('s:')) {
@@ -219,8 +314,22 @@
         renderRows();
         return;
       }
-      focusSessionWindow(sid);
+      focusSessionWindow(sid); // clears any peer target (one composer, one target)
       closePopover({ refocus: true });
+    } else if (key.startsWith('ps:')) {
+      const rest = key.slice(3);
+      const sep = rest.indexOf(' ');
+      if (sep > 0 && setPromptTargetPeer(rest.slice(0, sep), rest.slice(sep + 1))) {
+        closePopover({ refocus: true });
+      } else {
+        renderRows();
+      }
+    } else if (key.startsWith('p:')) {
+      if (setPromptTargetPeer(key.slice(2), null)) {
+        closePopover({ refocus: true });
+      } else {
+        renderRows();
+      }
     }
   }
 

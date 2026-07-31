@@ -128,6 +128,73 @@ pub enum ConnectionState {
     Disconnected,
 }
 
+/// Class of the transport candidate a live federation link is using.
+/// Drives the dashboard's reachability honesty: media/datachannel
+/// affordances (live display, file-transfer bytes, browser↔peer
+/// dashboard-control tunnels) are rendered from this class, never
+/// inferred from the peer row existing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerTransportClass {
+    /// The candidate URL is dialed directly (operator via-URL, card
+    /// address, direct IP/LAN/tailnet name).
+    Direct,
+    /// The candidate transits a reachability relay (Track RC Stage B:
+    /// the fleet-name candidate through the Connect relay). Signaling
+    /// and request/response work; ICE media and browser↔peer
+    /// datachannels need a direct route or provisioned TURN.
+    Relayed,
+}
+
+/// The transport candidate a live federation link is using, recorded
+/// by the actor after each successful connect and cleared while
+/// disconnected. `MultiTransport` re-walks candidates on every
+/// reconnect, so this can change across the link's lifetime.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerLinkInfo {
+    /// URL of the connected candidate.
+    pub url: String,
+    /// Reachability class of the connected candidate.
+    pub transport_class: PeerTransportClass,
+}
+
+impl PeerLinkInfo {
+    /// Derive link info from the connected candidate's spec.
+    ///
+    /// Classification seam: every candidate the registry builds today
+    /// is an operator/card URL dialed directly, so the class is
+    /// `Direct`. The Stage-B relay work (RC-B2) introduces the
+    /// fleet-name relay candidate; its constructor is the one place
+    /// that should classify `Relayed`.
+    pub(crate) fn from_spec(spec: &crate::peer::card::TransportSpec) -> Option<Self> {
+        use crate::peer::card::TransportSpec;
+        let url = match spec {
+            TransportSpec::IntendantWs { url } => url.clone(),
+            TransportSpec::A2A { url } => url.clone(),
+            TransportSpec::Mcp { url, .. } => url.clone(),
+            TransportSpec::OpenClawWs { url, .. } => url.clone(),
+            TransportSpec::Unknown => return None,
+        };
+        Some(Self {
+            url,
+            transport_class: PeerTransportClass::Direct,
+        })
+    }
+}
+
+/// The federation grant the peer advertised for this daemon's identity
+/// on the current connection (see
+/// [`crate::peer::PeerEvent::GrantAdvertised`]). Display metadata only
+/// — the peer enforces authority per request regardless.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerGrantInfo {
+    /// Profile name the peer granted (its own vocabulary).
+    pub profile: String,
+    /// Allowed operation permission ids derived by the peer from that
+    /// profile (`access::iam::operation_permission_id` vocabulary).
+    pub operations: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Command envelope
 // ---------------------------------------------------------------------------
@@ -267,6 +334,13 @@ struct PeerHandleInner {
     /// Folded view of the peer's available displays (see the actor's
     /// `displays_tx` docs — connection-scoped, cleared on disconnect).
     displays: watch::Receiver<Arc<Vec<PeerDisplayInfo>>>,
+    /// The connected transport candidate (see [`PeerLinkInfo`]) —
+    /// `Some` while connected, `None` otherwise.
+    link: watch::Receiver<Option<PeerLinkInfo>>,
+    /// The peer-advertised grant for this daemon's identity (see
+    /// [`PeerGrantInfo`]) — connection-scoped; `None` means unknown
+    /// (older peer or not yet advertised), not "nothing allowed".
+    grant: watch::Receiver<Option<PeerGrantInfo>>,
     /// Delegation-receipt ledger folded by the actor from
     /// [`PeerEvent::TaskReceipt`] (delegation id → the peer's local
     /// task/session identity). [`PeerHandle::delegate_task`] awaits an
@@ -329,6 +403,20 @@ impl PeerHandle {
         self.inner.connection.clone()
     }
 
+    /// Subscribe to connected-link changes (candidate URL + transport
+    /// class). The registry's state observer folds these into
+    /// `PeerStateChanged` pushes so the dashboard tracks link class
+    /// without polling.
+    pub fn link_updates(&self) -> watch::Receiver<Option<PeerLinkInfo>> {
+        self.inner.link.clone()
+    }
+
+    /// Subscribe to peer-advertised grant changes (see
+    /// [`PeerGrantInfo`]).
+    pub fn grant_updates(&self) -> watch::Receiver<Option<PeerGrantInfo>> {
+        self.inner.grant.clone()
+    }
+
     #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         matches!(*self.inner.connection.borrow(), ConnectionState::Connected)
@@ -371,6 +459,8 @@ impl PeerHandle {
             browser_tcp_via_url: self.inner.browser_tcp_via_url.clone(),
             sessions: self.inner.sessions.borrow().as_ref().clone(),
             displays: self.inner.displays.borrow().as_ref().clone(),
+            link: self.inner.link.borrow().clone(),
+            grant: self.inner.grant.borrow().clone(),
         }
     }
 
@@ -655,6 +745,37 @@ impl PeerHandle {
         }
     }
 
+    /// Forward a session-lifecycle `ControlMsg` to this peer
+    /// (host-scoped session actions: interrupt, resume, rename,
+    /// stop/restart, follow-up, approvals, …). Fire-and-forget like
+    /// approvals — outcomes come back on the event stream. The peer
+    /// authorizes the message per-action against the profile it
+    /// granted this daemon; this method carries no authority of its
+    /// own. Callers must pre-filter through
+    /// `dashboard_control::peer_session_control_allowed` so the
+    /// Settings/credentials/access planes stay closed to peer routing
+    /// with an honest local error instead of a remote deny.
+    pub async fn session_control(
+        &self,
+        message: crate::event::ControlMsg,
+    ) -> Result<(), PeerError> {
+        if !self.features().session_control {
+            return Err(PeerError::UnsupportedCapability("session_control".into()));
+        }
+        match self
+            .exec(PeerOp::SessionControl {
+                message: Box::new(message),
+            })
+            .await?
+        {
+            PeerOpAck::Ok => Ok(()),
+            other => Err(PeerError::Transport(format!(
+                "expected Ok ack, got {}",
+                other.name()
+            ))),
+        }
+    }
+
     /// Send one leg of a WebRTC signaling exchange to this peer.
     /// Returns immediately on dispatch; the peer's response (Answer,
     /// trickled IceCandidates) flows back asynchronously through the
@@ -871,6 +992,19 @@ pub struct PeerSnapshot {
     /// `serde(default)` keeps older producers parseable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub displays: Vec<PeerDisplayInfo>,
+    /// The connected transport candidate (URL + reachability class).
+    /// `None` while disconnected. The dashboard derives
+    /// media/datachannel availability from `link.transport_class` —
+    /// never from the peer row merely existing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<PeerLinkInfo>,
+    /// The grant the peer advertised for this daemon's identity on the
+    /// current connection (profile + derived operation permission
+    /// ids). `None` = unknown (older peer, or disconnected) — the
+    /// dashboard treats unknown as "act and report the outcome", not
+    /// as denial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<PeerGrantInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1081,8 @@ where
     let (sessions_tx, sessions_rx) = watch::channel(Arc::new(Vec::new()));
     let (displays_tx, displays_rx) = watch::channel(Arc::new(Vec::new()));
     let (receipts_tx, receipts_rx) = watch::channel(Arc::new(HashMap::new()));
+    let (link_tx, link_rx) = watch::channel(None);
+    let (grant_tx, grant_rx) = watch::channel(None);
 
     let transport = build_transport(events_in_tx);
     let features = transport.features();
@@ -965,6 +1101,8 @@ where
         sessions: std::collections::BTreeMap::new(),
         displays_tx,
         displays: std::collections::BTreeMap::new(),
+        link_tx,
+        grant_tx,
         receipts_tx,
         receipts: HashMap::new(),
         receipt_order: std::collections::VecDeque::new(),
@@ -986,6 +1124,8 @@ where
             card: card_rx,
             sessions: sessions_rx,
             displays: displays_rx,
+            link: link_rx,
+            grant: grant_rx,
             receipts: receipts_rx,
             commands: commands_tx,
             events: events_out_tx,
@@ -1000,6 +1140,43 @@ where
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// Snapshots from daemons predating the link/grant fields (and the
+    /// wire the dashboard round-trips) must keep parsing: both fields
+    /// are `serde(default)` and elided when absent.
+    #[test]
+    fn peer_snapshot_backcompat_without_link_and_grant() {
+        let json = r#"{
+            "id": "intendant:old-peer",
+            "label": "old",
+            "version": "0.0.9",
+            "connection_state": {"state": "connected"},
+            "status": "idle",
+            "capabilities": []
+        }"#;
+        let snap: PeerSnapshot = serde_json::from_str(json).expect("old snapshot parses");
+        assert!(snap.link.is_none());
+        assert!(snap.grant.is_none());
+
+        // And the new fields round-trip when present.
+        let mut snap = snap;
+        snap.link = Some(PeerLinkInfo {
+            url: "wss://peer.example/ws".into(),
+            transport_class: PeerTransportClass::Relayed,
+        });
+        snap.grant = Some(PeerGrantInfo {
+            profile: "peer-operator".into(),
+            operations: vec!["message.send".into()],
+        });
+        let round = serde_json::to_string(&snap).unwrap();
+        assert!(
+            round.contains(r#""transport_class":"relayed""#),
+            "snake_case wire form for the class: {round}"
+        );
+        let back: PeerSnapshot = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.link, snap.link);
+        assert_eq!(back.grant, snap.grant);
+    }
 
     #[test]
     fn connection_state_is_copy_and_equatable() {

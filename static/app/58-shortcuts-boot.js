@@ -727,6 +727,41 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
   switchStatsHost(e.target.value);
 });
 
+// Global operating target (RC-C1): the pane pickers publish into one
+// selection; this listener makes the others follow. Every pane setter
+// is equality-guarded and republishing the same value is a no-op, so
+// the publish→follow→publish cycle terminates immediately.
+document.addEventListener('ui2:target-changed', (e) => {
+  const hostId = String(e?.detail?.hostId || '');
+  // Shell (its local sentinel is SHELL_HOST_ID, not '').
+  if (typeof setShellHost === 'function') {
+    setShellHost(hostId || SHELL_HOST_ID);
+  }
+  // Files IDE + Transfers selects hold their own value; refresh the
+  // options first when the target isn't listed yet (a peer added since
+  // the last rebuild).
+  const followSelect = (selectId, refresh, onChanged) => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    if (sel.value === hostId) return;
+    if (![...sel.options].some(o => o.value === hostId)) refresh();
+    if (sel.value !== hostId) {
+      sel.value = hostId;
+      onChanged();
+    }
+  };
+  followSelect('files-ide-host', refreshFilesIdeHostOptions, onFilesIdeHostChanged);
+  followSelect('files-download-host', refreshFilesDownloadHostOptions, onFilesDownloadHostChanged);
+  if (typeof setSessionsHost === 'function') setSessionsHost(hostId);
+  if (typeof switchStatsHost === 'function' && activeStatsHost !== hostId) {
+    const statsSel = document.getElementById('stats-host-select');
+    if (statsSel && [...statsSel.options].some(o => o.value === hostId)) {
+      statsSel.value = hostId;
+    }
+    switchStatsHost(hostId);
+  }
+});
+
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The

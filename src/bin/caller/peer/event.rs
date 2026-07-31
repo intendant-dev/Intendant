@@ -59,6 +59,21 @@ pub enum PeerEvent {
         status: PeerStatus,
     },
 
+    /// The peer advertised the federation grant it resolved for this
+    /// daemon's identity on the current connection: the profile name
+    /// and the derived set of allowed operation permission ids
+    /// (`access::iam::operation_permission_id` vocabulary). Display
+    /// metadata only — authority stays entirely peer-side, enforced
+    /// per request; this echo exists so dashboards can render honest
+    /// affordances (no dead pills) instead of probing by denial.
+    /// Connection-scoped: re-advertised on every connect, cleared on
+    /// disconnect. Older peers never emit it, so `None` in the folded
+    /// view means "unknown", not "nothing allowed".
+    GrantAdvertised {
+        profile: String,
+        operations: Vec<String>,
+    },
+
     // ---- Activity stream — what the peer is doing right now ----
     /// A unit of work has begun (turn, tool call, sub-agent run, delegated
     /// task, etc). Activities have an opaque id and a kind for routing.
