@@ -93,8 +93,37 @@ $elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsId
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # -- Toolchain --
+# git is needed before anything else -- the clone is how the repo's own
+# setup scripts (scripts\setup-windows.ps1) arrive, so they cannot
+# install it for us. A stock box may lack it: try winget, then choco,
+# announcing the exact command before it runs -- elevation only ever
+# happens through their own visible prompts (UAC), never silently. With
+# neither manager present, stop and name the command to run.
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-    Fail "git is required. Install it (winget install Git.Git) and re-run -- or run scripts\setup-windows.ps1 from an elevated shell after cloning $Repo."
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $gitInstall = @("winget", "install", "--id", "Git.Git", "-e", "--source", "winget",
+            "--accept-package-agreements", "--accept-source-agreements")
+    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+        $gitInstall = @("choco", "install", "git", "-y")
+    } else {
+        Fail "git is required and neither winget nor choco is here to install it. Install it yourself (winget install Git.Git) and re-run -- or run scripts\setup-windows.ps1 from an elevated shell after cloning $Repo."
+    }
+    $gitInstallShown = $gitInstall -join " "
+    Say "git is missing -- installing it via: $gitInstallShown"
+    $gitInstallExe, $gitInstallArgs = $gitInstall
+    & $gitInstallExe @gitInstallArgs
+    if ($LASTEXITCODE -ne 0) {
+        Fail "git install failed -- run it yourself ($gitInstallShown), then re-run this installer."
+    }
+    # The package manager extends PATH for future shells only -- append the
+    # machine/user PATH here so this session sees the new git (append, not
+    # replace: process-only entries must survive).
+    $env:Path = $env:Path + ";" +
+        [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+        [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        Fail "git was installed but is not on PATH in this session -- open a new PowerShell and re-run this installer."
+    }
 }
 
 # -- Source --

@@ -63,9 +63,17 @@ detect_distro() {
 
 # ── Sudo ──────────────────────────────────────────────────────────────────
 
+# Prefix for the few commands that need root. ensure_sudo sets it: empty
+# when this shell already IS root (stock root images -- containers, many
+# VPS defaults -- ship no sudo at all, so hardcoding it would break the
+# exact boxes that need setup most), "sudo" once access is confirmed
+# otherwise.
+SUDO="sudo"
+
 ensure_sudo() {
-    # Already root -- nothing to check.
+    # Already root -- nothing to escalate through.
     if [[ $EUID -eq 0 ]]; then
+        SUDO=""
         return
     fi
 
@@ -217,8 +225,8 @@ install_apt_packages() {
     fi
 
     info "installing ${#missing[@]} system packages..."
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq "${missing[@]}"
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq "${missing[@]}"
 }
 
 # ── Rust ──────────────────────────────────────────────────────────────────
@@ -613,8 +621,8 @@ build_intendant() {
     # downstream tools (e.g. setup-lan.bat invoking `intendant access` over
     # SSH on this guest).
     info "linking intendant into /usr/local/bin..."
-    sudo ln -sf "$bin_dir/intendant" /usr/local/bin/intendant
-    sudo ln -sf "$bin_dir/intendant-runtime" /usr/local/bin/intendant-runtime
+    $SUDO ln -sf "$bin_dir/intendant" /usr/local/bin/intendant
+    $SUDO ln -sf "$bin_dir/intendant-runtime" /usr/local/bin/intendant-runtime
 
     echo ""
     ok "intendant          -> $bin_dir/intendant"
@@ -698,7 +706,11 @@ run_install() {
     # Phase 1: sudo
     info "checking sudo access..."
     ensure_sudo
-    ok "sudo access confirmed"
+    if [[ -z "$SUDO" ]]; then
+        ok "running as root (no sudo needed)"
+    else
+        ok "sudo access confirmed"
+    fi
 
     # Phase 2: system packages
     echo ""

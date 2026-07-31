@@ -2853,6 +2853,42 @@ mod tests {
     }
 
     #[test]
+    fn install_scripts_bootstrap_git_before_first_use() {
+        // Stock cloud images (Debian minimal, for one) ship without git,
+        // and the repo's setup scripts arrive BY the clone — the installer
+        // itself must stand git up through the platform package manager.
+        // Escalation stays honest: the exact command is announced before it
+        // runs, sudo is used only where it exists, and the no-root path
+        // dies naming the command instead of escalating silently.
+        assert!(
+            INSTALL_SH.contains("apt-get update && apt-get install -y git"),
+            "install.sh must bootstrap git via apt on Debian-family boxes"
+        );
+        assert!(
+            INSTALL_SH.contains("sudo sh -c '$GIT_INSTALL'"),
+            "install.sh must announce and run the identical command under sudo"
+        );
+        assert!(
+            INSTALL_SH.contains("there is no sudo — as root, run:"),
+            "the no-sudo path must name the exact command, never escalate"
+        );
+        assert!(
+            !INSTALL_SH.contains("git is required (install it and re-run)"),
+            "the bounce-to-manual git pre-flight must stay gone"
+        );
+        // The ps1 twin: winget first, choco fallback, honest fail with
+        // neither — plus the PATH pickup that makes the fresh git visible
+        // to the already-running session.
+        assert!(INSTALL_PS1.contains("\"winget\", \"install\", \"--id\", \"Git.Git\""));
+        assert!(INSTALL_PS1.contains("\"choco\", \"install\", \"git\", \"-y\""));
+        assert!(INSTALL_PS1.contains("GetEnvironmentVariable(\"Path\", \"Machine\")"));
+        assert!(
+            INSTALL_PS1.contains("neither winget nor choco"),
+            "install.ps1 must fail honestly when no package manager exists"
+        );
+    }
+
+    #[test]
     fn install_routes_redirect_to_the_release_assets() {
         // The canonical anchors live under the project repo on GitHub —
         // never under a serving origin. Golden twin of
