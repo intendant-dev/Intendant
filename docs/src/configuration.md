@@ -322,11 +322,16 @@ interruptions, limit-parked wrappers with pending work) are
 resume-attached under fresh wrappers with a continuation nudge, under the
 existing admission guards (see
 [Agenda & Memory](./agenda-and-memory.md#reminders)). Idle or completed
-sessions stay down.
+sessions stay down — except through the unfinished-commission sweep that
+runs after the mid-work loop under this same knob: an idle seat whose
+agenda commission is still open (occurrence fail-closed by this boot,
+unattested, no live process) is woken to continue, and what cannot be
+woken is listed on one needs-you agenda task instead of stranding
+silently (`failed` runs are listed, never re-fired).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
+| `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand and skips the commission sweep. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
 
 ### `[agent]` and external backends
 

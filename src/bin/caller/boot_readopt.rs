@@ -66,6 +66,37 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) const READOPT_CONTINUATION_TEXT: &str =
     "The daemon restarted mid-task — continue where you left off.";
 
+/// The commission sweep's variant of the same nudge: identical
+/// instruction tail (the seat resumes with full context either way),
+/// different lead — the woken seat should know it was idle-parked with
+/// an open commission, not interrupted mid-turn.
+pub(crate) const COMMISSION_CONTINUATION_TEXT: &str =
+    "The daemon restarted while this commissioned session was parked — \
+     continue where you left off.";
+
+/// Which lens judges a dead lineage tip in [`decide_candidate_with_lens`].
+/// The mid-work lens is the boot readopt's law (idle in, idle out: a
+/// concluded tip stays down); the open-commission lens is the boot
+/// sweep's (`commission_sweep`): the commission — started, unattested,
+/// un-terminal — is the question, so a concluded/idle tip is exactly
+/// the stranded shape and resumes. Every other rung is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeLens {
+    MidWork,
+    OpenCommission,
+}
+
+impl ResumeLens {
+    /// The synthesized continuation nudge for this lens — never the
+    /// original goal, which would double-execute.
+    fn continuation_text(self) -> &'static str {
+        match self {
+            ResumeLens::MidWork => READOPT_CONTINUATION_TEXT,
+            ResumeLens::OpenCommission => COMMISSION_CONTINUATION_TEXT,
+        }
+    }
+}
+
 /// Resume-attaches per boot. A crash rarely strands more than a handful
 /// of genuinely mid-work sessions (idle-in/idle-out keeps the set
 /// small); the cap bounds the model-spend of a pathological boot, and
@@ -261,7 +292,7 @@ fn boot_watershed_secs(state_root: &Path, own_boot_id: &str) -> Option<u64> {
 /// Last durable activity of a session dir, epoch seconds (the same
 /// probe the session catalog's era classification uses:
 /// `session.jsonl` mtime, dir mtime as fallback).
-fn activity_mtime_secs(dir: &Path) -> u64 {
+pub(crate) fn activity_mtime_secs(dir: &Path) -> u64 {
     let mtime = |path: &Path| {
         std::fs::metadata(path)
             .and_then(|meta| meta.modified())
@@ -400,6 +431,19 @@ pub(crate) fn decide_candidate(
     now_secs: u64,
     live: &HashSet<String>,
 ) -> ReadoptDecision {
+    decide_candidate_with_lens(home, candidate, now_secs, live, ResumeLens::MidWork)
+}
+
+/// [`decide_candidate`] with the tip-judgment lens explicit — the
+/// commission sweep's entry ([`ResumeLens::OpenCommission`]); every
+/// rung except the concluded-tip arm and the nudge text is shared.
+pub(crate) fn decide_candidate_with_lens(
+    home: &Path,
+    candidate: &ReadoptCandidate,
+    now_secs: u64,
+    live: &HashSet<String>,
+    lens: ResumeLens,
+) -> ReadoptDecision {
     if candidate.suspended {
         return ReadoptDecision::LeftDead(
             "standing series suspended after repeated failures".to_string(),
@@ -453,13 +497,24 @@ pub(crate) fn decide_candidate(
                     // continuation added).
                     (tip.source.clone(), tip.backend_session_id.clone(), tip_id)
                 }
-                Some(meta) => {
-                    return ReadoptDecision::LeftDead(format!(
-                        "already continued under session {} — that continuation concluded ({})",
-                        short_id(&tip_id),
-                        meta.status.as_deref().unwrap_or("no status")
-                    ));
-                }
+                Some(meta) => match lens {
+                    ResumeLens::MidWork => {
+                        return ReadoptDecision::LeftDead(format!(
+                            "already continued under session {} — that continuation concluded ({})",
+                            short_id(&tip_id),
+                            meta.status.as_deref().unwrap_or("no status")
+                        ));
+                    }
+                    // The open-commission lens: the tip concluded but
+                    // the COMMISSION did not (started, unattested,
+                    // un-terminal) — a paused/idle tip is exactly the
+                    // stranded shape the sweep exists to wake. Resume
+                    // the tip's own newest conversation, same as the
+                    // dead-mid-work arm.
+                    ResumeLens::OpenCommission => {
+                        (tip.source.clone(), tip.backend_session_id.clone(), tip_id)
+                    }
+                },
                 // No durable state to judge the tip by: fail toward
                 // leaving it down (idle in, idle out).
                 None => {
@@ -507,7 +562,7 @@ pub(crate) fn decide_candidate(
         session_id: resume_conversation,
         resume_id: None,
         project_root: project_root.map(|root| root.to_string_lossy().to_string()),
-        task: Some(READOPT_CONTINUATION_TEXT.to_string()),
+        task: Some(lens.continuation_text().to_string()),
         direct: None,
         attachments: Vec::new(),
         fork: false,
@@ -954,6 +1009,7 @@ mod tests {
             std::sync::Arc::new(secondary),
             true,
             std::time::Duration::ZERO,
+            None,
         ));
         assert!(
             events.try_recv().is_err(),
@@ -1013,6 +1069,7 @@ mod tests {
                     holder,
                     true,
                     spacing,
+                    None,
                 )
                 .await;
                 start.elapsed()
@@ -1232,6 +1289,102 @@ mod tests {
         }
     }
 
+    /// The commission sweep's one changed rung: a dead CONCLUDED tip
+    /// stays down under the mid-work lens (idle in, idle out) but
+    /// resumes under the open-commission lens — there the commission,
+    /// not the session status, is the question. Every other rung is
+    /// shared: the brake still outranks the lens.
+    #[test]
+    fn open_commission_lens_resumes_concluded_tip() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-orig", "b1-conv");
+        announce_ids(home.path(), "wrapper-cont", &["b1-conv", "b2-conv"]);
+        write_meta(home.path(), "wrapper-cont", "completed", None);
+        let candidate = ReadoptCandidate {
+            session_id: "wrapper-orig".to_string(),
+            class: MidWorkClass::Agenda,
+            suspended: false,
+            activity_secs: now_secs(),
+        };
+        match decide_candidate_with_lens(
+            home.path(),
+            &candidate,
+            now_secs(),
+            &HashSet::new(),
+            ResumeLens::MidWork,
+        ) {
+            ReadoptDecision::LeftDead(reason) => assert!(
+                reason.contains("concluded"),
+                "the mid-work lens leaves a concluded tip down: {reason}"
+            ),
+            other => panic!("expected LeftDead under the mid-work lens, got {other:?}"),
+        }
+        match decide_candidate_with_lens(
+            home.path(),
+            &candidate,
+            now_secs(),
+            &HashSet::new(),
+            ResumeLens::OpenCommission,
+        ) {
+            ReadoptDecision::Readopt(resume) => match *resume {
+                ControlMsg::ResumeSession {
+                    source,
+                    session_id,
+                    task,
+                    fork,
+                    auto_attach,
+                    ..
+                } => {
+                    assert_eq!(source, "claude-code");
+                    assert_eq!(
+                        session_id, "b2-conv",
+                        "the tip's own newest conversation, never the superseded eager row"
+                    );
+                    assert_eq!(
+                        task.as_deref(),
+                        Some(COMMISSION_CONTINUATION_TEXT),
+                        "the commission nudge, never the original goal"
+                    );
+                    assert!(!fork);
+                    assert!(auto_attach, "the automatic lane — Resume, never Revive");
+                }
+                other => panic!("expected ResumeSession, got {other:?}"),
+            },
+            other => panic!("the open-commission lens wakes a concluded tip, got {other:?}"),
+        }
+        let suspended = ReadoptCandidate {
+            suspended: true,
+            ..candidate
+        };
+        match decide_candidate_with_lens(
+            home.path(),
+            &suspended,
+            now_secs(),
+            &HashSet::new(),
+            ResumeLens::OpenCommission,
+        ) {
+            ReadoptDecision::LeftDead(reason) => assert!(
+                reason.contains("suspended"),
+                "the brake outranks the lens: {reason}"
+            ),
+            other => panic!("expected the brake to hold under either lens, got {other:?}"),
+        }
+    }
+
+    /// The two nudges share the instruction tail (resume-attach keeps
+    /// context either way; only the lead differs, naming why the seat
+    /// was woken) — the same mirroring law the readopt/reload pair pins.
+    #[test]
+    fn commission_nudge_shares_the_continuation_tail() {
+        let tail = "continue where you left off.";
+        assert!(READOPT_CONTINUATION_TEXT.ends_with(tail));
+        assert!(COMMISSION_CONTINUATION_TEXT.ends_with(tail));
+        assert_ne!(
+            READOPT_CONTINUATION_TEXT, COMMISSION_CONTINUATION_TEXT,
+            "the lead names the situation — parked commission vs mid-task"
+        );
+    }
+
     /// The trap from the commissioning card: re-eligibility must not
     /// stand a suspended series back up through its continuation's own
     /// store-class candidacy. The agenda seed carries suspension for one
@@ -1415,6 +1568,7 @@ pub(crate) async fn run_boot_readopt_pass(
     handover: std::sync::Arc<HandoverRuntime>,
     enabled: bool,
     dispatch_spacing: std::time::Duration,
+    agenda: Option<std::sync::Arc<crate::agenda::AgendaHandle>>,
 ) {
     if !enabled {
         eprintln!("[readopt] disabled by configuration — dead-boot sessions stay down");
@@ -1470,10 +1624,9 @@ pub(crate) async fn run_boot_readopt_pass(
             }
         }
     }
-    if candidates.is_empty() {
-        return;
-    }
     // The streak brake reaches the whole lineage before anything decides.
+    // (An empty candidate set still proceeds: the commission sweep below
+    // enumerates from the item store, not from these candidates.)
     propagate_suspension(&home, &mut candidates);
     let now_secs = crate::session_activity::epoch_seconds();
     let mut dispatched: Vec<ReadoptDispatch> = Vec::new();
@@ -1555,15 +1708,116 @@ pub(crate) async fn run_boot_readopt_pass(
             }
         }
     }
+    // The unfinished-commission sweep (one per boot): after the mid-work
+    // loop, the commission lens — stranded unfinished commissions
+    // (started, unattested, un-terminal, no live process) that
+    // idle-in-idle-out cannot see. Enumeration derives entirely from the
+    // item store + occurrence journal + shared lineage walker (the
+    // `commission_sweep` module doc states the law); the wakes ride the
+    // same automatic resume lane, per-boot cap, and one-resume-per-
+    // conversation dedupe as the loop above.
+    let sweep_plan = match agenda.as_deref() {
+        Some(handle) => {
+            let fresh: std::collections::HashSet<String> = seeds
+                .iter()
+                .map(|seed| seed.occurrence_id.clone())
+                .collect();
+            let standings =
+                crate::commission_sweep::classify_commissions(&handle.snapshot(), &fresh);
+            let mut history: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for standing in &standings {
+                if let crate::commission_sweep::CommissionStanding::Wake(cref) = standing {
+                    if let Some(sessions) = handle.occurrence_started_history(&cref.occurrence_id) {
+                        history.insert(cref.occurrence_id.clone(), sessions);
+                    }
+                }
+            }
+            let dispatched_sessions: HashSet<String> = dispatched
+                .iter()
+                .map(|dispatch| dispatch.session_id.clone())
+                .collect();
+            crate::commission_sweep::plan_sweep(
+                &home,
+                standings,
+                &history,
+                now_secs,
+                &live,
+                &dispatched_sessions,
+            )
+        }
+        None => crate::commission_sweep::SweepPlan::default(),
+    };
+    let mut sweep_listed = sweep_plan.listed;
+    let mut sweep_dispatched: Vec<(crate::commission_sweep::CommissionRef, ReadoptDispatch)> =
+        Vec::new();
+    for (cref, candidate_session, resume) in sweep_plan.wakes {
+        if draining_cut {
+            sweep_listed.push((cref, "daemon began draining mid-pass".to_string()));
+            continue;
+        }
+        if dispatched.len() + sweep_dispatched.len() >= READOPT_MAX_PER_BOOT {
+            sweep_listed.push((
+                cref,
+                format!("per-boot readopt cap ({READOPT_MAX_PER_BOOT}) reached"),
+            ));
+            continue;
+        }
+        if let ControlMsg::ResumeSession {
+            source, session_id, ..
+        } = resume.as_ref()
+        {
+            if !dispatched_conversations.insert((source.clone(), session_id.clone())) {
+                // An earlier dispatch this boot already resumes this
+                // conversation — the commission rides that seat.
+                eprintln!(
+                    "[commission-sweep] {} covered by an earlier resume this boot",
+                    short_id(&candidate_session)
+                );
+                continue;
+            }
+        }
+        // Same stagger discipline as the mid-work loop above: sweep
+        // wakes are the same continuation cold-start class, and a drain
+        // that begins during the wait sends the remainder to the owner
+        // lane — never spawned into a draining daemon.
+        if (!dispatched.is_empty() || !sweep_dispatched.is_empty()) && !dispatch_spacing.is_zero() {
+            tokio::time::sleep(dispatch_spacing).await;
+            if handover.is_draining() {
+                draining_cut = true;
+                sweep_listed.push((cref, "daemon began draining mid-pass".to_string()));
+                continue;
+            }
+        }
+        eprintln!(
+            "[commission-sweep] waking {} — open commission \u{201c}{}\u{201d} (occurrence {})",
+            short_id(&candidate_session),
+            cref.item_title,
+            short_id(&cref.occurrence_id)
+        );
+        bus.send(AppEvent::ControlCommand(*resume));
+        sweep_dispatched.push((
+            cref,
+            ReadoptDispatch {
+                session_id: candidate_session,
+                class: MidWorkClass::Agenda,
+            },
+        ));
+    }
     // Dispatches are not outcomes: hold the summary until the resumes have
     // had the verify window to spawn, register, and stay up, then record
-    // what actually happened to each.
+    // what actually happened to each. The sweep's wakes share the one
+    // window — the pass sleeps once.
+    let live_after = if dispatched.is_empty() && sweep_dispatched.is_empty() {
+        None
+    } else {
+        tokio::time::sleep(READOPT_VERIFY_WINDOW).await;
+        fetch_live_wrapper_ids_with_retry().await
+    };
     let outcomes = if dispatched.is_empty() {
         VerifiedOutcomes::default()
     } else {
-        tokio::time::sleep(READOPT_VERIFY_WINDOW).await;
-        let live_now = fetch_live_wrapper_ids_with_retry().await;
-        let outcomes = verify_dispatches(&home, &dispatched, live_now.as_ref());
+        let outcomes = verify_dispatches(&home, &dispatched, live_after.as_ref());
         for (id, _) in &outcomes.confirmed {
             eprintln!(
                 "[readopt] confirmed {} alive after the verify window",
@@ -1575,6 +1829,41 @@ pub(crate) async fn run_boot_readopt_pass(
         }
         outcomes
     };
+    // The sweep's dispatches verify through the same lineage walk; a
+    // wake that died inside the window is reclassified into the owner
+    // lane — never counted as woken.
+    let mut sweep_woken: Vec<(crate::commission_sweep::CommissionRef, String)> = Vec::new();
+    if !sweep_dispatched.is_empty() {
+        let records: Vec<ReadoptDispatch> = sweep_dispatched
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect();
+        let sweep_outcomes = verify_dispatches(&home, &records, live_after.as_ref());
+        let died: std::collections::HashMap<String, String> =
+            sweep_outcomes.died.into_iter().collect();
+        for (cref, record) in sweep_dispatched {
+            match died.get(&record.session_id) {
+                Some(reason) => {
+                    eprintln!(
+                        "[commission-sweep] reclassifying {}: {reason}",
+                        short_id(&record.session_id)
+                    );
+                    sweep_listed.push((cref, reason.clone()));
+                }
+                None => sweep_woken.push((cref, record.session_id)),
+            }
+        }
+    }
+    // A session the sweep verified alive was not left dead after all —
+    // the mid-work summary must not contradict the sweep's (the
+    // concluded-tip refusal the commission lens then overrode).
+    {
+        let woken_sessions: std::collections::HashSet<&str> = sweep_woken
+            .iter()
+            .map(|(_, session)| session.as_str())
+            .collect();
+        left_dead.retain(|(session, _)| !woken_sessions.contains(session.as_str()));
+    }
     if let Some(notification) = summary_notification(
         handover.boot_id(),
         &outcomes.confirmed,
@@ -1583,6 +1872,13 @@ pub(crate) async fn run_boot_readopt_pass(
     ) {
         bus.send(notification);
     }
+    crate::commission_sweep::report_sweep(
+        &bus,
+        agenda.as_deref(),
+        handover.boot_id(),
+        &sweep_woken,
+        &sweep_listed,
+    );
 }
 
 /// The live-wrapper snapshot, retried briefly: `live_wrapper_ids` is a
