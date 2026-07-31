@@ -2550,9 +2550,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     } = &dashboard_control_grant_for_ws
                     {
                         let operations =
-                            crate::access::access_policy::profile_operation_permission_ids(
-                                profile,
-                            );
+                            crate::access::access_policy::profile_operation_permission_ids(profile);
                         if let Ok(line) =
                             serde_json::to_string(&crate::types::OutboundEvent::PeerGrant {
                                 profile: profile.clone(),
