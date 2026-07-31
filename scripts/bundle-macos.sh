@@ -220,6 +220,14 @@ if [ -f "macos-app/AppIcon.icns" ]; then
     cp "macos-app/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 fi
 
+# Source-checkout stamp (written before signing, so the signature seals
+# it): the absolute path of the checkout this bundle was built from. The
+# daemon's self-update lane reads it so an INSTALLED source-built app can
+# still offer the pull+rebuild lane; on a machine where the recorded
+# path does not exist (a release built on CI), the probe falls down to
+# the verified release-download lane — exactly right.
+printf '%s\n' "$PROJECT_ROOT" > "$RESOURCES/source-checkout"
+
 # Info.plist — written before signing, so the signature seals it (the
 # pre-release-seam script signed first and wrote the plist after, which left
 # the seal broken and the code-signing identifier inferred from the executable

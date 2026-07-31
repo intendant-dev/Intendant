@@ -1146,6 +1146,43 @@ can tell a daemon died mid-park with work still owed. Activity and
 session-log rows make the pause, queued messages, cancellation, and resend
 visible.
 
+## Service-condition Error Parking
+
+A round can also die early on a **temporary service condition** — the
+provider-incident class: repeated HTTP 5xx after the backend's own transport
+retries gave up, gateway drops, stream cuts. Claude Code surfaces these as an
+errored result ("API Error: 500 …"), which used to end the round "cleanly"
+(error row → done signal → round complete): nothing was armed, so the session
+sat fake-idle, invisible to the credential-reload lane and every wake clock —
+and for a scheduled occurrence the DoneSignal journaled COMPLETED with the
+failure invisible (2026-07-29 specimens, both commission seats, stranded for
+over an hour).
+
+The drain now classifies early round endings at the round-outcome seam
+(`transient_service_condition` in `external_supervision.rs`, conservative
+marker matching): a fatal backend error with a temporary-service cause drains
+as `DrainOutcome::TransientRoundDeath`; **permanent causes — auth problems,
+refusals, invalid model pins, deliberate exits — keep their terminal shapes**
+(`TurnFailed` for the zero-turn round, the completion shape after real work).
+Temporary-class deaths enter the **same armed park** as the limit lanes — one
+`LimitParkState` slot, the same wake timer, queue-while-parked, cancel, and
+reload-preserve machinery, the same delivery-aware pending seam
+(`delivery_aware_park_pending` / `midturn_continuation`), with a
+`ParkKind::ServiceCondition` tag so every shared line says "Service-recovery
+pause", never "rate-limited" — plus a **wake schedule of their own**: limit
+parks wake at the provider's reset time, service-condition parks wake on a
+bounded widening backoff (30s → 2m → 5m → 15m → 30m, small jitter; integers
+tunable in `ERROR_PARK_BACKOFF_SCHEDULE_SECS`), each wake re-driving the
+interrupted work (the continue-where-you-left-off nudge when the turn had
+started, the driving message verbatim when it never did). A completed turn —
+or an explicit intervention (interrupt, reload, `/new`) — resets the attempt
+counter. When the schedule exhausts, the supervised lane ends the session
+with a FAILED terminal carrying the cause, so a scheduled occurrence journals
+`failed` — counting on the agenda's suspension streak and surfacing to the
+owner — instead of waiting unattended; the persistent daemon lane reports the
+outage on the error/presence surfaces and stops parking until the next user
+message re-drives it.
+
 ## Dashboard and Station parity
 
 The per-session dashboard features (Activity → Timeline agent windows and the
