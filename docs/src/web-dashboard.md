@@ -159,14 +159,18 @@ window.qa = Object.assign(window.qa || {}, {
 });
 ```
 
-Each entry is a cheap, side-effect-free function returning a
-JSON-serializable snapshot. Current probes: `qa.sessionsHydration()`
+Each entry is cheap and JSON-serializable; unless noted, probes are
+side-effect-free snapshot reads. Current probes: `qa.sessionsHydration()`
 (sessions-tab relationship-hydration termination, `40-session-launch.js`),
 `qa.sessionsFuel()` (new-session credential preflight,
 `55b-session-launch.js`), `qa.newSessionAgentPrefs()` (last-used
 launch-option prefill state, same fragment), `qa.focusSurface()` (Activity
 Focus target/promotion state), `qa.arrangeMenu()` (the Arrange menu's
-bulk-sweep rows, counts, and sub-agent auto-minimize state), and `qa.station()` — a pointer to
+bulk-sweep rows, counts, and sub-agent auto-minimize state),
+`qa.closableLens` (the closable-at-a-glance lens: `claim()` drives the
+pure positive-only classifier with an explicit matrix, `state()`
+snapshots chip count + lens engagement, `set(on)` — a drive, not a
+read — toggles the lens), and `qa.station()` — a pointer to
 `window.stationProbe`, which predates the namespace and keeps its legacy name
 (the validator's `--station-*` probes and smoke skills depend on it).
 `window.__intendantPaneDiag` above is the other legacy surface.
@@ -336,6 +340,27 @@ rename always wins, and the Track AW refinement — stamped definitions
 deriving `definition name - node id` — lands later at the same single
 derivation seam (`agenda/reminders.rs`, `derive_spawn_session_name`)
 without touching these chips.
+
+The **safe-to-stop derivation** (Track AO) rides the same occurrence
+block: `stop` serves the ruled conjunction from the durable journal —
+`kills_live_run` (the lineage tip of a started-without-terminal
+occurrence: a live firing), `owed_work` (a superseded member of one,
+regardless of process state), `settled` (every terminal) — and the ×
+affordance, the stop confirms, and the occurrence chip render
+machine-scoped consequence copy from it (a linkless session claims
+"safe" only as idle ∧ no linkage; a busy linkless card claims nothing).
+The **closable-at-a-glance lens** composes those positive claims for
+the whole grid: a toolbar chip beside Arrange counts the cards whose
+close the machine already rules safe — settled and quiet, idle with no
+agenda linkage, or finished; negative served claims veto, and a running
+window never counts, even settled — hides at zero (never "0 closable"),
+and, engaged, dims every other card so the closable set reads at a
+glance. The classifier (`sessionWindowClosableClaim` in
+`41-session-window-actions.js`) is strictly a composition of
+already-ruled claims, never a second derivation, and the count plus each
+card's class derive in the Arrange menu's one walk so they can never
+disagree; an emptied count disengages the lens rather than stranding a
+fully-dimmed grid.
 
 When a backend announces background commands (currently Claude Code's
 wire-reported task registry), the activity explainer inside that vitals panel
