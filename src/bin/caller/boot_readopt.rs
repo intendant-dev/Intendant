@@ -1718,6 +1718,16 @@ pub(crate) async fn run_boot_readopt_pass(
             }
         }
     }
+    // A session the sweep verified alive was not left dead after all —
+    // the mid-work summary must not contradict the sweep's (the
+    // concluded-tip refusal the commission lens then overrode).
+    {
+        let woken_sessions: std::collections::HashSet<&str> = sweep_woken
+            .iter()
+            .map(|(_, session)| session.as_str())
+            .collect();
+        left_dead.retain(|(session, _)| !woken_sessions.contains(session.as_str()));
+    }
     if let Some(notification) = summary_notification(
         handover.boot_id(),
         &outcomes.confirmed,
