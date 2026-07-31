@@ -178,4 +178,52 @@ mod tests {
             );
         }
     }
+
+    fn embedded(name: &str) -> &'static BuiltinSkill {
+        BUILTIN_SKILLS
+            .iter()
+            .find(|skill| skill.name == name)
+            .unwrap_or_else(|| panic!("builtin skill {name} missing"))
+    }
+
+    /// Guardrails that used to ride the CC first-prompt supervision addendum
+    /// live in the skill catalog now; the addendum is gone, so these lines
+    /// are the only teaching surface left. A skill edit that drops one must
+    /// fail here, not ship as a silently unguarded fleet.
+    #[test]
+    fn desktop_and_dashboard_guardrails_survive_in_the_skill_catalog() {
+        // The ambient half: intendant-cli's always-loaded description names
+        // the prohibition, so a session forms the intent without a body load.
+        let cli = embedded("intendant-cli");
+        let (config, _) = intendant_core::skills::parse_skill_md(cli.skill_md, Path::new(cli.name))
+            .expect("intendant-cli parses");
+        assert!(
+            config.description.contains("cliclick/osascript/xdotool")
+                && config.description.contains("approval settings"),
+            "intendant-cli description lost the ambient desktop-input guardrail"
+        );
+        // The recipe half: bodies repeat the rule where cu usage is taught.
+        for (name, needles) in [
+            (
+                "intendant-cli",
+                &["`cliclick`/`osascript`/`xdotool`", "approval settings"][..],
+            ),
+            (
+                "visual-collaboration",
+                &["`cliclick`/`osascript`/`xdotool`", "approval settings"][..],
+            ),
+            (
+                "station-e2e-qa",
+                &["foreground/nohup/setsid dashboard", "--hold-dashboard"][..],
+            ),
+        ] {
+            let skill = embedded(name);
+            for needle in needles {
+                assert!(
+                    skill.skill_md.contains(needle),
+                    "skills/{name}/SKILL.md lost its guardrail phrase {needle:?}"
+                );
+            }
+        }
+    }
 }

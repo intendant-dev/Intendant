@@ -683,7 +683,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "execute_cu_actions",
         manual_http_tool_definition!(
             "execute_cu_actions",
-            "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.",
+            "Execute computer-use actions on a display (click, type, scroll, etc). Desktop actions go through this tool — never cliclick/osascript/xdotool or ad-hoc scripts — so they run under the owner's approval settings. Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.",
             ExecuteCuActionsParams
         ),
     );

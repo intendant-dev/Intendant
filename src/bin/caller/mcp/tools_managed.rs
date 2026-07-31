@@ -1442,6 +1442,41 @@ mod tests {
         });
     }
 
+    /// The desktop-action guardrail (approval settings apply because input
+    /// routes through Intendant, never cliclick/osascript/xdotool) lost its
+    /// always-paid home when the CC first-prompt supervision addendum was
+    /// retired; the served tool description is the ambient surface every
+    /// MCP client sees, so pin the clause where clients actually read it.
+    #[test]
+    fn execute_cu_actions_description_carries_the_desktop_guardrail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let server = IntendantServer::new(state, EventBus::new());
+            let listing = server
+                .list_tools_json_for_session(None, Some(false), Some("core"))
+                .await;
+            let description = listing["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "execute_cu_actions")
+                .and_then(|tool| tool["description"].as_str())
+                .expect("execute_cu_actions is served with a description")
+                .to_string();
+            for needle in ["never cliclick/osascript/xdotool", "approval settings"] {
+                assert!(
+                    description.contains(needle),
+                    "execute_cu_actions description lost the desktop guardrail \
+                     phrase {needle:?}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn list_tools_core_profile_keeps_only_bootstrap_tools() {
         let rt = tokio::runtime::Builder::new_current_thread()

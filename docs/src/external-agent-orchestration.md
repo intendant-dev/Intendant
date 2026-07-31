@@ -252,7 +252,7 @@ What each supervised backend actually receives:
 | Session-scoped authority | child env → MCP Authorization header | child env → environment-expanded MCP Authorization header | child env → generated bridge MCP bearer-variable reference | child env → scoped `intendant ctl` bootstrap |
 | `session_id` scope in URL | yes | yes | yes | yes, consumed by `ctl`, not advertised as Pi MCP |
 | `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | yes | yes |
-| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | generated bridge-home MCP config + ordinary tool discovery | appended system prompt naming truthful `ctl --help` discovery |
+| Guidance channel | managed-context developer message | none — the materialized skill catalog + self-describing MCP schemas | generated bridge-home MCP config + ordinary tool discovery | appended system prompt naming truthful `ctl --help` discovery |
 
 The MCP bootstrap set for Codex, Claude Code, and Kimi includes the CU path
 (`read_screen`, `take_screenshot`, `execute_cu_actions`, `list_displays`,
@@ -343,8 +343,11 @@ own native capabilities where the upstream CLIs provide them.
   `${INTENDANT_MCP_BEARER_TOKEN}` inside the child. Both backends also receive
   the token-bearing `$INTENDANT_MCP_URL` for `ctl` through their private
   environment, plus `$INTENDANT`/`INTENDANT_SESSION_ID`; no bearer value rides
-  either process's argv. Claude's first-prompt bootstrap addendum names the
-  bootstrap tools and the `ctl` discovery flow.
+  either process's argv. Nothing is appended to Claude's prompts: capability
+  teaching comes from the machine-wide skill catalog and the MCP server's
+  self-describing schemas. (Historical transcripts predating that carry the
+  retired first-prompt bootstrap addendum; the transcript/title strip sites
+  keyed on `CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER` serve them forever.)
 
   For dashboard/browser validation against an already-running Intendant web port,
   managed agents should use the repository helper instead of generating ad-hoc
@@ -780,11 +783,10 @@ The Intendant MCP server is passed **inline** as a JSON string to
 `tool_profile=core` but no token; the Authorization header expands
 `${INTENDANT_MCP_BEARER_TOKEN}` from the child environment. The child also gets
 the token-bearing `INTENDANT_MCP_URL` plus `$INTENDANT` and
-`INTENDANT_SESSION_ID` so `"$INTENDANT" ctl ...` works from its shell. The
-first user message carries a
-bootstrap addendum naming the MCP bootstrap tools
-(`read_screen`/`take_screenshot`/`execute_cu_actions`, shared-view), the lazy
-`ctl --help` discovery flow, and the dashboard-validation helper.
+`INTENDANT_SESSION_ID` so `"$INTENDANT" ctl ...` works from its shell. User
+messages are sent as written — capability discovery rides the materialized
+skill catalog and the MCP bootstrap set's own schemas, never a prompt
+injection.
 `--permission-mode` is always passed explicitly (normalized; `manual` and
 empty map to `default`): when the flag is omitted the CLI resolves its
 default from the user's own `~/.claude/settings.json`
