@@ -2216,8 +2216,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     } else {
                         None
                     };
-                    if public_lease_ws && hosted_ws_authority.is_none() && !admitted_relay_peer_ws
-                    {
+                    if public_lease_ws && hosted_ws_authority.is_none() && !admitted_relay_peer_ws {
                         use tokio::io::AsyncWriteExt;
                         let error = if custom_domain_selected {
                             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
@@ -4466,8 +4465,7 @@ mod tests {
         let gw = spawn_relay_ingress_test_gateway_with_peer_auth(WebGatewayConfig::default()).await;
         let identity =
             crate::access::certs::issue_client_identity(gw.access_dir(), "peer-daemon").unwrap();
-        let fingerprint =
-            crate::peer::access_policy::fingerprint_pem(&identity.cert_pem).unwrap();
+        let fingerprint = crate::peer::access_policy::fingerprint_pem(&identity.cert_pem).unwrap();
         crate::peer::access_policy::write_approved_identity(
             gw.access_dir(),
             &fingerprint,
@@ -4494,7 +4492,8 @@ mod tests {
         )
         .await;
         assert!(
-            with_identity.starts_with("HTTP/1.1 403") && with_identity.contains(DISCOVERY_ONLY_REFUSAL),
+            with_identity.starts_with("HTTP/1.1 403")
+                && with_identity.contains(DISCOVERY_ONLY_REFUSAL),
             "key off: an active peer identity must not move the relay refusal: {with_identity}"
         );
         assert_eq!(
@@ -4699,8 +4698,7 @@ mod tests {
         // Revoked record: refused at resolution, on both lanes.
         let revoked =
             crate::access::certs::issue_client_identity(gw.access_dir(), "revoked-peer").unwrap();
-        let revoked_fp =
-            crate::peer::access_policy::fingerprint_pem(&revoked.cert_pem).unwrap();
+        let revoked_fp = crate::peer::access_policy::fingerprint_pem(&revoked.cert_pem).unwrap();
         crate::peer::access_policy::write_approved_identity(
             gw.access_dir(),
             &revoked_fp,
@@ -4728,8 +4726,7 @@ mod tests {
         // Expired record: same fate.
         let expired =
             crate::access::certs::issue_client_identity(gw.access_dir(), "expired-peer").unwrap();
-        let expired_fp =
-            crate::peer::access_policy::fingerprint_pem(&expired.cert_pem).unwrap();
+        let expired_fp = crate::peer::access_policy::fingerprint_pem(&expired.cert_pem).unwrap();
         crate::peer::access_policy::write_approved_identity_expiring(
             gw.access_dir(),
             &expired_fp,

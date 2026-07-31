@@ -797,7 +797,11 @@ mod tests {
                     delay >= KEEPALIVE_BASE && delay <= ceiling,
                     "seed {seed} tick {tick}: {delay:?} outside [{KEEPALIVE_BASE:?}, {ceiling:?}]"
                 );
-                assert_eq!(delay, keepalive_delay(seed, tick), "jitter must be deterministic");
+                assert_eq!(
+                    delay,
+                    keepalive_delay(seed, tick),
+                    "jitter must be deterministic"
+                );
             }
         }
     }
@@ -837,10 +841,7 @@ mod tests {
                 Err(PeerError::NotConnected)
             }
             async fn keepalive(&mut self) -> Result<(), PeerError> {
-                let count = self
-                    .pings
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    + 1;
+                let count = self.pings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 if count >= self.fail_on {
                     Err(PeerError::Transport("wire gone".into()))
                 } else {

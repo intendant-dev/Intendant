@@ -2157,8 +2157,7 @@ mod tests {
         assert!(!ConnectConfig::default().relay_peer_admission);
         let empty: ProjectConfig = toml::from_str("[connect]\nenabled = true\n").unwrap();
         assert!(!empty.connect.relay_peer_admission);
-        let on: ProjectConfig =
-            toml::from_str("[connect]\nrelay_peer_admission = true\n").unwrap();
+        let on: ProjectConfig = toml::from_str("[connect]\nrelay_peer_admission = true\n").unwrap();
         assert!(on.connect.relay_peer_admission);
 
         let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
