@@ -5450,6 +5450,334 @@ mod tests {
         assert_eq!(reopened.item(&id).unwrap(), before);
     }
 
+    fn propose_one_shot(id: &str) -> AgendaCommand {
+        AgendaCommand::ProposeEffect {
+            binding_refs: Vec::new(),
+            id: id.to_string(),
+            goal: "run the sweep and report".into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            interactive: None,
+            recurrence: None,
+            agent_config: None,
+            source: None,
+            trigger: None,
+            project_root: None,
+        }
+    }
+
+    fn session_actor() -> Option<AgendaActor> {
+        Some(AgendaActor {
+            principal: Some("principal:test:agent".into()),
+            session_id: Some("sess-w1".into()),
+            kind: Some("agent_session".into()),
+        })
+    }
+
+    /// Withdrawing a pending never-fired proposal clears the effects
+    /// view (the op log keeps the proposal's history), records the act
+    /// attributed in the item thread with its reason, and an ordinary
+    /// re-propose re-opens the lane. Replay converges over the new op.
+    #[test]
+    fn withdraw_clears_a_pending_unapproved_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("mooted plan"), owner(), 1000)
+            .unwrap()
+            .id;
+
+        // Nothing to withdraw yet, named.
+        let err = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: None,
+                    source: None,
+                },
+                session_actor(),
+                1001,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no proposed scheduled session"));
+
+        store
+            .apply_command(propose_one_shot(&id), session_actor(), 1002)
+            .unwrap();
+        let item = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: Some("  superseded by the rewrite  ".into()),
+                    source: None,
+                },
+                session_actor(),
+                1003,
+            )
+            .unwrap();
+        // The pending effect is gone; the thread carries the attributed
+        // act with the trimmed reason.
+        assert!(item.effects.is_empty());
+        assert_eq!(item.updated_ms, 1003);
+        let note = item.annotations.last().unwrap();
+        assert_eq!(
+            note.text,
+            "withdrew the scheduled-session proposal — superseded by the rewrite"
+        );
+        assert_eq!(note.kind.as_deref(), Some("agent_session"));
+        assert_eq!(note.session_id.as_deref(), Some("sess-w1"));
+
+        // The log recorded the attributed op with its reason.
+        let page = store.read_ops(0, None, AGENDA_OPS_DEFAULT_LIMIT).unwrap();
+        let withdraw = page
+            .ops
+            .iter()
+            .filter_map(|entry| entry.get("op"))
+            .find(|op| op["op"]["type"] == "withdraw_effect")
+            .expect("withdraw op in the log");
+        assert_eq!(withdraw["op"]["reason"], "superseded by the rewrite");
+        assert_eq!(withdraw["actor"]["session_id"], "sess-w1");
+
+        // Withdrawing again: nothing pends, named.
+        let err = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: None,
+                    source: None,
+                },
+                session_actor(),
+                1004,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no proposed scheduled session"));
+
+        // An ordinary re-propose re-opens the lane.
+        let item = store
+            .apply_command(propose_one_shot(&id), session_actor(), 1005)
+            .unwrap();
+        assert_eq!(item.effects.len(), 1);
+        assert!(item.effects[0].approval.is_none());
+        assert!(item.effects[0].withdrawn.is_none());
+
+        // Replay converges (fold/rebuild idempotence over the new op).
+        let before = store.item(&id).unwrap();
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.item(&id).unwrap(), before);
+    }
+
+    /// The approved side is the owner's revoke, never withdraw: the
+    /// refusal names revoke-schedule and the approval stands untouched.
+    #[test]
+    fn withdraw_of_an_approved_manifest_refuses_with_the_revoke_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("armed plan"), owner(), 1000)
+            .unwrap()
+            .id;
+        let proposed = store
+            .apply_command(propose_one_shot(&id), session_actor(), 1001)
+            .unwrap();
+        let digest = proposed.effects[0].digest.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest,
+                },
+                owner_kind(),
+                1002,
+            )
+            .unwrap();
+
+        let err = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: Some("too late".into()),
+                    source: None,
+                },
+                session_actor(),
+                1003,
+            )
+            .unwrap_err();
+        assert!(matches!(err, AgendaError::Transition(_)));
+        assert!(
+            err.to_string().contains("revoke-schedule"),
+            "refusal points at the owner's revoke: {err}"
+        );
+        let item = store.item(&id).unwrap();
+        assert!(item.effects[0].approval.is_some());
+        assert!(item.effects[0].withdrawn.is_none());
+    }
+
+    /// The RC re-propose race specimen: an item whose lineage FIRED
+    /// (occurrence settled + attested) carries an inert unapproved
+    /// revision. Withdrawing it keeps the entry — manifest, last_run,
+    /// attestation, streak — marked withdrawn; approve refuses with the
+    /// re-propose pointer; a fresh propose revives the same lineage.
+    #[test]
+    fn withdraw_preserves_fired_history_on_a_revised_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("raced item"), owner(), 1000)
+            .unwrap()
+            .id;
+        let proposed = store
+            .apply_command(propose_one_shot(&id), session_actor(), 1001)
+            .unwrap();
+        let digest = proposed.effects[0].digest.clone();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest,
+                },
+                owner_kind(),
+                1002,
+            )
+            .unwrap();
+        // The occurrence fires; mid-flight a re-propose revises the
+        // manifest (approval void, started run carried) — the race.
+        store
+            .record_occurrence(
+                OccurrenceWriteBack {
+                    item_id: &id,
+                    effect_id: &effect_id,
+                    occurrence_id: "occ-race",
+                    state: "started",
+                    session_id: Some("sess-run".into()),
+                    note: None,
+                },
+                2001,
+            )
+            .unwrap();
+        let revised = store
+            .apply_command(propose_one_shot(&id), session_actor(), 2002)
+            .unwrap();
+        assert_eq!(revised.effects[0].effect_id, effect_id, "stable lineage");
+        assert!(revised.effects[0].approval.is_none());
+        assert_eq!(
+            revised.effects[0].last_run.as_ref().unwrap().state,
+            "started",
+            "in-flight run carried across the revision"
+        );
+        // The run settles and self-reports onto the revised entry.
+        store
+            .record_occurrence(
+                OccurrenceWriteBack {
+                    item_id: &id,
+                    effect_id: &effect_id,
+                    occurrence_id: "occ-race",
+                    state: "completed",
+                    session_id: Some("sess-run".into()),
+                    note: Some("done".into()),
+                },
+                2003,
+            )
+            .unwrap();
+        store
+            .apply_command(
+                AgendaCommand::Attest {
+                    id: id.clone(),
+                    occurrence: "occ-race".into(),
+                    outcome: super::super::types::AttestationOutcome::Achieved,
+                    note: Some("landed".into()),
+                    refs: Vec::new(),
+                    source: None,
+                },
+                Some(AgendaActor {
+                    principal: None,
+                    session_id: Some("sess-run".into()),
+                    kind: Some("agent_session".into()),
+                }),
+                2004,
+            )
+            .unwrap();
+
+        // Withdraw the inert revision.
+        let item = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: Some("work already landed".into()),
+                    source: None,
+                },
+                session_actor(),
+                2005,
+            )
+            .unwrap();
+        // Fired history untouched: the entry stays with its manifest,
+        // settled run, and attestation — marked withdrawn, attributed.
+        assert_eq!(item.effects.len(), 1);
+        let effect = &item.effects[0];
+        assert_eq!(effect.effect_id, effect_id);
+        let withdrawn = effect.withdrawn.as_ref().unwrap();
+        assert_eq!(withdrawn.at_ms, 2005);
+        assert_eq!(withdrawn.kind.as_deref(), Some("agent_session"));
+        assert_eq!(withdrawn.reason.as_deref(), Some("work already landed"));
+        let run = effect.last_run.as_ref().unwrap();
+        assert_eq!(run.occurrence_id, "occ-race");
+        assert_eq!(run.state, "completed");
+        assert_eq!(
+            run.attestation.as_ref().unwrap().outcome,
+            super::super::types::AttestationOutcome::Achieved
+        );
+        assert_eq!(
+            item.annotations.last().unwrap().text,
+            "withdrew the scheduled-session proposal — work already landed"
+        );
+
+        // A withdrawn husk is never approvable; the refusal names the
+        // lane back.
+        let err = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: item.effects[0].digest.clone(),
+                },
+                owner_kind(),
+                2006,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("withdrawn"));
+        assert!(err.to_string().contains("propose a fresh manifest"));
+        // Double-withdraw refuses, named.
+        let err = store
+            .apply_command(
+                AgendaCommand::WithdrawEffect {
+                    id: id.clone(),
+                    reason: None,
+                    source: None,
+                },
+                session_actor(),
+                2007,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("already withdrawn"));
+
+        // A fresh propose revives the SAME lineage: withdrawn cleared,
+        // pending again (settled outcome cleared by the standing
+        // re-propose semantics, not by the withdraw).
+        let item = store
+            .apply_command(propose_one_shot(&id), session_actor(), 2008)
+            .unwrap();
+        assert_eq!(item.effects[0].effect_id, effect_id);
+        assert!(item.effects[0].withdrawn.is_none());
+        assert!(item.effects[0].approval.is_none());
+
+        // Replay converges over the whole history.
+        let before = store.item(&id).unwrap();
+        let mut reopened = AgendaStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.item(&id).unwrap(), before);
+    }
+
     /// Start-now beside a standing approval fires the approved digest
     /// (request_occurrence) instead of revising it; explicit overrides
     /// are a named refusal pointing at the honest revise path; a one-shot

@@ -2316,7 +2316,9 @@ pub(crate) fn apply_op(
                 return Some(format!("withdraw_effect for unknown {id} ignored"));
             };
             let Some(pos) = item.effects.iter().position(|e| e.effect_id == *effect_id) else {
-                return Some(format!("withdraw_effect for unknown effect on {id} ignored"));
+                return Some(format!(
+                    "withdraw_effect for unknown effect on {id} ignored"
+                ));
             };
             // Intake refuses this; a foreign log's line must not eat an
             // approval the owner granted (withdraw is the unapproved
@@ -3167,6 +3169,113 @@ mod tests {
         assert!(apply_op(&mut items, &rec(5, AgendaOp::Complete { id: "a".into() })).is_some());
         assert_eq!(items["a"].status, AgendaStatus::Retired);
         assert_eq!(items["a"].updated_ms, 4);
+    }
+
+    /// The withdraw fold's own guards: an approved effect is never eaten
+    /// by a foreign log's withdraw line (warn-ignored, approval intact);
+    /// a never-fired withdraw removes the entry and threads the reason;
+    /// and the additive `withdrawn` field is skip-serialized, so the
+    /// effect DTO stays byte-identical while absent.
+    #[test]
+    fn withdraw_fold_guards_and_dto_bytes() {
+        let manifest = SessionManifest {
+            binding_refs: Vec::new(),
+            goal: "sweep".into(),
+            fire_at_ms: 1000,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            recurrence: None,
+            trigger: None,
+        };
+        let mut items = BTreeMap::new();
+        apply_op(&mut items, &rec(1, add("a", "t")));
+        apply_op(
+            &mut items,
+            &rec(
+                2,
+                AgendaOp::ProposeEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                    manifest: manifest.clone(),
+                },
+            ),
+        );
+        // Absent-withdrawn DTO bytes carry no key (additive field).
+        let dto = serde_json::to_string(&items["a"].effects[0]).unwrap();
+        assert!(!dto.contains("withdrawn"));
+        let digest = items["a"].effects[0].digest.clone();
+        apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::ApproveEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                    digest,
+                },
+            ),
+        );
+        // Approved: the foreign withdraw line warns and changes nothing.
+        let warn = apply_op(
+            &mut items,
+            &rec(
+                4,
+                AgendaOp::WithdrawEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                    reason: Some("hostile line".into()),
+                },
+            ),
+        );
+        assert!(warn.is_some());
+        assert!(items["a"].effects[0].approval.is_some());
+        assert!(items["a"].effects[0].withdrawn.is_none());
+        assert!(items["a"].annotations.is_empty());
+        assert_eq!(items["a"].updated_ms, 3);
+        // Unapproved and never fired: the entry leaves the view and the
+        // thread records the act.
+        apply_op(
+            &mut items,
+            &rec(
+                5,
+                AgendaOp::RevokeEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                },
+            ),
+        );
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                6,
+                AgendaOp::WithdrawEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                    reason: None,
+                },
+            ),
+        )
+        .is_none());
+        assert!(items["a"].effects.is_empty());
+        assert_eq!(
+            items["a"].annotations.last().unwrap().text,
+            "withdrew the scheduled-session proposal"
+        );
+        // Unknown effect afterwards: warn, not a crash.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::WithdrawEffect {
+                    id: "a".into(),
+                    effect_id: "ef-1".into(),
+                    reason: None,
+                },
+            ),
+        )
+        .is_some());
     }
 
     #[test]

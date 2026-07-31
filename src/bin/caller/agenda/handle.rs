@@ -1082,8 +1082,8 @@ impl AgendaHandle {
                 // A withdrawn husk offers no Approve/re-arm affordance —
                 // it is never approvable, so it gets no fireability stamp
                 // (the serving decoration reflects no-pending-effect).
-                let approvable = (effect.approval.is_none() || effect.suspended())
-                    && effect.withdrawn.is_none();
+                let approvable =
+                    (effect.approval.is_none() || effect.suspended()) && effect.withdrawn.is_none();
                 if !approvable {
                     continue;
                 }
@@ -2233,6 +2233,66 @@ mod tests {
             )
             .unwrap();
         assert!(revoked.effects[0].approval.is_none());
+    }
+
+    /// Withdraw's tenant-edge actor gate mirrors ProposeEffect's exactly
+    /// (the soundness argument: any actor who may propose may already
+    /// replace the pending bytes wholesale — withdraw grants strictly
+    /// less). Every actor class that may propose may withdraw, owner
+    /// surfaces included; nothing about withdraw is owner-surface.
+    #[test]
+    fn withdraw_actor_gate_mirrors_propose() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "raced proposal".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                actor("agent_session", Some("sess-w7")),
+            )
+            .unwrap();
+        let propose = || AgendaCommand::ProposeEffect {
+            binding_refs: Vec::new(),
+            recurrence: None,
+            id: item.id.clone(),
+            goal: "run the sweep".into(),
+            fire_at_ms: 4_000_000_000_000,
+            orchestrate: false,
+            interactive: None,
+            agent_config: None,
+            source: None,
+            trigger: None,
+            project_root: None,
+        };
+        let withdraw = || AgendaCommand::WithdrawEffect {
+            id: item.id.clone(),
+            reason: None,
+            source: None,
+        };
+        // Actor-gate parity, exercised end to end: whoever's propose
+        // lands, their withdraw lands too — the same non-owner-surface
+        // lane, unattributed callers included (strictness beyond the
+        // gate would show up as a non-Transition refusal here).
+        for who in [
+            actor("agent_session", Some("sess-w7")),
+            actor("peer", None),
+            actor("dashboard", None),
+            actor("local_process", None),
+            None,
+        ] {
+            handle.apply(propose(), who.clone()).unwrap();
+            let withdrawn = handle.apply(withdraw(), who).unwrap();
+            assert!(withdrawn.effects.is_empty());
+        }
     }
 
     fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> Vec<AppEvent> {

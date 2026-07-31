@@ -1593,7 +1593,8 @@ mod tests {
                     "revoke_effect",
                     "set_blocker",
                     "stamp",
-                    "start_now"
+                    "start_now",
+                    "withdraw_effect"
                 ],
                 "agenda_op's served oneOf must keep the full AgendaCommand vocabulary"
             );
