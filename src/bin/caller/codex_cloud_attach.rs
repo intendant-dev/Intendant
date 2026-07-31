@@ -418,6 +418,7 @@ const WORKER_REPLY_KINDS: &[&str] = &[
     "display_closed",
     "display_error",
     "cu_result",
+    crate::remote_compute::REMOTE_COMMAND_RESULT_KIND,
 ];
 
 /// Host-id prefix that routes a dashboard terminal frame to a connected
@@ -923,6 +924,9 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     let terminal_registry = crate::terminal::TerminalRegistry::new(
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
+    let remote_commands = crate::remote_compute::WorkerRemoteCommands::new(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )?;
     // Same lifetime rule as the registry: the display session (and any
     // worker-launched Xvfb) survives reconnects; per-viewer stream state
     // dies with each socket.
@@ -935,9 +939,15 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
             &identity,
             &task,
             &terminal_registry,
+            &remote_commands,
             &mut display_state,
         )
         .await;
+        // A command whose control socket disappeared is no longer an
+        // accountable remote job. Kill it and let home report detachment;
+        // callers may retry against the next attachment with the same
+        // revision/cache inputs.
+        remote_commands.cancel_all().await;
         // The per-viewer display half is socket-scoped: the pump and
         // stream unwind on their own when the socket's channels close,
         // and this reset clears the handles so the next open starts
@@ -1277,6 +1287,7 @@ async fn hold_attachment(
     identity: &crate::peer::transport::tls_client::ClientIdentityPaths,
     task: &str,
     registry: &crate::terminal::TerminalRegistry,
+    remote_commands: &crate::remote_compute::WorkerRemoteCommands,
     display: &mut WorkerDisplayState,
 ) -> Result<(), String> {
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -1324,7 +1335,14 @@ async fn hold_attachment(
                 Some(Ok(message)) if message.is_close() => break,
                 Some(Ok(message)) => {
                     if let Ok(text) = message.into_text() {
-                        serve_worker_frame(registry, text.as_str(), &out_tx, &mut forwarders, display).await;
+                        serve_worker_frame(
+                            registry,
+                            remote_commands,
+                            text.as_str(),
+                            &out_tx,
+                            &mut forwarders,
+                            display,
+                        ).await;
                     }
                 }
                 Some(Err(error)) => return Err(format!("attachment socket: {error}")),
@@ -1350,6 +1368,7 @@ async fn hold_attachment(
 /// (or the identity expiry) tears the whole process down.
 async fn serve_worker_frame(
     registry: &crate::terminal::TerminalRegistry,
+    remote_commands: &crate::remote_compute::WorkerRemoteCommands,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
     forwarders: &mut std::collections::HashMap<
@@ -1382,6 +1401,10 @@ async fn serve_worker_frame(
         }
         value.to_string()
     };
+
+    if remote_commands.serve_frame(&frame, out_tx, &host_id).await {
+        return;
+    }
 
     // Display frames carry no terminal_id and no registry key.
     match kind.as_str() {
@@ -1774,12 +1797,19 @@ mod tests {
             r#"{"t":"display_tiles","host_id":"cloud:x","data":"aGk="}"#,
         );
         assert!(rx.try_recv().is_ok());
+        route_worker_frame(
+            &tx,
+            r#"{"t":"remote_command_result","host_id":"cloud:x","id":"remote-1","result":{"state":"succeeded","exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"duration_ms":1}}"#,
+        );
+        assert!(rx.try_recv().is_ok());
         // The worker cannot inject request kinds, hellos, or junk into
         // home — its inbound authority stays nothing.
         for dropped in [
             r#"{"t":"terminal_open","host_id":"cloud:x","terminal_id":"shell-0"}"#,
             r#"{"t":"display_open","host_id":"cloud:x"}"#,
             r#"{"t":"display_input","host_id":"cloud:x","event":{"t":"mm","x":0.1,"y":0.1}}"#,
+            r#"{"t":"remote_command_start","host_id":"cloud:x","id":"remote-1"}"#,
+            r#"{"t":"remote_command_cancel","host_id":"cloud:x","id":"remote-1"}"#,
             r#"{"v":2,"kind":"cloud-worker-hello","task_id":"x"}"#,
             r#"{"t":"api_sessions"}"#,
             "not json",
@@ -1801,6 +1831,8 @@ mod tests {
         session.start(10, None, None).await.expect("session starts");
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::terminal::TerminalRegistry::new(dir.path().to_path_buf());
+        let remote_commands =
+            crate::remote_compute::WorkerRemoteCommands::new(dir.path().to_path_buf()).unwrap();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(1024);
         let mut forwarders = std::collections::HashMap::new();
         let mut display = WorkerDisplayState {
@@ -1809,7 +1841,15 @@ mod tests {
         };
 
         let open = r#"{"t":"display_open","host_id":"cloud:t"}"#;
-        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
+        serve_worker_frame(
+            &registry,
+            &remote_commands,
+            open,
+            &out_tx,
+            &mut forwarders,
+            &mut display,
+        )
+        .await;
         let opened = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
             .await
             .expect("opened within deadline")
@@ -1835,10 +1875,26 @@ mod tests {
             .is_some_and(|data| !data.is_empty()));
 
         let input = r#"{"t":"display_input","host_id":"cloud:t","display_id":0,"event":{"t":"mm","x":0.5,"y":0.5}}"#;
-        serve_worker_frame(&registry, input, &out_tx, &mut forwarders, &mut display).await;
+        serve_worker_frame(
+            &registry,
+            &remote_commands,
+            input,
+            &out_tx,
+            &mut forwarders,
+            &mut display,
+        )
+        .await;
 
         let close = r#"{"t":"display_close","host_id":"cloud:t"}"#;
-        serve_worker_frame(&registry, close, &out_tx, &mut forwarders, &mut display).await;
+        serve_worker_frame(
+            &registry,
+            &remote_commands,
+            close,
+            &out_tx,
+            &mut forwarders,
+            &mut display,
+        )
+        .await;
         assert!(display.stream.is_none() && display.pump.is_none());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_closed = false;
@@ -1985,11 +2041,21 @@ mod tests {
     async fn reopening_a_worker_terminal_replaces_its_forwarder() {
         let dir = tempfile::tempdir().unwrap();
         let registry = crate::terminal::TerminalRegistry::new(dir.path().to_path_buf());
+        let remote_commands =
+            crate::remote_compute::WorkerRemoteCommands::new(dir.path().to_path_buf()).unwrap();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
         let mut forwarders = std::collections::HashMap::new();
         let open = r#"{"t":"terminal_open","host_id":"cloud:t","terminal_id":"shell-0","cols":80,"rows":24}"#;
         let mut display = WorkerDisplayState::default();
-        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
+        serve_worker_frame(
+            &registry,
+            &remote_commands,
+            open,
+            &out_tx,
+            &mut forwarders,
+            &mut display,
+        )
+        .await;
         assert_eq!(forwarders.len(), 1);
         let first = out_rx.recv().await.expect("first opened reply");
         assert!(first.contains("terminal_opened"), "{first}");
@@ -2001,7 +2067,15 @@ mod tests {
         // A second open for the same key attaches the surviving PTY and
         // must replace the listener, never stack a second one (stacked
         // listeners double every output chunk on the dashboard).
-        serve_worker_frame(&registry, open, &out_tx, &mut forwarders, &mut display).await;
+        serve_worker_frame(
+            &registry,
+            &remote_commands,
+            open,
+            &out_tx,
+            &mut forwarders,
+            &mut display,
+        )
+        .await;
         assert_eq!(forwarders.len(), 1);
         let second = out_rx.recv().await.expect("second opened reply");
         assert!(second.contains("terminal_opened"), "{second}");

@@ -1071,6 +1071,11 @@ html.ui-v2 .ag2-graph-projchip:disabled {
   opacity: 0.45;
   cursor: default;
 }
+html.ui-v2 .ag2-graph-projdiv {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
 html.ui-v2 .ag2-graph-panel.fullscreen {
   position: fixed;
   inset: 0;

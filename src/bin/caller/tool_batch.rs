@@ -149,6 +149,9 @@ pub struct ToolBatchResult {
     /// Workflow-checkpoint calls (coordination files, §9 v0).
     /// Vec of (call_id, args).
     pub workflow_checkpoints: Vec<(String, serde_json::Value)>,
+    /// Provider-neutral remote command job operations.
+    /// Vec of (call_id, args).
+    pub remote_command_calls: Vec<(String, serde_json::Value)>,
     /// Sub-agent spawn requests extracted from spawn_sub_agent tool calls.
     /// Vec of (call_id, args).
     pub sub_agent_spawns: Vec<(String, serde_json::Value)>,
@@ -176,6 +179,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut peer_calls = Vec::new();
     let mut live_audio_spawns = Vec::new();
     let mut workflow_checkpoints = Vec::new();
+    let mut remote_command_calls = Vec::new();
     let mut sub_agent_spawns = Vec::new();
     let mut sub_agent_waits = Vec::new();
     let mut sub_agent_results = Vec::new();
@@ -228,6 +232,11 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                 let args =
                     serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
                 workflow_checkpoints.push((tc.call_id.clone(), args));
+            }
+            "remote_command" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                remote_command_calls.push((tc.call_id.clone(), args));
             }
             "spawn_sub_agent" => {
                 let args =
@@ -310,6 +319,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         peer_calls,
         live_audio_spawns,
         workflow_checkpoints,
+        remote_command_calls,
         sub_agent_spawns,
         sub_agent_waits,
         sub_agent_results,
@@ -583,6 +593,24 @@ mod tests {
         assert!(
             result.agent_input_json.is_none(),
             "shared_view is caller-handled and must not reach the runtime"
+        );
+    }
+
+    #[test]
+    fn assemble_batch_keeps_remote_commands_out_of_the_local_runtime() {
+        let calls = vec![provider::ToolCall {
+            id: "call_remote".to_string(),
+            call_id: "call_remote".to_string(),
+            name: "remote_command".to_string(),
+            arguments: r#"{"op":"start","host":"cloud:task-1","argv":["cargo","check"],"expected_revision":"0123456"}"#.to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert_eq!(result.remote_command_calls.len(), 1);
+        assert_eq!(result.remote_command_calls[0].0, "call_remote");
+        assert_eq!(result.remote_command_calls[0].1["op"], "start");
+        assert!(
+            result.agent_input_json.is_none(),
+            "remote commands are controller-handled and must not execute on the local runtime"
         );
     }
 }

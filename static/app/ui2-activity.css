@@ -237,6 +237,41 @@ html.ui-v2 #activity-subtabs .ui2-arrange-btn[aria-expanded="true"] svg { transf
 html.ui-v2 #activity-subtabs .ui2-arrange-btn[hidden],
 html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-arrange-btn { display: none; }
 
+/* Closable-at-a-glance chip — sibling styling to Arrange. The count is
+   the machine-positive closable set; the pressed state engages the lens
+   (the window dim itself lives with the .session-window rules in
+   12-styles-tasks-log.css, keyed on the html attribute the toggle
+   stamps). Hidden at zero by ui2-activity.js, grid-only like every
+   window tool. */
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn .ui2-closable-lens-count {
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: color-mix(in srgb, var(--green) 45%, var(--line));
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-closable-lens-btn { display: none; }
+
 /* The Arrange menu popover: same mechanics as the Options popover below
    (display:none base, .open shows, position:fixed against the subtab
    row's overflow-x clipping, JS stamps top/right from the trigger). The

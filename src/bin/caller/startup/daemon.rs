@@ -277,6 +277,7 @@ pub(crate) async fn run_daemon(
             readopt_bus,
             readopt_handover,
             readopt_enabled,
+            crate::boot_readopt::READOPT_DISPATCH_SPACING,
         ));
     }
     let _ = supervisor_handle.await;

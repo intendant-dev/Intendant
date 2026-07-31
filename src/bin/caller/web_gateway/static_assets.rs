@@ -2077,4 +2077,31 @@ mod tests {
         assert!(APP_HTML
             .contains("Idle · no agenda-owed work — stopping loses only this session’s context"));
     }
+
+    /// The closable-at-a-glance lens (Track AO follow-through) stays a
+    /// POSITIVE-only composition of already-ruled claims: the served
+    /// stop derivation vetoes by name, settled turns positive only once
+    /// the window is quiet, a linked-but-unclaimed occurrence claims
+    /// nothing, the chip ships hidden (never "0 closable"), the dim keys
+    /// on the html attribute the toggle stamps, an emptied count
+    /// disengages the lens instead of stranding a fully-dimmed grid, and
+    /// the per-window class derives in the same single pass as the count
+    /// so the two can never disagree. The × affordance's ruled copy is
+    /// pinned above (`attestation_chips_follow_the_labeling_law`) — the
+    /// lens adds a glance layer without rewriting those claims.
+    #[test]
+    fn closable_lens_is_positive_only() {
+        assert!(APP_HTML
+            .contains("if (stop === 'kills_live_run' || stop === 'owed_work') return false;"));
+        assert!(APP_HTML.contains("if (stop === 'settled') return quiet;"));
+        assert!(APP_HTML.contains("if (stop || claim.linked) return false;"));
+        assert!(APP_HTML.contains("id=\"ui2-closable-lens-btn\" hidden"));
+        assert!(APP_HTML.contains(
+            "html[data-ui2-closable-lens=\"on\"] .session-window:not(.session-window-closable)"
+        ));
+        assert!(
+            APP_HTML.contains("if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);")
+        );
+        assert!(APP_HTML.contains("win.el.classList.toggle('session-window-closable', closable)"));
+    }
 }
