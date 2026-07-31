@@ -7526,7 +7526,10 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
         .expect("shortlog rides the dev check");
     assert_eq!(shortlog.len(), 1, "{body}");
     assert!(
-        shortlog[0].as_str().unwrap_or_default().contains("commit B"),
+        shortlog[0]
+            .as_str()
+            .unwrap_or_default()
+            .contains("commit B"),
         "the shortlog carries the behind commit's subject: {body}"
     );
     assert_eq!(

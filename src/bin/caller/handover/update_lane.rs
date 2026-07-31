@@ -1671,13 +1671,8 @@ mod tests {
         );
         assert!(!check.dirty, "untracked files are not dirtiness");
 
-        let capped = fold_source_check(
-            "abcdef012345",
-            "500\n",
-            "",
-            "?? target/\n M src/main.rs\n",
-        )
-        .unwrap();
+        let capped =
+            fold_source_check("abcdef012345", "500\n", "", "?? target/\n M src/main.rs\n").unwrap();
         assert_eq!(capped.behind, BEHIND_COUNT_CAP);
         assert!(capped.behind_capped, "cap reached reads as 500+");
         assert!(capped.dirty, "a tracked modification is");
@@ -1719,7 +1714,10 @@ mod tests {
         let catalog = channel_catalog(&source, true);
         assert_eq!(catalog["dev"]["check"], true);
         assert_eq!(catalog["dev"]["produce"], true);
-        assert_eq!(catalog["releases"]["check"], true, "release data is honest anywhere");
+        assert_eq!(
+            catalog["releases"]["check"], true,
+            "release data is honest anywhere"
+        );
         assert_eq!(catalog["releases"]["produce"], false);
         assert!(
             catalog["releases"]["reason"]
@@ -1760,7 +1758,10 @@ mod tests {
         assert_eq!(catalog["releases"]["produce"], false);
         assert_eq!(catalog["dev"]["produce"], false);
         assert!(
-            catalog["dev"]["reason"].as_str().unwrap().contains("stray binary"),
+            catalog["dev"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("stray binary"),
             "{catalog}"
         );
     }
@@ -2113,9 +2114,7 @@ mod tests {
             !lane.job_running.load(Ordering::Acquire),
             "a refused click leaves the single-flight latch free"
         );
-        let refusal = lane
-            .request_check(Some(UpdateChannel::Dev))
-            .unwrap_err();
+        let refusal = lane.request_check(Some(UpdateChannel::Dev)).unwrap_err();
         assert!(
             refusal.contains("no source checkout or app bundle"),
             "a dev check on an unmanaged install refuses with the flavor's reason: {refusal}"

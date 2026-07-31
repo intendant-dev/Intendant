@@ -157,8 +157,7 @@ pub(crate) async fn handle_daemon_update_lane(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response =
-        daemon_update_lane_api_response(produce, &body_text, mcp_server.as_ref()).await;
+    let response = daemon_update_lane_api_response(produce, &body_text, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
