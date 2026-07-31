@@ -580,7 +580,7 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
 /// betrayal would most want to swap.
 pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> {
     let origin = config.public_origin.as_str();
-    let mut artifacts = vec![
+    let artifacts = vec![
         (
             "/".to_string(),
             sha256_hex(landing_ui_html(origin).as_bytes()),
@@ -604,9 +604,6 @@ pub(crate) fn embedded_artifacts(config: &ServiceConfig) -> Vec<ArtifactRecord> 
             sha256_hex(CONNECT_SERVICE_WORKER_JS.as_bytes()),
         ),
     ];
-    for (name, bytes) in LANDING_ASSETS {
-        artifacts.push((format!("/assets/landing/{name}"), sha256_hex(bytes)));
-    }
     artifacts
         .into_iter()
         .map(|(path, sha256)| ArtifactRecord { path, sha256 })
@@ -1752,7 +1749,6 @@ mod tests {
             "/logo.svg",
             "/favicon.png",
             "/sw.js",
-            "/assets/landing/hero.webp",
         ] {
             assert!(paths.contains(&expected), "manifest must cover {expected}");
         }

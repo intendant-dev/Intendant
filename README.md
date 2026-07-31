@@ -20,11 +20,7 @@ Your everyday directory can be a browser tab. Hosted Connect gives any browser z
 
 And it doesn't stop at one box. Daemons federate into fleets, and people and organizations grant other people — and other agents — scoped access to their machines, infrastructure, and resources. Every session's authority is minted by the target machine's own IAM, never by a hosted service. The result is a **network of agentic networks**.
 
-<p align="center">
-  <img src="src/bin/connect/assets/landing-hero.webp" alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing job with an auto-approved command, proposes a diff, waits for an approval-gated run, and reports the verified result." />
-</p>
-
-## A daemon in ninety seconds
+## A daemon in minutes
 
 Stand up a keyless daemon on a fresh box with one command (registration on the hosted rendezvous is invite-only during the alpha; self-hosting is never gated). The installer is a release-pinned GitHub asset — stamped with the release it installs, sha256-committed to a public transparency log, and self-verifying: it announces its release identity at start and fails closed if the tree it fetches doesn't match. Prefer reading before running? Download the same asset, check it against the release's `.sha256`, then run it. (Until the first `v*` release is published, the asset URL 404s — clone and build from a checkout below.)
 
@@ -48,10 +44,6 @@ Add `--connect https://intendant.dev` (`-Connect …` — or your self-hosted re
 
 Connect needs no client software to link a daemon, remember its route, and show fleet presence from any browser. That convenience is deliberately separate from authority: a claim code creates no principal or grant, every hosted-provenance session in the default build is capped at the immutable zero-permission `role:none`, and a fleet-SNI endpoint serves only public shell/discovery bytes. There is no opt-in or ceiling-raising endpoint. Open the daemon from a trusted independently reached direct/mTLS surface to watch displays, send input, annotate, record, or administer access.
 
-<p align="center">
-  <img src="src/bin/connect/assets/landing-video.webp" alt="The dashboard's Video tab streaming a live agent desktop over WebRTC: a browser and a terminal scrolling a build, with view-only, annotate, record, and take-control affordances." />
-</p>
-
 ## Credential custody, with an explicit bridge limit
 
 Intendant implements vault storage, time-boxed leases, and client egress, while
@@ -62,10 +54,6 @@ still supporting ordinary `.env` credentials:
 - **Honest disk boundary** — API-key leases are memory-only, but `.env` remains supported, and full-credential OAuth leases temporarily materialize private auth homes under `<state-root>/leased-auth` (`~/.intendant/leased-auth` by default) until expiry, revocation, shutdown, or startup cleanup.
 
 A deliberately keyless daemon outside an active full-credential OAuth lease can therefore avoid durable provider secrets on disk. That is a configuration property, not an unconditional product guarantee. [How custody works and what is not bridged yet →](https://intendant-dev.github.io/Intendant/credential-custody.html)
-
-<p align="center">
-  <img src="src/bin/connect/assets/landing-vault.webp" alt="The credential vault panel: three credentials with masked secrets, two active leases expiring in 15 minutes, re-fuel buttons, and a client-egress relay option." />
-</p>
 
 ## A network of agentic networks
 
@@ -111,7 +99,7 @@ That is the shape of this system. Agents perform. Orchestrators conduct — the 
 
 **WebRTC display pipeline** — agents see and interact with graphical displays through a custom WebRTC transport (built on rtc-rs): macOS/Linux use a VP8 baseline plus on-demand H264 (VideoToolbox on macOS; NVENC/VA-API with x264 fallback on Linux), while Windows uses one always-on software Media Foundation H264 layer. Tile-based dirty-region streaming, bidirectional clipboard, multi-monitor, and peer-to-peer display sharing run across the same pipeline.
 
-**External-agent orchestration** — supervise Codex, Claude Code, Kimi Code, or Pi inside the same EventBus, approval, display, computer-use, shared-view, session, diff, history/search, usage, and cost surfaces as native agents. Intendant preserves backend differences honestly: Codex adds managed-context rewind and fission; Claude Code exposes stream-json controls and in-band agents; Kimi adds queued steering, undo, `:btw`/swarm agents, goals, and rich live profile control; Pi stays upstream and small, using documented JSONL RPC plus one private fail-closed approval extension. Pi has no built-in MCP or native sub-agents, so scoped platform capabilities are discovered through `$INTENDANT ctl` instead of being mislabeled.
+**External-agent orchestration** — supervise Codex, Claude Code, Kimi Code, or Pi inside the same EventBus, approval, display, computer-use, shared-view, session, diff, history/search, usage, and cost surfaces as native agents. Intendant preserves backend differences honestly: each backend keeps its native powers and its real limits, surfaced through the same supervision plane rather than flattened to a lowest common denominator.
 
 **Persistent daemon** — a control plane supervises many concurrent sessions and is the single writer of shared state; an idle web server runs headless. Federate with peer daemons for multi-host display and capability-based task routing.
 
@@ -123,8 +111,8 @@ Four execution shapes: **Direct** (one native loop), **Orchestrate** (the same l
 
 ## Dependencies
 
-- **Rust 1.96.1**, pinned for the whole workspace by `rust-toolchain.toml` (including rustfmt, clippy, and the WASM target)
-- **wasm-pack 0.14.0**, pinned by `.wasm-pack-version` — `cargo install wasm-pack --version 0.14.0 --locked`
+- **Rust**, pinned for the whole workspace by `rust-toolchain.toml` (including rustfmt, clippy, and the WASM target); rustup picks the pin up automatically
+- **wasm-pack**, pinned by `.wasm-pack-version` — `cargo install wasm-pack --locked --version "$(cat .wasm-pack-version)"`
 - **ffmpeg** — display recording and H264 encoding
 - **macOS**: `./scripts/setup-macos.sh` installs everything (cliclick, ffmpeg, Vortex Audio, wasm-pack, app bundle)
 - **Linux**: `./scripts/setup-linux.sh` installs everything (build-essential/binutils, libvpx, libxcb, xdotool, PipeWire, ffmpeg, PulseAudio, Xvfb)
@@ -133,7 +121,7 @@ Four execution shapes: **Direct** (one native loop), **Orchestrate** (the same l
 
 ## Quick Start
 
-On a fresh box, use the [installer one-liner](#a-daemon-in-ninety-seconds) above. From a checkout:
+On a fresh box, use the [installer one-liner](#a-daemon-in-minutes) above. From a checkout:
 
 ```bash
 cargo build --release
@@ -168,26 +156,9 @@ The full flag reference (providers, models, sandboxing, resume) lives in [Gettin
 
 ## Web Dashboard
 
-The web dashboard is the canonical frontend — on by default (port 8765; `--no-web` disables it), served to any authenticated browser, phone included — with thirteen destinations:
-
-- **Activity** — live Timeline with Focus/Grid session views, context/changes/control panes, approvals, and follow-up input
-- **Sessions** — browse, search, resume, and fork sessions across all backends
-- **Agenda** — park tasks, notes, and durable questions; manage reminders and review digest-bound scheduled-session proposals
-- **Memory** — explicitly search, inspect, and propose provenance-labeled claims, with effective durability shown on every view
-- **Live display** — WebRTC display viewers with remote control, annotations, and recording replay
-- **Station** — the operational-alpha WebGPU mission-control canvas for watching, launching, steering, approving, and administering sessions across the fleet. Its working action UI is currently a 2D HUD over a stylized 3D scene; the immersive in-scene presentation is in progress
-- **Terminal** — embedded xterm.js live shells on this daemon and peers
-- **Files** — editor workbench over local and peer filesystems, IAM-scoped
-- **Usage** — token usage per model with cost estimates and disk usage
-- **Access** — the trust surface for people and devices, peers, and organizations
-- **Vault** — sealed credential storage, leases, fueling, and custody status on authorized surfaces
-- **Settings** — provider/model, autonomy, external-agent backend, approval rules
-- **Debug** — diagnostics and internal state
+The web dashboard is the canonical frontend — on by default (port 8765; `--no-web` disables it), served to any authenticated browser, phone included. It spans live session activity with approvals and steering, session history and search across every backend, the Agenda and Memory planes, live WebRTC displays with remote control and recording, the Station mission-control canvas, embedded terminals and an IAM-scoped file workbench (local and peer), usage and cost, access administration, credential vault surfaces, and settings. The [web dashboard chapter](https://intendant-dev.github.io/Intendant/web-dashboard.html) tracks the current tab set.
 
 Optional **live voice** via Gemini Live or OpenAI Realtime — the browser connects directly to the model's realtime API through WASM with presence tools for approving actions, submitting tasks, and querying status by voice.
-
-Late-connecting browsers receive cached daemon/session state plus a bounded
-recent replay; the Activity hydration path loads older history on demand.
 
 ## Testing
 

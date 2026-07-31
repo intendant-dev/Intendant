@@ -120,44 +120,6 @@ pub(crate) async fn service_worker_js() -> Response {
     (headers, CONNECT_SERVICE_WORKER_JS).into_response()
 }
 
-/// Product screenshots for the landing page, embedded like the installer so
-/// every deployment serves visuals that match its own UI. Captured from a
-/// staged local rig (daemon "atlas", account "@ada") — synthetic content only.
-/// A table rather than a match so the artifact-transparency manifest
-/// (transparency.rs) enumerates exactly what this route serves.
-pub(crate) const LANDING_ASSETS: &[(&str, &[u8])] = &[
-    ("hero.webp", include_bytes!("assets/landing-hero.webp")),
-    ("video.webp", include_bytes!("assets/landing-video.webp")),
-    ("vault.webp", include_bytes!("assets/landing-vault.webp")),
-    (
-        "station.webp",
-        include_bytes!("assets/landing-station.webp"),
-    ),
-    ("claim.webp", include_bytes!("assets/landing-claim.webp")),
-    ("phone.webp", include_bytes!("assets/landing-phone.webp")),
-];
-
-pub(crate) fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
-    LANDING_ASSETS
-        .iter()
-        .find(|(asset_name, _)| *asset_name == name)
-        .map(|(_, bytes)| *bytes)
-}
-
-pub(crate) async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response {
-    match landing_asset_bytes(&name) {
-        Some(bytes) => (
-            [
-                (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, "public, max-age=86400"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
 pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> Response {
     // Filesystem probe (and first-run dir creation) off the async workers:
     // a slow disk must degrade this probe, not the whole runtime.
@@ -571,7 +533,6 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       --accent-ink: #11111b;
       --lavender: #b4befe;
       --ok: #a6e3a1;
-      --warn: #f9e2af;
       --radius: 12px;
       --shadow: 0 18px 50px rgba(0, 0, 0, .35);
     }}
@@ -621,21 +582,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
     .hero h1 em {{ font-style: normal; color: var(--lavender); }}
     .hero p {{ margin: 0 auto 28px; font-size: 17.5px; color: var(--muted); max-width: 680px; }}
     .cta {{ display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }}
-    /* Framed product shots */
-    .heroshot {{ position: relative; margin: 92px 0 0; }}
-    .heroshot::before {{
-      content: ""; position: absolute; inset: -60px 0 auto; height: 340px;
-      background: radial-gradient(640px 260px at 50% 20%, rgba(137, 180, 250, .16), transparent 70%);
-      pointer-events: none;
-    }}
-    .browserframe {{
-      position: relative; background: var(--top); border: 1px solid var(--line-strong);
-      border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;
-    }}
-    .bfbar {{
-      display: flex; align-items: center; gap: 7px; padding: 10px 14px;
-      border-bottom: 1px solid var(--line);
-    }}
+    /* Terminal-bar furniture (the advisor's fake prompt window) */
     .dot {{ width: 10px; height: 10px; border-radius: 50%; }}
     .dot.r {{ background: rgba(243, 139, 168, .75); }}
     .dot.y {{ background: rgba(249, 226, 175, .75); }}
@@ -644,55 +591,10 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       margin-left: 8px; font: 12.5px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       color: var(--muted-2); letter-spacing: .3px;
     }}
-    .browserframe img, .shot img {{ display: block; width: 100%; height: auto; }}
-    .shotcaption {{
-      margin: 14px auto 0; max-width: 740px; text-align: center;
-      font-size: 13.5px; color: var(--muted-2);
-    }}
-    /* The tour: alternating text/screenshot rows */
-    .tour {{ padding: 84px 0 0; }}
-    .trow {{
-      display: grid; grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
-      gap: 48px; align-items: center; padding: 30px 0;
-    }}
-    .trow.rev .txt {{ order: 2; }}
-    .eyebrow {{
-      font-size: 12px; font-weight: 700; letter-spacing: .14em;
-      text-transform: uppercase; color: var(--accent); margin-bottom: 10px;
-    }}
-    .trow h3 {{ margin: 0 0 12px; font-size: 23px; letter-spacing: -.3px; }}
-    .trow .txt p {{ margin: 0; font-size: 15.5px; color: var(--muted); }}
-    .shot {{
-      background: var(--top); border: 1px solid var(--line-strong);
-      border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
-    }}
-    .shotnote {{ margin-top: 10px; font-size: 13px; color: var(--muted-2); }}
-    /* Custody: the two fueling modes, told by what travels */
-    .fuelmap {{ margin-top: 16px; display: grid; gap: 9px; }}
-    .fuelrow {{ display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }}
-    .fueltag {{
-      flex: 0 0 auto; min-width: 96px; text-align: center; padding: 2px 8px;
-      border: 1px solid var(--line-strong); border-radius: 6px;
-      font: 700 10.5px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
-    }}
-    .fuelrow:last-child .fueltag {{ color: var(--ok); }}
-    .fuelflow {{ flex: 1; min-width: 230px; font-size: 13px; color: var(--muted-2); }}
-    .fuelflow em {{ font-style: normal; color: var(--muted); }}
-    .fuelflow .fx {{ opacity: .65; padding: 0 1px; }}
-    /* The phone row: a bezel, not a browser frame */
-    .phonepic {{ display: grid; justify-items: center; }}
-    .phonepic .shotnote {{ text-align: center; }}
-    .phoneframe {{
-      width: min(280px, 72vw); padding: 10px; border-radius: 44px;
-      background: #0d0d15; border: 1px solid var(--line-strong);
-      box-shadow: var(--shadow);
-    }}
-    .phoneframe img {{ display: block; width: 100%; height: auto; border-radius: 34px; }}
     section h2 {{ font-size: 24px; margin: 0 0 20px; letter-spacing: -.3px; }}
     .sectionlede {{ margin: -10px 0 24px; font-size: 15px; color: var(--muted); max-width: 660px; }}
     section.features {{ padding: 78px 0 0; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }}
     .card {{
       border: 1px solid var(--line); border-radius: var(--radius);
       background: var(--surface); padding: 18px 18px 16px;
@@ -746,15 +648,11 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
     footer nav {{ gap: 16px; }}
     @media (max-width: 920px) {{
       .hero {{ padding-top: 46px; }}
-      /* minmax(0, …) everywhere: a bare 1fr keeps the min-content floor and
-         lets wide content (the install one-liner) stretch the page. */
-      .trow {{ grid-template-columns: minmax(0, 1fr); gap: 16px; padding: 24px 0; }}
-      .trow.rev .txt {{ order: 0; }}
-      .tour {{ padding-top: 60px; }}
+      /* minmax(0, …): a bare 1fr keeps the min-content floor and lets
+         wide content (the install one-liner) stretch the page. */
       .igrid {{ grid-template-columns: minmax(0, 1fr); }}
       section.features, .whyname, .trustrow {{ padding-top: 56px; }}
       .install-section {{ padding-top: 36px; }}
-      .heroshot {{ margin-top: 64px; }}
     }}
   </style>
 </head>
@@ -821,131 +719,18 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       </div>
     </section>
 
-    <section class="heroshot">
-      <div class="browserframe">
-        <div class="bfbar">
-          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-          <span class="bftitle">atlas — Intendant dashboard</span>
-        </div>
-        <img src="/assets/landing/hero.webp" width="2200" height="1192" fetchpriority="high"
-             alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing nightly job with an auto-approved tail command, proposes a one-line diff to jobs/rollup.py, waits for an approval-gated backfill run, and reports the verified result.">
-      </div>
-      <p class="shotcaption">
-        The Activity feed on an authorized daemon: autonomy is a dial, approvals
-        are explicit, and every command, diff, and decision is logged and
-        replayable.
-      </p>
-    </section>
-
-    <section class="tour">
-      <div class="trow">
-        <div class="txt">
-          <div class="eyebrow">The desktop</div>
-          <h3>A real desktop, watched</h3>
-          <p>The agent gets a display it can see and drive — a browser, a
-          terminal, whatever the task needs — and you watch it stream live
-          over WebRTC. Input stays yours to share: take control at any
-          moment, annotate what you see, record what happened.</p>
-        </div>
-        <div class="pic">
-          <div class="shot">
-            <img loading="lazy" src="/assets/landing/video.webp" width="2000" height="1119"
-                 alt="The dashboard's Video tab streaming a live agent desktop over WebRTC: a browser and a terminal scrolling a build, with view-only, annotate, record, and take-control affordances.">
-          </div>
-          <div class="shotnote">Watching atlas's display, live — view-only until you hand input over.</div>
-        </div>
-      </div>
-
-      <div class="trow rev">
-        <div class="txt">
-          <div class="eyebrow">Mission control</div>
-          <h3>Every agent, one canvas</h3>
-          <p>Station renders the whole machine live — sessions, approvals,
-          context budgets, changes, and worktrees orbiting one WebGPU canvas.
-          The same daemon is operable from the CLI and MCP, and a glance away
-          from your phone in an enrolled browser.</p>
-        </div>
-        <div class="pic">
-          <div class="shot">
-            <img loading="lazy" src="/assets/landing/station.webp" width="2000" height="1014"
-                 alt="The Station tab: a radar-style WebGPU control room showing live nodes for peers, sessions, activity, context, changes, view, controls, and worktrees.">
-          </div>
-          <div class="shotnote">Station — the fleet and every session's state, rendered live.</div>
-        </div>
-      </div>
-
-      <div class="trow">
-        <div class="txt">
-          <div class="eyebrow">Credential custody</div>
-          <h3>Custody machinery, with a boundary</h3>
-          <p>Intendant implements sealed vault storage, time-boxed leases,
-          and client egress for authorized control sessions. The Connect
-          account-vault backend and a daemon's own vault are separate today.
-          This directory does not serve the vault client or crypto worker and
-          has no daemon-control channel, so it cannot create or unseal account
-          entries, grant a lease, or relay a provider call. Use a
-          trusted direct client for those mechanisms, or use
-          the daemon's local credential configuration.</p>
-          <div class="fuelmap">
-            <div class="fuelrow"><span class="fueltag">trusted client</span>
-              <span class="fuelflow">daemon-store vault <span class="fx">→</span> authorized lease or relay <span class="fx">→</span> daemon workload</span></div>
-            <div class="fuelrow"><span class="fueltag">Connect tab</span>
-              <span class="fuelflow">account-vault API/storage only <em>(no shipped client or daemon bridge)</em></span></div>
-          </div>
-        </div>
-        <div class="pic">
-          <div class="shot">
-            <img loading="lazy" src="/assets/landing/vault.webp" width="1800" height="975"
-                 alt="The trusted daemon dashboard's credential vault panel, showing masked entries and time-boxed lease controls.">
-          </div>
-          <div class="shotnote">Shown on an authorized daemon surface; Connect cannot invoke these controls.</div>
-        </div>
-      </div>
-
-      <div class="trow rev">
-        <div class="txt">
-          <div class="eyebrow">Arrival</div>
-          <h3>Link a machine with twelve words</h3>
-          <p>Start the daemon anywhere and it prints a one-time claim code.
-          Enter it here to link the route to your account for discovery. The
-          link changes no daemon IAM and grants no machine access; ownership
-          starts only from a trusted local or independently verified direct-mTLS surface.</p>
-        </div>
-        <div class="pic">
-          <div class="shot">
-            <img loading="lazy" src="/assets/landing/claim.webp" width="1800" height="635"
-             alt="Intendant Connect: a linked computer named atlas shown online with uptime history, next to the add-a-computer flow that accepts a twelve-word one-time claim code.">
-          </div>
-          <div class="shotnote">atlas, discoverable seconds after its one-time code was entered.</div>
-        </div>
-      </div>
-
-      <div class="trow">
-        <div class="txt">
-          <div class="eyebrow">The client</div>
-          <h3>Zero-install discovery; trusted enrollment for control</h3>
-          <p>Link and discover a daemon from this browser tab without client
-          software. To approve a diff, watch the live desktop, or run mission
-          control, use local loopback access or first enroll that browser for
-          independently verified direct mTLS from a trusted owner surface.
-          After enrollment the dashboard remains browser-based and carries
-          only the authority that daemon granted to the authenticated
-          principal. Installing a client certificate or profile is a real
-          enrollment step, not a zero-install claim.</p>
-        </div>
-        <div class="pic phonepic">
-          <div class="phoneframe">
-            <img loading="lazy" src="/assets/landing/phone.webp" width="780" height="1688"
-                 alt="The same Intendant session on a phone: the Activity feed showing the agent's diff, an approval-gated backfill command, and the verified result — driven entirely from a mobile browser.">
-          </div>
-          <div class="shotnote">The rollup fix from above — same session, held in one hand.</div>
-        </div>
-      </div>
-    </section>
-
     <section class="features">
       <h2>What's in the box</h2>
       <div class="grid">
+        <div class="card">
+          <h3>A real desktop, watched</h3>
+          <p>The agent gets a display it can see and drive — a browser, a
+          terminal, whatever the task needs — and an authorized dashboard
+          streams it live over WebRTC. Input stays yours to share: take
+          control at any moment, annotate what you see, record what
+          happened. Autonomy is a dial, approvals are explicit, and every
+          command, diff, and decision is logged and replayable.</p>
+        </div>
         <div class="card">
           <h3>Bring your own agent</h3>
           <p>Codex, Claude Code, Kimi Code, and Pi run as managed backends — under the
@@ -953,13 +738,21 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           native agent loop.</p>
         </div>
         <div class="card">
+          <h3>Every agent, one canvas</h3>
+          <p>Station renders the whole machine live — sessions, approvals,
+          context budgets, changes, and worktrees orbiting one WebGPU canvas.
+          The same daemon is operable from the CLI and MCP, and a glance away
+          from your phone in an enrolled browser.</p>
+        </div>
+        <div class="card">
           <h3>Your keys stay yours</h3>
           <p>Sealed vaults, expiring API-key leases, and client egress are
           available on authorized daemon sessions. Connect can store an
-          opaque account-vault envelope, but this directory serves neither its
-          vault client nor a path that could deliver it to a daemon.
-          Local .env credentials remain supported, and full-credential OAuth
-          leases temporarily materialize private auth files.</p>
+          opaque account-vault envelope, but there is
+          no shipped client or daemon bridge for it — this directory
+          cannot fuel a daemon or relay a provider call.
+          Local .env credentials remain supported, and full-credential
+          OAuth leases temporarily materialize private auth files.</p>
         </div>
         <div class="card">
           <h3>Multiple trusted interfaces</h3>
@@ -967,7 +760,9 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           automation, and live voice or phone for conversation. A remote
           browser enrolled for direct mTLS by a trusted owner runs the web
           client there, phone included, without a separate app install; that
-          remote browser still needs certificate or profile enrollment.</p>
+          remote browser still needs certificate or profile enrollment.
+          Installing a client certificate or profile is a real enrollment
+          step, not a zero-install claim.</p>
         </div>
         <div class="card">
           <h3>A fleet, not a box</h3>
@@ -2581,25 +2376,14 @@ mod tests {
         assert!(html.contains(DOCS_URL));
         assert!(html.contains(REPO_URL));
         assert!(html.contains("Built to be distrusted"));
-        // The tour shows the product: every embedded screenshot is referenced,
-        // with alt text so the page reads without images.
-        for asset in [
-            "hero.webp",
-            "video.webp",
-            "station.webp",
-            "vault.webp",
-            "claim.webp",
-            "phone.webp",
-        ] {
-            assert!(
-                html.contains(&format!("/assets/landing/{asset}")),
-                "landing page must reference {asset}"
-            );
-        }
-        assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
+        // The page is deliberately text-only: no product screenshots to
+        // rot as the UI moves — the copy carries the product, and every
+        // capability claim survives as prose in the feature cards.
+        assert!(!html.contains("/assets/landing/"));
+        assert!(!html.contains("<img loading="));
         // Discovery is zero-install; control honestly names its trusted
         // enrollment or native/local anchor instead of inheriting that claim.
-        assert!(html.contains("Zero-install discovery; trusted enrollment for control"));
+        assert!(html.contains("browser tab; control uses local presence or a browser enrolled for"));
         assert!(html.contains("Installing a client certificate or profile is a real"));
         assert!(html.contains("controlling the daemon still requires trusted certificate or"));
         assert!(html.contains("Multiple trusted interfaces"));
@@ -2607,23 +2391,25 @@ mod tests {
         assert!(html.contains("remote browser still needs certificate or profile enrollment"));
         assert!(!html.contains("terminal TUI"));
         // "How do I use it" is the page's first answer: the install
-        // questionnaire sits directly under the hero, before the shot tour.
+        // questionnaire sits directly under the hero, before the cards.
         let install_at = html.find(r#"<section class="install-section""#).unwrap();
-        let heroshot_at = html.find(r#"<section class="heroshot""#).unwrap();
-        let tour_at = html.find(r#"<section class="tour""#).unwrap();
+        let features_at = html.find(r#"<section class="features""#).unwrap();
         assert!(
-            install_at < heroshot_at && heroshot_at < tour_at,
-            "install must lead, then the product tour"
+            install_at < features_at,
+            "install must lead, then the feature cards"
         );
+        // The product story the tour used to carry now lives in the cards.
+        assert!(html.contains("A real desktop, watched"));
+        assert!(html.contains("command, diff, and decision is logged and replayable"));
+        assert!(html.contains("Every agent, one canvas"));
+        assert!(html.contains("Station renders the whole machine live"));
         // The name is the thesis, told through the house metaphor — the
         // ambition itself stays understated on the public page.
         assert!(html.contains("Why “Intendant”"));
         assert!(html.contains("companies tour on signed contracts"));
-        // Custody names both stores and makes the missing bridge explicit.
-        assert!(html.contains(r#"class="fuelmap""#));
-        assert!(html.contains("account-vault API/storage only"));
-        assert!(html.contains("no shipped client or daemon bridge"));
-        assert!(html.contains("Connect cannot invoke these controls"));
+        // Custody makes the missing bridge explicit.
+        assert!(html.contains("no shipped client or daemon bridge for it"));
+        assert!(html.contains("cannot fuel a daemon or relay a provider call"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
@@ -2748,27 +2534,6 @@ mod tests {
         let trust = trust_ui_html("https://x.example");
         assert!(trust.contains(svg_link) && trust.contains(png_link));
         assert!(!trust.contains(">IC</div>"));
-    }
-
-    #[test]
-    fn landing_assets_are_embedded_webp() {
-        for asset in [
-            "hero.webp",
-            "video.webp",
-            "station.webp",
-            "vault.webp",
-            "claim.webp",
-            "phone.webp",
-        ] {
-            let bytes = landing_asset_bytes(asset)
-                .unwrap_or_else(|| panic!("missing embedded landing asset {asset}"));
-            // RIFF....WEBP container magic.
-            assert!(bytes.len() > 8_192, "{asset} suspiciously small");
-            assert_eq!(&bytes[0..4], b"RIFF", "{asset} is not a RIFF container");
-            assert_eq!(&bytes[8..12], b"WEBP", "{asset} is not WebP");
-        }
-        assert!(landing_asset_bytes("nope.webp").is_none());
-        assert!(landing_asset_bytes("../secrets").is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -351,7 +351,6 @@ fn connect_router(state: Arc<AppState>) -> Router {
         .route("/favicon.png", get(favicon_png))
         .route("/logo.svg", get(logo_svg))
         .route("/sw.js", get(service_worker_js))
-        .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
         .route("/api/logout", post(api_logout))
