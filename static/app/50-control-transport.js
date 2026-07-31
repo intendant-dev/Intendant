@@ -1483,6 +1483,10 @@ function peerDashboardControlSignalAvailable(peerId) {
   if (!window.RTCPeerConnection) return false;
   const peer = daemons.find(d => d.host_id === id);
   if (!peer || peer.connected === false) return false;
+  // A relay-transiting federation link carries signaling but nothing
+  // ICE-borne: the browser↔peer datachannel cannot form without a
+  // direct route or provisioned TURN, so don't offer it.
+  if (!peerLinkSupportsMedia(id)) return false;
   if (dashboardConnectModeEnabled()) {
     return Boolean(
       dashboardTransport?.canUseRpc?.() &&
@@ -2617,6 +2621,14 @@ function snapshotToDaemonEntry(p) {
     // live peer_display_ready/removed events produced this list, so
     // wholesale row replacement never loses display state.
     displays: Array.isArray(p.displays) ? p.displays : [],
+    // Reachability honesty (RC-C1): the connected transport candidate
+    // ({url, transport_class: 'direct'|'relayed'}, null while
+    // disconnected) and the grant the peer advertised for this
+    // daemon's identity ({profile, operations}, null = unknown).
+    // Media/datachannel affordances derive from link.transport_class;
+    // action pills derive from grant.operations.
+    link: p.link || null,
+    grant: p.grant || null,
   };
 }
 
@@ -2722,6 +2734,18 @@ function updateDaemonSnapshot(snap) {
 // Drop a peer from the local daemons list and tear down its WASM
 // secondary connection. Tolerates unknown ids (a `peer_removed` may
 // arrive after `refreshPeersFromApi` has already pruned the entry).
+function removeDaemonByIdResetGlobalTarget(id) {
+  // A removed peer cannot stay the operating target — snap the whole
+  // dashboard back to the local daemon (a mere disconnect keeps the
+  // selection: the row persists and panes render the reconnect state).
+  if (
+    typeof currentGlobalTargetHostId === 'function' &&
+    currentGlobalTargetHostId() === String(id || '')
+  ) {
+    setGlobalTargetHost('', { source: 'peer-removed' });
+  }
+}
+
 function removeDaemonById(id) {
   if (!id) return;
   const idx = daemons.findIndex(d => d.host_id === id);
@@ -2740,6 +2764,7 @@ function removeDaemonById(id) {
   // RTCPeerConnection has nowhere to send signaling, and leaving it
   // alive would just stall on ICE failure.
   closePeerDisplaysForHost(id).catch(() => {});
+  removeDaemonByIdResetGlobalTarget(id);
   renderDaemonsList();
 }
 
@@ -3082,8 +3107,14 @@ function renderDaemonRow(d, isSelf) {
   // 3b's primary-as-media-relay takes over when no non-loopback path
   // is known — same contract the peer-side loopback warn describes.
   const tcpViaUrl = resolveBrowserTcpViaUrl(d);
+  // Render the display affordance from the live link's transport
+  // class, never from the peer row existing: a relay-only link cannot
+  // carry WebRTC media, so the pill would be dead — say so instead.
+  const linkSupportsMedia = peerLinkSupportsMedia(d.host_id);
   const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
-    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+    ? (linkSupportsMedia
+      ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+      : `<span class="daemon-relay-note" title="This peer is reachable over the relay link only. Live video and file transfer need a direct route or TURN; messages, tasks, approvals, and session actions still work.">relay link — no live media</span>`)
     : '';
   const controlsPanel = isSelf
     ? ''

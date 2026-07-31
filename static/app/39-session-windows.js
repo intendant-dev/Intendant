@@ -59,7 +59,78 @@ function markSessionWindowPendingActive(sessionId) {
 // automatic resolver rebind (pulse it) apart from a repeat render.
 let taskTargetChipRenderedTarget = null;
 
+// Composer peer target (RC-C1): when set, the composer sends to a
+// FEDERATED peer instead of a local session — a new task via
+// delegation ({hostId, sessionId: null}) or a follow-up scoped to one
+// of the peer's sessions ({hostId, sessionId}). Any explicit local
+// pick clears it (one composer, one target). Validity is re-checked
+// on read: a removed peer drops the target instead of stranding the
+// composer on a ghost.
+let promptTargetPeer = null;
+
+function currentPromptTargetPeer() {
+  if (!promptTargetPeer) return null;
+  const entry =
+    typeof peerEntryForHost === 'function' ? peerEntryForHost(promptTargetPeer.hostId) : null;
+  if (!entry) {
+    promptTargetPeer = null;
+    return null;
+  }
+  return promptTargetPeer;
+}
+
+function setPromptTargetPeer(hostId, sessionId) {
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  if (!entry) return false;
+  promptTargetPeer = {
+    hostId: entry.host_id,
+    sessionId: sessionId ? String(sessionId) : null,
+  };
+  updateTaskTargetChip();
+  return true;
+}
+
+function clearPromptTargetPeer(opts) {
+  if (!promptTargetPeer) return;
+  promptTargetPeer = null;
+  if (!opts || !opts.skipChip) updateTaskTargetChip();
+}
+
 function updateTaskTargetChip() {
+  // A peer target owns the chip while set: the composer routes to the
+  // peer daemon, not to any local session window.
+  const peerTarget = currentPromptTargetPeer();
+  if (peerTarget) {
+    const chip = document.getElementById('task-target-chip');
+    taskTargetChipRenderedTarget = `peer:${peerTarget.hostId}:${peerTarget.sessionId || ''}`;
+    updatePromptTargetSessionHighlight('');
+    updateControlFastButtonState();
+    if (!chip) return;
+    clearSessionBadgeStyle(chip);
+    chip.style.display = '';
+    chip.classList.add('has-target');
+    const entry = peerEntryForHost(peerTarget.hostId);
+    const label = document.createElement('span');
+    label.className = 'task-target-label';
+    label.textContent = 'Target:';
+    const badge = document.createElement('span');
+    badge.className = 'task-target-session-badge task-target-peer-badge';
+    const peerLabel = (entry && (entry.label || entry.host_id)) || peerTarget.hostId;
+    badge.textContent = peerTarget.sessionId
+      ? `${peerLabel} · ${peerTarget.sessionId.slice(0, 8)}`
+      : peerLabel;
+    chip.replaceChildren(label, badge);
+    const reconnecting = entry && entry.connected === false;
+    const title = peerTarget.sessionId
+      ? `Sends a follow-up to session ${peerTarget.sessionId} on ${peerLabel} through this daemon's peer grant${reconnecting ? ' — peer link is down, reconnecting' : ''}`
+      : `Delegates the task to ${peerLabel} through this daemon's peer grant${reconnecting ? ' — peer link is down, reconnecting' : ''}`;
+    chip.title = title;
+    chip.setAttribute('aria-label', title);
+    chip.classList.toggle('target-reconnecting', Boolean(reconnecting));
+    return;
+  }
+  const chip0 = document.getElementById('task-target-chip');
+  if (chip0) chip0.classList.remove('target-reconnecting');
   const sid = resolvePromptTargetSessionId();
   const previousTarget = taskTargetChipRenderedTarget;
   taskTargetChipRenderedTarget = sid;
@@ -6284,7 +6355,7 @@ function closeSessionRenameModal() {
   showSessionRenameStatus('');
 }
 
-function requestSessionRename(sessionOrId, sourceArg = '') {
+function requestSessionRename(sessionOrId, sourceArg = '', opts = {}) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, source: sourceArg };
@@ -6293,6 +6364,10 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
     showControlToast('error', 'Rename session failed: session ID is missing');
     return false;
   }
+  // Host-scoped rename (RC-C1): when the card belongs to a peer host,
+  // the save dispatch routes through api_peer_session_control instead
+  // of the local lane.
+  const renameHostId = String(opts.hostId || '').trim();
   const source = String(sourceArg || session.source || 'intendant').trim();
   const cached = sessionMetadataById.get(sid) || {};
   const backendSessionId = String(
@@ -6313,6 +6388,7 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
     sessionId: sid,
     source: effectiveSource,
     backendSessionId,
+    hostId: renameHostId,
   };
   const sessionInput = document.getElementById('session-rename-session');
   if (sessionInput) {
@@ -6344,13 +6420,36 @@ function saveSessionRenameModal() {
     return;
   }
   showSessionRenameStatus('Saving...');
-  dispatchControlMsg({
+  const message = {
     action: 'rename_session',
     session_id: sessionRenameEditing.sessionId,
     source: sessionRenameEditing.source,
     ...(sessionRenameEditing.backendSessionId ? { backend_session_id: sessionRenameEditing.backendSessionId } : {}),
     name,
-  });
+  };
+  if (sessionRenameEditing.hostId) {
+    // Peer-hosted session: the rename is authorized and applied by the
+    // peer; its result reaches us as a folded session_updated (no local
+    // rename-result echo), so close optimistically on accept.
+    const hostId = sessionRenameEditing.hostId;
+    daemonApi
+      .request('api_peer_session_control', { peer_id: hostId, message })
+      .then(resp => {
+        if (resp.ok) {
+          closeSessionRenameModal();
+          showControlToast('info', 'Rename sent — the peer applies it.');
+          if (typeof loadSessions === 'function') loadSessions({ force: true });
+        } else {
+          const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+          showSessionRenameStatus(`Peer refused (${resp.status})${detail}`, 'error');
+        }
+      })
+      .catch(err => {
+        showSessionRenameStatus(`Could not reach the peer: ${err?.message || err}`, 'error');
+      });
+    return;
+  }
+  dispatchControlMsg(message);
 }
 
 // Index over _cachedSessions for O(1) any-id lookups. Every mutation site

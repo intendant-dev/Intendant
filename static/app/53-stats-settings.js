@@ -112,6 +112,9 @@ function refreshStatsHostPicker() {
 function switchStatsHost(hostId) {
   activeStatsHost = hostId || '';
   renderStatsForActiveHost();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(activeStatsHost, { source: 'stats' });
+  }
 }
 
 // Render the Stats tab from whichever host is currently active,
@@ -874,6 +877,33 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 // 31-init-identity-fleet.js with the early state: a #stats deep link
 // reaches them during script evaluation — the deep-link TDZ rule.)
 
+// The federation fold (PeerSnapshot.sessions, SessionInfo shape) mapped
+// into the session-list row vocabulary the Sessions tab renders. Used
+// when a peer is reachable over the control link only (relay-only, or
+// no browser-dialable URL): the list stays live via peer_state_changed
+// snapshots even though the peer's own /api/sessions is unreachable.
+function peerFoldSessionRows(entry) {
+  const sessions = Array.isArray(entry.sessions) ? entry.sessions : [];
+  return sessions.map(s => ({
+    session_id: s.session_id,
+    name: s.label || '',
+    source: s.source || 'intendant',
+    started_at: s.started_at || '',
+    phase: s.phase || '',
+    needs_approval: !!s.needs_approval,
+    is_primary: !!s.is_primary,
+    parent_session_id: s.parent_session_id || null,
+    tokens_used: s.tokens_used ?? null,
+    goal: s.goal || null,
+    vitals: s.vitals || null,
+    // The fold carries no per-session store facts; resume rides the
+    // peer's own resume-id defaulting (resume_id = session_id), local
+    // delete/report affordances stay off.
+    can_resume: true,
+    can_delete: false,
+  }));
+}
+
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
   const cacheSessionMetadata = options.cacheSessionMetadata !== false;
@@ -935,6 +965,15 @@ function fetchSessionsForHost(hostId, options = {}) {
         if (dashboardConnectModeEnabled()) throw err;
         console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
       }
+    }
+    // Relay-only or otherwise browser-unreachable peers (RC-C1): no
+    // datachannel and no HTTP the browser can dial. Render the
+    // federation fold (PeerSnapshot.sessions, riding the control WS)
+    // instead of failing — thinner than the peer's own /api/sessions
+    // rows, honestly so.
+    const entry = daemons.find(x => x.host_id === hostId);
+    if (entry && (!peerLinkSupportsMedia(hostId) || !baseUrl)) {
+      return peerFoldSessionRows(entry);
     }
     if (dashboardConnectModeEnabled()) {
       throw new Error('Peer sessions are unavailable for this target');

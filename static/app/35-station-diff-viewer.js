@@ -1736,7 +1736,13 @@ function stationPeerSessionAgents(d) {
           ? String(goal.tokensUsed)
           : '',
         threadActions: [],
-        canInterrupt: false,
+        // Interrupt pill from the peer-advertised grant (RC-C1): the
+        // action routes through api_peer_session_control and the peer
+        // re-authorizes it; render it only when the session is live
+        // and the grant is not known to lack session.manage.
+        canInterrupt: (phase === 'running' || phase === 'thinking')
+          && (typeof peerAllowsOperation !== 'function'
+            || peerAllowsOperation(d.host_id, 'session.manage')),
       });
     }
     return out;

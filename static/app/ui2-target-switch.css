@@ -224,6 +224,51 @@ html.ui-v2 .ui2-tsw-foot {
 html.ui-v2 .ui2-tsw-foot .ui2-tsw-row { color: var(--text-3); }
 html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
 
+/* peers section (RC-C1): violet is the peer accent everywhere in the
+   chrome (files/access convention) — the rows read as "another
+   machine" at a glance */
+html.ui-v2 .ui2-tsw-peers-eyebrow {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-tsw-peer-badge {
+  color: var(--violet);
+  border: 1px solid rgba(var(--violet-rgb), .26);
+  background: rgba(var(--violet-rgb), .12);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+html.ui-v2 .ui2-tsw-peer-session { padding-left: 22px; }
+
+/* composer chip while a peer target is set — same violet voice */
+html.ui-v2 .task-target-peer-badge {
+  color: var(--violet);
+  border-color: rgba(var(--violet-rgb), .26);
+  background: rgba(var(--violet-rgb), .12);
+}
+html.ui-v2 .task-target-chip.target-reconnecting .task-target-peer-badge {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .12);
+}
+
+/* Access → Daemons: honest stand-in where "View display" would be a
+   dead pill on a relay-only link */
+html.ui-v2 .daemon-relay-note {
+  color: var(--text-3);
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-pill);
+  white-space: nowrap;
+}
+
 /* touch targets (brief: rows ≥44px at ≤820px); 16px input font keeps
    iOS Safari from zooming the page on focus */
 @media (max-width: 820px) {

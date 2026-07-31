@@ -708,6 +708,11 @@ function dashboardAccessTargetFromPeerSnapshot(snap) {
     ws_url: snap.ws_url || '',
     browser_tcp_via_url: snap.browser_tcp_via_url || '',
     capabilities: snap.capabilities || [],
+    // Field-for-field parity with the server row (routes_access.rs):
+    // the connected candidate's {url, transport_class} and the
+    // peer-advertised {profile, operations} grant.
+    link: snap.link || null,
+    grant: snap.grant || null,
   };
 }
 
@@ -1031,7 +1036,12 @@ function dashboardLaneBadge(hostId) {
   }
   const conn = peerDashboardControlConnectionsByHost.get(String(hostId || '').trim());
   const status = conn?.lastStatus || {};
-  const profile = String(status.grant_profile || target.profile || '').trim() || 'peer';
+  const advertisedProfile =
+    typeof peerEntryForHost === 'function'
+      ? (peerEntryForHost(hostId)?.grant?.profile || '')
+      : '';
+  const profile =
+    String(status.grant_profile || advertisedProfile || target.profile || '').trim() || 'peer';
   const viaLabel = String(selfHostLabel || 'this daemon').trim();
   const attributed = Boolean(status.attributed_fingerprint);
   const record = accessFleetTargets().find(t =>
@@ -1085,7 +1095,15 @@ function dashboardTargetSummary(hostId, context = '') {
   const online = peer.connected !== false;
   const conn = peerDashboardControlConnectionsByHost.get(peerId);
   const status = conn?.lastStatus || {};
-  const profile = status.grant_profile || '';
+  // The federation-link grant echo (PeerSnapshot.grant) names the
+  // profile before any browser↔peer datachannel exists — prefer the
+  // datachannel's own status once it opens (it reflects the exact
+  // grant that tunnel authorizes under).
+  const advertisedProfile =
+    typeof peerEntryForHost === 'function'
+      ? (peerEntryForHost(peerId)?.grant?.profile || '')
+      : '';
+  const profile = status.grant_profile || advertisedProfile || '';
   const grantKind = status.grant_kind || '';
   const hasExactGrant = Boolean(profile || grantKind);
   const access = hasExactGrant

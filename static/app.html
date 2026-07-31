@@ -31839,6 +31839,51 @@ html.ui-v2 .ui2-tsw-foot {
 html.ui-v2 .ui2-tsw-foot .ui2-tsw-row { color: var(--text-3); }
 html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
 
+/* peers section (RC-C1): violet is the peer accent everywhere in the
+   chrome (files/access convention) — the rows read as "another
+   machine" at a glance */
+html.ui-v2 .ui2-tsw-peers-eyebrow {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+html.ui-v2 .ui2-tsw-peer-badge {
+  color: var(--violet);
+  border: 1px solid rgba(var(--violet-rgb), .26);
+  background: rgba(var(--violet-rgb), .12);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+html.ui-v2 .ui2-tsw-peer-session { padding-left: 22px; }
+
+/* composer chip while a peer target is set — same violet voice */
+html.ui-v2 .task-target-peer-badge {
+  color: var(--violet);
+  border-color: rgba(var(--violet-rgb), .26);
+  background: rgba(var(--violet-rgb), .12);
+}
+html.ui-v2 .task-target-chip.target-reconnecting .task-target-peer-badge {
+  color: var(--amber);
+  border-color: rgba(var(--amber-rgb), .26);
+  background: rgba(var(--amber-rgb), .12);
+}
+
+/* Access → Daemons: honest stand-in where "View display" would be a
+   dead pill on a relay-only link */
+html.ui-v2 .daemon-relay-note {
+  color: var(--text-3);
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-pill);
+  white-space: nowrap;
+}
+
 /* touch targets (brief: rows ≥44px at ≤820px); 16px input font keeps
    iOS Safari from zooming the page on focus */
 @media (max-width: 820px) {
@@ -37994,7 +38039,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5cd3a10d20a93aec';
+const INTENDANT_APP_BUILD = '5e2430347e404cac';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38941,6 +38986,79 @@ if (DASHBOARD_ACCESS_PAGE_MODE) {
   document.title = 'Intendant Access';
 }
 let daemons = [];
+// ---- Global operating target (RC-C1) ----
+// One dashboard, one "operating <host>" selection. The per-pane host
+// pickers (Shell, Files, Transfers, Sessions, Stats) publish into and
+// follow this instead of each owning a private selection; panes with a
+// wider domain (the Shell's cloud exec hosts, which are not daemons)
+// may show a pane-local override without moving the global. '' = the
+// local daemon (self). Change notifications ride a
+// `ui2:target-changed` CustomEvent on document.
+let globalTargetHostId = '';
+function normalizeTargetHostId(hostId) {
+  const id = String(hostId == null ? '' : hostId).trim();
+  if (!id || id === 'local' || id === 'self') return '';
+  if (typeof selfPeerId !== 'undefined' && selfPeerId && id === selfPeerId) return '';
+  return id;
+}
+function currentGlobalTargetHostId() {
+  return globalTargetHostId;
+}
+function globalTargetIsLocal() {
+  return globalTargetHostId === '';
+}
+function peerEntryForHost(hostId) {
+  const id = normalizeTargetHostId(hostId);
+  if (!id) return null;
+  return daemons.find((d) => d.host_id === id) || null;
+}
+function setGlobalTargetHost(hostId, opts) {
+  const next = normalizeTargetHostId(hostId);
+  // Only daemon targets participate: '' (self) or a known peer row.
+  if (next && !peerEntryForHost(next)) return false;
+  if (next === globalTargetHostId) return true;
+  globalTargetHostId = next;
+  try {
+    document.dispatchEvent(
+      new CustomEvent('ui2:target-changed', {
+        detail: { hostId: next, source: (opts && opts.source) || '' },
+      }),
+    );
+  } catch (_e) {
+    /* CustomEvent is universal in shipped engines; never let a
+       dispatch failure strand the selection itself. */
+  }
+  return true;
+}
+// Honest-affordance helpers: what the peer advertised about OUR grant
+// and about the live link. Unknown grant (older peer, or the echo not
+// yet folded) is "act and report", never denial; unknown link means no
+// media promise.
+function peerGrantOperations(hostId) {
+  const entry = peerEntryForHost(hostId);
+  const ops = entry && entry.grant && Array.isArray(entry.grant.operations)
+    ? entry.grant.operations
+    : null;
+  return ops;
+}
+function peerAllowsOperation(hostId, operationId) {
+  const ops = peerGrantOperations(hostId);
+  if (!ops) return true; // unknown → optimistic, outcome reported honestly
+  return ops.includes(operationId);
+}
+function peerLinkTransportClass(hostId) {
+  const entry = peerEntryForHost(hostId);
+  return entry && entry.link && entry.link.transport_class
+    ? String(entry.link.transport_class)
+    : '';
+}
+// Media/datachannel affordances render from the transport class of the
+// live link — never from the peer row existing. Absent link info on a
+// connected row (daemon predating the field) keeps today's behavior.
+function peerLinkSupportsMedia(hostId) {
+  const cls = peerLinkTransportClass(hostId);
+  return cls !== 'relayed';
+}
 let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
 let accessUserClientGrantSubmitting = false;
@@ -50491,7 +50609,59 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (!sessionId) return;
-  const session = stationFindSessionById(sessionId) || { session_id: sessionId };
+  // Host-scoped routing (RC-C1): scene nodes for a PEER's sessions
+  // carry the peer's raw session ids. When the id resolves to a peer
+  // fold and not to anything local, actions route through
+  // api_peer_session_control instead of assuming a local session id.
+  const localSession = stationFindSessionById(sessionId);
+  const peerHostId = !localSession && !sessionWindows.has(sessionId)
+    && typeof peerEntryForHost === 'function'
+    ? (Array.isArray(daemons)
+      ? (daemons.find(d => Array.isArray(d.sessions)
+          && d.sessions.some(s => String(s.session_id) === sessionId))?.host_id || '')
+      : '')
+    : '';
+  if (peerHostId) {
+    const peerName = peerEntryForHost(peerHostId)?.label || peerHostId;
+    if (op === 'focus' || op === 'target' || op === 'steer') {
+      if (setPromptTargetPeer(peerHostId, sessionId)) {
+        showControlToast?.('info', `Composer targets ${shortSessionId(sessionId)} on ${peerName}`);
+        if (stationRenderedPrimaryActive()) {
+          station?.set_composer?.(true, 'send');
+          stationHandleComposerEvent({ op: 'focus' });
+        }
+      }
+      return;
+    }
+    if (op === 'interrupt') {
+      daemonApi
+        .request('api_peer_session_control', {
+          peer_id: peerHostId,
+          message: { action: 'interrupt', session_id: sessionId },
+        })
+        .then(resp => {
+          if (resp.ok) {
+            showControlToast?.('info', `Interrupt sent to ${shortSessionId(sessionId)} on ${peerName}`);
+          } else {
+            const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+            showControlToast?.('error', `${peerName} refused interrupt (${resp.status})${detail}`);
+          }
+        })
+        .catch(err => showControlToast?.('error', `Could not reach ${peerName}: ${err?.message || err}`));
+      return;
+    }
+    if (op === 'copy') {
+      copyTextToClipboard(sessionId)
+        .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sessionId)}`))
+        .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+      return;
+    }
+    // Anything else (transcript, thread ops, config) still lives on the
+    // peer's own dashboard — no silent no-ops.
+    showControlToast?.('info', `${op} for peer sessions happens on ${peerName}'s own dashboard.`);
+    return;
+  }
+  const session = localSession || { session_id: sessionId };
   const live = stationExternalLiveThreadDescriptor(session) || stationExternalLiveThreadDescriptor(sessionId);
   if (op === 'focus' || op === 'target') {
     focusSessionWindow(live?.liveId || sessionId);
@@ -53245,7 +53415,13 @@ function stationPeerSessionAgents(d) {
           ? String(goal.tokensUsed)
           : '',
         threadActions: [],
-        canInterrupt: false,
+        // Interrupt pill from the peer-advertised grant (RC-C1): the
+        // action routes through api_peer_session_control and the peer
+        // re-authorizes it; render it only when the session is live
+        // and the grant is not known to lack session.manage.
+        canInterrupt: (phase === 'running' || phase === 'thinking')
+          && (typeof peerAllowsOperation !== 'function'
+            || peerAllowsOperation(d.host_id, 'session.manage')),
       });
     }
     return out;
@@ -60892,7 +61068,78 @@ function markSessionWindowPendingActive(sessionId) {
 // automatic resolver rebind (pulse it) apart from a repeat render.
 let taskTargetChipRenderedTarget = null;
 
+// Composer peer target (RC-C1): when set, the composer sends to a
+// FEDERATED peer instead of a local session — a new task via
+// delegation ({hostId, sessionId: null}) or a follow-up scoped to one
+// of the peer's sessions ({hostId, sessionId}). Any explicit local
+// pick clears it (one composer, one target). Validity is re-checked
+// on read: a removed peer drops the target instead of stranding the
+// composer on a ghost.
+let promptTargetPeer = null;
+
+function currentPromptTargetPeer() {
+  if (!promptTargetPeer) return null;
+  const entry =
+    typeof peerEntryForHost === 'function' ? peerEntryForHost(promptTargetPeer.hostId) : null;
+  if (!entry) {
+    promptTargetPeer = null;
+    return null;
+  }
+  return promptTargetPeer;
+}
+
+function setPromptTargetPeer(hostId, sessionId) {
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  if (!entry) return false;
+  promptTargetPeer = {
+    hostId: entry.host_id,
+    sessionId: sessionId ? String(sessionId) : null,
+  };
+  updateTaskTargetChip();
+  return true;
+}
+
+function clearPromptTargetPeer(opts) {
+  if (!promptTargetPeer) return;
+  promptTargetPeer = null;
+  if (!opts || !opts.skipChip) updateTaskTargetChip();
+}
+
 function updateTaskTargetChip() {
+  // A peer target owns the chip while set: the composer routes to the
+  // peer daemon, not to any local session window.
+  const peerTarget = currentPromptTargetPeer();
+  if (peerTarget) {
+    const chip = document.getElementById('task-target-chip');
+    taskTargetChipRenderedTarget = `peer:${peerTarget.hostId}:${peerTarget.sessionId || ''}`;
+    updatePromptTargetSessionHighlight('');
+    updateControlFastButtonState();
+    if (!chip) return;
+    clearSessionBadgeStyle(chip);
+    chip.style.display = '';
+    chip.classList.add('has-target');
+    const entry = peerEntryForHost(peerTarget.hostId);
+    const label = document.createElement('span');
+    label.className = 'task-target-label';
+    label.textContent = 'Target:';
+    const badge = document.createElement('span');
+    badge.className = 'task-target-session-badge task-target-peer-badge';
+    const peerLabel = (entry && (entry.label || entry.host_id)) || peerTarget.hostId;
+    badge.textContent = peerTarget.sessionId
+      ? `${peerLabel} · ${peerTarget.sessionId.slice(0, 8)}`
+      : peerLabel;
+    chip.replaceChildren(label, badge);
+    const reconnecting = entry && entry.connected === false;
+    const title = peerTarget.sessionId
+      ? `Sends a follow-up to session ${peerTarget.sessionId} on ${peerLabel} through this daemon's peer grant${reconnecting ? ' — peer link is down, reconnecting' : ''}`
+      : `Delegates the task to ${peerLabel} through this daemon's peer grant${reconnecting ? ' — peer link is down, reconnecting' : ''}`;
+    chip.title = title;
+    chip.setAttribute('aria-label', title);
+    chip.classList.toggle('target-reconnecting', Boolean(reconnecting));
+    return;
+  }
+  const chip0 = document.getElementById('task-target-chip');
+  if (chip0) chip0.classList.remove('target-reconnecting');
   const sid = resolvePromptTargetSessionId();
   const previousTarget = taskTargetChipRenderedTarget;
   taskTargetChipRenderedTarget = sid;
@@ -67117,7 +67364,7 @@ function closeSessionRenameModal() {
   showSessionRenameStatus('');
 }
 
-function requestSessionRename(sessionOrId, sourceArg = '') {
+function requestSessionRename(sessionOrId, sourceArg = '', opts = {}) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, source: sourceArg };
@@ -67126,6 +67373,10 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
     showControlToast('error', 'Rename session failed: session ID is missing');
     return false;
   }
+  // Host-scoped rename (RC-C1): when the card belongs to a peer host,
+  // the save dispatch routes through api_peer_session_control instead
+  // of the local lane.
+  const renameHostId = String(opts.hostId || '').trim();
   const source = String(sourceArg || session.source || 'intendant').trim();
   const cached = sessionMetadataById.get(sid) || {};
   const backendSessionId = String(
@@ -67146,6 +67397,7 @@ function requestSessionRename(sessionOrId, sourceArg = '') {
     sessionId: sid,
     source: effectiveSource,
     backendSessionId,
+    hostId: renameHostId,
   };
   const sessionInput = document.getElementById('session-rename-session');
   if (sessionInput) {
@@ -67177,13 +67429,36 @@ function saveSessionRenameModal() {
     return;
   }
   showSessionRenameStatus('Saving...');
-  dispatchControlMsg({
+  const message = {
     action: 'rename_session',
     session_id: sessionRenameEditing.sessionId,
     source: sessionRenameEditing.source,
     ...(sessionRenameEditing.backendSessionId ? { backend_session_id: sessionRenameEditing.backendSessionId } : {}),
     name,
-  });
+  };
+  if (sessionRenameEditing.hostId) {
+    // Peer-hosted session: the rename is authorized and applied by the
+    // peer; its result reaches us as a folded session_updated (no local
+    // rename-result echo), so close optimistically on accept.
+    const hostId = sessionRenameEditing.hostId;
+    daemonApi
+      .request('api_peer_session_control', { peer_id: hostId, message })
+      .then(resp => {
+        if (resp.ok) {
+          closeSessionRenameModal();
+          showControlToast('info', 'Rename sent — the peer applies it.');
+          if (typeof loadSessions === 'function') loadSessions({ force: true });
+        } else {
+          const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+          showSessionRenameStatus(`Peer refused (${resp.status})${detail}`, 'error');
+        }
+      })
+      .catch(err => {
+        showSessionRenameStatus(`Could not reach the peer: ${err?.message || err}`, 'error');
+      });
+    return;
+  }
+  dispatchControlMsg(message);
 }
 
 // Index over _cachedSessions for O(1) any-id lookups. Every mutation site
@@ -71900,6 +72175,9 @@ function focusSessionWindow(sessionId) {
   if (!sid) return;
   const win = ensureSessionWindow(sid);
   if (!win) return;
+  // One composer, one target: focusing a local session retargets the
+  // composer locally, dropping any peer target.
+  if (typeof clearPromptTargetPeer === 'function') clearPromptTargetPeer({ skipChip: true });
   foregroundSessionFullId = sid;
   currentSessionFullId = sid;
   if (app && typeof app.select_session === 'function') {
@@ -77020,6 +77298,11 @@ function dashboardAccessTargetFromPeerSnapshot(snap) {
     ws_url: snap.ws_url || '',
     browser_tcp_via_url: snap.browser_tcp_via_url || '',
     capabilities: snap.capabilities || [],
+    // Field-for-field parity with the server row (routes_access.rs):
+    // the connected candidate's {url, transport_class} and the
+    // peer-advertised {profile, operations} grant.
+    link: snap.link || null,
+    grant: snap.grant || null,
   };
 }
 
@@ -77343,7 +77626,12 @@ function dashboardLaneBadge(hostId) {
   }
   const conn = peerDashboardControlConnectionsByHost.get(String(hostId || '').trim());
   const status = conn?.lastStatus || {};
-  const profile = String(status.grant_profile || target.profile || '').trim() || 'peer';
+  const advertisedProfile =
+    typeof peerEntryForHost === 'function'
+      ? (peerEntryForHost(hostId)?.grant?.profile || '')
+      : '';
+  const profile =
+    String(status.grant_profile || advertisedProfile || target.profile || '').trim() || 'peer';
   const viaLabel = String(selfHostLabel || 'this daemon').trim();
   const attributed = Boolean(status.attributed_fingerprint);
   const record = accessFleetTargets().find(t =>
@@ -77397,7 +77685,15 @@ function dashboardTargetSummary(hostId, context = '') {
   const online = peer.connected !== false;
   const conn = peerDashboardControlConnectionsByHost.get(peerId);
   const status = conn?.lastStatus || {};
-  const profile = status.grant_profile || '';
+  // The federation-link grant echo (PeerSnapshot.grant) names the
+  // profile before any browser↔peer datachannel exists — prefer the
+  // datachannel's own status once it opens (it reflects the exact
+  // grant that tunnel authorizes under).
+  const advertisedProfile =
+    typeof peerEntryForHost === 'function'
+      ? (peerEntryForHost(peerId)?.grant?.profile || '')
+      : '';
+  const profile = status.grant_profile || advertisedProfile || '';
   const grantKind = status.grant_kind || '';
   const hasExactGrant = Boolean(profile || grantKind);
   const access = hasExactGrant
@@ -82258,6 +82554,12 @@ function setShellHost(hostId) {
   renderDashboardTargetSummary('shell-target-summary', next, 'shell');
   if (activeTab === 'terminal' && activeTermSubtab === 'shell') {
     openShellSessionIfPossible(true);
+  }
+  // Publish into the global operating target. Daemon targets move the
+  // whole dashboard; the Shell's cloud exec hosts are pane-local (the
+  // setter refuses non-daemon ids) and leave the global untouched.
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(next === SHELL_HOST_ID ? '' : next, { source: 'shell' });
   }
 }
 /* ── static/app/44-shell-frames.js ── */
@@ -109957,6 +110259,10 @@ function peerDashboardControlSignalAvailable(peerId) {
   if (!window.RTCPeerConnection) return false;
   const peer = daemons.find(d => d.host_id === id);
   if (!peer || peer.connected === false) return false;
+  // A relay-transiting federation link carries signaling but nothing
+  // ICE-borne: the browser↔peer datachannel cannot form without a
+  // direct route or provisioned TURN, so don't offer it.
+  if (!peerLinkSupportsMedia(id)) return false;
   if (dashboardConnectModeEnabled()) {
     return Boolean(
       dashboardTransport?.canUseRpc?.() &&
@@ -111091,6 +111397,14 @@ function snapshotToDaemonEntry(p) {
     // live peer_display_ready/removed events produced this list, so
     // wholesale row replacement never loses display state.
     displays: Array.isArray(p.displays) ? p.displays : [],
+    // Reachability honesty (RC-C1): the connected transport candidate
+    // ({url, transport_class: 'direct'|'relayed'}, null while
+    // disconnected) and the grant the peer advertised for this
+    // daemon's identity ({profile, operations}, null = unknown).
+    // Media/datachannel affordances derive from link.transport_class;
+    // action pills derive from grant.operations.
+    link: p.link || null,
+    grant: p.grant || null,
   };
 }
 
@@ -111196,6 +111510,18 @@ function updateDaemonSnapshot(snap) {
 // Drop a peer from the local daemons list and tear down its WASM
 // secondary connection. Tolerates unknown ids (a `peer_removed` may
 // arrive after `refreshPeersFromApi` has already pruned the entry).
+function removeDaemonByIdResetGlobalTarget(id) {
+  // A removed peer cannot stay the operating target — snap the whole
+  // dashboard back to the local daemon (a mere disconnect keeps the
+  // selection: the row persists and panes render the reconnect state).
+  if (
+    typeof currentGlobalTargetHostId === 'function' &&
+    currentGlobalTargetHostId() === String(id || '')
+  ) {
+    setGlobalTargetHost('', { source: 'peer-removed' });
+  }
+}
+
 function removeDaemonById(id) {
   if (!id) return;
   const idx = daemons.findIndex(d => d.host_id === id);
@@ -111214,6 +111540,7 @@ function removeDaemonById(id) {
   // RTCPeerConnection has nowhere to send signaling, and leaving it
   // alive would just stall on ICE failure.
   closePeerDisplaysForHost(id).catch(() => {});
+  removeDaemonByIdResetGlobalTarget(id);
   renderDaemonsList();
 }
 
@@ -111556,8 +111883,14 @@ function renderDaemonRow(d, isSelf) {
   // 3b's primary-as-media-relay takes over when no non-loopback path
   // is known — same contract the peer-side loopback warn describes.
   const tcpViaUrl = resolveBrowserTcpViaUrl(d);
+  // Render the display affordance from the live link's transport
+  // class, never from the peer row existing: a relay-only link cannot
+  // carry WebRTC media, so the pill would be dead — say so instead.
+  const linkSupportsMedia = peerLinkSupportsMedia(d.host_id);
   const viewDisplayBtn = !isSelf && peerCanShareDisplay(d)
-    ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+    ? (linkSupportsMedia
+      ? `<button class="daemon-display-view" data-host-id="${escapeHtml(d.host_id)}" data-display-id="0" data-tcp-via-url="${escapeHtml(tcpViaUrl)}" title="Open this peer's display via WebRTC (browser↔peer direct, primary signals only)">View display</button>`
+      : `<span class="daemon-relay-note" title="This peer is reachable over the relay link only. Live video and file transfer need a direct route or TURN; messages, tasks, approvals, and session actions still work.">relay link — no live media</span>`)
     : '';
   const controlsPanel = isSelf
     ? ''
@@ -116264,6 +116597,9 @@ function refreshStatsHostPicker() {
 function switchStatsHost(hostId) {
   activeStatsHost = hostId || '';
   renderStatsForActiveHost();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(activeStatsHost, { source: 'stats' });
+  }
 }
 
 // Render the Stats tab from whichever host is currently active,
@@ -117026,6 +117362,33 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 // 31-init-identity-fleet.js with the early state: a #stats deep link
 // reaches them during script evaluation — the deep-link TDZ rule.)
 
+// The federation fold (PeerSnapshot.sessions, SessionInfo shape) mapped
+// into the session-list row vocabulary the Sessions tab renders. Used
+// when a peer is reachable over the control link only (relay-only, or
+// no browser-dialable URL): the list stays live via peer_state_changed
+// snapshots even though the peer's own /api/sessions is unreachable.
+function peerFoldSessionRows(entry) {
+  const sessions = Array.isArray(entry.sessions) ? entry.sessions : [];
+  return sessions.map(s => ({
+    session_id: s.session_id,
+    name: s.label || '',
+    source: s.source || 'intendant',
+    started_at: s.started_at || '',
+    phase: s.phase || '',
+    needs_approval: !!s.needs_approval,
+    is_primary: !!s.is_primary,
+    parent_session_id: s.parent_session_id || null,
+    tokens_used: s.tokens_used ?? null,
+    goal: s.goal || null,
+    vitals: s.vitals || null,
+    // The fold carries no per-session store facts; resume rides the
+    // peer's own resume-id defaulting (resume_id = session_id), local
+    // delete/report affordances stay off.
+    can_resume: true,
+    can_delete: false,
+  }));
+}
+
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
   const cacheSessionMetadata = options.cacheSessionMetadata !== false;
@@ -117087,6 +117450,15 @@ function fetchSessionsForHost(hostId, options = {}) {
         if (dashboardConnectModeEnabled()) throw err;
         console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
       }
+    }
+    // Relay-only or otherwise browser-unreachable peers (RC-C1): no
+    // datachannel and no HTTP the browser can dial. Render the
+    // federation fold (PeerSnapshot.sessions, riding the control WS)
+    // instead of failing — thinner than the peer's own /api/sessions
+    // rows, honestly so.
+    const entry = daemons.find(x => x.host_id === hostId);
+    if (entry && (!peerLinkSupportsMedia(hostId) || !baseUrl)) {
+      return peerFoldSessionRows(entry);
     }
     if (dashboardConnectModeEnabled()) {
       throw new Error('Peer sessions are unavailable for this target');
@@ -120308,10 +120680,60 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
 // artifact — all agents (native, Codex, Claude Code, Kimi Code, Pi) treat
 // subsequent messages as new turns in the existing conversation.
 // Shared by the Activity composer and the Station composer.
+// Composer routing for a peer target (RC-C1): a bare peer target
+// delegates the text as a task (`api_peer_task`); a peer session
+// target sends it as a follow-up scoped to that session
+// (`api_peer_session_control` → the federation link → the peer's own
+// per-action authorization). Both spend this daemon's peer grant.
+// Attachments stay local-only: frame ids resolve against this
+// daemon's stores, so they are refused up front instead of silently
+// dropped on the peer.
+function dispatchPeerTaskText(peerTarget, text) {
+  const entry = peerEntryForHost(peerTarget.hostId);
+  const label = (entry && (entry.label || entry.host_id)) || peerTarget.hostId;
+  if (!entry || entry.connected === false) {
+    showControlToast('error', `${label} is not connected — the peer link is reconnecting; try again shortly.`);
+    return false;
+  }
+  if (pendingAttachments.length > 0) {
+    showControlToast('error', 'Attachments cannot ride a peer target yet — remove them or target a local session.');
+    return false;
+  }
+  const done = (resp, verb) => {
+    if (resp.ok) {
+      showControlToast('info', `${verb} ${label}.`);
+    } else {
+      const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+      showControlToast('error', `${label} refused (${resp.status})${detail}`);
+    }
+  };
+  const fail = (err) => {
+    showControlToast('error', `Could not reach ${label}: ${err && err.message ? err.message : err}`);
+  };
+  if (peerTarget.sessionId) {
+    daemonApi
+      .request('api_peer_session_control', {
+        peer_id: peerTarget.hostId,
+        message: { action: 'follow_up', text, session_id: peerTarget.sessionId },
+      })
+      .then(resp => done(resp, `Follow-up sent to ${peerTarget.sessionId.slice(0, 8)} on`))
+      .catch(fail);
+  } else {
+    daemonApi
+      .request('api_peer_task', { peer_id: peerTarget.hostId, instructions: text })
+      .then(resp => done(resp, 'Task delegated to'))
+      .catch(fail);
+  }
+  return true;
+}
+
 function dispatchTaskText(text, options = {}) {
   if (!app) return false;
   text = String(text || '').trim();
   if (!text) return false;
+  const peerTarget =
+    typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+  if (peerTarget) return dispatchPeerTaskText(peerTarget, text);
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
@@ -120364,6 +120786,13 @@ function submitComposedText(text) {
   if (!app) return false;
   text = String(text || '').trim();
   if (!text) return false;
+  const composerPeerTarget =
+    typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+  if (composerPeerTarget) {
+    // Peer targets never steer or slash locally — the text goes to the
+    // peer daemon as a delegation or session follow-up.
+    return dispatchPeerTaskText(composerPeerTarget, text);
+  }
   const codexSlash = parseCodexSlashCommand(text);
   if (codexSlash) {
     return !!dispatchCodexSlashCommand(codexSlash);
@@ -120972,6 +121401,9 @@ function peerFileTransferSignalAvailable(peerId = filesDownloadSelectedPeerId())
   if (!window.RTCPeerConnection) return false;
   const peer = daemons.find(d => d.host_id === id);
   if (!peer || peer.connected === false) return false;
+  // File-transfer bytes ride a browser↔peer datachannel — nothing
+  // ICE-borne survives a relay-only link (RC-C1 honesty rail).
+  if (!peerLinkSupportsMedia(id)) return false;
   if (dashboardConnectModeEnabled()) {
     return Boolean(
       dashboardTransport?.canUseRpc?.() &&
@@ -121010,6 +121442,9 @@ function refreshFilesDownloadHostOptions() {
 function onFilesDownloadHostChanged(options = {}) {
   const browse = document.getElementById('files-download-browse-btn');
   const selectedPeer = filesDownloadSelectedPeerId();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(selectedPeer, { source: 'files-download' });
+  }
   if (browse) {
     // Peer browsing rides the fs-picker's api_fs_list target lane (55);
     // gate on reachability, not on peer-ness.
@@ -124875,6 +125310,9 @@ function refreshFilesIdeHostOptions() {
 
 function onFilesIdeHostChanged() {
   const hostId = filesIdeSelectedHostId();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(hostId, { source: 'files-ide' });
+  }
   renderDashboardTargetSummary('files-ide-target-summary', hostId, 'files');
   const state = filesIdeTreeState(hostId);
   const hiddenBtn = document.getElementById('files-ide-hidden-btn');
@@ -127789,6 +128227,9 @@ function setSessionsHost(hostId) {
   // Message lane (flagged): the tunnel twin serves the selected peer's own
   // index, so a host switch re-keys the search. No-op with the flag off.
   scheduleSessionMessageSearch();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(next, { source: 'sessions' });
+  }
 }
 
 // Whole-card action while browsing a peer: hand off to the peer's own
@@ -130629,6 +131070,87 @@ function buildSessionCard(m, derived, ctx) {
       actions.appendChild(btn);
     }
     card.appendChild(actions);
+  }
+
+  // Peer host cards (RC-C1): host-scoped session actions through
+  // api_peer_session_control — the peer authorizes each against the
+  // profile it granted this daemon. Pills derive from the advertised
+  // grant (peerAllowsOperation): a known-denied operation renders no
+  // pill; an unknown grant renders pills that act and report honestly.
+  if (ctx.viewingPeer && sessionId) {
+    const peerHostId = typeof currentSessionsHostId === 'function' ? currentSessionsHostId() : '';
+    const peerEntry = typeof peerEntryForHost === 'function' ? peerEntryForHost(peerHostId) : null;
+    if (peerEntry) {
+      const actions = document.createElement('div');
+      actions.className = 'sc-actions';
+      const linkDown = peerEntry.connected === false;
+      const peerName = peerEntry.label || peerEntry.host_id;
+      const addPill = (label, title, opId, onClick, cls) => {
+        if (!peerAllowsOperation(peerHostId, opId)) return;
+        const btn = document.createElement('button');
+        btn.className = cls || 'ui-btn';
+        btn.textContent = label;
+        btn.title = linkDown
+          ? `${title} — unavailable while the peer link reconnects`
+          : title;
+        btn.disabled = linkDown;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          onClick();
+        });
+        actions.appendChild(btn);
+      };
+      if (s.can_resume !== false) {
+        addPill(
+          'Resume on peer',
+          `Resume this session on ${peerName} (runs there under this daemon's peer grant)`,
+          'task.run',
+          () => {
+            const source = normalizeAgentId(s.backend_source || s.source || '') || 'intendant';
+            daemonApi
+              .request('api_peer_session_control', {
+                peer_id: peerHostId,
+                message: {
+                  action: 'resume_session',
+                  source,
+                  session_id: String(s.session_id),
+                  resume_id: String(s.backend_session_id || s.resume_id || s.session_id),
+                  project_root: s.project_root || null,
+                  direct: true,
+                },
+              })
+              .then(resp => {
+                if (resp.ok) showControlToast('info', `Resume sent to ${peerName}.`);
+                else {
+                  const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+                  showControlToast('error', `${peerName} refused resume (${resp.status})${detail}`);
+                }
+              })
+              .catch(err => showControlToast('error', `Could not reach ${peerName}: ${err?.message || err}`));
+          },
+          'ui-btn sc-resume-btn',
+        );
+      }
+      addPill(
+        'Message',
+        `Target the composer at this session on ${peerName}`,
+        'message.send',
+        () => {
+          if (setPromptTargetPeer(peerHostId, String(s.session_id))) {
+            routeTo('activity');
+            document.getElementById('activity-task-input')?.focus();
+          }
+        },
+      );
+      addPill(
+        'Rename',
+        `Rename this session on ${peerName}`,
+        'session.manage',
+        () => requestSessionRename(s, s.source || '', { hostId: peerHostId }),
+        'ui-btn sc-rename-btn',
+      );
+      if (actions.children.length) card.appendChild(actions);
+    }
   }
 
   if (ctx.viewingPeer) {
@@ -136749,6 +137271,41 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
   switchStatsHost(e.target.value);
 });
 
+// Global operating target (RC-C1): the pane pickers publish into one
+// selection; this listener makes the others follow. Every pane setter
+// is equality-guarded and republishing the same value is a no-op, so
+// the publish→follow→publish cycle terminates immediately.
+document.addEventListener('ui2:target-changed', (e) => {
+  const hostId = String(e?.detail?.hostId || '');
+  // Shell (its local sentinel is SHELL_HOST_ID, not '').
+  if (typeof setShellHost === 'function') {
+    setShellHost(hostId || SHELL_HOST_ID);
+  }
+  // Files IDE + Transfers selects hold their own value; refresh the
+  // options first when the target isn't listed yet (a peer added since
+  // the last rebuild).
+  const followSelect = (selectId, refresh, onChanged) => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    if (sel.value === hostId) return;
+    if (![...sel.options].some(o => o.value === hostId)) refresh();
+    if (sel.value !== hostId) {
+      sel.value = hostId;
+      onChanged();
+    }
+  };
+  followSelect('files-ide-host', refreshFilesIdeHostOptions, onFilesIdeHostChanged);
+  followSelect('files-download-host', refreshFilesDownloadHostOptions, onFilesDownloadHostChanged);
+  if (typeof setSessionsHost === 'function') setSessionsHost(hostId);
+  if (typeof switchStatsHost === 'function' && activeStatsHost !== hostId) {
+    const statsSel = document.getElementById('stats-host-select');
+    if (statsSel && [...statsSel.options].some(o => o.value === hostId)) {
+      statsSel.value = hostId;
+    }
+    switchStatsHost(hostId);
+  }
+});
+
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
@@ -137697,6 +138254,27 @@ function handleDisplayRequestResolved(d) {
     return ids;
   }
 
+  const PEER_SESSION_ROWS = 6; // newest-first cap per peer (fold order)
+
+  // Connected peers are composer targets too (RC-C1): the peer row
+  // delegates a new task; a peer session row scopes a follow-up to
+  // that session. Both spend this daemon's peer grant on the target.
+  function targetablePeers() {
+    if (typeof daemons === 'undefined' || !Array.isArray(daemons)) return [];
+    return daemons.filter(d => d && d.host_id && d.connected !== false);
+  }
+
+  function peerSessionRowsFor(d) {
+    const sessions = Array.isArray(d.sessions) ? d.sessions : [];
+    return sessions.slice(0, PEER_SESSION_ROWS);
+  }
+
+  function activePeerKey() {
+    const t = typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+    if (!t) return '';
+    return t.sessionId ? `ps:${t.hostId} ${t.sessionId}` : `p:${t.hostId}`;
+  }
+
   function rowPhase(sid) {
     if (hasPendingActiveSessionWindow(sid)) return 'active';
     const win = sessionWindows.get(sid);
@@ -137710,10 +138288,17 @@ function handleDisplayRequestResolved(d) {
     const parts = [
       resolvePromptTargetSessionId(),
       explicitForegroundSessionId() ? 'E' : 'A',
+      activePeerKey(),
       filterQuery,
     ];
     for (const sid of usableSessionIds()) {
       parts.push(sid, sessionIdentityParts(sid).name, rowPhase(sid));
+    }
+    for (const d of targetablePeers()) {
+      parts.push(d.host_id, d.label || '', d.connected === false ? 'off' : 'on');
+      for (const s of peerSessionRowsFor(d)) {
+        parts.push(s.session_id, s.label || '', s.phase || '');
+      }
     }
     return parts.join('\u0000');
   }
@@ -137778,6 +138363,44 @@ function handleDisplayRequestResolved(d) {
     return el;
   }
 
+  function buildPeerRow(d, activeKey) {
+    const key = `p:${d.host_id}`;
+    const row = makeRow(key, 'ui2-tsw-peer');
+    const label = d.label || d.host_id;
+    const badge = document.createElement('span');
+    badge.className = 'ui2-tsw-badge ui2-tsw-peer-badge';
+    badge.textContent = label;
+    const sub = document.createElement('span');
+    sub.className = 'ui2-tsw-row-sub';
+    sub.textContent = 'delegates a task';
+    row.append(badge, sub);
+    row.title = `Delegate the composed task to ${label} (runs there under this daemon's peer grant)`;
+    row.setAttribute('aria-label', `Peer ${label}: delegate a task`);
+    if (key === activeKey) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
+  function buildPeerSessionRow(d, s, activeKey) {
+    const key = `ps:${d.host_id} ${s.session_id}`;
+    const row = makeRow(key, 'ui2-tsw-peer-session');
+    const label = d.label || d.host_id;
+    const name = s.label || s.session_id.slice(0, 8);
+    const nameEl = document.createElement('span');
+    nameEl.className = 'ui2-tsw-row-name';
+    nameEl.textContent = name;
+    const phase = (s.phase === 'working' || s.phase === 'thinking')
+      ? 'active'
+      : (s.needs_approval || s.phase === 'waiting_approval') ? 'waiting' : 'done';
+    const dot = document.createElement('span');
+    dot.className = `ui2-tsw-dot ${phase}`;
+    dot.setAttribute('aria-hidden', 'true');
+    row.append(nameEl, dot);
+    row.title = `Send the composed text as a follow-up to session ${s.session_id} on ${label}`;
+    row.setAttribute('aria-label', `Session ${name} on peer ${label}: send a follow-up`);
+    if (key === activeKey) row.setAttribute('aria-selected', 'true');
+    return row;
+  }
+
   function renderRows() {
     const usable = usableSessionIds();
     const target = resolvePromptTargetSessionId();
@@ -137809,7 +138432,34 @@ function handleDisplayRequestResolved(d) {
     if (usable.length) children.push(buildAutoRow(autoActive));
     for (const sid of list) children.push(buildSessionRow(sid, target));
     if (!usable.length) children.push(buildEmpty('No targetable sessions'));
-    else if (!list.length) children.push(buildEmpty('No matches'));
+    else if (!list.length && !q) children.push(buildEmpty('No matches'));
+
+    // Peers section: connected peer daemons and their known sessions.
+    const activeKey = activePeerKey();
+    const peers = targetablePeers();
+    let peerRows = [];
+    for (const d of peers) {
+      const label = d.label || d.host_id;
+      const peerMatches = !q || ui2FuzzyScore(q, label) >= 0 || ui2FuzzyScore(q, d.host_id) >= 0;
+      if (peerMatches) peerRows.push(buildPeerRow(d, activeKey));
+      for (const s of peerSessionRowsFor(d)) {
+        const sessionMatches = !q
+          || peerMatches
+          || ui2FuzzyScore(q, s.label || '') >= 0
+          || ui2FuzzyScore(q, s.session_id) >= 0;
+        if (sessionMatches) peerRows.push(buildPeerSessionRow(d, s, activeKey));
+      }
+    }
+    if (peerRows.length) {
+      const divider = document.createElement('div');
+      divider.className = 'ui2-tsw-eyebrow ui2-tsw-peers-eyebrow';
+      divider.textContent = 'Peers';
+      divider.setAttribute('aria-hidden', 'true');
+      children.push(divider, ...peerRows);
+    }
+    if (usable.length && !list.length && !peerRows.length && q) {
+      children.push(buildEmpty('No matches'));
+    }
     rowsEl.replaceChildren(...children);
     lastSig = currentSignature();
 
@@ -137869,6 +138519,7 @@ function handleDisplayRequestResolved(d) {
       // The explicit pick lives in two refs (foreground + current), possibly
       // holding different ids — discard until the explicit lane is empty so
       // the resolver takes over.
+      clearPromptTargetPeer({ skipChip: true });
       for (let i = 0; i < 4 && explicitForegroundSessionId(); i++) {
         discardPromptTargetReference(explicitForegroundSessionId());
       }
@@ -137877,6 +138528,7 @@ function handleDisplayRequestResolved(d) {
     } else if (key === 'new') {
       // Close without refocus: openNewSessionFromPrompt focuses the
       // new-session input on the next frame and must win.
+      clearPromptTargetPeer();
       openNewSessionFromPrompt();
       closePopover();
     } else if (key.startsWith('s:')) {
@@ -137885,8 +138537,22 @@ function handleDisplayRequestResolved(d) {
         renderRows();
         return;
       }
-      focusSessionWindow(sid);
+      focusSessionWindow(sid); // clears any peer target (one composer, one target)
       closePopover({ refocus: true });
+    } else if (key.startsWith('ps:')) {
+      const rest = key.slice(3);
+      const sep = rest.indexOf(' ');
+      if (sep > 0 && setPromptTargetPeer(rest.slice(0, sep), rest.slice(sep + 1))) {
+        closePopover({ refocus: true });
+      } else {
+        renderRows();
+      }
+    } else if (key.startsWith('p:')) {
+      if (setPromptTargetPeer(key.slice(2), null)) {
+        closePopover({ refocus: true });
+      } else {
+        renderRows();
+      }
     }
   }
 

@@ -1298,6 +1298,9 @@ function focusSessionWindow(sessionId) {
   if (!sid) return;
   const win = ensureSessionWindow(sid);
   if (!win) return;
+  // One composer, one target: focusing a local session retargets the
+  // composer locally, dropping any peer target.
+  if (typeof clearPromptTargetPeer === 'function') clearPromptTargetPeer({ skipChip: true });
   foregroundSessionFullId = sid;
   currentSessionFullId = sid;
   if (app && typeof app.select_session === 'function') {

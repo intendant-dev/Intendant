@@ -1403,6 +1403,9 @@ function refreshFilesIdeHostOptions() {
 
 function onFilesIdeHostChanged() {
   const hostId = filesIdeSelectedHostId();
+  if (typeof setGlobalTargetHost === 'function') {
+    setGlobalTargetHost(hostId, { source: 'files-ide' });
+  }
   renderDashboardTargetSummary('files-ide-target-summary', hostId, 'files');
   const state = filesIdeTreeState(hostId);
   const hiddenBtn = document.getElementById('files-ide-hidden-btn');

@@ -1029,6 +1029,87 @@ function buildSessionCard(m, derived, ctx) {
     card.appendChild(actions);
   }
 
+  // Peer host cards (RC-C1): host-scoped session actions through
+  // api_peer_session_control — the peer authorizes each against the
+  // profile it granted this daemon. Pills derive from the advertised
+  // grant (peerAllowsOperation): a known-denied operation renders no
+  // pill; an unknown grant renders pills that act and report honestly.
+  if (ctx.viewingPeer && sessionId) {
+    const peerHostId = typeof currentSessionsHostId === 'function' ? currentSessionsHostId() : '';
+    const peerEntry = typeof peerEntryForHost === 'function' ? peerEntryForHost(peerHostId) : null;
+    if (peerEntry) {
+      const actions = document.createElement('div');
+      actions.className = 'sc-actions';
+      const linkDown = peerEntry.connected === false;
+      const peerName = peerEntry.label || peerEntry.host_id;
+      const addPill = (label, title, opId, onClick, cls) => {
+        if (!peerAllowsOperation(peerHostId, opId)) return;
+        const btn = document.createElement('button');
+        btn.className = cls || 'ui-btn';
+        btn.textContent = label;
+        btn.title = linkDown
+          ? `${title} — unavailable while the peer link reconnects`
+          : title;
+        btn.disabled = linkDown;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          onClick();
+        });
+        actions.appendChild(btn);
+      };
+      if (s.can_resume !== false) {
+        addPill(
+          'Resume on peer',
+          `Resume this session on ${peerName} (runs there under this daemon's peer grant)`,
+          'task.run',
+          () => {
+            const source = normalizeAgentId(s.backend_source || s.source || '') || 'intendant';
+            daemonApi
+              .request('api_peer_session_control', {
+                peer_id: peerHostId,
+                message: {
+                  action: 'resume_session',
+                  source,
+                  session_id: String(s.session_id),
+                  resume_id: String(s.backend_session_id || s.resume_id || s.session_id),
+                  project_root: s.project_root || null,
+                  direct: true,
+                },
+              })
+              .then(resp => {
+                if (resp.ok) showControlToast('info', `Resume sent to ${peerName}.`);
+                else {
+                  const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+                  showControlToast('error', `${peerName} refused resume (${resp.status})${detail}`);
+                }
+              })
+              .catch(err => showControlToast('error', `Could not reach ${peerName}: ${err?.message || err}`));
+          },
+          'ui-btn sc-resume-btn',
+        );
+      }
+      addPill(
+        'Message',
+        `Target the composer at this session on ${peerName}`,
+        'message.send',
+        () => {
+          if (setPromptTargetPeer(peerHostId, String(s.session_id))) {
+            routeTo('activity');
+            document.getElementById('activity-task-input')?.focus();
+          }
+        },
+      );
+      addPill(
+        'Rename',
+        `Rename this session on ${peerName}`,
+        'session.manage',
+        () => requestSessionRename(s, s.source || '', { hostId: peerHostId }),
+        'ui-btn sc-rename-btn',
+      );
+      if (actions.children.length) card.appendChild(actions);
+    }
+  }
+
   if (ctx.viewingPeer) {
     card.classList.add('sc-peer');
     card.title = 'Open this session on the peer’s dashboard';

@@ -960,6 +960,79 @@ if (DASHBOARD_ACCESS_PAGE_MODE) {
   document.title = 'Intendant Access';
 }
 let daemons = [];
+// ---- Global operating target (RC-C1) ----
+// One dashboard, one "operating <host>" selection. The per-pane host
+// pickers (Shell, Files, Transfers, Sessions, Stats) publish into and
+// follow this instead of each owning a private selection; panes with a
+// wider domain (the Shell's cloud exec hosts, which are not daemons)
+// may show a pane-local override without moving the global. '' = the
+// local daemon (self). Change notifications ride a
+// `ui2:target-changed` CustomEvent on document.
+let globalTargetHostId = '';
+function normalizeTargetHostId(hostId) {
+  const id = String(hostId == null ? '' : hostId).trim();
+  if (!id || id === 'local' || id === 'self') return '';
+  if (typeof selfPeerId !== 'undefined' && selfPeerId && id === selfPeerId) return '';
+  return id;
+}
+function currentGlobalTargetHostId() {
+  return globalTargetHostId;
+}
+function globalTargetIsLocal() {
+  return globalTargetHostId === '';
+}
+function peerEntryForHost(hostId) {
+  const id = normalizeTargetHostId(hostId);
+  if (!id) return null;
+  return daemons.find((d) => d.host_id === id) || null;
+}
+function setGlobalTargetHost(hostId, opts) {
+  const next = normalizeTargetHostId(hostId);
+  // Only daemon targets participate: '' (self) or a known peer row.
+  if (next && !peerEntryForHost(next)) return false;
+  if (next === globalTargetHostId) return true;
+  globalTargetHostId = next;
+  try {
+    document.dispatchEvent(
+      new CustomEvent('ui2:target-changed', {
+        detail: { hostId: next, source: (opts && opts.source) || '' },
+      }),
+    );
+  } catch (_e) {
+    /* CustomEvent is universal in shipped engines; never let a
+       dispatch failure strand the selection itself. */
+  }
+  return true;
+}
+// Honest-affordance helpers: what the peer advertised about OUR grant
+// and about the live link. Unknown grant (older peer, or the echo not
+// yet folded) is "act and report", never denial; unknown link means no
+// media promise.
+function peerGrantOperations(hostId) {
+  const entry = peerEntryForHost(hostId);
+  const ops = entry && entry.grant && Array.isArray(entry.grant.operations)
+    ? entry.grant.operations
+    : null;
+  return ops;
+}
+function peerAllowsOperation(hostId, operationId) {
+  const ops = peerGrantOperations(hostId);
+  if (!ops) return true; // unknown → optimistic, outcome reported honestly
+  return ops.includes(operationId);
+}
+function peerLinkTransportClass(hostId) {
+  const entry = peerEntryForHost(hostId);
+  return entry && entry.link && entry.link.transport_class
+    ? String(entry.link.transport_class)
+    : '';
+}
+// Media/datachannel affordances render from the transport class of the
+// live link — never from the peer row existing. Absent link info on a
+// connected row (daemon predating the field) keeps today's behavior.
+function peerLinkSupportsMedia(hostId) {
+  const cls = peerLinkTransportClass(hostId);
+  return cls !== 'relayed';
+}
 let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
 let accessUserClientGrantSubmitting = false;

@@ -747,10 +747,60 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
 // artifact — all agents (native, Codex, Claude Code, Kimi Code, Pi) treat
 // subsequent messages as new turns in the existing conversation.
 // Shared by the Activity composer and the Station composer.
+// Composer routing for a peer target (RC-C1): a bare peer target
+// delegates the text as a task (`api_peer_task`); a peer session
+// target sends it as a follow-up scoped to that session
+// (`api_peer_session_control` → the federation link → the peer's own
+// per-action authorization). Both spend this daemon's peer grant.
+// Attachments stay local-only: frame ids resolve against this
+// daemon's stores, so they are refused up front instead of silently
+// dropped on the peer.
+function dispatchPeerTaskText(peerTarget, text) {
+  const entry = peerEntryForHost(peerTarget.hostId);
+  const label = (entry && (entry.label || entry.host_id)) || peerTarget.hostId;
+  if (!entry || entry.connected === false) {
+    showControlToast('error', `${label} is not connected — the peer link is reconnecting; try again shortly.`);
+    return false;
+  }
+  if (pendingAttachments.length > 0) {
+    showControlToast('error', 'Attachments cannot ride a peer target yet — remove them or target a local session.');
+    return false;
+  }
+  const done = (resp, verb) => {
+    if (resp.ok) {
+      showControlToast('info', `${verb} ${label}.`);
+    } else {
+      const detail = resp.body && resp.body.error ? ` — ${resp.body.error}` : '';
+      showControlToast('error', `${label} refused (${resp.status})${detail}`);
+    }
+  };
+  const fail = (err) => {
+    showControlToast('error', `Could not reach ${label}: ${err && err.message ? err.message : err}`);
+  };
+  if (peerTarget.sessionId) {
+    daemonApi
+      .request('api_peer_session_control', {
+        peer_id: peerTarget.hostId,
+        message: { action: 'follow_up', text, session_id: peerTarget.sessionId },
+      })
+      .then(resp => done(resp, `Follow-up sent to ${peerTarget.sessionId.slice(0, 8)} on`))
+      .catch(fail);
+  } else {
+    daemonApi
+      .request('api_peer_task', { peer_id: peerTarget.hostId, instructions: text })
+      .then(resp => done(resp, 'Task delegated to'))
+      .catch(fail);
+  }
+  return true;
+}
+
 function dispatchTaskText(text, options = {}) {
   if (!app) return false;
   text = String(text || '').trim();
   if (!text) return false;
+  const peerTarget =
+    typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+  if (peerTarget) return dispatchPeerTaskText(peerTarget, text);
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
@@ -803,6 +853,13 @@ function submitComposedText(text) {
   if (!app) return false;
   text = String(text || '').trim();
   if (!text) return false;
+  const composerPeerTarget =
+    typeof currentPromptTargetPeer === 'function' ? currentPromptTargetPeer() : null;
+  if (composerPeerTarget) {
+    // Peer targets never steer or slash locally — the text goes to the
+    // peer daemon as a delegation or session follow-up.
+    return dispatchPeerTaskText(composerPeerTarget, text);
+  }
   const codexSlash = parseCodexSlashCommand(text);
   if (codexSlash) {
     return !!dispatchCodexSlashCommand(codexSlash);
