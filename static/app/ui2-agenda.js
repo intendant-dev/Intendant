@@ -796,6 +796,29 @@ function agendaRelationPartners(item) {
   return partners;
 }
 
+// The typed view of the same union: one row per partner with the link's
+// kind and direction from whichever side stores it (a typed link reads
+// storer → target; `outgoing` = this item stores it). Untyped links
+// carry kind ''.
+function agendaRelationEdges(item) {
+  const edges = [];
+  const seen = new Set([item.id]);
+  (item.relates_to || []).forEach((link) => {
+    if (seen.has(link.target_id)) return;
+    seen.add(link.target_id);
+    edges.push({ pid: link.target_id, kind: link.link_kind || '', outgoing: true });
+  });
+  (agendaItems || []).forEach((other) => {
+    if (seen.has(other.id)) return;
+    const link = (other.relates_to || []).find((e) => e.target_id === item.id);
+    if (link) {
+      seen.add(other.id);
+      edges.push({ pid: other.id, kind: link.link_kind || '', outgoing: false });
+    }
+  });
+  return edges;
+}
+
 // Triage-rank convention: the triage mandate writes ordinary annotations
 // with the self-described `triage` source, and a "rank N" phrase in the
 // text is its DECLARED ranking convention. The /rank (\d+)/ parse here is

@@ -791,7 +791,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
     </section>
 
     <section class="install-section" id="install">
-      <h2>Stand up a daemon in about ninety seconds</h2>
+      <h2>Stand up a daemon in a few minutes</h2>
       <p class="sectionlede">
         Four answers about the machine the agent will live on, and the exact
         command appears. You can discover it from your phone without a separate
@@ -986,7 +986,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       perform, orchestrators conduct (Codex, Claude Code, Kimi Code, and Pi as
       guest conductors), and the Intendant runs the house and answers to you —
       houses federate, companies tour on signed contracts, house rules always
-      win: a network of agentic networks.</p>
+      win.</p>
     </section>
 
     <section class="trustrow">
@@ -2615,9 +2615,10 @@ mod tests {
             install_at < heroshot_at && heroshot_at < tour_at,
             "install must lead, then the product tour"
         );
-        // The name is the thesis, stated once, quietly, before the trust row.
+        // The name is the thesis, told through the house metaphor — the
+        // ambition itself stays understated on the public page.
         assert!(html.contains("Why “Intendant”"));
-        assert!(html.contains("a network of agentic networks"));
+        assert!(html.contains("companies tour on signed contracts"));
         // Custody names both stores and makes the missing bridge explicit.
         assert!(html.contains(r#"class="fuelmap""#));
         assert!(html.contains("account-vault API/storage only"));

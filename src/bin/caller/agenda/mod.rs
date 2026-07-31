@@ -41,6 +41,7 @@ mod spawn_project;
 mod store;
 mod summary;
 mod types;
+mod working_set;
 
 pub(crate) use ask::{agenda_ask_pending, ask_outcome_delivery_text, spawn_ask_resolver};
 pub(crate) use blobs::find_blob;

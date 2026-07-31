@@ -84,6 +84,7 @@ mod provider_mock;
 mod quarantine;
 mod recording;
 mod relay_tunnel;
+mod remote_compute;
 mod sandbox;
 mod schema_validator;
 mod service_mode;

@@ -4712,6 +4712,21 @@ body.context-focus-active {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--peach) 22%, transparent);
   filter: saturate(0.65);
 }
+/* Closable-at-a-glance lens (the Activity toolbar chip stamps the html
+   attribute; each window's class derives in ui2-activity.js's Arrange
+   walk from the positive safe-to-stop claims): every card the machine
+   does NOT rule safe recedes, the closable set keeps full presence with
+   a quiet affirmative ring. Positive-only — the dim says "look here",
+   never "unsafe". */
+html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
+  opacity: 0.35;
+  filter: saturate(0.55);
+}
+html[data-ui2-closable-lens="on"] .session-window.session-window-closable {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--green) 45%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--green) 22%, transparent);
+}
 /* Terminal honesty strip: a dead window's plain statement of how it
    ended, with the lineage pointer when the work continued elsewhere. */
 .session-window .session-window-terminal-note {
@@ -20473,6 +20488,41 @@ html.ui-v2 #activity-subtabs .ui2-arrange-btn[aria-expanded="true"] svg { transf
 html.ui-v2 #activity-subtabs .ui2-arrange-btn[hidden],
 html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-arrange-btn { display: none; }
 
+/* Closable-at-a-glance chip — sibling styling to Arrange. The count is
+   the machine-positive closable set; the pressed state engages the lens
+   (the window dim itself lives with the .session-window rules in
+   12-styles-tasks-log.css, keyed on the html attribute the toggle
+   stamps). Hidden at zero by ui2-activity.js, grid-only like every
+   window tool. */
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn .ui2-closable-lens-count {
+  color: var(--green);
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn:hover { color: var(--text); background: var(--hover-wash); }
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: color-mix(in srgb, var(--green) 45%, var(--line));
+}
+html.ui-v2 #activity-subtabs .ui2-closable-lens-btn[hidden],
+html.ui-v2:not([data-ui2-layout="grid"]) #activity-subtabs .ui2-closable-lens-btn { display: none; }
+
 /* The Arrange menu popover: same mechanics as the Options popover below
    (display:none base, .open shows, position:fixed against the subtab
    row's overflow-x clipping, JS stamps top/right from the trigger). The
@@ -24553,7 +24603,71 @@ html.ui-v2 .ag2-graph-swatch.s-ring.t-green { border: 1.5px solid var(--green); 
 html.ui-v2 .ag2-graph-swatch.s-line { width: 14px; }
 html.ui-v2 .ag2-graph-swatch.s-line.t-place { border-top: 2px solid rgba(var(--iris-rgb), 0.55); }
 html.ui-v2 .ag2-graph-swatch.s-line.t-rel { border-top: 2px dashed var(--text-3); }
+html.ui-v2 .ag2-graph-swatch.s-line.t-typed { border-top: 2px solid var(--text-2); }
 html.ui-v2 .ag2-graph-swatch.s-line.t-dep { border-top: 2px solid rgba(var(--rose-rgb), 0.6); }
+html.ui-v2 .ag2-graph-swatch.s-ring.t-terr { border: 1.5px dotted var(--text-2); }
+html.ui-v2 .ag2-graph-swatch.s-sq { width: 7px; height: 7px; }
+html.ui-v2 .ag2-graph-swatch.s-sq.t-file { background: var(--text-3); }
+html.ui-v2 .ag2-graph-swatch.s-sq.t-dir {
+  border: 1.5px solid var(--text-2);
+  box-sizing: border-box;
+}
+html.ui-v2 .ag2-graph-projrow {
+  position: absolute;
+  top: 38px;
+  right: 14px;
+  display: flex;
+  gap: 5px;
+}
+html.ui-v2 .ag2-graph-projchip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  padding: 2px 9px;
+  cursor: pointer;
+}
+html.ui-v2 .ag2-graph-projchip:hover:not(:disabled) { color: var(--text); }
+html.ui-v2 .ag2-graph-projchip.active {
+  color: var(--iris);
+  border-color: var(--iris);
+}
+html.ui-v2 .ag2-graph-projchip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+html.ui-v2 .ag2-graph-projdiv {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
+html.ui-v2 .ag2-graph-panel.fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 600;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
+html.ui-v2 .ag2-graph-panel.fullscreen canvas {
+  height: 100vh;
+  height: 100dvh;
+}
+html.ui-v2 .ag2-graph-capnote {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+  pointer-events: none;
+  padding: 0 40px;
+  text-align: center;
+}
 
 /* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows
    ride the shared .ag2-chip family; dots pulse via the shared ui2-pulse
@@ -25956,6 +26070,18 @@ html.ui-v2 .ag2-reladd {
   font-size: 10.5px !important;
   padding: 2px 6px !important;
 }
+html.ui-v2 .ag2-relkind-add {
+  border-radius: var(--r-pill) !important;
+  max-width: 110px;
+  font-size: 10.5px !important;
+  padding: 2px 6px !important;
+}
+html.ui-v2 .ag2-relkind {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
 html.ui-v2 .ag2-tagchip {
   display: inline-flex;
   align-items: center;
@@ -27075,6 +27201,87 @@ html.ui-v2 .handover-update-reach,
 html.ui-v2 .handover-update-note {
   font-size: 11px;
   color: var(--muted, #7e8896);
+}
+
+/* ── self-update panel (Access → Daemons): the PRODUCE half — flavor,
+   behind-ness, the consent buttons, and the job's live log tail. Same
+   family as the update chip above; the chip stays the SWAP surface. ── */
+html.ui-v2 .update-lane-card {
+  margin: 10px 0 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: var(--surface1, rgba(40, 40, 48, 0.96));
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+html.ui-v2 .update-lane-flavor {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-body {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+html.ui-v2 .update-lane-status {
+  color: var(--text, #e6e6e6);
+  font-weight: 600;
+}
+html.ui-v2 .update-lane-note {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-done {
+  font-size: 11px;
+  color: var(--success, #57e389);
+}
+html.ui-v2 .update-lane-error {
+  font-size: 11px;
+  color: var(--error, #ff7b63);
+}
+html.ui-v2 .update-lane-log {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 140px;
+  overflow-y: auto;
+  border-radius: 6px;
+  background: var(--surface0, rgba(24, 24, 30, 0.9));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted, #9aa4b2);
+}
+html.ui-v2 .update-lane-actions {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+}
+html.ui-v2 .update-lane-btn {
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .update-lane-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
@@ -31732,6 +31939,19 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
             <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
                     title="Grid — session windows with the concurrent stream below">Grid</button>
           </div>
+          <!-- Closable-at-a-glance chip + lens toggle: the POSITIVE count
+               of session cards whose close the machine already rules safe
+               (the served safe-to-stop claim settled, idle with no agenda
+               linkage, or finished — sessionWindowClosableClaim in
+               41-session-window-actions.js; the count and each card's
+               class derive in ui2-activity.js's Arrange walk). Hidden at
+               zero — never "0 closable" — and engaging it dims every
+               other card. -->
+          <button type="button" class="ui2-closable-lens-btn" id="ui2-closable-lens-btn" hidden
+                  aria-pressed="false"
+                  title="Session cards that are safe to close — click to dim the rest">
+            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span>closable</span>
+          </button>
           <!-- One compact menu button consolidating the bulk window sweeps
                (it replaced five standalone pills: Minimize done, Hide done,
                Collapse all/Expand all, Expand/Collapse details).
@@ -33781,6 +34001,7 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
               </div>
             </div>
             <div id="access-target-overview" class="access-target-surface"></div>
+            <div id="update-lane-card"></div>
             <details class="acc-fold" id="access-peer-controls-fold">
               <summary>Peer messaging &amp; quick controls</summary>
               <div class="acc-fold-body">
@@ -36809,17 +37030,23 @@ function ui2WireLayoutToggle() {
 // Predicates are 41/40's shared boundaries: sessionWindowIsSubagent (the
 // relationship kind the badges use), sessionWindowIsDoneSubagent (the
 // "N sub" active boundary), sessionWindowHasHardDoneEvidence (ended /
-// done / interrupted — never bare idle).
+// done / interrupted — never bare idle), and
+// sessionWindowIsClosableAtAGlance (the positive-only safe-to-stop
+// composition). The closable lens's per-window class rides this same
+// pass — same freshness ticks (badge crossings, the relationship render
+// pass, every sweep) — so the chip's number and the dimmed set can
+// never disagree.
 function ui2ArrangeMenuModel() {
   const model = {
     windows: 0, expanded: 0, minimized: 0,
     subs: 0, subsExpanded: 0, doneSubsExpanded: 0,
-    hardDone: 0, detailsExpanded: 0,
+    hardDone: 0, detailsExpanded: 0, closable: 0,
   };
   if (typeof sessionWindows === 'undefined') return model;
   const isSub = typeof sessionWindowIsSubagent === 'function' ? sessionWindowIsSubagent : null;
   const isDoneSub = typeof sessionWindowIsDoneSubagent === 'function' ? sessionWindowIsDoneSubagent : null;
   const isHardDone = typeof sessionWindowHasHardDoneEvidence === 'function' ? sessionWindowHasHardDoneEvidence : null;
+  const isClosable = typeof sessionWindowIsClosableAtAGlance === 'function' ? sessionWindowIsClosableAtAGlance : null;
   for (const [sid, win] of sessionWindows) {
     if (!win) continue;
     model.windows += 1;
@@ -36836,6 +37063,11 @@ function ui2ArrangeMenuModel() {
       }
     }
     if (isHardDone && isHardDone(sid)) model.hardDone += 1;
+    if (isClosable) {
+      const closable = isClosable(sid);
+      if (closable) model.closable += 1;
+      if (win.el) win.el.classList.toggle('session-window-closable', closable);
+    }
   }
   return model;
 }
@@ -36917,6 +37149,9 @@ function ui2RefreshArrangeMenu() {
           : `Collapse header details on all ${m.detailsExpanded} expanded session windows`)
       : 'Expand header details on every session window',
   });
+  // The closable chip rides the same single-pass refresh (and the same
+  // walk already stamped every window's closable class above).
+  ui2RefreshClosableLensChip(m.closable);
 }
 
 // Legacy seam: 40-session-launch.js's relationship-render pass still
@@ -36976,6 +37211,82 @@ function ui2RunArrangeAction(action, row) {
   }
   ui2RefreshArrangeMenu();
 }
+
+// ── The closable-at-a-glance lens ──────────────────────────────────────
+// A grid lens over the positive safe-to-stop claims
+// (sessionWindowClosableClaim / sessionWindowIsClosableAtAGlance in
+// 41-session-window-actions.js): the chip counts the cards whose close
+// the machine already rules safe and, engaged, dims every other card so
+// the closable set reads at a glance (the dim rules live with the
+// .session-window styles in 12-styles-tasks-log.css, keyed on the html
+// attribute stamped here). Positive-only at the surface too: the chip
+// hides at zero — never "0 closable" — and because an engaged lens with
+// an empty count would strand a fully-dimmed grid behind a hidden
+// toggle, the refresh disengages it the moment the count empties.
+// Transient by design: the lens is a look, not a mode — it never
+// persists across reloads.
+let ui2ClosableLensOn = false;
+
+function ui2SetClosableLens(on) {
+  ui2ClosableLensOn = !!on;
+  const html = document.documentElement;
+  if (ui2ClosableLensOn) html.setAttribute('data-ui2-closable-lens', 'on');
+  else html.removeAttribute('data-ui2-closable-lens');
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (btn) btn.setAttribute('aria-pressed', ui2ClosableLensOn ? 'true' : 'false');
+}
+
+function ui2RefreshClosableLensChip(count) {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  const n = Number(count) || 0;
+  btn.hidden = n === 0;
+  if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);
+  const countEl = document.getElementById('ui2-closable-lens-count');
+  if (countEl) countEl.textContent = String(n);
+  btn.title = n === 1
+    ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
+    : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`;
+}
+
+function ui2WireClosableLens() {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    ui2SetClosableLens(!ui2ClosableLensOn);
+    ui2RefreshArrangeMenu();
+  });
+}
+
+// QA facade (window.qa convention): claim() drives the pure classifier
+// with an explicit matrix (the conjunction is otherwise untestable
+// without a live daemon), set()/state() drive and snapshot the chip +
+// lens surface after a fresh single-pass walk.
+window.qa = Object.assign(window.qa || {}, {
+  closableLens: {
+    claim: (c) => (typeof sessionWindowClosableClaim === 'function'
+      ? sessionWindowClosableClaim(c || {}) : null),
+    isClosable: (sid) => (typeof sessionWindowIsClosableAtAGlance === 'function'
+      ? sessionWindowIsClosableAtAGlance(sid) : null),
+    set: (on) => { ui2SetClosableLens(!!on); ui2RefreshArrangeMenu(); return ui2ClosableLensOn; },
+    state: () => {
+      ui2RefreshArrangeMenu();
+      const btn = document.getElementById('ui2-closable-lens-btn');
+      const ids = typeof sessionWindows === 'undefined' ? [] : [...sessionWindows.keys()];
+      const canClassify = typeof sessionWindowIsClosableAtAGlance === 'function';
+      return {
+        on: ui2ClosableLensOn,
+        lensAttr: document.documentElement.getAttribute('data-ui2-closable-lens') || '',
+        count: Number(document.getElementById('ui2-closable-lens-count')?.textContent || '0'),
+        chipHidden: !btn || !!btn.hidden,
+        closable: canClassify ? ids.filter((sid) => sessionWindowIsClosableAtAGlance(sid)) : [],
+        closableClassed: ids.filter(
+          (sid) => !!sessionWindows.get(sid)?.el?.classList?.contains('session-window-closable')
+        ),
+      };
+    },
+  },
+});
 
 // Popover mechanics copied from the Options wiring below: fixed-position
 // anchor stamped at open, outside-pointerdown + Escape close, resize
@@ -37541,6 +37852,7 @@ function ui2RailTick(force) {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
     ui2WireArrangeMenu();
+    ui2WireClosableLens();
     ui2WireViewOptions();
     ui2DressComposer();
     ui2BuildVitalsRail();
@@ -37619,7 +37931,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '38e82a937e68d816';
+const INTENDANT_APP_BUILD = '58ee65168a04f957';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -59785,6 +60097,10 @@ function clearLogs(options = {}) {
   updateLogEmptyState();
   activeCommandOutputGroups.clear();
   commandOutputGroups.clear();
+  // The main feed's reasoning-dedupe registry tracks what the feed SHOWS
+  // — emptied feed, emptied registry (41b-reasoning-log.js), or a
+  // reconnect replay's rows would be skipped as already-rendered.
+  resetLiveFeedReasoningDedupe();
   if (clearSessionWindows) {
     for (const win of sessionWindows.values()) {
       resetSessionWindowLog(win);
@@ -65815,16 +66131,23 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     }
     if (!data) throw lastError || new Error('session detail fetch failed');
     const entries = Array.isArray(data.entries) ? data.entries : [];
-    if (!entries.length) return;
     applySessionIdentitiesFromReplayEntries(entries);
     applyExternalIdentitiesFromLogEntries(entries);
     applySessionGoalsFromReplayEntries(entries);
     applySessionPrsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
+    // Live-feed parity lane: fresh transcript-materialized reasoning rows
+    // enter the MAIN Activity feed before the window merge below, so the
+    // mirrored copy is already in the window history and the merge's
+    // signature scan collapses the pair (41b-reasoning-log.js). Runs on
+    // the empty fetch too — the first pass arms the per-session
+    // watermark even when the transcript has no rows yet.
+    const injected = injectTranscriptReasoningIntoLiveFeed(entries, targetSid, record.source);
+    if (!entries.length) return;
     const targetWin = sessionWindows.get(targetSid) || record.win;
     updateSessionWindowRemotePageState(targetWin, data, record.source, record.sessionId);
     const rendered = appendMissingRestoredSessionWindowEntries(targetWin, entries, targetSid);
-    if (rendered > 0) stationScheduleUpdate();
+    if (rendered > 0 || injected > 0) stationScheduleUpdate();
   } catch (err) {
     console.warn('Failed to sync external session window transcript', record.sessionId, err);
   } finally {
@@ -71317,6 +71640,59 @@ function hideDoneSessionWindows() {
   return changed;
 }
 
+// ── Closable at a glance (Track AO follow-through) ─────────────────────
+// The POSITIVE half of the safe-to-stop story, composed for the grid
+// lens (ui2-activity.js owns the count chip and the dim toggle; its
+// Arrange walk derives the count and the per-window class). One claim
+// function, matrix-driven by the QA harness; the × affordance and the
+// stop confirms above keep their own copy surfaces untouched. The
+// predicate is strictly a conjunction of claims that ALREADY exist —
+// never a second derivation:
+//   · the served stop claim (grid_envelope.rs, consumed verbatim):
+//     kills_live_run / owed_work veto outright — the durable journal
+//     debt outranks any process look; settled turns positive only once
+//     the window itself is quiet, extending the ruled
+//     suppressed-while-running choice to the lens (a running window
+//     never reads closable, even settled — it may be doing new,
+//     untracked work);
+//   · the × affordance's linkless conjunction: idle ∧ no agenda linkage;
+//   · hard done evidence (ended / done / interrupted) — the "already
+//     ended" positive the stop flow and the Hide-finished sweep already
+//     rule.
+// A linked occurrence with no served stop claim, and any unrecognized
+// claim, stay not-closable: positive-only, absence claims nothing.
+function sessionWindowClosableClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  if (stop === 'kills_live_run' || stop === 'owed_work') return false;
+  // An ABSENT phase is no claim (normalizeSessionPhase defaults '' to
+  // 'idle', which would read wider than the ×'s raw win.phase === 'idle'
+  // check — positive-only forbids that): a phase-less window is quiet
+  // only on hard done evidence.
+  const quiet = !!claim.hardDone
+    || (!!claim.phase && normalizeSessionPhase(claim.phase) === 'idle');
+  if (stop === 'settled') return quiet;
+  if (stop || claim.linked) return false;
+  return quiet;
+}
+
+// The sid boundary over the pure claim above: every input is a fact some
+// shipped surface already trusts — the served envelope in
+// sessionMetadataById, the ×'s win.phase, the sweeps' hard-done
+// predicate. Nothing here looks at the journal or the process directly.
+function sessionWindowIsClosableAtAGlance(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win) return false;
+  const meta = sessionMetadataById.get(sid) || {};
+  const occ = (meta.agenda || {}).occurrence;
+  return sessionWindowClosableClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!meta.agenda,
+    phase: win.phase || meta.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+  });
+}
+
 // QA facade (window.qa convention): the dashboard validator's grid-pill
 // probe builds throwaway windows and reads per-window sweep state, and the
 // boot smoke's jump-button probe drives the transcript state machine — the
@@ -75317,14 +75693,224 @@ function wireReasoningLogClone(clone, sourceEntry) {
 
 // Live-feed path (dispatched from renderLogEntry): append to the main
 // stream and mirror into the owning session window, exactly like the
-// other special row types.
+// other special row types. The injected-signature check guards the
+// append: when the transcript-sync lane already forwarded this row into
+// the feed, its delayed live/replayed copy must not double it. The match
+// is CONSUMED — an identical text the model genuinely thinks again later
+// renders like it always did; only the injected row's own copy skips.
 function renderReasoningLogEntry(c) {
   finalizeSessionCommandOutputGroups(c);
   inferSessionPhaseFromLog(c);
+  const record = sessionWindowRecordFromLogCommand(c);
+  const signatures = liveFeedReasoningSignatures(record);
+  if (signatures.some(signature => _injectedReasoningSignatures.has(signature))) {
+    for (const signature of signatures) {
+      _injectedReasoningSignatures.delete(signature);
+    }
+    return;
+  }
   const entry = buildReasoningLogEntryNode(c);
   if (!entry) return;
-  appendLogEntryElement(entry, sessionWindowRecordFromLogCommand(c));
+  for (const signature of signatures) {
+    _liveFeedReasoningSignatures.add(signature);
+  }
+  appendLogEntryElement(entry, record);
 }
+
+// ── Transcript → live-feed reasoning parity ────────────────────────────
+// The live lane's only source is the wrapper's normalized event stream —
+// and print-mode Claude Code (sdk-cli entrypoint, ≥ 2.1.217) withholds
+// summarized-thinking TEXT everywhere that stream can see: the streamed
+// thinking_deltas, the completed envelope block, and the native
+// transcript all carry empty signature-only shells (wire capture
+// 2026-07-30, CC 2.1.220 — {"thinking":"","estimated_tokens":N}). For
+// spawned print-mode seats there is honestly nothing to render, and
+// nothing is fabricated. But transcript-materialized thinking DOES exist
+// for cli-entrypoint stretches (interactive-born sessions the daemon
+// adopted or attached), and the session-window transcript sync already
+// fetches those rows on a live cadence — into the window only. This lane
+// forwards the FRESH ones into the main Activity feed too, so live
+// viewers see the same rows the Sessions detail and rehydrated cards
+// render: derived from the one transcript source (derive, don't mirror),
+// same grammar (level model + kind reasoning), same renderer.
+//
+// Three structures, two lifetimes:
+//   - _liveFeedReasoningSignatures is the UNION registry: every reasoning
+//     row the MAIN feed currently shows, from either lane. The injector
+//     checks it so a row the live lane already rendered (or a prior sync
+//     already forwarded) is never forwarded again.
+//   - _injectedReasoningSignatures holds the injected rows only. The
+//     live-lane renderer checks (and consumes from) THIS set, so the one
+//     delayed copy of an injected row skips while a genuinely repeated
+//     identical thought still renders.
+//   Both reset with the feed (clearLogs — a reconnect replay rebuilds the
+//   feed from the session log, which never persisted injected rows).
+//   - the per-(source, session) watermark makes the FIRST sync pass a
+//     catch-up (history belongs to the card/window; the feed starts at
+//     "now") and every later pass live. Page-lifetime: it tracks the
+//     sync lane's coverage, not the feed's contents.
+const _liveFeedReasoningSignatures = new Set();
+const _injectedReasoningSignatures = new Set();
+const _transcriptReasoningSyncWatermarks = new Map();
+
+// Signatures under the window/session canonical id, so the live lane
+// (backend or daemon sid on the row) and the transcript lane (window
+// sid) hash identically. Empty when the record can't be signed — such
+// rows render unguarded, exactly like before this lane existed.
+function liveFeedReasoningSignatures(record) {
+  if (!record || !record.content) return [];
+  const sid = String(record.session_id || record.sessionId || '').trim();
+  const targetSid = (sid && sessionWindowTargetForLogSession(sid)) || sid;
+  if (!targetSid) return [];
+  return sessionWindowTranscriptSignaturesForRecord(
+    { ...record, session_id: targetSid },
+    targetSid
+  );
+}
+
+// The main feed was cleared (reconnect replay, explicit clear): its
+// registries empty with it. Watermarks survive — the transcript's
+// already-covered span is unchanged by what the feed shows.
+function resetLiveFeedReasoningDedupe() {
+  _liveFeedReasoningSignatures.clear();
+  _injectedReasoningSignatures.clear();
+}
+
+// Forward fresh transcript-materialized reasoning rows into the main
+// Activity feed. Called from syncExternalSessionWindowTranscript with
+// the fetched detail entries BEFORE the window merge, so the mirrored
+// copy is already in the window history and the merge's signature scan
+// collapses the pair. Deliberately NOT renderReasoningLogEntry: these
+// rows are late-materialized, so the live side-effects (phase inference,
+// output-group finalization) must not fire from them — a post-round
+// injection would flip a settled card back to "thinking", and a mid-turn
+// one could clip a still-streaming output group. Returns the number of
+// rows appended.
+function injectTranscriptReasoningIntoLiveFeed(entries, targetSid, source) {
+  const sid = String(targetSid || '').trim();
+  if (!sid || !Array.isArray(entries)) return 0;
+  const key = `${String(source || '').trim().toLowerCase()}\u001f${sid}`;
+  let maxTs = null;
+  for (const entry of entries) {
+    const ts = sessionWindowTranscriptTimestampMs(
+      entry?.ts_ms ?? entry?.tsMs ?? entry?.ts ?? entry?.timestamp ?? ''
+    );
+    if (ts !== null && (maxTs === null || ts > maxTs)) maxTs = ts;
+  }
+  if (!_transcriptReasoningSyncWatermarks.has(key)) {
+    // First pass = catch-up. An empty transcript starts the watermark at
+    // 0 so everything that materializes after we started watching counts
+    // as live; a populated one starts at its newest row.
+    _transcriptReasoningSyncWatermarks.set(key, maxTs ?? 0);
+    return 0;
+  }
+  const watermark = _transcriptReasoningSyncWatermarks.get(key);
+  const fresh = [];
+  for (const entry of entries) {
+    if (String(entry?.kind || '') !== 'reasoning') continue;
+    if (String(entry?.level || '') !== 'model') continue;
+    if (!String(entry?.content || '').trim()) continue;
+    const ts = sessionWindowTranscriptTimestampMs(
+      entry?.ts_ms ?? entry?.tsMs ?? entry?.ts ?? entry?.timestamp ?? ''
+    );
+    if (ts === null || ts <= watermark) continue;
+    fresh.push({ entry, ts });
+  }
+  fresh.sort((a, b) => a.ts - b.ts);
+  let injected = 0;
+  for (const { entry } of fresh) {
+    const record = sessionWindowRecordFromReplayEntry(entry, sid);
+    if (!record) continue;
+    const targeted = { ...record, session_id: sid };
+    const signatures = liveFeedReasoningSignatures(targeted);
+    // Unsignable rows stay out: an injected row the live lane could not
+    // recognize later would double with its own delayed copy.
+    if (signatures.length === 0) continue;
+    if (signatures.some(signature => _liveFeedReasoningSignatures.has(signature))) continue;
+    const node = buildReasoningLogEntryNode(targeted);
+    if (!node) continue;
+    for (const signature of signatures) {
+      _liveFeedReasoningSignatures.add(signature);
+      _injectedReasoningSignatures.add(signature);
+    }
+    appendLogEntryElement(node, targeted);
+    injected += 1;
+  }
+  if (maxTs !== null && maxTs > watermark) {
+    _transcriptReasoningSyncWatermarks.set(key, maxTs);
+  }
+  return injected;
+}
+
+// QA readback (window.qa convention): a self-contained behavioral probe
+// of this lane against the REAL functions — watermark catch-up, the
+// freshness gate, idempotent re-sync, and the cross-lane dedupe in both
+// directions. Uses a unique synthetic session id per run and scrubs its
+// rows and mirror window on the way out; meant for throwaway QA
+// dashboards (scripts/validate-dashboard.cjs --wait-for-function
+// "window.qa.reasoningLiveParity().pass").
+window.qa = Object.assign(window.qa || {}, {
+  reasoningLiveParity() {
+    const sid = 'qa-reasoning-parity-' + Date.now().toString(36);
+    const source = 'claude-code';
+    const t0 = Date.now() - 60000;
+    const mk = (content, tsMs) => ({
+      level: 'model',
+      source: 'Claude Code',
+      kind: 'reasoning',
+      content,
+      ts: new Date(tsMs).toISOString(),
+      ts_ms: tsMs,
+    });
+    const countRows = () => document.querySelectorAll(
+      `#log-stream .reasoning-log-entry[data-session-id="${sid}"]`
+    ).length;
+    const live = content => renderReasoningLogEntry({
+      level: 'model', source: 'Claude Code', kind: 'reasoning',
+      content, session_id: sid, ts_ms: Date.now(),
+    });
+    const report = { pass: false, sid };
+    try {
+      report.firstPassInjected = injectTranscriptReasoningIntoLiveFeed(
+        [mk('probe row A', t0)], sid, source);
+      report.secondPassInjected = injectTranscriptReasoningIntoLiveFeed(
+        [mk('probe row A', t0), mk('probe row B', t0 + 1000)], sid, source);
+      report.resyncInjected = injectTranscriptReasoningIntoLiveFeed(
+        [mk('probe row A', t0), mk('probe row B', t0 + 1000)], sid, source);
+      report.rowsAfterInject = countRows();
+      // The injected row's own delayed live copy skips (and is consumed)…
+      live('probe row B');
+      report.rowsAfterLiveDup = countRows();
+      // …so the same text genuinely thought again still renders.
+      live('probe row B');
+      report.rowsAfterLiveRepeat = countRows();
+      live('probe row C');
+      report.rowsAfterLiveNew = countRows();
+      report.postLiveResyncInjected = injectTranscriptReasoningIntoLiveFeed(
+        [mk('probe row C', t0 + 2000)], sid, source);
+      report.pass =
+        report.firstPassInjected === 0 &&
+        report.secondPassInjected === 1 &&
+        report.resyncInjected === 0 &&
+        report.rowsAfterInject === 1 &&
+        report.rowsAfterLiveDup === 1 &&
+        report.rowsAfterLiveRepeat === 2 &&
+        report.rowsAfterLiveNew === 3 &&
+        report.postLiveResyncInjected === 0;
+    } finally {
+      const synthetic = document.querySelectorAll(`.log-entry[data-session-id="${sid}"]`);
+      const removedFromMain = Array.from(synthetic)
+        .filter(el => el.closest('#log-stream')).length;
+      synthetic.forEach(el => el.remove());
+      if (typeof removeSessionWindow === 'function') removeSessionWindow(sid);
+      if (typeof logEntryCount === 'number') {
+        logEntryCount = Math.max(0, logEntryCount - removedFromMain);
+        updateLogEmptyState();
+      }
+    }
+    return report;
+  },
+});
 /* ── static/app/42-usage-terminal.js ── */
 // ── Usage Tab Rendering ──
 // ── Token Ticker ──
@@ -92304,6 +92890,29 @@ function agendaRelationPartners(item) {
   return partners;
 }
 
+// The typed view of the same union: one row per partner with the link's
+// kind and direction from whichever side stores it (a typed link reads
+// storer → target; `outgoing` = this item stores it). Untyped links
+// carry kind ''.
+function agendaRelationEdges(item) {
+  const edges = [];
+  const seen = new Set([item.id]);
+  (item.relates_to || []).forEach((link) => {
+    if (seen.has(link.target_id)) return;
+    seen.add(link.target_id);
+    edges.push({ pid: link.target_id, kind: link.link_kind || '', outgoing: true });
+  });
+  (agendaItems || []).forEach((other) => {
+    if (seen.has(other.id)) return;
+    const link = (other.relates_to || []).find((e) => e.target_id === item.id);
+    if (link) {
+      seen.add(other.id);
+      edges.push({ pid: other.id, kind: link.link_kind || '', outgoing: false });
+    }
+  });
+  return edges;
+}
+
 // Triage-rank convention: the triage mandate writes ordinary annotations
 // with the self-described `triage` source, and a "rank N" phrase in the
 // text is its DECLARED ranking convention. The /rank (\d+)/ parse here is
@@ -95713,6 +96322,28 @@ let agendaInspAnnDraft = '';
 let agendaInspTagDraft = '';
 let agendaInspRefDraft = '';
 let agendaInspRefMust = false;
+let agendaInspRelKind = '';
+
+// The typed-adjacency vocabulary (G2 `link_kind`) — a static mirror of
+// the daemon's RELATES_TO_LINK_KINDS, pinned by a daemon-side parity
+// test so a vocabulary change that forgets this file fails the suite
+// instead of shipping as drift.
+const AGENDA_REL_KINDS = ['duplicates', 'supersedes', 'follow_up_of', 'evidences'];
+// Reading direction: a typed link reads storer → target ("A supersedes
+// B" lives on A). The passive forms keep the incoming side readable.
+const AGENDA_REL_KIND_LABELS = {
+  duplicates: ['duplicates ▸', '◂ duplicated by'],
+  supersedes: ['supersedes ▸', '◂ superseded by'],
+  follow_up_of: ['follow-up of ▸', '◂ has follow-up'],
+  evidences: ['evidences ▸', '◂ evidenced by'],
+};
+
+function agendaRelKindLabel(kind, outgoing) {
+  const pair = AGENDA_REL_KIND_LABELS[kind];
+  // Unknown kinds (a newer daemon's vocabulary) stay readable as text.
+  if (!pair) return outgoing ? `${kind} ▸` : `◂ ${kind}`;
+  return outgoing ? pair[0] : pair[1];
+}
 
 function agendaOpenInspector(id) {
   const opened = agendaFindItem(id);
@@ -96468,14 +97099,23 @@ function agendaInspOrganizationHtml(item) {
       const selected = item.part_of && item.part_of.parent_id === x.id ? ' selected' : '';
       return `<option value="${escapeHtml(x.id)}"${selected}>${hub}${escapeHtml(x.title.slice(0, 46))}</option>`;
     }).join('');
-  const partners = agendaRelationPartners(item);
-  const rels = [...partners].map((pid) => {
+  const relEdges = agendaRelationEdges(item);
+  const partners = new Set(relEdges.map((edge) => edge.pid));
+  const rels = relEdges.map(({ pid, kind, outgoing }) => {
     const target = agendaFindItem(pid);
     if (!target) return '';
+    const kindChip = kind
+      ? `<span class="ag2-relkind">${escapeHtml(agendaRelKindLabel(kind, outgoing))}</span>`
+      : '';
     return `<span class="ag2-relchip">
-      <a data-open-item="${escapeHtml(pid)}">${escapeHtml(target.title.slice(0, 34))}</a>
-      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the see-also link (the log keeps history)">×</button>
+      ${kindChip}<a data-open-item="${escapeHtml(pid)}">${escapeHtml(target.title.slice(0, 34))}</a>
+      <button type="button" class="ag2-x" data-remove-rel="${escapeHtml(pid)}" title="Remove the link (the log keeps history; re-add to change its kind)">×</button>
     </span>`;
+  }).join('');
+  const relKindOptions = ['', ...AGENDA_REL_KINDS].map((kind) => {
+    const selected = kind === agendaInspRelKind ? ' selected' : '';
+    const label = kind ? kind.replace(/_/g, ' ') : 'see-also';
+    return `<option value="${kind}"${selected}>${label}</option>`;
   }).join('');
   const relOptions = others
     .filter((x) => !partners.has(x.id))
@@ -96500,6 +97140,9 @@ function agendaInspOrganizationHtml(item) {
         <span class="ag2-orgk">See also</span>
         <div class="ag2-orgv">
           ${rels}
+          <select class="ag2-relkind-add" data-act-change="rel-kind" aria-label="Link kind (reads this item → target)">
+            ${relKindOptions}
+          </select>
           <select class="ag2-reladd" data-act-change="rel-add" aria-label="Relate to">
             <option value="">+ relate…</option>${relOptions}
           </select>
@@ -96881,10 +97524,18 @@ function agendaInspChange(e) {
     agendaSetItemUrgency(item.id, t.value, t);
   } else if (t.dataset.actChange === 'place') {
     agendaInspPlace(item, t.value, t);
+  } else if (t.dataset.actChange === 'rel-kind') {
+    // Draft only — the link sends when a target is picked.
+    agendaInspRelKind = t.value;
   } else if (t.dataset.actChange === 'rel-add') {
     const v = t.value;
     t.value = '';
-    if (v) agendaSendOp({ op: 'add_relates_to', id: item.id, target_id: v }, t);
+    if (v) {
+      const params = { op: 'add_relates_to', id: item.id, target_id: v };
+      if (agendaInspRelKind) params.link_kind = agendaInspRelKind;
+      agendaInspRelKind = '';
+      agendaSendOp(params, t);
+    }
   } else if (t.dataset.actChange === 'dep-add') {
     const v = t.value;
     if (v) {
@@ -96950,12 +97601,14 @@ function agendaInspAddTag(item) {
 // Pointer type inference for the add row (the daemon validates the typed
 // command either way — this only picks the claimed type): http(s) → url,
 // a 12+-hex run → memory claim id, an id the sessions join knows → session,
-// anything else → file path.
+// a trailing slash → dir (the browser cannot stat; the daemon re-checks
+// and normalizes the slash away), anything else → file path.
 function agendaInspInferRefType(locator) {
   if (/^https?:\/\//i.test(locator)) return 'url';
   if (/^[0-9a-f]{12,}$/i.test(locator)) return 'memory';
   if (agendaSessions && agendaSessions[locator]) return 'session';
   if (/^sess-/.test(locator)) return 'session';
+  if (locator.length > 1 && /\/$/.test(locator)) return 'dir';
   return 'file';
 }
 
@@ -97978,6 +98631,66 @@ let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
 let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+// Projection state: 'all' (whole non-retired ledger), 'hubs' (the hub
+// overview — automatic past the node cap, or chosen), 'focus' (one
+// hub's placed subtree). The render pass decides the projection from
+// the chip row + focus + cap; build/draw only read it. `territory`
+// overlays derived file/dir satellite nodes on the 'all'/'focus' pools.
+let agendaGraphFocus = null;
+let agendaGraphProjection = 'all';
+let agendaGraphChosen = null; // null = auto ('hubs' past the cap, else 'all')
+let agendaGraphTerritory = false;
+let agendaGraphSubtreeTerr = new Map();
+let agendaGraphTerrStats = { shown: 0, total: 0 };
+// Arrangement mode over the current pool: 'orbit' (the default force
+// constellation) or one of the ontology lenses — 'flow' (relies_on
+// layered left→right), 'time' (age as radius, newest center), 'actor'
+// (clustered by parking provenance), 'attention' (needs-you gravity).
+// Modes bias the layout and emphasis only; pool, links, picking, caps,
+// and card-lens parity are untouched. Build computes the active mode's
+// per-node targets; relax applies them as one extra spring.
+let agendaGraphMode = 'orbit';
+const AGENDA_GRAPH_MODES = [
+  ['flow', 'flow', 'dependency flow — prerequisites left, dependents right'],
+  ['time', 'time', 'age as radius — newest at the center'],
+  ['actor', 'actor', 'clustered by who parked it'],
+  ['attention', 'attention', 'needs-you gravity — attention items pull center'],
+];
+let agendaGraphTimeMarks = [];
+let agendaGraphActorMarks = [];
+let agendaGraphAttnCount = 0;
+let agendaGraphFullscreen = false;
+let agendaGraphEscHook = null;
+
+// Theater-mode fullscreen: CSS-only (`position: fixed` on the panel) —
+// the packaged app's WKWebView does not reliably grant the
+// element-fullscreen API, and the CSS route behaves identically on
+// every frontend. The draw loop re-measures the canvas per frame, so
+// no canvas code changes; the wire pass re-applies the state across
+// re-renders. ESC exits (deferring to overlays that already consumed
+// the key).
+function agendaGraphSetFullscreen(on) {
+  agendaGraphFullscreen = on;
+  if (!on) agendaGraphRemoveEsc();
+  agendaRenderTab();
+}
+
+function agendaGraphEnsureEsc() {
+  if (agendaGraphEscHook) return;
+  agendaGraphEscHook = (e) => {
+    if (e.key === 'Escape' && !e.defaultPrevented) {
+      agendaGraphSetFullscreen(false);
+    }
+  };
+  document.addEventListener('keydown', agendaGraphEscHook);
+}
+
+function agendaGraphRemoveEsc() {
+  if (agendaGraphEscHook) {
+    document.removeEventListener('keydown', agendaGraphEscHook);
+    agendaGraphEscHook = null;
+  }
+}
 let agendaGraphMouse = { x: -1e4, y: -1e4, down: false, moved: 0 };
 let agendaGraphHover = null;
 let agendaGraphPalCache = null;
@@ -97993,16 +98706,75 @@ function agendaGraphReducedMotion() {
 
 // The graph's pool: every non-retired item, deliberately unfiltered —
 // the constellation shows the whole topology; search and the lens-bar
-// filter chips keep applying to the card lenses only.
+// filter chips keep applying to the card lenses only. A focused hub
+// narrows the pool to its placed subtree (self included); a focus whose
+// item left the ledger clears itself.
 function agendaGraphPoolItems() {
-  return (agendaItems || []).filter((item) => item.status !== 'retired');
+  const all = (agendaItems || []).filter((item) => item.status !== 'retired');
+  if (agendaGraphFocus) {
+    if (!all.some((item) => item.id === agendaGraphFocus)) {
+      agendaGraphFocus = null;
+    } else {
+      const desc = agendaDescendantIds(agendaGraphFocus);
+      return all.filter(
+        (item) => item.id === agendaGraphFocus || desc.has(item.id),
+      );
+    }
+  }
+  return all;
+}
+
+// The over-cap degradation: instead of refusing, the constellation
+// becomes a hub overview — only items with placed children — and a
+// click focuses one hub's subtree. The projection stays functional at
+// any ledger size a real taxonomy produces.
+function agendaGraphHubOverviewItems(all) {
+  const parents = new Set();
+  all.forEach((item) => {
+    if (item.part_of) parents.add(item.part_of.parent_id);
+  });
+  return all.filter((item) => parents.has(item.id));
+}
+
+// The active projection's node pool — the one truth build and draw use.
+function agendaGraphProjectionItems() {
+  const pool = agendaGraphPoolItems();
+  if (agendaGraphProjection === 'hubs' && !agendaGraphFocus) {
+    return agendaGraphHubOverviewItems(pool);
+  }
+  return pool;
 }
 
 // ---- Lens surface (the AGENDA_LENSES render/deactivate pair) ----
 
 function agendaGraphRenderLens(host) {
-  const items = agendaGraphPoolItems();
+  // Resolve the projection: an explicit chip choice wins; focus
+  // overrides the pool; auto degrades an over-cap ledger to the hub
+  // overview (the ratified cap still bounds every projection — the
+  // O(n²) relaxation and the label field stop earning their keep
+  // beyond it).
+  let items = agendaGraphPoolItems();
+  let overCapAll = false;
+  if (agendaGraphFocus) {
+    agendaGraphProjection = 'focus';
+  } else {
+    const wantHubs = agendaGraphChosen === 'hubs'
+      || (agendaGraphChosen !== 'all' && items.length > AGENDA_GRAPH_NODE_CAP);
+    agendaGraphProjection = 'all';
+    if (wantHubs) {
+      const hubs = agendaGraphHubOverviewItems(items);
+      if (hubs.length && hubs.length <= AGENDA_GRAPH_NODE_CAP) {
+        items = hubs;
+        agendaGraphProjection = 'hubs';
+      }
+    } else if (agendaGraphChosen === 'all' && items.length > AGENDA_GRAPH_NODE_CAP) {
+      // The owner explicitly asked for Everything past the cap: keep
+      // the panel and its chips, park the canvas, say why.
+      overCapAll = true;
+    }
+  }
   if (!items.length) {
+    agendaGraphFullscreen = false;
     agendaGraphTeardown();
     host.innerHTML = `<div class="ag2-empty">
       <div class="ag2-empty-glyph">◍</div>
@@ -98011,15 +98783,17 @@ function agendaGraphRenderLens(host) {
     </div>`;
     return;
   }
-  if (items.length > AGENDA_GRAPH_NODE_CAP) {
-    // Ratified cap: past this the O(n²) relaxation and the label field
-    // stop earning their keep — skip the layout entirely.
+  if (!overCapAll && items.length > AGENDA_GRAPH_NODE_CAP) {
+    // A focused subtree past the cap has no cheaper projection to
+    // degrade to — the flat refusal names the way out (and drops any
+    // fullscreen so the refusal never fills the window).
+    agendaGraphFullscreen = false;
     agendaGraphTeardown();
     host.innerHTML = `<div class="ag2-graph-panel empty">
       <div class="ag2-empty">
         <div class="ag2-empty-glyph">◍</div>
         <div class="ag2-empty-title">The constellation caps at ${AGENDA_GRAPH_NODE_CAP} items</div>
-        <div class="ag2-empty-hint">Use By hub for large ledgers.</div>
+        <div class="ag2-empty-hint">This subtree exceeds the cap — focus a narrower hub, or use By hub.</div>
       </div>
     </div>`;
     return;
@@ -98029,8 +98803,104 @@ function agendaGraphRenderLens(host) {
     host.innerHTML = agendaGraphPanelHtml();
     canvas = host.querySelector('#ag2-graph-canvas');
   }
+  agendaGraphWireChrome(host, overCapAll);
+  if (overCapAll) {
+    agendaGraphTeardown();
+    return;
+  }
   agendaGraphBindCanvas(canvas);
   agendaGraphEnsureLoop();
+}
+
+// Per-projection static chrome: the projection chip row, the cap note,
+// and the hint line. Static strings only — no item text ever lands in
+// this markup (the painted badge carries titles as inert pixels).
+function agendaGraphWireChrome(host, overCapAll) {
+  const panel = host.querySelector('.ag2-graph-panel');
+  if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  if (agendaGraphFullscreen) agendaGraphEnsureEsc();
+  else agendaGraphRemoveEsc();
+  const hintLine = host.querySelector('#ag2-graph-hint');
+  if (hintLine) {
+    const modeHint = (AGENDA_GRAPH_MODES.find(([m]) => m === agendaGraphMode) || [])[2];
+    hintLine.textContent = overCapAll
+      ? 'everything exceeds the cap — pick hubs, or focus one hub'
+      : modeHint
+        || (agendaGraphProjection === 'hubs'
+          ? 'hub overview — click a hub to focus its subtree'
+          : agendaGraphProjection === 'focus'
+            ? (agendaGraphTerritory
+              ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
+              : 'focused subtree — double-click empty space to clear')
+            : 'drag to orbit · click a node to open it · double-click a hub to focus');
+  }
+  const note = host.querySelector('#ag2-graph-capnote');
+  if (note) note.hidden = !overCapAll;
+  const inHubs = !overCapAll && agendaGraphProjection === 'hubs';
+  const chips = host.querySelectorAll('.ag2-graph-projchip');
+  chips.forEach((chip) => {
+    const kind = chip.dataset.proj;
+    if (kind === 'hubs') {
+      chip.classList.toggle('active', inHubs);
+      chip.disabled = false;
+      chip.title = 'only the hubs — click one to focus its subtree';
+      chip.onclick = () => {
+        agendaGraphChosen = 'hubs';
+        agendaGraphFocus = null;
+        agendaRenderTab();
+      };
+    } else if (kind === 'all') {
+      chip.classList.toggle('active', overCapAll
+        || (!inHubs && agendaGraphProjection === 'all'));
+      chip.disabled = false;
+      chip.title = 'every non-retired item (bounded by the node cap)';
+      chip.onclick = () => {
+        agendaGraphChosen = 'all';
+        agendaGraphFocus = null;
+        agendaRenderTab();
+      };
+    } else if (kind === 'terr') {
+      chip.classList.toggle('active', agendaGraphTerritory && !inHubs);
+      chip.disabled = inHubs || overCapAll;
+      chip.title = inHubs
+        ? 'territory needs a concrete pool — focus a hub or pick everything'
+        : 'overlay file/dir satellites from the pool’s refs';
+      chip.onclick = () => {
+        agendaGraphTerritory = !agendaGraphTerritory;
+        agendaRenderTab();
+      };
+    } else if (kind === 'clearfocus') {
+      chip.hidden = !agendaGraphFocus;
+      chip.classList.add('active');
+      chip.disabled = false;
+      chip.title = 'clear the focused hub';
+      chip.onclick = () => {
+        agendaGraphFocus = null;
+        agendaRenderTab();
+      };
+    } else if (kind && kind.startsWith('mode-')) {
+      const mode = kind.slice(5);
+      chip.classList.toggle('active', agendaGraphMode === mode);
+      chip.disabled = overCapAll;
+      chip.title = agendaGraphMode === mode
+        ? 'back to the orbit arrangement'
+        : (AGENDA_GRAPH_MODES.find(([m]) => m === mode) || [])[2] || mode;
+      chip.onclick = () => {
+        agendaGraphMode = agendaGraphMode === mode ? 'orbit' : mode;
+        agendaRenderTab();
+      };
+    } else if (kind === 'full') {
+      chip.textContent = agendaGraphFullscreen ? '✕ exit full' : '⛶ full';
+      chip.classList.toggle('active', agendaGraphFullscreen);
+      chip.disabled = false;
+      chip.title = agendaGraphFullscreen
+        ? 'exit fullscreen (esc works too)'
+        : 'fill the window with the map';
+      chip.onclick = () => {
+        agendaGraphSetFullscreen(!agendaGraphFullscreen);
+      };
+    }
+  });
 }
 
 function agendaGraphLegendChip(swatchClass, label) {
@@ -98047,15 +98917,33 @@ function agendaGraphPanelHtml() {
       <div class="ag2-graph-eyebrow-title">Constellation</div>
       <div class="ag2-graph-eyebrow-sub">placement · adjacency · dependencies</div>
     </div>
-    <div class="ag2-graph-hint">drag to orbit · click a node to open it</div>
+    <div class="ag2-graph-hint" id="ag2-graph-hint">drag to orbit · click a node to open it</div>
+    <div class="ag2-graph-projrow">
+      <button type="button" class="ag2-graph-projchip" data-proj="hubs">hubs</button>
+      <button type="button" class="ag2-graph-projchip" data-proj="all">everything</button>
+      <button type="button" class="ag2-graph-projchip" data-proj="terr">territory</button>
+      <button type="button" class="ag2-graph-projchip" data-proj="clearfocus" hidden>focused ✕</button>
+      <span class="ag2-graph-projdiv"></span>
+      ${AGENDA_GRAPH_MODES.map(([mode, label]) =>
+    `<button type="button" class="ag2-graph-projchip" data-proj="mode-${mode}">${label}</button>`).join('\n      ')}
+      <span class="ag2-graph-projdiv"></span>
+      <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
+    </div>
+    <div class="ag2-graph-capnote" id="ag2-graph-capnote" hidden>
+      past the ${AGENDA_GRAPH_NODE_CAP}-node cap — the hubs projection or a focused hub keeps the map legible
+    </div>
     <div class="ag2-graph-legend">
       ${agendaGraphLegendChip('s-dot t-iris', 'open')}
       ${agendaGraphLegendChip('s-dot t-amber', 'question')}
       ${agendaGraphLegendChip('s-dot t-green', 'done')}
       ${agendaGraphLegendChip('s-ring t-rose', 'blocked')}
       ${agendaGraphLegendChip('s-ring t-green', 'standing run')}
+      ${agendaGraphLegendChip('s-ring t-terr', 'territory')}
+      ${agendaGraphLegendChip('s-sq t-file', 'file')}
+      ${agendaGraphLegendChip('s-sq t-dir', 'dir')}
       ${agendaGraphLegendChip('s-line t-place', 'filed under')}
       ${agendaGraphLegendChip('s-line t-rel', 'see-also')}
+      ${agendaGraphLegendChip('s-line t-typed', 'typed →')}
       ${agendaGraphLegendChip('s-line t-dep', 'waits on')}
     </div>
   </div>`;
@@ -98093,13 +98981,37 @@ function agendaGraphBindCanvas(canvas) {
     },
     up: () => {
       const m = agendaGraphMouse;
-      // A press that traveled under ~6px is a click; open its node in
-      // the slice-A inspector.
+      // A press that traveled under ~6px is a click. In the hub
+      // overview a click focuses the hub's subtree; everywhere else it
+      // opens the node in the slice-A inspector.
       if (m.down && m.moved < 6 && agendaGraphHover) {
-        agendaOpenInspector(agendaGraphHover);
+        const satNode = agendaGraphHover.startsWith('terr|')
+          ? agendaGraphNodes.find((n) => n.id === agendaGraphHover)
+          : null;
+        if (satNode && satNode.sat) {
+          // Satellites are view-materialized, not store items: the
+          // click opens the newest carrying item.
+          agendaOpenInspector(satNode.sat.carrier);
+        } else if (agendaGraphProjection === 'hubs') {
+          agendaGraphFocus = agendaGraphHover;
+          agendaRenderTab();
+        } else {
+          agendaOpenInspector(agendaGraphHover);
+        }
       }
       m.down = false;
       agendaGraphArmAutoResume();
+    },
+    dbl: () => {
+      // Double-click a hub to focus its subtree; double-click empty
+      // space to clear an active focus.
+      if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
+        agendaGraphFocus = agendaGraphHover;
+        agendaRenderTab();
+      } else if (!agendaGraphHover && agendaGraphFocus) {
+        agendaGraphFocus = null;
+        agendaRenderTab();
+      }
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -98115,6 +99027,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mousedown', hooks.down);
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
+  canvas.addEventListener('dblclick', hooks.dbl);
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -98126,6 +99039,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mousedown', hooks.down);
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
+    canvas.removeEventListener('dblclick', hooks.dbl);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -98195,6 +99109,7 @@ function agendaGraphTeardown() {
     agendaGraphPaneObserver = null;
   }
   agendaGraphUnbindCanvas();
+  agendaGraphRemoveEsc();
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
@@ -98206,12 +99121,77 @@ function agendaGraphTeardown() {
 // nodes keep their positions and the settle budget re-arms so the new
 // shape relaxes in over the following frames.
 function agendaGraphBuild() {
-  const items = agendaGraphPoolItems();
-  const key = items.map((x) => [
+  const items = agendaGraphProjectionItems();
+  // Territory satellites: one node per distinct file/dir locator across
+  // the pool's refs (DECLARED territory; observed affinity joins later
+  // via the gardener), newest attach first, capped into the node-cap
+  // room so items + satellites never exceed the ratified bound.
+  const territoryOn = agendaGraphTerritory && agendaGraphProjection !== 'hubs';
+  let satellites = [];
+  if (territoryOn) {
+    const best = new Map();
+    items.forEach((x) => (x.refs || []).forEach((r) => {
+      if (r.ref_type !== 'file' && r.ref_type !== 'dir') return;
+      const skey = `${r.ref_type}:${r.locator}`;
+      let entry = best.get(skey);
+      if (!entry) {
+        entry = {
+          key: skey, t: r.ref_type, locator: r.locator,
+          newest: 0, carrier: x.id, owners: [],
+        };
+        best.set(skey, entry);
+      }
+      entry.owners.push(x.id);
+      if ((r.added_ms || 0) >= entry.newest) {
+        entry.newest = r.added_ms || 0;
+        entry.carrier = x.id;
+      }
+    }));
+    const room = Math.max(0, AGENDA_GRAPH_NODE_CAP - items.length);
+    const all = [...best.values()].sort((a, b) =>
+      b.newest - a.newest || (a.locator < b.locator ? -1 : 1));
+    satellites = all.slice(0, Math.min(60, room));
+    agendaGraphTerrStats = { shown: satellites.length, total: all.length };
+  } else {
+    agendaGraphTerrStats = { shown: 0, total: 0 };
+  }
+  // Hub overview: halo hubs by their SUBTREE's declared territory — a
+  // client-side walk over the full pool (no daemon change), so the map
+  // shows where the files live before diving in.
+  agendaGraphSubtreeTerr = new Map();
+  if (agendaGraphProjection === 'hubs') {
+    const pool = agendaGraphPoolItems();
+    const kids = new Map();
+    pool.forEach((x) => {
+      if (x.part_of) {
+        const list = kids.get(x.part_of.parent_id) || [];
+        list.push(x.id);
+        kids.set(x.part_of.parent_id, list);
+      }
+    });
+    const own = new Map(pool.map((x) => [x.id,
+      (x.refs || []).filter((r) => r.ref_type === 'file' || r.ref_type === 'dir').length]));
+    items.forEach((hub) => {
+      let sum = 0;
+      const seen = new Set();
+      const queue = [hub.id];
+      while (queue.length) {
+        const id = queue.pop();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        sum += own.get(id) || 0;
+        (kids.get(id) || []).forEach((k) => queue.push(k));
+      }
+      agendaGraphSubtreeTerr.set(hub.id, sum);
+    });
+  }
+  const key = `${agendaGraphProjection}|${agendaGraphFocus || ''}|${agendaGraphMode}|terr:${satellites.map((s) => s.key).join(',')};` + items.map((x) => [
     x.id,
     x.status,
     x.part_of ? x.part_of.parent_id : '',
-    (x.relates_to || []).length,
+    // Adjacency keyed per-link (target + kind) so a re-typed link
+    // rebuilds even when the count is unchanged.
+    (x.relates_to || []).map((l) => `${l.target_id}~${l.link_kind || ''}`).join(','),
     (x.relies_on || []).length,
     x.kind,
   ].join('|')).join(';');
@@ -98228,6 +99208,100 @@ function agendaGraphBuild() {
     };
   });
   const idx = new Map(agendaGraphNodes.map((n, i) => [n.id, i]));
+  satellites.forEach((sat, i) => {
+    const nodeId = `terr|${sat.key}`;
+    const near = idx.get(sat.carrier);
+    const base = near !== undefined ? agendaGraphNodes[near].p : [0, 0, 0];
+    const a = i * 1.7;
+    agendaGraphNodes.push({
+      id: nodeId,
+      sat,
+      p: previous.get(nodeId) || [
+        base[0] + Math.cos(a) * 26,
+        base[1] + (Math.random() - 0.5) * 22,
+        base[2] + Math.sin(a) * 26,
+      ],
+    });
+    idx.set(nodeId, agendaGraphNodes.length - 1);
+  });
+  // The active mode's per-node layout targets (item nodes only;
+  // satellites keep riding their carrier springs). Node objects are
+  // rebuilt fresh above, so stale mode fields cannot linger.
+  const byIdBuild = new Map(items.map((x) => [x.id, x]));
+  agendaGraphTimeMarks = [];
+  agendaGraphActorMarks = [];
+  agendaGraphAttnCount = 0;
+  if (agendaGraphMode === 'flow') {
+    // relies_on rank: prerequisites left of dependents. Bounded passes
+    // instead of recursion so a foreign log's cycle stays total.
+    const rank = new Map(items.map((x) => [x.id, 0]));
+    for (let pass = 0; pass < 16; pass++) {
+      let moved = false;
+      items.forEach((x) => (x.relies_on || []).forEach((l) => {
+        if (!rank.has(l.target_id)) return;
+        const want = rank.get(l.target_id) + 1;
+        if (want > rank.get(x.id) && want < 40) {
+          rank.set(x.id, want);
+          moved = true;
+        }
+      }));
+      if (!moved) break;
+    }
+    const maxRank = Math.max(1, ...rank.values());
+    agendaGraphNodes.forEach((n) => {
+      if (!n.sat) n.tx = (rank.get(n.id) - maxRank / 2) * 72;
+    });
+  } else if (agendaGraphMode === 'time') {
+    const born = (x) => (x.provenance && x.provenance.created_ms) || x.updated_ms || 0;
+    const times = items.map(born);
+    const newest = Math.max(...times, 1);
+    const oldest = Math.min(...times, newest);
+    const span = Math.max(1, newest - oldest);
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const x = byIdBuild.get(n.id);
+      n.tr = 36 + ((newest - born(x)) / span) * 150;
+    });
+    const day = (ms) => new Date(ms).toISOString().slice(5, 10);
+    agendaGraphTimeMarks = [
+      { r: 36, label: `newest · ${day(newest)}` },
+      { r: 36 + 75, label: day(oldest + span / 2) },
+      { r: 186, label: `oldest · ${day(oldest)}` },
+    ];
+  } else if (agendaGraphMode === 'actor') {
+    const who = (x) => (x.provenance
+      && (x.provenance.source || x.provenance.kind
+        || (x.provenance.principal || '').split(':').pop())) || 'unknown';
+    const counts = new Map();
+    items.forEach((x) => counts.set(who(x), (counts.get(who(x)) || 0) + 1));
+    const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const anchor = new Map(top.map(([name], i) => [name, (i / top.length) * Math.PI * 2]));
+    agendaGraphActorMarks = top.map(([name, count], i) => ({
+      name, count, angle: (i / top.length) * Math.PI * 2,
+    }));
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const a = anchor.get(who(byIdBuild.get(n.id)));
+      n.anchor = a === undefined
+        ? [0, 0, 0]
+        : [Math.cos(a) * 132, 0, Math.sin(a) * 132];
+    });
+  } else if (agendaGraphMode === 'attention') {
+    const now = Date.now();
+    agendaGraphNodes.forEach((n) => {
+      if (n.sat) return;
+      const x = byIdBuild.get(n.id);
+      const st = agendaEffectState(x);
+      const attn = x.status === 'open' && (
+        agendaItemIsBlocked(x)
+        || (x.kind === 'question' && !x.answer && !x.dismissed)
+        || (st && (st.kind === 'pending' || st.kind === 'suspended'))
+        || (x.due_ms && x.due_ms < now));
+      n.attn = !!attn;
+      n.tr = attn ? 28 : 172;
+      if (attn) agendaGraphAttnCount += 1;
+    });
+  }
   const links = [];
   const seenRel = new Set();
   items.forEach((x) => {
@@ -98239,13 +99313,26 @@ function agendaGraphBuild() {
         links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'dep' });
       }
     });
-    // relates_to renders undirected: dedupe the two stored directions.
+    // relates_to renders undirected and deduped across the two stored
+    // directions; a typed link keeps its stored direction (a = storer,
+    // b = target — "A supersedes B" draws its arrow at B).
     (x.relates_to || []).forEach((link) => {
       if (!idx.has(link.target_id)) return;
       const pair = [x.id, link.target_id].sort().join(':');
       if (seenRel.has(pair)) return;
       seenRel.add(pair);
-      links.push({ a: idx.get(x.id), b: idx.get(link.target_id), t: 'rel' });
+      links.push({
+        a: idx.get(x.id),
+        b: idx.get(link.target_id),
+        t: 'rel',
+        k: link.link_kind || null,
+      });
+    });
+  });
+  satellites.forEach((sat) => {
+    const b = idx.get(`terr|${sat.key}`);
+    sat.owners.forEach((owner) => {
+      if (idx.has(owner)) links.push({ a: idx.get(owner), b, t: 'terr' });
     });
   });
   agendaGraphLinks = links;
@@ -98283,8 +99370,10 @@ function agendaGraphRelax(iterations) {
     links.forEach((link) => {
       const A = nodes[link.a].p;
       const B = nodes[link.b].p;
-      const rest = link.t === 'place' ? 74 : link.t === 'dep' ? 96 : 116;
-      const k = link.t === 'place' ? 0.014 : 0.007;
+      const rest = link.t === 'place' ? 74
+        : link.t === 'terr' ? 52
+          : link.t === 'dep' ? 96 : 116;
+      const k = link.t === 'place' ? 0.014 : link.t === 'terr' ? 0.012 : 0.007;
       const dx = B[0] - A[0];
       const dy = B[1] - A[1];
       const dz = B[2] - A[2];
@@ -98297,6 +99386,24 @@ function agendaGraphRelax(iterations) {
       n.p[0] *= 0.9965;
       n.p[1] *= 0.994;
       n.p[2] *= 0.9965;
+      // Mode springs (one per node, fields set by the active mode's
+      // build pass): tx = layered x (flow), tr = radial xz target
+      // (time/attention), anchor = cluster point (actor).
+      if (n.tx !== undefined) {
+        n.p[0] += (n.tx - n.p[0]) * 0.03;
+      }
+      if (n.tr !== undefined) {
+        const cur = Math.hypot(n.p[0], n.p[2]) + 0.01;
+        const f = ((n.tr - cur) * 0.035) / cur;
+        n.p[0] += n.p[0] * f;
+        n.p[2] += n.p[2] * f;
+        n.p[1] *= 0.97;
+      }
+      if (n.anchor) {
+        n.p[0] += (n.anchor[0] - n.p[0]) * 0.025;
+        n.p[1] += (n.anchor[1] - n.p[1]) * 0.02;
+        n.p[2] += (n.anchor[2] - n.p[2]) * 0.025;
+      }
     });
   }
 }
@@ -98322,6 +99429,34 @@ function agendaGraphPalette() {
   return agendaGraphPalCache;
 }
 
+// One territory satellite: a small square (dirs slightly larger), the
+// basename labeled while hot, full locator + carrier count on the
+// subtitle. Locators are data — fillText only, inert pixels.
+function agendaGraphDrawSatellite(g, node, q, hot, pal, w) {
+  const sat = node.sat;
+  const size = (sat.t === 'dir' ? 3.4 : 2.6) * q.s + (hot ? 0.9 : 0);
+  const alpha = Math.max(0.3, Math.min(0.85, q.s * 1.05 - 0.1));
+  g.beginPath();
+  g.rect(q.x - size, q.y - size, size * 2, size * 2);
+  g.fillStyle = `rgba(${pal.text},${alpha * (hot ? 0.85 : 0.45)})`;
+  g.fill();
+  if (hot) {
+    const name = sat.locator.replace(/\/+$/, '').split('/').pop() || sat.locator;
+    const label = sat.t === 'dir' ? `${name}/` : name;
+    g.font = '700 10px "JetBrains Mono", monospace';
+    const tw = g.measureText(label).width;
+    let lx = q.x + size + 7;
+    if (lx + tw > w - 10) lx = q.x - size - 7 - tw;
+    g.fillStyle = `rgba(${pal.text},.95)`;
+    g.fillText(label, lx, q.y + 3.5);
+    g.font = '9px "JetBrains Mono", monospace';
+    g.fillStyle = pal.t3;
+    g.fillText(
+      `${sat.locator} · ${sat.owners.length} item${sat.owners.length === 1 ? '' : 's'} — click opens newest carrier`,
+      lx, q.y + 16);
+  }
+}
+
 // ---- Draw (3D-ish projection, hover picking, rings, labels) ----
 
 function agendaGraphDraw(ts) {
@@ -98330,8 +99465,8 @@ function agendaGraphDraw(ts) {
   const items = agendaGraphBuild();
   if (!items.length || items.length > AGENDA_GRAPH_NODE_CAP) {
     // The ledger crossed a boundary between renders (event-lane merge):
-    // re-enter through the render pass, which owns the cap and empty
-    // states (it tears this loop down).
+    // re-enter through the render pass, which owns projection choice,
+    // the cap, and the empty states (it tears this loop down).
     agendaRenderTab();
     return;
   }
@@ -98414,11 +99549,23 @@ function agendaGraphDraw(ts) {
       g.setLineDash([]);
       g.strokeStyle = `rgba(${pal.iris},${depth * (hot ? 0.75 : 0.38)})`;
       g.lineWidth = hot ? 1.6 : 1.1;
-    } else if (link.t === 'rel') {
-      g.setLineDash([3, 5]);
+    } else if (link.t === 'terr') {
+      g.setLineDash([1.5, 3.5]);
       g.lineDashOffset = 0;
-      g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.5 : 0.16)})`;
+      g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.45 : 0.14)})`;
       g.lineWidth = 1;
+    } else if (link.t === 'rel') {
+      if (link.k) {
+        // Typed adjacency: solid and slightly stronger than see-also.
+        g.setLineDash([]);
+        g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.6 : 0.26)})`;
+        g.lineWidth = hot ? 1.4 : 1.05;
+      } else {
+        g.setLineDash([3, 5]);
+        g.lineDashOffset = 0;
+        g.strokeStyle = `rgba(${pal.text},${depth * (hot ? 0.5 : 0.16)})`;
+        g.lineWidth = 1;
+      }
     } else {
       g.setLineDash([2, 6]);
       g.lineDashOffset = reduced ? 0 : -ts * 0.02;
@@ -98427,12 +99574,77 @@ function agendaGraphDraw(ts) {
     }
     g.stroke();
     g.setLineDash([]);
+    if (agendaGraphMode === 'flow' && link.t === 'dep') {
+      // Flow mode: the dependency direction becomes explicit — the
+      // arrowhead sits at the PREREQUISITE end ("waits on →").
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      const ax = b.x - Math.cos(ang) * 11;
+      const ay = b.y - Math.sin(ang) * 11;
+      const sz = 3.4 + (hot ? 0.9 : 0);
+      g.beginPath();
+      g.moveTo(ax + Math.cos(ang) * sz, ay + Math.sin(ang) * sz);
+      g.lineTo(ax + Math.cos(ang + 2.5) * sz, ay + Math.sin(ang + 2.5) * sz);
+      g.lineTo(ax + Math.cos(ang - 2.5) * sz, ay + Math.sin(ang - 2.5) * sz);
+      g.closePath();
+      g.fillStyle = `rgba(${pal.rose},${depth * (hot ? 0.85 : 0.5)})`;
+      g.fill();
+    }
+    if (link.t === 'rel' && link.k) {
+      // A typed link reads storer → target: arrowhead at the target
+      // end, the kind labeled at the midpoint while an endpoint is hot.
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      const ax = b.x - Math.cos(ang) * 11;
+      const ay = b.y - Math.sin(ang) * 11;
+      const sz = 3.2 + (hot ? 0.9 : 0);
+      g.beginPath();
+      g.moveTo(ax + Math.cos(ang) * sz, ay + Math.sin(ang) * sz);
+      g.lineTo(ax + Math.cos(ang + 2.5) * sz, ay + Math.sin(ang + 2.5) * sz);
+      g.lineTo(ax + Math.cos(ang - 2.5) * sz, ay + Math.sin(ang - 2.5) * sz);
+      g.closePath();
+      g.fillStyle = `rgba(${pal.text},${depth * (hot ? 0.7 : 0.32)})`;
+      g.fill();
+      if (hot) {
+        g.font = '9px "JetBrains Mono", monospace';
+        g.fillStyle = `rgba(${pal.text},.8)`;
+        g.fillText(
+          link.k.replace(/_/g, ' '),
+          (a.x + b.x) / 2 + 5,
+          (a.y + b.y) / 2 - 5,
+        );
+      }
+    }
   });
+  // Mode orientation marks: painted, inert pixels like every label.
+  if (agendaGraphMode === 'time' && agendaGraphTimeMarks.length) {
+    g.font = '9px "JetBrains Mono", monospace';
+    agendaGraphTimeMarks.forEach((mark) => {
+      const sr = mark.r * 1.28;
+      g.beginPath();
+      g.arc(cx, cyy, sr, 0, Math.PI * 2);
+      g.strokeStyle = `rgba(${pal.text},.07)`;
+      g.lineWidth = 1;
+      g.stroke();
+      g.fillStyle = pal.t3;
+      g.fillText(mark.label, cx + sr * 0.72, cyy - sr * 0.72);
+    });
+  }
+  if (agendaGraphMode === 'actor') {
+    g.font = '600 9.5px "JetBrains Mono", monospace';
+    agendaGraphActorMarks.forEach((mark) => {
+      const q = project([Math.cos(mark.angle) * 172, -34, Math.sin(mark.angle) * 172]);
+      g.fillStyle = pal.t3;
+      g.fillText(`${mark.name} · ${mark.count}`, q.x - 20, q.y);
+    });
+  }
   // Nodes far → near.
   const order = nodes.map((n, i) => i).sort((a, b) => pts[b].z - pts[a].z);
   order.forEach((i) => {
     const node = nodes[i];
     const q = pts[i];
+    if (node.sat) {
+      agendaGraphDrawSatellite(g, node, q, hover === node.id, pal, w);
+      return;
+    }
     const item = byId.get(node.id);
     if (!item) return;
     const kids = childCount.get(node.id) || 0;
@@ -98440,9 +99652,12 @@ function agendaGraphDraw(ts) {
       : item.kind === 'question' ? pal.amber : pal.iris;
     const hot = hover === node.id;
     const r = (3.4 + Math.min(kids, 4) * 1.3 + (hot ? 1.4 : 0)) * q.s;
-    const alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
+    let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
+    // Attention mode: needs-you items glow, the rest recede.
+    if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
     g.shadowColor = `rgba(${rgb},.8)`;
-    g.shadowBlur = hot ? 20 : 11 * q.s;
+    g.shadowBlur = hot ? 20
+      : (agendaGraphMode === 'attention' && node.attn ? 24 : 11 * q.s);
     g.beginPath();
     g.arc(q.x, q.y, r, 0, Math.PI * 2);
     g.fillStyle = `rgba(${rgb},${alpha})`;
@@ -98469,6 +99684,18 @@ function agendaGraphDraw(ts) {
         (reduced ? 0.65 : 0.45 + 0.4 * Math.sin(ts / 280)) * alpha);
     }
     if (st && st.kind === 'pending') ring(pal.amber, 5.4, 0.75 * alpha);
+    // Territory halo: a dotted outer ring on nodes carrying file/dir
+    // refs — the declared working set made visible.
+    const territory = agendaGraphProjection === 'hubs'
+      ? agendaGraphSubtreeTerr.get(node.id) || 0
+      : (item.refs || []).filter(
+        (r) => r.ref_type === 'file' || r.ref_type === 'dir',
+      ).length;
+    if (territory) {
+      g.setLineDash([1.5, 3.2]);
+      ring(pal.text, 7.6, 0.3 * alpha);
+      g.setLineDash([]);
+    }
     if (kids || hot) {
       g.font = `${hot ? '700' : '600'} 11px "Hanken Grotesk", sans-serif`;
       const title = String(item.title || '');
@@ -98486,12 +99713,44 @@ function agendaGraphDraw(ts) {
       if (hot) {
         g.font = '9.5px "JetBrains Mono", monospace';
         g.fillStyle = pal.t3;
+        const open = agendaGraphProjection === 'hubs'
+          ? 'click to focus'
+          : 'click to open';
         g.fillText(
-          `${item.kind} · ${item.status}${kids ? ` · hub, ${kids} filed` : ''} — click to open`,
+          `${item.kind} · ${item.status}${kids ? ` · hub, ${kids} filed` : ''}${territory ? ` · ${territory} territory` : ''} — ${open}`,
           lx, ly + 13);
       }
     }
   });
+  // Projection badge (painted, inert pixels like every label): what the
+  // constellation is currently showing.
+  const terrBadge = agendaGraphTerrStats.shown
+    ? ` · territory ${agendaGraphTerrStats.shown}${agendaGraphTerrStats.total > agendaGraphTerrStats.shown ? ` of ${agendaGraphTerrStats.total}` : ''}`
+    : '';
+  const modeBadge = agendaGraphMode === 'orbit' ? ''
+    : agendaGraphMode === 'attention'
+      ? ` · attention — ${agendaGraphAttnCount} need you`
+      : ` · ${agendaGraphMode}`;
+  if (agendaGraphProjection !== 'all' || terrBadge || modeBadge) {
+    const allCount = (agendaItems || []).filter(
+      (x) => x.status !== 'retired',
+    ).length;
+    const itemCount = nodes.filter((n) => !n.sat).length;
+    let badge = '';
+    if (agendaGraphProjection === 'hubs') {
+      badge = `hub overview · ${itemCount} hubs of ${allCount} items`;
+    } else if (agendaGraphProjection === 'focus') {
+      const focused = byId.get(agendaGraphFocus);
+      const title = focused ? String(focused.title || '') : '';
+      const short = title.length > 40 ? `${title.slice(0, 39)}…` : title;
+      badge = `focused: ${short} · ${itemCount} of ${allCount} items`;
+    } else {
+      badge = `everything · ${itemCount} items`;
+    }
+    g.font = '10px "JetBrains Mono", monospace';
+    g.fillStyle = pal.t3;
+    g.fillText(badge + modeBadge + terrBadge, 14, 64);
+  }
 }
 
 // ---- Wire (the one permanent listener; see the fragment header) ----
@@ -101100,6 +102359,232 @@ async function memoryProposeFromForm(button) {
     document.addEventListener('DOMContentLoaded', handoverStart);
   } else {
     handoverStart();
+  }
+})();
+/* ── static/app/ui2-update-lane.js ── */
+// ── ui2-update-lane — the self-update panel (Access → Daemons) ──────
+// Sits beside the daemons list's provenance rows and renders the
+// daemon's `update_lane` block from GET /api/daemon/handover: install
+// flavor, the bounded behind-origin-main / behind-latest-release check,
+// and the produce job's live phase + log tail. The buttons are the
+// owner's consent surface: POST /api/daemon/update-lane/{check,produce}
+// (HTTP-only by design — a tunnel-only remote surface watches progress
+// here but cannot click a build onto the box; the catch renders that
+// honestly). Producing lands a newer binary at the watched path; the
+// EXISTING update chip + one-click swap lane takes over from there.
+// textContent construction throughout: repo paths, versions, and child
+// process log lines are observed strings, never markup.
+(() => {
+  const UPDATE_LANE_POLL_MS = 30000;
+  const UPDATE_LANE_BUSY_POLL_MS = 3000;
+  const action = { inFlight: false, note: '' };
+  let lastBlock = null;
+  let pollTimer = null;
+
+  function updateLaneMount() {
+    return document.getElementById('update-lane-card');
+  }
+
+  async function updateLanePost(path) {
+    if (action.inFlight) return;
+    action.inFlight = true;
+    action.note = '';
+    render(lastBlock);
+    try {
+      const resp = await authedFetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      let body = null;
+      try { body = await resp.json(); } catch (_) { /* non-JSON error body */ }
+      if (body && body.update_lane) lastBlock = body.update_lane;
+      if (!resp.ok) {
+        action.note = (body && body.detail)
+          ? body.detail
+          : `This surface cannot reach the update lane (HTTP ${resp.status}).`;
+      }
+    } catch (err) {
+      action.note = `This surface cannot reach the update lane: ${(err && err.message) || err}`;
+    } finally {
+      action.inFlight = false;
+      render(lastBlock);
+      schedulePoll(true);
+    }
+  }
+
+  function actionButton(label, path, disabled) {
+    const btn = document.createElement('button');
+    btn.className = 'update-lane-btn';
+    btn.textContent = label;
+    btn.disabled = Boolean(disabled) || action.inFlight;
+    btn.addEventListener('click', () => updateLanePost(path));
+    return btn;
+  }
+
+  function line(parent, cls, text) {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  }
+
+  function describeCheck(block, body) {
+    const check = block.check || {};
+    const running = block.running || {};
+    if (check.error) {
+      line(body, 'update-lane-error', `Check failed: ${check.error}`);
+      return { behind: false };
+    }
+    if (block.flavor === 'source') {
+      if (typeof check.behind !== 'number') {
+        line(body, 'update-lane-note', check.in_flight
+          ? 'Checking origin/main…'
+          : 'Not checked yet.');
+        return { behind: false };
+      }
+      const capped = check.behind_capped ? '+' : '';
+      if (check.behind > 0) {
+        line(body, 'update-lane-status',
+          `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
+          + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
+      } else {
+        line(body, 'update-lane-note',
+          `Up to date with origin/main (running ${running.git_sha || '?'}).`);
+      }
+      if (check.dirty) {
+        line(body, 'update-lane-note',
+          'The checkout has local changes — the update will refuse to pull over them.');
+      }
+      return { behind: check.behind > 0 };
+    }
+    if (block.flavor === 'consumer-app') {
+      if (!check.latest_tag) {
+        line(body, 'update-lane-note', check.in_flight
+          ? 'Checking the latest logged release…'
+          : 'Not checked yet.');
+        return { behind: false };
+      }
+      const behind = Number(check.behind) > 0;
+      line(body, behind ? 'update-lane-status' : 'update-lane-note',
+        `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
+        + (check.compare_error ? ` ${check.compare_error}.` : ''));
+      return { behind };
+    }
+    return { behind: false };
+  }
+
+  function describeJob(block, body) {
+    const job = block.job;
+    if (!job) return false;
+    const runningJob = !('ok' in job);
+    if (runningJob) {
+      line(body, 'update-lane-status',
+        `${job.lane === 'source' ? 'Building from main' : 'Downloading release'} — ${job.phase}…`);
+    } else if (job.ok) {
+      line(body, 'update-lane-done', job.detail || 'Update produced.');
+    } else {
+      line(body, 'update-lane-error', `Update failed: ${job.error || 'see the daemon log'}. The running daemon is untouched.`);
+    }
+    const tail = Array.isArray(job.log_tail) ? job.log_tail.slice(-8) : [];
+    if (tail.length && (runningJob || !job.ok)) {
+      const log = document.createElement('pre');
+      log.className = 'update-lane-log';
+      log.textContent = tail.join('\n');
+      body.appendChild(log);
+    }
+    return runningJob;
+  }
+
+  function render(block) {
+    const mount = updateLaneMount();
+    if (!mount) return;
+    lastBlock = block;
+    mount.textContent = '';
+    if (!block) return;
+    const card = document.createElement('div');
+    card.className = 'update-lane-card';
+    const head = document.createElement('div');
+    head.className = 'update-lane-head';
+    const title = document.createElement('strong');
+    title.textContent = 'Daemon update';
+    head.appendChild(title);
+    const flavorChip = document.createElement('span');
+    flavorChip.className = 'update-lane-flavor';
+    flavorChip.textContent = block.flavor === 'source'
+      ? 'source install'
+      : block.flavor === 'consumer-app' ? 'release install' : 'unmanaged';
+    head.appendChild(flavorChip);
+    card.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'update-lane-body';
+    if (block.flavor === 'source' && block.repo_root) {
+      line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
+    } else if (block.flavor === 'consumer-app' && block.app_root) {
+      line(body, 'update-lane-note', `Installed app: ${block.app_root}`);
+    }
+    if (block.unavailable) {
+      line(body, 'update-lane-note', block.unavailable);
+    }
+
+    const verdict = describeCheck(block, body);
+    const jobRunning = describeJob(block, body);
+
+    if (action.note) line(body, 'update-lane-note', action.note);
+
+    const actions = document.createElement('div');
+    actions.className = 'update-lane-actions';
+    if (!block.unavailable) {
+      if (block.flavor === 'source') {
+        actions.appendChild(actionButton(
+          jobRunning ? 'Updating…' : 'Update from main',
+          '/api/daemon/update-lane/produce',
+          jobRunning || !verdict.behind,
+        ));
+      } else if (block.flavor === 'consumer-app') {
+        actions.appendChild(actionButton(
+          jobRunning ? 'Updating…' : 'Download & verify release',
+          '/api/daemon/update-lane/produce',
+          jobRunning || !verdict.behind,
+        ));
+      }
+      actions.appendChild(actionButton('Check now', '/api/daemon/update-lane/check',
+        jobRunning || Boolean(block.check && block.check.in_flight)));
+    }
+    card.appendChild(body);
+    if (actions.childElementCount) card.appendChild(actions);
+    mount.appendChild(card);
+  }
+
+  async function poll() {
+    try {
+      if (typeof daemonApi === 'undefined') return;
+      if (!daemonApi.availability('api_daemon_handover').ok) return;
+      const resp = await daemonApi.request('api_daemon_handover', {});
+      if (resp && resp.ok && resp.body) render(resp.body.update_lane || null);
+    } catch (_) { /* transient — keep the last render */ }
+  }
+
+  function schedulePoll(immediate) {
+    if (pollTimer) clearTimeout(pollTimer);
+    const busy = Boolean(lastBlock && (
+      (lastBlock.job && !('ok' in lastBlock.job)) ||
+      (lastBlock.check && lastBlock.check.in_flight)));
+    pollTimer = setTimeout(async () => {
+      await poll();
+      schedulePoll(false);
+    }, immediate ? 400 : (busy ? UPDATE_LANE_BUSY_POLL_MS : UPDATE_LANE_POLL_MS));
+  }
+
+  function start() {
+    poll().then(() => schedulePoll(false));
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
   }
 })();
 /* ── static/app/ui2-cloud-workers.js ── */

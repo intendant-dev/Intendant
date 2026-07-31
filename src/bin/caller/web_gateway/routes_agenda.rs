@@ -145,6 +145,16 @@ pub(crate) async fn agenda_item_api_response(
                     .expect("object body")
                     .insert("pull_requests".to_string(), pull_requests.into());
             }
+            // Derived territory sibling (working set): served like the
+            // other joins — on the detail lane only, never stored.
+            if let Some(working_set) = agenda.working_set(&item.id) {
+                if working_set.total > 0 {
+                    body.as_object_mut().expect("object body").insert(
+                        "working_set".to_string(),
+                        serde_json::to_value(&working_set).expect("working set serializes"),
+                    );
+                }
+            }
             ApiResponse::json(200, JsonBody::Value(body))
         }
         crate::agenda::AgendaPrefixResolution::Ambiguous(candidates) => ApiResponse::json(
@@ -987,6 +997,85 @@ mod tests {
         );
         assert!(empty["items"].as_array().unwrap().is_empty());
         assert_eq!(empty["counts"]["open"], 2);
+    }
+
+    /// The item route serves the derived `working_set` sibling: the
+    /// item's and its placed subtree's file/dir refs with the carrying
+    /// item named — and omits the block entirely when no territory
+    /// exists (agenda ontology P3; served, never stored).
+    #[tokio::test]
+    async fn item_route_serves_working_set_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, agenda) = mcp_with_agenda(dir.path());
+        let owner = Some(crate::agenda::AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| crate::agenda::AgendaCommand::Add {
+            kind: crate::agenda::AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            source: None,
+            refs: Vec::new(),
+        };
+        let hub = agenda.apply(add("program hub"), owner.clone()).unwrap();
+        let child = agenda.apply(add("child seat"), owner.clone()).unwrap();
+        let bare = agenda.apply(add("bare"), owner.clone()).unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::AddPartOf {
+                    id: child.id.clone(),
+                    parent_id: hub.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, b"territory").unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::AddRef {
+                    id: child.id.clone(),
+                    ref_type: crate::agenda::AgendaRefType::File,
+                    locator: brief.to_string_lossy().into_owned(),
+                    must_read: false,
+                    label: None,
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        agenda
+            .apply(
+                crate::agenda::AgendaCommand::AddRef {
+                    id: hub.id.clone(),
+                    ref_type: crate::agenda::AgendaRefType::Dir,
+                    locator: dir.path().to_string_lossy().into_owned(),
+                    must_read: false,
+                    label: None,
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap();
+
+        let body = json_of(&agenda_item_api_response(&hub.id, Some(&server)).await);
+        assert_eq!(body["working_set"]["total"], serde_json::json!(2));
+        let rows = body["working_set"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row["item_id"] == serde_json::json!(child.id)
+                    && row["ref_type"] == serde_json::json!("file")),
+            "the child's file ref rides the hub's aggregate, carrier named"
+        );
+
+        let body = json_of(&agenda_item_api_response(&bare.id, Some(&server)).await);
+        assert!(body.get("working_set").is_none(), "no territory, no block");
     }
 
     /// Track AS S4 pin (ruling Q5): the item route resolves an exact id

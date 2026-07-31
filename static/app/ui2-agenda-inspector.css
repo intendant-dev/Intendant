@@ -550,6 +550,18 @@ html.ui-v2 .ag2-reladd {
   font-size: 10.5px !important;
   padding: 2px 6px !important;
 }
+html.ui-v2 .ag2-relkind-add {
+  border-radius: var(--r-pill) !important;
+  max-width: 110px;
+  font-size: 10.5px !important;
+  padding: 2px 6px !important;
+}
+html.ui-v2 .ag2-relkind {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
 html.ui-v2 .ag2-tagchip {
   display: inline-flex;
   align-items: center;

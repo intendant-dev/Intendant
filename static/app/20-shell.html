@@ -144,6 +144,19 @@
             <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
                     title="Grid — session windows with the concurrent stream below">Grid</button>
           </div>
+          <!-- Closable-at-a-glance chip + lens toggle: the POSITIVE count
+               of session cards whose close the machine already rules safe
+               (the served safe-to-stop claim settled, idle with no agenda
+               linkage, or finished — sessionWindowClosableClaim in
+               41-session-window-actions.js; the count and each card's
+               class derive in ui2-activity.js's Arrange walk). Hidden at
+               zero — never "0 closable" — and engaging it dims every
+               other card. -->
+          <button type="button" class="ui2-closable-lens-btn" id="ui2-closable-lens-btn" hidden
+                  aria-pressed="false"
+                  title="Session cards that are safe to close — click to dim the rest">
+            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span>closable</span>
+          </button>
           <!-- One compact menu button consolidating the bulk window sweeps
                (it replaced five standalone pills: Minimize done, Hide done,
                Collapse all/Expand all, Expand/Collapse details).

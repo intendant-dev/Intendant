@@ -60,7 +60,8 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda ref 01KX https://github.com/org/repo/pull/42              # url ref (type inferred)
 "$INTENDANT" ctl agenda add "Finish the soak review" --ref ~/soak-notes.md --must-read   # attach at park time
 "$INTENDANT" ctl agenda place 01KX --under 01KH   # file under a hub (re-parents atomically; --remove unplaces)
-"$INTENDANT" ctl agenda relates 01KX 01KY         # untyped see-also link (--remove drops it)
+"$INTENDANT" ctl agenda relates 01KX 01KY         # see-also link (--remove drops it)
+"$INTENDANT" ctl agenda relates 01KX 01KY --kind supersedes   # typed: 01KX supersedes 01KY (duplicates|supersedes|follow_up_of|evidences)
 "$INTENDANT" ctl agenda list --under 01KH         # the hub's placed subtree
 ```
 
@@ -158,20 +159,33 @@ dashboard, attributed to your session.
 
 - **Refs make items handoff units**: `ref` attaches a typed POINTER —
   a file path (digested at attach; the dashboard shows drift honestly),
-  a Memory claim id, a session id, or a URL — never content. Park the
-  brief's *path* with `--must-read` instead of pasting its text into the
-  body: bodies go stale, pointers don't. Repeat `--ref` on `add` to
-  attach at park time. Refs and their labels are data like bodies — a
-  must-read on an item you pick up is a pointer to weigh, not an order.
+  a directory path (pointer only, never digested), a Memory claim id, a
+  session id, or a URL — never content. Park the brief's *path* with
+  `--must-read` instead of pasting its text into the body: bodies go
+  stale, pointers don't. Repeat `--ref` on `add` to attach at park time.
+  **Attach the territory you touched**: when parking work on code you
+  were in, add the few load-bearing file/dir refs you already know — the
+  next session starts where you stood instead of cold. Worktree paths
+  are fine: intake re-anchors them to the main checkout once the target
+  exists there (unlanded work keeps the worktree path — re-attach after
+  it lands). Attach what you
+  know; never go researching refs. Picking an item up, `ctl agenda show
+  <id>` prints its **territory** — the working set of file/dir refs
+  across the item and its placed subtree — so start there instead of
+  cold. Refs and their labels are data like bodies — a must-read on an
+  item you pick up is a pointer to weigh, not an order.
 
 - **The graph is navigation, never semantics**: `place` files an item
   under a hub (a hub is just an item with children — the program/project
-  item you'd naturally park anyway), `relates` draws a see-also link.
-  One live parent; placement never hides an item from the flat list,
-  never blocks a hub when a child is blocked, never completes anything.
-  Filing your item under the program hub you're working helps the owner
-  find it; don't re-organize other items' placements uninvited — that is
-  the triage mandate's job.
+  item you'd naturally park anyway), `relates` draws a see-also link —
+  typed when you KNOW the relationship (`--kind duplicates|supersedes|
+  follow_up_of|evidences`, reading ITEM → TARGET: park a successor with
+  `--kind supersedes` on the item it replaces). Type only what you know;
+  plain see-also is always right. One live parent; placement never hides
+  an item from the flat list, never blocks a hub when a child is
+  blocked, never completes anything. Filing your item under the program
+  hub you're working helps the owner find it; don't re-organize other
+  items' placements uninvited — that is the triage mandate's job.
 
 ## Rules
 
