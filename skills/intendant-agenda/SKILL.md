@@ -165,7 +165,10 @@ dashboard, attributed to your session.
   stale, pointers don't. Repeat `--ref` on `add` to attach at park time.
   **Attach the territory you touched**: when parking work on code you
   were in, add the few load-bearing file/dir refs you already know — the
-  next session starts where you stood instead of cold. Attach what you
+  next session starts where you stood instead of cold. Worktree paths
+  are fine: intake re-anchors them to the main checkout once the target
+  exists there (unlanded work keeps the worktree path — re-attach after
+  it lands). Attach what you
   know; never go researching refs. Picking an item up, `ctl agenda show
   <id>` prints its **territory** — the working set of file/dir refs
   across the item and its placed subtree — so start there instead of

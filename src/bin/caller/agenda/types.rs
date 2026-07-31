@@ -951,8 +951,10 @@ impl AgendaRefType {
 pub struct AgendaRef {
     pub(crate) ref_type: AgendaRefType,
     /// `file`/`dir`: absolute path; `memory`: claim id; `session`:
-    /// conversation id; `url`: http(s) URL. Stored verbatim as intake
-    /// validated it (dir refs: trailing slashes normalized away).
+    /// conversation id; `url`: http(s) URL. Stored as intake validated
+    /// it (dir refs: trailing slashes normalized away; file/dir paths
+    /// inside a live linked worktree re-anchor to the main checkout
+    /// when the target exists there — worktree landing normalization).
     pub(crate) locator: String,
     /// File refs only: full sha256 hex of the file as it stood at attach —
     /// intake-minted and recorded in the op (replay never hashes). The

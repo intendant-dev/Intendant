@@ -250,6 +250,18 @@ intake): a directory has no attach-time byte identity without a priced
 tree-hash scheme — future vocabulary — so presence is its only drift
 signal.
 
+**Worktree landing normalization.** A file/dir path attached from
+inside a live linked git worktree re-anchors at intake to the main
+checkout when the target already exists there (the `.git` marker file
+is parsed directly — no git invocation; file digests then record the
+landed bytes, since that is where the ref points). Worktree paths die
+at merge cleanup, and the durable identity of touched territory is
+where the work landed. Work not yet landed keeps its verbatim worktree
+path and decays honestly — re-attach after landing, or let the weekly
+gardener propose the repair. Observed-territory sidecars (NS) stay
+verbatim by their sealed extraction law; the equivalent rebase is the
+consumer's mechanical step.
+
 **The working set is served, never stored.** The item detail lanes —
 `GET /api/agenda/items/{id}` and the `agenda_item` tool behind `ctl
 agenda show` — carry a derived `working_set` block when territory
