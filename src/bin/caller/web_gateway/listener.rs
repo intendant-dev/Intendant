@@ -2058,6 +2058,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         hosted_control: Arc::clone(&hosted_control),
                         custom_domain: Arc::clone(&custom_domain),
                         fleet_hosted_control_enabled: config.connect.hosted_control_enabled,
+                        relay_peer_admission: config.connect.relay_peer_admission,
                         bus: bus.clone(),
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
@@ -2150,6 +2151,21 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     let public_lease_ws = public_lane.public_lease_ingress;
                     let configured_public_ws = public_lane.configured;
                     let live_tls_custom_domain = public_lane.live_custom_domain;
+                    // Relay peer admission — the WS twin of the HTTP
+                    // exemption in `http_dispatch.rs` (see the comment
+                    // there for the full rationale): under the
+                    // boot-pinned owner opt-in, an Approved, unexpired
+                    // peer identity record passes the fleet/relay
+                    // transport-provenance refusal below into the SAME
+                    // ladder direct-lane peers walk (remote client auth,
+                    // grant minting, per-frame profile authorization).
+                    // Browser-enrolled certificates resolve no record and
+                    // are refused byte-identically; the owner-name
+                    // (custom-domain) lane stays lease-only.
+                    let admitted_relay_peer_ws = config.connect.relay_peer_admission
+                        && base_discovery_only_ws
+                        && !custom_domain_selected
+                        && peer_connection_identity.is_some();
                     let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
@@ -2200,7 +2216,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     } else {
                         None
                     };
-                    if public_lease_ws && hosted_ws_authority.is_none() {
+                    if public_lease_ws && hosted_ws_authority.is_none() && !admitted_relay_peer_ws
+                    {
                         use tokio::io::AsyncWriteExt;
                         let error = if custom_domain_selected {
                             "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"

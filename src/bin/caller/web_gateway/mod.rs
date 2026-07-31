@@ -502,6 +502,12 @@ mod tests {
             std::env::remove_var(key);
             Self { key, previous }
         }
+
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
