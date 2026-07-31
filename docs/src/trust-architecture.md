@@ -61,13 +61,33 @@ own fleet certificate. The daemon tunnel splices that ciphertext into a
 dedicated loopback-only gateway ingress, separate from the public listener.
 Which listener accepted the connection is immutable transport provenance: the
 gateway marks every such connection `ReachabilityRelay` before TLS or HTTP
-parsing. With hosted control off, it serves only authority-free discovery bytes
+parsing. In the all-off default, it serves only authority-free discovery bytes
 under anonymous `role:none` and refuses every protected HTTP, MCP, signaling,
-and WebSocket route. With hosted control on, the sole protected-route carve-out
-is a fresh proof by an active daemon-minted `hosted_lease` principal, or a
-one-use WebSocket ticket minted by such a proof; a second compiled classifier
-then limits the route, method, frame, concrete action, target, and outbound
-event projection. Thus neither the loopback address of the tunnel's last hop
+and WebSocket route. Exactly two per-daemon opt-ins admit anything more, each
+gating its own credential class and neither moving the other:
+
+- With hosted control on (`[connect] hosted_control_enabled`), the
+  browser-lane carve-out is a fresh proof by an active daemon-minted
+  `hosted_lease` principal, or a one-use WebSocket ticket minted by such a
+  proof; a second compiled classifier then limits the route, method, frame,
+  concrete action, target, and outbound event projection.
+- With relay peer admission on (`[connect] relay_peer_admission` — default
+  off, boot-pinned, deliberately no environment override), the peer-lane
+  carve-out is a TLS client certificate that resolves to an **Approved,
+  unexpired peer identity record**: a daemon-side credential minted by the
+  target's own access CA through an owner-consented lane (pairing invite,
+  doorbell approval, or org grant materialization) whose private key lives in
+  daemon files — a class no browser keystore can hold or be scripted into
+  presenting. Admission converts transport provenance only: the connection
+  continues into the same transport-auth ladder every direct-lane peer
+  request passes, the peer profile the owner granted remains the sole
+  control-depth authority per operation and frame, and revocation or expiry
+  of the record kills the next request. A browser-enrolled mTLS certificate
+  resolves no peer record and keeps the refusal byte-identical, in both key
+  states. The relay itself is unchanged — it still sees only ciphertext and
+  admits nothing; the widening is entirely a daemon-side policy predicate.
+
+Thus neither the loopback address of the tunnel's last hop
 nor a browser-controlled `Host: localhost` can enter the trusted-local lane.
 Fleet SNI remains an independent provenance gate, not an mTLS bypass. The relay
 ingress also rejects non-TLS bytes before the gateway's raw ICE-TCP and
