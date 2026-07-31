@@ -6,6 +6,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_doorbell(
     mut stream: DemuxStream,
     header_text: &str,
@@ -14,6 +15,7 @@ pub(crate) async fn handle_doorbell(
     peer_access_request_config: crate::project::PeerAccessRequestConfig,
     source_hint: String,
     is_tls: bool,
+    target_identity_public_key: Option<String>,
 ) {
     use tokio::io::AsyncWriteExt;
     let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -37,6 +39,7 @@ pub(crate) async fn handle_doorbell(
                 is_tls,
                 Some(source_hint.clone()),
                 &peer_access_request_config,
+                target_identity_public_key,
             ),
             Err((status, body)) => (status, body),
         }
@@ -528,6 +531,7 @@ pub(crate) fn peer_access_request_create(
     is_tls: bool,
     source_hint: Option<String>,
     config: &crate::project::PeerAccessRequestConfig,
+    target_identity_public_key: Option<String>,
 ) -> (u16, String) {
     let req: crate::peer::access_request::AccessRequestCreate =
         match serde_json::from_str(body_text) {
@@ -552,6 +556,7 @@ pub(crate) fn peer_access_request_create(
         card_url,
         source_hint,
         config,
+        target_identity_public_key,
     ) {
         Ok(created) => (200, serde_json::to_string(&created).unwrap_or_default()),
         Err(crate::error::CallerError::Config(msg))

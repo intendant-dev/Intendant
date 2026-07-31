@@ -25,7 +25,7 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
     pub(crate) session_model: String,
-    pub(crate) agent_card_json: String,
+    pub(crate) agent_card_live: Arc<crate::web_gateway::agent_card::AgentCardLive>,
     /// Shared, not owned: rebuilt per request under keep-alive, and the
     /// card is a multi-KB JSON tree most handlers never touch.
     pub(crate) agent_card_value_for_targets: Arc<serde_json::Value>,
@@ -111,7 +111,7 @@ pub(crate) async fn serve_http_request(
         config_json,
         session_provider,
         session_model,
-        agent_card_json,
+        agent_card_live,
         agent_card_value_for_targets,
         app_html,
         app_html_override,
@@ -2033,6 +2033,11 @@ pub(crate) async fn serve_http_request(
                     peer_access_request_config,
                     source_hint,
                     is_tls,
+                    // The gateway's one loaded daemon identity (the card
+                    // attestation signer) also stamps approval results,
+                    // so doorbell-paired dialers learn the identity key
+                    // they later verify attestations against.
+                    agent_card_live.identity_public_key(),
                 )
                 .await;
             }
@@ -2854,15 +2859,21 @@ pub(crate) async fn serve_http_request(
         parked_ok = reuse && write_ok;
     } else if req_path == "/.well-known/agent-card.json" {
         // Canonical public peer identity + capability surface. It carries no
-        // runtime secret and remains wildcard-readable for discovery.
+        // runtime secret and remains wildcard-readable for discovery. Served
+        // from the live renderer so the identity attestation always binds
+        // the CURRENT TLS leaves (re-signed across certificate rotation)
+        // and the relay candidate appears once the fleet name is known.
         let reuse = stream.exchange_reusable();
-        let response =
-            HttpResponse::with_content("200 OK", "application/json", agent_card_json.clone())
-                .header("Cache-Control", "no-cache")
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Connection", "close")
-                .connection_reuse(reuse)
-                .into_string();
+        let response = HttpResponse::with_content(
+            "200 OK",
+            "application/json",
+            agent_card_live.render_json().as_ref().clone(),
+        )
+        .header("Cache-Control", "no-cache")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Connection", "close")
+        .connection_reuse(reuse)
+        .into_string();
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
         parked_ok = reuse && write_ok;

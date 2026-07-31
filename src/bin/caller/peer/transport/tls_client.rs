@@ -45,6 +45,19 @@ pub fn installed_access_client_identity_paths() -> Option<ClientIdentityPaths> {
     }
 }
 
+/// The server-verification policy one connect attempt runs under: the pin
+/// set plus the protocol floor. Resolved per candidate by the transport —
+/// the raw stored pins for direct-IP/legacy candidates (byte-identical to
+/// the pre-B2 behavior), or the identity-attested pin set with the TLS 1.3
+/// floor for public-name candidates of an identity-paired peer (Track RC
+/// Stage B2). Both connect legs (agent-card fetch + WebSocket attach) and
+/// the HTTP side-channels consume it through the one [`TlsClientCache`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveTlsPolicy {
+    pub pins: Vec<Fingerprint>,
+    pub require_tls13: bool,
+}
+
 /// Build a reqwest client for peer Agent Card discovery.
 ///
 /// If `pinned_fingerprints` is non-empty, server certificate verification is
@@ -57,7 +70,7 @@ pub fn reqwest_client(
     client_identity: Option<&ClientIdentityPaths>,
 ) -> Result<reqwest::Client, PeerError> {
     let mut builder = reqwest::Client::builder().timeout(timeout);
-    if let Some(config) = rustls_client_config(pinned_fingerprints, client_identity)? {
+    if let Some(config) = rustls_client_config(pinned_fingerprints, client_identity, false)? {
         builder = builder.use_preconfigured_tls(config);
     }
     builder
@@ -68,10 +81,15 @@ pub fn reqwest_client(
 /// Build a rustls client config for peer WebSocket/HTTP clients.
 ///
 /// Returns `None` when neither pinning nor client-auth is required, allowing
-/// callers to use their library's default TLS connector.
+/// callers to use their library's default TLS connector. `require_tls13`
+/// floors the pinned config at TLS 1.3 (see
+/// [`crate::access::pinning::pinned_client_config_with_client_auth`]); it is
+/// only meaningful on the pinned path, which is the only path the attested
+/// policy produces.
 pub fn rustls_client_config(
     pinned_fingerprints: &[Fingerprint],
     client_identity: Option<&ClientIdentityPaths>,
+    require_tls13: bool,
 ) -> Result<Option<rustls::ClientConfig>, PeerError> {
     let identity = match client_identity {
         Some(paths) => Some(load_client_identity(paths)?),
@@ -80,8 +98,12 @@ pub fn rustls_client_config(
 
     if !pinned_fingerprints.is_empty() {
         let verifier = PinnedFingerprintVerifier::new(pinned_fingerprints.to_vec());
-        let config = super::pinning::pinned_client_config_with_client_auth(verifier, identity)
-            .map_err(|e| PeerError::Auth(format!("peer TLS client identity setup failed: {e}")))?;
+        let config = super::pinning::pinned_client_config_with_client_auth(
+            verifier,
+            identity,
+            require_tls13,
+        )
+        .map_err(|e| PeerError::Auth(format!("peer TLS client identity setup failed: {e}")))?;
         return Ok(Some(config));
     }
 
@@ -180,6 +202,12 @@ pub struct TlsClientCache(Arc<std::sync::Mutex<Option<TlsCacheEntry>>>);
 #[derive(Debug)]
 struct TlsCacheEntry {
     pins: Vec<Fingerprint>,
+    /// Protocol floor the entry was built under (the RC-B2 attested
+    /// policy sets it; every legacy path passes `false`). Part of the
+    /// freshness key so a peer whose candidates alternate between the
+    /// attested and raw policies rebuilds instead of serving the wrong
+    /// floor.
+    require_tls13: bool,
     /// Identity paths plus the (cert, key) stamps captured at build time.
     identity: Option<(ClientIdentityPaths, Option<FileStamp>, Option<FileStamp>)>,
     /// `None` = neither pinning nor client auth: WS callers use their
@@ -191,8 +219,13 @@ struct TlsCacheEntry {
 }
 
 impl TlsCacheEntry {
-    fn is_fresh(&self, pins: &[Fingerprint], identity: Option<&ClientIdentityPaths>) -> bool {
-        if self.pins != pins {
+    fn is_fresh(
+        &self,
+        pins: &[Fingerprint],
+        identity: Option<&ClientIdentityPaths>,
+        require_tls13: bool,
+    ) -> bool {
+        if self.pins != pins || self.require_tls13 != require_tls13 {
             return false;
         }
         match (&self.identity, identity) {
@@ -212,35 +245,63 @@ impl TlsCacheEntry {
 }
 
 impl TlsClientCache {
-    /// The rustls config for WebSocket connects: `None` when neither
-    /// pinning nor client auth is configured (use the library default).
-    pub fn client_config(
+    /// The rustls config for WebSocket connects under an explicit
+    /// per-candidate policy (pins + protocol floor) — the RC-B2 seam
+    /// both connect legs resolve their TLS material through. `None`
+    /// when neither pinning nor client auth is configured (use the
+    /// library default).
+    pub fn client_config_for_policy(
         &self,
-        pinned_fingerprints: &[Fingerprint],
+        policy: &EffectiveTlsPolicy,
         client_identity: Option<&ClientIdentityPaths>,
     ) -> Result<Option<Arc<rustls::ClientConfig>>, PeerError> {
-        Ok(self.entry(pinned_fingerprints, client_identity)?.0)
+        Ok(self
+            .entry(&policy.pins, client_identity, policy.require_tls13)?
+            .0)
     }
 
     /// The pooled HTTP client on the same trust policy. Callers set
     /// per-request timeouts (`RequestBuilder::timeout`).
-    pub fn http_client(
+    pub fn http_client_for_policy(
+        &self,
+        policy: &EffectiveTlsPolicy,
+        client_identity: Option<&ClientIdentityPaths>,
+    ) -> Result<reqwest::Client, PeerError> {
+        Ok(self
+            .entry(&policy.pins, client_identity, policy.require_tls13)?
+            .1)
+    }
+
+    /// Raw-pin shorthand for tests: the legacy no-floor policy.
+    #[cfg(test)]
+    pub(crate) fn client_config(
+        &self,
+        pinned_fingerprints: &[Fingerprint],
+        client_identity: Option<&ClientIdentityPaths>,
+    ) -> Result<Option<Arc<rustls::ClientConfig>>, PeerError> {
+        Ok(self.entry(pinned_fingerprints, client_identity, false)?.0)
+    }
+
+    /// Raw-pin shorthand for tests, HTTP-client half.
+    #[cfg(test)]
+    pub(crate) fn http_client(
         &self,
         pinned_fingerprints: &[Fingerprint],
         client_identity: Option<&ClientIdentityPaths>,
     ) -> Result<reqwest::Client, PeerError> {
-        Ok(self.entry(pinned_fingerprints, client_identity)?.1)
+        Ok(self.entry(pinned_fingerprints, client_identity, false)?.1)
     }
 
     fn entry(
         &self,
         pins: &[Fingerprint],
         identity: Option<&ClientIdentityPaths>,
+        require_tls13: bool,
     ) -> Result<(Option<Arc<rustls::ClientConfig>>, reqwest::Client), PeerError> {
         {
             let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = cached.as_ref() {
-                if entry.is_fresh(pins, identity) {
+                if entry.is_fresh(pins, identity, require_tls13) {
                     return Ok((entry.config.clone(), entry.http_client.clone()));
                 }
             }
@@ -254,7 +315,7 @@ impl TlsClientCache {
                 file_stamp(&paths.key_path),
             )
         });
-        let config = rustls_client_config(pins, identity)?.map(Arc::new);
+        let config = rustls_client_config(pins, identity, require_tls13)?.map(Arc::new);
         let mut builder = reqwest::Client::builder();
         if let Some(config) = &config {
             builder = builder.use_preconfigured_tls(rustls::ClientConfig::clone(config));
@@ -264,12 +325,113 @@ impl TlsClientCache {
             .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
         let entry = TlsCacheEntry {
             pins: pins.to_vec(),
+            require_tls13,
             identity: identity_stamps,
             config: config.clone(),
             http_client: http_client.clone(),
         };
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
         Ok((config, http_client))
+    }
+}
+
+/// Accept-any-certificate verifier for the attestation prefetch: the
+/// agent-card fetch that happens BEFORE server trust is established on an
+/// identity-attested candidate. The document it retrieves is
+/// content-signed (`access::identity_attestation`) and verified against
+/// the key persisted at pairing, so the transport deliberately carries no
+/// trust — the release-pinned-installer pattern, and the same posture as
+/// the pairing bootstrap's `CaptureOnFirstContactVerifier`. Handshake
+/// signatures are still verified so a passive wire observer cannot splice
+/// a stolen certificate without its key; that is hygiene, not a trust
+/// input. Never presents a client certificate: nothing about this daemon
+/// leaks to an unverified endpoint.
+#[derive(Debug)]
+struct ContentSignedProbeVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ContentSignedProbeVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// One-shot HTTP client for the content-signed attestation prefetch. Not
+/// cached: prefetches happen once per connect attempt, and the reconnect
+/// walk is backoff-paced.
+pub(crate) fn content_signed_probe_client(timeout: Duration) -> Result<reqwest::Client, PeerError> {
+    let provider = match rustls::crypto::CryptoProvider::get_default() {
+        Some(p) => p.clone(),
+        None => Arc::new(rustls::crypto::ring::default_provider()),
+    };
+    let verifier = ContentSignedProbeVerifier {
+        provider: provider.clone(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .map_err(|e| PeerError::Auth(format!("attestation probe TLS setup failed: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .use_preconfigured_tls(config)
+        .build()
+        .map_err(|e| PeerError::CardFetch(format!("build attestation probe client: {e}")))
+}
+
+/// Host classification for the per-candidate verification policy: `true`
+/// when the URL's host is a DNS name (the class whose presented
+/// certificate is SNI-selected and rotation-bearing — fleet names, custom
+/// names, LAN names), `false` for IP literals (the raw-pin fast path) and
+/// for anything unparseable (fail toward the legacy path, which still
+/// refuses on its own pin).
+pub(crate) fn url_host_is_dns_name(url: &str) -> bool {
+    match url::Url::parse(url) {
+        Ok(parsed) => matches!(parsed.host(), Some(url::Host::Domain(_))),
+        Err(_) => false,
     }
 }
 
@@ -366,6 +528,63 @@ mod tests {
             !Arc::ptr_eq(&first, &rotated),
             "a rotated identity must rebuild the config"
         );
+    }
+
+    /// The protocol floor is part of the cache key: the same pin set
+    /// under a different floor rebuilds instead of serving the wrong
+    /// TLS material (the RC-B2 attested policy vs a raw-pin sibling).
+    #[test]
+    fn tls_cache_keys_on_protocol_floor() {
+        let cache = TlsClientCache::default();
+        let pins = [[3u8; 32]];
+        let raw = cache
+            .client_config_for_policy(
+                &EffectiveTlsPolicy {
+                    pins: pins.to_vec(),
+                    require_tls13: false,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("pinned config");
+        let floored = cache
+            .client_config_for_policy(
+                &EffectiveTlsPolicy {
+                    pins: pins.to_vec(),
+                    require_tls13: true,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("pinned config");
+        assert!(
+            !Arc::ptr_eq(&raw, &floored),
+            "same pins under a different floor must rebuild"
+        );
+        let floored_again = cache
+            .client_config_for_policy(
+                &EffectiveTlsPolicy {
+                    pins: pins.to_vec(),
+                    require_tls13: true,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("cached config");
+        assert!(Arc::ptr_eq(&floored, &floored_again));
+    }
+
+    /// Host classification for the verification policy: DNS names take
+    /// the attested path, IP literals (and garbage) stay on the raw-pin
+    /// fast path.
+    #[test]
+    fn url_host_classification() {
+        assert!(url_host_is_dns_name("wss://d-aa.fleet.example:443/ws"));
+        assert!(url_host_is_dns_name("wss://localhost:8443/ws"));
+        assert!(url_host_is_dns_name("wss://nicks-mac.local:8443/ws"));
+        assert!(!url_host_is_dns_name("wss://127.0.0.1:8443/ws"));
+        assert!(!url_host_is_dns_name("wss://[::1]:8443/ws"));
+        assert!(!url_host_is_dns_name("not a url"));
     }
 
     /// The unpinned, identity-less shape stays `None` (library default

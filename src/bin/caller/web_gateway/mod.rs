@@ -284,6 +284,15 @@ pub struct WebGatewayConfig {
     /// machine's access stores or hostname.
     #[serde(skip)]
     pub hosted_control_daemon_label: Option<String>,
+    /// Key path for the daemon identity that signs the agent card's
+    /// `identity_attestation` block (RC-B2). Production wires the daemon
+    /// identity store's key path at startup; tests inject a temp path or
+    /// leave it unset, which serves the card without an attestation (and
+    /// identity-paired dialers then fail closed on public-name
+    /// candidates). Same hermetic-injection pattern as
+    /// `hosted_control_identity_path`.
+    #[serde(skip)]
+    pub attestation_identity_path: Option<std::path::PathBuf>,
 }
 
 impl Default for WebGatewayConfig {
@@ -304,6 +313,7 @@ impl Default for WebGatewayConfig {
             connect: crate::project::ConnectConfig::default(),
             hosted_control_identity_path: None,
             hosted_control_daemon_label: None,
+            attestation_identity_path: None,
         }
     }
 }

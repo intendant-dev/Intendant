@@ -69,7 +69,7 @@ pub fn mcp_endpoint(card: &AgentCard) -> Option<String> {
         }
     }
     for spec in &card.transports {
-        if let TransportSpec::IntendantWs { url } = spec {
+        if let TransportSpec::IntendantWs { url, .. } = spec {
             return Some(format!("{}/mcp", ws_url_to_http_base(url)));
         }
     }
@@ -98,10 +98,16 @@ pub async fn call_peer_mcp_tool(
     // Shared with the transport's card fetch: one pooled client per
     // credentials bundle, so a CU loop's dozens of tool calls reuse the
     // TCP+TLS connection instead of a fresh handshake (and root-store
-    // load) per call.
+    // load) per call. The effective policy keeps this side-channel on
+    // the same trust decision as the live link — for an identity-
+    // attested peer the raw stored pin no longer matches what a
+    // fleet-name endpoint presents.
     let client = creds
         .tls
-        .http_client(&creds.pinned_fingerprints, creds.client_identity.as_ref())
+        .http_client_for_policy(
+            &creds.effective_tls_policy(),
+            creds.client_identity.as_ref(),
+        )
         .map_err(|e| format!("build peer http client: {e}"))?;
     let body = serde_json::json!({
         "jsonrpc": "2.0",

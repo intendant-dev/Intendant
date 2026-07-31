@@ -32,6 +32,18 @@ pub struct PeerInvite {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_cert_fingerprint: Option<String>,
+    /// The issuing daemon's Ed25519 daemon-identity public key
+    /// (base64url, unpadded). Version 2 invites carry it so the joining
+    /// daemon can verify identity-bound leaf attestations on fleet-name
+    /// and relayed dials (rotation-proof; see
+    /// `crate::access::identity_attestation`). It rides the invite under
+    /// the same out-of-band custody as the `server_cert_fingerprint` pin
+    /// (B0 ruling P2) — the ceremony, not any later fetch, is what makes
+    /// it trustworthy. Version 1 invites (pre-B2 issuers, or an issuer
+    /// whose identity key failed to load) omit it; joiners then keep
+    /// legacy raw-pin behavior on every candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_identity_public_key: Option<String>,
     pub client_cert_pem: String,
     pub client_key_pem: String,
     pub issued_at_unix: i64,
@@ -596,12 +608,23 @@ fn cmd_revoke(args: PeerArgs) -> Result<(), CallerError> {
 
 pub(crate) fn create_invite(options: InviteOptions) -> Result<InviteOutcome, CallerError> {
     let cert_dir = access::backend::select_backend().cert_dir();
-    create_invite_from_cert_dir(&cert_dir, options)
+    // Best effort, mirroring the doorbell caller-ID stance: a box whose
+    // identity key cannot load still issues a (version 1) invite — the
+    // joiner just keeps legacy raw-pin verification.
+    let identity = match crate::daemon_identity::DaemonIdentity::load_or_create_default() {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            eprintln!(":: peer invite: daemon identity unavailable ({e}); issuing a v1 invite without an identity key");
+            None
+        }
+    };
+    create_invite_from_cert_dir(&cert_dir, options, identity.as_ref())
 }
 
 pub(crate) fn create_invite_from_cert_dir(
     cert_dir: &Path,
     options: InviteOptions,
+    identity: Option<&crate::daemon_identity::DaemonIdentity>,
 ) -> Result<InviteOutcome, CallerError> {
     let label = options.label.unwrap_or_else(access::resolve_host_label);
     let client_name = options
@@ -611,9 +634,10 @@ pub(crate) fn create_invite_from_cert_dir(
         Some(url) => normalize_card_url(&url)?,
         None => default_card_url(cert_dir, options.port)?,
     };
-    let identity =
+    let client_identity =
         access::certs::issue_client_identity(cert_dir, &client_name).map_err(access_error)?;
-    let client_fingerprint = crate::peer::access_policy::fingerprint_pem(&identity.cert_pem)?;
+    let client_fingerprint =
+        crate::peer::access_policy::fingerprint_pem(&client_identity.cert_pem)?;
     let server_cert_fingerprint = access::certs::read_server_cert_fingerprint(cert_dir)
         .ok_or_else(|| {
             CallerError::Config(format!(
@@ -634,13 +658,22 @@ pub(crate) fn create_invite_from_cert_dir(
         None,
     )?;
 
+    let daemon_identity_public_key = identity.map(|identity| identity.public_key_b64u());
     let invite = PeerInvite {
-        version: 1,
+        // Version 2 = carries the issuer's daemon-identity public key;
+        // pre-B2 joiners refuse it loudly ("unsupported peer invite
+        // version 2") rather than silently dropping the key.
+        version: if daemon_identity_public_key.is_some() {
+            2
+        } else {
+            1
+        },
         card_url,
         label: Some(label),
         server_cert_fingerprint: Some(server_cert_fingerprint.clone()),
-        client_cert_pem: identity.cert_pem,
-        client_key_pem: identity.key_pem,
+        daemon_identity_public_key,
+        client_cert_pem: client_identity.cert_pem,
+        client_key_pem: client_identity.key_pem,
         issued_at_unix: crate::access::access_policy::unix_timestamp(),
     };
     let encoded = encode_invite(&invite)?;
@@ -668,7 +701,10 @@ pub fn decode_invite(input: &str) -> Result<PeerInvite, CallerError> {
 }
 
 fn validate_invite(invite: &PeerInvite) -> Result<(), CallerError> {
-    if invite.version != 1 {
+    // v1 = legacy (no identity key); v2 = carries the issuer's
+    // daemon-identity public key. Anything newer refuses — fail closed
+    // on formats this build cannot validate.
+    if !matches!(invite.version, 1 | 2) {
         return Err(CallerError::Config(format!(
             "unsupported peer invite version {}",
             invite.version
@@ -688,6 +724,34 @@ fn validate_invite(invite: &PeerInvite) -> Result<(), CallerError> {
         crate::peer::transport::pinning::parse_fingerprint(fp).map_err(|e| {
             CallerError::Config(format!("peer invite has invalid server fingerprint: {e}"))
         })?;
+    }
+    match invite.daemon_identity_public_key.as_deref() {
+        Some(key) => {
+            validate_identity_public_key(key).map_err(|e| {
+                CallerError::Config(format!("peer invite has an invalid identity key: {e}"))
+            })?;
+        }
+        None if invite.version >= 2 => {
+            return Err(CallerError::Config(
+                "peer invite version 2 is missing its daemon identity key".into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Shared shape check for a pairing-carried Ed25519 daemon-identity
+/// public key: base64url (unpadded) decoding to exactly 32 bytes.
+pub(crate) fn validate_identity_public_key(key: &str) -> Result<(), String> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(key.trim())
+        .map_err(|e| format!("not base64url: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected a 32-byte Ed25519 public key, got {} bytes",
+            bytes.len()
+        ));
     }
     Ok(())
 }
@@ -735,6 +799,12 @@ pub(crate) fn join_peer_invite(
             if !pins.is_empty() {
                 peer.pinned_fingerprints = pins;
             }
+            // A v2 invite refreshes the paired identity key; a v1
+            // re-join keeps whatever an earlier v2 pairing persisted
+            // (never silently downgrade verification).
+            if invite.daemon_identity_public_key.is_some() {
+                peer.identity_public_key = invite.daemon_identity_public_key.clone();
+            }
         }
         None => {
             project.config.peers.push(PeerConfig {
@@ -745,6 +815,7 @@ pub(crate) fn join_peer_invite(
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
+                identity_public_key: invite.daemon_identity_public_key.clone(),
                 browser_tcp_via_url: None,
                 certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
@@ -897,10 +968,23 @@ mod tests {
             server_cert_fingerprint: Some(
                 "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
             ),
+            daemon_identity_public_key: None,
             client_cert_pem: "-----BEGIN CERTIFICATE-----\npeer\n-----END CERTIFICATE-----\n"
                 .into(),
             client_key_pem: "-----BEGIN PRIVATE KEY-----\npeer\n-----END PRIVATE KEY-----\n".into(),
             issued_at_unix: 1,
+        }
+    }
+
+    fn test_identity(dir: &std::path::Path) -> crate::daemon_identity::DaemonIdentity {
+        crate::daemon_identity::DaemonIdentity::load_or_create(dir.join("identity.pk8")).unwrap()
+    }
+
+    fn invite_v2(key: &str) -> PeerInvite {
+        PeerInvite {
+            version: 2,
+            daemon_identity_public_key: Some(key.to_string()),
+            ..invite()
         }
     }
 
@@ -919,6 +1003,110 @@ mod tests {
         let encoded = encode_invite(&original).unwrap();
         assert!(encoded.starts_with(INVITE_PREFIX));
         assert_eq!(decode_invite(&encoded).unwrap(), original);
+    }
+
+    /// Pairing migration, invite lane: v1 (legacy, no key) decodes; v2
+    /// round-trips with its key; a v2 stripped of the key refuses (never
+    /// a silent downgrade); versions newer than this build refuses.
+    #[test]
+    fn invite_versions_migrate_and_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let identity = test_identity(dir.path());
+        let key = identity.public_key_b64u();
+
+        // v1 legacy: still decodes, no key.
+        let v1 = invite();
+        let decoded = decode_invite(&encode_invite(&v1).unwrap()).unwrap();
+        assert!(decoded.daemon_identity_public_key.is_none());
+
+        // v2 round-trip.
+        let v2 = invite_v2(&key);
+        let decoded = decode_invite(&encode_invite(&v2).unwrap()).unwrap();
+        assert_eq!(decoded.daemon_identity_public_key.as_deref(), Some(&*key));
+
+        // v2 without its key: refused.
+        let mut stripped = invite_v2(&key);
+        stripped.daemon_identity_public_key = None;
+        let err = decode_invite(&encode_invite(&stripped).unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("missing its daemon identity key"),
+            "got: {err}"
+        );
+
+        // Malformed key: refused.
+        let mut malformed = invite_v2("not-32-bytes");
+        malformed.version = 2;
+        let err = decode_invite(&encode_invite(&malformed).unwrap()).unwrap_err();
+        assert!(err.to_string().contains("invalid identity key"), "got: {err}");
+
+        // Future version: refused loudly (fail closed).
+        let mut v3 = invite_v2(&key);
+        v3.version = 3;
+        let err = decode_invite(&encode_invite(&v3).unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported peer invite version 3"),
+            "got: {err}"
+        );
+    }
+
+    /// The issuing side: with a loadable identity the invite is v2 and
+    /// carries the issuer's public key; without one it stays v1.
+    #[test]
+    fn create_invite_carries_identity_key_as_v2() {
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), &names("10.0.0.9"), "peer", false).unwrap();
+        let identity = test_identity(tmp.path());
+
+        let outcome = create_invite_from_cert_dir(
+            tmp.path(),
+            InviteOptions::default(),
+            Some(&identity),
+        )
+        .unwrap();
+        assert_eq!(outcome.invite.version, 2);
+        assert_eq!(
+            outcome.invite.daemon_identity_public_key.as_deref(),
+            Some(&*identity.public_key_b64u())
+        );
+        decode_invite(&outcome.encoded).expect("v2 invite validates");
+
+        let legacy = create_invite_from_cert_dir(tmp.path(), InviteOptions::default(), None)
+            .unwrap();
+        assert_eq!(legacy.invite.version, 1);
+        assert!(legacy.invite.daemon_identity_public_key.is_none());
+    }
+
+    /// The joining side: a v2 invite persists the key on the peer
+    /// config; a later v1 re-join keeps it (no silent downgrade); a v1
+    /// join never invents one.
+    #[test]
+    fn join_persists_identity_key_and_never_downgrades() {
+        let root = TempDir::new().unwrap();
+        let certs = TempDir::new().unwrap();
+        let identity = test_identity(certs.path());
+        let key = identity.public_key_b64u();
+        let mut project = Project {
+            root: root.path().to_path_buf(),
+            config: ProjectConfig::default(),
+        };
+
+        join_peer_invite(&mut project, certs.path(), invite(), None).unwrap();
+        assert!(project.config.peers[0].identity_public_key.is_none());
+
+        join_peer_invite(&mut project, certs.path(), invite_v2(&key), None).unwrap();
+        assert_eq!(
+            project.config.peers[0].identity_public_key.as_deref(),
+            Some(&*key)
+        );
+
+        // Legacy re-join (a v1 invite for the same peer) keeps the key.
+        join_peer_invite(&mut project, certs.path(), invite(), None).unwrap();
+        assert_eq!(project.config.peers.len(), 1);
+        assert_eq!(
+            project.config.peers[0].identity_public_key.as_deref(),
+            Some(&*key),
+            "a v1 re-join must not silently drop attested verification"
+        );
     }
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -1063,6 +1251,7 @@ mod tests {
                 client_name: Some("dashboard pairing".into()),
                 ..InviteOptions::default()
             },
+            None,
         )
         .unwrap();
         let decoded = decode_invite(&outcome.encoded).unwrap();

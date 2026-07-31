@@ -105,6 +105,16 @@ pub(crate) struct ApprovedAccessResult {
     pub client_cert_pem: String,
     pub approved_profile: String,
     pub approved_at_unix: i64,
+    /// The TARGET daemon's Ed25519 identity public key (base64url,
+    /// unpadded), so doorbell-paired dialers can verify identity-bound
+    /// leaf attestations on fleet-name/relayed dials. Authenticity to
+    /// the requester roots in the pairing ceremony — this result rides
+    /// the status channel pinned to the server fingerprint captured on
+    /// first contact — exactly the trust class the fingerprint itself
+    /// rides (B0 ruling P2). Absent from pre-B2 targets; requesters
+    /// then keep legacy raw-pin behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_daemon_identity_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +167,11 @@ pub(crate) struct StoredAccessRequest {
     pub denied_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_cert_pem: Option<String>,
+    /// This (target) daemon's identity public key, stamped when the
+    /// request was received so the approval result can carry it (see
+    /// [`ApprovedAccessResult::target_daemon_identity_public_key`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_daemon_identity_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,6 +400,11 @@ pub(crate) fn create_pending_request(
     target_card_url: String,
     source_hint: Option<String>,
     config: &PeerAccessRequestConfig,
+    // This daemon's identity public key, resolved by the transport edge
+    // (the gateway owns the loaded identity; tests inject or pass None)
+    // so this store-level function never touches the machine-global
+    // identity path.
+    target_identity_public_key: Option<String>,
 ) -> Result<AccessRequestCreated, CallerError> {
     if !public_requests_enabled(config) {
         return Err(CallerError::Config(
@@ -473,6 +493,7 @@ pub(crate) fn create_pending_request(
         approved_at_unix: None,
         denied_at_unix: None,
         client_cert_pem: None,
+        target_daemon_identity_public_key: target_identity_public_key,
     };
     write_request(cert_dir, &stored)?;
     eprintln!(
@@ -790,6 +811,11 @@ pub(crate) fn install_approved_identity(
             ))
         },
     )?;
+    if let Some(key) = result.target_daemon_identity_public_key.as_deref() {
+        super::pairing::validate_identity_public_key(key).map_err(|e| {
+            CallerError::Config(format!("approved result has an invalid identity key: {e}"))
+        })?;
+    }
     let peer_dir = cert_dir.join("peers").join(storage_slug(
         label_override.or(result.label.as_deref()),
         &result.card_url,
@@ -819,6 +845,12 @@ pub(crate) fn install_approved_identity(
             peer.client_cert = Some(cert_path.to_string_lossy().into_owned());
             peer.client_key = Some(key_path.to_string_lossy().into_owned());
             peer.pinned_fingerprints = pins;
+            // A result carrying the target's identity key refreshes it;
+            // a pre-B2 target's result (no key) keeps whatever an
+            // earlier pairing persisted (never silently downgrade).
+            if result.target_daemon_identity_public_key.is_some() {
+                peer.identity_public_key = result.target_daemon_identity_public_key.clone();
+            }
         }
         None => {
             project.config.peers.push(PeerConfig {
@@ -829,6 +861,7 @@ pub(crate) fn install_approved_identity(
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
+                identity_public_key: result.target_daemon_identity_public_key.clone(),
                 browser_tcp_via_url: None,
                 certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
             });
@@ -903,6 +936,9 @@ fn status_response(stored: &StoredAccessRequest) -> AccessRequestStatusResponse 
                     .clone()
                     .unwrap_or_else(|| DEFAULT_PROFILE.to_string()),
                 approved_at_unix: stored.approved_at_unix.unwrap_or(stored.created_at_unix),
+                target_daemon_identity_public_key: stored
+                    .target_daemon_identity_public_key
+                    .clone(),
             })
     } else {
         None
@@ -1635,6 +1671,7 @@ mod tests {
             card_url.into(),
             Some(source.clone()),
             &config,
+            None,
         )
         .unwrap();
         let stored = find_request(certs.path(), &created.request_id).unwrap();
@@ -1653,6 +1690,7 @@ mod tests {
             card_url.into(),
             Some(source.clone()),
             &config,
+            None,
         )
         .unwrap();
         let stored = find_request(certs.path(), &created.request_id).unwrap();
@@ -1676,6 +1714,7 @@ mod tests {
             card_url.into(),
             Some(source.clone()),
             &config,
+            None,
         )
         .unwrap();
         let stored = find_request(certs.path(), &created.request_id).unwrap();
@@ -1699,6 +1738,7 @@ mod tests {
             card_url.into(),
             Some(source),
             &config,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1748,6 +1788,7 @@ mod tests {
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
             &config,
+            None,
         )
         .unwrap_err();
 
@@ -1791,6 +1832,7 @@ mod tests {
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
             &PeerAccessRequestConfig::default(),
+            None,
         )
         .unwrap();
         // The id rides argv in `peer complete <id>`: a leading '-' reads
@@ -1828,6 +1870,7 @@ mod tests {
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
             &PeerAccessRequestConfig::default(),
+            None,
         )
         .unwrap();
         let approved = approve_request(certs.path(), &created.code, None).unwrap();
@@ -1870,6 +1913,7 @@ mod tests {
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
             &PeerAccessRequestConfig::default(),
+            None,
         )
         .unwrap();
         let approved = approve_request(certs.path(), &created.code, None).unwrap();
@@ -1909,6 +1953,7 @@ mod tests {
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
             &PeerAccessRequestConfig::default(),
+            None,
         )
         .unwrap();
         let approved = approve_request(certs.path(), &created.code, None).unwrap();
@@ -1945,6 +1990,7 @@ mod tests {
             client_cert_pem: cert,
             approved_profile: "peer-daemon".into(),
             approved_at_unix: unix_timestamp(),
+            target_daemon_identity_public_key: None,
         };
 
         let outcome =
@@ -1956,6 +2002,145 @@ mod tests {
         assert!(outcome.client_key_path.exists());
         assert_eq!(project.config.peers.len(), 1);
         assert_eq!(project.config.peers[0].card_url, result.card_url);
+        assert!(
+            project.config.peers[0].identity_public_key.is_none(),
+            "a pre-B2 result installs without inventing an identity key"
+        );
+    }
+
+    /// Pairing migration, doorbell lane: the approval result carries the
+    /// target identity key stamped at create time; the requester
+    /// persists it; a pre-B2 result (no field) parses to `None` and a
+    /// later key-less re-install never drops a persisted key.
+    #[test]
+    fn doorbell_lane_carries_and_persists_target_identity_key() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let target_key = test_identity().public_key_b64u();
+
+        // Target side: stamped at create, carried on the approved result.
+        let requester_key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: requester_key.public_key_pem,
+            nonce: "doorbell-key-nonce-1".into(),
+            requested_profile: None,
+            requester_card_url: None,
+            requester_daemon_id: None,
+            requester_daemon_sig: None,
+            requester_daemon_sig_ts: None,
+            dialed_origin: None,
+            requester_tier: None,
+        };
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            None,
+            &PeerAccessRequestConfig::default(),
+            Some(target_key.clone()),
+        )
+        .unwrap();
+        approve_request(certs.path(), &created.code, None).unwrap();
+        let status = request_status(certs.path(), &created.request_id).unwrap();
+        let result = status.result.expect("approved result");
+        assert_eq!(
+            result.target_daemon_identity_public_key.as_deref(),
+            Some(&*target_key)
+        );
+
+        // Wire compat: a pre-B2 target's result has no field → None.
+        let legacy: ApprovedAccessResult = serde_json::from_value(serde_json::json!({
+            "card_url": "https://target/.well-known/agent-card.json",
+            "server_cert_fingerprint": result.server_cert_fingerprint,
+            "client_cert_pem": result.client_cert_pem,
+            "approved_profile": "peer-operator",
+            "approved_at_unix": 1,
+        }))
+        .unwrap();
+        assert!(legacy.target_daemon_identity_public_key.is_none());
+
+        // Requester side: install persists the key…
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project {
+            root: root.path().to_path_buf(),
+            config: ProjectConfig::default(),
+        };
+        let key_material = access::certs::generate_client_key_material().unwrap();
+        install_approved_identity(
+            &mut project,
+            certs.path(),
+            &result,
+            &key_material.key_pem,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            project.config.peers[0].identity_public_key.as_deref(),
+            Some(&*target_key)
+        );
+
+        // …and a later key-less result for the same peer keeps it.
+        install_approved_identity(
+            &mut project,
+            certs.path(),
+            &legacy,
+            &key_material.key_pem,
+            None,
+        )
+        .unwrap();
+        assert_eq!(project.config.peers.len(), 1);
+        assert_eq!(
+            project.config.peers[0].identity_public_key.as_deref(),
+            Some(&*target_key),
+            "a pre-B2 re-install must not silently drop attested verification"
+        );
+    }
+
+    /// A malformed identity key in an approval result refuses install
+    /// outright — corrupt or tampered results never write config.
+    #[test]
+    fn install_refuses_malformed_identity_key() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let root = tempfile::TempDir::new().unwrap();
+        std::fs::write(root.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project {
+            root: root.path().to_path_buf(),
+            config: ProjectConfig::default(),
+        };
+        let key_material = access::certs::generate_client_key_material().unwrap();
+        let cert = access::certs::issue_client_certificate_for_public_key(
+            certs.path(),
+            "primary",
+            &key_material.public_key_pem,
+        )
+        .unwrap();
+        let result = ApprovedAccessResult {
+            card_url: "https://target/.well-known/agent-card.json".into(),
+            label: None,
+            server_cert_fingerprint: access::certs::read_server_cert_fingerprint(certs.path())
+                .unwrap(),
+            client_cert_pem: cert,
+            approved_profile: "peer-operator".into(),
+            approved_at_unix: unix_timestamp(),
+            target_daemon_identity_public_key: Some("not-a-key".into()),
+        };
+        let err = install_approved_identity(
+            &mut project,
+            certs.path(),
+            &result,
+            &key_material.key_pem,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid identity key"),
+            "got: {err}"
+        );
+        assert!(project.config.peers.is_empty(), "nothing installed");
     }
 
     /// The create limiter is process-global, and the aging test below

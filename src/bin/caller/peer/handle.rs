@@ -161,23 +161,30 @@ pub struct PeerLinkInfo {
 impl PeerLinkInfo {
     /// Derive link info from the connected candidate's spec.
     ///
-    /// Classification seam: every candidate the registry builds today
-    /// is an operator/card URL dialed directly, so the class is
-    /// `Direct`. The Stage-B relay work (RC-B2) introduces the
-    /// fleet-name relay candidate; its constructor is the one place
-    /// that should classify `Relayed`.
+    /// Classification seam: the spec itself carries the class. Every
+    /// operator/card URL dialed directly classifies `Direct`; the one
+    /// `Relayed` constructor is the relay-mode card render
+    /// (`web_gateway::agent_card`), which stamps `relay: true` on the
+    /// auto-appended fleet-name candidate (Track RC Stage B2).
     pub(crate) fn from_spec(spec: &crate::peer::card::TransportSpec) -> Option<Self> {
         use crate::peer::card::TransportSpec;
-        let url = match spec {
-            TransportSpec::IntendantWs { url } => url.clone(),
-            TransportSpec::A2A { url } => url.clone(),
-            TransportSpec::Mcp { url, .. } => url.clone(),
-            TransportSpec::OpenClawWs { url, .. } => url.clone(),
+        let (url, transport_class) = match spec {
+            TransportSpec::IntendantWs { url, relay } => (
+                url.clone(),
+                if *relay {
+                    PeerTransportClass::Relayed
+                } else {
+                    PeerTransportClass::Direct
+                },
+            ),
+            TransportSpec::A2A { url } => (url.clone(), PeerTransportClass::Direct),
+            TransportSpec::Mcp { url, .. } => (url.clone(), PeerTransportClass::Direct),
+            TransportSpec::OpenClawWs { url, .. } => (url.clone(), PeerTransportClass::Direct),
             TransportSpec::Unknown => return None,
         };
         Some(Self {
             url,
-            transport_class: PeerTransportClass::Direct,
+            transport_class,
         })
     }
 }
@@ -439,7 +446,7 @@ impl PeerHandle {
     pub fn snapshot(&self) -> PeerSnapshot {
         let card = self.card_snapshot();
         let ws_url = card.transports.iter().find_map(|t| match t {
-            crate::peer::card::TransportSpec::IntendantWs { url } => Some(url.clone()),
+            crate::peer::card::TransportSpec::IntendantWs { url, .. } => Some(url.clone()),
             _ => None,
         });
         let capabilities: Vec<serde_json::Value> = card

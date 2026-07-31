@@ -126,6 +126,15 @@ pub(crate) fn build_and_hydrate_peer_registry(
     let log_path = log_dir.join("peers.jsonl");
     let (log_tx, _log_handle) = peer::spawn_peer_log_writer(log_path);
     let registry = peer::PeerRegistry::new(log_tx);
+    // Durable root for attestation anti-rollback floors (RC-B2, A4):
+    // beside the peer credential dirs in the access store, resolved here
+    // at the production edge (tests build their own registries and
+    // inject temp dirs).
+    registry.set_attestation_state_dir(
+        crate::access::identity_attestation::default_high_water_dir(
+            &access::backend::select_backend().cert_dir(),
+        ),
+    );
     for cfg in peer_configs {
         let registry_for_task = registry.clone();
         let card_url = cfg.card_url.clone();
@@ -133,6 +142,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
         let bearer_token = cfg.bearer_token.clone();
         let via_urls = cfg.via_urls.clone();
         let pinned_fingerprints = cfg.pinned_fingerprints.clone();
+        let identity_public_key = cfg.identity_public_key.clone();
         let browser_tcp_via_url = cfg.browser_tcp_via_url.clone();
         let certificate_witness_vantage = cfg.certificate_witness_vantage;
         let explicit_client_identity = match peer_client_identity_from_config(cfg) {
@@ -157,7 +167,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
             // same URL (primary-side localhost tunnel, split
             // browser/primary machines, etc.).
             if let Err(e) = registry_for_task
-                .add_peer_with_credentials_and_client_identity_label_and_witness_vantage(
+                .add_peer_full(
                     &card_url,
                     via_urls,
                     bearer_token,
@@ -166,6 +176,7 @@ pub(crate) fn build_and_hydrate_peer_registry(
                     explicit_client_identity,
                     label,
                     certificate_witness_vantage,
+                    identity_public_key,
                 )
                 .await
             {

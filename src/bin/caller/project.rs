@@ -1861,6 +1861,21 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_fingerprints: Vec<String>,
+    /// The peer daemon's Ed25519 daemon-identity public key (base64url,
+    /// unpadded), persisted at pairing (v2 invites and doorbell approval
+    /// results carry it under exactly the trust class the
+    /// `pinned_fingerprints` ceremony pin rides — the out-of-band invite
+    /// or the fingerprint-pinned approval channel; B0 ruling P2).
+    ///
+    /// When set, candidates whose host is a DNS name verify the
+    /// presented server certificate through the peer's identity-bound
+    /// leaf attestation instead of the raw pin — the attestation binds
+    /// the peer's *current* access and fleet leaves, so fleet-name and
+    /// relayed dials survive certificate rotation. Absent (legacy
+    /// pairings), every candidate keeps today's raw-pin behavior.
+    /// Direct-IP candidates use the raw pin either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_public_key: Option<String>,
     /// Explicit URL the **browser** uses to reach this peer's HTTP
     /// port for WebRTC ICE-TCP — decoupled from the via URL the
     /// primary uses for federation.

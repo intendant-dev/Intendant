@@ -1439,7 +1439,7 @@ async fn hold_attachment(
         tokio_tungstenite::tungstenite::http::HeaderValue::from_static("1"),
     );
     let connector =
-        crate::peer::transport::tls_client::rustls_client_config(pinned, Some(identity))
+        crate::peer::transport::tls_client::rustls_client_config(pinned, Some(identity), false)
             .map_err(|e| format!("build TLS config: {e}"))?
             .map(|config| tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config)));
     let (mut ws, _resp) =

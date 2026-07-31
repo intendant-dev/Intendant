@@ -266,7 +266,10 @@ impl PeerActor {
             card.transports = self
                 .via_urls
                 .iter()
-                .map(|url| crate::peer::card::TransportSpec::IntendantWs { url: url.clone() })
+                .map(|url| crate::peer::card::TransportSpec::IntendantWs {
+                    url: url.clone(),
+                    relay: false,
+                })
                 .collect();
         }
     }

@@ -1937,7 +1937,7 @@ pub(crate) fn fleet_access_origin_allowed(
             // per fleet-CORS request and preflight.
             let card = handle.card_snapshot();
             let ws_url = card.transports.iter().find_map(|t| match t {
-                crate::peer::card::TransportSpec::IntendantWs { url } => Some(url.as_str()),
+                crate::peer::card::TransportSpec::IntendantWs { url, .. } => Some(url.as_str()),
                 _ => None,
             });
             for candidate in [ws_url, handle.browser_tcp_via_url()].into_iter().flatten() {

@@ -66,6 +66,7 @@ impl AgentCard {
             transports,
             capabilities,
             auth,
+            identity_attestation: None,
         }
     }
 }
@@ -108,6 +109,17 @@ pub struct AgentCard {
     /// signature). Connecting peers consult this to decide what
     /// credentials to send.
     pub auth: AuthRequirements,
+
+    /// Daemon-identity-signed binding of this daemon's current TLS leaf
+    /// fingerprints (`access::identity_attestation`). Content-signed
+    /// discovery data: dialers that persisted this daemon's identity key
+    /// at pairing verify fleet-name/relayed candidates against it (the
+    /// fetch transport is untrusted; the signature is the authority).
+    /// Absent on pre-B2 daemons and on daemons without a loadable
+    /// identity; grafted at serve time, so locally constructed cards
+    /// leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_attestation: Option<crate::access::identity_attestation::DaemonIdentityAttestation>,
 }
 
 /// One way to reach a peer.
@@ -124,7 +136,19 @@ pub enum TransportSpec {
     /// Native Intendant↔Intendant WebSocket. Carries the full `AppEvent`
     /// stream, mapped through the upcaster into `PeerEvent` variants.
     /// This is the highest-fidelity transport between Intendants.
-    IntendantWs { url: String },
+    IntendantWs {
+        url: String,
+        /// True for the auto-appended fleet-name candidate a relay-mode
+        /// daemon advertises (Track RC Stage B): the URL transits the
+        /// Connect relay, so a link on this candidate classifies
+        /// [`crate::peer::handle::PeerTransportClass::Relayed`] and the
+        /// dashboard renders media/datachannel capability honestly.
+        /// The card's constructor is the one place that sets it; old
+        /// daemons ignore the field on the wire and dial the candidate
+        /// as a plain URL.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        relay: bool,
+    },
 
     /// Linux Foundation Agent2Agent — JSON-RPC over HTTPS + SSE.
     /// The standardizing bet for cross-daemon-kind federation.
@@ -737,6 +761,75 @@ mod tests {
         assert!(matches!(card.capabilities[0], Capability::Display));
         assert!(matches!(card.capabilities[1], Capability::Unknown));
         assert!(matches!(&card.capabilities[2], Capability::Custom(n) if n == "vortex-audio"));
+    }
+
+    /// The relay-class stamp on `intendant-ws` transports: absent on the
+    /// wire for direct candidates (old-parser compat + byte-stable
+    /// cards), `"relay": true` for the relay candidate, and tolerant
+    /// parsing in both directions (an old card has no field → `false`;
+    /// an old build ignores the unknown field and dials the URL).
+    #[test]
+    fn intendant_ws_relay_stamp_wire_forms() {
+        let direct = TransportSpec::IntendantWs {
+            url: "wss://x/ws".into(),
+            relay: false,
+        };
+        let json = serde_json::to_string(&direct).unwrap();
+        assert!(
+            !json.contains("relay"),
+            "relay:false stays off the wire: {json}"
+        );
+
+        let relayed = TransportSpec::IntendantWs {
+            url: "wss://d-aa.fleet.example:443/ws".into(),
+            relay: true,
+        };
+        let json = serde_json::to_string(&relayed).unwrap();
+        assert!(json.contains("\"relay\":true"), "got: {json}");
+        let parsed: TransportSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, relayed);
+
+        // Old-shape wire form (no field) parses as direct.
+        let legacy: TransportSpec =
+            serde_json::from_str(r#"{ "type": "intendant-ws", "url": "wss://x/ws" }"#).unwrap();
+        assert!(matches!(legacy, TransportSpec::IntendantWs { relay: false, .. }));
+    }
+
+    /// The `identity_attestation` block is additive: absent parses to
+    /// `None` (pre-B2 cards), present round-trips.
+    #[test]
+    fn identity_attestation_block_is_additive() {
+        let json = r#"{
+            "id": "intendant:legacy",
+            "label": "Legacy",
+            "version": "0.1.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
+            "capabilities": [],
+            "auth": { "transport": { "scheme": "none" } }
+        }"#;
+        let card: AgentCard = serde_json::from_str(json).unwrap();
+        assert!(card.identity_attestation.is_none());
+
+        let with_block = r#"{
+            "id": "intendant:attested",
+            "label": "Attested",
+            "version": "0.1.0",
+            "transports": [{ "type": "intendant-ws", "url": "wss://x/ws" }],
+            "capabilities": [],
+            "auth": { "transport": { "scheme": "none" } },
+            "identity_attestation": {
+                "version": 1,
+                "identity_public_key": "a2V5",
+                "access_cert_fingerprint": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+                "issued_at_unix_ms": 42,
+                "signature": "c2ln"
+            }
+        }"#;
+        let card: AgentCard = serde_json::from_str(with_block).unwrap();
+        let block = card.identity_attestation.expect("block parses");
+        assert_eq!(block.version, 1);
+        assert_eq!(block.issued_at_unix_ms, 42);
+        assert!(block.fleet_cert_fingerprint.is_none());
     }
 
     /// Forward-compat: an unknown MCP transport inside a `Mcp` variant

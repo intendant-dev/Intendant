@@ -41,7 +41,7 @@ pub fn certificate_ledger_endpoints(card: &AgentCard) -> Vec<String> {
         .transports
         .iter()
         .filter_map(|transport| match transport {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 Some(format!("{}{LEDGER_PATH}", ws_url_to_http_base(url)))
             }
             _ => None,
@@ -65,8 +65,8 @@ pub async fn fetch_certificate_ledger(
     let credentials = handle.transport_credentials();
     let tls_config = credentials
         .tls
-        .client_config(
-            &credentials.pinned_fingerprints,
+        .client_config_for_policy(
+            &credentials.effective_tls_policy(),
             credentials.client_identity.as_ref(),
         )
         .map_err(|error| format!("build peer ledger TLS policy: {error}"))?;
