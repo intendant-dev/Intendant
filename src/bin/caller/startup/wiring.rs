@@ -389,6 +389,13 @@ pub(crate) fn spawn_mode_web_gateway(
                     .with_spawn_context(crate::agenda::SessionSpawnContext {
                         home: crate::platform::home_dir(),
                         default_project_root: project_root.clone(),
+                        // The boot-effective default backend (--agent →
+                        // `[agent] default_backend`): what the propose
+                        // lane records onto executor-less manifests so
+                        // the approval names WHO runs.
+                        default_agent: initial_agent_backend
+                            .as_ref()
+                            .map(|backend| backend.as_short_str().to_string()),
                     })
                     // Track HS3: the immediacy verbs (start_now,
                     // request_occurrence) refuse while draining.

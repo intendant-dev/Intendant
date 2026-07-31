@@ -94,10 +94,12 @@ impl AgendaHandle {
             reminder_nudge: tokio::sync::Notify::new(),
             spawn_ctx: SessionSpawnContext {
                 // The agenda dir contains no session records, so the
-                // default context resolves no provenance and no default
-                // project — and never touches the real home.
+                // default context resolves no provenance, no default
+                // project, and no default agent — and never touches the
+                // real home.
                 home: dir.to_path_buf(),
                 default_project_root: None,
+                default_agent: None,
             },
             decoration_journal: Mutex::new(None),
             handover: None,
@@ -105,9 +107,15 @@ impl AgendaHandle {
     }
 
     /// Install the daemon's real spawn context (wiring edge; tests inject
-    /// tempdir-scoped ones to exercise resolution).
+    /// tempdir-scoped ones to exercise resolution). Pushed down into the
+    /// store too: the fireability legs of the propose/approve intake
+    /// resolve against it there, so the ONE validator lives in the ONE
+    /// lane (`command_to_op`) every mint surface routes through.
     pub(crate) fn with_spawn_context(mut self, spawn_ctx: SessionSpawnContext) -> Self {
-        self.spawn_ctx = spawn_ctx;
+        self.spawn_ctx = spawn_ctx.clone();
+        if let Ok(store) = self.store.get_mut() {
+            store.set_spawn_context(spawn_ctx);
+        }
         self
     }
 
@@ -1057,6 +1065,35 @@ impl AgendaHandle {
                 &super::scheduler::local_minute_of_day_at,
             );
         });
+        // Fireability decoration (display-only, the `next_fire_ms`
+        // pattern): stamped exactly where an approve/re-arm affordance
+        // could render — an open item's pending-review or suspended
+        // effect — so the dashboard withholds Approve on an unfireable
+        // manifest and opens the editor on the named field instead. The
+        // SAME validator the propose/approve intake runs, so the served
+        // verdict and the refusal a click would meet can never disagree.
+        let staleness_ms = policy.staleness_ms();
+        for item in items.iter_mut() {
+            if item.status != super::types::AgendaStatus::Open {
+                continue;
+            }
+            let provenance = item.provenance.session_id.clone();
+            for effect in item.effects.iter_mut() {
+                let approvable = effect.approval.is_none() || effect.suspended();
+                if !approvable {
+                    continue;
+                }
+                effect.fireability_refusal = super::fireability::validate(
+                    super::fireability::FireabilityCandidate::of_manifest(&effect.manifest),
+                    provenance.as_deref(),
+                    &self.spawn_ctx,
+                    staleness_ms,
+                    now_ms,
+                )
+                .err()
+                .map(|refusal| refusal.view());
+            }
+        }
     }
 
     /// One page of the raw occurrence journal (read-only; the
@@ -1211,11 +1248,24 @@ mod tests {
     /// source item, occurrence state, title, and the sealed inputs of
     /// the manifest that ran it; every resume-lineage member shares the
     /// block; linkage outliving its item degrades to the id-only shape.
+
+    /// Fireability rig for handle tests: a spawn context whose daemon
+    /// default project is the agenda dir itself (absolute, exists for
+    /// the test's lifetime) so pin-less proposes resolve and record.
+    fn ctx_with_default_project(dir: &std::path::Path) -> SessionSpawnContext {
+        SessionSpawnContext {
+            home: dir.to_path_buf(),
+            default_project_root: Some(dir.to_path_buf()),
+            default_agent: None,
+        }
+    }
+
     #[test]
     fn session_agenda_envelopes_compose_journal_store_and_refs() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
 
         // A sealed input the proposer really read (intake re-hashes it).
         let sealed_src = dir.path().join("inputs.md");
@@ -1246,7 +1296,7 @@ mod tests {
                 AgendaCommand::ProposeEffect {
                     id: item.id.clone(),
                     goal: "run it".into(),
-                    fire_at_ms: 1_000,
+                    fire_at_ms: 4_102_444_800_000, // far-future floor: these tests never fire it
                     orchestrate: false,
                     interactive: None,
                     recurrence: None,
@@ -1356,7 +1406,8 @@ mod tests {
     /// sess-successor (Rider A's lineage), occ-2 fired under the bare
     /// item by sess-other.
     fn attest_rig(dir: &std::path::Path) -> (AgendaHandle, AgendaItem, AgendaItem) {
-        let handle = AgendaHandle::new(AgendaStore::open(dir).unwrap(), EventBus::new(), dir);
+        let handle = AgendaHandle::new(AgendaStore::open(dir).unwrap(), EventBus::new(), dir)
+            .with_spawn_context(ctx_with_default_project(dir));
         let owner = Some(AgendaActor {
             principal: Some("principal:root:dashboard".into()),
             session_id: None,
@@ -1377,7 +1428,7 @@ mod tests {
                 AgendaCommand::ProposeEffect {
                     id: item.id.clone(),
                     goal: "run it".into(),
-                    fire_at_ms: 1_000,
+                    fire_at_ms: 4_102_444_800_000, // far-future floor: these tests never fire it
                     orchestrate: false,
                     interactive: None,
                     recurrence: None,
@@ -1994,7 +2045,8 @@ mod tests {
         std::fs::create_dir_all(&agenda).unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda);
+        let handle = AgendaHandle::new(AgendaStore::open(&agenda).unwrap(), bus, &agenda)
+            .with_spawn_context(ctx_with_default_project(&agenda));
         // Stamping parks + proposes, so agent sessions may do it —
         // approval stays the owner-surface act the existing gate tests
         // pin.
@@ -2051,7 +2103,8 @@ mod tests {
     fn agent_cannot_approve_its_own_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -2739,6 +2792,7 @@ mod tests {
             .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
                 home: dir.path().to_path_buf(),
                 default_project_root: Some(default_project.path().to_path_buf()),
+                default_agent: None,
             });
         let item = handle
             .apply(
@@ -2844,6 +2898,7 @@ mod tests {
             .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
                 home: home.path().to_path_buf(),
                 default_project_root: None,
+                default_agent: None,
             });
         let item = handle
             .apply(
@@ -2929,13 +2984,81 @@ mod tests {
         assert!(orphan_now.effects.is_empty(), "refusal mints nothing");
     }
 
+    /// The serving half of the fireability class law: an approvable
+    /// state (pending review) whose manifest the validator refuses is
+    /// SERVED with the verdict (`fireability_refusal`, the
+    /// `next_fire_ms` decoration pattern) so no frontend has to offer
+    /// Approve blind — and the verdict clears once the daemon state
+    /// resolves it. Armed effects are never stamped (no approve
+    /// affordance renders there).
+    #[test]
+    fn pending_effects_serve_their_fireability_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        // A LEGACY pin-less manifest folded from the log — the propose
+        // intake would refuse minting this on a projectless daemon, so
+        // seed it as history (the migration-honesty class).
+        let legacy = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"it\",\"kind\":\"task\",",
+            "\"title\":\"legacy\",\"body\":\"\",\"tags\":[]}}\n",
+            "{\"v\":1,\"at_ms\":2,\"op\":{\"type\":\"propose_effect\",\"id\":\"it\",",
+            "\"effect_id\":\"ef-legacy000000\",\"manifest\":{\"goal\":\"g\",",
+            "\"fire_at_ms\":4102444800000}}}\n"
+        );
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("agenda.jsonl"), legacy).unwrap();
+        let projectless = AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus.clone(),
+            dir.path(),
+        );
+        let served = projectless.snapshot();
+        let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
+        let refusal = effect
+            .fireability_refusal
+            .as_ref()
+            .expect("a pending unresolvable manifest serves its refusal");
+        assert_eq!(refusal.field, "project");
+        assert!(refusal.reason.contains("--project"), "{}", refusal.reason);
+
+        // The same ledger under a daemon that CAN resolve it: verdict
+        // absent, approve proceeds, and the ARMED effect is unstamped.
+        let default_project = tempfile::tempdir().unwrap();
+        let resolvable = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(super::super::spawn_project::SessionSpawnContext {
+                home: dir.path().to_path_buf(),
+                default_project_root: Some(default_project.path().to_path_buf()),
+                default_agent: None,
+            });
+        let served = resolvable.snapshot();
+        let effect = &served.iter().find(|i| i.id == "it").unwrap().effects[0];
+        assert!(effect.fireability_refusal.is_none());
+        let digest = effect.digest.clone();
+        let armed = resolvable
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: "it".into(),
+                    digest,
+                },
+                Some(AgendaActor {
+                    principal: Some("owner".into()),
+                    session_id: None,
+                    kind: Some("dashboard".into()),
+                }),
+            )
+            .unwrap();
+        assert!(armed.effects[0].approval.is_some());
+        assert!(armed.effects[0].fireability_refusal.is_none());
+    }
+
     /// Approval binds the digest: an edit (re-propose) voids it, and a
     /// stale digest is refused at intake with the named mismatch.
     #[test]
     fn approval_binds_the_manifest_digest() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -3130,7 +3253,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -3285,7 +3409,8 @@ mod tests {
             AgendaStore::open(dir.path()).unwrap(),
             EventBus::new(),
             dir.path(),
-        );
+        )
+        .with_spawn_context(ctx_with_default_project(dir.path()));
         let watcher_id = armed_gate_watcher(&handle);
         let question = handle
             .apply(
@@ -3328,7 +3453,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         armed_gate_watcher(&handle);
         let covered = park_question(&handle, "Gate: sign off HS6", vec!["gate".into()]);
         let uncovered = park_question(&handle, "Which vendor for the NAS?", Vec::new());
@@ -3361,7 +3487,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         armed_gate_watcher(&handle);
         let covered = park_question(&handle, "Gate: queue entry", vec!["gate".into()]);
         let uncovered = park_question(&handle, "Pick the offsite week?", Vec::new());
@@ -3406,7 +3533,8 @@ mod tests {
     fn broadcast_copies_carry_full_decorations() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
         let watcher_id = armed_gate_watcher(&handle);
         let question = park_question(&handle, "Gate: soak the queue", vec!["gate".into()]);
         let due = question.watched_by.as_ref().and_then(|w| w.due_ms);

@@ -169,6 +169,14 @@ pub(crate) struct AgendaStore {
     /// ([`Self::drain_foreign_changes`], Track AS S8/Q6). Deduped;
     /// bounded by the item count.
     foreign_changes: Vec<String>,
+    /// Daemon spawn facts the fireability legs of the ProposeEffect /
+    /// ApproveEffect intake resolve against (the ONE validator lives in
+    /// `command_to_op`, so the stamp lane inherits it per node). The
+    /// handle's `with_spawn_context` pushes the wiring-edge context down;
+    /// [`AgendaStore::open`] defaults to the hermetic nothing-resolves
+    /// shape (home = the agenda dir, no default project, no default
+    /// agent) so tests never touch the real home.
+    spawn_ctx: super::spawn_project::SessionSpawnContext,
 }
 
 /// Facts of one scheduled-session occurrence outcome, written back by the
@@ -296,9 +304,32 @@ impl AgendaStore {
             item_seqs: fold.item_seqs,
             boot_fold,
             foreign_changes: Vec::new(),
+            spawn_ctx: super::spawn_project::SessionSpawnContext {
+                home: dir.to_path_buf(),
+                default_project_root: None,
+                default_agent: None,
+            },
         };
         store.sync_ask_state();
         Ok(store)
+    }
+
+    /// Install the daemon's real spawn context for the fireability legs
+    /// of the propose/approve intake (pushed down by the handle's
+    /// `with_spawn_context`; tests inject tempdir-scoped contexts).
+    pub(crate) fn set_spawn_context(&mut self, ctx: super::spawn_project::SessionSpawnContext) {
+        self.spawn_ctx = ctx;
+    }
+
+    /// The reminder policy's staleness bound, read live from this
+    /// agenda's own policy file — the SAME bound the planner classifies
+    /// missed sessions with, so the floor leg of fireability and the
+    /// fire path can never disagree. A propose/approve is a rare verb;
+    /// the read is one small JSON file (absent = defaults).
+    fn staleness_ms(&self) -> u64 {
+        super::reminders::ReminderPolicyStore::open(&self.dir)
+            .policy()
+            .staleness_ms()
     }
 
     /// Post-fold bookkeeping for persisted rich asks: floor the process
@@ -1579,26 +1610,7 @@ impl AgendaStore {
                         "{id} is not open — reopen it before scheduling work on it"
                     )));
                 }
-                if fire_at_ms == 0 {
-                    return Err(AgendaError::Invalid("fire_at_ms must be set".into()));
-                }
-                // Executor pins are validated NOW, not at fire time: a
-                // digest-bound manifest is reviewed and approved long
-                // before it spawns, so every contradiction the launch
-                // path would deterministically reject must be named here
-                // (same rules, same wording — one authority). All-inherit
-                // normalizes to the legacy absent shape so a config-less
-                // propose keeps byte-identical manifest bytes and digests.
                 let agent_config = agent_config.filter(|config| !config.is_empty());
-                if let Some(config) = agent_config.as_deref() {
-                    crate::session_supervisor::validate_launch_config(config)
-                        .map_err(AgendaError::Invalid)?;
-                    if let Some(warning) =
-                        crate::session_supervisor::unrecognized_claude_model_warning(config)
-                    {
-                        eprintln!("[agenda] propose advisory: {warning}");
-                    }
-                }
                 if let Some(rec) = &recurrence {
                     if rec.every_ms < super::types::RECURRENCE_MIN_EVERY_MS {
                         return Err(AgendaError::Invalid(format!(
@@ -1635,30 +1647,72 @@ impl AgendaStore {
                     }
                     validate_trigger(trig)?;
                 }
-                // Explicit project pin (T3c): the same contradiction the
-                // launch path would deterministically refuse at fire time
-                // is named NOW, at review time — a picker-stamped
-                // standing manifest on a projectless daemon otherwise
-                // fires straight into the named refusal.
-                let project_root = match project_root.map(|p| p.trim().to_string()) {
-                    None => None,
-                    Some(p) if p.is_empty() => None,
-                    Some(p) => {
-                        let path = std::path::Path::new(&p);
-                        if !path.is_absolute() {
-                            return Err(AgendaError::Invalid(format!(
-                                "project_root must be an absolute path, got {p:?}"
-                            )));
-                        }
-                        if !path.is_dir() {
-                            return Err(AgendaError::Invalid(format!(
-                                "project_root {p:?} is not an existing directory — the spawn \
-                                 would be refused at fire time; fix the path or omit it for \
-                                 the daemon default"
-                            )));
-                        }
-                        Some(p)
+                // Fireability (card 01KYSZAGQVHAAYS7BK9H3QFM3C): an
+                // approvable manifest IS a fireable manifest — the ONE
+                // validator resolves the project through the fire path's
+                // own chain (explicit pin → the parking session's root →
+                // the daemon default, refused named when nothing
+                // resolves), resolves the executor (explicit selection →
+                // the daemon default → internal) and validates the
+                // config AS RESOLVED, and applies the planner's own
+                // missed rule to the floor. The resolutions are RECORDED
+                // below: the digest the owner approves names WHERE and
+                // WHO, never empty-means-whatever-fires. (This
+                // deliberately ends the byte-identical-to-legacy shape
+                // for pin-less proposes — a fresh propose mints a fresh
+                // digest anyway; parked legacy manifests refold
+                // untouched and keep their bound digests.)
+                let explicit_project = project_root
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty());
+                let resolved = super::fireability::validate(
+                    super::fireability::FireabilityCandidate {
+                        fire_at_ms,
+                        recurrence: recurrence.as_ref(),
+                        trigger: trigger.as_ref(),
+                        project_root: explicit_project,
+                        agent_config: agent_config.as_deref(),
+                    },
+                    item.provenance.session_id.as_deref(),
+                    &self.spawn_ctx,
+                    self.staleness_ms(),
+                    now_ms,
+                )
+                .map_err(|refusal| AgendaError::Invalid(refusal.message()))?;
+                // The chain's resolution, named in the daemon log: a
+                // fallback-resolved recording is a real decision the
+                // owner reviews on the manifest, and this line says
+                // where it came from.
+                match resolved.project_source {
+                    super::spawn_project::SpawnProjectSource::Explicit => {}
+                    super::spawn_project::SpawnProjectSource::Provenance => eprintln!(
+                        "[agenda] propose: recorded the parking session's project root {}",
+                        resolved.project_root.display()
+                    ),
+                    super::spawn_project::SpawnProjectSource::DaemonDefault => eprintln!(
+                        "[agenda] propose: recorded the daemon default project root {}",
+                        resolved.project_root.display()
+                    ),
+                }
+                let project_root = Some(resolved.project_root.to_string_lossy().into_owned());
+                let agent_config = {
+                    let mut config = agent_config.unwrap_or_default();
+                    if config
+                        .agent
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|agent| !agent.is_empty())
+                        .is_none()
+                    {
+                        config.agent = Some(resolved.agent.clone());
                     }
+                    if let Some(warning) =
+                        crate::session_supervisor::unrecognized_claude_model_warning(&config)
+                    {
+                        eprintln!("[agenda] propose advisory: {warning}");
+                    }
+                    Some(config)
                 };
                 let goal = {
                     let goal = goal.trim();
@@ -1714,12 +1768,11 @@ impl AgendaStore {
                         orchestrate,
                         // Shape rides the command (the approval-time
                         // editor's toggle); absent keeps the legacy
-                        // autonomous goal run. Without an explicit pin
-                        // the project resolves at fire time (provenance
-                        // → daemon default → named refusal). The
-                        // executor pins (if any) ride the digest-bound
-                        // manifest; absent fields inherit the daemon
-                        // defaults.
+                        // autonomous goal run. Project and executor are
+                        // the RESOLVED values recorded above — the
+                        // digest the owner approves names where and who;
+                        // remaining absent executor pins (model, effort)
+                        // inherit backend defaults at launch.
                         interactive: interactive.unwrap_or(false),
                         project_root,
                         agent_config,
@@ -2141,6 +2194,24 @@ impl AgendaStore {
                         effect.digest
                     )));
                 }
+                // Approve is the ARM gate: the same fireability check the
+                // propose lane runs, against the daemon's state NOW —
+                // approval can never arm a plan the fire path already
+                // refuses (the class law: approve is never offered on an
+                // unfireable manifest). This is also where a LEGACY
+                // pin-less manifest meets the validator: its project
+                // resolves through the unchanged fallback chain when the
+                // daemon can, and refuses named (the edit prompt) when it
+                // cannot. Check-only — an approval binds bytes and never
+                // rewrites them, so nothing is recorded here.
+                super::fireability::validate(
+                    super::fireability::FireabilityCandidate::of_manifest(&effect.manifest),
+                    item.provenance.session_id.as_deref(),
+                    &self.spawn_ctx,
+                    self.staleness_ms(),
+                    now_ms,
+                )
+                .map_err(|refusal| AgendaError::Invalid(refusal.message()))?;
                 Ok(AgendaOp::ApproveEffect {
                     id,
                     effect_id: effect.effect_id.clone(),
@@ -3183,6 +3254,18 @@ mod tests {
             session_id: None,
             kind: None,
         })
+    }
+
+    /// Fireability rig: give the hermetic store a daemon default project
+    /// so pin-less proposes resolve (the mint law refuses them
+    /// otherwise). Returns the tempdir GUARD — it must outlive every
+    /// propose, or the recorded root stops existing and approve refuses.
+    fn with_default_project(store: &mut AgendaStore) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_project_root = Some(project.path().to_path_buf());
+        store.set_spawn_context(ctx);
+        project
     }
 
     #[test]
@@ -5126,6 +5209,7 @@ mod tests {
     fn g3pre_recurrence_intake_streak_and_rearm() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -5323,6 +5407,7 @@ mod tests {
     fn g3pre_start_now_routes_standing_manifests_to_requests() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -5469,6 +5554,7 @@ mod tests {
         let pin = digest_file(&brief).unwrap();
         let locator = format!("file:{}", brief.display());
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("sealed"), owner(), 1000)
             .unwrap();
@@ -5637,6 +5723,7 @@ mod tests {
         let pin = digest_file(&brief).unwrap();
         let locator = format!("file:{}", brief.display());
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("editable"), owner(), 1000)
             .unwrap();
@@ -5739,6 +5826,7 @@ mod tests {
     fn approve_signs_the_edited_digest() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("edit me"), owner(), 1000)
             .unwrap();
@@ -5823,6 +5911,7 @@ mod tests {
     fn propose_shape_toggle_rides_the_digest_bound_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let item = store
             .apply_command(add_cmd("shaped"), owner(), 1000)
             .unwrap();
@@ -6002,6 +6091,7 @@ mod tests {
     fn trigger_intake_enforces_exclusion_and_the_predicate_bounds() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("triggered"), owner(), 1000)
             .unwrap()
@@ -6086,6 +6176,7 @@ mod tests {
     fn executor_propose_intake_records_validates_and_normalizes() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
         let id = store
             .apply_command(add_cmd("standing"), owner(), 1000)
             .unwrap()
@@ -6121,16 +6212,28 @@ mod tests {
         );
         let executor_digest = item.effects[0].digest.clone();
 
+        // A config-less propose RECORDS the resolved executor (the
+        // fireability mint law: no default backend on this hermetic
+        // store, so `internal`) — the owner approves WHO runs, never
+        // empty-means-whatever.
         let item = store.apply_command(propose(None), owner(), 1002).unwrap();
-        assert!(item.effects[0].manifest.agent_config.is_none());
+        assert_eq!(
+            item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         let plain_digest = item.effects[0].digest.clone();
         assert_ne!(
             executor_digest, plain_digest,
             "the executor is digest-visible — the owner approves WHO runs"
         );
 
-        // All-inherit normalizes to ABSENT: identical manifest bytes,
-        // identical digest — a config-less gesture is unchanged by AU.
+        // All-inherit normalizes to the SAME recorded shape as a
+        // config-less propose: identical manifest bytes, identical
+        // digest — the empty-config gesture and no config agree.
         let item = store
             .apply_command(
                 propose(Some(crate::event::AgentLaunchConfig::default())),
@@ -6138,7 +6241,14 @@ mod tests {
                 1003,
             )
             .unwrap();
-        assert!(item.effects[0].manifest.agent_config.is_none());
+        assert_eq!(
+            item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         assert_eq!(item.effects[0].digest, plain_digest);
 
         // Named intake rejections — the launch path's own rules, at
@@ -6485,10 +6595,12 @@ mod tests {
         }
     }
 
-    /// T3c: an explicit project pin is validated at review time — the
-    /// same contradiction the launch path would refuse at fire time,
-    /// named NOW — and binds the digest (the approval covers WHERE);
-    /// blank normalizes to the legacy absent shape.
+    /// T3c, extended by the fireability mint law: an explicit project
+    /// pin is validated at review time — the same contradiction the
+    /// launch path would refuse at fire time, named NOW — and binds the
+    /// digest (the approval covers WHERE). A blank/absent pin resolves
+    /// through the fire path's chain and the RESOLUTION is recorded;
+    /// with nothing to resolve against, the propose refuses named.
     #[test]
     fn propose_project_root_validates_and_binds() {
         let dir = tempfile::tempdir().unwrap();
@@ -6510,6 +6622,17 @@ mod tests {
             project_root,
             source: None,
         };
+        // Projectless store, no provenance: a pin-less propose refuses
+        // with the concrete missing flag named (the mint law's headline
+        // case — the approvable-but-unfireable class dies here).
+        let err = store
+            .apply_command(propose(Some("   ".into())), owner(), 1500)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--project"), "{err}");
         for (bad, needle) in [
             (
                 Some("relative/path".to_string()),
@@ -6528,12 +6651,16 @@ mod tests {
                 "expected {needle:?} in {err}"
             );
         }
+        // With a daemon default: blank RESOLVES and the resolution is
+        // recorded — the digest the owner reviews names where.
+        let default_project = with_default_project(&mut store);
         let parked = store
             .apply_command(propose(Some("   ".into())), owner(), 3000)
             .unwrap();
         assert_eq!(
-            parked.effects[0].manifest.project_root, None,
-            "blank normalizes absent"
+            parked.effects[0].manifest.project_root,
+            Some(default_project.path().display().to_string()),
+            "the chain's resolution is recorded, never left empty"
         );
         let unpinned_digest = parked.effects[0].digest.clone();
         let proj = tempfile::tempdir().unwrap();
@@ -6554,16 +6681,319 @@ mod tests {
         );
     }
 
+    // ---- Fireability (card 01KYSZAGQVHAAYS7BK9H3QFM3C) ----
+
+    /// The parking-session leg of the mint law: a pin-less propose on an
+    /// item parked BY A SESSION resolves through that session's recorded
+    /// project root and records it — the fallback chain is validated
+    /// against, never narrowed to explicit-only.
+    #[test]
+    fn propose_records_the_parking_session_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        // The parking session's recorded project, under the ctx home.
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let meta_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join("sess-parker");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(
+            meta_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "sess-parker",
+                "created_at": "now",
+                "project_root": project.path().to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        store.set_spawn_context(super::super::spawn_project::SessionSpawnContext {
+            home: home.path().to_path_buf(),
+            default_project_root: None,
+            default_agent: None,
+        });
+        let parker = Some(AgendaActor {
+            principal: Some("principal:agent-session:sess-parker".into()),
+            session_id: Some("sess-parker".into()),
+            kind: Some("agent_session".into()),
+        });
+        let id = store
+            .apply_command(add_cmd("parked by a session"), parker, 1000)
+            .unwrap()
+            .id;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1_000_000,
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                2000,
+            )
+            .unwrap();
+        assert_eq!(
+            parked.effects[0].manifest.project_root,
+            Some(project.path().display().to_string()),
+            "the parking session's root is the recorded resolution"
+        );
+    }
+
+    /// Executor honesty: a config-less propose records the daemon's
+    /// default backend (or internal), an explicit selection is kept, and
+    /// a pin contradicting the resolved default refuses at the mint.
+    #[test]
+    fn propose_records_the_resolved_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let project = with_default_project(&mut store);
+        let _ = &project;
+        let id = store
+            .apply_command(add_cmd("who runs"), owner(), 1000)
+            .unwrap()
+            .id;
+        let propose =
+            |config: Option<crate::event::AgentLaunchConfig>| AgendaCommand::ProposeEffect {
+                binding_refs: Vec::new(),
+                id: id.clone(),
+                goal: "g".into(),
+                fire_at_ms: 1_000_000,
+                orchestrate: false,
+                interactive: None,
+                recurrence: None,
+                agent_config: config.map(Box::new),
+                trigger: None,
+                project_root: None,
+                source: None,
+            };
+        // No daemon default: internal is the recorded executor.
+        let parked = store.apply_command(propose(None), owner(), 2000).unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("internal"));
+        // A daemon default backend is recorded when the config is bare.
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_agent = Some("claude-code".into());
+        store.set_spawn_context(ctx);
+        let parked = store.apply_command(propose(None), owner(), 3000).unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("claude-code"));
+        // Explicit selection wins over the default.
+        let parked = store
+            .apply_command(
+                propose(Some(crate::event::AgentLaunchConfig {
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                })),
+                owner(),
+                4000,
+            )
+            .unwrap();
+        let recorded = parked.effects[0].manifest.agent_config.as_deref().unwrap();
+        assert_eq!(recorded.agent.as_deref(), Some("codex"));
+        // A model pin contradicting the resolved default refuses at the
+        // mint — executor unfireability, named.
+        let err = store
+            .apply_command(
+                propose(Some(crate::event::AgentLaunchConfig {
+                    codex_model: Some("gpt-5.3-codex".into()),
+                    ..Default::default()
+                })),
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(executor): "),
+            "{err}"
+        );
+    }
+
+    /// THE CLASS TEST: approve is never offered on an unfireable
+    /// manifest — the approve intake re-runs the same validator against
+    /// the daemon's state NOW, so a legacy pin-less manifest (folded
+    /// from an old log) or a plan whose window already passed refuses
+    /// at the arm gate with the named edit prompt, never arms dead.
+    #[test]
+    fn approve_is_never_armed_on_an_unfireable_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // A LEGACY pin-less manifest enters via the op log (the fold
+        // never validates — parked history loads untouched).
+        let legacy = concat!(
+            "{\"v\":1,\"at_ms\":1,\"op\":{\"type\":\"add\",\"id\":\"it\",\"kind\":\"task\",",
+            "\"title\":\"legacy\",\"body\":\"\",\"tags\":[]}}\n",
+            "{\"v\":1,\"at_ms\":2,\"op\":{\"type\":\"propose_effect\",\"id\":\"it\",",
+            "\"effect_id\":\"ef-legacy000000\",\"manifest\":{\"goal\":\"g\",",
+            "\"fire_at_ms\":1000000}}}\n"
+        );
+        std::fs::write(dir.path().join(LOG_FILE), legacy).unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let digest = store.item("it").unwrap().effects[0].digest.clone();
+        let approve = AgendaCommand::ApproveEffect {
+            id: "it".into(),
+            digest: digest.clone(),
+        };
+        // Projectless daemon: the arm gate refuses, named — the edit
+        // prompt's grammar, field first.
+        let err = store
+            .apply_command(approve.clone(), owner(), 3000)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        // The same manifest arms once the daemon can resolve it — the
+        // chain is consulted at the gate, legacy bytes untouched.
+        let _project = with_default_project(&mut store);
+        store.apply_command(approve, owner(), 4000).unwrap();
+        assert!(store.item("it").unwrap().effects[0].approval.is_some());
+
+        // Floor half of the class law: a one-shot proposed sane can
+        // still go stale before the owner approves — the arm gate is
+        // where the guarantee holds, so approving past the staleness
+        // window refuses with the reschedule remedy named.
+        let id = store
+            .apply_command(add_cmd("stale floor"), owner(), 5000)
+            .unwrap()
+            .id;
+        let hour = 3_600_000u64;
+        let fire_at = 24 * hour;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: fire_at,
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                23 * hour,
+            )
+            .unwrap();
+        let digest = parked.effects[0].digest.clone();
+        let err = store
+            .apply_command(
+                AgendaCommand::ApproveEffect {
+                    id: id.clone(),
+                    digest: digest.clone(),
+                },
+                owner(),
+                fire_at + 13 * hour, // 12h staleness default + 1h
+            )
+            .unwrap_err();
+        assert!(err.to_string().starts_with("unfireable(floor): "), "{err}");
+        assert!(err.to_string().contains("--at"), "{err}");
+        // Within the window the same approve arms.
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect { id, digest },
+                owner(),
+                fire_at + hour,
+            )
+            .unwrap();
+    }
+
+    /// TRAP pin: trigger-armed schedules are never floor-refused — the
+    /// floor is the ARM floor, and a long-past floor is an immediate
+    /// arming, at propose and at approve alike.
+    #[test]
+    fn trigger_manifests_are_never_floor_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("gate"), owner(), 1000)
+            .unwrap()
+            .id;
+        let month = 30 * 24 * 3_600_000u64;
+        let parked = store
+            .apply_command(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: id.clone(),
+                    goal: "g".into(),
+                    fire_at_ms: 1, // the arm floor, arbitrarily old
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: Some(super::super::types::TriggerSpec::OnUnblock),
+                    project_root: None,
+                    source: None,
+                },
+                owner(),
+                2 * month,
+            )
+            .unwrap();
+        let digest = parked.effects[0].digest.clone();
+        store
+            .apply_command(
+                AgendaCommand::ApproveEffect { id, digest },
+                owner(),
+                3 * month,
+            )
+            .unwrap();
+    }
+
+    /// The stamp lane inherits the mint law per node (it proposes
+    /// through the same intake arm): a projectless stamp with no
+    /// project pin anywhere refuses named instead of parking
+    /// approvable-but-dead nodes.
+    #[test]
+    fn stamp_inherits_the_fireability_mint_law() {
+        // A BARE rig — house set materialized, but no daemon default
+        // project (stamp_rig() installs one; this test needs its
+        // absence).
+        let root = tempfile::tempdir().unwrap();
+        super::super::definitions::materialize_house_definitions(root.path()).unwrap();
+        let agenda = root.path().join("agenda");
+        std::fs::create_dir_all(&agenda).unwrap();
+        let mut store = AgendaStore::open(&agenda).unwrap();
+        let err = store
+            .apply_stamp_command(stamp_cmd("fix-task"), owner(), 1000)
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("unfireable(project): "),
+            "{err}"
+        );
+        let _project = with_default_project(&mut store);
+        store
+            .apply_stamp_command(stamp_cmd("fix-task"), owner(), 2000)
+            .unwrap();
+    }
+
     // ---- Track AW: the stamp lane ----
 
     /// A state root with the house set materialized and the agenda under
-    /// `<root>/agenda` — the deployed layout, hermetic in a tempdir.
+    /// `<root>/agenda` — the deployed layout, hermetic in a tempdir. The
+    /// state root doubles as the daemon default project so pin-less
+    /// stamped nodes resolve (the fireability mint law refuses them
+    /// otherwise; `stamp_inherits_the_fireability_mint_law` exercises
+    /// the projectless refusal on a bare rig).
     fn stamp_rig() -> (tempfile::TempDir, AgendaStore) {
         let root = tempfile::tempdir().unwrap();
         super::super::definitions::materialize_house_definitions(root.path()).unwrap();
         let agenda = root.path().join("agenda");
         std::fs::create_dir_all(&agenda).unwrap();
-        let store = AgendaStore::open(&agenda).unwrap();
+        let mut store = AgendaStore::open(&agenda).unwrap();
+        let mut ctx = store.spawn_ctx.clone();
+        ctx.default_project_root = Some(root.path().to_path_buf());
+        store.set_spawn_context(ctx);
         (root, store)
     }
 
@@ -6651,10 +7081,17 @@ mod tests {
         assert_eq!(investigate.agent.as_deref(), Some("claude-code"));
         assert_eq!(investigate.claude_model.as_deref(), Some("claude-fable-5"));
         assert_eq!(investigate.claude_effort.as_deref(), Some("max"));
-        assert!(by_node("implement").item.effects[0]
-            .manifest
-            .agent_config
-            .is_none());
+        // An unpinned node records the resolved executor (the
+        // fireability mint law — internal on this default-less rig)
+        // instead of the legacy absent shape.
+        assert_eq!(
+            by_node("implement").item.effects[0]
+                .manifest
+                .agent_config
+                .as_deref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("internal")
+        );
         // The durable log carries ordinary ops only — and no approval op
         // of any kind.
         let log = std::fs::read_to_string(store.log_path()).unwrap();

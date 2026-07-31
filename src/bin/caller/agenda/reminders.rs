@@ -162,7 +162,7 @@ impl ReminderPolicy {
             .unwrap_or(self.default_urgency)
     }
 
-    fn staleness_ms(&self) -> u64 {
+    pub(crate) fn staleness_ms(&self) -> u64 {
         u64::from(self.staleness_hours) * 3_600_000
     }
 }
@@ -2816,6 +2816,7 @@ mod tests {
             requested: Vec::new(),
             next_fire_ms: None,
             last_run_attempt: None,
+            fireability_refusal: None,
         });
         base
     }
@@ -3241,6 +3242,7 @@ mod tests {
                 requested: Vec::new(),
                 next_fire_ms: None,
                 last_run_attempt: None,
+                fireability_refusal: None,
             });
             base
         };
@@ -3357,6 +3359,7 @@ mod tests {
             requested: Vec::new(),
             next_fire_ms: None,
             last_run_attempt: None,
+            fireability_refusal: None,
         });
         base
     }
@@ -4058,6 +4061,7 @@ mod tests {
             requested: Vec::new(),
             next_fire_ms: None,
             last_run_attempt: None,
+            fireability_refusal: None,
         });
         base
     }

@@ -5705,7 +5705,8 @@ fn help_agenda() {
       [--binding-ref file:PATH]...   # sealed refs: sha256-pin content the goal depends on —\n\
       # hashed here at propose time, covered by the approval digest, re-verified at every fire\n\
       [--project DIR]   # digest-bound project pin: where fired sessions run (absolute, must\n\
-      # exist; omitted = the parking session's root, else the daemon default)\n\
+      # exist; omitted = the parking session's root, else the daemon default, RESOLVED and\n\
+      # recorded at propose — a daemon that resolves nothing refuses, naming this flag)\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda stamp NAME|file:PATH/SKILL.md [--project DIR] [--at WHEN]\n\

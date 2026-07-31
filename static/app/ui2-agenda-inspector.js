@@ -254,6 +254,52 @@ window.qa = Object.assign(window.qa || {}, {
       refReader: sheet,
     };
   },
+  // Fireability readback + driver (card 01KYSZAGQVHAAYS7BK9H3QFM3C QA
+  // leg): per-item effect state as the cards judge it (kind, the served
+  // refusal, which affordances the DOM actually offers), plus the
+  // schedule sheet's focus state. Drivers: `{route:true}` opens the tab,
+  // `{sched:id}` the schedule sheet, `{reschedule:id}` fires the
+  // missed-card one-tap (async — poll the readback for the outcome).
+  agendaFireability: (drive) => {
+    drive = drive || {};
+    if (drive.route && typeof routeTo === 'function') routeTo('agenda');
+    if (drive.sched && agendaFindItem(drive.sched)) {
+      agendaOpenSchedSheet(drive.sched);
+    }
+    if (drive.reschedule) {
+      const btn = document.querySelector(
+        `[data-resched-effect="${(window.CSS && CSS.escape) ? CSS.escape(drive.reschedule) : drive.reschedule}"]`
+      );
+      agendaRescheduleMissed(drive.reschedule, btn || undefined);
+    }
+    const effects = (agendaItems || []).flatMap((row) => {
+      const item = agendaFullItemFor(row.id) || row;
+      const st = agendaEffectState(item);
+      if (!st) return [];
+      const sel = (window.CSS && CSS.escape) ? CSS.escape(item.id) : item.id;
+      return [{
+        id: item.id,
+        kind: st.kind,
+        refusal: st.effect.fireability_refusal || null,
+        hasApprove: !!document.querySelector(`[data-op-btn="approve_effect"][data-id="${sel}"]`),
+        hasReschedule: !!document.querySelector(`[data-resched-effect="${sel}"]`),
+        hasFixPlan: !!document.querySelector(`[data-edit-sched="${sel}"][data-focus]:not([data-focus=""])`),
+      }];
+    });
+    const s = agendaSheetState;
+    return {
+      effects,
+      sheet: s && (s.kind === 'sched' || s.kind === 'sched-loading')
+        ? {
+          kind: s.kind,
+          itemId: s.itemId,
+          focusField: s.focusField || '',
+          error: s.error || '',
+          projectRequired: !!document.querySelector('#ag2-sheet .ags-hint-required'),
+        }
+        : null,
+    };
+  },
 });
 
 // ---- Header ----
@@ -1501,7 +1547,16 @@ function agendaRefReadDownload() {
 
 // -- Schedule sheet --
 
-function agendaOpenSchedSheet(itemId) {
+function agendaOpenSchedSheet(itemId, opts) {
+  // A fireability edit prompt (`opts.focus` = the refused field,
+  // `opts.refusal` = the daemon's named message) lands the sheet on the
+  // broken field with the refusal shown — the approve-time refusal is
+  // an edit prompt, never a dead end. Parked through the loading state
+  // and re-adopted when the arrival hook re-enters without opts.
+  if (!opts && agendaSheetState && agendaSheetState.kind === 'sched-loading'
+    && agendaSheetState.itemId === itemId) {
+    opts = agendaSheetState.opts || undefined;
+  }
   // Serving grain (Track AS): list rows are summaries — the manifest
   // MINUS goal and sealed refs. The editor round-trips the WHOLE
   // manifest, so it prefills only from the FULL item; until the
@@ -1512,7 +1567,7 @@ function agendaOpenSchedSheet(itemId) {
   const item = agendaFullItemFor(itemId);
   if (!item) {
     if (!agendaFindItem(itemId)) return;
-    agendaSheetState = { kind: 'sched-loading', itemId };
+    agendaSheetState = { kind: 'sched-loading', itemId, opts: opts || null };
     agendaSheetRender();
     return;
   }
@@ -1564,13 +1619,22 @@ function agendaOpenSchedSheet(itemId) {
     execEffort: cfg.claude_effort || cfg.codex_reasoning_effort || cfg.kimi_thinking || cfg.pi_thinking || '',
     approveNow: true,
     voids: !!(st && st.effect.approval),
-    error: '',
+    // A served fireability refusal (or an approve-time one carried in
+    // opts) renders as the sheet's inline error from the first paint,
+    // and the named field gets focus below.
+    error: (opts && opts.refusal)
+      || (st && st.effect.fireability_refusal
+        ? `unfireable(${st.effect.fireability_refusal.field}): ${st.effect.fireability_refusal.reason}`
+        : ''),
+    focusField: (opts && opts.focus)
+      || (st && st.effect.fireability_refusal && st.effect.fireability_refusal.field) || '',
   };
   // Opening the editor IS looking at the current revision.
   if (st && typeof agendaAckEffectDigest === 'function') {
     agendaAckEffectDigest(st.effect.effect_id, st.effect.digest);
   }
   agendaSheetRender();
+  agendaSchedApplyFocus();
   // Model/effort option lists come from the served settings; fetch like
   // the start sheet does and re-render when they land.
   if (agendaStartSheetSettings === null && typeof fetchDashboardSettings === 'function') {
@@ -1581,6 +1645,57 @@ function agendaOpenSchedSheet(itemId) {
         if (agendaSheetState && agendaSheetState.kind === 'sched') agendaSheetRender();
       });
   }
+  // The projectless-required hint derives from the SAME source the
+  // start sheet uses (api_project_root); fetch once and re-render so
+  // the Project row can say "required" instead of guessing.
+  if (agendaDaemonDefaultProject === null && typeof fetchProjectRoot === 'function') {
+    fetchProjectRoot()
+      .then((root) => { agendaDaemonDefaultProject = root || ''; })
+      .catch(() => { agendaDaemonDefaultProject = ''; })
+      .finally(() => {
+        if (agendaSheetState && agendaSheetState.kind === 'sched') agendaSheetRender();
+      });
+  }
+}
+
+// Migration honesty (fireability): an op refused by the daemon's
+// `unfireable(<field>): …` grammar — a parked pin-less manifest meeting
+// the validator at its next approve, or the missed-card one-tap hitting
+// a now-unresolvable plan — surfaces as an EDIT prompt, never a dead
+// end: the one plan editor opens with the named field focused and the
+// refusal shown. Called by agendaSendOp on every refusal; the grammar is
+// the daemon's pinned wire contract (FIREABILITY_REFUSAL_PREFIX in
+// agenda/fireability.rs).
+function agendaFireabilityEditPrompt(params, message) {
+  if (!params) return;
+  // approve refusals always prompt; a propose refusal prompts only when
+  // no sheet owns the gesture (the missed-card one-tap) — sheet flows
+  // keep their own inline errors.
+  const prompts = params.op === 'approve_effect'
+    || (params.op === 'propose_effect' && !agendaSheetState);
+  if (!prompts) return;
+  const match = /^unfireable\((project|executor|floor)\): /.exec(String(message || ''));
+  if (!match) return;
+  agendaOpenSchedSheet(params.id, { focus: match[1], refusal: String(message) });
+}
+
+// Land the sheet on the field a fireability refusal named: focus it and
+// pulse its row. project → the Project input, executor → the backend
+// select, floor → the First-run input.
+function agendaSchedApplyFocus() {
+  const s = agendaSheetState;
+  if (!s || s.kind !== 'sched' || !s.focusField) return;
+  const selector = s.focusField === 'project' ? '[data-sheet="projectRoot"]'
+    : s.focusField === 'executor' ? '[data-sheet="execBackend"]'
+      : s.focusField === 'floor' ? '[data-sheet="when"]' : '';
+  if (!selector) return;
+  const host = document.getElementById('ag2-sheet');
+  const el = host && host.querySelector(selector);
+  if (!el) return;
+  el.focus();
+  const row = el.closest('div') || el;
+  row.classList.add('ag2-field-attn');
+  setTimeout(() => row.classList.remove('ag2-field-attn'), 4000);
 }
 
 function agendaSchedSheetHtml(item) {
@@ -1684,8 +1799,8 @@ function agendaSchedSheetHtml(item) {
       ${cadenceBlock}
       <span class="ag2-sheet-k">Project</span>
       <div>
-        <input type="text" data-sheet="projectRoot" data-mf-field="project_root" aria-label="Project root" placeholder="resolves at fire time" value="${escapeHtml(s.projectRoot)}" />
-        <div class="ag2-hint">Absolute directory the fired session runs under; digest-bound. Empty = the parking session’s project, else the daemon default.</div>
+        <input type="text" data-sheet="projectRoot" data-mf-field="project_root" aria-label="Project root" placeholder="${escapeHtml(agendaSchedProjectPlaceholder(item))}" value="${escapeHtml(s.projectRoot)}" />
+        ${agendaSchedProjectHintHtml(item, s)}
       </div>
     </div>
     ${standingBlock}
@@ -1699,6 +1814,34 @@ function agendaSchedSheetHtml(item) {
       <button type="button" class="ag2-btn ghost" data-sheet-act="close">Cancel</button>
       <button type="button" class="ag2-btn prim" data-sheet-act="sched-confirm">${s.approveNow ? 'Propose & approve' : 'Propose schedule'}</button>
     </div>`;
+}
+
+// The Project row's hint, derived from the SAME resolution the daemon's
+// fireability validator runs (explicit → the parking session's root →
+// the daemon default → refused named): an empty pick on an item the
+// chain cannot cover says "required" up front, exactly like the
+// start-now sheet — one knowledge source (agendaStartProjectResolution),
+// never a sheet-local copy of the rule. The daemon remains the
+// authority: its propose-time refusal renders inline if a stale hint
+// let an unresolvable propose through.
+function agendaSchedProjectHintHtml(item, s) {
+  if (s.projectRoot) {
+    return '<div class="ag2-hint">Absolute directory the fired session runs under; digest-bound — recorded on the manifest so the approval covers where.</div>';
+  }
+  const res = agendaStartProjectResolution(item);
+  const hint = `empty = ${agendaStartProjectHint(res.source)}`
+    + (res.value ? ` (${res.value})` : '');
+  const required = res.source === 'none';
+  return `<div class="ag2-hint${required ? ' ags-hint-required' : ''}">${escapeHtml(
+    required
+      ? 'required — this daemon runs without a default project and the propose will be refused without one'
+      : hint
+  )}</div>`;
+}
+
+function agendaSchedProjectPlaceholder(item) {
+  const res = agendaStartProjectResolution(item);
+  return res.value ? res.value : res.source === 'none' ? 'required on this daemon' : 'resolves when proposed';
 }
 
 // The executor rows on the schedule sheet (Track AU): backend/model/
@@ -1812,12 +1955,16 @@ async function agendaSchedConfirm(button) {
       agendaAckEffectDigest(effect.effect_id, effect.digest);
       agendaDigestPulse = { effectId: effect.effect_id, at: Date.now() };
     }
+    // Close BEFORE the approve leg: a refused approve surfaces through
+    // agendaSendOp (tab flash, card paint, and the fireability edit
+    // prompt re-opening this sheet focused) — closing afterwards would
+    // clobber that re-open.
+    agendaSheetClose();
+    agendaSheetRender();
     let approved = false;
     if (s.approveNow && effect && effect.digest) {
       approved = await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest });
     }
-    agendaSheetClose();
-    agendaSheetRender();
     if (typeof showControlToast === 'function') {
       const short = effect && effect.digest ? agendaShortDigest(effect.digest) : '';
       showControlToast(approved ? 'success' : 'info', approved
@@ -1826,6 +1973,73 @@ async function agendaSchedConfirm(button) {
     }
   } catch (e) {
     fail(String(e && e.message || e));
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+// The missed-window card's one-tap remedy — the RESCHEDULE lane's single
+// propose emitter (the third lane beside the edit sheet's confirm and
+// the seals adopt; each lane one emitter). Re-proposes the manifest
+// VERBATIM with the floor moved to now (the one thing the miss broke)
+// and re-approves the fresh digest — the tap happens on an owner
+// surface, and the copy on the button names exactly that. Grain law:
+// the manifest comes from the FULL item (a summary would blank the goal
+// and unseal the refs); a cache miss awaits the item route directly.
+async function agendaRescheduleMissed(itemId, button) {
+  if (button) button.disabled = true;
+  try {
+    let item = agendaFullItemFor(itemId);
+    if (!item) {
+      try {
+        const resp = await daemonApi.request('api_agenda_item', { item_id: itemId });
+        if (resp.ok && resp.body && resp.body.item) {
+          agendaAdoptFullItem(resp.body.item);
+          item = resp.body.item;
+        }
+      } catch (e) { /* named refusal below */ }
+    }
+    if (!item) {
+      agendaFlashError('could not load the full plan to reschedule — try again');
+      return false;
+    }
+    const st = agendaEffectState(item);
+    const m = st && st.manifest;
+    if (!st || !m || st.kind !== 'missed') {
+      agendaFlashError('nothing to reschedule — the plan changed under this card');
+      agendaRenderTab();
+      return false;
+    }
+    const params = {
+      op: 'propose_effect',
+      id: item.id,
+      goal: m.goal,
+      fire_at_ms: Date.now(),
+      orchestrate: !!m.orchestrate,
+    };
+    if (m.interactive) params.interactive = true;
+    if (m.project_root) params.project_root = m.project_root;
+    if (m.agent_config) params.agent_config = m.agent_config;
+    if (m.recurrence) params.recurrence = m.recurrence;
+    if (m.trigger) params.trigger = m.trigger;
+    if (Array.isArray(m.binding_refs) && m.binding_refs.length) params.binding_refs = m.binding_refs;
+    const proposed = await agendaSendOp(params, button);
+    if (!proposed) return false;
+    const effect = (proposed.effects || [])[0];
+    if (effect && typeof agendaAckEffectDigest === 'function') {
+      agendaAckEffectDigest(effect.effect_id, effect.digest);
+      agendaDigestPulse = { effectId: effect.effect_id, at: Date.now() };
+    }
+    const approved = effect && effect.digest
+      ? await agendaSendOp({ op: 'approve_effect', id: item.id, digest: effect.digest }, button)
+      : false;
+    if (approved) {
+      if (typeof agendaApprovalMoment === 'function') agendaApprovalMoment(approved);
+      if (typeof showControlToast === 'function') {
+        showControlToast('success', 'Rescheduled — the same plan runs now under a fresh approval.');
+      }
+    }
+    return !!approved;
   } finally {
     if (button) button.disabled = false;
   }
