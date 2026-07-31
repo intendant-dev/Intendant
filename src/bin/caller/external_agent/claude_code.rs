@@ -4154,6 +4154,20 @@ impl ExternalAgent for ClaudeCodeAgent {
         "claude-code"
     }
 
+    fn next_round_reads_fresh_credentials(&mut self) -> bool {
+        match self.child.as_mut() {
+            // No process: the next round spawns one, and the spawn reads
+            // the credential store fresh.
+            None => true,
+            // An exited process equally cannot carry its old credential
+            // read into the next round (the resume respawn reads fresh).
+            // A live child CAN — the persistent stream-input shape sends
+            // later turns into the same process — so only a confirmed
+            // exit answers true.
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+        }
+    }
+
     async fn initialize(
         &mut self,
         config: AgentConfig,
@@ -8883,6 +8897,20 @@ mod tests {
             CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER),
             "bootstrap addendum no longer contains its strip marker"
         );
+    }
+
+    /// The rate-limit park wake's turn-free era-refresh gate: with no
+    /// backend process at all, the next round's spawn reads the
+    /// credential store fresh, so the wake may re-announce identity on
+    /// the session's behalf. (A LIVE child answers false — its
+    /// spawn-time credentials still govern the next round — and only a
+    /// confirmed exit flips that; both riding `Child::try_wait` in the
+    /// override.)
+    #[test]
+    fn wake_refresh_gate_open_without_backend_process() {
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        assert!(agent.next_round_reads_fresh_credentials());
     }
 
     #[test]

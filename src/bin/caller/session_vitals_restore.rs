@@ -1589,6 +1589,7 @@ mod tests {
             status: Some("allowed_warning".into()),
             observed_at_epoch: Some(1_784_499_000),
             account: account.map(str::to_string),
+            account_prior: false,
         }
     }
 
@@ -1784,6 +1785,7 @@ mod tests {
             status: Some("allowed".into()),
             observed_at_epoch: Some(1_784_499_000),
             account: None,
+            account_prior: false,
         };
         hub.apply_rate_limit_windows("cc-1", vec![window.clone()]);
         // The persist may ride the blocking pool: wait for the file.
