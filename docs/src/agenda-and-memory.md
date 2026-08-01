@@ -441,6 +441,24 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
+**The spawn governor (2026-08-01): simultaneous fires stagger.** When
+several due occurrences would dispatch at once — eight approvals in seven
+seconds once fired eight seats in one second, pinning the daemon at 230%
+CPU and starving its control plane for ten minutes — the dispatch seam
+serializes spawn starts at one per 30s (a tuned constant, never a knob)
+in due-instant-then-approval order, so worktree creation and backend
+warmup never overlap. A solo fire never waits: the stagger engages only
+under contention, meaning a second spawn wants in while the previous
+start's interval still runs (run-now gestures included). A held
+occurrence is not journaled — it stays due and re-plans on the next
+pass, so completing or retiring the item or revoking the approval
+between slots cancels it for free, and its eventual journal row records
+the actual dispatch instant beside the due instant it was held from.
+Cadence, trigger, and requested fires all ride the same governor. This
+is the burst limiter: distinct from the rustc compile governor (same
+philosophy, different resource) and composable with a future
+headroom/admission program (the level limiter).
+
 **Withdrawing a pending proposal (`withdraw_effect`,
 `ctl agenda withdraw ID [--reason]`, the card's Decline).** A
 still-unapproved proposal can be taken back — the recorded "never" the
