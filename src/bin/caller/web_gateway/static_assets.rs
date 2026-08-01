@@ -802,11 +802,23 @@ mod tests {
             0,
             "the stamp transport lives in the shared wrapper — one call site, one fragment"
         );
-        assert_eq!(
-            sheet.matches("approve_effect").count(),
-            0,
-            "the automate sheet cannot approve — the ceremony stays the owner's"
-        );
+        // The ban is on EMISSION shapes, by name: the shared op emitter
+        // (`agendaSendOp`, same fragment) INSPECTS `params.op ===
+        // 'approve_effect'` for the approve-while-blocked confirm, which
+        // is reading a surface's op, never minting one — approvals are
+        // still emitted only by the surfaces the other pins govern.
+        for emission in [
+            "op: 'approve_effect'",
+            "op: \"approve_effect\"",
+            "data-op-btn=\"approve_effect\"",
+        ] {
+            assert_eq!(
+                sheet.matches(emission).count(),
+                0,
+                "the automate sheet cannot approve — the ceremony stays the owner's \
+                 ({emission:?} found)"
+            );
+        }
         assert_eq!(
             sheet.matches("propose_effect").count(),
             0,
