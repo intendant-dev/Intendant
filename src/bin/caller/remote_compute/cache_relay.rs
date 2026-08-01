@@ -622,21 +622,49 @@ impl HomeCacheSession {
             return error_response(error);
         }
         match self.store.open(&key).await {
-            Ok(Some((file, bytes))) => {
+            Ok(Some((mut file, bytes))) => {
                 if bytes > MAX_CACHE_OBJECT_BYTES as u64 {
                     return error_response("cached object exceeds the relay object limit");
                 }
-                if bytes > 0 {
+                // Old workers omit `inline`; keep their offset-zero exchange
+                // intact so a daemon upgrade does not strand an attachment.
+                if frame.get("inline").and_then(Value::as_bool) != Some(true) {
+                    if bytes > 0 {
+                        self.downloads.insert(
+                            transfer_id.clone(),
+                            HomeDownload {
+                                file,
+                                bytes,
+                                offset: 0,
+                            },
+                        );
+                    }
+                    return json!({"state":"hit", "transfer_id":transfer_id, "bytes":bytes});
+                }
+                let mut first = vec![0u8; bytes.min(CACHE_CHUNK_BYTES as u64) as usize];
+                if let Err(error) = file.read_exact(&mut first).await {
+                    return error_response(format!("read cached object: {error}"));
+                }
+                let offset = first.len() as u64;
+                let done = offset == bytes;
+                if !done {
                     self.downloads.insert(
                         transfer_id.clone(),
                         HomeDownload {
                             file,
                             bytes,
-                            offset: 0,
+                            offset,
                         },
                     );
                 }
-                json!({"state":"hit", "transfer_id":transfer_id, "bytes":bytes})
+                json!({
+                    "state":"hit",
+                    "transfer_id":transfer_id,
+                    "bytes":bytes,
+                    "offset":0,
+                    "data":base64::engine::general_purpose::STANDARD.encode(first),
+                    "done":done,
+                })
             }
             Ok(None) => json!({"state":"miss"}),
             Err(error) => error_response(error),
@@ -698,10 +726,42 @@ impl HomeCacheSession {
         if expected_digest.len() != 64 || !expected_digest.bytes().all(hex_byte) {
             return error_response("cache upload digest has an invalid shape");
         }
-        let (temp_path, file) = match self.store.create_upload_file(&transfer_id) {
+        // `inline` is an additive protocol capability. An old worker gets
+        // the original offset-zero reply; a new worker can also fall back
+        // when an old home ignores these fields.
+        let first = match (
+            frame.get("inline").and_then(Value::as_bool),
+            frame.get("data"),
+        ) {
+            (Some(true), None) => Vec::new(),
+            (Some(true), Some(Value::String(value))) => {
+                match base64::engine::general_purpose::STANDARD.decode(value) {
+                    Ok(bytes)
+                        if bytes.len() <= CACHE_CHUNK_BYTES
+                            && bytes.len() as u64 <= expected_bytes =>
+                    {
+                        bytes
+                    }
+                    _ => return error_response("cache upload opening chunk is invalid"),
+                }
+            }
+            (Some(true), Some(_)) => {
+                return error_response("cache upload opening chunk is invalid")
+            }
+            _ => Vec::new(),
+        };
+        let (temp_path, mut file) = match self.store.create_upload_file(&transfer_id) {
             Ok(created) => created,
             Err(error) => return error_response(error),
         };
+        if let Err(error) = file.write_all(&first).await {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return error_response(format!("write cache upload: {error}"));
+        }
+        let mut digest = sha2::Sha256::new();
+        digest.update(&first);
+        let written = first.len() as u64;
         self.uploads.insert(
             transfer_id.clone(),
             HomeUpload {
@@ -710,11 +770,11 @@ impl HomeCacheSession {
                 file,
                 expected_bytes,
                 expected_digest,
-                written: 0,
-                digest: sha2::Sha256::new(),
+                written,
+                digest,
             },
         );
-        json!({"state":"ready", "transfer_id":transfer_id, "offset":0})
+        json!({"state":"ready", "transfer_id":transfer_id, "offset":written})
     }
 
     async fn put_chunk(&mut self, frame: &Value) -> Value {
@@ -957,7 +1017,10 @@ impl WorkerCacheClient {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
         let transfer_id = uuid::Uuid::new_v4().simple().to_string();
         let response = self
-            .exchange("get_begin", json!({"key":key, "transfer_id":transfer_id}))
+            .exchange(
+                "get_begin",
+                json!({"key":key, "transfer_id":transfer_id, "inline":true}),
+            )
             .await?;
         let expected = match response.get("state").and_then(Value::as_str) {
             Some("miss") => return Ok(None),
@@ -970,6 +1033,22 @@ impl WorkerCacheClient {
             _ => return Err(response_error(&response)),
         };
         let mut bytes = Vec::with_capacity(expected.min(4 * 1024 * 1024));
+        if let Some(encoded) = response.get("data").and_then(Value::as_str) {
+            let first = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+                .filter(|chunk| chunk.len() <= CACHE_CHUNK_BYTES)
+                .ok_or_else(|| "cache relay opening download chunk is invalid".to_string())?;
+            let done = response.get("done").and_then(Value::as_bool);
+            if response.get("offset").and_then(Value::as_u64) != Some(0)
+                || first.len() > expected
+                || (first.is_empty() && expected > 0)
+                || done != Some(first.len() == expected)
+            {
+                return Err("cache relay opening download chunk made invalid progress".to_string());
+            }
+            bytes.extend_from_slice(&first);
+        }
         while bytes.len() < expected {
             let response = self
                 .exchange(
@@ -1001,6 +1080,7 @@ impl WorkerCacheClient {
             return Err("cache object exceeds the relay object limit".to_string());
         }
         let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+        let first_len = bytes.len().min(CACHE_CHUNK_BYTES);
         let response = self
             .exchange(
                 "put_begin",
@@ -1009,14 +1089,24 @@ impl WorkerCacheClient {
                     "transfer_id":transfer_id,
                     "bytes":bytes.len(),
                     "sha256":sha256_hex(bytes),
+                    "inline":true,
+                    "data":base64::engine::general_purpose::STANDARD.encode(&bytes[..first_len]),
                 }),
             )
             .await?;
         if response.get("state").and_then(Value::as_str) != Some("ready") {
             return Err(response_error(&response));
         }
-        let mut offset = 0usize;
-        for chunk in bytes.chunks(CACHE_CHUNK_BYTES) {
+        let Some(offset) = response
+            .get("offset")
+            .and_then(Value::as_u64)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| *offset == 0 || *offset == first_len)
+        else {
+            return Err("cache relay upload began at the wrong offset".to_string());
+        };
+        let mut offset = offset;
+        for chunk in bytes[offset..].chunks(CACHE_CHUNK_BYTES) {
             let response = self
                 .exchange(
                     "put_chunk",
@@ -1080,7 +1170,7 @@ impl WorkerCacheSidecar {
         let shutdown_task = shutdown.clone();
         let state = Arc::new(WebDavState {
             client,
-            operation: tokio::sync::Mutex::new(()),
+            operations: tokio::sync::Semaphore::new(MAX_TRANSFERS_PER_JOB),
         });
         let app = Router::new().fallback(webdav_request).with_state(state);
         tokio::spawn(async move {
@@ -1104,10 +1194,10 @@ impl Drop for WorkerCacheSidecar {
 
 struct WebDavState {
     client: WorkerCacheClient,
-    /// sccache may issue backend calls concurrently. Serializing the relay
-    /// keeps both memory and attachment traffic bounded independently of the
-    /// compiler's job count.
-    operation: tokio::sync::Mutex<()>,
+    /// sccache may issue backend calls concurrently. Limiting the relay to
+    /// the same two-operation budget enforced by home keeps memory and
+    /// attachment traffic bounded independently of the compiler's job count.
+    operations: tokio::sync::Semaphore,
 }
 
 async fn webdav_request(
@@ -1117,7 +1207,9 @@ async fn webdav_request(
     _headers: HeaderMap,
     body: Body,
 ) -> Response<Body> {
-    let _operation = state.operation.lock().await;
+    let Ok(_operation) = state.operations.acquire().await else {
+        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    };
     let raw_path = uri.path();
     let key = raw_path.strip_prefix('/').unwrap_or(raw_path);
     match method.as_str() {
