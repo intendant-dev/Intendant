@@ -2249,7 +2249,13 @@ async fn eight_fire_wave_staggers_and_daemon_stays_responsive() {
     for n in 0..8 {
         let added = ctl(
             &daemon,
-            &["--json", "agenda", "add", &format!("wave-item-{n}"), "--task"],
+            &[
+                "--json",
+                "agenda",
+                "add",
+                &format!("wave-item-{n}"),
+                "--task",
+            ],
         )
         .await;
         assert!(added.status.success(), "{}", text_of(&added));
