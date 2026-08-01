@@ -38310,7 +38310,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5d107a2a2b8703bf';
+const INTENDANT_APP_BUILD = '5ee48f9d553a3106';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -101761,6 +101761,24 @@ function agendaGraphDraw(ts) {
       childCount.set(x.part_of.parent_id, (childCount.get(x.part_of.parent_id) || 0) + 1);
     }
   });
+  // Place-link bundling: a hub with a wide fan (≥6 children) routes
+  // its links through a shared trunk — each curve's control point
+  // pulls toward a point between the hub and its children's centroid,
+  // so the fan leaves the hub as one limb and splays near the leaves
+  // instead of spraying straight spokes. Screen-space, recomputed per
+  // frame from live positions; smaller fans stay straight lines.
+  const bundleTrunks = new Map();
+  agendaGraphLinks.forEach((link) => {
+    if (link.t !== 'place') return;
+    let trunk = bundleTrunks.get(link.b);
+    if (!trunk) {
+      trunk = { x: 0, y: 0, n: 0 };
+      bundleTrunks.set(link.b, trunk);
+    }
+    trunk.x += pts[link.a].x;
+    trunk.y += pts[link.a].y;
+    trunk.n += 1;
+  });
   // Links under nodes: placement solid iris, see-also dashed neutral,
   // waits-on rose with the animated dash (static under reduced motion).
   agendaGraphLinks.forEach((link) => {
@@ -101779,7 +101797,16 @@ function agendaGraphDraw(ts) {
     const depth = fade * Math.max(0.25, Math.min(1, ((a.s + b.s) / 2) * 1.1 - 0.18));
     g.beginPath();
     g.moveTo(a.x, a.y);
-    g.lineTo(b.x, b.y);
+    const trunk = link.t === 'place' ? bundleTrunks.get(link.b) : null;
+    if (trunk && trunk.n >= 6) {
+      const tx = b.x + (trunk.x / trunk.n - b.x) * 0.35;
+      const ty = b.y + (trunk.y / trunk.n - b.y) * 0.35;
+      const mx = (a.x + b.x) / 2;
+      const my = (a.y + b.y) / 2;
+      g.quadraticCurveTo(mx + (tx - mx) * 0.55, my + (ty - my) * 0.55, b.x, b.y);
+    } else {
+      g.lineTo(b.x, b.y);
+    }
     if (link.t === 'place') {
       // Files mode: the six hub fans would visually unify the whole
       // field and bury the territory clusters — recede unless hot.
