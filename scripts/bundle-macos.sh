@@ -58,6 +58,9 @@
 #                              codesign does not find identities in
 #                              out-of-search-list keychains (verified
 #                              empirically; --keychain alone is not enough).
+#                              Verified up front: an out-of-search-list
+#                              keychain fails the run immediately with the
+#                              remedy named, before the long build.
 #   INTENDANT_NOTARY_KEY_FILE  App Store Connect API private key (.p8) for
 #                              `notarytool`.
 #   INTENDANT_NOTARY_KEY_ID    Key ID of that API key.
@@ -91,6 +94,36 @@ PROFILE="${1:-release}"
 
 die() {
     echo "Error: $*" >&2
+    exit 1
+}
+
+# codesign resolves identities ONLY through the keychain search list — an
+# unlocked keychain passed via --keychain alone is not enough (verified
+# empirically). The search list is per-session state: a `security
+# list-keychains -s` write from a daemon/LaunchDaemon session (a CI
+# runner's service session) can fail to apply or persist, so a later run's
+# codesign dies with a bare "no identity found" long after the write
+# looked successful (v0.1.0 release, 2026-08-01). Verify instead of
+# trusting the write, and name the remedy.
+require_keychain_in_search_list() {
+    local keychain="$1"
+    if security list-keychains -d user | sed 's/^ *"//; s/"$//' | grep -qxF "$keychain"; then
+        return 0
+    fi
+    {
+        echo "Error: signing keychain is not in the user keychain search list:"
+        echo "  $keychain"
+        echo "codesign cannot find identities in out-of-search-list keychains, so"
+        echo "signing would fail later with a misleading 'identity not found'."
+        echo "A 'security list-keychains -s' write from this session type does"
+        echo "not stick — daemon/LaunchDaemon sessions (e.g. a CI runner"
+        echo "service) drop it. Fix it ONCE from an interactive ssh (or GUI)"
+        echo "session as this account:"
+        echo ""
+        echo "  security list-keychains -d user -s \"$keychain\" \$(security list-keychains -d user | tr -d '\"')"
+        echo ""
+        echo "then re-run this script."
+    } >&2
     exit 1
 }
 
@@ -128,6 +161,13 @@ case "$NOTARY_STATE" in
             || die "INTENDANT_NOTARY_KEY_FILE does not exist: $NOTARY_KEY_FILE"
         ;;
 esac
+
+# The release keychain must already be searchable (see the header note):
+# verify now, before the long build, not at codesign time.
+if [ -n "$SIGN_RELEASE_IDENTITY" ] && [ -n "$SIGN_RELEASE_KEYCHAIN" ]; then
+    [ -f "$SIGN_RELEASE_KEYCHAIN" ] || die "INTENDANT_SIGN_KEYCHAIN does not exist: $SIGN_RELEASE_KEYCHAIN"
+    require_keychain_in_search_list "$SIGN_RELEASE_KEYCHAIN"
+fi
 
 # --- Version stamp ----------------------------------------------------------
 # Release builds get the tag (workflow passes INTENDANT_APP_VERSION=v1.2.3);
@@ -484,6 +524,10 @@ CERTCONF
     echo "Signing app bundle..."
     security unlock-keychain -p "$SIGN_KEYCHAIN_PASS" "$SIGN_KEYCHAIN" 2>/dev/null
     if security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+        # The identity is in the keychain (find-identity queries the file
+        # directly), but codesign resolves through the SEARCH LIST — verify
+        # it, or die with the remedy instead of an opaque codesign error.
+        require_keychain_in_search_list "$SIGN_KEYCHAIN"
         codesign --force --deep --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP"
         echo "Signed with '$SIGN_IDENTITY' (TCC grants will persist across recompiles)"
     else

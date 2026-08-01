@@ -405,11 +405,19 @@ PGP signing key — `PGP_SIGN_KEY_B64`, `PGP_SIGN_KEY_PASSPHRASE`
    mint, rotation, and revocation ceremonies). The certify-only primary
    key never enters CI — only the signing subkey does, and it carries a
    two-year expiry as a dead-man switch.
-2. `base64 -i ~/.intendant/release-signing/secret-subkey-ci.asc | pbcopy`
-   → `PGP_SIGN_KEY_B64`; the escrow's `passphrase` file content →
-   `PGP_SIGN_KEY_PASSPHRASE`.
-3. The release runner needs `gpg` on PATH (`brew install gnupg` on the
-   fleet Mac); the workflow imports the subkey into a throwaway
+2. Provision both secrets deterministically with the gh CLI, straight from
+   the escrow files — stdin only, never clipboard hand-paste (a hand-pasted
+   `PGP_SIGN_KEY_PASSPHRASE` drifted from the escrow and failed the v0.1.0
+   tag run with `Bad passphrase`):
+
+   ```bash
+   base64 -i ~/.intendant/release-signing/secret-subkey-ci.asc | gh secret set PGP_SIGN_KEY_B64 --repo intendant-dev/Intendant
+   gh secret set PGP_SIGN_KEY_PASSPHRASE --repo intendant-dev/Intendant < ~/.intendant/release-signing/passphrase
+   ```
+3. The release runner needs `gpg` and the `gh` CLI on PATH
+   (`scripts/setup-macos.sh` installs both, and the workflow preflights
+   them at job start — a tag build missing either fails in seconds, not
+   after the build); the workflow imports the subkey into a throwaway
    `GNUPGHOME` under `RUNNER_TEMP` and removes it in an `always()`
    cleanup step.
 4. Before cutting a release, `scripts/release-pgp-dryrun.sh` rehearses
