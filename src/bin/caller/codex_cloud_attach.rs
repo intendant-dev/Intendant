@@ -927,6 +927,18 @@ pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String
     Ok(parsed.to_string())
 }
 
+fn enrollment_url_from_home(home: &str) -> Result<String, String> {
+    let mut parsed = url::Url::parse(home).map_err(|e| format!("invalid home URL: {e}"))?;
+    parsed
+        .set_scheme("https")
+        .map_err(|_| "home URL cannot be converted to HTTPS".to_string())?;
+    // Enrollment and attachment share one origin but deliberately use
+    // different routes. Replace the normalized attachment path instead of
+    // appending to it.
+    parsed.set_path(ENROLL_PATH);
+    Ok(parsed.to_string())
+}
+
 /// The attach follow-up prompt: everything in it is public except the
 /// single-use token, which is the point of the ceremony.
 pub fn attach_prompt(
@@ -1238,8 +1250,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", key_path.display()))?;
 
     // 2. Redeem the token for a certificate at the public enroll route.
-    let http_base = crate::peer::transport::ws_url_to_http_base(&home);
-    let enroll_url = format!("{http_base}{ENROLL_PATH}");
+    let enroll_url = enrollment_url_from_home(&home)?;
     let client = crate::peer::transport::tls_client::reqwest_client(
         std::time::Duration::from_secs(20),
         &pinned,
@@ -2501,6 +2512,14 @@ mod tests {
         assert_eq!(
             home_url_from(Some("wss://home.example:8443/ws".into())).unwrap(),
             "wss://home.example:8443/api/codex-cloud/attach"
+        );
+    }
+
+    #[test]
+    fn enrollment_replaces_the_attachment_path_on_the_same_origin() {
+        assert_eq!(
+            enrollment_url_from_home("wss://home.example:8443/api/codex-cloud/attach").unwrap(),
+            "https://home.example:8443/api/codex-cloud/enroll"
         );
     }
 
