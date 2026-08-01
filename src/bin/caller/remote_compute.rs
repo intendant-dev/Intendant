@@ -6,6 +6,7 @@
 //! clean-worktree default keep a caller from accidentally validating a
 //! different source tree than the one it intended to send.
 
+mod cache_relay;
 mod scheduler;
 pub(crate) mod source;
 
@@ -39,6 +40,10 @@ const WORKER_PRIVATE_STATE_ENV: &str = "INTENDANT_HOME";
 pub(crate) const REMOTE_COMMAND_START_KIND: &str = "remote_command_start";
 pub(crate) const REMOTE_COMMAND_CANCEL_KIND: &str = "remote_command_cancel";
 pub(crate) const REMOTE_COMMAND_RESULT_KIND: &str = "remote_command_result";
+
+pub(crate) fn route_remote_cache_frame(task_id: &str, text: &str) -> bool {
+    cache_relay::route_worker_frame(task_id, text)
+}
 
 fn remove_worker_private_state(command: &mut tokio::process::Command) {
     command.env_remove(WORKER_PRIVATE_STATE_ENV);
@@ -83,6 +88,10 @@ pub(crate) struct RemoteCommandSpec {
     /// views or result logs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     cache_env: BTreeMap<String, String>,
+    /// Opaque, one-job capability for the attachment-backed home cache.
+    /// It is never copied into job views, results, or debug output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_relay_token: Option<String>,
     #[serde(default = "default_require_clean")]
     pub require_clean: bool,
     pub timeout_s: u64,
@@ -98,6 +107,7 @@ impl std::fmt::Debug for RemoteCommandSpec {
             .field("source_id", &self.source_id)
             .field("cache", &self.cache)
             .field("cache_env_keys", &self.cache_env.keys().collect::<Vec<_>>())
+            .field("cache_relay", &self.cache_relay_token.is_some())
             .field("require_clean", &self.require_clean)
             .field("timeout_s", &self.timeout_s)
             .finish()
@@ -178,11 +188,18 @@ impl RemoteCommandSpec {
                 "env may contain at most {MAX_ENV_BYTES} bytes in total"
             ));
         }
-        if self.cache == RemoteCacheMode::None && !self.cache_env.is_empty() {
+        let has_direct_cache = !self.cache_env.is_empty();
+        let has_home_relay = self.cache_relay_token.is_some();
+        if self.cache == RemoteCacheMode::None && (has_direct_cache || has_home_relay) {
             return Err("cache configuration was supplied while cache mode is none".to_string());
         }
-        if self.cache == RemoteCacheMode::DurableSccache && self.cache_env.is_empty() {
-            return Err("durable_sccache requires dedicated cache configuration".to_string());
+        if self.cache == RemoteCacheMode::DurableSccache && (has_direct_cache == has_home_relay) {
+            return Err("durable_sccache requires exactly one durable cache transport".to_string());
+        }
+        if let Some(token) = self.cache_relay_token.as_deref() {
+            if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("durable cache relay capability has an invalid shape".to_string());
+            }
         }
         let cache_env_bytes = self.cache_env.iter().try_fold(
             0usize,
@@ -509,6 +526,7 @@ fn subscribe_home_job(
 async fn start_remote_command(
     requested_host: Option<String>,
     spec: RemoteCommandSpec,
+    cache_store: Option<cache_relay::HomeCacheStore>,
     source_mode: RemoteSourceMode,
     snapshot: Option<source::HomeSourceSnapshot>,
     branch_hint: Option<String>,
@@ -557,8 +575,15 @@ async fn start_remote_command(
     insert_home_job(view.clone(), caller.owner_session_id())?;
 
     tokio::spawn(async move {
-        if let Err(error) =
-            prepare_and_dispatch(job_id.clone(), requested_host, spec, snapshot, branch_hint).await
+        if let Err(error) = prepare_and_dispatch(
+            job_id.clone(),
+            requested_host,
+            spec,
+            cache_store,
+            snapshot,
+            branch_hint,
+        )
+        .await
         {
             update_home_job(&job_id, |job| {
                 if !job.state.is_terminal() {
@@ -576,6 +601,7 @@ async fn prepare_and_dispatch(
     job_id: String,
     requested_host: String,
     mut spec: RemoteCommandSpec,
+    cache_store: Option<cache_relay::HomeCacheStore>,
     snapshot: Option<source::HomeSourceSnapshot>,
     branch_hint: Option<String>,
 ) -> Result<(), String> {
@@ -610,6 +636,13 @@ async fn prepare_and_dispatch(
         .to_string();
     let (to_worker, from_worker) = crate::codex_cloud_attach::attachment_channel(&task_id)
         .ok_or_else(|| format!("remote host {host} has no live attachment"))?;
+    let cache_session = match (cache_store, spec.cache_relay_token.as_deref()) {
+        (Some(store), Some(token)) => Some(cache_relay::HomeCacheSession::register(
+            &task_id, &job_id, token, store,
+        )?),
+        (None, None) => None,
+        _ => return Err("durable cache relay preparation was internally inconsistent".into()),
+    };
     let watchdog_s = spec.timeout_s.saturating_add(WORKER_WATCHDOG_GRACE_S);
     let frame = serde_json::json!({
         "t": REMOTE_COMMAND_START_KIND,
@@ -649,6 +682,7 @@ async fn prepare_and_dispatch(
             worker_use,
             from_worker,
             to_worker,
+            cache_session,
             Duration::from_secs(watchdog_s),
         )
         .await;
@@ -671,6 +705,7 @@ async fn await_worker_result(
     _worker_use: scheduler::WorkerUse,
     mut from_worker: tokio::sync::broadcast::Receiver<String>,
     to_worker: mpsc::Sender<String>,
+    mut cache_session: Option<cache_relay::HomeCacheSession>,
     watchdog: Duration,
 ) {
     let deadline = tokio::time::Instant::now() + watchdog;
@@ -679,8 +714,9 @@ async fn await_worker_result(
         if remaining.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, from_worker.recv()).await {
-            Ok(Ok(text)) => {
+        tokio::select! {
+            worker = from_worker.recv() => match worker {
+            Ok(text) => {
                 let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
                     continue;
                 };
@@ -725,15 +761,26 @@ async fn await_worker_result(
                 }
                 return;
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 update_home_job(&job_id, |job| {
                     job.state = RemoteCommandState::Failed;
                     job.error = Some("remote host detached while the command was running".into());
                 });
                 return;
             }
-            Err(_) => break,
+            },
+            cache_frame = async {
+                match cache_session.as_mut() {
+                    Some(session) => session.next_frame().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let (Some(session), Some(frame)) = (cache_session.as_mut(), cache_frame) {
+                    session.handle_frame(frame, &to_worker).await;
+                }
+            }
+            _ = tokio::time::sleep(remaining) => break,
         }
     }
 
@@ -902,9 +949,13 @@ pub(crate) async fn execute_remote_command_operation(
                     (base_revision, Some(snapshot), branch_hint)
                 }
             };
-            let cache_env = match cache {
-                RemoteCacheMode::None => BTreeMap::new(),
-                RemoteCacheMode::DurableSccache => durable_sccache_env()?,
+            let DurableSccacheConfig {
+                cache_env,
+                cache_relay_token,
+                cache_store,
+            } = match cache {
+                RemoteCacheMode::None => DurableSccacheConfig::default(),
+                RemoteCacheMode::DurableSccache => durable_sccache_config(project_root)?,
             };
             let spec = RemoteCommandSpec {
                 argv,
@@ -914,10 +965,20 @@ pub(crate) async fn execute_remote_command_operation(
                 source_id: None,
                 cache,
                 cache_env,
+                cache_relay_token,
                 require_clean: require_clean.unwrap_or(true),
                 timeout_s: timeout_s.unwrap_or(900),
             };
-            start_remote_command(host, spec, source, snapshot, branch_hint, caller).await
+            start_remote_command(
+                host,
+                spec,
+                cache_store,
+                source,
+                snapshot,
+                branch_hint,
+                caller,
+            )
+            .await
         }
         crate::mcp::RemoteCommandParams::Status { job_id } => {
             remote_command_status(&job_id, &caller)
@@ -933,6 +994,39 @@ pub(crate) async fn execute_remote_command_operation(
         crate::mcp::RemoteCommandParams::Cancel { job_id } => {
             cancel_remote_command(&job_id, &caller).await
         }
+    }
+}
+
+#[derive(Default)]
+struct DurableSccacheConfig {
+    cache_env: BTreeMap<String, String>,
+    cache_relay_token: Option<String>,
+    cache_store: Option<cache_relay::HomeCacheStore>,
+}
+
+fn durable_sccache_config(project_root: Option<&Path>) -> Result<DurableSccacheConfig, String> {
+    const TRANSPORT_ENV: &str = "INTENDANT_REMOTE_CACHE_TRANSPORT";
+    let transport = std::env::var(TRANSPORT_ENV)
+        .unwrap_or_else(|_| "home".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match transport.as_str() {
+        "home" | "attachment" => {
+            let project_root = project_root
+                .ok_or("durable_sccache through home requires a supervised project root")?;
+            let store = cache_relay::HomeCacheStore::for_project(project_root)?;
+            Ok(DurableSccacheConfig {
+                cache_env: BTreeMap::new(),
+                cache_relay_token: Some(uuid::Uuid::new_v4().simple().to_string()),
+                cache_store: Some(store),
+            })
+        }
+        "direct" => Ok(DurableSccacheConfig {
+            cache_env: durable_sccache_env()?,
+            cache_relay_token: None,
+            cache_store: None,
+        }),
+        _ => Err(format!("{TRANSPORT_ENV} must be home (default) or direct")),
     }
 }
 
@@ -994,6 +1088,7 @@ pub(crate) struct WorkerRemoteCommands {
     project_root: PathBuf,
     jobs: WorkerCancelMap,
     sources: source::WorkerSources,
+    cache_relay: cache_relay::WorkerCacheRelay,
     retired: tokio_util::sync::CancellationToken,
 }
 
@@ -1007,6 +1102,7 @@ impl WorkerRemoteCommands {
             project_root,
             jobs: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sources,
+            cache_relay: cache_relay::WorkerCacheRelay::default(),
             retired: tokio_util::sync::CancellationToken::new(),
         })
     }
@@ -1017,6 +1113,9 @@ impl WorkerRemoteCommands {
         out_tx: &mpsc::Sender<String>,
         host_id: &str,
     ) -> bool {
+        if self.cache_relay.serve_frame(frame).await {
+            return true;
+        }
         if self.sources.serve_frame(frame, out_tx, host_id).await {
             return true;
         }
@@ -1124,10 +1223,19 @@ impl WorkerRemoteCommands {
 
         let project_root = self.project_root.clone();
         let sources = self.sources.clone();
+        let cache_relay = self.cache_relay.clone();
         let jobs = Arc::clone(&self.jobs);
         let reply_tx = out_tx.clone();
         let reply_host = host_id.to_string();
         tokio::spawn(async move {
+            let cache_client = spec.cache_relay_token.as_ref().map(|token| {
+                cache_relay.client(
+                    id.clone(),
+                    token.clone(),
+                    reply_host.clone(),
+                    reply_tx.clone(),
+                )
+            });
             let source_lease = match spec.source_id.as_deref() {
                 Some(source_id) => {
                     let acquired = tokio::select! {
@@ -1164,8 +1272,11 @@ impl WorkerRemoteCommands {
                 }
                 None => None,
             };
-            let result = run_worker_command(&project_root, spec, source_lease, cancel_rx).await;
+            let result =
+                run_worker_command(&project_root, spec, source_lease, cache_client, cancel_rx)
+                    .await;
             send_worker_result(&reply_tx, &reply_host, &id, result).await;
+            cache_relay.cancel_job(&id).await;
             jobs.lock().await.remove(&id);
         });
     }
@@ -1205,6 +1316,7 @@ async fn run_worker_command(
     project_root: &Path,
     spec: RemoteCommandSpec,
     source_lease: Option<source::WorkerSourceLease>,
+    cache_client: Option<cache_relay::WorkerCacheClient>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> RemoteCommandResult {
     let started = Instant::now();
@@ -1272,9 +1384,17 @@ async fn run_worker_command(
     } else {
         None
     };
-    let cache_execution = match prepare_cache(&spec, selected_root).await {
-        Ok(cache) => cache,
-        Err(error) => return RemoteCommandResult::failed(error, started),
+    let cache_execution = tokio::select! {
+        cache = prepare_cache(&spec, selected_root, cache_client) => match cache {
+            Ok(cache) => cache,
+            Err(error) => return RemoteCommandResult::failed(error, started),
+        },
+        _ = &mut cancel_rx => {
+            return RemoteCommandResult::cancelled(
+                "command was cancelled while preparing its durable cache",
+                started,
+            )
+        }
     };
 
     let mut command = crate::platform::spawn_command(&spec.argv[0]);
@@ -1410,6 +1530,9 @@ struct CacheExecution {
     command_env: BTreeMap<String, String>,
     stats_env: BTreeMap<String, String>,
     before: CacheStats,
+    /// Keeps the loopback WebDAV relay alive through the final stats read.
+    sidecar: Option<cache_relay::WorkerCacheSidecar>,
+    stop_server: bool,
 }
 
 type CacheLockMap = HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>;
@@ -1454,20 +1577,64 @@ fn cache_lane_digest(config: &BTreeMap<String, String>, selected_root: &Path) ->
         .collect()
 }
 
+fn no_proxy_with_loopback(existing: Option<&str>) -> String {
+    let mut value = existing.unwrap_or_default().trim().to_string();
+    for host in ["127.0.0.1", "localhost"] {
+        let present = value
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(host));
+        if !present {
+            if !value.is_empty() {
+                value.push(',');
+            }
+            value.push_str(host);
+        }
+    }
+    value
+}
+
 async fn prepare_cache(
     spec: &RemoteCommandSpec,
     selected_root: &Path,
+    cache_client: Option<cache_relay::WorkerCacheClient>,
 ) -> Result<Option<CacheExecution>, String> {
     if spec.cache == RemoteCacheMode::None {
         return Ok(None);
     }
-    if spec.cache_env.is_empty() {
-        return Err(
-            "durable_sccache carried no dedicated backend configuration; refusing an implicit worker-local cache"
-                .to_string(),
-        );
-    }
-    let mut stats_env = spec.cache_env.clone();
+    let (mut stats_env, sidecar, stop_server) = match (
+        spec.cache_relay_token.as_ref(),
+        cache_client,
+    ) {
+        (Some(_), Some(client)) => {
+            let sidecar = cache_relay::WorkerCacheSidecar::start(client).await?;
+            let mut env = BTreeMap::new();
+            env.insert(
+                "SCCACHE_WEBDAV_ENDPOINT".to_string(),
+                sidecar.endpoint().to_string(),
+            );
+            // Codex Cloud injects HTTP(S) proxy variables. Without an
+            // explicit bypass, sccache sends even this loopback WebDAV URL
+            // through the egress proxy, which correctly rejects private
+            // targets. Preserve any caller/worker bypasses while making the
+            // attachment-local sidecar unconditionally direct.
+            for name in ["NO_PROXY", "no_proxy"] {
+                let inherited = spec
+                    .env
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok());
+                env.insert(name.to_string(), no_proxy_with_loopback(inherited.as_deref()));
+            }
+            (env, Some(sidecar), true)
+        }
+        (None, None) if !spec.cache_env.is_empty() => (spec.cache_env.clone(), None, false),
+        _ => {
+            return Err(
+                "durable_sccache carried no usable durable transport; refusing an implicit worker-local cache"
+                    .to_string(),
+            )
+        }
+    };
     let digest = cache_lane_digest(&stats_env, selected_root);
     let socket = std::env::temp_dir().join(format!("intendant-sccache-{}.sock", &digest[..24]));
     stats_env.insert(
@@ -1526,11 +1693,13 @@ async fn prepare_cache(
         command_env,
         stats_env,
         before,
+        sidecar,
+        stop_server,
     }))
 }
 
 async fn finish_cache(cache: CacheExecution) -> RemoteCacheReport {
-    match run_sccache_stats(&cache.stats_env).await {
+    let report = match run_sccache_stats(&cache.stats_env).await {
         Ok(after) => RemoteCacheReport {
             mode: RemoteCacheMode::DurableSccache,
             hits_delta: after.hits.saturating_sub(cache.before.hits),
@@ -1550,7 +1719,12 @@ async fn finish_cache(cache: CacheExecution) -> RemoteCacheReport {
             errors_delta: 0,
             stats_error: Some(format!("read final sccache stats: {error}")),
         },
+    };
+    if cache.stop_server {
+        let _ = run_sccache(&["--stop-server"], &cache.stats_env).await;
     }
+    drop(cache.sidecar);
+    report
 }
 
 async fn run_sccache(args: &[&str], env: &BTreeMap<String, String>) -> Result<String, String> {
@@ -1834,6 +2008,7 @@ mod tests {
             source_id: None,
             cache: RemoteCacheMode::None,
             cache_env: BTreeMap::new(),
+            cache_relay_token: None,
             require_clean: true,
             timeout_s: 300,
         }
@@ -1880,6 +2055,19 @@ mod tests {
         assert!(output[OUTPUT_LIMIT_BYTES - tail.len()..]
             .iter()
             .all(|byte| *byte == b't'));
+    }
+
+    #[test]
+    fn loopback_cache_proxy_bypass_preserves_existing_hosts() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("registry.example, localhost")),
+            "registry.example, localhost,127.0.0.1"
+        );
+        assert_eq!(
+            no_proxy_with_loopback(Some("127.0.0.1,LOCALHOST")),
+            "127.0.0.1,LOCALHOST"
+        );
+        assert_eq!(no_proxy_with_loopback(None), "127.0.0.1,localhost");
     }
 
     #[test]
@@ -1941,6 +2129,16 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("invalid dedicated cache"));
+
+        command.cache_env.clear();
+        command.cache_relay_token = Some("a".repeat(32));
+        command.validate().unwrap();
+        assert!(!format!("{command:?}").contains(&"a".repeat(32)));
+        command.cache_env = BTreeMap::from([("SCCACHE_BUCKET".into(), "compiler-cache".into())]);
+        assert!(command
+            .validate()
+            .unwrap_err()
+            .contains("exactly one durable cache transport"));
     }
 
     #[test]
@@ -2034,12 +2232,14 @@ mod tests {
             source_id: None,
             cache: RemoteCacheMode::None,
             cache_env: BTreeMap::new(),
+            cache_relay_token: None,
             require_clean: true,
             timeout_s: 10,
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, command.clone(), None, cancel_rx).await;
+        let result =
+            run_worker_command(&project_root, command.clone(), None, None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Succeeded, "{result:#?}");
         assert_eq!(result.stdout.trim(), revision);
@@ -2049,7 +2249,7 @@ mod tests {
         let mut wrong_revision = command.clone();
         wrong_revision.expected_revision = "deadbee".into();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, wrong_revision, None, cancel_rx).await;
+        let result = run_worker_command(&project_root, wrong_revision, None, None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result
@@ -2059,7 +2259,7 @@ mod tests {
 
         std::fs::write(repo.path().join("uncommitted.txt"), "not selected\n").unwrap();
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let result = run_worker_command(&project_root, command, None, cancel_rx).await;
+        let result = run_worker_command(&project_root, command, None, None, cancel_rx).await;
         drop(cancel_tx);
         assert_eq!(result.state, RemoteCommandState::Failed);
         assert!(result

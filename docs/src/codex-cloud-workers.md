@@ -47,6 +47,24 @@ observation does not establish an eviction timeout, but it proves the loss
 mode is real: **an external build cache is a requirement for reuse that must
 survive replacement, not an optimization.**
 
+### Compute capacity is a lease property
+
+Do not treat the environment name as a machine size. OpenAI's published Cloud
+environment contract describes isolated containers and setup caching, but does
+not specify a fixed CPU/RAM allocation or expose a machine-size selector.
+Measured capacity has varied between tasks. Intendant therefore records the
+worker's current effective parallelism in every attachment fingerprint; that
+number is evidence about this lease, not a promise about the next one.
+
+For example, the 2026-08-01 acceptance worker exposed CPUs `0-2`, so Linux
+`nproc` reported 3, while its cgroup `cpu.max` was `200000 100000`: a hard
+quota of two CPU-core equivalents. Rust's quota-aware
+`available_parallelism()` and the Intendant fingerprint correctly reported 2.
+Use the fingerprint value for scheduling and performance expectations. Remote
+execution can still be worthwhile when its purpose is to remove load from
+home, but it must not be advertised as faster than a particular local machine
+without a measurement from the attached lease.
+
 Consequences Intendant encodes:
 
 - **An environment is a template, not a machine.** New tasks — sequential or
@@ -455,25 +473,41 @@ The contract is intentionally stricter than an interactive terminal:
   snapshot. Commands using one snapshot are serialized. A command that
   mutates selected source invalidates that prepared workspace; ignored build
   outputs such as `target/` remain warm and reusable.
-- `cache: "durable_sccache"` is explicit and rejects a local backend at
-  setup. Home maps only
-  dedicated `INTENDANT_REMOTE_CACHE_` settings for sccache and its documented
-  backend credential families (`SCCACHE_*`, `AWS_*`, `ACTIONS_*`,
-  `ALIBABA_CLOUD_*`, and `TENCENTCLOUD_*`) into the authenticated command,
-  requires an
-  external backend (a task-local `SCCACHE_DIR` is refused), configures
-  `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, and a stable
-  `SCCACHE_BASEDIRS`, then reports hit/miss/write/error deltas. Backend
-  configuration is inherited by the requested build/test child because a
-  sccache client automatically restarts a missing server; carrying the same
-  configuration prevents that restart from quietly selecting the default
-  local-disk cache. Startup also rejects a server whose stats identify a
-  local-disk backend. The default is `cache: "none"`. The Cloud environment
-  must provide sccache 0.14 or newer; explicit durable-cache jobs fail before
-  the requested command when it is absent or the server/backend cannot start.
-  During a running build, sccache can still compile uncached after a backend
-  read/write error; the result reports those error counters rather than
-  pretending every compilation was cached.
+- `cache: "durable_sccache"` is explicit. By default, the worker starts a
+  loopback-only WebDAV sidecar and carries cache objects over the existing
+  authenticated attachment. Home stores them in an owner-private,
+  per-repository namespace under
+  `$INTENDANT_HOME/remote-cache/sccache-v1/`; the default ceiling is 20 GiB
+  with oldest-file eviction. Each command receives an opaque relay capability
+  valid only for that task and job. Home accepts no general filesystem
+  operation from it: keys must have sccache's content-addressed shape, objects
+  are capped at 128 MiB, job writes at 8 GiB, chunks are ordered and
+  digest-checked, and incomplete staging files are discarded. Cache frames
+  use a private bounded route rather than the worker's general reply
+  broadcast. Thus a worker gets durable cache reuse without home credentials
+  or general authority on home. `INTENDANT_REMOTE_CACHE_HOME_DIR` may select
+  another absolute home-side directory, and
+  `INTENDANT_REMOTE_CACHE_MAX_BYTES` may set a 256 MiB–1 TiB byte ceiling.
+  Intendant configures `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, and a
+  stable `SCCACHE_BASEDIRS`, then reports hit/miss/write/error deltas. The
+  loopback sidecar is automatically added to both `NO_PROXY` spellings so a
+  Cloud egress proxy cannot intercept its worker-local HTTP traffic. The
+  default remains `cache: "none"`. The Cloud environment must provide
+  sccache 0.14 or newer; an explicit durable-cache job fails before the
+  requested command when sccache or its relay cannot start. During a running
+  build, sccache can still compile uncached after a backend read/write error;
+  the result reports those error counters rather than pretending every
+  compilation was cached.
+- Deployments that deliberately want the worker to contact an external
+  sccache backend itself can set `INTENDANT_REMOTE_CACHE_TRANSPORT=direct`.
+  Only in that mode does home map dedicated `INTENDANT_REMOTE_CACHE_`
+  variables for sccache and its documented credential families (`SCCACHE_*`,
+  `AWS_*`, `ACTIONS_*`, `ALIBABA_CLOUD_*`, and `TENCENTCLOUD_*`) into the
+  authenticated command. Direct mode requires an external backend, refuses
+  task-local `SCCACHE_DIR`, and carries the same configuration into the build
+  so an automatic sccache-server restart cannot silently fall back to local
+  disk. Use it only when the Cloud egress path is known to preserve that
+  backend's requests byte-for-byte.
 - Stdout and stderr are each bounded to 128 KiB. On overflow the result keeps
   the first 32 KiB and the latest tail and marks that stream truncated.
   Timeout, cancellation, and attachment loss terminate the owned process
@@ -649,9 +683,10 @@ an ephemeral hosted CI runner:
 
 - Keep repeated commands on the same attached task while it remains warm.
 - Put stable toolchain/package preparation in the environment setup cache.
-- Use `cache: "durable_sccache"` with a separately scoped external backend
-  when cold replacement performance matters. A task-local sccache directory
-  is refused because it is lost with the same worker as `target/`.
+- Use `cache: "durable_sccache"` when cold replacement performance matters.
+  The default attachment relay persists objects on home without exposing
+  object-store credentials to the worker. A task-local sccache directory is
+  never used because it is lost with the same worker as `target/`.
 - Do not promise a fully warm Rust build from sccache alone. Existing
   cross-worktree measurements show it can repopulate identical dependency
   outputs, but local incremental workspace crates, build scripts,
@@ -659,19 +694,18 @@ an ephemeral hosted CI runner:
   fresh target tree. Correctness never depends on cache hits, and the job
   result exposes the measured cache deltas instead of claiming warmth.
 
-The daemon-side prefixes are a custody boundary, not new sccache option
-names: for example, `INTENDANT_REMOTE_CACHE_SCCACHE_BUCKET` becomes
-`SCCACHE_BUCKET`, and `INTENDANT_REMOTE_CACHE_AWS_ACCESS_KEY_ID` becomes
-`AWS_ACCESS_KEY_ID` only inside the authenticated remote command. Consult
-sccache's upstream [configuration reference](https://github.com/mozilla/sccache/blob/main/docs/Configuration.md)
+For optional direct transport, the daemon-side prefixes are a custody
+boundary, not new sccache option names: for example,
+`INTENDANT_REMOTE_CACHE_SCCACHE_BUCKET` becomes `SCCACHE_BUCKET`, and
+`INTENDANT_REMOTE_CACHE_AWS_ACCESS_KEY_ID` becomes `AWS_ACCESS_KEY_ID` only
+inside the authenticated remote command. The worker container is a
+shell-authority boundary, not a credential enclave: another same-UID process
+could inspect those direct-mode values. Use only a cache-only principal
+restricted to one cache namespace, never a general AWS/account credential or
+any daemon/provider credential. Consult sccache's upstream
+[configuration reference](https://github.com/mozilla/sccache/blob/main/docs/Configuration.md)
 for backend-specific variables and its [Rust caveats](https://github.com/mozilla/sccache/blob/main/docs/Rust.md)
 for what can and cannot be cached.
-
-The worker container is still a shell-authority boundary, not a credential
-enclave: the requested command inherits the cache configuration, and another
-same-UID process could inspect it too. Use a cache-only principal restricted
-to the one cache namespace, never a general AWS/account credential or any
-daemon/provider credential.
 
 The practical split is therefore: Linux workers run platform-neutral
 `cargo check`, tests, clippy, code generation, and other heavy computation;
