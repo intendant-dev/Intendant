@@ -1251,11 +1251,21 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
 
     // 2. Redeem the token for a certificate at the public enroll route.
     let enroll_url = enrollment_url_from_home(&home)?;
-    let client = crate::peer::transport::tls_client::reqwest_client(
-        std::time::Duration::from_secs(20),
-        &pinned,
-        None,
-    )
+    let client = if tls_terminated_proxy {
+        // Managed Cloud egress can terminate TLS under a private CA that is
+        // installed in the worker's native trust store. This mode already
+        // makes that proxy an explicit trust decision; use the same roots
+        // for enrollment that the WebSocket leg uses below.
+        crate::peer::transport::tls_client::reqwest_client_with_native_roots(
+            std::time::Duration::from_secs(20),
+        )
+    } else {
+        crate::peer::transport::tls_client::reqwest_client(
+            std::time::Duration::from_secs(20),
+            &pinned,
+            None,
+        )
+    }
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
     let enrollment_deadline =

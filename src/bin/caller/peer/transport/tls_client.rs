@@ -78,6 +78,21 @@ pub fn reqwest_client(
         .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))
 }
 
+/// Build a reqwest client that trusts the host's native certificate roots.
+///
+/// This is distinct from reqwest's compiled WebPKI-root default: managed
+/// execution environments can install a private egress-proxy CA in their
+/// native trust store. Callers must opt in deliberately when that proxy is
+/// part of the selected transport trust boundary.
+pub fn reqwest_client_with_native_roots(timeout: Duration) -> Result<reqwest::Client, PeerError> {
+    let config = native_roots_client_config(None)?;
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .use_preconfigured_tls(config)
+        .build()
+        .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))
+}
+
 /// Build a rustls client config for peer WebSocket/HTTP clients.
 ///
 /// Returns `None` when neither pinning nor client-auth is required, allowing
@@ -107,20 +122,29 @@ pub fn rustls_client_config(
         return Ok(Some(config));
     }
 
-    let Some((cert_chain, key)) = identity else {
+    let Some(identity) = identity else {
         return Ok(None);
     };
 
+    Ok(Some(native_roots_client_config(Some(identity))?))
+}
+
+fn native_roots_client_config(
+    identity: Option<crate::web_tls::RustlsIdentity>,
+) -> Result<rustls::ClientConfig, PeerError> {
     let roots = crate::web_tls::load_native_root_store()
         .map_err(|e| PeerError::Auth(format!("load native TLS roots: {e}")))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(rustls::DEFAULT_VERSIONS)
         .map_err(|e| PeerError::Auth(format!("peer TLS protocol setup failed: {e}")))?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(cert_chain, key)
-        .map_err(|e| PeerError::Auth(format!("peer TLS client identity setup failed: {e}")))?;
-    Ok(Some(config))
+        .with_root_certificates(roots);
+    match identity {
+        Some((cert_chain, key)) => builder
+            .with_client_auth_cert(cert_chain, key)
+            .map_err(|e| PeerError::Auth(format!("peer TLS client identity setup failed: {e}"))),
+        None => Ok(builder.with_no_client_auth()),
+    }
 }
 
 fn load_client_identity(
@@ -451,6 +475,11 @@ mod tests {
     fn rustls_client_config_none_without_pin_or_identity() {
         let config = rustls_client_config(&[], None, false).unwrap();
         assert!(config.is_none());
+    }
+
+    #[test]
+    fn native_roots_reqwest_client_builds_without_an_identity() {
+        reqwest_client_with_native_roots(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
