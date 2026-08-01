@@ -2133,6 +2133,7 @@ response omits the header.
 | POST | `/api/peers/{peer_id}/task` | federation (per method/path) | own origin | bounded | Delegate a task to a connected peer |
 | POST | `/api/peers/{peer_id}/approval` | federation (per method/path) | own origin | bounded | Resolve a peer-forwarded approval request |
 | POST | `/api/peers/{peer_id}/session-control` | federation (per method/path) | own origin | bounded | Forward a session-lifecycle action to a connected peer's session |
+| GET | `/api/peers/{peer_id}/session-detail` | federation (per method/path) | own origin | bounded | Fetch a peer session's transcript page over the federation HTTP lane (peer-side IAM governs) |
 | POST | `/api/peers/{peer_id}/webrtc` | federation (per method/path) | own origin | bounded | Relay display WebRTC signaling to a connected peer |
 | POST | `/api/peers/{peer_id}/file-transfer-webrtc` | federation (per method/path) | own origin | bounded | Relay file-transfer WebRTC signaling to a connected peer |
 | POST | `/api/peers/{peer_id}/dashboard-control-webrtc` | federation (per method/path) | own origin | bounded | Relay dashboard-control WebRTC signaling to a connected peer |

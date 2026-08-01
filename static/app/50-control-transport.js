@@ -1694,6 +1694,12 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_peer_message':
     case 'api_peer_task':
     case 'api_peer_approval':
+    // Session-control and session-detail wait on a remote daemon's
+    // ack/fetch exactly like their siblings above — session-control
+    // previously fell through to the 5 s default and timed out on slow
+    // federation links (RC-C2 fix).
+    case 'api_peer_session_control':
+    case 'api_peer_session_detail':
     case 'api_peer_add':
     case 'api_peer_pairing_join':
     case 'api_peer_pairing_request_access':

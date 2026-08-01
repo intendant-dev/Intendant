@@ -235,6 +235,11 @@ pub enum UiCommand {
         id: String,
         command: String,
         category: String,
+        /// The peer-side session the approval belongs to. Additive
+        /// (RC-C2): absent from peers predating the fold's session
+        /// attribution — JS attributes those to the peer daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// A peer's approval got resolved (locally by us via
     /// /api/peers/{id}/approval, by the peer's own auto-approval, or
@@ -3627,11 +3632,13 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             let id = req["request_id"].as_str().unwrap_or("").to_string();
             let command = req["preview"].as_str().unwrap_or("").to_string();
             let category = req["category"].as_str().unwrap_or("").to_string();
+            let session_id = req["session_id"].as_str().map(str::to_string);
             vec![UiCommand::PeerApprovalRequested {
                 host_id: host,
                 id,
                 command,
                 category,
+                session_id,
             }]
         }
 
@@ -6608,6 +6615,7 @@ mod tests {
                     "category": "command",
                     "preview": "rm -rf /tmp/foo",
                     "auto_resolvable": false,
+                    "session_id": "sess-beta-1",
                 },
             },
         });
@@ -6618,14 +6626,17 @@ mod tests {
                 id,
                 command,
                 category,
-            } => Some((host_id, id, command, category)),
+                session_id,
+            } => Some((host_id, id, command, category, session_id)),
             _ => None,
         });
-        let (host_id, id, command, category) = req.expect("PeerApprovalRequested emitted");
+        let (host_id, id, command, category, session_id) =
+            req.expect("PeerApprovalRequested emitted");
         assert_eq!(host_id, "intendant:beta");
         assert_eq!(id, "42");
         assert_eq!(command, "rm -rf /tmp/foo");
         assert_eq!(category, "command");
+        assert_eq!(session_id.as_deref(), Some("sess-beta-1"));
     }
 
     /// `approval_resolved` renders as a PeerApprovalResolved that JS

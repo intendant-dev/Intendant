@@ -2675,6 +2675,20 @@ pub(crate) static ROUTES: &[Route] = &[
     )
     .with_tunnel(tunnel_method("api_peer_session_control")),
     federation_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("session-detail"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Fetch a peer session's transcript page over the federation HTTP lane (peer-side IAM governs)",
+    )
+    .with_tunnel(tunnel_method("api_peer_session_detail")),
+    federation_route(
         RouteMethod::Post,
         PathPattern::Segments(
             "/api/peers",
@@ -3880,6 +3894,18 @@ mod tests {
                 "api_peer_approval",
                 "POST",
                 "/api/peers/{peer_id}/approval",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_session_control",
+                "POST",
+                "/api/peers/{peer_id}/session-control",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_session_detail",
+                "GET",
+                "/api/peers/{peer_id}/session-detail",
                 Op::PeerUse,
             ),
             (

@@ -265,6 +265,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
   api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
   api_peer_session_control: { verb: 'POST', path: '/api/peers/{peer_id}/session-control' },
+  api_peer_session_detail: { verb: 'GET', path: '/api/peers/{peer_id}/session-detail', query: ['session_id', 'source', 'limit', 'before'] },
   api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
   api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
   api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },

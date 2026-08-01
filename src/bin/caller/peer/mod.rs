@@ -98,6 +98,7 @@ pub mod coordinator;
 pub mod event;
 pub mod handle;
 pub use intendant_core::peer_id as id;
+pub mod http_api;
 pub mod log_writer;
 pub mod mcp_http;
 pub mod ops;
