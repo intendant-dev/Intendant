@@ -97,10 +97,21 @@ fn start_mode_from_body(body_text: &str) -> Result<String, String> {
     }
 }
 
-/// Whether a status payload carries `reload_candidates`: exactly at
-/// `success`, the moment the Vault card offers the reload chips.
+/// Whether a status payload carries `reload_candidates`: at ceremony
+/// `success` (the moment the Vault card offers the reload chips), and
+/// whenever the credential watch's `out_of_band` block rides the payload
+/// with a reload offer — the SAME chips for a change made directly at
+/// the backend CLI (a sign-out observation carries no offer: reloading
+/// onto an empty store would be a trap, not a remedy).
 pub(crate) fn status_wants_reload_candidates(status: &serde_json::Value) -> bool {
-    status.get("phase").and_then(|v| v.as_str()) == Some("success")
+    if status.get("phase").and_then(|v| v.as_str()) == Some("success") {
+        return true;
+    }
+    status
+        .get("out_of_band")
+        .and_then(|block| block.get("reload_offer"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
 }
 
 /// Merge the live registry's reload candidates into a status payload —
@@ -115,18 +126,27 @@ pub(crate) fn status_with_reload_candidates(
     status
 }
 
-/// The provider's auth-status payload; at `success` it carries
-/// `reload_candidates` derived from the LIVE session registry — the
-/// exact candidate set `route_reload_credentials` accepts, replacing the
-/// disk-catalog filtering that listed dead pre-restart sessions as live
-/// and aged parked ones off. Shared by all three providers' status
-/// routes and their tunnel twins.
+/// The provider's auth-status payload; at `success` — and whenever the
+/// out-of-band credential watch has an unsuperseded observation — it
+/// carries `reload_candidates` derived from the LIVE session registry:
+/// the exact candidate set `route_reload_credentials` accepts, replacing
+/// the disk-catalog filtering that listed dead pre-restart sessions as
+/// live and aged parked ones off. The watch's `out_of_band` block and
+/// its `credential_watch` applicability block ride the same body, so the
+/// Vault card renders one atomic truth. Shared by all three providers'
+/// status routes and their tunnel twins.
 pub(crate) async fn auth_status_payload(provider: Provider) -> serde_json::Value {
-    let status = auth_ceremony::manager().status_value_for(provider);
+    let mut status = auth_ceremony::manager().status_value_for(provider);
+    let source = provider.agent_backend().as_short_str();
+    if let Some(observation) = crate::credential_watch::observation_for(source) {
+        if let Some(block) = crate::credential_watch::out_of_band_block(&status, &observation) {
+            status["out_of_band"] = block;
+        }
+    }
+    status["credential_watch"] = crate::credential_watch::applicability_block(provider);
     if !status_wants_reload_candidates(&status) {
         return status;
     }
-    let source = provider.agent_backend().as_short_str();
     let candidates = match crate::session_supervisor::published_live_session_registry() {
         Some(registry) => registry.reload_candidates_for_source(source).await,
         // No supervisor ⇒ no supervised sessions ⇒ nothing reloadable:

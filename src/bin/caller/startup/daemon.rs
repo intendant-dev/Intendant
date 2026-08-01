@@ -162,6 +162,11 @@ pub(crate) async fn run_daemon(
     // hub's credential-era boundary); same publish-from-startup law as
     // the registries above so tests' manager use stays silent.
     crate::auth_ceremony::publish_ceremony_bus(bus.clone());
+    // Out-of-band credential changes announce on the same era boundary:
+    // a slow stat poll over the backend CLIs' own auth artifacts, one
+    // bounded identity probe per change, and the ceremony's reload
+    // surface + one info notification on a confirmed switch.
+    crate::credential_watch::spawn_credential_watch(bus.clone(), project_root.clone());
     // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
     // detection over bus declarations ∪ observed git status (the same
     // registry the vitals prober probes) ∪ open-PR file sets; publishes

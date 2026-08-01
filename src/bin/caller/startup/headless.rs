@@ -506,6 +506,9 @@ pub(crate) async fn run_headless_mode(
     // credential-era fold here too (the dashboard-on headless shape
     // serves the same Vault sign-in routes).
     crate::auth_ceremony::publish_ceremony_bus(bus.clone());
+    // And the out-of-band credential watch, for the same reason: this
+    // shape serves the auth-status routes that carry its observations.
+    crate::credential_watch::spawn_credential_watch(bus.clone(), Some(project.root.clone()));
     // Restored sessions, mirroring daemon boot: with the dashboard on,
     // the store's idle session windows keep their git/health chips here
     // too, and their vitals hydrate from disk (this shape falls through

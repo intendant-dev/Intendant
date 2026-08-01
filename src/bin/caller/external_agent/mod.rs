@@ -325,8 +325,10 @@ fn external_child_env_allowed(name: &str, passthrough: &HashSet<String>) -> bool
 /// Call this BEFORE a spawn site's deliberate `.env()` injections:
 /// explicit sets made after `env_clear()` survive it (the `INTENDANT_*`
 /// bootstrap env, leased `CODEX_HOME`/`CLAUDE_CONFIG_DIR`/`KIMI_CODE_HOME`/
-/// `PI_CODING_AGENT_DIR`, the Linux GUI env, trace roots).
-pub(super) fn apply_external_child_env_policy(command: &mut tokio::process::Command) {
+/// `PI_CODING_AGENT_DIR`, the Linux GUI env, trace roots). `pub(crate)`
+/// for the credential watch's identity probes, which run the same
+/// external CLIs and must not hand them the daemon's provider keys.
+pub(crate) fn apply_external_child_env_policy(command: &mut tokio::process::Command) {
     let passthrough = intendant_core::env_scrub::env_passthrough_set(
         std::env::var(intendant_core::env_scrub::ENV_PASSTHROUGH_VAR)
             .ok()

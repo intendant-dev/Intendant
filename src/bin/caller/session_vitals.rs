@@ -692,6 +692,17 @@ pub(crate) struct SessionAccountMembership {
     pub(crate) account: AccountEra,
 }
 
+/// Whether an era label is a minted nonce (`era-N`) rather than an
+/// account label — the shape [`SessionVitalsHub::observe_backend_account`]
+/// mints for label-less sign-ins. The credential watch skips these when
+/// seeding its persisted-era baseline: a nonce names no account, so
+/// nothing can truthfully conflict with it.
+pub(crate) fn is_minted_era_label(label: &str) -> bool {
+    label
+        .strip_prefix("era-")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The per-source current-era registry (see
 /// [`SessionVitalsHub::observe_backend_account`]).
 #[derive(Debug, Default)]
@@ -3652,6 +3663,27 @@ mod tests {
             .get(session_id)
             .map(|vitals| vitals.limits.clone())
             .unwrap_or_default()
+    }
+
+    /// The minted-nonce matcher recognizes exactly the shape
+    /// `observe_backend_account` mints for label-less sign-ins — the
+    /// credential watch relies on this to keep nonces out of its
+    /// persisted-era baseline.
+    #[test]
+    fn minted_era_label_matcher_pins_the_mint_format() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus);
+        hub.observe_backend_account("claude-code", None);
+        let minted = hub
+            .current_era("claude-code")
+            .expect("label-less sign-in mints an era");
+        assert!(
+            is_minted_era_label(&minted),
+            "the matcher must recognize the mint shape: {minted}"
+        );
+        for not_minted in ["a@x", "era-", "era-x", "era-1x", "owner@era-2.com", ""] {
+            assert!(!is_minted_era_label(not_minted), "{not_minted}");
+        }
     }
 
     /// THE COMMISSIONED KEYING PIN (2026-07-28): the limits fold is keyed
