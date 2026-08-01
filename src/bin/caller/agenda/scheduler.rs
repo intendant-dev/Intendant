@@ -2425,8 +2425,7 @@ mod tests {
         // Honest times: each row records the instant it was actually
         // written — the shared due instant stays in `due_ms`, and no
         // staggered row is backdated to it.
-        let journal_text =
-            std::fs::read_to_string(handle.dir().join("occurrences.jsonl")).unwrap();
+        let journal_text = std::fs::read_to_string(handle.dir().join("occurrences.jsonl")).unwrap();
         let mut prepared_rows = 0;
         for row in journal_text
             .lines()
