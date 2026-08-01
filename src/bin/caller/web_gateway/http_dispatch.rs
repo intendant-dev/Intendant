@@ -1320,6 +1320,7 @@ pub(crate) async fn serve_http_request(
                 return handle_daemon_update_lane(
                     stream,
                     false,
+                    route_body,
                     mcp_server,
                     route.cors,
                     fleet_cors_origin.as_deref(),
@@ -1330,6 +1331,7 @@ pub(crate) async fn serve_http_request(
                 return handle_daemon_update_lane(
                     stream,
                     true,
+                    route_body,
                     mcp_server,
                     route.cors,
                     fleet_cors_origin.as_deref(),

@@ -25574,6 +25574,31 @@ html.ui-v2 .ag2-inspector-backdrop { display: none; }
     background: rgba(4, 5, 8, 0.45);
   }
 }
+/* Graph theater-mode fullscreen (ag2-graph-fs on <html>, managed by the
+   graph fragment): the fullscreen panel is fixed at z 600, so the
+   inspector lifts above it as a floating card — full functionality over
+   the constellation, any viewport width. Backdrop stays off so the map
+   remains interactive beside the card. */
+html.ui-v2.ag2-graph-fs .ag2-inspector {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: 0;
+  z-index: 620;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+  transition: none;
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector.open {
+  width: min(478px, calc(100vw - 40px));
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector-backdrop {
+  display: none !important;
+}
+
 html.ui-v2 .ag2-insp-col {
   width: 100%;
   min-width: 280px;
@@ -27332,6 +27357,74 @@ html.ui-v2 .update-lane-btn {
 html.ui-v2 .update-lane-btn:disabled {
   opacity: 0.55;
   cursor: default;
+}
+
+/* ── update channels: the front door's two sections, the dev shortlog,
+   the Advanced fold, and the swap step ui2-handover renders in. ── */
+html.ui-v2 .update-lane-channel {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.4));
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+}
+html.ui-v2 .update-lane-channel-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-shortlog {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  border-radius: 6px;
+  background: var(--surface0, rgba(24, 24, 30, 0.9));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted, #9aa4b2);
+}
+html.ui-v2 .update-lane-advanced {
+  margin-top: 8px;
+}
+html.ui-v2 .update-lane-advanced > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-swap:not(:empty) {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+}
+html.ui-v2 .update-lane-swap-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-swap .handover-update-actions {
+  margin-top: 6px;
+}
+html.ui-v2 .update-lane-footer {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-update-panel-link {
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent, #62a0ea);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  align-self: flex-start;
 }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
@@ -38026,7 +38119,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '78439b374791dd19';
+const INTENDANT_APP_BUILD = '64c3da45d6ada8d4';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -99132,7 +99225,9 @@ let agendaGraphCanvas = null;
 let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
-let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+let agendaGraphCam = {
+  yaw: 0.6, pitch: -0.34, auto: true, zoom: 1, panX: 0, panY: 0,
+};
 // Projection state: 'all' (whole non-retired ledger), 'hubs' (the hub
 // overview — automatic past the node cap, or chosen), 'focus' (one
 // hub's placed subtree). The render pass decides the projection from
@@ -99177,12 +99272,25 @@ function agendaGraphSetFullscreen(on) {
   agendaRenderTab();
 }
 
+// While graph-fullscreen is active a marker class on <html> lifts the
+// agenda inspector above the fixed panel (see ui2-agenda-inspector.css)
+// so node-click keeps its full behavior — inspector over constellation.
+function agendaGraphSyncFsMarker() {
+  document.documentElement.classList.toggle('ag2-graph-fs', agendaGraphFullscreen);
+}
+
 function agendaGraphEnsureEsc() {
   if (agendaGraphEscHook) return;
   agendaGraphEscHook = (e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented) {
-      agendaGraphSetFullscreen(false);
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    // Polite ordering: an open inspector consumes the first ESC;
+    // fullscreen exits on the next.
+    const insp = document.getElementById('ag2-inspector');
+    if (insp && insp.classList.contains('open')) {
+      agendaCloseInspector();
+      return;
     }
+    agendaGraphSetFullscreen(false);
   };
   document.addEventListener('keydown', agendaGraphEscHook);
 }
@@ -99293,6 +99401,7 @@ function agendaGraphRenderLens(host) {
 function agendaGraphWireChrome(host) {
   const panel = host.querySelector('.ag2-graph-panel');
   if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  agendaGraphSyncFsMarker();
   if (agendaGraphFullscreen) agendaGraphEnsureEsc();
   else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
@@ -99305,7 +99414,7 @@ function agendaGraphWireChrome(host) {
           ? (agendaGraphTerritory
             ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
             : 'focused subtree — double-click empty space to clear')
-          : 'drag to orbit · click a node to open it · double-click a hub to focus');
+          : 'drag to orbit · wheel to zoom · shift-drag to pan · click a node to open it · double-click a hub to focus');
   }
   const inHubs = agendaGraphProjection === 'hubs';
   const chips = host.querySelectorAll('.ag2-graph-projchip');
@@ -99433,9 +99542,15 @@ function agendaGraphBindCanvas(canvas) {
       const nx = e.clientX - rect.left;
       const ny = e.clientY - rect.top;
       if (m.down) {
-        agendaGraphCam.yaw += (nx - m.x) * 0.005;
-        agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
-          agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        if (e.shiftKey) {
+          // Shift-drag pans in screen space (zoom's natural partner).
+          agendaGraphCam.panX += nx - m.x;
+          agendaGraphCam.panY += ny - m.y;
+        } else {
+          agendaGraphCam.yaw += (nx - m.x) * 0.005;
+          agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
+            agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        }
         m.moved += Math.abs(nx - m.x) + Math.abs(ny - m.y);
         agendaGraphCam.auto = false;
       }
@@ -99471,14 +99586,42 @@ function agendaGraphBindCanvas(canvas) {
     },
     dbl: () => {
       // Double-click a hub to focus its subtree; double-click empty
-      // space to clear an active focus.
+      // space to reset a zoom/pan first, then to clear an active focus.
       if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
         agendaGraphFocus = agendaGraphHover;
         agendaRenderTab();
-      } else if (!agendaGraphHover && agendaGraphFocus) {
-        agendaGraphFocus = null;
-        agendaRenderTab();
+      } else if (!agendaGraphHover) {
+        const cam = agendaGraphCam;
+        if (cam.zoom !== 1 || cam.panX || cam.panY) {
+          cam.zoom = 1;
+          cam.panX = 0;
+          cam.panY = 0;
+        } else if (agendaGraphFocus) {
+          agendaGraphFocus = null;
+          agendaRenderTab();
+        }
       }
+    },
+    wheel: (e) => {
+      // Wheel / trackpad-pinch (ctrl-wheel) zoom, anchored to the
+      // cursor: the world point under the pointer stays put via the
+      // screen-space pan. preventDefault keeps the page from scrolling
+      // — scoped to the canvas, removed on unbind.
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const cam = agendaGraphCam;
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0022));
+      const next = Math.max(0.35, Math.min(3.5, cam.zoom * factor));
+      const ratio = next / cam.zoom;
+      const ax = rect.width / 2;
+      const ay = rect.height / 2 + 8;
+      cam.panX = mx - ax - (mx - ax - cam.panX) * ratio;
+      cam.panY = my - ay - (my - ay - cam.panY) * ratio;
+      cam.zoom = next;
+      cam.auto = false;
+      agendaGraphArmAutoResume();
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -99495,6 +99638,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
   canvas.addEventListener('dblclick', hooks.dbl);
+  canvas.addEventListener('wheel', hooks.wheel, { passive: false });
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -99507,6 +99651,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
     canvas.removeEventListener('dblclick', hooks.dbl);
+    canvas.removeEventListener('wheel', hooks.wheel);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -99577,6 +99722,7 @@ function agendaGraphTeardown() {
   }
   agendaGraphUnbindCanvas();
   agendaGraphRemoveEsc();
+  document.documentElement.classList.remove('ag2-graph-fs');
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
@@ -100009,7 +100155,13 @@ function agendaGraphDraw(ts) {
     const ry = p[1] * cp - rz * sp;
     rz = p[1] * sp + rz * cp;
     const s = focal / (focal + rz + 40);
-    return { x: cx + rx * s * 1.35, y: cyy + ry * s * 1.35, s, z: rz };
+    const k = s * 1.35 * cam.zoom;
+    return {
+      x: cx + cam.panX + rx * k,
+      y: cyy + cam.panY + ry * k,
+      s: s * cam.zoom,
+      z: rz,
+    };
   };
   const nodes = agendaGraphNodes;
   const pts = nodes.map((n) => project(n.p));
@@ -100231,6 +100383,9 @@ function agendaGraphDraw(ts) {
     : agendaGraphMode === 'attention'
       ? ` · attention — ${agendaGraphAttnCount} need you`
       : ` · ${agendaGraphMode}`;
+  const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
+    ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
+    : '';
   {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
@@ -100249,7 +100404,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + modeBadge + terrBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge + zoomBadge, 14, 64);
   }
 }
 
@@ -102745,6 +102900,38 @@ async function memoryProposeFromForm(button) {
     if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
   };
 
+  // The update panel (ui2-update-lane) composes this SAME swap consumer
+  // instead of duplicating it: it hands over a mount element, and every
+  // chip-state render refills it — one implementation of the
+  // supervised / relay / hand-off logic, two surfaces. The mount is
+  // replaced wholesale per panel render; a disconnected mount is
+  // silently dropped.
+  let panelSwapMount = null;
+  function fillPanelSwapSection() {
+    const mount = panelSwapMount;
+    if (!mount) return;
+    if (!mount.isConnected) { panelSwapMount = null; return; }
+    mount.textContent = '';
+    const body = lastHandoverBody;
+    const update = body && body.update;
+    if (!update || body.draining) return;
+    const disk = update.on_disk;
+    const running = update.running || {};
+    const head = document.createElement('div');
+    head.className = 'update-lane-swap-head';
+    head.textContent = disk
+      ? `New build on disk: commit ${disk.git_sha || '?'} (${disk.version || '?'}, built ${disk.built_at || '?'}) — running ${running.git_sha || '?'}.`
+      : `The binary on disk changed but its provenance is unreadable${update.probe_error ? ` (${update.probe_error})` : ''}.`;
+    mount.appendChild(head);
+    if (update.honesty) {
+      const honesty = document.createElement('div');
+      honesty.className = 'handover-update-honesty';
+      honesty.textContent = update.honesty;
+      mount.appendChild(honesty);
+    }
+    mount.appendChild(handoverUpdateActions(body, disk));
+  }
+
   // The co-homed daemon a hand-off would drain toward: live, not this
   // boot, not already on its way out. Prefer one whose build matches the
   // on-disk update.
@@ -102844,6 +103031,7 @@ async function memoryProposeFromForm(button) {
   // come from probing a binary the daemon merely observed — never markup.
   function handoverUpdateRender(body) {
     lastHandoverBody = body;
+    fillPanelSwapSection();
     const update = body && body.update;
     if (!update || body.draining) { updateChipClear(); return; }
     const disk = update.on_disk;
@@ -102921,6 +103109,16 @@ async function memoryProposeFromForm(button) {
       el.appendChild(pending);
     }
     el.appendChild(handoverUpdateActions(body, disk));
+    // The pill expands into the full update panel: the chip stays the
+    // standing fact; channels, checks, and builds live there.
+    if (typeof routeTo === 'function') {
+      const panelLink = document.createElement('button');
+      panelLink.type = 'button';
+      panelLink.className = 'handover-update-panel-link';
+      panelLink.textContent = 'Open the update panel';
+      panelLink.addEventListener('click', () => routeTo('access', 'daemons'));
+      el.appendChild(panelLink);
+    }
   }
 
   function handoverBanner() {
@@ -102998,6 +103196,15 @@ async function memoryProposeFromForm(button) {
     stateKey: updateChipStateKey,
   };
 
+  // The update panel's composition hook (production, not QA): the panel
+  // registers its swap mount here and this module keeps it honest.
+  window.intendantHandoverUpdate = {
+    renderSwapSection: (mount) => {
+      panelSwapMount = mount;
+      fillPanelSwapSection();
+    },
+  };
+
   function handoverStart() {
     handoverPoll();
     setInterval(handoverPoll, HANDOVER_POLL_MS);
@@ -103009,21 +103216,30 @@ async function memoryProposeFromForm(button) {
   }
 })();
 /* ── static/app/ui2-update-lane.js ── */
-// ── ui2-update-lane — the self-update panel (Access → Daemons) ──────
-// Sits beside the daemons list's provenance rows and renders the
-// daemon's `update_lane` block from GET /api/daemon/handover: install
-// flavor, the bounded behind-origin-main / behind-latest-release check,
-// and the produce job's live phase + log tail. The buttons are the
-// owner's consent surface: POST /api/daemon/update-lane/{check,produce}
+// ── ui2-update-lane — the update panel (Access → Daemons) ───────────
+// The check-for-updates front door over the daemon's `update_lane`
+// block (GET /api/daemon/handover): running provenance, the two-channel
+// vocabulary — Releases (default; logged, PGP-verified builds) and
+// Dev — build from main (power-user lane behind the Advanced fold) —
+// each channel's bounded check as data (release compare; behind-count +
+// shortlog), and the produce job's live phase + log tail with real
+// errors verbatim. Which channel an install can check/produce comes
+// from the payload's `channels` catalog, never hardcoded here. The
+// buttons are the owner's consent surface: POST
+// /api/daemon/update-lane/{check,produce} with {"channel": …}
 // (HTTP-only by design — a tunnel-only remote surface watches progress
 // here but cannot click a build onto the box; the catch renders that
 // honestly). Producing lands a newer binary at the watched path; the
-// EXISTING update chip + one-click swap lane takes over from there.
-// textContent construction throughout: repo paths, versions, and child
-// process log lines are observed strings, never markup.
+// swap step below is the EXISTING chip consumer (ui2-handover renders
+// it into this panel's mount — one swap implementation, two surfaces).
+// Nothing here updates anything without an explicit click.
+// textContent construction throughout: repo paths, versions, commit
+// subjects, and child process log lines are observed strings, never
+// markup.
 (() => {
   const UPDATE_LANE_POLL_MS = 30000;
   const UPDATE_LANE_BUSY_POLL_MS = 3000;
+  const ADVANCED_OPEN_KEY = 'update-lane-advanced-open';
   const action = { inFlight: false, note: '' };
   let lastBlock = null;
   let pollTimer = null;
@@ -103032,7 +103248,17 @@ async function memoryProposeFromForm(button) {
     return document.getElementById('update-lane-card');
   }
 
-  async function updateLanePost(path) {
+  function advancedOpenStored() {
+    try { return localStorage.getItem(ADVANCED_OPEN_KEY) === '1'; } catch (_) { return false; }
+  }
+  function advancedOpenStore(open) {
+    try {
+      if (open) localStorage.setItem(ADVANCED_OPEN_KEY, '1');
+      else localStorage.removeItem(ADVANCED_OPEN_KEY);
+    } catch (_) { /* storage unavailable — the fold lives for this page only */ }
+  }
+
+  async function updateLanePost(path, channel) {
     if (action.inFlight) return;
     action.inFlight = true;
     action.note = '';
@@ -103041,7 +103267,7 @@ async function memoryProposeFromForm(button) {
       const resp = await authedFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify({ channel }),
       });
       let body = null;
       try { body = await resp.json(); } catch (_) { /* non-JSON error body */ }
@@ -103060,12 +103286,12 @@ async function memoryProposeFromForm(button) {
     }
   }
 
-  function actionButton(label, path, disabled) {
+  function actionButton(label, path, channel, disabled) {
     const btn = document.createElement('button');
     btn.className = 'update-lane-btn';
     btn.textContent = label;
     btn.disabled = Boolean(disabled) || action.inFlight;
-    btn.addEventListener('click', () => updateLanePost(path));
+    btn.addEventListener('click', () => updateLanePost(path, channel));
     return btn;
   }
 
@@ -103077,49 +103303,104 @@ async function memoryProposeFromForm(button) {
     return el;
   }
 
-  function describeCheck(block, body) {
-    const check = block.check || {};
-    const running = block.running || {};
+  // ── Channel sections (availability + data come from the payload) ──
+
+  function channelInfo(block, name) {
+    return (block.channels && block.channels[name]) || { check: false, produce: false };
+  }
+  function channelCheck(block, name) {
+    return (block.checks && block.checks[name]) || {};
+  }
+
+  // The releases check as data: latest logged release vs the running
+  // package version.
+  function describeReleasesCheck(check, running, body) {
     if (check.error) {
-      line(body, 'update-lane-error', `Check failed: ${check.error}`);
+      line(body, 'update-lane-error', `Release check failed: ${check.error}`);
       return { behind: false };
     }
-    if (block.flavor === 'source') {
-      if (typeof check.behind !== 'number') {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking origin/main…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const capped = check.behind_capped ? '+' : '';
-      if (check.behind > 0) {
-        line(body, 'update-lane-status',
-          `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
-          + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
-      } else {
-        line(body, 'update-lane-note',
-          `Up to date with origin/main (running ${running.git_sha || '?'}).`);
-      }
-      if (check.dirty) {
-        line(body, 'update-lane-note',
-          'The checkout has local changes — the update will refuse to pull over them.');
-      }
-      return { behind: check.behind > 0 };
+    if (!check.latest_tag) {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Checking the latest logged release…'
+        : 'Not checked yet.');
+      return { behind: false };
     }
-    if (block.flavor === 'consumer-app') {
-      if (!check.latest_tag) {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking the latest logged release…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const behind = Number(check.behind) > 0;
-      line(body, behind ? 'update-lane-status' : 'update-lane-note',
-        `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
-        + (check.compare_error ? ` ${check.compare_error}.` : ''));
-      return { behind };
+    const behind = Number(check.behind) > 0;
+    line(body, behind ? 'update-lane-status' : 'update-lane-note',
+      `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
+      + (check.compare_error ? ` ${check.compare_error}.` : ''));
+    return { behind };
+  }
+
+  // The dev check as data: behind-count + the bounded shortlog.
+  function describeDevCheck(check, running, body) {
+    if (check.error) {
+      line(body, 'update-lane-error', `Compare failed: ${check.error}`);
+      return { behind: false };
     }
-    return { behind: false };
+    if (typeof check.behind !== 'number') {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Fetching origin and comparing…'
+        : 'Not checked yet.');
+      return { behind: false };
+    }
+    const capped = check.behind_capped ? '+' : '';
+    if (check.behind > 0) {
+      line(body, 'update-lane-status',
+        `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
+        + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
+      const shortlog = Array.isArray(check.shortlog) ? check.shortlog : [];
+      if (shortlog.length) {
+        const log = document.createElement('pre');
+        log.className = 'update-lane-shortlog';
+        log.textContent = shortlog.join('\n')
+          + (check.behind > shortlog.length ? `\n… and ${check.behind}${capped === '+' ? '+' : ''} total` : '');
+        body.appendChild(log);
+      }
+    } else {
+      line(body, 'update-lane-note',
+        `Up to date with origin/main (running ${running.git_sha || '?'}).`);
+    }
+    if (check.dirty) {
+      line(body, 'update-lane-note',
+        'The checkout has local changes to tracked files — a build will refuse to pull over them.');
+    }
+    return { behind: check.behind > 0 };
+  }
+
+  // One channel's section: data, then the consent buttons this install
+  // actually supports — an unavailable produce renders its reason
+  // instead of a button that cannot mean what it says.
+  function channelSection(block, name, title, jobRunning, describe, checkLabel, produceLabel) {
+    const info = channelInfo(block, name);
+    const check = channelCheck(block, name);
+    const section = document.createElement('div');
+    section.className = 'update-lane-channel';
+    line(section, 'update-lane-channel-title', title);
+    const body = document.createElement('div');
+    body.className = 'update-lane-body';
+    section.appendChild(body);
+    const verdict = info.check
+      ? describe(check, block.running || {}, body)
+      : { behind: false };
+    if (!info.produce && info.reason) {
+      line(body, 'update-lane-note', info.reason);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'update-lane-actions';
+    if (info.check) {
+      actions.appendChild(actionButton(checkLabel, '/api/daemon/update-lane/check', name,
+        jobRunning || Boolean(check.in_flight)));
+    }
+    if (info.produce) {
+      actions.appendChild(actionButton(
+        jobRunning ? 'Working…' : produceLabel,
+        '/api/daemon/update-lane/produce', name,
+        jobRunning || !verdict.behind,
+      ));
+    }
+    if (actions.childElementCount) section.appendChild(actions);
+    return section;
   }
 
   function describeJob(block, body) {
@@ -103167,6 +103448,9 @@ async function memoryProposeFromForm(button) {
 
     const body = document.createElement('div');
     body.className = 'update-lane-body';
+    const running = block.running || {};
+    line(body, 'update-lane-note',
+      `Running: commit ${running.git_sha || '?'} · v${running.version || '?'} · built ${running.built_at || '?'}`);
     if (block.flavor === 'source' && block.repo_root) {
       line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
     } else if (block.flavor === 'consumer-app' && block.app_root) {
@@ -103176,33 +103460,51 @@ async function memoryProposeFromForm(button) {
       line(body, 'update-lane-note', block.unavailable);
     }
 
-    const verdict = describeCheck(block, body);
     const jobRunning = describeJob(block, body);
-
     if (action.note) line(body, 'update-lane-note', action.note);
-
-    const actions = document.createElement('div');
-    actions.className = 'update-lane-actions';
-    if (!block.unavailable) {
-      if (block.flavor === 'source') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Update from main',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      } else if (block.flavor === 'consumer-app') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Download & verify release',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      }
-      actions.appendChild(actionButton('Check now', '/api/daemon/update-lane/check',
-        jobRunning || Boolean(block.check && block.check.in_flight)));
-    }
     card.appendChild(body);
-    if (actions.childElementCount) card.appendChild(actions);
+
+    // Releases — the default channel, for everyone.
+    card.appendChild(channelSection(
+      block, 'releases', 'Releases — verified, signed builds (default)', jobRunning,
+      describeReleasesCheck, 'Check latest release', 'Download & install release',
+    ));
+
+    // Dev — build from main, one obvious click deeper.
+    const advanced = document.createElement('details');
+    advanced.className = 'update-lane-advanced';
+    if (advancedOpenStored()) advanced.open = true;
+    advanced.addEventListener('toggle', () => advancedOpenStore(advanced.open));
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced';
+    advanced.appendChild(summary);
+    advanced.appendChild(channelSection(
+      block, 'dev', 'Dev — build from main', jobRunning,
+      describeDevCheck, 'Fetch & compare', 'Pull & build from main',
+    ));
+    card.appendChild(advanced);
+
+    // The swap step: rendered by the EXISTING chip consumer
+    // (ui2-handover) into this mount — supervisor-claimed one-click
+    // when the daemon is app-supervised, its honest reach otherwise.
+    // Empty while no newer build sits on disk.
+    const swap = document.createElement('div');
+    swap.className = 'update-lane-swap';
+    card.appendChild(swap);
+    if (window.intendantHandoverUpdate
+        && typeof window.intendantHandoverUpdate.renderSwapSection === 'function') {
+      window.intendantHandoverUpdate.renderSwapSection(swap);
+    }
+
+    line(card, 'update-lane-footer',
+      'Updates happen only on your click here — nothing installs or restarts automatically.');
     mount.appendChild(card);
+  }
+
+  function anyCheckInFlight(block) {
+    if (!block || !block.checks) return false;
+    return ['releases', 'dev'].some((name) =>
+      block.checks[name] && block.checks[name].in_flight);
   }
 
   async function poll() {
@@ -103218,7 +103520,7 @@ async function memoryProposeFromForm(button) {
     if (pollTimer) clearTimeout(pollTimer);
     const busy = Boolean(lastBlock && (
       (lastBlock.job && !('ok' in lastBlock.job)) ||
-      (lastBlock.check && lastBlock.check.in_flight)));
+      anyCheckInFlight(lastBlock)));
     pollTimer = setTimeout(async () => {
       await poll();
       schedulePoll(false);

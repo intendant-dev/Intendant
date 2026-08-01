@@ -54,7 +54,9 @@ let agendaGraphCanvas = null;
 let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
-let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+let agendaGraphCam = {
+  yaw: 0.6, pitch: -0.34, auto: true, zoom: 1, panX: 0, panY: 0,
+};
 // Projection state: 'all' (whole non-retired ledger), 'hubs' (the hub
 // overview — automatic past the node cap, or chosen), 'focus' (one
 // hub's placed subtree). The render pass decides the projection from
@@ -99,12 +101,25 @@ function agendaGraphSetFullscreen(on) {
   agendaRenderTab();
 }
 
+// While graph-fullscreen is active a marker class on <html> lifts the
+// agenda inspector above the fixed panel (see ui2-agenda-inspector.css)
+// so node-click keeps its full behavior — inspector over constellation.
+function agendaGraphSyncFsMarker() {
+  document.documentElement.classList.toggle('ag2-graph-fs', agendaGraphFullscreen);
+}
+
 function agendaGraphEnsureEsc() {
   if (agendaGraphEscHook) return;
   agendaGraphEscHook = (e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented) {
-      agendaGraphSetFullscreen(false);
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    // Polite ordering: an open inspector consumes the first ESC;
+    // fullscreen exits on the next.
+    const insp = document.getElementById('ag2-inspector');
+    if (insp && insp.classList.contains('open')) {
+      agendaCloseInspector();
+      return;
     }
+    agendaGraphSetFullscreen(false);
   };
   document.addEventListener('keydown', agendaGraphEscHook);
 }
@@ -215,6 +230,7 @@ function agendaGraphRenderLens(host) {
 function agendaGraphWireChrome(host) {
   const panel = host.querySelector('.ag2-graph-panel');
   if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  agendaGraphSyncFsMarker();
   if (agendaGraphFullscreen) agendaGraphEnsureEsc();
   else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
@@ -227,7 +243,7 @@ function agendaGraphWireChrome(host) {
           ? (agendaGraphTerritory
             ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
             : 'focused subtree — double-click empty space to clear')
-          : 'drag to orbit · click a node to open it · double-click a hub to focus');
+          : 'drag to orbit · wheel to zoom · shift-drag to pan · click a node to open it · double-click a hub to focus');
   }
   const inHubs = agendaGraphProjection === 'hubs';
   const chips = host.querySelectorAll('.ag2-graph-projchip');
@@ -355,9 +371,15 @@ function agendaGraphBindCanvas(canvas) {
       const nx = e.clientX - rect.left;
       const ny = e.clientY - rect.top;
       if (m.down) {
-        agendaGraphCam.yaw += (nx - m.x) * 0.005;
-        agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
-          agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        if (e.shiftKey) {
+          // Shift-drag pans in screen space (zoom's natural partner).
+          agendaGraphCam.panX += nx - m.x;
+          agendaGraphCam.panY += ny - m.y;
+        } else {
+          agendaGraphCam.yaw += (nx - m.x) * 0.005;
+          agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
+            agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        }
         m.moved += Math.abs(nx - m.x) + Math.abs(ny - m.y);
         agendaGraphCam.auto = false;
       }
@@ -393,14 +415,42 @@ function agendaGraphBindCanvas(canvas) {
     },
     dbl: () => {
       // Double-click a hub to focus its subtree; double-click empty
-      // space to clear an active focus.
+      // space to reset a zoom/pan first, then to clear an active focus.
       if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
         agendaGraphFocus = agendaGraphHover;
         agendaRenderTab();
-      } else if (!agendaGraphHover && agendaGraphFocus) {
-        agendaGraphFocus = null;
-        agendaRenderTab();
+      } else if (!agendaGraphHover) {
+        const cam = agendaGraphCam;
+        if (cam.zoom !== 1 || cam.panX || cam.panY) {
+          cam.zoom = 1;
+          cam.panX = 0;
+          cam.panY = 0;
+        } else if (agendaGraphFocus) {
+          agendaGraphFocus = null;
+          agendaRenderTab();
+        }
       }
+    },
+    wheel: (e) => {
+      // Wheel / trackpad-pinch (ctrl-wheel) zoom, anchored to the
+      // cursor: the world point under the pointer stays put via the
+      // screen-space pan. preventDefault keeps the page from scrolling
+      // — scoped to the canvas, removed on unbind.
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const cam = agendaGraphCam;
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0022));
+      const next = Math.max(0.35, Math.min(3.5, cam.zoom * factor));
+      const ratio = next / cam.zoom;
+      const ax = rect.width / 2;
+      const ay = rect.height / 2 + 8;
+      cam.panX = mx - ax - (mx - ax - cam.panX) * ratio;
+      cam.panY = my - ay - (my - ay - cam.panY) * ratio;
+      cam.zoom = next;
+      cam.auto = false;
+      agendaGraphArmAutoResume();
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -417,6 +467,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
   canvas.addEventListener('dblclick', hooks.dbl);
+  canvas.addEventListener('wheel', hooks.wheel, { passive: false });
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -429,6 +480,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
     canvas.removeEventListener('dblclick', hooks.dbl);
+    canvas.removeEventListener('wheel', hooks.wheel);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -499,6 +551,7 @@ function agendaGraphTeardown() {
   }
   agendaGraphUnbindCanvas();
   agendaGraphRemoveEsc();
+  document.documentElement.classList.remove('ag2-graph-fs');
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
@@ -931,7 +984,13 @@ function agendaGraphDraw(ts) {
     const ry = p[1] * cp - rz * sp;
     rz = p[1] * sp + rz * cp;
     const s = focal / (focal + rz + 40);
-    return { x: cx + rx * s * 1.35, y: cyy + ry * s * 1.35, s, z: rz };
+    const k = s * 1.35 * cam.zoom;
+    return {
+      x: cx + cam.panX + rx * k,
+      y: cyy + cam.panY + ry * k,
+      s: s * cam.zoom,
+      z: rz,
+    };
   };
   const nodes = agendaGraphNodes;
   const pts = nodes.map((n) => project(n.p));
@@ -1153,6 +1212,9 @@ function agendaGraphDraw(ts) {
     : agendaGraphMode === 'attention'
       ? ` · attention — ${agendaGraphAttnCount} need you`
       : ` · ${agendaGraphMode}`;
+  const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
+    ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
+    : '';
   {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
@@ -1171,7 +1233,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + modeBadge + terrBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge + zoomBadge, 14, 64);
   }
 }
 
