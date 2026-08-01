@@ -7025,6 +7025,31 @@ async fn drainer_exits_at_last_session_end() {
         || daemon_a.log_tail(),
     )
     .await;
+    // Drain-holdout honesty: the drainer NAMES its wait set — the
+    // running session rides the presence record (the successor-side
+    // banner's only channel) as a holdout row with its phase, beside
+    // the count. A silent "draining" with no named holdouts is the
+    // 40-minute-mystery class this exists to kill.
+    poll_until(
+        "the drainer's presence naming its holdout row",
+        RUN_TIMEOUT,
+        || async {
+            let presence: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&presence_path).ok()?).ok()?;
+            let rows = presence.get("holdouts")?.as_array()?;
+            (presence["session_count"] == 1
+                && rows.len() == 1
+                && rows[0]["session_id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty())
+                && rows[0]["phase"]
+                    .as_str()
+                    .is_some_and(|phase| phase != "done"))
+            .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
     assert!(
         !journal_states_for_item(&daemon_a.rig, &item_id).contains(&"unknown".to_string()),
         "the new holder must spare the draining daemon's live session:\n{:?}",
@@ -7101,6 +7126,49 @@ async fn drainer_exits_at_last_session_end() {
         serde_json::from_slice(&std::fs::read(&presence_path).expect("presence file"))
             .expect("presence json");
     assert_eq!(presence["state"], "exited");
+
+    // The successor's predecessor-exit watch closed the post-drain
+    // readopt gap: it observed the draining boot while it lived, and
+    // after the exit it ran the scoped pass over the released set. In
+    // this leg the drained session COMPLETED, so the honest outcome is
+    // an empty release ("nothing released mid-work") — but any
+    // per-candidate adjudication line equally proves the pass ran; the
+    // point pinned here is that the exit instant is ACTED on, not slept
+    // through until the next restart.
+    let b_log_path = daemon_a.rig.home.path().join("daemon-b.log");
+    poll_until(
+        "the successor's watch observing the draining predecessor",
+        RUN_TIMEOUT,
+        || async {
+            std::fs::read_to_string(&b_log_path)
+                .unwrap_or_default()
+                .contains("watching draining co-homed daemon")
+                .then_some(())
+        },
+        || {
+            std::fs::read_to_string(&b_log_path)
+                .map(|log| tail(&log, 2000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    poll_until(
+        "the successor's scoped pass running at the predecessor's exit",
+        RUN_TIMEOUT,
+        || async {
+            let log = std::fs::read_to_string(&b_log_path).unwrap_or_default();
+            (log.contains("nothing released mid-work")
+                || log.contains("released when draining daemon")
+                || log.contains("[readopt] leaving"))
+            .then_some(())
+        },
+        || {
+            std::fs::read_to_string(&b_log_path)
+                .map(|log| tail(&log, 2000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
     drop(daemon_b);
 }
 

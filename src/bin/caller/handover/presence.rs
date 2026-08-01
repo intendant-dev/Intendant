@@ -362,8 +362,7 @@ mod tests {
         assert_eq!(after["holdouts"][0]["session_id"], "sess-parked-1");
         assert_eq!(after["holdouts"][0]["phase"], "waiting_rate_limit");
         assert_eq!(
-            after["holdouts"][0]["limit_park"]["resets_at_epoch"],
-            1_754_000_000_u64,
+            after["holdouts"][0]["limit_park"]["resets_at_epoch"], 1_754_000_000_u64,
             "the parked-until instant rides the record — the decisive fact"
         );
 

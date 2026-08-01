@@ -329,9 +329,15 @@ unattested, no live process) is woken to continue, and what cannot be
 woken is listed on one needs-you agenda task instead of stranding
 silently (`failed` runs are listed, never re-fired).
 
+The same knob governs the **predecessor-exit watch**: on the holder, a
+co-homed draining daemon's exit triggers one scoped readopt pass over
+the sessions it released (see
+[Control Plane & Daemon](./control-plane-and-daemon.md#graceful-daemon-handover-drain--takeover)),
+instead of leaving them down until the next restart.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand and skips the commission sweep. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
+| `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand and skips the commission sweep and the predecessor-exit watch. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
 
 ### `[agent]` and external backends
 

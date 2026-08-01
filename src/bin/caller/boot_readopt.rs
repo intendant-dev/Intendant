@@ -2095,9 +2095,10 @@ pub(crate) async fn run_predecessor_exit_watch(
             if handover.is_draining() {
                 return;
             }
-            let live: HashSet<String> = crate::session_supervisor::published_live_session_registry()
-                .and_then(|registry| registry.live_wrapper_ids())
-                .unwrap_or_default();
+            let live: HashSet<String> =
+                crate::session_supervisor::published_live_session_registry()
+                    .and_then(|registry| registry.live_wrapper_ids())
+                    .unwrap_or_default();
             run_released_readopt_pass(
                 &home,
                 &bus,

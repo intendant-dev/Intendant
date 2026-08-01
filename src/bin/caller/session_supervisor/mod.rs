@@ -1363,8 +1363,7 @@ mod tests {
         assert_eq!(status["holdouts"][0]["name"], "nightly build");
         assert_eq!(status["holdouts"][0]["phase"], "waiting_rate_limit");
         assert_eq!(
-            status["holdouts"][0]["limit_park"]["resets_at_epoch"],
-            1_754_000_000_u64,
+            status["holdouts"][0]["limit_park"]["resets_at_epoch"], 1_754_000_000_u64,
             "the parked-until instant is the decisive fact — it must reach the surface"
         );
         let record = crate::handover::read_presence_records(home.path())
@@ -1437,11 +1436,17 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
         assert_eq!(ids, vec!["s-early", "s-late", "s-plain"]);
         assert_eq!(
-            rows[0].limit_park.as_ref().and_then(|park| park.resets_at_epoch),
+            rows[0]
+                .limit_park
+                .as_ref()
+                .and_then(|park| park.resets_at_epoch),
             Some(1_000)
         );
         assert_eq!(rows[2].limit_park, None);
-        assert_eq!(rows[2].phase, "running", "phases normalize for stable rendering");
+        assert_eq!(
+            rows[2].phase, "running",
+            "phases normalize for stable rendering"
+        );
     }
 
     pub(crate) fn test_supervisor_with_mock_provider(
