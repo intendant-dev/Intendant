@@ -103,14 +103,16 @@ pub(crate) async fn handle_daemon_handover_status(
 }
 
 /// Transport-neutral core of the two self-update-lane actions (`POST
-/// /api/daemon/update-lane/{check,produce}`). Check runs the bounded
-/// behind-ness compare; produce is the owner's consent click — it
-/// starts the supervised produce job (or refuses honestly: no lane for
-/// this install, a job already running, an unsupported platform). Both
-/// answer the lane's fresh status block so the panel renders truth
-/// immediately.
+/// /api/daemon/update-lane/{check,produce}`). The optional body names
+/// the channel (`{"channel": "releases"|"dev"}`; absent = the install's
+/// native lane). Check runs that channel's bounded compare; produce is
+/// the owner's consent click — it starts the supervised produce job (or
+/// refuses honestly: a channel this install cannot use, a job already
+/// running, an unsupported platform). Both answer the lane's fresh
+/// status block so the panel renders truth immediately.
 pub(crate) async fn daemon_update_lane_api_response(
     produce: bool,
+    body_text: &str,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
     let runtime = match mcp_server {
@@ -121,27 +123,28 @@ pub(crate) async fn daemon_update_lane_api_response(
     let Some(lane) = lane else {
         return ApiResponse::json_error(503, "the self-update lane is not wired on this daemon");
     };
-    if produce {
-        match lane.request_produce() {
-            Ok(block) => ApiResponse::json(
-                200,
-                JsonBody::Value(serde_json::json!({ "started": true, "update_lane": block })),
-            ),
-            Err(refusal) => ApiResponse::json(
-                409,
-                JsonBody::Value(serde_json::json!({
-                    "error": "update_lane_refused",
-                    "detail": refusal,
-                    "update_lane": lane.status_block(),
-                })),
-            ),
-        }
+    let channel = match crate::handover::parse_channel_arg(body_text) {
+        Ok(channel) => channel,
+        Err(refusal) => return ApiResponse::json_error(400, &refusal),
+    };
+    let outcome = if produce {
+        lane.request_produce(channel)
     } else {
-        let block = lane.request_check();
-        ApiResponse::json(
+        lane.request_check(channel)
+    };
+    match outcome {
+        Ok(block) => ApiResponse::json(
             200,
             JsonBody::Value(serde_json::json!({ "started": true, "update_lane": block })),
-        )
+        ),
+        Err(refusal) => ApiResponse::json(
+            409,
+            JsonBody::Value(serde_json::json!({
+                "error": "update_lane_refused",
+                "detail": refusal,
+                "update_lane": lane.status_block(),
+            })),
+        ),
     }
 }
 
@@ -149,11 +152,12 @@ pub(crate) async fn daemon_update_lane_api_response(
 pub(crate) async fn handle_daemon_update_lane(
     stream: DemuxStream,
     produce: bool,
+    body_text: String,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = daemon_update_lane_api_response(produce, mcp_server.as_ref()).await;
+    let response = daemon_update_lane_api_response(produce, &body_text, mcp_server.as_ref()).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 

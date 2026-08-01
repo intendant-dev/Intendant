@@ -1,18 +1,27 @@
-// ── ui2-update-lane — the self-update panel (Access → Daemons) ──────
-// Sits beside the daemons list's provenance rows and renders the
-// daemon's `update_lane` block from GET /api/daemon/handover: install
-// flavor, the bounded behind-origin-main / behind-latest-release check,
-// and the produce job's live phase + log tail. The buttons are the
-// owner's consent surface: POST /api/daemon/update-lane/{check,produce}
+// ── ui2-update-lane — the update panel (Access → Daemons) ───────────
+// The check-for-updates front door over the daemon's `update_lane`
+// block (GET /api/daemon/handover): running provenance, the two-channel
+// vocabulary — Releases (default; logged, PGP-verified builds) and
+// Dev — build from main (power-user lane behind the Advanced fold) —
+// each channel's bounded check as data (release compare; behind-count +
+// shortlog), and the produce job's live phase + log tail with real
+// errors verbatim. Which channel an install can check/produce comes
+// from the payload's `channels` catalog, never hardcoded here. The
+// buttons are the owner's consent surface: POST
+// /api/daemon/update-lane/{check,produce} with {"channel": …}
 // (HTTP-only by design — a tunnel-only remote surface watches progress
 // here but cannot click a build onto the box; the catch renders that
 // honestly). Producing lands a newer binary at the watched path; the
-// EXISTING update chip + one-click swap lane takes over from there.
-// textContent construction throughout: repo paths, versions, and child
-// process log lines are observed strings, never markup.
+// swap step below is the EXISTING chip consumer (ui2-handover renders
+// it into this panel's mount — one swap implementation, two surfaces).
+// Nothing here updates anything without an explicit click.
+// textContent construction throughout: repo paths, versions, commit
+// subjects, and child process log lines are observed strings, never
+// markup.
 (() => {
   const UPDATE_LANE_POLL_MS = 30000;
   const UPDATE_LANE_BUSY_POLL_MS = 3000;
+  const ADVANCED_OPEN_KEY = 'update-lane-advanced-open';
   const action = { inFlight: false, note: '' };
   let lastBlock = null;
   let pollTimer = null;
@@ -21,7 +30,17 @@
     return document.getElementById('update-lane-card');
   }
 
-  async function updateLanePost(path) {
+  function advancedOpenStored() {
+    try { return localStorage.getItem(ADVANCED_OPEN_KEY) === '1'; } catch (_) { return false; }
+  }
+  function advancedOpenStore(open) {
+    try {
+      if (open) localStorage.setItem(ADVANCED_OPEN_KEY, '1');
+      else localStorage.removeItem(ADVANCED_OPEN_KEY);
+    } catch (_) { /* storage unavailable — the fold lives for this page only */ }
+  }
+
+  async function updateLanePost(path, channel) {
     if (action.inFlight) return;
     action.inFlight = true;
     action.note = '';
@@ -30,7 +49,7 @@
       const resp = await authedFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify({ channel }),
       });
       let body = null;
       try { body = await resp.json(); } catch (_) { /* non-JSON error body */ }
@@ -49,12 +68,12 @@
     }
   }
 
-  function actionButton(label, path, disabled) {
+  function actionButton(label, path, channel, disabled) {
     const btn = document.createElement('button');
     btn.className = 'update-lane-btn';
     btn.textContent = label;
     btn.disabled = Boolean(disabled) || action.inFlight;
-    btn.addEventListener('click', () => updateLanePost(path));
+    btn.addEventListener('click', () => updateLanePost(path, channel));
     return btn;
   }
 
@@ -66,49 +85,104 @@
     return el;
   }
 
-  function describeCheck(block, body) {
-    const check = block.check || {};
-    const running = block.running || {};
+  // ── Channel sections (availability + data come from the payload) ──
+
+  function channelInfo(block, name) {
+    return (block.channels && block.channels[name]) || { check: false, produce: false };
+  }
+  function channelCheck(block, name) {
+    return (block.checks && block.checks[name]) || {};
+  }
+
+  // The releases check as data: latest logged release vs the running
+  // package version.
+  function describeReleasesCheck(check, running, body) {
     if (check.error) {
-      line(body, 'update-lane-error', `Check failed: ${check.error}`);
+      line(body, 'update-lane-error', `Release check failed: ${check.error}`);
       return { behind: false };
     }
-    if (block.flavor === 'source') {
-      if (typeof check.behind !== 'number') {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking origin/main…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const capped = check.behind_capped ? '+' : '';
-      if (check.behind > 0) {
-        line(body, 'update-lane-status',
-          `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
-          + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
-      } else {
-        line(body, 'update-lane-note',
-          `Up to date with origin/main (running ${running.git_sha || '?'}).`);
-      }
-      if (check.dirty) {
-        line(body, 'update-lane-note',
-          'The checkout has local changes — the update will refuse to pull over them.');
-      }
-      return { behind: check.behind > 0 };
+    if (!check.latest_tag) {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Checking the latest logged release…'
+        : 'Not checked yet.');
+      return { behind: false };
     }
-    if (block.flavor === 'consumer-app') {
-      if (!check.latest_tag) {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking the latest logged release…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const behind = Number(check.behind) > 0;
-      line(body, behind ? 'update-lane-status' : 'update-lane-note',
-        `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
-        + (check.compare_error ? ` ${check.compare_error}.` : ''));
-      return { behind };
+    const behind = Number(check.behind) > 0;
+    line(body, behind ? 'update-lane-status' : 'update-lane-note',
+      `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
+      + (check.compare_error ? ` ${check.compare_error}.` : ''));
+    return { behind };
+  }
+
+  // The dev check as data: behind-count + the bounded shortlog.
+  function describeDevCheck(check, running, body) {
+    if (check.error) {
+      line(body, 'update-lane-error', `Compare failed: ${check.error}`);
+      return { behind: false };
     }
-    return { behind: false };
+    if (typeof check.behind !== 'number') {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Fetching origin and comparing…'
+        : 'Not checked yet.');
+      return { behind: false };
+    }
+    const capped = check.behind_capped ? '+' : '';
+    if (check.behind > 0) {
+      line(body, 'update-lane-status',
+        `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
+        + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
+      const shortlog = Array.isArray(check.shortlog) ? check.shortlog : [];
+      if (shortlog.length) {
+        const log = document.createElement('pre');
+        log.className = 'update-lane-shortlog';
+        log.textContent = shortlog.join('\n')
+          + (check.behind > shortlog.length ? `\n… and ${check.behind}${capped === '+' ? '+' : ''} total` : '');
+        body.appendChild(log);
+      }
+    } else {
+      line(body, 'update-lane-note',
+        `Up to date with origin/main (running ${running.git_sha || '?'}).`);
+    }
+    if (check.dirty) {
+      line(body, 'update-lane-note',
+        'The checkout has local changes to tracked files — a build will refuse to pull over them.');
+    }
+    return { behind: check.behind > 0 };
+  }
+
+  // One channel's section: data, then the consent buttons this install
+  // actually supports — an unavailable produce renders its reason
+  // instead of a button that cannot mean what it says.
+  function channelSection(block, name, title, jobRunning, describe, checkLabel, produceLabel) {
+    const info = channelInfo(block, name);
+    const check = channelCheck(block, name);
+    const section = document.createElement('div');
+    section.className = 'update-lane-channel';
+    line(section, 'update-lane-channel-title', title);
+    const body = document.createElement('div');
+    body.className = 'update-lane-body';
+    section.appendChild(body);
+    const verdict = info.check
+      ? describe(check, block.running || {}, body)
+      : { behind: false };
+    if (!info.produce && info.reason) {
+      line(body, 'update-lane-note', info.reason);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'update-lane-actions';
+    if (info.check) {
+      actions.appendChild(actionButton(checkLabel, '/api/daemon/update-lane/check', name,
+        jobRunning || Boolean(check.in_flight)));
+    }
+    if (info.produce) {
+      actions.appendChild(actionButton(
+        jobRunning ? 'Working…' : produceLabel,
+        '/api/daemon/update-lane/produce', name,
+        jobRunning || !verdict.behind,
+      ));
+    }
+    if (actions.childElementCount) section.appendChild(actions);
+    return section;
   }
 
   function describeJob(block, body) {
@@ -156,6 +230,9 @@
 
     const body = document.createElement('div');
     body.className = 'update-lane-body';
+    const running = block.running || {};
+    line(body, 'update-lane-note',
+      `Running: commit ${running.git_sha || '?'} · v${running.version || '?'} · built ${running.built_at || '?'}`);
     if (block.flavor === 'source' && block.repo_root) {
       line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
     } else if (block.flavor === 'consumer-app' && block.app_root) {
@@ -165,33 +242,51 @@
       line(body, 'update-lane-note', block.unavailable);
     }
 
-    const verdict = describeCheck(block, body);
     const jobRunning = describeJob(block, body);
-
     if (action.note) line(body, 'update-lane-note', action.note);
-
-    const actions = document.createElement('div');
-    actions.className = 'update-lane-actions';
-    if (!block.unavailable) {
-      if (block.flavor === 'source') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Update from main',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      } else if (block.flavor === 'consumer-app') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Download & verify release',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      }
-      actions.appendChild(actionButton('Check now', '/api/daemon/update-lane/check',
-        jobRunning || Boolean(block.check && block.check.in_flight)));
-    }
     card.appendChild(body);
-    if (actions.childElementCount) card.appendChild(actions);
+
+    // Releases — the default channel, for everyone.
+    card.appendChild(channelSection(
+      block, 'releases', 'Releases — verified, signed builds (default)', jobRunning,
+      describeReleasesCheck, 'Check latest release', 'Download & install release',
+    ));
+
+    // Dev — build from main, one obvious click deeper.
+    const advanced = document.createElement('details');
+    advanced.className = 'update-lane-advanced';
+    if (advancedOpenStored()) advanced.open = true;
+    advanced.addEventListener('toggle', () => advancedOpenStore(advanced.open));
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced';
+    advanced.appendChild(summary);
+    advanced.appendChild(channelSection(
+      block, 'dev', 'Dev — build from main', jobRunning,
+      describeDevCheck, 'Fetch & compare', 'Pull & build from main',
+    ));
+    card.appendChild(advanced);
+
+    // The swap step: rendered by the EXISTING chip consumer
+    // (ui2-handover) into this mount — supervisor-claimed one-click
+    // when the daemon is app-supervised, its honest reach otherwise.
+    // Empty while no newer build sits on disk.
+    const swap = document.createElement('div');
+    swap.className = 'update-lane-swap';
+    card.appendChild(swap);
+    if (window.intendantHandoverUpdate
+        && typeof window.intendantHandoverUpdate.renderSwapSection === 'function') {
+      window.intendantHandoverUpdate.renderSwapSection(swap);
+    }
+
+    line(card, 'update-lane-footer',
+      'Updates happen only on your click here — nothing installs or restarts automatically.');
     mount.appendChild(card);
+  }
+
+  function anyCheckInFlight(block) {
+    if (!block || !block.checks) return false;
+    return ['releases', 'dev'].some((name) =>
+      block.checks[name] && block.checks[name].in_flight);
   }
 
   async function poll() {
@@ -207,7 +302,7 @@
     if (pollTimer) clearTimeout(pollTimer);
     const busy = Boolean(lastBlock && (
       (lastBlock.job && !('ok' in lastBlock.job)) ||
-      (lastBlock.check && lastBlock.check.in_flight)));
+      anyCheckInFlight(lastBlock)));
     pollTimer = setTimeout(async () => {
       await poll();
       schedulePoll(false);
