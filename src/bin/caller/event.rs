@@ -3181,11 +3181,12 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id,
             id,
             command_preview,
-            ..
+            category,
         } => Some(OutboundEvent::ApprovalRequired {
             session_id: session_id.clone(),
             id: *id,
             command: command_preview.clone(),
+            category: Some(category.to_string()),
         }),
         AppEvent::UserQuestionRequired {
             session_id,

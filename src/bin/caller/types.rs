@@ -465,6 +465,12 @@ pub enum OutboundEvent {
         session_id: Option<String>,
         id: u64,
         command: String,
+        /// The [`crate::autonomy::ActionCategory`] wire string
+        /// (`command_exec`, `file_write`, `destructive`, …). Additive:
+        /// absent from daemons predating RC-C2 — consumers fall back to
+        /// `command_exec`, the pre-existing lossy default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
     /// The agent asks the human structured question(s) and blocks until
     /// answered via `{"action":"answer_question","id":…,"answers":{…}}`
