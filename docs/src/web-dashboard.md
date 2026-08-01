@@ -1998,8 +1998,8 @@ response omits the header.
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
-| POST | `/api/daemon/update-lane/check` | Settings | own origin | ≤ 4 KiB | Self-update lane: run the bounded behind-origin-main / behind-latest-release check now |
-| POST | `/api/daemon/update-lane/produce` | Settings | own origin | ≤ 4 KiB | Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip |
+| POST | `/api/daemon/update-lane/check` | Settings | own origin | ≤ 4 KiB | Self-update lane: run the bounded behind-origin-main / behind-latest-release check now (optional body {"channel": "releases"|"dev"}; absent = the install's native lane) |
+| POST | `/api/daemon/update-lane/produce` | Settings | own origin | ≤ 4 KiB | Self-update lane: produce the update artifact on the named channel (dev = source pull+build, releases = verified release download) for the swap chip |
 | POST | `/api/daemon/update-swap` | Settings | own origin | ≤ 4 KiB | Ask the attached app supervisor for the one-click update swap (refused when no live supervisor is attached) |
 | POST | `/api/daemon/update-swap/claim` | Settings | own origin | ≤ 4 KiB | App supervisor poll: claim the pending one-click swap request (consuming; expired requests evaporate) |
 | POST | `/api/daemon/update-swap/result` | Settings | own origin | ≤ 4 KiB | App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane) |

@@ -1164,19 +1164,6 @@ html.ui-v2 .ag2-graph-panel.fullscreen canvas {
   height: 100vh;
   height: 100dvh;
 }
-html.ui-v2 .ag2-graph-capnote {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text-3);
-  pointer-events: none;
-  padding: 0 40px;
-  text-align: center;
-}
 
 /* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows
    ride the shared .ag2-chip family; dots pulse via the shared ui2-pulse
