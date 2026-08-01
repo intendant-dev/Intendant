@@ -488,6 +488,17 @@ html.ui-v2 .ag2-insp-dep {
   align-items: center;
   gap: 8px;
 }
+/* A delivered-awaiting-Complete prerequisite: the actionable wait —
+   sky (the achieved self-report hue), with its release affordance. */
+html.ui-v2 .ag2-insp-dep.delivered {
+  border-left: 2px solid rgba(var(--sky-rgb), 0.55);
+  padding-left: 7px;
+}
+html.ui-v2 .ag2-insp-dep .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+  flex-shrink: 0;
+}
 html.ui-v2 .ag2-insp-deplink {
   flex: 1;
   min-width: 0;
