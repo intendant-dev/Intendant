@@ -19783,6 +19783,41 @@ html.ui-v2 #tab-sessions .sd-meta-strip {
 html.ui-v2 #tab-sessions .sd-meta-strip .label { color: var(--text-3); }
 html.ui-v2 #tab-sessions .sd-meta-strip .value { color: var(--text-2); }
 
+/* Peer transcript provenance banner (RC-C2): explicit target
+   provenance on every peer view — who governs the transcript, over
+   which link class, and how fresh the snapshot is. */
+html.ui-v2 #tab-sessions .session-detail-peer-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-2, var(--surface-3));
+  border-radius: var(--r-card, 8px);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-who { font-weight: 600; color: var(--text); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-link-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2, var(--surface-3));
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status[data-state="error"] { color: var(--red, #d66); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner button {
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner button.sd-peer-external { margin-left: 0; }
+
 /* Detail actions: Resume leads (accent), Configure/Rename quiet. */
 html.ui-v2 #tab-sessions .session-detail-action-btn {
   padding: 6px 13px;
@@ -21778,6 +21813,15 @@ html.ui-v2 #approval-panel .approval-category {
 }
 /* keep v1's empty-hide winning */
 html.ui-v2 #approval-panel .approval-category:empty { display: none; }
+/* Peer provenance line (RC-C2): names the governing daemon under a
+   peer-raised approval — quiet but always legible. */
+html.ui-v2 #approval-panel .approval-provenance {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: -4px 0 10px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 #approval-panel .approval-provenance[hidden] { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   height: 33px;
@@ -32194,6 +32238,10 @@ html.ui-v2 .daemon-relay-note {
                   <div class="approval-title">Approval needed</div>
                   <div class="approval-command" id="approval-command"></div>
                   <div class="approval-category" id="approval-category"></div>
+                  <!-- Peer provenance (RC-C2): filled only for approvals
+                       raised on a federated peer — names the target daemon
+                       and the delegation lane the decision will transit. -->
+                  <div class="approval-provenance" id="approval-provenance" hidden></div>
                   <div class="approval-actions">
                     <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
                     <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>
@@ -37748,6 +37796,13 @@ function ui2StampApprovalSession() {
     chip.className = 'ui2-approval-session';
     title.appendChild(chip);
   }
+  // Peer approvals (RC-C2): the provenance line owns the naming — the
+  // chip's session badge styling keys off LOCAL session identity and
+  // would mislabel a peer's session id.
+  if (typeof pendingApprovalHostId !== 'undefined' && pendingApprovalHostId) {
+    chip.hidden = true;
+    return;
+  }
   const sid = (typeof pendingApprovalSessionId !== 'undefined' && pendingApprovalSessionId) || '';
   if (!sid) { chip.hidden = true; return; }
   chip.hidden = false;
@@ -38026,7 +38081,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '78439b374791dd19';
+const INTENDANT_APP_BUILD = 'b6461f0c2493130f';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38870,6 +38925,10 @@ let currentSessionDetail = null;
 let currentSessionDetailContext = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
+// Host of the peer daemon that raised the shown approval; '' = local.
+// Peer approvals fold into the same panel + queue (RC-C2), decided via
+// api_peer_approval instead of the local session-control lane.
+let pendingApprovalHostId = '';
 let steerCounter = 0;
 let followUpCounter = 0;
 const pendingFollowUpsById = new Map();
@@ -47396,7 +47455,9 @@ function handleStationAction(action) {
       const map = { approve: 'approve', skip: 'skip', approve_all: 'approve_all', deny: 'deny' };
       if (app) processCommands(app.send_approval(map[decision] || 'approve'));
     } else {
-      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept', deny: 'decline' };
+      // approve_all maps to accept_for_session (→ ControlMsg::ApproveAll
+      // on the peer) — it used to silently degrade to a one-shot accept.
+      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept_for_session', deny: 'decline' };
       resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
     }
   } else if (action.type === 'open_display') {
@@ -50644,8 +50705,21 @@ function stationHandleSessionAction(action) {
         .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
       return;
     }
-    // Anything else (transcript, thread ops, config) still lives on the
-    // peer's own dashboard — no silent no-ops.
+    if (op === 'transcript' && typeof openSessionDetail === 'function') {
+      // RC-C2: the transcript reads HERE, fetched over the federation
+      // link (the Sessions overlay's peer lane); routeTo surfaces it.
+      const peerSession = (daemons.find(d => d.host_id === peerHostId)?.sessions || [])
+        .find(ps => ps.session_id === sessionId);
+      openSessionDetail(
+        { session_id: sessionId, source: peerSession?.source || 'intendant' },
+        null,
+        { hostId: peerHostId }
+      );
+      if (typeof routeTo === 'function') { try { routeTo('sessions'); } catch (_) {} }
+      return;
+    }
+    // Anything else (thread ops, config) still lives on the peer's own
+    // dashboard — no silent no-ops.
     showControlToast?.('info', `${op} for peer sessions happens on ${peerName}'s own dashboard.`);
     return;
   }
@@ -53339,11 +53413,14 @@ function stationPhaseFromPeerSession(phase) {
   return 'idle';
 }
 
-// A peer's non-primary sessions as display-only scene nodes orbiting
-// that peer's host (v1: no action pills — the SessionAction handlers
-// assume local session ids). Newest first, capped: the scene is a
-// bounded constellation by design (same doctrine as the recent-session
-// nodes); the peer's own dashboard remains the exhaustive list.
+// A peer's non-primary sessions as scene nodes orbiting that peer's
+// host. Host-scoped actions ride the RC-C1 routing (focus/steer target
+// the composer, interrupt via api_peer_session_control) plus the RC-C2
+// transcript read; a session-attributed pending approval renders the
+// node's approval prompt keyed (host, id). Newest first, capped: the
+// scene is a bounded constellation by design (same doctrine as the
+// recent-session nodes); the peer's own dashboard remains the
+// exhaustive list.
 const PEER_SESSION_SCENE_NODES = 12;
 function stationPeerSessionAgents(d) {
   try {
@@ -53391,9 +53468,26 @@ function stationPeerSessionAgents(d) {
         worktree: '',
         parentId: parentNodeId,
         needsApproval: !!s.needs_approval,
-        approvalId: null,
-        approvalCommand: '',
-        approvalCategory: '',
+        // RC-C2: approvals are session-attributed in the fold — surface
+        // this session's pending ask on its node so the Station prompt
+        // can resolve it (host-keyed; ids collide across daemons).
+        ...(() => {
+          const pending = typeof peerPendingApprovals !== 'undefined'
+            ? peerPendingApprovals.get(d.host_id)
+            : null;
+          if (pending) {
+            for (const [aid, entry] of pending) {
+              if (entry.sessionId && entry.sessionId === id) {
+                return {
+                  approvalId: aid,
+                  approvalCommand: entry.command || '',
+                  approvalCategory: entry.category || '',
+                };
+              }
+            }
+          }
+          return { approvalId: null, approvalCommand: '', approvalCategory: '' };
+        })(),
         sessionId: id,
         source,
         relationshipKind: kind,
@@ -55802,11 +55896,30 @@ function processCommands(cmds) {
         break;
       }
       case 'peer_approval_requested':
-        addPendingApproval(c.host_id, c.id, c.command, c.category);
+        // RC-C2: peer approvals are first-class in the merged rail —
+        // the peers-panel fold, the bottom approval panel/queue, and
+        // the attention center, all keyed (host, id) since approval
+        // ids are per-daemon counters that collide across daemons.
+        addPendingApproval(c.host_id, c.id, c.command, c.category, c.session_id);
+        if (typeof attentionAdd === 'function') {
+          attentionAdd('approval', c.session_id, c.id, true, {
+            hostId: c.host_id,
+            text: c.command || '',
+          });
+        }
+        if (typeof showApproval === 'function') {
+          showApproval(c.id, c.command, c.category, c.session_id || '', c.host_id);
+        }
         stationScheduleUpdate();
         break;
       case 'peer_approval_resolved':
         removePendingApproval(c.host_id, c.id);
+        if (typeof attentionRemove === 'function') {
+          attentionRemove('approval', null, c.id, true, 'resolved', c.host_id);
+        }
+        if (typeof retirePanelPeerApproval === 'function') {
+          retirePanelPeerApproval(c.host_id, c.id);
+        }
         stationScheduleUpdate();
         break;
       // Folded per-session snapshots from a peer's event stream —
@@ -74903,20 +75016,22 @@ function scheduleShowNextQueuedApproval() {
     const next = approvalDisplayQueue.shift();
     if (!next) return;
     if (typeof attentionItems !== 'undefined' && typeof attentionKey === 'function') {
-      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id))
-        || attentionItems.has(attentionKey('approval', '', next.id));
+      const host = next.hostId || '';
+      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id, host))
+        || attentionItems.has(attentionKey('approval', '', next.id, host));
       if (!tracked) {
         scheduleShowNextQueuedApproval();
         return;
       }
     }
-    showApproval(next.id, next.command, next.category, next.sessionId);
+    showApproval(next.id, next.command, next.category, next.sessionId, next.hostId);
   }, 0);
 }
 
 function clearPendingApproval() {
   pendingApprovalId = null;
   pendingApprovalSessionId = '';
+  pendingApprovalHostId = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
   setApprovalIndicator(false);
@@ -74933,18 +75048,25 @@ function revealActivityLogPanel() {
   }
 }
 
-function showApproval(id, command, category, sessionId) {
+function showApproval(id, command, category, sessionId, hostId) {
   if (processingLogReplay) return;
+  const host = hostId || '';
   // Concurrent approvals: keep the one on screen, queue the newcomer, and
   // badge the count — a second approval used to silently replace the first.
-  if (pendingApprovalId !== null && String(pendingApprovalId) !== String(id)) {
+  // Peer approvals share the queue (RC-C2) but key on (host, id): approval
+  // ids are per-daemon counters and collide across daemons by construction.
+  if (
+    pendingApprovalId !== null
+    && !(String(pendingApprovalId) === String(id) && pendingApprovalHostId === host)
+  ) {
     const qid = String(id);
-    if (!approvalDisplayQueue.some(q => String(q.id) === qid)) {
+    if (!approvalDisplayQueue.some(q => String(q.id) === qid && (q.hostId || '') === host)) {
       approvalDisplayQueue.push({
         id,
         command,
         category,
-        sessionId: sessionId || approvalSessionIds.get(qid) || '',
+        sessionId: sessionId || (host ? '' : approvalSessionIds.get(qid)) || '',
+        hostId: host,
       });
     }
     updateApprovalPendingCount();
@@ -74952,25 +75074,39 @@ function showApproval(id, command, category, sessionId) {
   }
   hideAllPanels();
   pendingApprovalId = id;
-  pendingApprovalSessionId =
-    sessionId
-    || approvalSessionIds.get(String(id))
-    || currentSessionFullId
-    || '';
-  if (pendingApprovalSessionId) {
-    ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
-    focusSessionWindow(pendingApprovalSessionId);
+  pendingApprovalHostId = host;
+  if (host) {
+    // The session id is the PEER's — never resolve or focus it against
+    // local windows; the provenance line names the peer context instead.
+    pendingApprovalSessionId = sessionId || '';
+  } else {
+    pendingApprovalSessionId =
+      sessionId
+      || approvalSessionIds.get(String(id))
+      || currentSessionFullId
+      || '';
+    if (pendingApprovalSessionId) {
+      ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
+      focusSessionWindow(pendingApprovalSessionId);
+    }
   }
   document.getElementById('approval-command').textContent = command;
   const approvalCategoryEl = document.getElementById('approval-category');
   approvalCategoryEl.textContent = category || '';
   // No category (older sessions, rehydrated approvals) → no empty pill.
   approvalCategoryEl.style.display = category ? '' : 'none';
-  stationCurrentApproval = {
-    id: String(id),
-    command: command || '',
-    category: category || '',
-  };
+  renderApprovalProvenance(host, pendingApprovalSessionId);
+  if (host) {
+    // Station already renders peer approvals from peerPendingApprovals —
+    // mirroring one into stationCurrentApproval would draw it twice.
+    stationCurrentApproval = null;
+  } else {
+    stationCurrentApproval = {
+      id: String(id),
+      command: command || '',
+      category: category || '',
+    };
+  }
   stationScheduleUpdate();
   revealActivityLogPanel();
   // A re-show of the same approval (bootstrap replay) lands here with the
@@ -74979,6 +75115,123 @@ function showApproval(id, command, category, sessionId) {
   document.getElementById('approval-panel').classList.add('visible');
   setApprovalIndicator(true);
   updateApprovalPendingCount();
+}
+
+// The provenance line under a PEER approval: names the governing daemon
+// and what deciding does NOW — the decision transits this daemon's peer
+// grant; the peer's own profile gate authorizes it (or refuses, if this
+// daemon's grant lacks approval.resolve — surfaced up front, honestly).
+function renderApprovalProvenance(hostId, peerSessionId) {
+  const el = document.getElementById('approval-provenance');
+  if (!el) return;
+  if (!hostId) {
+    el.hidden = true;
+    el.textContent = '';
+    el.removeAttribute('title');
+    return;
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkDown = entry ? entry.connected === false : false;
+  const denied = typeof peerAllowsOperation === 'function'
+    && !peerAllowsOperation(hostId, 'approval.resolve');
+  let text = `on ${label}`;
+  if (peerSessionId) text += ` · session ${String(peerSessionId).slice(0, 8)}`;
+  if (denied) {
+    text += ` — this daemon's grant at ${label} does not include approval.resolve`;
+  } else if (linkDown) {
+    text += ' — peer link reconnecting; deciding will fail until it returns';
+  } else {
+    text += ' — deciding sends through this daemon’s peer grant';
+  }
+  el.textContent = text;
+  el.title = denied
+    ? `${label} granted this daemon a profile without approval.resolve — the buttons below `
+      + 'will be refused by the peer. Decide it on the peer’s own dashboard.'
+    : `This approval was raised on ${label}. Your decision is sent to ${label} over the `
+      + `federation link and authorized there against the profile ${label} granted this `
+      + 'daemon (the delegation lane — the peer’s audit names this daemon, not you).';
+  el.hidden = false;
+}
+
+// Decide the panel's PEER approval (RC-C2). The action vocabulary maps
+// onto the four-way ApprovalDecision the federation wire speaks —
+// including approve_all → accept_for_session (ApproveAll on the peer),
+// which the Station lane used to silently degrade to a one-shot accept.
+// The api_peer_approval response IS the ack: unlike local approvals
+// there is no local waiting-phase evidence to watch, so the panel's
+// sending state resolves on the reply (the peer's approval_resolved
+// event also arrives on the fold and is idempotent).
+const PEER_APPROVAL_DECISIONS = Object.freeze({
+  approve: 'accept',
+  approve_all: 'accept_for_session',
+  deny: 'decline',
+  skip: 'cancel',
+});
+
+// A peer approval resolved (by us, another dashboard, or the peer's own
+// policy) — retire it from the panel/queue surfaces. Session-agnostic:
+// the resolve event carries only (host, id).
+function retirePanelPeerApproval(hostId, approvalId) {
+  const host = hostId || '';
+  const qid = String(approvalId);
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i--) {
+    const q = approvalDisplayQueue[i];
+    if ((q.hostId || '') === host && String(q.id) === qid) approvalDisplayQueue.splice(i, 1);
+  }
+  updateApprovalPendingCount();
+  if (pendingApprovalHostId === host && String(pendingApprovalId) === qid) {
+    setApprovalPanelSending(false);
+    clearPendingApproval();
+    hidePanel('approval-panel');
+  }
+}
+async function sendPeerApprovalFromPanel(hostId, approvalId, action) {
+  const decision = PEER_APPROVAL_DECISIONS[action];
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  if (!decision) {
+    showControlToast('error', `'${action}' is not a peer-routable approval decision`);
+    return;
+  }
+  if (typeof peerAllowsOperation === 'function'
+      && !peerAllowsOperation(hostId, 'approval.resolve')) {
+    showControlToast(
+      'error',
+      `${label} granted this daemon a profile without approval.resolve — decide this on ${label}'s own dashboard`
+    );
+    return;
+  }
+  if (entry && entry.connected === false) {
+    showControlToast('error', `${label} is not connected — the peer link is reconnecting`);
+    return;
+  }
+  setApprovalPanelSending(true);
+  try {
+    const resp = await daemonApi.request('api_peer_approval', {
+      peer_id: hostId,
+      request_id: String(approvalId),
+      decision,
+    });
+    if (resp.ok) {
+      removePendingApproval(hostId, approvalId);
+      if (typeof attentionRemove === 'function') {
+        attentionRemove('approval', pendingApprovalSessionId, approvalId, true, 'resolved', hostId);
+      }
+      setApprovalPanelSending(false);
+      clearPendingApproval();
+      hidePanel('approval-panel');
+    } else {
+      setApprovalPanelSending(false);
+      showControlToast(
+        'error',
+        `${label} refused (${resp.status})${resp.body?.error ? ` — ${resp.body.error}` : ''}`
+      );
+    }
+  } catch (e) {
+    setApprovalPanelSending(false);
+    showControlToast('error', `Could not reach ${label}: ${e?.message || e}`);
+  }
 }
 
 function showHumanInput(question) {
@@ -110634,10 +110887,21 @@ function sessionDetailErrorIsMissing(data) {
 // fallback policy. Callers keep the payload-with-error contract this
 // helper always had — errors surface as data.error, never as throws for
 // delivered responses (sessionDetailErrorIsMissing keys off that).
+//
+// RC-C2: `options.hostId` targets a PEER session's transcript. Two
+// lanes, one response shape (the peer's own api_session_detail body):
+// the browser↔peer dashboard-control tunnel when the link supports it
+// (the `api_sessions {target}` precedent), else the daemon-mediated
+// federation HTTP lane (`api_peer_session_detail`) — the
+// request/response path that works on relay-only links where no
+// datachannel can form. A response the PEER delivered (including its
+// own 403/404 refusals) is returned honestly either way; only an
+// undelivered lane-1 attempt falls through to lane 2.
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
   const source = String(options.source || 'intendant').trim() || 'intendant';
+  const hostId = String(options.hostId || '').trim();
   const params = { session_id: sid, source };
   if (options.limit !== undefined && options.limit !== null) {
     params.limit = options.limit;
@@ -110645,17 +110909,40 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
+  const unwrap = (resp) => {
+    const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+      ? resp.body
+      : {};
+    if (!resp.ok && !data.error) {
+      data.error = `HTTP ${resp.status}`;
+    }
+    return data;
+  };
+  if (hostId) {
+    if (
+      typeof peerDashboardControlSignalAvailable === 'function'
+      && peerDashboardControlSignalAvailable(hostId)
+    ) {
+      const resp = await daemonApi.request('api_session_detail', params, {
+        target: hostId,
+        signal: options.signal,
+        cache: options.cache,
+      });
+      const delivered = resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body);
+      if (resp.ok || delivered) return unwrap(resp);
+      // fall through: the datachannel attempt died undelivered
+    }
+    return unwrap(await daemonApi.request(
+      'api_peer_session_detail',
+      { peer_id: hostId, ...params },
+      { signal: options.signal, cache: options.cache }
+    ));
+  }
   const resp = await daemonApi.request('api_session_detail', params, {
     signal: options.signal,
     cache: options.cache,
   });
-  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
-    ? resp.body
-    : {};
-  if (!resp.ok && !data.error) {
-    data.error = `HTTP ${resp.status}`;
-  }
-  return data;
+  return unwrap(resp);
 }
 
 // daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
@@ -111525,8 +111812,20 @@ function updateDaemonSnapshot(snap) {
   if (!snap || !snap.id) return;
   const idx = daemons.findIndex(d => d.host_id === snap.id);
   if (idx < 0) return;
+  const wasConnected = daemons[idx].connected;
   daemons[idx] = snapshotToDaemonEntry(snap);
   upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
+  // Reconnect transition (RC-C2): pending approvals learned before the
+  // link dropped are unverifiable — anything resolved while the link
+  // was down never produced an `approval_resolved` here. Clear the
+  // host's fold and let the peer's bootstrap re-announce repopulate it
+  // (targets predating the re-announce degrade to the sessions rail's
+  // `needs_approval` boolean — honest, not stale). Approval surfaces
+  // re-render via the helpers' own repaint calls.
+  if (!wasConnected && daemons[idx].connected
+      && typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(snap.id, 'link reconnected — awaiting re-announce');
+  }
   renderDaemonsList();
   if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
 }
@@ -111557,9 +111856,15 @@ function removeDaemonById(id) {
   removeDashboardAccessTarget(id);
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
-  // approvals — once the peer is gone there's nothing to resolve.
+  // approvals — once the peer is gone there's nothing to resolve
+  // (clearPeerApprovalsForHost also sweeps the merged rail surfaces:
+  // approval panel/queue + attention items).
   expandedDaemons.delete(id);
-  peerPendingApprovals.delete(id);
+  if (typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(id, 'peer removed');
+  } else {
+    peerPendingApprovals.delete(id);
+  }
   // Tear down any active per-peer display: the peer is gone, the
   // RTCPeerConnection has nowhere to send signaling, and leaving it
   // alive would just stall on ICE failure.
@@ -111968,16 +112273,25 @@ function applyDaemonExpandedState(hostId, expanded) {
 // Approval requests arrive over each peer's secondary WebSocket as
 // `approval_required` events. They're surfaced inline in the peer's
 // controls panel with approve / deny / skip buttons that POST to
-// /api/peers/{id}/approval. Buttons map to the four-way ApprovalDecision
-// vocabulary (accept / accept_for_session / decline / cancel) — the
-// dashboard surfaces three of them today; AcceptForSession can be added
-// when there's a use case. Wire-level encoding is in
-// peer::transport::intendant (ResolveApproval → ControlMsg::Approve|Deny|Skip).
+// /api/peers/{id}/approval, and (RC-C2) fold into the merged global
+// rail — the bottom approval panel/queue + the attention center — keyed
+// (host, id). Buttons map to the four-way ApprovalDecision vocabulary
+// (accept / accept_for_session / decline / cancel); the panel's
+// "Approve all" maps to accept_for_session (→ ControlMsg::ApproveAll on
+// the peer). Wire-level encoding is in peer::transport::intendant
+// (ResolveApproval → ControlMsg::Approve|ApproveAll|Deny|Skip).
 
-function addPendingApproval(hostId, approvalId, command, category) {
+function addPendingApproval(hostId, approvalId, command, category, sessionId) {
   let m = peerPendingApprovals.get(hostId);
   if (!m) { m = new Map(); peerPendingApprovals.set(hostId, m); }
-  m.set(String(approvalId), { command: command || '', category: category || '' });
+  m.set(String(approvalId), {
+    command: command || '',
+    category: category || '',
+    // The PEER's session id (RC-C2, additive on the wire) — lets the
+    // merged rail and Station session nodes attribute the ask; '' from
+    // peers predating the field.
+    sessionId: sessionId || '',
+  });
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }
@@ -111987,6 +112301,25 @@ function removePendingApproval(hostId, approvalId) {
   if (!m) return;
   m.delete(String(approvalId));
   if (m.size === 0) peerPendingApprovals.delete(hostId);
+  renderPeerApprovals(hostId);
+  stationScheduleUpdate();
+}
+
+// Sweep every approval surface for one host (RC-C2). Two callers with
+// the same honesty rationale: a reconnect (entries learned before the
+// drop are unverifiable — the peer's bootstrap re-announce repopulates
+// what is still pending; older peers degrade to the sessions rail's
+// needs_approval boolean) and peer removal (nothing left to resolve).
+function clearPeerApprovalsForHost(hostId, reason) {
+  const m = peerPendingApprovals.get(hostId);
+  const ids = m ? [...m.keys()] : [];
+  peerPendingApprovals.delete(hostId);
+  for (const id of ids) {
+    if (typeof retirePanelPeerApproval === 'function') retirePanelPeerApproval(hostId, id);
+    if (typeof attentionRemove === 'function') {
+      attentionRemove('approval', null, id, true, reason || 'link reset', hostId);
+    }
+  }
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }
@@ -128259,8 +128592,10 @@ function setSessionsHost(hostId) {
 // Whole-card action while browsing a peer: hand off to the peer's own
 // dashboard (its own auth applies there) rather than faking cross-daemon
 // session control this daemon has no authority for.
-function openPeerSessionExternally(s) {
-  const host = sessionsHostRowFor(currentSessionsHostId());
+function openPeerSessionExternally(s, hostId) {
+  // Explicit host when the caller knows it (the peer transcript banner);
+  // the Sessions pane's active host otherwise.
+  const host = sessionsHostRowFor(hostId || currentSessionsHostId());
   const base = String(host?.browser_tcp_via_url || host?.url || '').replace(/\/+$/, '');
   if (!base) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');
@@ -131179,8 +131514,12 @@ function buildSessionCard(m, derived, ctx) {
 
   if (ctx.viewingPeer) {
     card.classList.add('sc-peer');
-    card.title = 'Open this session on the peer’s dashboard';
-    card.addEventListener('click', () => openPeerSessionExternally(s));
+    // RC-C2: the card opens the transcript HERE, fetched over the
+    // federation link — the peer's own dashboard stays one click away
+    // inside the overlay (frames/recordings/live view live there).
+    card.title = 'Read this session’s transcript (fetched from the peer)';
+    const peerHostForDetail = typeof currentSessionsHostId === 'function' ? currentSessionsHostId() : '';
+    card.addEventListener('click', () => openSessionDetail(s, null, { hostId: peerHostForDetail }));
   } else {
     card.addEventListener('click', () => openSessionDetail(s));
   }
@@ -133040,8 +133379,18 @@ function renderSessionDetailTitle(session) {
   titleText.title = primaryText;
   const titleId = document.createElement('span');
   titleId.className = 'sd-title-id';
-  titleId.textContent = `${sourceLabel} ${sessionId}`;
-  titleId.title = sessionId;
+  // Peer transcripts (RC-C2) name their governing daemon in the title —
+  // provenance is explicit even before the banner renders.
+  const peerHost = String(session.hostId || '').trim();
+  if (peerHost) {
+    const peerEntry = typeof peerEntryForHost === 'function' ? peerEntryForHost(peerHost) : null;
+    const peerLabel = peerEntry?.label || peerHost;
+    titleId.textContent = `${sourceLabel} ${sessionId} on ${peerLabel}`;
+    titleId.title = `${sessionId} — a session on ${peerLabel}, read over the federation link`;
+  } else {
+    titleId.textContent = `${sourceLabel} ${sessionId}`;
+    titleId.title = sessionId;
+  }
   titleLine.appendChild(titleKind);
   titleLine.appendChild(titleText);
   titleLine.appendChild(titleId);
@@ -133155,12 +133504,18 @@ function prepareSessionDetailContext(ctx, detailEl) {
   return true;
 }
 
-function openSessionDetail(sessionOrId, taskArg) {
+function openSessionDetail(sessionOrId, taskArg, opts) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
   const sessionId = session.session_id;
   const source = session.source || 'intendant';
+  // Peer transcript lane (RC-C2): `hostId` reads the session's transcript
+  // from a federated peer. Same overlay, same renderer, one extra rail of
+  // honesty: explicit target provenance, a fetched-at stamp with refresh,
+  // and peer-store-resident media (frames, recordings) rendered as absent
+  // instead of dead thumbnails.
+  const hostId = String(opts?.hostId || session.hostId || '').trim();
   const detailEl = document.getElementById('session-detail');
   const logsEl = document.getElementById('session-detail-logs');
   const detailSubtab = activeSessionsSubtab === 'deep' ? 'deep' : 'recent';
@@ -133168,7 +133523,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   if (!detailEl || !logsEl || !prepareSessionDetailContext(detailContext, detailEl)) return;
 
   detailEl.classList.remove('hidden');
-  currentSessionDetail = { ...session, source };
+  currentSessionDetail = { ...session, source, hostId };
   renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
   sessionDetailLogView = null;
@@ -133178,6 +133533,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   document.getElementById('sd-recordings').classList.add('hidden');
   document.getElementById('sd-frames').classList.add('hidden');
   document.getElementById('session-detail-frames').innerHTML = '';
+  renderPeerDetailBanner(hostId, sessionId, source, null);
 
   const detailSessionId = sessionId;
   const detailSource = source;
@@ -133189,19 +133545,30 @@ function openSessionDetail(sessionOrId, taskArg) {
     failure.textContent = message;
     logsEl.appendChild(failure);
   };
-  fetchSessionDetailPayload(detailSessionId, { source: detailSource, limit: SESSION_DETAIL_PAGE_LIMIT })
+  fetchSessionDetailPayload(detailSessionId, {
+    source: detailSource,
+    limit: SESSION_DETAIL_PAGE_LIMIT,
+    hostId,
+  })
     .then(data => {
+      if (currentSessionDetail?.session_id !== detailSessionId) return;
       if (data.error) {
         renderDetailFailure(String(data.error));
+        if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: String(data.error) });
         return;
       }
       const entries = data.entries || [];
-      applySessionIdentitiesFromReplayEntries(entries);
-      applySessionGoalsFromReplayEntries(entries);
-      applySessionPrsFromReplayEntries(entries);
+      if (!hostId) {
+        // Identity/goal/PR side-tables are LOCAL session state — a peer's
+        // entries must not pollute them (its session ids are not ours).
+        applySessionIdentitiesFromReplayEntries(entries);
+        applySessionGoalsFromReplayEntries(entries);
+        applySessionPrsFromReplayEntries(entries);
+      }
       renderSessionDetailLogs(entries, logsEl, {
         sessionId: detailSessionId,
         source: detailSource,
+        hostId,
         pageStart: data.page_start ?? data.pageStart,
         pageEnd: data.page_end ?? data.pageEnd,
         totalEntries: data.total_entries ?? data.totalEntries,
@@ -133209,26 +133576,121 @@ function openSessionDetail(sessionOrId, taskArg) {
       });
       updateSessionDetailLogsBadge(sessionDetailLogView, entries.length);
 
-      // Render frames gallery
+      // Render frames gallery. Peer frames live in the PEER's stores —
+      // the gallery would be dead thumbnails; the banner says so instead.
       const frames = data.frames || [];
-      if (frames.length > 0) {
+      if (frames.length > 0 && !hostId) {
         renderSessionFrames(sessionId, frames);
+      }
+      if (hostId) {
+        renderPeerDetailBanner(hostId, detailSessionId, detailSource, {
+          fetchedAt: Date.now(),
+          frameCount: frames.length,
+        });
       }
     })
     .catch(e => {
       renderDetailFailure(`Failed to load${e?.message ? ` — ${e.message}` : ''}`);
+      if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: e?.message || 'failed to load' });
     });
 
   // Lazy-load recordings for Intendant sessions. External CLI histories do not
-  // have Intendant media directories.
-  if (source === 'intendant') {
+  // have Intendant media directories; peer recordings live on the peer.
+  if (source === 'intendant' && !hostId) {
     loadSessionRecordings(sessionId);
+  }
+}
+
+// The provenance banner above a PEER transcript (RC-C2): names the
+// governing daemon and the link class, stamps when the page was fetched
+// (a transcript page is a snapshot, never a live stream), offers Refresh,
+// and links the peer's own dashboard for everything that stays there
+// (frames, recordings, full history). Every line says what is true NOW.
+function renderPeerDetailBanner(hostId, sessionId, source, state) {
+  const detailEl = document.getElementById('session-detail');
+  if (!detailEl) return;
+  let banner = document.getElementById('session-detail-peer-banner');
+  if (!hostId) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'session-detail-peer-banner';
+    banner.className = 'session-detail-peer-banner';
+    const titleEl = document.getElementById('session-detail-title');
+    if (titleEl && titleEl.parentElement) {
+      titleEl.insertAdjacentElement('afterend', banner);
+    } else {
+      detailEl.prepend(banner);
+    }
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkClass = entry?.link?.transport_class || '';
+  const linkDown = entry ? entry.connected === false : false;
+  banner.textContent = '';
+  const who = document.createElement('span');
+  who.className = 'sd-peer-who';
+  who.textContent = `Transcript from ${label}`;
+  who.title = `Fetched over the federation link under this daemon's peer identity; `
+    + `${label}'s own profile gate authorized the read.`;
+  banner.appendChild(who);
+  if (linkClass) {
+    const chip = document.createElement('span');
+    chip.className = 'sd-peer-link-chip';
+    chip.textContent = linkClass === 'relayed' ? 'relay link' : 'direct link';
+    chip.title = linkClass === 'relayed'
+      ? 'Reachability-relay link: request/response only — no live media or datachannels.'
+      : 'Direct federation link.';
+    banner.appendChild(chip);
+  }
+  const status = document.createElement('span');
+  status.className = 'sd-peer-status';
+  if (state?.error) {
+    status.textContent = `— ${state.error}`;
+    status.dataset.state = 'error';
+  } else if (state?.fetchedAt) {
+    const stamp = new Date(state.fetchedAt).toLocaleTimeString();
+    status.textContent = linkDown
+      ? `— snapshot from ${stamp}; peer link down, refresh will fail until it returns`
+      : `— snapshot fetched ${stamp}`;
+    if (state.frameCount > 0) {
+      status.textContent += ` · ${state.frameCount} frame${state.frameCount === 1 ? '' : 's'} on ${label} (not proxied)`;
+    }
+  } else {
+    status.textContent = linkDown ? '— peer link reconnecting…' : '— fetching…';
+  }
+  banner.appendChild(status);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'sd-peer-refresh';
+  refresh.textContent = 'Refresh';
+  refresh.title = `Re-fetch this transcript page from ${label} now.`;
+  refresh.addEventListener('click', () => {
+    if (currentSessionDetail?.session_id === sessionId) {
+      openSessionDetail(currentSessionDetail, null, { hostId });
+    }
+  });
+  banner.appendChild(refresh);
+  if (entry && typeof openPeerSessionExternally === 'function') {
+    const external = document.createElement('button');
+    external.type = 'button';
+    external.className = 'sd-peer-external';
+    external.textContent = `Open on ${label}`;
+    external.title = `Open ${label}'s own dashboard (full history, frames, recordings, live view).`;
+    external.addEventListener('click', () => {
+      openPeerSessionExternally({ session_id: sessionId, source }, hostId);
+    });
+    banner.appendChild(external);
   }
 }
 
 function closeSessionDetail() {
   // Clean up session recording player
   if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
+  const peerBanner = document.getElementById('session-detail-peer-banner');
+  if (peerBanner) peerBanner.remove();
   revokeSessionFrameObjectUrls();
   document.getElementById('session-detail-recordings').innerHTML = '';
   document.getElementById('session-detail-frames').innerHTML = '';
@@ -133575,6 +134037,7 @@ function updateSessionDetailViewPageState(view, info = {}) {
     ''
   ).trim();
   view.source = normalizeAgentId(info.source || view.source || currentSessionDetail?.source || 'intendant') || 'intendant';
+  view.hostId = String(info.hostId ?? view.hostId ?? currentSessionDetail?.hostId ?? '').trim();
 
   const pageStart = sessionDetailNumberOrNull(info.pageStart ?? info.page_start);
   if (pageStart !== null) {
@@ -134325,6 +134788,7 @@ function loadOlderRemoteSessionDetailRows(view) {
     limit: SESSION_DETAIL_PAGE_LIMIT,
     before,
     cache: 'no-store',
+    hostId: view.hostId || currentSessionDetail?.hostId || '',
   })
     .then(data => {
       if (sessionDetailLogView !== view || view.scroller?._sessionDetailView !== view || data?.error) return;
@@ -135913,7 +136377,7 @@ const ATTENTION_BADGE_KEY = 'intendant.attention.badge'; // 'off' disables; defa
 const ATTENTION_NOTIFY_KEY = 'intendant.attention.notify'; // 'on' enables; default off
 const ATTENTION_NOTIFY_DEBOUNCE_MS = 1500;
 
-// key "kind:sessionKey:id" -> { kind, sessionId, id, ts, title, text }
+// key "kind:host:sessionKey:id" -> { kind, sessionId, hostId, id, ts, title, text }
 // (`ts` is the item's arrival time in ms — the wire `ts` when the event
 // carries one, else receipt time; `title`/`text` are kept for `notify`
 // items so the inbox can still name the cause after the toast expired.)
@@ -135955,8 +136419,12 @@ function attentionSessionKey(sessionId) {
   return (sessionId && String(sessionId)) || 'main';
 }
 
-function attentionKey(kind, sessionId, id) {
-  return `${kind}:${attentionSessionKey(sessionId)}:${String(id)}`;
+// Keys carry a host dimension (RC-C2): peer approvals share the rail,
+// and approval ids are per-daemon counters that collide across daemons
+// — without the host a session-less peer approval and a session-less
+// local one with the same id would merge into one item.
+function attentionKey(kind, sessionId, id, hostId) {
+  return `${kind}:${hostId || 'local'}:${attentionSessionKey(sessionId)}:${String(id)}`;
 }
 
 function attentionTailPush(item, reason) {
@@ -135966,12 +136434,14 @@ function attentionTailPush(item, reason) {
 
 function attentionAdd(kind, sessionId, id, live, meta) {
   if (id === undefined || id === null) return;
-  const key = attentionKey(kind, sessionId, id);
+  const hostId = (meta && meta.hostId) || '';
+  const key = attentionKey(kind, sessionId, id, hostId);
   const prior = attentionItems.get(key);
   const wireTs = meta && Number(meta.ts);
   attentionItems.set(key, {
     kind,
     sessionId: sessionId || '',
+    hostId,
     id,
     ts: (prior && prior.ts)
       || (Number.isFinite(wireTs) && wireTs > 0 ? wireTs : Date.now()),
@@ -135986,9 +136456,24 @@ function attentionAdd(kind, sessionId, id, live, meta) {
 }
 
 // Removal driven by a wire event (`live` false while rebuilding from
-// replayed history, which never feeds the recent tail).
-function attentionRemove(kind, sessionId, id, live, reason) {
-  const key = attentionKey(kind, sessionId, id);
+// replayed history, which never feeds the recent tail). Peer removals
+// (RC-C2) may arrive session-blind — `peer_approval_resolved` carries
+// only (host, id) — so a host-scoped removal with a null sessionId
+// scans for the item instead of keying directly.
+function attentionRemove(kind, sessionId, id, live, reason, hostId) {
+  const host = hostId || '';
+  if (host && (sessionId === undefined || sessionId === null)) {
+    const sid = String(id);
+    for (const [key, item] of [...attentionItems]) {
+      if (item.kind === kind && item.hostId === host && String(item.id) === sid) {
+        attentionItems.delete(key);
+        if (live) attentionTailPush(item, reason || 'resolved');
+      }
+    }
+    attentionRepaint();
+    return;
+  }
+  const key = attentionKey(kind, sessionId, id, host);
   const item = attentionItems.get(key);
   if (!item) return;
   attentionItems.delete(key);
@@ -135998,7 +136483,9 @@ function attentionRemove(kind, sessionId, id, live, reason) {
 function attentionClearSession(sessionId, live) {
   const sessionKey = attentionSessionKey(sessionId);
   for (const [key, item] of [...attentionItems]) {
-    if (attentionSessionKey(item.sessionId) === sessionKey) {
+    // Local-lane sweep: peer items (RC-C2) retire on their own peer
+    // events / link transitions, never on local session lifecycle.
+    if (!item.hostId && attentionSessionKey(item.sessionId) === sessionKey) {
       attentionItems.delete(key);
       if (live) attentionTailPush(item, 'session ended');
     }
@@ -136089,7 +136576,8 @@ function attentionApplyEvent(d, live) {
     // them whenever the main session finished any turn.)
     const sessionKey = attentionSessionKey(d.session_id);
     for (const [key, item] of [...attentionItems]) {
-      if (attentionSessionKey(item.sessionId) === sessionKey
+      if (!item.hostId
+          && attentionSessionKey(item.sessionId) === sessionKey
           && item.kind !== 'display' && item.kind !== 'radar' && item.kind !== 'notify') {
         attentionItems.delete(key);
         if (live) attentionTailPush(item, 'turn ended');
@@ -136106,7 +136594,24 @@ function attentionApplyEvent(d, live) {
 // dead stream can't retract items, so a stale badge would lie — clear and
 // let the reconnect bootstrap rebuild what is still pending.
 function attentionOnServerState(connected) {
-  if (!connected) attentionClearAll();
+  if (!connected) {
+    attentionClearAll();
+    return;
+  }
+  // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
+  // but their source of truth — the browser-side peer fold — survived a
+  // local transport flap. Rebuild them; peer-link transitions own their
+  // real invalidation (clearPeerApprovalsForHost).
+  if (typeof peerPendingApprovals !== 'undefined') {
+    for (const [hostId, pending] of peerPendingApprovals) {
+      for (const [id, entry] of pending) {
+        attentionAdd('approval', entry.sessionId || '', id, false, {
+          hostId,
+          text: entry.command || '',
+        });
+      }
+    }
+  }
 }
 
 // ── Title + favicon badge ──
@@ -136189,6 +136694,17 @@ function attentionPaintChip() {
 
 function attentionSessionLabel(item) {
   const sid = String(item.sessionId || '').trim();
+  // Peer items (RC-C2): name the governing daemon — the session id is
+  // the PEER's and means nothing to local session metadata. Explicit
+  // target provenance on every peer-attributed item.
+  if (item.hostId) {
+    let label = item.hostId;
+    try {
+      const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(item.hostId) : null;
+      if (entry && entry.label) label = entry.label;
+    } catch (_) {}
+    return sid ? `on ${label} · ${sid.slice(0, 8)}` : `on ${label}`;
+  }
   // Session-less notifications are the agenda scheduler's (reminders,
   // scheduled-session outcomes) — name their home, not a session.
   if (!sid) return item.kind === 'notify' ? 'Agenda' : 'main session';
@@ -136223,6 +136739,24 @@ function attentionDefaultPrimary(kind) {
 // never call showPanel/hideAllPanels here (both clear pending ask state).
 function attentionNavigate(item) {
   attentionInboxSetOpen(false);
+  // Peer approvals (RC-C2): the handling surface is the merged approval
+  // panel — surface that entry (or its queue slot) and reveal the panel.
+  // The session id is the PEER's; never resolve it against local windows.
+  if (item.hostId) {
+    const pending = typeof peerPendingApprovals !== 'undefined'
+      ? peerPendingApprovals.get(item.hostId)
+      : null;
+    const entry = pending ? pending.get(String(item.id)) : null;
+    if (entry && typeof showApproval === 'function') {
+      showApproval(item.id, entry.command, entry.category, entry.sessionId || '', item.hostId);
+      if (typeof routeTo === 'function') { try { routeTo('activity'); } catch (_) {} }
+    } else if (typeof routeTo === 'function') {
+      // Not in the fold anymore (resolved elsewhere / link reset) — the
+      // peer row panel is the fallback surface.
+      try { routeTo('access'); } catch (_) {}
+    }
+    return;
+  }
   const sid = String(item.sessionId || '').trim();
   if (item.kind === 'notify') {
     // Click IS the acknowledgement — retire to the recent tail, then go
@@ -136250,7 +136784,7 @@ function attentionNavigate(item) {
 // Inbox-driven retirement (notify click/dismiss): the one removal path
 // that is a user act rather than a wire event.
 function attentionRetire(item, reason) {
-  const key = attentionKey(item.kind, item.sessionId, item.id);
+  const key = attentionKey(item.kind, item.sessionId, item.id, item.hostId);
   const found = attentionItems.get(key);
   if (!found) return;
   attentionItems.delete(key);
@@ -136289,7 +136823,9 @@ function attentionInboxItem(item, recent) {
       // the cleared cause may need follow-up.
       attentionInboxSetOpen(false);
       const sid = String(item.sessionId || '').trim();
-      if (sid && typeof focusSessionWindow === 'function') {
+      if (item.hostId) {
+        if (typeof routeTo === 'function') { try { routeTo('access'); } catch (_) {} }
+      } else if (sid && typeof focusSessionWindow === 'function') {
         try { focusSessionWindow(sid); } catch (_) {}
       } else if (item.kind === 'notify' && typeof routeTo === 'function') {
         try { routeTo('agenda'); } catch (_) {}
@@ -136601,6 +137137,16 @@ window.sendApproval = function(action) {
   // A send is already in flight for the shown approval — don't double-fire
   // (keyboard shortcuts stay wired; they just no-op while disabled).
   if (approvalSendPending) return;
+  // Peer approvals (RC-C2): decided via api_peer_approval under this
+  // daemon's peer grant — the local session-control lane, the detached-
+  // session guard, and the local ack tracker do not apply. The panel's
+  // sending state resolves on the peer's reply.
+  if (pendingApprovalHostId) {
+    const panel = document.getElementById('approval-panel');
+    if (panel && panel.classList.contains('approval-sending')) return;
+    sendPeerApprovalFromPanel(pendingApprovalHostId, pendingApprovalId, action);
+    return;
+  }
   if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
     showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
     approvalSessionIds.delete(String(pendingApprovalId));

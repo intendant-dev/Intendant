@@ -32,7 +32,7 @@ const ATTENTION_BADGE_KEY = 'intendant.attention.badge'; // 'off' disables; defa
 const ATTENTION_NOTIFY_KEY = 'intendant.attention.notify'; // 'on' enables; default off
 const ATTENTION_NOTIFY_DEBOUNCE_MS = 1500;
 
-// key "kind:sessionKey:id" -> { kind, sessionId, id, ts, title, text }
+// key "kind:host:sessionKey:id" -> { kind, sessionId, hostId, id, ts, title, text }
 // (`ts` is the item's arrival time in ms — the wire `ts` when the event
 // carries one, else receipt time; `title`/`text` are kept for `notify`
 // items so the inbox can still name the cause after the toast expired.)
@@ -74,8 +74,12 @@ function attentionSessionKey(sessionId) {
   return (sessionId && String(sessionId)) || 'main';
 }
 
-function attentionKey(kind, sessionId, id) {
-  return `${kind}:${attentionSessionKey(sessionId)}:${String(id)}`;
+// Keys carry a host dimension (RC-C2): peer approvals share the rail,
+// and approval ids are per-daemon counters that collide across daemons
+// — without the host a session-less peer approval and a session-less
+// local one with the same id would merge into one item.
+function attentionKey(kind, sessionId, id, hostId) {
+  return `${kind}:${hostId || 'local'}:${attentionSessionKey(sessionId)}:${String(id)}`;
 }
 
 function attentionTailPush(item, reason) {
@@ -85,12 +89,14 @@ function attentionTailPush(item, reason) {
 
 function attentionAdd(kind, sessionId, id, live, meta) {
   if (id === undefined || id === null) return;
-  const key = attentionKey(kind, sessionId, id);
+  const hostId = (meta && meta.hostId) || '';
+  const key = attentionKey(kind, sessionId, id, hostId);
   const prior = attentionItems.get(key);
   const wireTs = meta && Number(meta.ts);
   attentionItems.set(key, {
     kind,
     sessionId: sessionId || '',
+    hostId,
     id,
     ts: (prior && prior.ts)
       || (Number.isFinite(wireTs) && wireTs > 0 ? wireTs : Date.now()),
@@ -105,9 +111,24 @@ function attentionAdd(kind, sessionId, id, live, meta) {
 }
 
 // Removal driven by a wire event (`live` false while rebuilding from
-// replayed history, which never feeds the recent tail).
-function attentionRemove(kind, sessionId, id, live, reason) {
-  const key = attentionKey(kind, sessionId, id);
+// replayed history, which never feeds the recent tail). Peer removals
+// (RC-C2) may arrive session-blind — `peer_approval_resolved` carries
+// only (host, id) — so a host-scoped removal with a null sessionId
+// scans for the item instead of keying directly.
+function attentionRemove(kind, sessionId, id, live, reason, hostId) {
+  const host = hostId || '';
+  if (host && (sessionId === undefined || sessionId === null)) {
+    const sid = String(id);
+    for (const [key, item] of [...attentionItems]) {
+      if (item.kind === kind && item.hostId === host && String(item.id) === sid) {
+        attentionItems.delete(key);
+        if (live) attentionTailPush(item, reason || 'resolved');
+      }
+    }
+    attentionRepaint();
+    return;
+  }
+  const key = attentionKey(kind, sessionId, id, host);
   const item = attentionItems.get(key);
   if (!item) return;
   attentionItems.delete(key);
@@ -117,7 +138,9 @@ function attentionRemove(kind, sessionId, id, live, reason) {
 function attentionClearSession(sessionId, live) {
   const sessionKey = attentionSessionKey(sessionId);
   for (const [key, item] of [...attentionItems]) {
-    if (attentionSessionKey(item.sessionId) === sessionKey) {
+    // Local-lane sweep: peer items (RC-C2) retire on their own peer
+    // events / link transitions, never on local session lifecycle.
+    if (!item.hostId && attentionSessionKey(item.sessionId) === sessionKey) {
       attentionItems.delete(key);
       if (live) attentionTailPush(item, 'session ended');
     }
@@ -208,7 +231,8 @@ function attentionApplyEvent(d, live) {
     // them whenever the main session finished any turn.)
     const sessionKey = attentionSessionKey(d.session_id);
     for (const [key, item] of [...attentionItems]) {
-      if (attentionSessionKey(item.sessionId) === sessionKey
+      if (!item.hostId
+          && attentionSessionKey(item.sessionId) === sessionKey
           && item.kind !== 'display' && item.kind !== 'radar' && item.kind !== 'notify') {
         attentionItems.delete(key);
         if (live) attentionTailPush(item, 'turn ended');
@@ -225,7 +249,24 @@ function attentionApplyEvent(d, live) {
 // dead stream can't retract items, so a stale badge would lie — clear and
 // let the reconnect bootstrap rebuild what is still pending.
 function attentionOnServerState(connected) {
-  if (!connected) attentionClearAll();
+  if (!connected) {
+    attentionClearAll();
+    return;
+  }
+  // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
+  // but their source of truth — the browser-side peer fold — survived a
+  // local transport flap. Rebuild them; peer-link transitions own their
+  // real invalidation (clearPeerApprovalsForHost).
+  if (typeof peerPendingApprovals !== 'undefined') {
+    for (const [hostId, pending] of peerPendingApprovals) {
+      for (const [id, entry] of pending) {
+        attentionAdd('approval', entry.sessionId || '', id, false, {
+          hostId,
+          text: entry.command || '',
+        });
+      }
+    }
+  }
 }
 
 // ── Title + favicon badge ──
@@ -308,6 +349,17 @@ function attentionPaintChip() {
 
 function attentionSessionLabel(item) {
   const sid = String(item.sessionId || '').trim();
+  // Peer items (RC-C2): name the governing daemon — the session id is
+  // the PEER's and means nothing to local session metadata. Explicit
+  // target provenance on every peer-attributed item.
+  if (item.hostId) {
+    let label = item.hostId;
+    try {
+      const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(item.hostId) : null;
+      if (entry && entry.label) label = entry.label;
+    } catch (_) {}
+    return sid ? `on ${label} · ${sid.slice(0, 8)}` : `on ${label}`;
+  }
   // Session-less notifications are the agenda scheduler's (reminders,
   // scheduled-session outcomes) — name their home, not a session.
   if (!sid) return item.kind === 'notify' ? 'Agenda' : 'main session';
@@ -342,6 +394,24 @@ function attentionDefaultPrimary(kind) {
 // never call showPanel/hideAllPanels here (both clear pending ask state).
 function attentionNavigate(item) {
   attentionInboxSetOpen(false);
+  // Peer approvals (RC-C2): the handling surface is the merged approval
+  // panel — surface that entry (or its queue slot) and reveal the panel.
+  // The session id is the PEER's; never resolve it against local windows.
+  if (item.hostId) {
+    const pending = typeof peerPendingApprovals !== 'undefined'
+      ? peerPendingApprovals.get(item.hostId)
+      : null;
+    const entry = pending ? pending.get(String(item.id)) : null;
+    if (entry && typeof showApproval === 'function') {
+      showApproval(item.id, entry.command, entry.category, entry.sessionId || '', item.hostId);
+      if (typeof routeTo === 'function') { try { routeTo('activity'); } catch (_) {} }
+    } else if (typeof routeTo === 'function') {
+      // Not in the fold anymore (resolved elsewhere / link reset) — the
+      // peer row panel is the fallback surface.
+      try { routeTo('access'); } catch (_) {}
+    }
+    return;
+  }
   const sid = String(item.sessionId || '').trim();
   if (item.kind === 'notify') {
     // Click IS the acknowledgement — retire to the recent tail, then go
@@ -369,7 +439,7 @@ function attentionNavigate(item) {
 // Inbox-driven retirement (notify click/dismiss): the one removal path
 // that is a user act rather than a wire event.
 function attentionRetire(item, reason) {
-  const key = attentionKey(item.kind, item.sessionId, item.id);
+  const key = attentionKey(item.kind, item.sessionId, item.id, item.hostId);
   const found = attentionItems.get(key);
   if (!found) return;
   attentionItems.delete(key);
@@ -408,7 +478,9 @@ function attentionInboxItem(item, recent) {
       // the cleared cause may need follow-up.
       attentionInboxSetOpen(false);
       const sid = String(item.sessionId || '').trim();
-      if (sid && typeof focusSessionWindow === 'function') {
+      if (item.hostId) {
+        if (typeof routeTo === 'function') { try { routeTo('access'); } catch (_) {} }
+      } else if (sid && typeof focusSessionWindow === 'function') {
         try { focusSessionWindow(sid); } catch (_) {}
       } else if (item.kind === 'notify' && typeof routeTo === 'function') {
         try { routeTo('agenda'); } catch (_) {}

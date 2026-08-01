@@ -757,6 +757,13 @@ function ui2StampApprovalSession() {
     chip.className = 'ui2-approval-session';
     title.appendChild(chip);
   }
+  // Peer approvals (RC-C2): the provenance line owns the naming — the
+  // chip's session badge styling keys off LOCAL session identity and
+  // would mislabel a peer's session id.
+  if (typeof pendingApprovalHostId !== 'undefined' && pendingApprovalHostId) {
+    chip.hidden = true;
+    return;
+  }
   const sid = (typeof pendingApprovalSessionId !== 'undefined' && pendingApprovalSessionId) || '';
   if (!sid) { chip.hidden = true; return; }
   chip.hidden = false;

@@ -1500,6 +1500,15 @@ html.ui-v2 #approval-panel .approval-category {
 }
 /* keep v1's empty-hide winning */
 html.ui-v2 #approval-panel .approval-category:empty { display: none; }
+/* Peer provenance line (RC-C2): names the governing daemon under a
+   peer-raised approval — quiet but always legible. */
+html.ui-v2 #approval-panel .approval-provenance {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: -4px 0 10px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 #approval-panel .approval-provenance[hidden] { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   height: 33px;

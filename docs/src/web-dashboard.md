@@ -122,7 +122,25 @@ interrupt) routed through `api_peer_session_control` and derived from the
 peer-advertised grant, and media affordances (live display, file transfer,
 the browser↔peer control tunnel) render from the connected link's transport
 class — a relay-only peer gets an honest "no live media" note plus the
-federation-fold session list instead of dead pills. Agenda, Memory,
+federation-fold session list instead of dead pills. **Peer transcripts**
+(RC-C2): clicking a peer session card (or a Station peer node's transcript
+action) opens the session-detail overlay reading the transcript *from the
+peer* — over the browser↔peer tunnel when the link supports it, else the
+daemon-mediated `api_peer_session_detail` federation fetch that works on
+relay-only links — under a provenance banner naming the peer, the link
+class, and the snapshot's fetch time, with Refresh and an "Open on
+<peer>" hand-off; frames and recordings stay on the peer and render as
+absent, never as dead thumbnails. **Peer approvals** fold into the global
+rail: the bottom approval panel, its queue, and the attention center key
+every item by `(host, id)` — approval ids are per-daemon counters that
+collide across daemons — with a provenance line naming the governing
+daemon and the delegation lane; deciding routes through
+`api_peer_approval` under this daemon's peer grant (Approve all maps to
+`accept_for_session`), the peer's own profile gate authorizes it, and a
+grant known to lack `approval.resolve` is said up front instead of
+failing after the click. On a peer-link reconnect the fold clears and
+repopulates from the peer's bootstrap re-announce — older peers degrade
+to the session rows' `needs_approval` mark. Agenda, Memory,
 Vault/custody, Access/IAM, and Settings never route to a peer.
 
 The section headings below keep the internal pane names (`Video` is the Live

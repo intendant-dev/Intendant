@@ -4038,20 +4038,22 @@ function scheduleShowNextQueuedApproval() {
     const next = approvalDisplayQueue.shift();
     if (!next) return;
     if (typeof attentionItems !== 'undefined' && typeof attentionKey === 'function') {
-      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id))
-        || attentionItems.has(attentionKey('approval', '', next.id));
+      const host = next.hostId || '';
+      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id, host))
+        || attentionItems.has(attentionKey('approval', '', next.id, host));
       if (!tracked) {
         scheduleShowNextQueuedApproval();
         return;
       }
     }
-    showApproval(next.id, next.command, next.category, next.sessionId);
+    showApproval(next.id, next.command, next.category, next.sessionId, next.hostId);
   }, 0);
 }
 
 function clearPendingApproval() {
   pendingApprovalId = null;
   pendingApprovalSessionId = '';
+  pendingApprovalHostId = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
   setApprovalIndicator(false);
@@ -4068,18 +4070,25 @@ function revealActivityLogPanel() {
   }
 }
 
-function showApproval(id, command, category, sessionId) {
+function showApproval(id, command, category, sessionId, hostId) {
   if (processingLogReplay) return;
+  const host = hostId || '';
   // Concurrent approvals: keep the one on screen, queue the newcomer, and
   // badge the count — a second approval used to silently replace the first.
-  if (pendingApprovalId !== null && String(pendingApprovalId) !== String(id)) {
+  // Peer approvals share the queue (RC-C2) but key on (host, id): approval
+  // ids are per-daemon counters and collide across daemons by construction.
+  if (
+    pendingApprovalId !== null
+    && !(String(pendingApprovalId) === String(id) && pendingApprovalHostId === host)
+  ) {
     const qid = String(id);
-    if (!approvalDisplayQueue.some(q => String(q.id) === qid)) {
+    if (!approvalDisplayQueue.some(q => String(q.id) === qid && (q.hostId || '') === host)) {
       approvalDisplayQueue.push({
         id,
         command,
         category,
-        sessionId: sessionId || approvalSessionIds.get(qid) || '',
+        sessionId: sessionId || (host ? '' : approvalSessionIds.get(qid)) || '',
+        hostId: host,
       });
     }
     updateApprovalPendingCount();
@@ -4087,25 +4096,39 @@ function showApproval(id, command, category, sessionId) {
   }
   hideAllPanels();
   pendingApprovalId = id;
-  pendingApprovalSessionId =
-    sessionId
-    || approvalSessionIds.get(String(id))
-    || currentSessionFullId
-    || '';
-  if (pendingApprovalSessionId) {
-    ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
-    focusSessionWindow(pendingApprovalSessionId);
+  pendingApprovalHostId = host;
+  if (host) {
+    // The session id is the PEER's — never resolve or focus it against
+    // local windows; the provenance line names the peer context instead.
+    pendingApprovalSessionId = sessionId || '';
+  } else {
+    pendingApprovalSessionId =
+      sessionId
+      || approvalSessionIds.get(String(id))
+      || currentSessionFullId
+      || '';
+    if (pendingApprovalSessionId) {
+      ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
+      focusSessionWindow(pendingApprovalSessionId);
+    }
   }
   document.getElementById('approval-command').textContent = command;
   const approvalCategoryEl = document.getElementById('approval-category');
   approvalCategoryEl.textContent = category || '';
   // No category (older sessions, rehydrated approvals) → no empty pill.
   approvalCategoryEl.style.display = category ? '' : 'none';
-  stationCurrentApproval = {
-    id: String(id),
-    command: command || '',
-    category: category || '',
-  };
+  renderApprovalProvenance(host, pendingApprovalSessionId);
+  if (host) {
+    // Station already renders peer approvals from peerPendingApprovals —
+    // mirroring one into stationCurrentApproval would draw it twice.
+    stationCurrentApproval = null;
+  } else {
+    stationCurrentApproval = {
+      id: String(id),
+      command: command || '',
+      category: category || '',
+    };
+  }
   stationScheduleUpdate();
   revealActivityLogPanel();
   // A re-show of the same approval (bootstrap replay) lands here with the
@@ -4114,6 +4137,123 @@ function showApproval(id, command, category, sessionId) {
   document.getElementById('approval-panel').classList.add('visible');
   setApprovalIndicator(true);
   updateApprovalPendingCount();
+}
+
+// The provenance line under a PEER approval: names the governing daemon
+// and what deciding does NOW — the decision transits this daemon's peer
+// grant; the peer's own profile gate authorizes it (or refuses, if this
+// daemon's grant lacks approval.resolve — surfaced up front, honestly).
+function renderApprovalProvenance(hostId, peerSessionId) {
+  const el = document.getElementById('approval-provenance');
+  if (!el) return;
+  if (!hostId) {
+    el.hidden = true;
+    el.textContent = '';
+    el.removeAttribute('title');
+    return;
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkDown = entry ? entry.connected === false : false;
+  const denied = typeof peerAllowsOperation === 'function'
+    && !peerAllowsOperation(hostId, 'approval.resolve');
+  let text = `on ${label}`;
+  if (peerSessionId) text += ` · session ${String(peerSessionId).slice(0, 8)}`;
+  if (denied) {
+    text += ` — this daemon's grant at ${label} does not include approval.resolve`;
+  } else if (linkDown) {
+    text += ' — peer link reconnecting; deciding will fail until it returns';
+  } else {
+    text += ' — deciding sends through this daemon’s peer grant';
+  }
+  el.textContent = text;
+  el.title = denied
+    ? `${label} granted this daemon a profile without approval.resolve — the buttons below `
+      + 'will be refused by the peer. Decide it on the peer’s own dashboard.'
+    : `This approval was raised on ${label}. Your decision is sent to ${label} over the `
+      + `federation link and authorized there against the profile ${label} granted this `
+      + 'daemon (the delegation lane — the peer’s audit names this daemon, not you).';
+  el.hidden = false;
+}
+
+// Decide the panel's PEER approval (RC-C2). The action vocabulary maps
+// onto the four-way ApprovalDecision the federation wire speaks —
+// including approve_all → accept_for_session (ApproveAll on the peer),
+// which the Station lane used to silently degrade to a one-shot accept.
+// The api_peer_approval response IS the ack: unlike local approvals
+// there is no local waiting-phase evidence to watch, so the panel's
+// sending state resolves on the reply (the peer's approval_resolved
+// event also arrives on the fold and is idempotent).
+const PEER_APPROVAL_DECISIONS = Object.freeze({
+  approve: 'accept',
+  approve_all: 'accept_for_session',
+  deny: 'decline',
+  skip: 'cancel',
+});
+
+// A peer approval resolved (by us, another dashboard, or the peer's own
+// policy) — retire it from the panel/queue surfaces. Session-agnostic:
+// the resolve event carries only (host, id).
+function retirePanelPeerApproval(hostId, approvalId) {
+  const host = hostId || '';
+  const qid = String(approvalId);
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i--) {
+    const q = approvalDisplayQueue[i];
+    if ((q.hostId || '') === host && String(q.id) === qid) approvalDisplayQueue.splice(i, 1);
+  }
+  updateApprovalPendingCount();
+  if (pendingApprovalHostId === host && String(pendingApprovalId) === qid) {
+    setApprovalPanelSending(false);
+    clearPendingApproval();
+    hidePanel('approval-panel');
+  }
+}
+async function sendPeerApprovalFromPanel(hostId, approvalId, action) {
+  const decision = PEER_APPROVAL_DECISIONS[action];
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  if (!decision) {
+    showControlToast('error', `'${action}' is not a peer-routable approval decision`);
+    return;
+  }
+  if (typeof peerAllowsOperation === 'function'
+      && !peerAllowsOperation(hostId, 'approval.resolve')) {
+    showControlToast(
+      'error',
+      `${label} granted this daemon a profile without approval.resolve — decide this on ${label}'s own dashboard`
+    );
+    return;
+  }
+  if (entry && entry.connected === false) {
+    showControlToast('error', `${label} is not connected — the peer link is reconnecting`);
+    return;
+  }
+  setApprovalPanelSending(true);
+  try {
+    const resp = await daemonApi.request('api_peer_approval', {
+      peer_id: hostId,
+      request_id: String(approvalId),
+      decision,
+    });
+    if (resp.ok) {
+      removePendingApproval(hostId, approvalId);
+      if (typeof attentionRemove === 'function') {
+        attentionRemove('approval', pendingApprovalSessionId, approvalId, true, 'resolved', hostId);
+      }
+      setApprovalPanelSending(false);
+      clearPendingApproval();
+      hidePanel('approval-panel');
+    } else {
+      setApprovalPanelSending(false);
+      showControlToast(
+        'error',
+        `${label} refused (${resp.status})${resp.body?.error ? ` — ${resp.body.error}` : ''}`
+      );
+    }
+  } catch (e) {
+    setApprovalPanelSending(false);
+    showControlToast('error', `Could not reach ${label}: ${e?.message || e}`);
+  }
 }
 
 function showHumanInput(question) {
