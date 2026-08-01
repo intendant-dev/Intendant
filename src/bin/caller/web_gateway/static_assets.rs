@@ -669,6 +669,35 @@ mod tests {
         assert_eq!(asset.body, VAULT_KERNEL_JS.as_bytes());
     }
 
+    /// The update-copy honesty pin: the update chip, the Daemon update
+    /// panel, and the swap confirm affordance each state the same plain
+    /// sentence — installs alongside, running sessions finish
+    /// uninterrupted, the old version may keep running while they do.
+    /// Pinned against the served bytes (and the docs chapter) so a
+    /// rewording that drops the honest bounds fails here instead of
+    /// shipping.
+    #[test]
+    fn update_copy_honesty_sentence_is_pinned() {
+        const SENTENCE: &str = "The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.";
+        let served = APP_HTML.matches(SENTENCE).count();
+        assert_eq!(
+            served, 3,
+            "the served dashboard must state the update-copy honesty sentence \
+             on exactly its three surfaces (update chip, Daemon update panel, \
+             swap confirm) — found {served}; edit the static/app/ fragments \
+             and regenerate with `cargo run -p app-html-assembler`"
+        );
+        let chapter_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/src/web-dashboard.md");
+        let chapter = std::fs::read_to_string(chapter_path)
+            .expect("docs/src/web-dashboard.md is part of the checkout");
+        assert_eq!(
+            chapter.matches(SENTENCE).count(),
+            1,
+            "docs/src/web-dashboard.md must state the same update-copy \
+             honesty sentence exactly once"
+        );
+    }
+
     #[test]
     fn vault_kernel_override_serves_disk_sibling() {
         let dir = tempfile::tempdir().unwrap();
