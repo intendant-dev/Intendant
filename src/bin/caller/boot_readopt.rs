@@ -276,6 +276,31 @@ fn session_meta_for(home: &Path, session_id: &str) -> Option<SessionMeta> {
     serde_json::from_str::<SessionMeta>(&raw).ok()
 }
 
+/// The `outcome` string from a session dir's `summary.json`, if any.
+fn session_summary_outcome(home: &Path, session_id: &str) -> Option<String> {
+    let dir = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)?;
+    let raw = std::fs::read_to_string(dir.join("summary.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(value.get("outcome")?.as_str()?.to_string())
+}
+
+/// Whether a session is a safeguards TERMINAL — its conversation ended
+/// on a provider safeguards flag. The durable meta marker covers
+/// terminals recorded since the classifier landed; the summary-outcome
+/// prose match ([`crate::safeguards_flag_condition`]) covers rows
+/// flagged before it existed. A flagged conversation is terminal for
+/// its bytes: the guard ladder lists it as needs-recast and never
+/// nudges it (a lineage whose CONTINUATION proceeded past an upstream
+/// flag is not a safeguards terminal — only the resume target itself is
+/// judged).
+pub(crate) fn session_safeguards_terminal(home: &Path, session_id: &str) -> bool {
+    if session_meta_for(home, session_id).is_some_and(|meta| meta.safeguards_flag.is_some()) {
+        return true;
+    }
+    session_summary_outcome(home, session_id)
+        .is_some_and(|outcome| crate::safeguards_flag_condition(&outcome))
+}
+
 /// The boot watershed: this boot's presence-registration instant, in
 /// epoch seconds. Sessions whose durable activity predates it belong to
 /// dead boots. `None` when presence is unreadable — the pass then
@@ -540,6 +565,18 @@ pub(crate) fn decide_candidate_with_lens(
         // the manual lane would.
         None => (source, backend_session_id, candidate.session_id.clone()),
     };
+    // The safeguards rung: a resume target that ended on a provider
+    // safeguards flag is terminal for its bytes — a nudge into that
+    // context re-flags (proven live 2026-07-31: the resumed seat
+    // re-flagged immediately, three times in one arc). Both lenses hit
+    // this rung, so the commission sweep can never wake a flagged
+    // conversation either. Listed as needs-recast by the pass, never
+    // nudged; the owner's fresh recast is the only lane out.
+    if session_safeguards_terminal(home, &resume_root_key) {
+        return ReadoptDecision::LeftDead(
+            crate::safeguards_recast::SAFEGUARDS_LEFT_DEAD_REASON.to_string(),
+        );
+    }
     let project_root =
         crate::external_wrapper_index::recorded_project_root_for_wrapper(home, &resume_root_key)
             .map(PathBuf::from);
@@ -920,6 +957,89 @@ mod tests {
             },
             other => panic!("expected Readopt, got {other:?}"),
         }
+    }
+
+    /// The safeguards rung: a resume target that ended on a provider
+    /// safeguards flag is listed as needs-recast and NEVER nudged — on
+    /// BOTH lenses, so the commission sweep cannot wake it either (a
+    /// live resume into a flagged context re-flagged immediately,
+    /// 2026-07-31). Both durable evidences trip it: the meta marker
+    /// (stamped at flag time) and the pre-marker summary-outcome prose
+    /// match (specimen 69c8535e's summary carried only the raw banner).
+    #[test]
+    fn readopt_lists_safeguards_terminal_and_never_nudges() {
+        let home = tempfile::tempdir().unwrap();
+        announce(home.path(), "wrapper-flagged", "flagged-conv");
+        let meta = serde_json::json!({
+            "session_id": "wrapper-flagged",
+            "created_at": "2026-07-31T00:00:00",
+            "status": "interrupted",
+            "safeguards_flag": {
+                "flagged_at_epoch": now_secs(),
+                "reason_preview": "API Error: Fable 5's safeguards flagged this message",
+            },
+        });
+        std::fs::write(
+            logs_root(home.path())
+                .join("wrapper-flagged")
+                .join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        let candidate = ReadoptCandidate {
+            session_id: "wrapper-flagged".to_string(),
+            class: MidWorkClass::MidTurn,
+            suspended: false,
+            activity_secs: now_secs(),
+        };
+        for lens in [ResumeLens::MidWork, ResumeLens::OpenCommission] {
+            match decide_candidate_with_lens(
+                home.path(),
+                &candidate,
+                now_secs(),
+                &HashSet::new(),
+                lens,
+            ) {
+                ReadoptDecision::LeftDead(reason) => assert_eq!(
+                    reason,
+                    crate::safeguards_recast::SAFEGUARDS_LEFT_DEAD_REASON,
+                    "the left-dead reason is the needs-recast filter key"
+                ),
+                ReadoptDecision::Readopt(_) => {
+                    panic!("a safeguards terminal must never be nudged, on either lens")
+                }
+            }
+        }
+
+        let home2 = tempfile::tempdir().unwrap();
+        announce(home2.path(), "wrapper-legacy", "legacy-conv");
+        std::fs::write(
+            logs_root(home2.path())
+                .join("wrapper-legacy")
+                .join("summary.json"),
+            serde_json::json!({
+                "outcome": "claude-code backend error (success): API Error: Fable 5's \
+                            safeguards flagged this message \
+                            (https://www.anthropic.com/legal/aup)."
+            })
+            .to_string(),
+        )
+        .unwrap();
+        write_meta(home2.path(), "wrapper-legacy", "running", None);
+        let legacy = ReadoptCandidate {
+            session_id: "wrapper-legacy".to_string(),
+            class: MidWorkClass::MidTurn,
+            suspended: false,
+            activity_secs: now_secs(),
+        };
+        assert!(
+            matches!(
+                decide_candidate(home2.path(), &legacy, now_secs(), &HashSet::new()),
+                ReadoptDecision::LeftDead(reason)
+                    if reason == crate::safeguards_recast::SAFEGUARDS_LEFT_DEAD_REASON
+            ),
+            "the pre-marker prose match must trip the same rung"
+        );
     }
 
     /// The guard ladder: a suspended series stays down (the streak law
@@ -1863,6 +1983,36 @@ pub(crate) async fn run_boot_readopt_pass(
             .map(|(_, session)| session.as_str())
             .collect();
         left_dead.retain(|(session, _)| !woken_sessions.contains(session.as_str()));
+    }
+    // Safeguards terminals the ladder left down are LISTED durably as
+    // needs-recast: the flag-time lane already parks live flags, so this
+    // covers flags a dead daemon never surfaced and re-states the boot
+    // fact that flagged mid-work sessions were deliberately not resumed.
+    {
+        let recast_entries: Vec<crate::safeguards_recast::RecastRef> = left_dead
+            .iter()
+            .filter(|(_, reason)| {
+                reason.as_str() == crate::safeguards_recast::SAFEGUARDS_LEFT_DEAD_REASON
+            })
+            .map(|(session_id, _)| {
+                let source =
+                    crate::external_wrapper_index::conversation_for_wrapper(&home, session_id)
+                        .map(|(source, _)| source)
+                        .unwrap_or_else(|| "external".to_string());
+                let reason = session_meta_for(&home, session_id)
+                    .and_then(|meta| meta.safeguards_flag)
+                    .map(|flag| flag.reason_preview)
+                    .or_else(|| session_summary_outcome(&home, session_id))
+                    .unwrap_or_else(|| "provider safeguards flagged the conversation".to_string());
+                crate::safeguards_recast::RecastRef {
+                    session_id: session_id.clone(),
+                    source,
+                    reason,
+                    disposition: crate::safeguards_recast::RecastDisposition::SessionEnded,
+                }
+            })
+            .collect();
+        crate::safeguards_recast::report_boot_needs_recast(agenda.as_deref(), &recast_entries);
     }
     if let Some(notification) = summary_notification(
         handover.boot_id(),

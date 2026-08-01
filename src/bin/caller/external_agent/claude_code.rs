@@ -3611,8 +3611,18 @@ async fn reader_task(
                 reader_state.close_open_task_children(&mut cleanup);
                 // A process that dies mid-turn never sends its result —
                 // settle the activity claim so the chip can't show a
-                // phantom "thinking" for a dead backend.
+                // phantom "thinking" for a dead backend, and clear the
+                // dispatch-side latch so owner follow-ups can't take the
+                // inject-into-running-turn lane against a dead model and
+                // wait forever (the 2026-07-31 zombie-turn specimen: a
+                // safeguards flag killed the backend mid-turn and the
+                // latched bool kept "awaiting the model's next activity"
+                // alive indefinitely).
                 reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
+                reader_state
+                    .shared
+                    .turn_active
+                    .store(false, Ordering::SeqCst);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }
@@ -3628,6 +3638,13 @@ async fn reader_task(
                 }
                 let mut cleanup = CcLineOutcome::default();
                 reader_state.close_open_task_children(&mut cleanup);
+                // Same turn-close as the EOF arm: an IO-error death must
+                // not leave either latch claiming a running turn.
+                reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
+                reader_state
+                    .shared
+                    .turn_active
+                    .store(false, Ordering::SeqCst);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }

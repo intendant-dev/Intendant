@@ -87,6 +87,7 @@ mod quarantine;
 mod recording;
 mod relay_tunnel;
 mod remote_compute;
+mod safeguards_recast;
 mod sandbox;
 mod schema_validator;
 mod service_mode;

@@ -675,8 +675,17 @@ function buildSessionCard(m, derived, ctx) {
   top.appendChild(titleBlock);
 
   const statusEl = document.createElement('span');
-  statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
-  statusEl.textContent = displayStatus.replace('_', ' ');
+  // Safeguards terminals get their own honest face — never the generic
+  // interrupted/failed chip: this class needs a recast, not a retry.
+  const safeguardsFlagged = !!(s.terminal && s.terminal.class === 'safeguards_flagged');
+  if (safeguardsFlagged) {
+    statusEl.className = 'ui-chip err sc-status safeguards-flagged';
+    statusEl.textContent = 'safeguards-flagged';
+    statusEl.title = 'Provider safeguards flagged this conversation and it ended. Never auto-retried and never switched to another model — recast the task in a fresh session.';
+  } else {
+    statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
+    statusEl.textContent = displayStatus.replace('_', ' ');
+  }
   top.appendChild(statusEl);
 
   const sourceEl = document.createElement('span');
