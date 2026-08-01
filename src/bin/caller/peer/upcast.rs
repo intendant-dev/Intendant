@@ -158,20 +158,13 @@ pub(crate) fn wire_log_level(s: &str) -> LogLevel {
 /// category tags.
 #[allow(dead_code)]
 pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> String {
-    use crate::autonomy::ActionCategory as C;
-    match cat {
-        C::FileRead => "file_read",
-        C::FileWrite => "file_write",
-        C::FileDelete => "file_delete",
-        C::CommandExec => "command_exec",
-        C::NetworkRequest => "network_request",
-        C::Destructive => "destructive",
-        C::HumanInput => "human_input",
-        C::LiveAudioSpawn => "live_audio_spawn",
-        C::DisplayControl => "display_control",
-        C::ToolCall => "tool_call",
-    }
-    .to_string()
+    // One vocabulary: the `ActionCategory` Display string is what the
+    // local dashboard, the per-category approval rules, and (since
+    // RC-C2) the `approval_required` wire field all speak. This helper
+    // used to hand-mirror the list and had drifted on one variant
+    // (`network_request` vs Display's `network`); delegating kills the
+    // divergence class.
+    cat.to_string()
 }
 
 /// Map the action string on `ApprovalResolved` (which is free-form
@@ -1057,6 +1050,7 @@ impl AppEventUpcaster {
                         category: action_category_wire(category),
                         preview: command_preview.clone(),
                         auto_resolvable: false,
+                        session_id: session_id.clone(),
                     },
                 }];
                 out.extend(session_updated_events(
@@ -1083,6 +1077,7 @@ impl AppEventUpcaster {
                         category: "human_question".to_string(),
                         preview: crate::external_output::user_question_preview(questions),
                         auto_resolvable: false,
+                        session_id: session_id.clone(),
                     },
                 }];
                 out.extend(session_updated_events(
@@ -1109,6 +1104,7 @@ impl AppEventUpcaster {
                             category: "auto".to_string(),
                             preview: preview.clone(),
                             auto_resolvable: true,
+                            session_id: None,
                         },
                     },
                     PeerEvent::ApprovalResolved {
@@ -1126,6 +1122,7 @@ impl AppEventUpcaster {
                         category: "human_question".to_string(),
                         preview: question.clone(),
                         auto_resolvable: false,
+                        session_id: None,
                     },
                 }]
             }
@@ -2572,24 +2569,25 @@ impl WireEventUpcaster {
 
             // ---- Approval flow ----
             //
-            // OutboundEvent::ApprovalRequired drops the ActionCategory
-            // field from AppEvent (wire format only carries `command`,
-            // not category). We default to "command_exec" which is
-            // the overwhelmingly common case. Parity test documents
-            // this as intentional loss — non-command-exec categories
-            // (file_write, destructive, etc.) lose their specific
-            // category name on the wire path.
+            // `category` rides the wire additively since RC-C2; a peer
+            // predating it omits the field and we keep the historical
+            // "command_exec" default (the overwhelmingly common case —
+            // the pre-RC-C2 wire dropped the ActionCategory entirely).
             OutboundEvent::ApprovalRequired {
                 session_id,
                 id,
                 command,
+                category,
             } => {
                 let mut out = vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
-                        category: "command_exec".to_string(),
+                        category: category
+                            .clone()
+                            .unwrap_or_else(|| "command_exec".to_string()),
                         preview: command.clone(),
                         auto_resolvable: false,
+                        session_id: session_id.clone(),
                     },
                 }];
                 out.extend(session_updated_events(
@@ -2616,6 +2614,7 @@ impl WireEventUpcaster {
                             category: "auto".to_string(),
                             preview: preview.clone(),
                             auto_resolvable: true,
+                            session_id: None,
                         },
                     },
                     PeerEvent::ApprovalResolved {
@@ -2633,6 +2632,7 @@ impl WireEventUpcaster {
                         category: "human_question".to_string(),
                         preview: question.clone(),
                         auto_resolvable: false,
+                        session_id: None,
                     },
                 }]
             }
@@ -2654,6 +2654,7 @@ impl WireEventUpcaster {
                         category: "human_question".to_string(),
                         preview: crate::external_output::user_question_preview(questions),
                         auto_resolvable: false,
+                        session_id: session_id.clone(),
                     },
                 }];
                 out.extend(session_updated_events(
@@ -4702,33 +4703,58 @@ mod tests {
     /// path fills in `"command_exec"` as the default category. Path A
     /// preserves the actual category (e.g. "file_delete").
     #[test]
-    fn drift_approval_required_category_is_dropped_on_wire() {
+    fn drift_approval_required_category_rides_the_wire() {
         let app_event = AppEvent::ApprovalRequired {
-            session_id: None,
+            session_id: Some("s1".into()),
             id: 42,
             command_preview: "rm -rf /tmp/foo".into(),
             category: crate::autonomy::ActionCategory::FileDelete,
         };
         let mut app_upcaster = AppEventUpcaster::new();
         let path_a = app_upcaster.upcast(&app_event);
-        let category_a = match &path_a[0] {
-            PeerEvent::ApprovalRequested { request } => request.category.clone(),
+        let (category_a, session_a) = match &path_a[0] {
+            PeerEvent::ApprovalRequested { request } => {
+                (request.category.clone(), request.session_id.clone())
+            }
             _ => panic!("expected ApprovalRequested"),
         };
         assert_eq!(category_a, "file_delete");
+        assert_eq!(session_a.as_deref(), Some("s1"));
 
+        // RC-C2: the wire carries the category (Display string) and the
+        // fold passes the session id through — a merged approvals rail
+        // can attribute the ask to its peer session and real category.
         let outbound =
             crate::event::app_event_to_outbound(&app_event).expect("ApprovalRequired maps");
         let mut wire_upcaster = WireEventUpcaster::new();
         let path_b = wire_upcaster.upcast(&outbound);
-        let category_b = match &path_b[0] {
-            PeerEvent::ApprovalRequested { request } => request.category.clone(),
+        let (category_b, session_b) = match &path_b[0] {
+            PeerEvent::ApprovalRequested { request } => {
+                (request.category.clone(), request.session_id.clone())
+            }
             _ => panic!("expected ApprovalRequested"),
         };
         assert_eq!(
-            category_b, "command_exec",
-            "wire path uses default category because ActionCategory isn't on the wire"
+            category_b, "file_delete",
+            "wire path carries the real category since RC-C2"
         );
+        assert_eq!(session_b.as_deref(), Some("s1"));
+
+        // A frame from a peer predating the field keeps the historical
+        // command_exec default — and still session-attributes.
+        let old_frame: OutboundEvent = serde_json::from_str(
+            r#"{"event":"approval_required","session_id":"s1","id":43,"command":"make deploy"}"#,
+        )
+        .expect("pre-RC-C2 frame parses");
+        let mut old_wire = WireEventUpcaster::new();
+        let path_c = old_wire.upcast(&old_frame);
+        match &path_c[0] {
+            PeerEvent::ApprovalRequested { request } => {
+                assert_eq!(request.category, "command_exec");
+                assert_eq!(request.session_id.as_deref(), Some("s1"));
+            }
+            _ => panic!("expected ApprovalRequested"),
+        }
     }
 
     /// `UserDisplayGranted` carries `display_id` + `agent_visible` on
@@ -4937,6 +4963,7 @@ mod tests {
             session_id: Some("s1".into()),
             id: 7,
             command: "rm -rf scratch".into(),
+            category: None,
         });
         assert_eq!(out.len(), 2, "ApprovalRequested + SessionUpdated");
         match &out[1] {
@@ -5062,6 +5089,7 @@ mod tests {
                 session_id: Some("s1".into()),
                 id: 3,
                 command: "x".into(),
+                category: None,
             },
             OutboundEvent::TaskComplete {
                 session_id: Some("s1".into()),

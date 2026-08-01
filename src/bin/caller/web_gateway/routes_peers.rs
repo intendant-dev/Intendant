@@ -220,6 +220,14 @@ pub(crate) async fn peers_sub_router_api_response(
             Some(registry) if segments == ["pairing", "join"] && req_method == "POST" => {
                 peers_pairing_join(registry, project_root, body_text).await
             }
+            Some(registry)
+                if segments.len() == 2
+                    && segments[1] == "session-detail"
+                    && req_method == "GET" =>
+            {
+                let id = url_path_decode(segments[0]);
+                peers_session_detail(registry, &id, query_str).await
+            }
             Some(registry) if segments.len() == 2 && req_method == "POST" => {
                 let id = url_path_decode(segments[0]);
                 let op = segments[1];
@@ -2472,6 +2480,84 @@ pub(crate) async fn peers_resolve_approval(
     match handle.resolve_approval(&req.request_id, req.decision).await {
         Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
         Err(e) => peer_error_response(e),
+    }
+}
+
+/// Handle `GET /api/peers/{id}/session-detail`: fetch one page of a
+/// peer session's transcript over the federation HTTP lane
+/// ([`crate::peer::http_api`]) and pass the peer's status + JSON body
+/// through verbatim. This is the request/response lane that works over
+/// every link class the control WS works over — including a
+/// reachability relay, where the browser↔peer dashboard-control
+/// datachannel cannot form. Authority is entirely peer-side: the
+/// peer's own route IAM evaluates the profile it granted this daemon's
+/// identity for `SessionInspect`, and its refusal body is what the
+/// dashboard surfaces.
+pub(crate) async fn peers_session_detail(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    query_str: &str,
+) -> (u16, String) {
+    let mut session_id: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut limit: Option<u64> = None;
+    let mut before: Option<u64> = None;
+    for pair in query_str.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = url_decode(v);
+        match url_decode(k).as_str() {
+            "session_id" => session_id = Some(value),
+            "source" => source = Some(value),
+            "limit" => limit = value.parse().ok(),
+            "before" => before = value.parse().ok(),
+            _ => {}
+        }
+    }
+    let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
+        return (
+            400,
+            serde_json::json!({"error": "missing required query parameter: session_id"})
+                .to_string(),
+        );
+    };
+    let handle = match peer_handle_or_404(registry, id) {
+        Ok(h) => h,
+        Err(resp) => return resp,
+    };
+    match crate::peer::http_api::fetch_peer_session_detail(
+        &handle,
+        &session_id,
+        source.as_deref(),
+        limit,
+        before,
+    )
+    .await
+    {
+        Ok(reply) => {
+            // The peer's status + body pass through verbatim so its own
+            // refusals (403 profile denial, 404 unknown session) reach
+            // the dashboard as the governing daemon's honest answer —
+            // except that a non-JSON body is wrapped, so this endpoint
+            // always yields JSON.
+            if serde_json::from_str::<serde_json::Value>(&reply.body).is_ok() {
+                (reply.status, reply.body)
+            } else {
+                (
+                    502,
+                    serde_json::json!({
+                        "error": format!(
+                            "peer returned a non-JSON response (HTTP {})",
+                            reply.status
+                        )
+                    })
+                    .to_string(),
+                )
+            }
+        }
+        Err(e) => (
+            502,
+            serde_json::json!({"error": format!("could not fetch from peer: {e}")}).to_string(),
+        ),
     }
 }
 

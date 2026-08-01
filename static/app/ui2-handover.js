@@ -119,6 +119,38 @@
     if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
   };
 
+  // The update panel (ui2-update-lane) composes this SAME swap consumer
+  // instead of duplicating it: it hands over a mount element, and every
+  // chip-state render refills it — one implementation of the
+  // supervised / relay / hand-off logic, two surfaces. The mount is
+  // replaced wholesale per panel render; a disconnected mount is
+  // silently dropped.
+  let panelSwapMount = null;
+  function fillPanelSwapSection() {
+    const mount = panelSwapMount;
+    if (!mount) return;
+    if (!mount.isConnected) { panelSwapMount = null; return; }
+    mount.textContent = '';
+    const body = lastHandoverBody;
+    const update = body && body.update;
+    if (!update || body.draining) return;
+    const disk = update.on_disk;
+    const running = update.running || {};
+    const head = document.createElement('div');
+    head.className = 'update-lane-swap-head';
+    head.textContent = disk
+      ? `New build on disk: commit ${disk.git_sha || '?'} (${disk.version || '?'}, built ${disk.built_at || '?'}) — running ${running.git_sha || '?'}.`
+      : `The binary on disk changed but its provenance is unreadable${update.probe_error ? ` (${update.probe_error})` : ''}.`;
+    mount.appendChild(head);
+    if (update.honesty) {
+      const honesty = document.createElement('div');
+      honesty.className = 'handover-update-honesty';
+      honesty.textContent = update.honesty;
+      mount.appendChild(honesty);
+    }
+    mount.appendChild(handoverUpdateActions(body, disk));
+  }
+
   // The co-homed daemon a hand-off would drain toward: live, not this
   // boot, not already on its way out. Prefer one whose build matches the
   // on-disk update.
@@ -218,6 +250,7 @@
   // come from probing a binary the daemon merely observed — never markup.
   function handoverUpdateRender(body) {
     lastHandoverBody = body;
+    fillPanelSwapSection();
     const update = body && body.update;
     if (!update || body.draining) { updateChipClear(); return; }
     const disk = update.on_disk;
@@ -295,6 +328,16 @@
       el.appendChild(pending);
     }
     el.appendChild(handoverUpdateActions(body, disk));
+    // The pill expands into the full update panel: the chip stays the
+    // standing fact; channels, checks, and builds live there.
+    if (typeof routeTo === 'function') {
+      const panelLink = document.createElement('button');
+      panelLink.type = 'button';
+      panelLink.className = 'handover-update-panel-link';
+      panelLink.textContent = 'Open the update panel';
+      panelLink.addEventListener('click', () => routeTo('access', 'daemons'));
+      el.appendChild(panelLink);
+    }
   }
 
   function handoverBanner() {
@@ -370,6 +413,15 @@
   window.qa.handoverUpdateChip = {
     render: (body) => handoverUpdateRender(body),
     stateKey: updateChipStateKey,
+  };
+
+  // The update panel's composition hook (production, not QA): the panel
+  // registers its swap mount here and this module keeps it honest.
+  window.intendantHandoverUpdate = {
+    renderSwapSection: (mount) => {
+      panelSwapMount = mount;
+      fillPanelSwapSection();
+    },
   };
 
   function handoverStart() {

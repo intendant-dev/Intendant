@@ -632,6 +632,12 @@ pub struct ApprovalRequest {
     pub preview: String,
     /// Whether local autonomy policy is allowed to auto-resolve this.
     pub auto_resolvable: bool,
+    /// The peer-side session the approval belongs to. Additive (RC-C2):
+    /// absent from folds predating it and from session-less asks — a
+    /// merged approvals rail attributes those to the peer daemon, not a
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Re-export of the shared approval decision type. The canonical

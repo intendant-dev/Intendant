@@ -1155,7 +1155,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateLaneCheck,
-        "Self-update lane: run the bounded behind-origin-main / behind-latest-release check now",
+        "Self-update lane: run the bounded behind-origin-main / behind-latest-release check now (optional body {\"channel\": \"releases\"|\"dev\"}; absent = the install's native lane)",
     ),
     op_route(
         RouteMethod::Post,
@@ -1163,7 +1163,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateLaneProduce,
-        "Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip",
+        "Self-update lane: produce the update artifact on the named channel (dev = source pull+build, releases = verified release download) for the swap chip",
     ),
     // The one-click swap relay (the SWAP half, beyond the app's own
     // webview): a dashboard surface asks the daemon, the daemon parks
@@ -2675,6 +2675,20 @@ pub(crate) static ROUTES: &[Route] = &[
     )
     .with_tunnel(tunnel_method("api_peer_session_control")),
     federation_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/peers",
+            &[
+                SegmentSpec::Capture("peer_id"),
+                SegmentSpec::Literal("session-detail"),
+            ],
+        ),
+        BodyPolicy::Default,
+        RouteHandlerId::PeersSubRouter,
+        "Fetch a peer session's transcript page over the federation HTTP lane (peer-side IAM governs)",
+    )
+    .with_tunnel(tunnel_method("api_peer_session_detail")),
+    federation_route(
         RouteMethod::Post,
         PathPattern::Segments(
             "/api/peers",
@@ -3880,6 +3894,18 @@ mod tests {
                 "api_peer_approval",
                 "POST",
                 "/api/peers/{peer_id}/approval",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_session_control",
+                "POST",
+                "/api/peers/{peer_id}/session-control",
+                Op::PeerUse,
+            ),
+            (
+                "api_peer_session_detail",
+                "GET",
+                "/api/peers/{peer_id}/session-detail",
                 Op::PeerUse,
             ),
             (

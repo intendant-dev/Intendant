@@ -40,6 +40,31 @@ html.ui-v2 .ag2-inspector-backdrop { display: none; }
     background: rgba(4, 5, 8, 0.45);
   }
 }
+/* Graph theater-mode fullscreen (ag2-graph-fs on <html>, managed by the
+   graph fragment): the fullscreen panel is fixed at z 600, so the
+   inspector lifts above it as a floating card — full functionality over
+   the constellation, any viewport width. Backdrop stays off so the map
+   remains interactive beside the card. */
+html.ui-v2.ag2-graph-fs .ag2-inspector {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: 0;
+  z-index: 620;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+  transition: none;
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector.open {
+  width: min(478px, calc(100vw - 40px));
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector-backdrop {
+  display: none !important;
+}
+
 html.ui-v2 .ag2-insp-col {
   width: 100%;
   min-width: 280px;
@@ -462,6 +487,17 @@ html.ui-v2 .ag2-insp-dep {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* A delivered-awaiting-Complete prerequisite: the actionable wait —
+   sky (the achieved self-report hue), with its release affordance. */
+html.ui-v2 .ag2-insp-dep.delivered {
+  border-left: 2px solid rgba(var(--sky-rgb), 0.55);
+  padding-left: 7px;
+}
+html.ui-v2 .ag2-insp-dep .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+  flex-shrink: 0;
 }
 html.ui-v2 .ag2-insp-deplink {
   flex: 1;

@@ -3,16 +3,25 @@
 // Approval requests arrive over each peer's secondary WebSocket as
 // `approval_required` events. They're surfaced inline in the peer's
 // controls panel with approve / deny / skip buttons that POST to
-// /api/peers/{id}/approval. Buttons map to the four-way ApprovalDecision
-// vocabulary (accept / accept_for_session / decline / cancel) — the
-// dashboard surfaces three of them today; AcceptForSession can be added
-// when there's a use case. Wire-level encoding is in
-// peer::transport::intendant (ResolveApproval → ControlMsg::Approve|Deny|Skip).
+// /api/peers/{id}/approval, and (RC-C2) fold into the merged global
+// rail — the bottom approval panel/queue + the attention center — keyed
+// (host, id). Buttons map to the four-way ApprovalDecision vocabulary
+// (accept / accept_for_session / decline / cancel); the panel's
+// "Approve all" maps to accept_for_session (→ ControlMsg::ApproveAll on
+// the peer). Wire-level encoding is in peer::transport::intendant
+// (ResolveApproval → ControlMsg::Approve|ApproveAll|Deny|Skip).
 
-function addPendingApproval(hostId, approvalId, command, category) {
+function addPendingApproval(hostId, approvalId, command, category, sessionId) {
   let m = peerPendingApprovals.get(hostId);
   if (!m) { m = new Map(); peerPendingApprovals.set(hostId, m); }
-  m.set(String(approvalId), { command: command || '', category: category || '' });
+  m.set(String(approvalId), {
+    command: command || '',
+    category: category || '',
+    // The PEER's session id (RC-C2, additive on the wire) — lets the
+    // merged rail and Station session nodes attribute the ask; '' from
+    // peers predating the field.
+    sessionId: sessionId || '',
+  });
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }
@@ -22,6 +31,25 @@ function removePendingApproval(hostId, approvalId) {
   if (!m) return;
   m.delete(String(approvalId));
   if (m.size === 0) peerPendingApprovals.delete(hostId);
+  renderPeerApprovals(hostId);
+  stationScheduleUpdate();
+}
+
+// Sweep every approval surface for one host (RC-C2). Two callers with
+// the same honesty rationale: a reconnect (entries learned before the
+// drop are unverifiable — the peer's bootstrap re-announce repopulates
+// what is still pending; older peers degrade to the sessions rail's
+// needs_approval boolean) and peer removal (nothing left to resolve).
+function clearPeerApprovalsForHost(hostId, reason) {
+  const m = peerPendingApprovals.get(hostId);
+  const ids = m ? [...m.keys()] : [];
+  peerPendingApprovals.delete(hostId);
+  for (const id of ids) {
+    if (typeof retirePanelPeerApproval === 'function') retirePanelPeerApproval(hostId, id);
+    if (typeof attentionRemove === 'function') {
+      attentionRemove('approval', null, id, true, reason || 'link reset', hostId);
+    }
+  }
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }

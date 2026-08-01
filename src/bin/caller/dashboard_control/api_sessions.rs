@@ -454,6 +454,9 @@ pub(crate) async fn control_request_frame(
         "api_peer_session_control" => {
             api_peer_session_control_response(id, params.as_ref(), &runtime).await
         }
+        "api_peer_session_detail" => {
+            api_peer_session_detail_response(id, params.as_ref(), &runtime).await
+        }
         "api_peer_webrtc_signal" => {
             api_peer_webrtc_signal_response(id, params.as_ref(), &runtime).await
         }
