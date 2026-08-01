@@ -190,7 +190,8 @@ fn enrollment_request_payload(body: &str, encoded_header: Option<&str>) -> Resul
     }
     let header = encoded_header
         .map(|encoded| {
-            let max_encoded_len = (crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES * 4 + 2) / 3;
+            let max_encoded_len =
+                (crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES * 4).div_ceil(3);
             if encoded.len() > max_encoded_len {
                 return Err(format!(
                     "fallback header exceeds {} decoded bytes",
