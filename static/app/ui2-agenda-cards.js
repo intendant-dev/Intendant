@@ -262,6 +262,11 @@ function agendaWireScaffold() {
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
   groups.addEventListener('keydown', agendaGroupsKeydown);
+  // The status circle's press-and-hold reveal (self-explanation
+  // without acting) — pointer type feeds the touch first-tap arm.
+  groups.addEventListener('pointerdown', agendaCtlPointerDown);
+  groups.addEventListener('pointerup', agendaCtlPointerEnd);
+  groups.addEventListener('pointercancel', agendaCtlPointerEnd);
   // Tab-scoped keyboard: '/' focuses search, 'n' the composer, Escape
   // closes overlays inspector-last. Skips typing contexts; the approval
   // rail's y/n shortcuts live on the Activity tab so there is no overlap.
@@ -774,6 +779,72 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Blocked chip + per-gate detail (chip honesty) ----
+// Derivations live in ui2-agenda.js (agendaBlockedExplain and friends);
+// this section renders them. Advisory throughout — the chip and rows
+// gate nothing, exactly like the served flag they explain.
+
+// Cards whose in-flight waits the owner tapped open at calm depth
+// (render-time presentation state; blockers and delivered waits never
+// fold, so they need no entry here).
+const agendaBlockedOpen = new Set();
+
+// The blocked chip is a BUTTON (house law: every symbol self-explains
+// on tap — no hover-only): the tip names each gate, the tap unfolds
+// the per-gate rows under the card at any depth. When every
+// unsatisfied prerequisite is delivered-and-attested the face stops
+// crying wolf: 'delivered · awaiting Complete' (sky), nothing is
+// stuck — only Complete taps are missing.
+function agendaBlockedChipHtml(item) {
+  const explain = agendaBlockedExplain(item);
+  const spec = agendaBlockedChipSpec(explain);
+  return `<button type="button" class="ag2-chip ag2-chip-btn t-${spec.tone}" data-blocked-toggle="${escapeHtml(item.id)}"
+    title="${escapeHtml(agendaBlockedTip(explain))}">${escapeHtml(spec.label)}</button>`;
+}
+
+function agendaBlockedPrereqRowHtml(p) {
+  const chip = agendaChipHtml(p.status, p.tone,
+    p.detail || 'Live status, derived at render — advisory; it gates nothing');
+  const name = p.target
+    ? `<a class="ag2-blk-link" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span>waits on ${escapeHtml(p.title)}</span>`;
+  const go = p.kind === 'delivered'
+    ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+        title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+    : '';
+  return `<div class="ag2-blk-row${p.kind === 'delivered' ? ' delivered' : ''}">${chip}${name}${go}</div>`;
+}
+
+// The card's per-gate rows (replacing the old single-line first-gate
+// text): every uncleared blocker, every unsatisfied prerequisite with
+// its live status, each a door to the prerequisite itself. Fold rules
+// live in agendaBlockedDetailPlan; the chip toggles the calm-depth
+// fold. Renders from locally visible gates even when the served flag
+// is absent (never-summarized event rows), exactly like the old line.
+function agendaBlockedDetailHtml(item) {
+  if (item.status !== 'open') return '';
+  const explain = agendaBlockedExplain(item);
+  if (!explain.blockers.length && !explain.prereqs.length && !explain.unexplained) return '';
+  const plan = agendaBlockedDetailPlan(explain, agendaDepth, agendaBlockedOpen.has(item.id));
+  if (!plan.visible) return '';
+  const rows = [];
+  explain.blockers.forEach((b) => {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-mark" aria-hidden="true">●</span>
+      <span>waiting on: “${escapeHtml(b.criterion)}”
+        <span class="ag2-blk-hint">— stated blocker; nothing evaluates it, people do</span></span></div>`);
+  });
+  plan.rows.delivered.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  plan.rows.waits.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  if (explain.unexplained) {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-hint">the daemon judges this blocked,
+      but no gate is visible in this window — it may have just changed</span></div>`);
+  }
+  if (plan.rows.hiddenWaits) {
+    rows.push(`<button type="button" class="ag2-blk-more" data-blocked-toggle="${escapeHtml(item.id)}">+ ${plan.rows.hiddenWaits} in-flight wait${plan.rows.hiddenWaits === 1 ? '' : 's'} ›</button>`);
+  }
+  return `<div class="ag2-blocked-detail${explain.allDelivered ? ' delivered' : ''}">${rows.join('')}</div>`;
+}
+
 // ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
 // The self-report axis renders BESIDE the transport verdict, never as
 // it: every attestation surface says "self-reported" and carries the
@@ -825,8 +896,7 @@ function agendaCardChips(item) {
       `Reminder ${agendaAbsTime(item.due_ms)} — delivery follows your policy`));
   }
   if (agendaItemIsBlocked(item)) {
-    chips.push(agendaChipHtml('blocked', 'rose',
-      'Derived at render — an uncleared blocker or unmet prerequisite'));
+    chips.push(agendaBlockedChipHtml(item));
   }
   // Tier-1 PR join chips (render-time only — never stored, never ops):
   // draft state and rename divergence come from the scanner's last
@@ -1469,31 +1539,79 @@ function agendaDismissAsk(item) {
 
 // ---- Card ----
 
+// The status circle's tappable self-explanation (house law: no
+// hover-only): a press-and-hold on any pointer, or the first tap on a
+// hover-less one, REVEALS the action as a labeled pill beside the
+// circle instead of acting; the next tap (circle or pill) acts. Mouse
+// clicks keep today's immediate action — the reveal is additive.
+let agendaCtlReveal = null; // { id, until } — the one revealed circle
+let agendaCtlHoldTimer = null;
+let agendaCtlHoldFiredAt = 0;
+let agendaCtlPointerType = 'mouse';
+
+function agendaCtlAction(item) {
+  if (item.kind === 'question' && item.status === 'open') return null;
+  return item.status === 'open' ? 'Mark done' : 'Reopen';
+}
+
+function agendaCtlRevealShow(id) {
+  agendaCtlReveal = { id, until: Date.now() + 6000 };
+  agendaRenderTab();
+  setTimeout(() => {
+    if (agendaCtlReveal && agendaCtlReveal.until <= Date.now()) {
+      agendaCtlReveal = null;
+      agendaRenderTab();
+    }
+  }, 6200);
+}
+
+function agendaCtlPointerDown(e) {
+  agendaCtlPointerType = e.pointerType || 'mouse';
+  const ctl = e.target.closest('.ag2-ctl');
+  if (!ctl || !ctl.dataset.ctl) return;
+  const item = agendaFindItem(ctl.dataset.ctl);
+  if (!item || !agendaCtlAction(item)) return;
+  if (agendaCtlHoldTimer) clearTimeout(agendaCtlHoldTimer);
+  agendaCtlHoldTimer = setTimeout(() => {
+    agendaCtlHoldTimer = null;
+    agendaCtlHoldFiredAt = Date.now();
+    agendaCtlRevealShow(item.id);
+  }, 450);
+}
+
+function agendaCtlPointerEnd() {
+  if (agendaCtlHoldTimer) {
+    clearTimeout(agendaCtlHoldTimer);
+    agendaCtlHoldTimer = null;
+  }
+}
+
 function agendaCtlHtml(item) {
   const id = escapeHtml(item.id);
   if (item.kind === 'question' && item.status === 'open') {
-    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it">?</button>`;
+    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it" aria-label="Open question">?</button>`;
   }
-  if (item.status === 'open') {
-    return `<button type="button" class="ag2-ctl open" data-ctl="${id}" title="Mark done"></button>`;
-  }
-  if (item.status === 'done') {
-    return `<button type="button" class="ag2-ctl done" data-ctl="${id}" title="Reopen">✓</button>`;
-  }
-  return `<button type="button" class="ag2-ctl retired" data-ctl="${id}" title="Reopen (retired)"></button>`;
+  const [cls, glyph, tip] = item.status === 'open'
+    ? ['open', '', 'Mark done — completes this item; reopen any time']
+    : item.status === 'done'
+      ? ['done', '✓', 'Done — tap to reopen']
+      : ['retired', '', 'Retired — tap to reopen'];
+  const action = agendaCtlAction(item);
+  const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id;
+  const pill = revealed
+    ? `<button type="button" class="ag2-ctl-label" data-ctl="${id}">${escapeHtml(action)}</button>`
+    : '';
+  return `<button type="button" class="ag2-ctl ${cls}${revealed ? ' revealed' : ''}" data-ctl="${id}" title="${escapeHtml(tip)}" aria-label="${escapeHtml(action)}">${glyph}</button>${pill}`;
 }
 
 function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  // Calm depth folds prerequisite-only wait lines (the blocked chip
-  // still shows); an explicit uncleared blocker always renders — it
-  // names what someone must do.
-  const blockedRaw = agendaBlockedLine(item);
-  const blockedLine = blockedRaw
-    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
-    ? null : blockedRaw;
+  // Per-gate blocked rows: explicit blockers and delivered-awaiting
+  // waits always render; calm depth folds only the genuinely in-flight
+  // waits, and the blocked chip's tap unfolds them (agendaBlockedOpen).
+  const blockedDetail = agendaBlockedDetailHtml(item);
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -1510,7 +1628,7 @@ function agendaCardHtml(row) {
         ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
-      ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${blockedDetail}
       ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
@@ -1673,6 +1791,12 @@ function agendaLensFooterHtml(lensId) {
 // ---- List event delegation (wired once on #ag2-groups) ----
 
 function agendaGroupsClick(e) {
+  // The click a press-and-hold releases into already did its job (the
+  // reveal) — swallow it whole before any branch can act on it.
+  if (agendaCtlHoldFiredAt && Date.now() - agendaCtlHoldFiredAt < 800) {
+    agendaCtlHoldFiredAt = 0;
+    return;
+  }
   // S6 footer affordances: the Archive pager and the see-archive door.
   if (e.target.closest('[data-archive-more]')) {
     e.preventDefault();
@@ -1692,16 +1816,42 @@ function agendaGroupsClick(e) {
     return;
   }
   const ctl = e.target.closest('[data-ctl]');
+  // A revealed circle disarms on any click that isn't its own control.
+  if (agendaCtlReveal && !(ctl && ctl.dataset.ctl === agendaCtlReveal.id)) {
+    agendaCtlReveal = null;
+    agendaRenderTab();
+  }
   if (ctl) {
     const item = agendaFindItem(ctl.dataset.ctl);
     if (!item) return;
     if (item.kind === 'question' && item.status === 'open') {
       agendaOpenInspector(item.id);
-    } else if (item.status === 'open') {
+      return;
+    }
+    // Hover-less pointers: the first tap names the action; the second
+    // (circle or pill, while revealed) acts. Hover pointers act at
+    // once, exactly as today; keyboard activations (detail 0 — the
+    // aria-label already names them) always act.
+    const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id
+      && agendaCtlReveal.until > Date.now();
+    if (agendaCtlPointerType === 'touch' && !revealed && e.detail !== 0) {
+      agendaCtlRevealShow(item.id);
+      return;
+    }
+    agendaCtlReveal = null;
+    if (item.status === 'open') {
       agendaSendOp({ op: 'complete', id: item.id }, ctl);
     } else {
       agendaSendOp({ op: 'reopen', id: item.id }, ctl);
     }
+    return;
+  }
+  const blockedToggle = e.target.closest('[data-blocked-toggle]');
+  if (blockedToggle) {
+    const id = blockedToggle.dataset.blockedToggle;
+    if (agendaBlockedOpen.has(id)) agendaBlockedOpen.delete(id);
+    else agendaBlockedOpen.add(id);
+    agendaRenderTab();
     return;
   }
   const opBtn = e.target.closest('[data-op-btn]');
