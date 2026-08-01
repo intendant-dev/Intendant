@@ -1425,9 +1425,21 @@ function agendaGraphDraw(ts) {
       const ax = Math.cos(mark.angle) * mark.r;
       const az = Math.sin(mark.angle) * mark.r;
       const cr = 16 + 9 * Math.sqrt(mark.count);
+      const steps = 36;
+      // A barely-there wash inside the boundary makes the area read as
+      // a region (a country on a map), not just a line.
+      g.beginPath();
+      for (let i = 0; i <= steps; i++) {
+        const a = (i / steps) * Math.PI * 2;
+        const p = project([ax + Math.cos(a) * cr, 0, az + Math.sin(a) * cr]);
+        if (i === 0) g.moveTo(p.x, p.y);
+        else g.lineTo(p.x, p.y);
+      }
+      g.closePath();
+      g.fillStyle = `rgba(${pal.iris},.045)`;
+      g.fill();
       g.setLineDash([2, 4]);
       g.lineWidth = 1;
-      const steps = 36;
       for (let i = 0; i < steps; i++) {
         const a0 = (i / steps) * Math.PI * 2;
         const a1 = ((i + 1) / steps) * Math.PI * 2;
@@ -1437,15 +1449,10 @@ function agendaGraphDraw(ts) {
         g.beginPath();
         g.moveTo(p0.x, p0.y);
         g.lineTo(p1.x, p1.y);
-        g.strokeStyle = `rgba(${pal.text},${0.16 * depth})`;
+        g.strokeStyle = `rgba(${pal.text},${0.22 * depth})`;
         g.stroke();
       }
       g.setLineDash([]);
-      const q = project([ax, -(cr + 16), az]);
-      g.font = '600 9.5px "JetBrains Mono", monospace';
-      g.fillStyle = pal.t3;
-      const label = `${mark.name} · ${mark.count}`;
-      g.fillText(label, q.x - g.measureText(label).width / 2, q.y);
     });
   }
   // Nodes far → near.
@@ -1469,6 +1476,12 @@ function agendaGraphDraw(ts) {
     let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
     // Attention mode: needs-you items glow, the rest recede.
     if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
+    // Files mode: the no-territory core is context, not subject — it
+    // recedes so the area clusters carry the figure-ground. (Core
+    // nodes are exactly the ones on the loose 0.03 leash.)
+    if (agendaGraphMode === 'files' && !hot && node.anchorK === 0.03) {
+      alpha *= 0.5;
+    }
     const glow = agendaGraphGlowSprite(rgb);
     // Halo budget shrinks on crowded boards — past ~150 nodes the full
     // glow tiles the disc into one nebula and drowns the geometry.
@@ -1510,13 +1523,15 @@ function agendaGraphDraw(ts) {
     }
     if (st && st.kind === 'pending') ring(pal.amber, 5.4, 0.75 * alpha);
     // Territory halo: a dotted outer ring on nodes carrying file/dir
-    // refs — the declared working set made visible.
+    // refs — the declared working set made visible. Suppressed in
+    // files mode, where nearly every clustered node would carry one
+    // and the area boundary circles already say it.
     const territory = agendaGraphProjection === 'hubs'
       ? agendaGraphSubtreeTerr.get(node.id) || 0
       : (item.refs || []).filter(
         (r) => r.ref_type === 'file' || r.ref_type === 'dir',
       ).length;
-    if (territory) {
+    if (territory && agendaGraphMode !== 'files') {
       g.setLineDash([1.5, 3.2]);
       ring(pal.text, 7.6, 0.3 * alpha);
       g.setLineDash([]);
@@ -1547,6 +1562,44 @@ function agendaGraphDraw(ts) {
       }
     }
   });
+  // Files-mode area labels paint over the nodes, on the outer rim at
+  // each area's own angle with a short leader to its wash — outside is
+  // where the empty pixels are, and the leader keeps the association
+  // unambiguous at any camera.
+  if (agendaGraphMode === 'files') {
+    g.font = '600 9.5px "JetBrains Mono", monospace';
+    const origin = project([0, 0, 0]);
+    agendaGraphFilesMarks.forEach((mark) => {
+      const cr = 16 + 9 * Math.sqrt(mark.count);
+      const cosA = Math.cos(mark.angle);
+      const sinA = Math.sin(mark.angle);
+      const rim = project([cosA * (mark.r + cr), 0, sinA * (mark.r + cr)]);
+      // Extend the leader in SCREEN space: world-radial extension
+      // forshortens to nothing at the disc's top and bottom under
+      // pitch, stranding those labels inside the node field.
+      let dx = rim.x - origin.x;
+      let dy = rim.y - origin.y;
+      const dl = Math.hypot(dx, dy) || 1;
+      dx /= dl;
+      dy /= dl;
+      const tip = { x: rim.x + dx * 20, y: rim.y + dy * 20 };
+      g.beginPath();
+      g.moveTo(rim.x, rim.y);
+      g.lineTo(tip.x, tip.y);
+      g.strokeStyle = `rgba(${pal.text},.25)`;
+      g.lineWidth = 1;
+      g.stroke();
+      const label = `${mark.name} · ${mark.count}`;
+      const tw = g.measureText(label).width;
+      const leftSide = dx < -0.25;
+      g.fillStyle = pal.t3;
+      g.fillText(
+        label,
+        leftSide ? tip.x - tw - 4 : Math.abs(dx) <= 0.25 ? tip.x - tw / 2 : tip.x + 4,
+        tip.y + (dy > 0.3 ? 10 : dy < -0.3 ? -4 : 3),
+      );
+    });
+  }
   // Projection badge (painted, inert pixels like every label): what the
   // constellation is currently showing.
   const terrBadge = agendaGraphTerrStats.shown
