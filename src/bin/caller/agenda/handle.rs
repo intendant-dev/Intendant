@@ -1098,6 +1098,29 @@ impl AgendaHandle {
                 .map(|refusal| refusal.view());
             }
         }
+        // Approve-while-blocked decoration (the `next_fire_ms` pattern),
+        // served BESIDE the fireability verdicts above: the named causes
+        // keeping each open item blocked, resolved against the full fold
+        // so a dependency target outside the served slice still gets its
+        // live title/status served — approve surfaces derive their
+        // confirm from this, never from a client-side join. Advisory by
+        // doctrine: it names, it never gates (the fireability stamp is
+        // what withholds Approve; this one only makes the confirm
+        // honest). Compute-then-stamp like the planner views: the
+        // universe borrow ends before the mutable pass.
+        let blocked_views: Vec<Option<Vec<super::types::AgendaBlockedOn>>> = {
+            let universe: &[AgendaItem] = context.unwrap_or(items);
+            items
+                .iter()
+                .map(|item| {
+                    let causes = super::summary::blocked_on(universe, item);
+                    (!causes.is_empty()).then_some(causes)
+                })
+                .collect()
+        };
+        for (item, causes) in items.iter_mut().zip(blocked_views) {
+            item.blocked_on = causes;
+        }
     }
 
     /// One page of the raw occurrence journal (read-only; the
@@ -3113,6 +3136,139 @@ mod tests {
             .unwrap();
         assert!(armed.effects[0].approval.is_some());
         assert!(armed.effects[0].fireability_refusal.is_none());
+    }
+
+    /// The approve-while-blocked serving half (confirm-not-gate): an
+    /// open dependent's served copies carry `blocked_on` — the NAMED
+    /// prerequisite with live title/status — beside the pending
+    /// effect's fireability-verdict field, on the list lane AND on the
+    /// single-item command response, whose decoration resolves the
+    /// target from the full fold even though only one item rides the
+    /// response (the window-starvation case the field exists for).
+    /// Approving while blocked PROCEEDS — advisory means advisory —
+    /// and completing the prerequisite clears the decoration at the
+    /// next serve.
+    #[test]
+    fn served_items_name_blocked_on_beside_the_verdict_and_approve_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path())
+            .with_spawn_context(ctx_with_default_project(dir.path()));
+        let owner = Some(AgendaActor {
+            principal: Some("owner".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        let add = |title: &str| {
+            handle
+                .apply(
+                    AgendaCommand::Add {
+                        kind: super::super::types::AgendaKind::Task,
+                        title: title.into(),
+                        body: String::new(),
+                        tags: Vec::new(),
+                        due_ms: None,
+                        source: None,
+                        refs: Vec::new(),
+                    },
+                    owner.clone(),
+                )
+                .unwrap()
+        };
+        let prereq = add("the prerequisite step");
+        let dependent = add("the dependent");
+        handle
+            .apply(
+                AgendaCommand::AddReliesOn {
+                    id: dependent.id.clone(),
+                    target_id: prereq.id.clone(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        // A time-floored manifest — the shape the approve confirm/
+        // warning applies to.
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: dependent.id.clone(),
+                    goal: "run the follow-up".into(),
+                    fire_at_ms: 4_102_444_800_000,
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: None,
+                    agent_config: None,
+                    trigger: None,
+                    project_root: None,
+                    binding_refs: Vec::new(),
+                    source: None,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        // The single-item command response names the cause from the
+        // full fold.
+        let causes = proposed
+            .blocked_on
+            .as_ref()
+            .expect("a blocked dependent's response carries blocked_on");
+        assert_eq!(causes.len(), 1);
+        assert_eq!(causes[0].title, "the prerequisite step");
+        assert_eq!(causes[0].target_status.as_deref(), Some("open"));
+        assert_eq!(causes[0].target_id.as_deref(), Some(prereq.id.as_str()));
+        // Beside the verdict: the pending effect carries the
+        // fireability field (fireable here — verdict absent).
+        assert!(proposed.effects[0].fireability_refusal.is_none());
+
+        // The list lane serves the same view; the unblocked
+        // prerequisite itself carries no decoration.
+        let served = handle.snapshot();
+        let row = served.iter().find(|i| i.id == dependent.id).unwrap();
+        assert!(row.blocked_on.is_some());
+        assert!(served
+            .iter()
+            .find(|i| i.id == prereq.id)
+            .unwrap()
+            .blocked_on
+            .is_none());
+
+        // Advisory means advisory: approve on the still-blocked item
+        // PROCEEDS (the surfaces confirm/warn; nothing refuses).
+        let digest = proposed.effects[0].digest.clone();
+        let armed = handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: dependent.id.clone(),
+                    digest,
+                },
+                owner.clone(),
+            )
+            .unwrap();
+        assert!(armed.effects[0].approval.is_some());
+        assert!(
+            armed.blocked_on.is_some(),
+            "the approve response still names the live cause for the warning"
+        );
+
+        // Completing the prerequisite clears the decoration at the
+        // next serve — nothing was ever stored.
+        handle
+            .apply(
+                AgendaCommand::Complete {
+                    id: prereq.id.clone(),
+                    source: None,
+                },
+                owner,
+            )
+            .unwrap();
+        let served = handle.snapshot();
+        assert!(served
+            .iter()
+            .find(|i| i.id == dependent.id)
+            .unwrap()
+            .blocked_on
+            .is_none());
     }
 
     /// Approval binds the digest: an edit (re-propose) voids it, and a

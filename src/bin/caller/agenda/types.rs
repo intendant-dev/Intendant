@@ -804,6 +804,19 @@ pub struct AgendaItem {
     /// `None` in the fold product, never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) watched_by: Option<AgendaWatchedBy>,
+    /// Display-only serving-seam decoration (the `next_fire_ms` pattern):
+    /// the NAMED causes currently keeping this open item blocked — each
+    /// uncleared blocker's criterion, each unsatisfied `relies_on` target
+    /// with its live title and status — served beside the effects'
+    /// fireability verdicts so approve surfaces derive the
+    /// approve-while-blocked confirm from served truth, never from a
+    /// client-side join a serving window could starve. ADVISORY by
+    /// doctrine: nothing evaluates it, nothing refuses on it — blocked is
+    /// bookkeeping, and approval stays the owner's absolute lever.
+    /// Present exactly when the item is open and blocked; always `None`
+    /// in the fold product, never folded from ops, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blocked_on: Option<Vec<AgendaBlockedOn>>,
 }
 
 /// The automation claiming an open item (the `watched_by` decoration):
@@ -826,6 +839,33 @@ pub struct AgendaWatchedBy {
     /// the claim comes from a consuming occurrence already running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) due_ms: Option<u64>,
+}
+
+/// One named cause in the `blocked_on` decoration: what exactly keeps an
+/// open item blocked right now, with the human name every confirm/warning
+/// renders (the UX rider: name the actual prerequisite, never a generic
+/// warning). Two lanes share the shape — a blocker names its criterion, a
+/// dependency names its target's live title. Item-authored text: render
+/// quoted, like every title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaBlockedOn {
+    /// `"blocker"` (an uncleared human criterion) or `"relies_on"` (an
+    /// unsatisfied dependency edge).
+    pub(crate) cause: String,
+    /// The display name: the blocker's criterion, or the prerequisite
+    /// item's title (its id when the target is missing from the fold).
+    pub(crate) title: String,
+    /// relies_on lane: the prerequisite item id (click-through target).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_id: Option<String>,
+    /// relies_on lane: the target's live status — `"open"`, `"retired"`
+    /// (does not satisfy; renders review), or `"missing"` (absent from
+    /// the fold).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_status: Option<String>,
+    /// blocker lane: the uncleared blocker's stable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blocker_id: Option<String>,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -1893,6 +1933,7 @@ pub(crate) fn apply_op(
                     relates_to: Vec::new(),
                     deferred_until: None,
                     watched_by: None,
+                    blocked_on: None,
                 },
             );
             None
@@ -2603,11 +2644,12 @@ pub(crate) fn apply_op(
 /// non-Done target and simply derives blocked), nothing walks, nothing
 /// evaluates, nothing fires.
 ///
-/// This is presentation, deliberately NOT a stored or wire field (the DTO
-/// stays the pure fold product — the D0-Agenda-Data migration replays the
-/// log verbatim). The dashboard and ctl derive the same judgment from the
-/// serialized items like the overdue chip; this typed twin exists to PIN
-/// the semantics in unit tests (the retire-review and cycle rules).
+/// This is presentation, deliberately never STORED (the fold product
+/// stays pure — the D0-Agenda-Data migration replays the log verbatim).
+/// On the wire it now travels only as the serving-seam `blocked_on`
+/// decoration ([`AgendaItem::blocked_on`], stamped like `next_fire_ms`,
+/// derived in [`super::summary::blocked_on`]); this typed twin exists to
+/// PIN the semantics in unit tests (the retire-review and cycle rules).
 #[cfg(test)]
 pub(crate) fn dependency_state(
     items: &BTreeMap<String, AgendaItem>,
