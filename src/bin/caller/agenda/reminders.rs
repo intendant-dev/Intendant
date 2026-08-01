@@ -934,6 +934,10 @@ pub(crate) struct SpawnOccurrence {
     /// This occurrence's own instant — for a standing series (G3-pre),
     /// the series/requested instant, not the manifest's first fire.
     pub(crate) fire_at_ms: u64,
+    /// The manifest approval's instant — the spawn governor's second
+    /// ordering key (due instant first, approval order second) when
+    /// simultaneous dues stagger.
+    pub(crate) approved_at_ms: u64,
     /// Standing-series occurrence (G3-pre): a missed instant resolves
     /// without the one-shot's "re-approve to reschedule" tail — the next
     /// instant needs no ceremony.
@@ -1598,6 +1602,7 @@ pub(crate) fn plan(
                     goal: effect.manifest.goal.clone(),
                     orchestrate: effect.manifest.orchestrate,
                     fire_at_ms: instant,
+                    approved_at_ms: approval.at_ms,
                     recurring,
                     interactive: effect.manifest.interactive,
                     project_root: effect.manifest.project_root.clone(),
