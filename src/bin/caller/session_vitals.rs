@@ -422,6 +422,10 @@ impl GitVitalsProber {
         Some(toplevel)
     }
 
+    /// Probe one cwd to the vitals shape alone — the prober contract's
+    /// test seam (production flows through [`Self::probe_resolved`],
+    /// which additionally yields the ledger harvest).
+    #[cfg(test)]
     pub(crate) async fn probe(&mut self, cwd: &Path) -> Option<SessionGitVitals> {
         self.probe_resolved(cwd).await.map(|(_, vitals, _)| vitals)
     }
