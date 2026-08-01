@@ -38267,7 +38267,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4fdda11296ec6aba';
+const INTENDANT_APP_BUILD = 'fa8eefb3824e906c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -100249,6 +100249,14 @@ function agendaGraphRemoveEsc() {
 }
 let agendaGraphMouse = { x: -1e4, y: -1e4, down: false, moved: 0 };
 let agendaGraphHover = null;
+// Explorability state: the live search verdicts (recomputed only when
+// the query changes — display-only, never touches layout), the link
+// adjacency for hover-neighborhood focus, and when the current hover
+// began (the neighborhood fade waits ~350ms so casual mouse travel
+// never flickers the field).
+let agendaGraphSearchCache = { q: '', ids: null };
+let agendaGraphNeighbors = new Map();
+let agendaGraphHoverSince = 0;
 let agendaGraphPalCache = null;
 let agendaGraphPalAt = 0;
 let agendaGraphMotionQuery = null;
@@ -100403,6 +100411,12 @@ function agendaGraphWireChrome(host) {
         agendaGraphFocus = null;
         agendaRenderTab();
       };
+    } else if (kind === 'fit') {
+      chip.disabled = false;
+      chip.title = 'frame every node (zoom + pan to fit)';
+      chip.onclick = () => {
+        agendaGraphFitAll();
+      };
     } else if (kind && kind.startsWith('mode-')) {
       const mode = kind.slice(5);
       chip.classList.toggle('active', agendaGraphMode === mode);
@@ -100448,6 +100462,7 @@ function agendaGraphPanelHtml() {
       <button type="button" class="ag2-graph-projchip" data-proj="all">everything</button>
       <button type="button" class="ag2-graph-projchip" data-proj="terr">territory</button>
       <button type="button" class="ag2-graph-projchip" data-proj="clearfocus" hidden>focused ✕</button>
+      <button type="button" class="ag2-graph-projchip" data-proj="fit">⊙ fit</button>
       <span class="ag2-graph-projdiv"></span>
       ${AGENDA_GRAPH_MODES.map(([mode, label]) =>
     `<button type="button" class="ag2-graph-projchip" data-proj="mode-${mode}">${label}</button>`).join('\n      ')}
@@ -100601,6 +100616,48 @@ function agendaGraphUnbindCanvas() {
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
+}
+
+// Frame every node: mirror the draw projection at zoom 1 / no pan,
+// then solve the zoom + pan that centers the bounding box with margin.
+// Screen offsets scale linearly with zoom (k = s·1.35·zoom), so the
+// zoom-1 bounds scale exactly and one pass suffices.
+function agendaGraphFitAll() {
+  const canvas = agendaGraphCanvas;
+  if (!canvas || !agendaGraphNodes.length) return;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (!w || !h) return;
+  const cam = agendaGraphCam;
+  const cy = Math.cos(cam.yaw);
+  const sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch);
+  const sp = Math.sin(cam.pitch);
+  const focal = 760;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  agendaGraphNodes.forEach((n) => {
+    const p = n.p;
+    const rx = p[0] * cy + p[2] * sy;
+    let rz = -p[0] * sy + p[2] * cy;
+    const ry = p[1] * cp - rz * sp;
+    rz = p[1] * sp + rz * cp;
+    const k = (focal / (focal + rz + 40)) * 1.35;
+    const x = rx * k;
+    const y = ry * k;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  });
+  cam.zoom = Math.max(0.35, Math.min(3.5,
+    Math.min(w / (maxX - minX + 70), h / (maxY - minY + 70))));
+  cam.panX = -((minX + maxX) / 2) * cam.zoom;
+  cam.panY = -((minY + maxY) / 2) * cam.zoom;
+  cam.auto = false;
+  agendaGraphArmAutoResume();
 }
 
 // Auto-orbit resumes ~4s after the last interaction — never under
@@ -101077,9 +101134,20 @@ function agendaGraphBuild() {
   // nodes carry labels; the two notions overlap on hubs but diverge on
   // heavily-cited leaves, which is the point.
   const degrees = new Array(agendaGraphNodes.length).fill(0);
+  agendaGraphNeighbors = new Map();
+  const addNeighbor = (from, to) => {
+    let set = agendaGraphNeighbors.get(from);
+    if (!set) {
+      set = new Set();
+      agendaGraphNeighbors.set(from, set);
+    }
+    set.add(to);
+  };
   links.forEach((link) => {
     degrees[link.a] += 1;
     degrees[link.b] += 1;
+    addNeighbor(agendaGraphNodes[link.a].id, agendaGraphNodes[link.b].id);
+    addNeighbor(agendaGraphNodes[link.b].id, agendaGraphNodes[link.a].id);
   });
   agendaGraphNodes.forEach((nd, i) => { nd.deg = degrees[i]; });
   agendaGraphLinks = links;
@@ -101425,8 +101493,35 @@ function agendaGraphDraw(ts) {
       hover = n.id;
     }
   });
+  if (hover !== agendaGraphHover) agendaGraphHoverSince = ts;
   agendaGraphHover = hover;
   canvas.style.cursor = hover ? 'pointer' : agendaGraphMouse.down ? 'grabbing' : 'grab';
+  // Search coupling, display-only: the card lenses' live query never
+  // filters the graph pool (deliberate — the constellation shows the
+  // whole topology), but matching nodes stay lit while the rest
+  // recede. Verdicts recompute only when the query changes.
+  const searchQ = (typeof agendaSearch === 'string' ? agendaSearch : '')
+    .trim().toLowerCase();
+  if (searchQ !== agendaGraphSearchCache.q) {
+    agendaGraphSearchCache = {
+      q: searchQ,
+      ids: searchQ
+        ? new Set(items.filter((x) => agendaSearchMatch(x, searchQ)).map((x) => x.id))
+        : null,
+    };
+  }
+  const searchIds = agendaGraphSearchCache.ids;
+  // Hover neighborhood: hold the pointer on a node ~350ms and the
+  // field outside its 1-hop neighborhood fades back (eased; instant
+  // under reduced motion), so a dense board becomes locally readable.
+  let hoodFocus = 0;
+  if (hover) {
+    const held = ts - agendaGraphHoverSince;
+    if (held > 350) hoodFocus = reduced ? 1 : Math.min(1, (held - 350) / 250);
+  }
+  const hood = hoodFocus > 0
+    ? agendaGraphNeighbors.get(hover) || new Set()
+    : null;
   const byId = new Map(items.map((x) => [x.id, x]));
   const childCount = new Map();
   items.forEach((x) => {
@@ -101439,8 +101534,17 @@ function agendaGraphDraw(ts) {
   agendaGraphLinks.forEach((link) => {
     const a = pts[link.a];
     const b = pts[link.b];
-    const depth = Math.max(0.25, Math.min(1, ((a.s + b.s) / 2) * 1.1 - 0.18));
     const hot = hover && (nodes[link.a].id === hover || nodes[link.b].id === hover);
+    // Explorability fades ride the depth factor: a link recedes when
+    // neither endpoint matches the live search, and when it is not
+    // incident to a held-hover's neighborhood.
+    let fade = 1;
+    if (searchIds && !hot
+      && !searchIds.has(nodes[link.a].id) && !searchIds.has(nodes[link.b].id)) {
+      fade *= 0.35;
+    }
+    if (hood && !hot) fade *= 1 - 0.75 * hoodFocus;
+    const depth = fade * Math.max(0.25, Math.min(1, ((a.s + b.s) / 2) * 1.1 - 0.18));
     g.beginPath();
     g.moveTo(a.x, a.y);
     g.lineTo(b.x, b.y);
@@ -101593,6 +101697,10 @@ function agendaGraphDraw(ts) {
     if (agendaGraphMode === 'files' && !hot && node.anchorK === 0.03) {
       alpha *= 0.5;
     }
+    // Explorability fades: live-search misses and outside-the-hovered-
+    // neighborhood nodes recede (never the hovered node itself).
+    if (searchIds && !hot) alpha *= searchIds.has(node.id) ? 1 : 0.25;
+    if (hood && !hot && !hood.has(node.id)) alpha *= 1 - 0.7 * hoodFocus;
     const glow = agendaGraphGlowSprite(rgb);
     // Halo budget shrinks on crowded boards — past ~150 nodes the full
     // glow tiles the disc into one nebula and drowns the geometry.
@@ -101729,6 +101837,9 @@ function agendaGraphDraw(ts) {
   const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
     ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
     : '';
+  const searchBadge = searchIds
+    ? ` · search — ${searchIds.size} match${searchIds.size === 1 ? '' : 'es'}`
+    : '';
   {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
@@ -101747,7 +101858,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + modeBadge + terrBadge + zoomBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge + zoomBadge + searchBadge, 14, 64);
   }
 }
 
