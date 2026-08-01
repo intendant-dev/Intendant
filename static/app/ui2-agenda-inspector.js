@@ -1622,6 +1622,11 @@ function agendaOpenSchedSheet(itemId, opts) {
     // of re-propose, and re-propose replaces the whole manifest — what
     // the owner isn't editing must ride along untouched.
     trigger: (m && m.trigger) || null,
+    // The on-unblock offer for dependents (suggested mode): preselected
+    // only on a FRESH propose for an item with relies_on edges; an
+    // existing proposal opens exactly as it stands — existing time-floor
+    // manifests are never silently converted by opening this sheet.
+    onUnblock: !m && Array.isArray(item.relies_on) && item.relies_on.length > 0,
     bindingRefs: m && Array.isArray(m.binding_refs) ? m.binding_refs.slice() : [],
     execBackend: cfg.agent || '',
     execModel: cfg.claude_model || cfg.codex_model || cfg.kimi_model || cfg.pi_model || '',
@@ -1717,7 +1722,14 @@ function agendaSchedSheetHtml(item) {
       </div>
       <div class="ag2-hint">The list serves summaries; the editor prefills from the full item so nothing is dropped on save.</div>`;
   }
-  const standing = !!s.repeat;
+  // The on-unblock offer (dependents' suggested mode): rendered whenever
+  // the manifest is time-driven and the item carries relies_on edges;
+  // ticked, it swaps the cadence lane for the dependency-gated trigger
+  // (a manifest is cadenced OR triggered — the daemon's intake rule,
+  // honored here instead of met as a refusal).
+  const offerUnblock = !s.trigger && Array.isArray(item.relies_on) && item.relies_on.length > 0;
+  const unblockOn = offerUnblock && !!s.onUnblock;
+  const standing = !!s.repeat && !unblockOn;
   const standingBlock = standing
     ? `<div class="ag2-sheet-callout t-green">Standing series — one approval covers every run until revoked. A failure streak suspends it for you to re-arm.</div>
       <div class="ag2-sheet-grid">
@@ -1768,7 +1780,13 @@ function agendaSchedSheetHtml(item) {
     : 'when this item unblocks')}</div>
         <div class="ag2-hint">Event-triggered — carried unchanged through this edit; the time above is the arm floor, not a fire instant.</div>
       </div>`
-    : `<span class="ag2-sheet-k">Repeats</span>
+    : unblockOn
+      ? `<span class="ag2-sheet-k" data-mf-field="trigger">Fires</span>
+      <div>
+        <div>when this item unblocks (its prerequisites complete)</div>
+        <div class="ag2-hint">Event-triggered (on_unblock): approve anytime — the fire waits for the real unblock. The time above is the arm floor, not a fire instant.</div>
+      </div>`
+      : `<span class="ag2-sheet-k">Repeats</span>
       <select data-sheet="repeat" data-mf-field="recurrence" aria-label="Repeats">
         <option value=""${s.repeat === '' ? ' selected' : ''}>never — one run</option>
         <option value="1"${s.repeat === '1' ? ' selected' : ''}>every day</option>
@@ -1776,6 +1794,12 @@ function agendaSchedSheetHtml(item) {
         <option value="14"${s.repeat === '14' ? ' selected' : ''}>every two weeks</option>
         ${keepOption}
       </select>`;
+  // The offer row itself: a visible, reversible tick — never applied
+  // silently (a fresh propose on a dependent item arrives pre-ticked;
+  // editing an existing plan arrives as-it-stands).
+  const unblockOffer = offerUnblock
+    ? `<label class="ag2-check" data-sheet-offer="on_unblock"><input type="checkbox" data-sheet="onUnblock"${s.onUnblock ? ' checked' : ''}><span>Fire when prerequisites complete (on_unblock) — suggested for dependents<br><span class="ag2-hint">This item relies on ${item.relies_on.length} prerequisite${item.relies_on.length === 1 ? '' : 's'}. Ticked: the session fires when they are all done — approving early is safe, the fire waits${s.repeat && unblockOn ? '; the cadence pick is cleared (a manifest is cadenced OR triggered)' : ''}.</span></span></label>`
+    : '';
   // Sealed binding refs render READ-ONLY with their hashes: they are
   // carried verbatim through the edit, and editing sealed content stays
   // the re-seal ceremony (restate a new pin where the ref was minted).
@@ -1803,8 +1827,8 @@ function agendaSchedSheetHtml(item) {
     </div>
     ${shapeBlock}
     <div class="ag2-sheet-grid">
-      <span class="ag2-sheet-k">${s.trigger ? 'Armed from' : 'First run'}</span>
-      <input type="datetime-local" data-sheet="when" data-mf-field="fire_at_ms" aria-label="${s.trigger ? 'Armed from' : 'First run'}" value="${escapeHtml(s.when)}" />
+      <span class="ag2-sheet-k">${s.trigger || unblockOn ? 'Armed from' : 'First run'}</span>
+      <input type="datetime-local" data-sheet="when" data-mf-field="fire_at_ms" aria-label="${s.trigger || unblockOn ? 'Armed from' : 'First run'}" value="${escapeHtml(s.when)}" />
       ${cadenceBlock}
       <span class="ag2-sheet-k">Project</span>
       <div>
@@ -1812,6 +1836,7 @@ function agendaSchedSheetHtml(item) {
         ${agendaSchedProjectHintHtml(item, s)}
       </div>
     </div>
+    ${unblockOffer}
     ${standingBlock}
     ${agendaSchedExecutorRowsHtml()}
     ${refsBlock}
@@ -1921,8 +1946,12 @@ async function agendaSchedConfirm(button) {
   if (s.shape === 'interactive') params.interactive = true;
   if (s.projectRoot && s.projectRoot.trim()) params.project_root = s.projectRoot.trim();
   if (s.trigger) params.trigger = s.trigger;
+  // The ticked on-unblock offer mints the dependency-gated trigger —
+  // the EXISTING trigger vocabulary, exactly what `ctl agenda schedule
+  // --on-unblock` proposes; `when` stays the arm floor.
+  else if (s.onUnblock) params.trigger = { kind: 'on_unblock' };
   if (s.bindingRefs && s.bindingRefs.length) params.binding_refs = s.bindingRefs;
-  if (s.repeat && !s.trigger) {
+  if (s.repeat && !params.trigger) {
     const rec = {
       every_ms: s.repeat === 'keep' ? s.keepEveryMs : Number(s.repeat) * 864e5,
     };
@@ -1977,7 +2006,11 @@ async function agendaSchedConfirm(button) {
     if (typeof showControlToast === 'function') {
       const short = effect && effect.digest ? agendaShortDigest(effect.digest) : '';
       showControlToast(approved ? 'success' : 'info', approved
-        ? (params.recurrence ? `Proposed and approved — one approval covers the series (digest ${short}).` : `Proposed and approved — fires ${agendaAbsTime(fire)} (digest ${short}).`)
+        ? (params.recurrence ? `Proposed and approved — one approval covers the series (digest ${short}).`
+          : params.trigger ? (params.trigger.kind === 'on_unblock'
+            ? `Proposed and approved — armed; fires when the prerequisites complete (digest ${short}).`
+            : `Proposed and approved — armed; fires on matching items (digest ${short}).`)
+            : `Proposed and approved — fires ${agendaAbsTime(fire)} (digest ${short}).`)
         : `Proposed — waiting on an owner approval of ${short ? `digest ${short}` : 'this exact digest'}.`);
     }
   } catch (e) {
@@ -2142,7 +2175,8 @@ function agendaSheetInput(e) {
   const t = e.target.closest('[data-sheet]');
   if (!t) return;
   const key = t.dataset.sheet;
-  const structural = key === 'repeat' || key === 'approveNow' || key === 'execBackend';
+  const structural = key === 'repeat' || key === 'approveNow' || key === 'execBackend'
+    || key === 'onUnblock';
   if (t.type === 'checkbox') s[key] = !!t.checked;
   else s[key] = t.value;
   if (key === 'execBackend') {

@@ -2335,6 +2335,7 @@ async fn run_agenda(
                         .to_string(),
                 );
             }
+            let triggered = trigger.is_some();
             if let Some(trigger) = trigger {
                 map.insert("trigger".to_string(), trigger);
             }
@@ -2359,6 +2360,7 @@ async fn run_agenda(
             // manifest — the owner approves WHO runs the goal.
             insert_agenda_launch_config(&mut map, &args);
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            let proposed_item = agenda_response_item(&response);
             print_tool_response(response, config, None)?;
             if args.one("--every").is_some() {
                 println!(
@@ -2371,6 +2373,27 @@ async fn run_agenda(
                     "proposed — nothing fires until the owner approves the digest \
                      (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
                 );
+            }
+            // The on-unblock offer for dependents: a time-floored
+            // proposal on an item with `relies_on` edges gets the
+            // dependency-gated mode named (suggested, never applied —
+            // this proposal is exactly what was asked for). Derived
+            // from the served response item, not a local guess.
+            if !triggered {
+                let prerequisites = proposed_item
+                    .as_ref()
+                    .and_then(|item| item.get("relies_on"))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if prerequisites > 0 {
+                    println!(
+                        "this item relies on {prerequisites} prerequisite(s) — the \
+                         dependency-gated shape is suggested for dependents: re-run this \
+                         schedule with --on-unblock to fire when they complete (--at then \
+                         sets the arm floor; approving early is safe by construction)"
+                    );
+                }
             }
         }
         "stamp" => {
@@ -2459,6 +2482,20 @@ async fn run_agenda(
                 println!("manifest under review for {id}:");
                 print_json(&effect["manifest"])?;
                 let digest = effect.get("digest").and_then(Value::as_str).unwrap_or("");
+                // The review moment of the approve-while-blocked
+                // advisory: name the live prerequisite BEFORE the owner
+                // echoes the digest back. Advisory only — the approve
+                // below proceeds regardless.
+                if agenda_effect_is_time_floored(item, digest) {
+                    if let Some(named) = agenda_blocked_named_line(item) {
+                        println!(
+                            "\nnote: {named} — approving is still allowed (advisory, never a \
+                             gate); this time-floored manifest fires on its own clock. A \
+                             re-propose with --on-unblock would wait for the real unblock \
+                             instead."
+                        );
+                    }
+                }
                 println!("\napprove exactly this revision with:\n  intendant ctl agenda approve {} --digest {digest}", &id[..12.min(id.len())]);
                 return Ok(());
             };
@@ -2470,7 +2507,18 @@ async fn run_agenda(
             map.insert("id".to_string(), Value::String(id));
             map.insert("digest".to_string(), Value::String(digest.to_string()));
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            // Approve-while-blocked (confirm-not-gate): the named
+            // warning prints AND the approval stands — derived from the
+            // `blocked_on` decoration the approve response itself
+            // serves, so the warning and the daemon's judgment can
+            // never disagree.
+            let approved_item = agenda_response_item(&response);
             print_tool_response(response, config, None)?;
+            if let Some(item) = approved_item {
+                if let Some(warning) = agenda_approve_blocked_warning(&item, digest) {
+                    println!("{warning}");
+                }
+            }
         }
         "start" => {
             // Owner start-now: an owner-shell act (local_process is an
@@ -3735,6 +3783,78 @@ async fn agenda_resolve_id_str(
 /// tool (Track AS S7): server-side resolution — exact id wins, an
 /// ambiguous prefix is refused with candidates — replacing the
 /// 18-subcommand whole-ledger fetch this file used to pay per lookup.
+/// The `{"item": …}` payload an `agenda_op` tool response carries (one
+/// JSON text content block) — extracted BEFORE printing so the approve/
+/// schedule lanes can derive their served-truth advisories from it.
+fn agenda_response_item(response: &Value) -> Option<Value> {
+    let result = response.get("result")?;
+    let parsed: Value = serde_json::from_str(single_text_content(result)?).ok()?;
+    parsed.get("item").cloned()
+}
+
+/// One named line for the first cause the daemon serves in `blocked_on`
+/// (the approve-while-blocked advisory): names the actual prerequisite
+/// title or blocker criterion, never a generic warning. `None` when the
+/// item is not currently served as blocked.
+fn agenda_blocked_named_line(item: &Value) -> Option<String> {
+    let causes = item.get("blocked_on").and_then(Value::as_array)?;
+    let first = causes.first()?;
+    let title = first.get("title").and_then(Value::as_str).unwrap_or("");
+    let named = if first.get("cause").and_then(Value::as_str) == Some("blocker") {
+        format!("blocker {title:?} is still uncleared")
+    } else {
+        match first.get("target_status").and_then(Value::as_str) {
+            Some("retired") => format!("prerequisite {title:?} was retired without completing"),
+            Some("missing") => format!("prerequisite {title:?} is missing from this agenda"),
+            _ => format!("prerequisite {title:?} is still open"),
+        }
+    };
+    let more = causes.len().saturating_sub(1);
+    Some(if more > 0 {
+        format!("{named} (and {more} more)")
+    } else {
+        named
+    })
+}
+
+/// True when the effect bound by `digest` is time-floored (no event
+/// trigger) — the only shape the approve-while-blocked advisory warns
+/// on: an `on_unblock` approval is safe by construction (the fire waits
+/// for the real unblock), and `on_item_match` fires on its own arrivals
+/// either way.
+fn agenda_effect_is_time_floored(item: &Value, digest: &str) -> bool {
+    item.get("effects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|effect| effect.get("digest").and_then(Value::as_str) == Some(digest))
+        .map(|effect| {
+            effect
+                .get("manifest")
+                .and_then(|manifest| manifest.get("trigger"))
+                .map(Value::is_null)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false)
+}
+
+/// The approve-lane advisory (confirm-not-gate): the named warning
+/// `agenda approve` prints while PROCEEDING — blocked bookkeeping never
+/// refuses an approval; the dependency-gated alternative is named so the
+/// owner can pick it next time. Derived from the daemon-served
+/// `blocked_on` decoration on the approve response itself.
+fn agenda_approve_blocked_warning(item: &Value, digest: &str) -> Option<String> {
+    if !agenda_effect_is_time_floored(item, digest) {
+        return None;
+    }
+    let named = agenda_blocked_named_line(item)?;
+    Some(format!(
+        "warning: {named} — approved anyway (blocked is advisory bookkeeping, never a lock); \
+         this time-floored manifest fires on its own clock regardless. To gate the fire on \
+         the real unblock instead, re-propose with --on-unblock."
+    ))
+}
+
 async fn agenda_fetch_item(
     client: &reqwest::Client,
     config: &Config,
@@ -5734,7 +5854,9 @@ fn help_agenda() {
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
       [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
-      # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor)\n\
+      # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor).\n\
+      # --on-unblock is the suggested mode for items with relies-on prerequisites: approve anytime,\n\
+      # the fire waits for the real unblock\n\
       [--binding-ref file:PATH]...   # sealed refs: sha256-pin content the goal depends on —\n\
       # hashed here at propose time, covered by the approval digest, re-verified at every fire\n\
       [--project DIR]   # digest-bound project pin: where fired sessions run (absolute, must\n\
@@ -5750,7 +5872,8 @@ fn help_agenda() {
       # executor overrides apply to single-node actions only\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
-  intendant ctl agenda approve ID_PREFIX [--digest HEX]\n\
+  intendant ctl agenda approve ID_PREFIX [--digest HEX]   # a blocked item approves fine —\n\
+      # the warning names the live prerequisite and the approval stands (advisory, never a gate)\n\
   intendant ctl agenda revoke-schedule ID_PREFIX\n\
   intendant ctl agenda withdraw ID_PREFIX [--reason TEXT]   # take back a PENDING unapproved\n\
       # proposal (yours included) — the approve solicitation clears, fired history and the\n\
@@ -5946,6 +6069,98 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// The approve-while-blocked warning is NAMED (the UX rider: the
+    /// actual prerequisite title, never a generic line), derived from
+    /// the served `blocked_on` decoration, and always phrased as an
+    /// advisory beside a standing approval — confirm-not-gate.
+    #[test]
+    fn approve_blocked_warning_names_the_prerequisite_and_proceeds() {
+        let item = serde_json::json!({
+            "blocked_on": [{
+                "cause": "relies_on",
+                "title": "Ship the serving envelope",
+                "target_id": "01TARGET",
+                "target_status": "open",
+            }],
+            "effects": [{ "digest": "abc123", "manifest": { "fire_at_ms": 1 } }],
+        });
+        let warning = agenda_approve_blocked_warning(&item, "abc123")
+            .expect("a blocked item's time-floored approve warns");
+        assert!(
+            warning.contains("prerequisite \"Ship the serving envelope\" is still open"),
+            "{warning}"
+        );
+        assert!(warning.contains("approved anyway"), "{warning}");
+        assert!(warning.contains("--on-unblock"), "{warning}");
+    }
+
+    /// The advisory scopes to TIME-FLOORED manifests only: an
+    /// `on_unblock`-triggered approval is safe by construction (the
+    /// fire waits for the real unblock), so it never warns — which also
+    /// keeps workflow batch approvals quiet by design.
+    #[test]
+    fn approve_blocked_warning_skips_event_triggered_manifests() {
+        let item = serde_json::json!({
+            "blocked_on": [{
+                "cause": "relies_on",
+                "title": "T",
+                "target_status": "open",
+            }],
+            "effects": [{
+                "digest": "abc123",
+                "manifest": { "fire_at_ms": 1, "trigger": { "kind": "on_unblock" } },
+            }],
+        });
+        assert_eq!(agenda_approve_blocked_warning(&item, "abc123"), None);
+    }
+
+    /// No served blocked fact — or a digest that matches no served
+    /// effect — warns nothing: the advisory derives from served truth
+    /// only, never from a client-side guess.
+    #[test]
+    fn approve_blocked_warning_absent_when_unblocked_or_unserved() {
+        let unblocked = serde_json::json!({
+            "effects": [{ "digest": "abc123", "manifest": { "fire_at_ms": 1 } }],
+        });
+        assert_eq!(agenda_approve_blocked_warning(&unblocked, "abc123"), None);
+        let blocked = serde_json::json!({
+            "blocked_on": [{ "cause": "relies_on", "title": "T", "target_status": "open" }],
+            "effects": [{ "digest": "abc123", "manifest": { "fire_at_ms": 1 } }],
+        });
+        assert_eq!(agenda_approve_blocked_warning(&blocked, "other"), None);
+    }
+
+    /// The named line covers every cause lane the daemon serves:
+    /// blocker criteria, retired/missing dependency review states, and
+    /// the "(and N more)" tail when several causes stand.
+    #[test]
+    fn blocked_named_line_covers_blocker_and_review_lanes() {
+        let blocker = serde_json::json!({
+            "blocked_on": [
+                { "cause": "blocker", "title": "vendor API still 403s", "blocker_id": "bk-1" },
+                { "cause": "relies_on", "title": "T2", "target_status": "open" },
+            ],
+        });
+        assert_eq!(
+            agenda_blocked_named_line(&blocker).as_deref(),
+            Some("blocker \"vendor API still 403s\" is still uncleared (and 1 more)")
+        );
+        let retired = serde_json::json!({
+            "blocked_on": [{ "cause": "relies_on", "title": "Old plan", "target_status": "retired" }],
+        });
+        assert_eq!(
+            agenda_blocked_named_line(&retired).as_deref(),
+            Some("prerequisite \"Old plan\" was retired without completing")
+        );
+        let missing = serde_json::json!({
+            "blocked_on": [{ "cause": "relies_on", "title": "01GONE", "target_status": "missing" }],
+        });
+        assert_eq!(
+            agenda_blocked_named_line(&missing).as_deref(),
+            Some("prerequisite \"01GONE\" is missing from this agenda")
+        );
     }
 
     /// Q7 (Track HS5): bare owner ctl follows the ACTIVE daemon — an

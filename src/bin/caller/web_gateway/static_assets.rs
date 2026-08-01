@@ -1124,6 +1124,92 @@ mod tests {
         );
     }
 
+    /// The approve-while-blocked confirm (confirm-not-gate) rides the
+    /// ONE approve emitter — `agendaSendOp`, which every surface
+    /// (card strips, inspector, sheet approve-now, missed-reschedule)
+    /// funnels through — BEFORE dispatch, derives from the served
+    /// `blocked_on` truth, names the actual prerequisite, and scopes
+    /// to time-floored manifests (an event-triggered approval is safe
+    /// by construction, so the workflow batch sheet stays quiet).
+    #[test]
+    fn approve_while_blocked_confirm_rides_the_one_emitter() {
+        let agenda = include_str!("../../../../static/app/ui2-agenda.js");
+        let send = agenda
+            .find("async function agendaSendOp")
+            .expect("the one approve emitter exists");
+        let confirm = agenda
+            .find("await agendaApproveBlockedConfirm(params)")
+            .expect("the confirm is wired at the emitter");
+        let dispatch = agenda
+            .find("daemonApi.request('api_agenda_op', params)")
+            .expect("the emitter dispatches the op");
+        assert!(
+            send < confirm && confirm < dispatch,
+            "the confirm runs inside agendaSendOp BEFORE the op is sent"
+        );
+        assert!(
+            agenda.contains("params.op === 'approve_effect'"),
+            "only approve legs confirm"
+        );
+        assert!(
+            agenda.contains("item.blocked_on"),
+            "derived from the SERVED blocked_on truth, never a client-side join"
+        );
+        assert!(
+            agenda.contains("(effect.manifest && effect.manifest.trigger)) return true"),
+            "event-triggered manifests skip the confirm — safe by construction"
+        );
+        for named in [
+            "is still open",
+            "was retired without completing",
+            "is missing from this agenda",
+            "is still uncleared",
+        ] {
+            assert!(
+                agenda.contains(named),
+                "the confirm names the actual cause lane: {named:?}"
+            );
+        }
+        assert!(
+            agenda.contains("— approve anyway?"),
+            "confirm-not-gate: the question, never a refusal"
+        );
+    }
+
+    /// The on-unblock offer (dependents' suggested mode) renders on the
+    /// schedule sheet for items with `relies_on` edges, preselects ONLY
+    /// on a fresh propose (existing time-floor plans open unchanged),
+    /// and mints the EXISTING trigger vocabulary — never a parallel
+    /// mechanism.
+    #[test]
+    fn sched_sheet_offers_on_unblock_for_dependents() {
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.js");
+        assert!(
+            inspector.contains(r#"data-sheet-offer="on_unblock""#),
+            "the offer row exists on the sheet"
+        );
+        assert!(
+            inspector.contains(r#"data-sheet="onUnblock""#),
+            "the offer is a visible, reversible tick"
+        );
+        assert!(
+            inspector.contains(
+                "Fire when prerequisites complete (on_unblock) — suggested for dependents"
+            ),
+            "the offer says what it does NOW and that it is the suggested mode"
+        );
+        assert!(
+            inspector.contains("params.trigger = { kind: 'on_unblock' }"),
+            "the ticked offer mints the existing OnUnblock trigger vocabulary"
+        );
+        assert!(
+            inspector.contains(
+                "onUnblock: !m && Array.isArray(item.relies_on) && item.relies_on.length > 0"
+            ),
+            "preselected only on a FRESH propose for a dependent item"
+        );
+    }
+
     /// Derive, don't mirror — the fragment half: every field
     /// `SessionManifest`'s own schema declares appears on the edit sheet
     /// as a `data-mf-field` marker (editor or read-only row), and no

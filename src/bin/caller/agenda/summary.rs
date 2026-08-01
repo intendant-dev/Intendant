@@ -176,6 +176,14 @@ pub(crate) struct AgendaItemSummary {
     /// `relies_on` edge whose target is not Done (missing/retired
     /// targets do not satisfy). Open items only.
     pub(crate) blocked: bool,
+    /// The NAMED causes behind `blocked` (same field path as the full
+    /// DTO's serving-seam decoration): uncleared blocker criteria and
+    /// unsatisfied prerequisite titles/statuses, so approve surfaces
+    /// derive the approve-while-blocked confirm from served truth even
+    /// when the prerequisite item sits outside the served window.
+    /// Present exactly when `blocked` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blocked_on: Option<Vec<super::types::AgendaBlockedOn>>,
     /// Cross-item serving-seam flag: the un-triaged frontier (the
     /// triage mandate's declared scope; see [`item_in_frontier`]).
     pub(crate) frontier: bool,
@@ -391,6 +399,7 @@ pub(crate) fn summarize(all: &[AgendaItem], served: &[AgendaItem]) -> Vec<Agenda
 }
 
 fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> AgendaItemSummary {
+    let blocked_causes = blocked_on(all, item);
     AgendaItemSummary {
         id: item.id.clone(),
         kind: item.kind,
@@ -507,7 +516,8 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
             .collect(),
         watched_by: item.watched_by.clone(),
         deferred_until: item.deferred_until,
-        blocked: item_is_blocked(all, item),
+        blocked: !blocked_causes.is_empty(),
+        blocked_on: (!blocked_causes.is_empty()).then_some(blocked_causes),
         frontier: item_in_frontier(item, watermark),
         triage: triage_info(item),
         children: None,
@@ -558,20 +568,59 @@ pub(crate) fn item_in_frontier(item: &AgendaItem, triage_watermark: u64) -> bool
 
 /// Blocked = open, and an uncleared blocker exists or a `relies_on`
 /// target is not Done (a missing or retired target does not satisfy —
-/// the same rule the trigger planner and the render twins use).
+/// the same rule the trigger planner and the render twins use). The
+/// bool IS "any named cause exists" — one live derivation,
+/// [`blocked_on`]; this named twin survives only to PIN that identity
+/// in tests (the `types::is_blocked` pattern).
+#[cfg(test)]
 pub(crate) fn item_is_blocked(all: &[AgendaItem], item: &AgendaItem) -> bool {
+    !blocked_on(all, item).is_empty()
+}
+
+/// The NAMED causes keeping an open item blocked right now — the single
+/// derivation behind the served `blocked` flag, the `blocked_on`
+/// decoration on both serving grains, and therefore behind every
+/// approve-while-blocked confirm/warning (advisory by doctrine: these
+/// name, they never gate). Empty exactly when the item is not blocked.
+/// Blocker entries name the uncleared criterion; dependency entries name
+/// the target's live title and status (`open`, `retired` — which does
+/// not satisfy, `missing` — absent from the fold, named by id).
+pub(crate) fn blocked_on(
+    all: &[AgendaItem],
+    item: &AgendaItem,
+) -> Vec<super::types::AgendaBlockedOn> {
     if item.status != AgendaStatus::Open {
-        return false;
+        return Vec::new();
     }
-    if item.blockers.iter().any(|b| b.cleared.is_none()) {
-        return true;
+    let mut causes = Vec::new();
+    for blocker in item.blockers.iter().filter(|b| b.cleared.is_none()) {
+        causes.push(super::types::AgendaBlockedOn {
+            cause: "blocker".to_string(),
+            title: blocker.criterion.clone(),
+            target_id: None,
+            target_status: None,
+            blocker_id: Some(blocker.blocker_id.clone()),
+        });
     }
-    item.relies_on.iter().any(|edge| {
-        all.iter()
-            .find(|candidate| candidate.id == edge.target_id)
-            .map(|target| target.status != AgendaStatus::Done)
-            .unwrap_or(true)
-    })
+    for edge in &item.relies_on {
+        let target = all.iter().find(|candidate| candidate.id == edge.target_id);
+        let (title, status) = match target {
+            None => (edge.target_id.clone(), "missing"),
+            Some(target) => match target.status {
+                AgendaStatus::Done => continue,
+                AgendaStatus::Retired => (target.title.clone(), "retired"),
+                AgendaStatus::Open => (target.title.clone(), "open"),
+            },
+        };
+        causes.push(super::types::AgendaBlockedOn {
+            cause: "relies_on".to_string(),
+            title,
+            target_id: Some(edge.target_id.clone()),
+            target_status: Some(status.to_string()),
+            blocker_id: None,
+        });
+    }
+    causes
 }
 
 /// The triage rank/note convention (the mandate's declared "rank N"
@@ -753,6 +802,18 @@ mod tests {
             "the served flag IS the predicate"
         );
         assert!(summary.blocked, "open prerequisite blocks the dependent");
+        let causes = summary
+            .blocked_on
+            .as_ref()
+            .expect("a blocked summary carries its named causes");
+        assert_eq!(causes.len(), 1);
+        assert_eq!(causes[0].cause, "relies_on");
+        assert_eq!(
+            causes[0].title, "prerequisite",
+            "the confirm derives the ACTUAL prerequisite title from serving"
+        );
+        assert_eq!(causes[0].target_id.as_deref(), Some(prereq.id.as_str()));
+        assert_eq!(causes[0].target_status.as_deref(), Some("open"));
         assert_eq!(
             summary.frontier,
             item_in_frontier(full, triage_watermark(&all))
@@ -1004,5 +1065,119 @@ mod tests {
         let digest_prefix = full.effects[0].digest[..8].to_string();
         assert!(matches_query(full, &digest_prefix), "digest prefix");
         assert!(!matches_query(full, "nomatch-anywhere"));
+    }
+
+    fn bare(id: &str, title: &str, status: AgendaStatus) -> AgendaItem {
+        AgendaItem {
+            id: id.into(),
+            kind: AgendaKind::Task,
+            title: title.into(),
+            body: String::new(),
+            tags: Vec::new(),
+            due_ms: None,
+            provenance: super::super::types::AgendaProvenance {
+                principal: None,
+                session_id: None,
+                kind: None,
+                source: None,
+                created_ms: 1,
+            },
+            status,
+            updated_ms: 1,
+            completed_ms: None,
+            answer: None,
+            effects: Vec::new(),
+            ask: None,
+            dismissed: None,
+            annotations: Vec::new(),
+            blockers: Vec::new(),
+            relies_on: Vec::new(),
+            refs: Vec::new(),
+            part_of: None,
+            relates_to: Vec::new(),
+            deferred_until: None,
+            watched_by: None,
+            blocked_on: None,
+        }
+    }
+
+    fn dep(target_id: &str) -> super::super::types::AgendaDependency {
+        super::super::types::AgendaDependency {
+            target_id: target_id.into(),
+            added_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+        }
+    }
+
+    /// The approve-while-blocked serving contract (confirm derivation
+    /// from served truth): `blocked_on` names every live cause —
+    /// blocker criteria verbatim, unsatisfied prerequisites by live
+    /// title with `open`/`retired`/`missing` status, Done targets
+    /// dropped — is empty exactly when the item is unblocked or
+    /// non-open, and the served `blocked` flag IS its non-emptiness.
+    #[test]
+    fn blocked_on_names_causes_across_lanes() {
+        let prereq_open = bare("01AOPEN", "Ship the envelope", AgendaStatus::Open);
+        let prereq_retired = bare("01BRETIRED", "Old plan", AgendaStatus::Retired);
+        let prereq_done = bare("01CDONE", "Landed already", AgendaStatus::Done);
+        let mut item = bare("01DDEPENDENT", "dependent", AgendaStatus::Open);
+        item.relies_on = vec![
+            dep("01AOPEN"),
+            dep("01BRETIRED"),
+            dep("01CDONE"),
+            dep("01MISSING"),
+        ];
+        item.blockers = vec![super::super::types::AgendaBlocker {
+            blocker_id: "bk-1".into(),
+            criterion: "vendor API still 403s".into(),
+            set_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+            cleared: None,
+        }];
+        let all = vec![prereq_open, prereq_retired, prereq_done, item.clone()];
+
+        let causes = blocked_on(&all, &item);
+        assert_eq!(
+            causes.len(),
+            4,
+            "blocker + open + retired + missing; Done drops"
+        );
+        assert_eq!(causes[0].cause, "blocker");
+        assert_eq!(causes[0].title, "vendor API still 403s");
+        assert_eq!(causes[0].blocker_id.as_deref(), Some("bk-1"));
+        assert_eq!(causes[1].cause, "relies_on");
+        assert_eq!(causes[1].title, "Ship the envelope");
+        assert_eq!(causes[1].target_status.as_deref(), Some("open"));
+        assert_eq!(causes[2].title, "Old plan");
+        assert_eq!(causes[2].target_status.as_deref(), Some("retired"));
+        assert_eq!(
+            causes[3].title, "01MISSING",
+            "a missing target is named by id"
+        );
+        assert_eq!(causes[3].target_status.as_deref(), Some("missing"));
+        assert!(
+            causes
+                .iter()
+                .all(|c| c.target_id.as_deref() != Some("01CDONE")),
+            "a Done prerequisite is satisfied — never a cause"
+        );
+        assert_eq!(
+            item_is_blocked(&all, &item),
+            !blocked_on(&all, &item).is_empty(),
+            "the served flag IS non-emptiness of the named causes"
+        );
+
+        let mut done_item = item.clone();
+        done_item.status = AgendaStatus::Done;
+        assert!(
+            blocked_on(&all, &done_item).is_empty(),
+            "non-open items never derive blocked causes"
+        );
     }
 }

@@ -208,10 +208,32 @@ operations in the same append-only log:
 **Blocked is derived presentation, never state.** An open item with any
 uncleared blocker or unsatisfied dependency renders a blocked chip, and
 list surfaces can filter on it (`ctl agenda list --blocked`, the dashboard
-filter) — but the value is computed at render time by each surface (the
-daemon ships the same pure helper for ctl and tests), never stored, never
-put on the wire, and never a notification trigger: the reminder lane
-remains the only thing that fires.
+filter). The judgment is never stored and never a notification trigger
+(the reminder lane remains the only thing that fires); since Track AS S5
+it IS served — the summary grain carries the `blocked` flag, and both
+serving grains carry the **`blocked_on` decoration**: the named causes
+(each uncleared blocker's criterion; each unsatisfied prerequisite's live
+title and status), stamped at the serving seam beside the effects'
+fireability verdicts like `next_fire_ms`, never folded from ops.
+
+**Blocked never gates approval — advisory plus confirm.** Blocked-state
+is bookkeeping that lags reality in both directions (a finished
+prerequisite awaiting its Complete tap; a completed-but-unfinished one),
+and blocker criteria are explicitly unevaluated — so approving a
+scheduled session on a currently blocked item is always allowed, and the
+approve/deny lever stays the owner's absolute call. What every approve
+surface adds is one NAMED confirm when the manifest is time-floored:
+the dashboard strips and inspector ask "prerequisite *title* is still
+open — approve anyway?" (derived from the served `blocked_on` truth,
+never a client-side join), and `ctl agenda approve` prints the same
+named warning and proceeds. Nothing refuses; the fireability validator
+is a separate, unchanged concern. The mechanically right enforcement
+point for dependents is **fire-time trigger semantics**: propose the
+manifest with the `on_unblock` trigger (the manifest editor sheet and
+`ctl agenda schedule` suggest it for items with `relies_on` edges) and
+approval-anytime becomes safe by construction — approve early, the fire
+waits for the real unblock. Event-triggered manifests therefore skip
+the confirm entirely, which also keeps workflow batch approvals quiet.
 
 ### Typed references (G1)
 

@@ -591,6 +591,14 @@ function agendaOnTabShown() {
 }
 
 async function agendaSendOp(params, button) {
+  // Approve-while-blocked (confirm-not-gate): every approve surface —
+  // card strips, inspector, sheet approve-now, missed-reschedule —
+  // funnels through this emitter, so the ONE named confirm lives here.
+  // Cancel sends nothing; accept proceeds — nothing ever refuses.
+  if (params && params.op === 'approve_effect'
+    && !(await agendaApproveBlockedConfirm(params))) {
+    return false;
+  }
   if (button) button.disabled = true;
   try {
     const resp = await daemonApi.request('api_agenda_op', params);
@@ -683,6 +691,43 @@ function agendaLinkState(link) {
 // contract); a row that has never been summarized wears no flag.
 function agendaItemIsBlocked(item) {
   return item.blocked === true;
+}
+
+// Approve-while-blocked (advisory-plus-confirm): ONE named confirm
+// before approve_effect binds a TIME-FLOORED manifest on an item the
+// daemon currently serves as blocked. Derived from served truth only —
+// the `blocked_on` decoration rides both serving grains beside the
+// effects' fireability verdicts — never from a client-side join a
+// serving window could starve. Event-triggered manifests skip it: an
+// on_unblock approval is safe by construction (the fire waits for the
+// real unblock), which also keeps the workflow batch sheet quiet.
+// Advisory by doctrine: cancel just sends nothing; nothing refuses.
+async function agendaApproveBlockedConfirm(params) {
+  const item = agendaFindItem(params.id)
+    || (typeof agendaFullItemFor === 'function' ? agendaFullItemFor(params.id) : null);
+  const causes = item && Array.isArray(item.blocked_on) ? item.blocked_on : [];
+  if (!causes.length) return true;
+  const effect = ((item && item.effects) || []).find((e) => e.digest === params.digest);
+  if (!effect || (effect.manifest && effect.manifest.trigger)) return true;
+  const first = causes[0];
+  const name = first.title || first.target_id || '';
+  const named = first.cause === 'blocker'
+    ? `blocker “${name}” is still uncleared`
+    : first.target_status === 'retired' ? `prerequisite “${name}” was retired without completing`
+      : first.target_status === 'missing' ? `prerequisite “${name}” is missing from this agenda`
+        : `prerequisite “${name}” is still open`;
+  const more = causes.length > 1 ? ` (and ${causes.length - 1} more)` : '';
+  const message = `${named}${more} — approve anyway?`;
+  if (typeof showDashboardConfirm !== 'function') return window.confirm(message);
+  const choice = await showDashboardConfirm({
+    title: 'Approve while blocked?',
+    message,
+    warning: 'Approving is allowed — blocked is advisory bookkeeping, never a lock. This time-floored manifest fires on its own clock regardless; re-proposing with the on_unblock trigger would make the fire wait for the real unblock instead.',
+    confirmLabel: 'Approve anyway',
+    cancelLabel: 'Not now',
+    danger: false,
+  });
+  return choice === true;
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
