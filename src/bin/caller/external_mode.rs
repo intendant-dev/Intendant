@@ -256,6 +256,57 @@ fn synthesized_reload_continuation(reload_interrupted_turn: bool) -> Option<Foll
     midturn_continuation(RELOAD_MIDTURN_CONTINUATION_TEXT, reload_interrupted_turn)
 }
 
+/// Surface every message still owed to a lane its terminal killed, with
+/// the named reason: accepted mid-turn steers retire through the shared
+/// cancel seam (otherwise their "awaiting the model's next activity"
+/// claim outlives the model — the 2026-07-31 zombie-turn specimen, where
+/// an owner follow-up sat against a dead backend indefinitely), and
+/// queued follow-ups report FAILED instead of vanishing with the loop.
+/// Surfacing only — nothing here re-arms delivery: the park lanes own
+/// re-delivery for their own classes, and the safeguards class must
+/// never re-arm at all (re-delivery into a flagged context is the
+/// re-flag loop). Returns (retired steers, failed follow-ups) for the
+/// caller's log row.
+pub(crate) fn surface_undelivered_input_at_terminal(
+    bus: &EventBus,
+    session_id: &Option<String>,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    parked_follow_ups: &mut std::collections::VecDeque<FollowUpMessage>,
+    detail: &str,
+) -> (usize, usize) {
+    let retired_steers = cancel_pending_runtime_steers_for_session(
+        bus,
+        pending_runtime_steers,
+        None,
+        None,
+        None,
+        detail,
+    );
+    let mut failed_follow_ups = 0usize;
+    while let Some(parked) = parked_follow_ups.pop_front() {
+        failed_follow_ups += 1;
+        emit_follow_up_status(
+            bus,
+            session_id.as_deref(),
+            &parked.follow_up_id,
+            Some(&parked.text),
+            "failed",
+            Some(detail),
+        );
+    }
+    (retired_steers, failed_follow_ups)
+}
+
+/// Named reason for input a terminal leaves undelivered (first line,
+/// bounded — the full cause is the terminal's own log row).
+fn undelivered_detail_for_terminal(reason: &str) -> String {
+    let first_line = reason.lines().next().unwrap_or("").trim();
+    format!(
+        "undelivered — the session ended: {}",
+        truncate_string_copy(first_line, 120)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_external_agent_mode(
     backend: external_agent::AgentBackend,
@@ -1356,6 +1407,81 @@ pub(crate) async fn run_external_agent_mode(
                                                         },
                                                     ))
                                                 });
+                                            }
+                                            DrainOutcome::SafeguardsFlagged {
+                                                reason,
+                                                turns_in_round,
+                                            } => {
+                                                // A backend-started round
+                                                // ended on the provider's
+                                                // safeguards flag: the
+                                                // honest terminal, never
+                                                // a park — mechanical
+                                                // retry re-flags forever.
+                                                stats.rounds = round;
+                                                let entry =
+                                                    crate::safeguards_recast::RecastRef {
+                                                        session_id: live_session_id
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                        source: agent.name().to_string(),
+                                                        reason: reason.clone(),
+                                                        disposition:
+                                                            crate::safeguards_recast::RecastDisposition::SessionEnded,
+                                                    };
+                                                let line =
+                                                    crate::safeguards_recast::safeguards_flag_line(
+                                                        &reason,
+                                                    );
+                                                slog(&session_log, |l| l.error(&line));
+                                                slog(&session_log, |l| {
+                                                    l.set_safeguards_flag(entry.meta(
+                                                        crate::session_activity::epoch_seconds(),
+                                                    ))
+                                                });
+                                                let (retired_steers, failed_follow_ups) =
+                                                    surface_undelivered_input_at_terminal(
+                                                        &bus,
+                                                        &live_session_id,
+                                                        &mut pending_runtime_steers,
+                                                        &mut parked_follow_ups,
+                                                        crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL,
+                                                    );
+                                                if retired_steers + failed_follow_ups > 0 {
+                                                    slog(&session_log, |l| {
+                                                        l.info(&format!(
+                                                            "Surfaced {} owed message(s) as undelivered — the flagged session never redelivers them",
+                                                            retired_steers + failed_follow_ups
+                                                        ))
+                                                    });
+                                                }
+                                                record_external_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                    project_root: round_session_root.clone(),
+                                                });
+                                                bus.send(AppEvent::TaskComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    reason: reason.clone(),
+                                                    summary: None,
+                                                    outcome: crate::event::TaskOutcome::Failed,
+                                                });
+                                                crate::safeguards_recast::report_safeguards_flag(
+                                                    &bus,
+                                                    crate::agenda::published_agenda_handle()
+                                                        .as_deref(),
+                                                    &entry,
+                                                );
+                                                stats.terminal_outcome = Some(reason);
+                                                break 'outer;
                                             }
                                             DrainOutcome::TransientRoundDeath {
                                                 reason,
@@ -2908,6 +3034,29 @@ pub(crate) async fn run_external_agent_mode(
                                 turn: None,
                             });
                         }
+                        DrainOutcome::SafeguardsFlagged { reason, .. } => {
+                            // The provider's safeguards flagged the
+                            // in-flight turn the user's edit already
+                            // superseded. Proceed with the rollback: the
+                            // edit rewrites the offending tail (a recast
+                            // by the owner's own hand), and if the
+                            // retained context still flags, the edited
+                            // message's own round ends through the
+                            // primary safeguards terminal. No park, no
+                            // retry, never a model switch.
+                            let line = format!(
+                                "Provider safeguards flagged the in-flight turn ({}); proceeding with the edit rollback — the edit replaces the flagged content",
+                                reason
+                            );
+                            slog(&session_log, |l| l.warn(&line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content: line,
+                                turn: None,
+                            });
+                        }
                         DrainOutcome::TransientRoundDeath { reason, .. } => {
                             // The in-flight turn died on a temporary
                             // service condition mid-edit. Like the limit
@@ -3241,6 +3390,78 @@ pub(crate) async fn run_external_agent_mode(
             }
         }
         match drain_outcome {
+            DrainOutcome::SafeguardsFlagged {
+                reason,
+                turns_in_round,
+            } => {
+                // The provider's safeguards flagged the conversation:
+                // terminal for these bytes whatever the round count — no
+                // park (mechanical retry re-flags forever), no model
+                // fallback, no completion (a DoneSignal journaled the
+                // 2026-07-31 specimen 69c8535e COMPLETED at 95 turns and
+                // the death was invisible). The honest terminal is FAILED
+                // plus the safeguards attention surfaces; the remedy is
+                // the owner's fresh-session recast.
+                stats.rounds = round;
+                let entry = crate::safeguards_recast::RecastRef {
+                    session_id: live_session_id.clone().unwrap_or_default(),
+                    source: agent.name().to_string(),
+                    reason: reason.clone(),
+                    disposition: crate::safeguards_recast::RecastDisposition::SessionEnded,
+                };
+                let line = crate::safeguards_recast::safeguards_flag_line(&reason);
+                slog(&session_log, |l| l.error(&line));
+                // Durable first: the boot pass and the session catalog
+                // key on the meta marker, so it must survive whatever
+                // happens after this point.
+                slog(&session_log, |l| {
+                    l.set_safeguards_flag(entry.meta(crate::session_activity::epoch_seconds()))
+                });
+                let (retired_steers, failed_follow_ups) = surface_undelivered_input_at_terminal(
+                    &bus,
+                    &live_session_id,
+                    &mut pending_runtime_steers,
+                    &mut parked_follow_ups,
+                    crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL,
+                );
+                if retired_steers + failed_follow_ups > 0 {
+                    slog(&session_log, |l| {
+                        l.info(&format!(
+                            "Surfaced {} owed message(s) as undelivered — the flagged session never redelivers them",
+                            retired_steers + failed_follow_ups
+                        ))
+                    });
+                }
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    turns_in_round,
+                );
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                    project_root: round_session_root.clone(),
+                });
+                bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
+                    reason: reason.clone(),
+                    // The cause is the story; the last response IS the
+                    // provider's flag banner, so echoing it as a summary
+                    // would double it.
+                    summary: None,
+                    outcome: crate::event::TaskOutcome::Failed,
+                });
+                crate::safeguards_recast::report_safeguards_flag(
+                    &bus,
+                    crate::agenda::published_agenda_handle().as_deref(),
+                    &entry,
+                );
+                stats.terminal_outcome = Some(reason);
+                break;
+            }
             DrainOutcome::TurnFailed {
                 reason,
                 turns_in_round,
@@ -3260,6 +3481,16 @@ pub(crate) async fn run_external_agent_mode(
                         "External agent round failed before any turn completed: {reason}"
                     ))
                 });
+                // Queued input would re-fire into the same refusal —
+                // surface it with the named reason instead of dropping
+                // it silently with the loop.
+                surface_undelivered_input_at_terminal(
+                    &bus,
+                    &live_session_id,
+                    &mut pending_runtime_steers,
+                    &mut parked_follow_ups,
+                    &undelivered_detail_for_terminal(&reason),
+                );
                 record_external_round_inline(
                     &session_log,
                     persist_model_responses_inline,
@@ -4329,6 +4560,16 @@ pub(crate) async fn run_external_agent_mode(
                         reason, exit_code
                     ));
                 });
+                // Input owed to the dead lane surfaces with the named
+                // reason instead of waiting forever on a model that no
+                // longer exists (the zombie-turn class).
+                surface_undelivered_input_at_terminal(
+                    &bus,
+                    &live_session_id,
+                    &mut pending_runtime_steers,
+                    &mut parked_follow_ups,
+                    &undelivered_detail_for_terminal(&reason),
+                );
                 bus.send(AppEvent::TaskComplete {
                     session_id: live_session_id.clone(),
                     reason: reason.clone(),
@@ -4342,6 +4583,13 @@ pub(crate) async fn run_external_agent_mode(
                 slog(&session_log, |l| {
                     l.info("External agent event channel closed")
                 });
+                surface_undelivered_input_at_terminal(
+                    &bus,
+                    &live_session_id,
+                    &mut pending_runtime_steers,
+                    &mut parked_follow_ups,
+                    &undelivered_detail_for_terminal("external agent event channel closed"),
+                );
                 stats.terminal_outcome = Some("external agent event channel closed".to_string());
                 break;
             }
