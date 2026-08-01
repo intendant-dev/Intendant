@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::codex_cloud::{record_attachment_state, state_path, AttachmentState, StoreLock};
 
@@ -56,6 +57,10 @@ const ATTACH_PROOF_MAX_SKEW_MS: i64 = 5 * 60 * 1000;
 const ATTACH_PROOF_REPLAY_TTL_MS: u64 = 10 * 60 * 1000;
 const ATTACH_PROOF_REPLAY_GLOBAL_CAP: usize = 4096;
 const ATTACH_PROOF_REPLAY_PER_WORKER_CAP: usize = 64;
+/// Stay comfortably below the five-minute idle teardown observed on managed
+/// Cloud egress paths. Both endpoints originate pings, so a half-open write
+/// fails promptly and long silent commands keep their control socket.
+const ATTACHMENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 const CLOUD_WORKER_HEADER: &str = "x-intendant-cloud-worker";
 const CLOUD_WORKER_FINGERPRINT_HEADER: &str = "x-intendant-cloud-worker-fingerprint";
@@ -63,6 +68,15 @@ const CLOUD_WORKER_TASK_HEADER: &str = "x-intendant-cloud-worker-task";
 const CLOUD_WORKER_NONCE_HEADER: &str = "x-intendant-cloud-worker-nonce";
 const CLOUD_WORKER_TIMESTAMP_HEADER: &str = "x-intendant-cloud-worker-timestamp";
 const CLOUD_WORKER_PROOF_HEADER: &str = "x-intendant-cloud-worker-proof";
+
+fn attachment_keepalive_timer() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + ATTACHMENT_KEEPALIVE_INTERVAL,
+        ATTACHMENT_KEEPALIVE_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 // ── Broker store ───────────────────────────────────────────────────────
 
@@ -803,6 +817,7 @@ pub(crate) async fn serve_attachment_socket<S>(
     );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
     let (mut write, mut read) = ws_stream.split();
+    let mut keepalive = attachment_keepalive_timer();
     loop {
         tokio::select! {
             frame = read.next() => match frame {
@@ -826,6 +841,15 @@ pub(crate) async fn serve_attachment_socket<S>(
                     }
                 }
                 None => break,
+            },
+            _ = keepalive.tick() => {
+                if write
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             },
             _ = tokio::time::sleep_until(deadline) => {
                 eprintln!(
@@ -2025,6 +2049,7 @@ async fn hold_attachment(
         tokio::task::JoinHandle<()>,
     > = std::collections::HashMap::new();
     let (mut sink, mut stream) = ws.split();
+    let mut keepalive = attachment_keepalive_timer();
     loop {
         tokio::select! {
             frame = stream.next() => match frame {
@@ -2051,6 +2076,11 @@ async fn hold_attachment(
                         .map_err(|e| format!("send frame: {e}"))?;
                 }
                 None => break,
+            },
+            _ = keepalive.tick() => {
+                sink.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|e| format!("send attachment keepalive: {e}"))?;
             },
             _ = remote_commands.retired() => {
                 let _ = sink.close().await;
@@ -2533,6 +2563,17 @@ mod tests {
         assert_eq!(attachment_remaining_ms(100, 100_000), 0);
         assert_eq!(attachment_remaining_ms(100, 99_000), 1_000);
         assert_eq!(attachment_remaining_ms(-5, 0), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attachment_keepalive_waits_then_repeats() {
+        let started = tokio::time::Instant::now();
+        let mut keepalive = attachment_keepalive_timer();
+        keepalive.tick().await;
+        assert_eq!(started.elapsed(), ATTACHMENT_KEEPALIVE_INTERVAL);
+        keepalive.tick().await;
+        assert_eq!(started.elapsed(), ATTACHMENT_KEEPALIVE_INTERVAL * 2);
+        assert!(ATTACHMENT_KEEPALIVE_INTERVAL < Duration::from_secs(5 * 60));
     }
 
     #[test]

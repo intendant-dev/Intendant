@@ -690,7 +690,9 @@ live worker to home over direct mTLS or an explicitly trusted, proof-bound
 HTTPS reverse proxy. The attachment carries terminal, tile display,
 computer-use, bounded source-transfer, and provider-neutral remote-command
 frames in addition to liveness; each direction has a closed allowlist, and
-worker replies are never dispatched as authority on home. Workers are
+worker replies are never dispatched as authority on home. Both endpoints send
+periodic WebSocket pings so a long command with no output survives idle egress
+proxies and a dead connection surfaces promptly. Workers are
 ephemeral enrollments with zero-authority expiring identities, not static
 `[[peer]]` registry entries, and home must be reachable from the worker's
 egress allowlist (there is no relay tier).
