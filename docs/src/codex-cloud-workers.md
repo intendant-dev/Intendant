@@ -125,7 +125,7 @@ intendant codex-cloud probe --task task_e_...
 # Continue a finished task with a new turn (see "Follow-ups" below).
 intendant codex-cloud followup task_e_... -m "Now also fix the tests"
 
-# Attach the live worker to this daemon over mTLS (see "Attaching" below).
+# Attach the live worker to this daemon (direct mTLS by default; see below).
 intendant codex-cloud attach task_e_... --home-url wss://your-host:8765 --send
 
 # Drop terminal leases with no live attachment (default: older than 7 days).
@@ -211,7 +211,7 @@ intendant codex-cloud followup task_e_... --json < prompt.txt   # stdin keeps pr
 `INTENDANT_CODEX_CLOUD_BACKEND` overrides the backend base URL (tests point
 it at a local stub; the default is the production web backend).
 
-## Attaching a worker to home (mTLS enrollment ceremony)
+## Attaching a worker to home
 
 A worker has no inbound reachability and no durable identity, so attaching
 it inverts the usual peer pairing. Home runs the whole ceremony:
@@ -235,10 +235,10 @@ argv. The agent then:
    `POST /api/codex-cloud/enroll` route and receives a client certificate
    whose identity record carries the system-issued **`cloud-worker`**
    profile and a hard expiry (`--identity-ttl-s`, default 3600);
-3. dials home's gateway over mTLS, pinned to the fingerprint baked into
-   the prompt, and holds the socket in the foreground. The accepted socket
-   *is* the attachment: the lease flips `connected` while it lives and
-   `disconnected` when it dies.
+3. dials home's dedicated `/api/codex-cloud/attach` WebSocket over mTLS,
+   pinned to the fingerprint baked into the prompt, and holds the socket in
+   the foreground. The accepted socket *is* the attachment: the lease flips
+   `connected` while it lives and `disconnected` when it dies.
 
 Security shape: the enrollment token is stored hashed, minutes-TTL
 (`--token-ttl-s`, default 900), bound to one task, and burned atomically on
@@ -254,6 +254,58 @@ later slices; the worker's inbound authority on home stays nothing.
 The worker's egress must be able to reach `--home-url`: in a
 network-restricted Codex Cloud environment, add the home host to the
 environment's allowlist or the dial is refused before TLS.
+
+### HTTPS proxies and TLS-terminating reverse proxies
+
+The worker honors `HTTPS_PROXY` / `https_proxy` (then `ALL_PROXY` /
+`all_proxy`) for its WebSocket by opening an HTTP `CONNECT` tunnel itself;
+`NO_PROXY` / `no_proxy` bypasses matching hosts. This matters in Codex Cloud:
+an ordinary tungstenite WebSocket dial does not consult those variables and
+would try a blocked direct socket even though HTTP requests work.
+
+Prefer raw TCP passthrough when the egress proxy and public ingress both carry
+it: direct mTLS then stays end to end. If the only reachable ingress is an
+HTTPS reverse proxy that terminates TLS before Intendant, opt in explicitly:
+
+```bash
+intendant codex-cloud attach task_e_... \
+  --home-url wss://your-host.example/api/codex-cloud/attach \
+  --tls-terminated-proxy --send
+```
+
+For automatic `remote_command` acquisition, configure both:
+
+```bash
+INTENDANT_CODEX_CLOUD_HOME_URL=wss://your-host.example/api/codex-cloud/attach
+INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1
+```
+
+In that mode the worker validates the public endpoint with normal WebPKI
+instead of pinning Intendant's inner TLS certificate. It still generates the
+same task-local P-256 key and receives the same zero-authority client
+certificate. Every WebSocket attempt signs a transcript containing the exact
+attachment path, certificate fingerprint, task id, random nonce, and current
+timestamp. Home verifies it against the public key stored at enrollment and
+atomically consumes the nonce; a captured request cannot be replayed. The
+gateway recognizes this proof only on the dedicated Cloud attachment path,
+routes it directly to the closed worker bridge, and never creates a dashboard
+principal or IAM grant. Direct mTLS remains accepted and takes precedence.
+
+This flag is deliberately not automatic. The selected WebPKI endpoint and
+the component terminating TLS can see and relay attachment traffic, so use it
+only for infrastructure the owner trusts. With Tailscale HTTPS Funnel, TLS is
+terminated by `tailscaled` on the home machine and then reverse-proxied to the
+local Intendant HTTPS listener; that local Tailscale process is the additional
+trusted component. A representative setup is:
+
+```bash
+tailscale funnel --bg --https=443 https+insecure://127.0.0.1:8765
+```
+
+The public enrollment token remains single-use and short-lived, and the
+worker proof still grants no authority over home. The explicit trust choice is
+in the other direction: the WebPKI endpoint is accepted as the home allowed to
+send commands into that ephemeral worker.
 
 ## Terminal on a live worker
 
@@ -388,7 +440,8 @@ The contract is intentionally stricter than an interactive terminal:
   Capture runs twice and proceeds only when the content-addressed bytes match.
   Ignored files — notably `.env` and `target/` — do not cross the attachment.
   The compressed transfer is capped at 64 MiB (128 MiB expanded, 16 MiB per
-  untracked file, 4096 untracked files), chunked over mTLS, and verified by
+  untracked file, 4096 untracked files), chunked over the authenticated
+  attachment, and verified by
   digest before the worker materializes an isolated Git worktree.
 - `require_clean` defaults to true. For a pushed revision it means a clean
   checkout; for a snapshot it means unchanged from the exact selected
@@ -399,7 +452,8 @@ The contract is intentionally stricter than an interactive terminal:
   setup. Home maps only
   dedicated `INTENDANT_REMOTE_CACHE_` settings for sccache and its documented
   backend credential families (`SCCACHE_*`, `AWS_*`, `ACTIONS_*`,
-  `ALIBABA_CLOUD_*`, and `TENCENTCLOUD_*`) into the mTLS command, requires an
+  `ALIBABA_CLOUD_*`, and `TENCENTCLOUD_*`) into the authenticated command,
+  requires an
   external backend (a task-local `SCCACHE_DIR` is refused), configures
   `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, and a stable
   `SCCACHE_BASEDIRS`, then reports hit/miss/write/error deltas. Backend
@@ -429,7 +483,9 @@ The contract is intentionally stricter than an interactive terminal:
 
 Automatic acquisition requires `INTENDANT_CODEX_CLOUD_ENVIRONMENT` and the
 reachable `INTENDANT_CODEX_CLOUD_HOME_URL`; the environment bootstrap must
-install the matching Intendant binary and allow egress to home. Optional
+install the matching Intendant binary and allow egress to home. Set
+`INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1` only for the explicitly trusted
+reverse-proxy mode described above. Optional
 `INTENDANT_REMOTE_COMPUTE_BRANCH` selects the provider checkout,
 `INTENDANT_REMOTE_COMPUTE_ACQUIRE_TIMEOUT_S` bounds attachment wait, and
 `INTENDANT_REMOTE_COMPUTE_IDLE_TIMEOUT_S` controls retirement. Concurrent
@@ -623,7 +679,8 @@ feedback time; it does not replace CI.
 This integration covers automatic reuse/acquisition, explicit working-tree
 snapshots, durable compiler-cache configuration, the job/control plane, the
 safe setup/maintenance contract, and the enrollment ceremony that attaches a
-live worker to home over mTLS. The attachment carries terminal, tile display,
+live worker to home over direct mTLS or an explicitly trusted, proof-bound
+HTTPS reverse proxy. The attachment carries terminal, tile display,
 computer-use, bounded source-transfer, and provider-neutral remote-command
 frames in addition to liveness; each direction has a closed allowlist, and
 worker replies are never dispatched as authority on home. Workers are

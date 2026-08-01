@@ -1078,6 +1078,49 @@ html.ui-v2 .ag2-graph-legend {
   gap: 6px;
   pointer-events: none;
 }
+html.ui-v2 .ag2-graph-timebar {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 3;
+}
+html.ui-v2 .ag2-graph-timebar-oldest {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"] {
+  flex: 1;
+  height: 3px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(var(--iris-rgb), .25);
+  border-radius: 2px;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--iris-rgb));
+  border: 2px solid var(--bg-1);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), .5);
+  cursor: ew-resize;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"]::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--iris-rgb));
+  border: 2px solid var(--bg-1);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), .5);
+  cursor: ew-resize;
+}
 html.ui-v2 .ag2-graph-chip {
   display: inline-flex;
   align-items: center;
