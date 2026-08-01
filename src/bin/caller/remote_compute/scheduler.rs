@@ -149,12 +149,18 @@ async fn acquire_new_worker(key: &WorkerKey) -> Result<AcquiredWorker, String> {
         return Ok(worker);
     }
     let home_url = crate::codex_cloud_attach::home_url_from(None)?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let server_fingerprint = crate::access::certs::read_server_cert_fingerprint(&cert_dir)
-        .ok_or_else(|| {
-            "automatic remote compute needs the daemon gateway TLS identity; start the daemon once and retry"
-                .to_string()
-        })?;
+    let tls_terminated_proxy = crate::codex_cloud_attach::tls_terminated_proxy_from_env();
+    let server_fingerprint = if tls_terminated_proxy {
+        None
+    } else {
+        let cert_dir = crate::access::backend::select_backend().cert_dir();
+        Some(
+            crate::access::certs::read_server_cert_fingerprint(&cert_dir).ok_or_else(|| {
+                "automatic remote compute needs the daemon gateway TLS identity; start the daemon once and retry"
+                    .to_string()
+            })?,
+        )
+    };
     let lease_store = crate::codex_cloud::state_path();
     let broker = crate::codex_cloud_attach::broker_path(&lease_store);
     let now_ms = crate::codex_cloud::now_unix_ms();
@@ -164,8 +170,12 @@ async fn acquire_new_worker(key: &WorkerKey) -> Result<AcquiredWorker, String> {
         crate::codex_cloud_attach::DEFAULT_IDENTITY_TTL_S,
         now_ms,
     )?;
-    let prompt =
-        crate::codex_cloud_attach::automatic_attach_prompt(&home_url, &server_fingerprint, &token);
+    let prompt = crate::codex_cloud_attach::automatic_attach_prompt(
+        &home_url,
+        server_fingerprint.as_deref(),
+        &token,
+        tls_terminated_proxy,
+    );
     let submitted = crate::codex_cloud::submit_task(
         &lease_store,
         crate::codex_cloud::SubmitTaskRequest {
