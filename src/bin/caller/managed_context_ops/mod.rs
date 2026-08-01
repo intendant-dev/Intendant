@@ -12,7 +12,8 @@ use crate::{
     emit_external_turn_status, emit_fission_detach_relationships, emit_follow_up_status,
     emit_user_message_log, fission_anchor_cut_line, fission_anchor_first_lines,
     fission_anchor_reachable_after_rewind, fission_detach_parent_candidates,
-    is_codex_injected_user_text_for_main, transient_service_condition, CodexThreadActionDedupe,
+    is_codex_injected_user_text_for_main, safeguards_flag_condition, transient_service_condition,
+    CodexThreadActionDedupe,
     DrainOutcome, ExternalBackendRecovery, ExternalContextSnapshotState, ExternalDiffDeltaTracker,
     FatalRoundError, PendingRuntimeSteer, UserAttachments, UserTurnRevisionState,
 };
@@ -446,6 +447,18 @@ pub(crate) fn backend_recovery_outcome_or_context_rewind(
         };
     }
     if let Some(fatal) = fatal_round_error {
+        // The safeguards-flag class outranks every retry-shaped outcome:
+        // the flag is terminal for these bytes — a park would retry into
+        // the same flag, and a completion would journal the death
+        // invisible (2026-07-31 specimen 69c8535e: the flag rode a
+        // DoneSignal into a COMPLETED occurrence at 95 turns). No
+        // auto-retry lane, no model fallback — the honest terminal.
+        if safeguards_flag_condition(&fatal.reason) {
+            return DrainOutcome::SafeguardsFlagged {
+                reason: fatal.reason,
+                turns_in_round,
+            };
+        }
         // The round-outcome classification (recovery scheduling for
         // early round endings): a TEMPORARY service condition — the
         // provider-incident class — must not end the round's story with
@@ -1015,6 +1028,86 @@ mod tests {
                 "zero-turn transient death must classify, not TurnFailed: {transient}"
             );
         }
+    }
+
+    /// PIN `no_auto_retry_lane_for_the_safeguards_class`: a fatal cause
+    /// carrying a provider-safeguards marker classifies as
+    /// `SafeguardsFlagged` — never the transient park shape (the ONLY
+    /// classification that retries), never the completion fallthrough
+    /// that journaled the 2026-07-31 specimen COMPLETED (session
+    /// 69c8535e, 95 turns), and never the zero-turn launch-refusal
+    /// shape. No auto-retry lane exists for this class, ever, and no
+    /// model fallback anywhere: the remedy is the owner's fresh-session
+    /// recast.
+    #[test]
+    fn no_auto_retry_lane_for_the_safeguards_class() {
+        // The live specimen as the drain formats it (2026-07-31,
+        // byte-identical across four firings).
+        let specimen = "claude-code backend error (success): API Error: Fable 5's safeguards \
+             flagged this message (https://www.anthropic.com/legal/aup). Our intentionally \
+             broad safeguards allow us to deliver more capabilities faster, but can sometimes \
+             flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't \
+             respond to this message with Fable 5.\n\nTry rephrasing the request in a new \
+             session or change your model.\n\nLearn more: \
+             https://support.claude.com/en/articles/15363606\n\nRequest ID: \
+             req_011Cdb3myRJ9NKDAZzSxkQjv";
+        for flagged in [
+            specimen,
+            "Claude's response was flagged by our safeguards",
+            "backend error: request blocked under Anthropic's Usage Policy",
+        ] {
+            assert!(
+                safeguards_flag_condition(flagged),
+                "safeguards cause not recognized: {flagged}"
+            );
+            assert!(
+                !transient_service_condition(flagged),
+                "safeguards cause must never classify transient (the park lane): {flagged}"
+            );
+            // After real work — the specimen shape: the flag outranks
+            // the completion fallthrough.
+            match backend_recovery_outcome_or_context_rewind(
+                None,
+                ManagedContextRewindTurnStopStatus::NotRequested,
+                None,
+                fatal(flagged),
+                Some(flagged.to_string()),
+                95,
+                true,
+            ) {
+                DrainOutcome::SafeguardsFlagged {
+                    reason,
+                    turns_in_round,
+                } => {
+                    assert_eq!(reason, flagged);
+                    assert_eq!(turns_in_round, 95);
+                }
+                _ => panic!("safeguards death after real turns must classify: {flagged}"),
+            }
+            // Zero-turn: still the safeguards terminal, not the
+            // launch-refusal shape.
+            assert!(
+                matches!(
+                    backend_recovery_outcome_or_context_rewind(
+                        None,
+                        ManagedContextRewindTurnStopStatus::NotRequested,
+                        None,
+                        fatal(flagged),
+                        None,
+                        0,
+                        false,
+                    ),
+                    DrainOutcome::SafeguardsFlagged { .. }
+                ),
+                "zero-turn safeguards death must stay SafeguardsFlagged: {flagged}"
+            );
+        }
+        // The transient and deliberate-terminal sets keep their lanes —
+        // the safeguards markers must not swallow them.
+        assert!(!safeguards_flag_condition(
+            "Claude Code backend error: API Error: 529 {\"type\":\"overloaded_error\"}"
+        ));
+        assert!(!safeguards_flag_condition("Session ended: stopped by user"));
     }
 
     #[test]

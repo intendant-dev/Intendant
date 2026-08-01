@@ -1013,6 +1013,61 @@ pub(crate) async fn run_with_presence(
                                             turn: None,
                                         });
                                     }
+                                    Ok(DrainOutcome::SafeguardsFlagged {
+                                        reason,
+                                        turns_in_round,
+                                    }) => {
+                                        // The provider's safeguards flagged
+                                        // the resumed rewind turn: terminal
+                                        // for those bytes — close the
+                                        // flagged conversation (the owner's
+                                        // next message starts fresh: the
+                                        // recast lane). Never a retry,
+                                        // never a model switch, and never
+                                        // "send a message to resume" (that
+                                        // invites the re-flag).
+                                        cumulative_stats.rounds += 1;
+                                        let entry = crate::safeguards_recast::RecastRef {
+                                            session_id: session_log_id(&session_log)
+                                                .unwrap_or_default(),
+                                            source: agent.name().to_string(),
+                                            reason: reason.clone(),
+                                            disposition:
+                                                crate::safeguards_recast::RecastDisposition::ConversationClosed,
+                                        };
+                                        let line =
+                                            crate::safeguards_recast::safeguards_flag_line_conversation_closed(
+                                                &reason,
+                                            );
+                                        slog(&session_log, |l| l.error(&line));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                            project_root: round_session_root.clone(),
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: line,
+                                            level: Some(types::LogLevel::Error),
+                                            turn: None,
+                                        });
+                                        crate::safeguards_recast::report_safeguards_flag(
+                                            &bus,
+                                            crate::agenda::published_agenda_handle().as_deref(),
+                                            &entry,
+                                        );
+                                        persistent_agent = None;
+                                        persistent_thread = None;
+                                        persistent_event_rx = None;
+                                        persistent_diff_tracker =
+                                            ExternalDiffDeltaTracker::default();
+                                        persistent_pending_runtime_steers.clear();
+                                        persistent_handled_steer_ids.clear();
+                                        persistent_open_side_threads.clear();
+                                        persistent_side_rounds.clear();
+                                        persistent_side_turn_revisions.clear();
+                                    }
                                     Ok(DrainOutcome::TransientRoundDeath {
                                         reason,
                                         turns_in_round,
@@ -1108,6 +1163,63 @@ pub(crate) async fn run_with_presence(
                                                     content: park_line,
                                                     turn: None,
                                                 });
+                                            }
+                                            Ok(Some(DrainOutcome::SafeguardsFlagged {
+                                                reason,
+                                                turns_in_round,
+                                            })) => {
+                                                // The provider's safeguards
+                                                // flagged the chained rewind
+                                                // turn: terminal for those
+                                                // bytes — close the flagged
+                                                // conversation (the owner's
+                                                // next message starts
+                                                // fresh: the recast lane).
+                                                // Never a retry, never a
+                                                // model switch.
+                                                cumulative_stats.rounds += 1;
+                                                let entry =
+                                                    crate::safeguards_recast::RecastRef {
+                                                        session_id: session_log_id(&session_log)
+                                                            .unwrap_or_default(),
+                                                        source: agent.name().to_string(),
+                                                        reason: reason.clone(),
+                                                        disposition:
+                                                            crate::safeguards_recast::RecastDisposition::ConversationClosed,
+                                                    };
+                                                let line =
+                                                    crate::safeguards_recast::safeguards_flag_line_conversation_closed(
+                                                        &reason,
+                                                    );
+                                                slog(&session_log, |l| l.error(&line));
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: session_log_id(&session_log),
+                                                    round: cumulative_stats.rounds,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                    project_root: round_session_root.clone(),
+                                                });
+                                                bus.send(AppEvent::PresenceLog {
+                                                    message: line,
+                                                    level: Some(types::LogLevel::Error),
+                                                    turn: None,
+                                                });
+                                                crate::safeguards_recast::report_safeguards_flag(
+                                                    &bus,
+                                                    crate::agenda::published_agenda_handle()
+                                                        .as_deref(),
+                                                    &entry,
+                                                );
+                                                persistent_agent = None;
+                                                persistent_thread = None;
+                                                persistent_event_rx = None;
+                                                persistent_diff_tracker =
+                                                    ExternalDiffDeltaTracker::default();
+                                                persistent_pending_runtime_steers.clear();
+                                                persistent_handled_steer_ids.clear();
+                                                persistent_open_side_threads.clear();
+                                                persistent_side_rounds.clear();
+                                                persistent_side_turn_revisions.clear();
                                             }
                                             Ok(Some(DrainOutcome::TransientRoundDeath {
                                                 reason,
@@ -2294,6 +2406,55 @@ pub(crate) async fn run_with_presence(
                                     )
                                     .await;
                                     persistent_limit_park = Some(park);
+                                }
+                                DrainOutcome::SafeguardsFlagged {
+                                    reason,
+                                    turns_in_round,
+                                } => {
+                                    // A spontaneous round ended on the
+                                    // provider's safeguards flag:
+                                    // terminal for those bytes, never a
+                                    // park (retry re-flags forever). The
+                                    // persistent lane survives — the
+                                    // flagged backend conversation is
+                                    // closed, and the owner's next
+                                    // message starts a FRESH one, which
+                                    // is the recast lane. No model
+                                    // fallback, no automatic re-fire.
+                                    cumulative_stats.rounds = round;
+                                    let entry = crate::safeguards_recast::RecastRef {
+                                        session_id: session_log_id(&session_log)
+                                            .unwrap_or_default(),
+                                        source: agent.name().to_string(),
+                                        reason: reason.clone(),
+                                        disposition:
+                                            crate::safeguards_recast::RecastDisposition::ConversationClosed,
+                                    };
+                                    let line =
+                                        crate::safeguards_recast::safeguards_flag_line_conversation_closed(
+                                            &reason,
+                                        );
+                                    slog(&session_log, |l| l.error(&line));
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                        project_root: round_session_root.clone(),
+                                    });
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: line,
+                                        level: Some(types::LogLevel::Error),
+                                        turn: None,
+                                    });
+                                    crate::safeguards_recast::report_safeguards_flag(
+                                        &bus,
+                                        crate::agenda::published_agenda_handle().as_deref(),
+                                        &entry,
+                                    );
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
                                 }
                                 DrainOutcome::TransientRoundDeath {
                                     reason,
@@ -3635,6 +3796,80 @@ pub(crate) async fn run_with_presence(
                             pending: Some(limit_park_pending(pending, turn_had_started)),
                             kind: ParkKind::ProviderLimit,
                         });
+                    }
+                    DrainOutcome::SafeguardsFlagged {
+                        reason,
+                        turns_in_round,
+                    } => {
+                        // The task-driven round ended on the provider's
+                        // safeguards flag: terminal for those bytes,
+                        // never a park — the driving message must NOT
+                        // re-arm (re-delivery into a flagged context is
+                        // the re-flag loop), so it surfaces as
+                        // undelivered with the named reason, and accepted
+                        // mid-turn steers retire the same way instead of
+                        // being cleared silently. The persistent lane
+                        // survives: the flagged backend conversation is
+                        // closed and the owner's next message starts a
+                        // FRESH one — the recast lane. No model
+                        // fallback, no automatic re-fire.
+                        cumulative_stats.rounds += 1;
+                        let entry = crate::safeguards_recast::RecastRef {
+                            session_id: session_log_id(&session_log).unwrap_or_default(),
+                            source: backend.to_string(),
+                            reason: reason.clone(),
+                            disposition:
+                                crate::safeguards_recast::RecastDisposition::ConversationClosed,
+                        };
+                        let line =
+                            crate::safeguards_recast::safeguards_flag_line_conversation_closed(
+                                &reason,
+                            );
+                        slog(&session_log, |l| l.error(&line));
+                        emit_follow_up_status(
+                            &bus,
+                            session_log_id(&session_log),
+                            &active_followup.follow_up_id,
+                            Some(&merged_text),
+                            "failed",
+                            Some(crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL),
+                        );
+                        cancel_pending_runtime_steers_for_session(
+                            &bus,
+                            &mut persistent_pending_runtime_steers,
+                            None,
+                            None,
+                            None,
+                            crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL,
+                        );
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: session_log_id(&session_log),
+                            round: cumulative_stats.rounds,
+                            turns_in_round,
+                            native_message_count: None,
+                            project_root: round_session_root.clone(),
+                        });
+                        bus.send(AppEvent::PresenceLog {
+                            message: line,
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        crate::safeguards_recast::report_safeguards_flag(
+                            &bus,
+                            crate::agenda::published_agenda_handle().as_deref(),
+                            &entry,
+                        );
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                        persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                        persistent_pending_runtime_steers.clear();
+                        persistent_handled_steer_ids.clear();
+                        persistent_open_side_threads.clear();
+                        persistent_side_rounds.clear();
+                        persistent_side_turn_revisions.clear();
+                        persistent_pending_managed_context_replays.clear();
+                        break;
                     }
                     DrainOutcome::TransientRoundDeath {
                         reason,

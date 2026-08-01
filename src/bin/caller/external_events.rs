@@ -3444,6 +3444,7 @@ mod tests {
             DrainOutcome::TurnCompleted { .. } => "TurnCompleted",
             DrainOutcome::TurnFailed { .. } => "TurnFailed",
             DrainOutcome::TransientRoundDeath { .. } => "TransientRoundDeath",
+            DrainOutcome::SafeguardsFlagged { .. } => "SafeguardsFlagged",
             DrainOutcome::Terminated { .. } => "Terminated",
             DrainOutcome::ChannelClosed => "ChannelClosed",
             DrainOutcome::RecoveryRequired { .. } => "RecoveryRequired",
@@ -3694,6 +3695,19 @@ mod tests {
                 false,
                 "TurnFailed",
             ),
+            // The 2026-07-31 safeguards specimen through the same echo
+            // shape: the flag must drain as its OWN terminal — never the
+            // transient park, never the completion that journaled the
+            // live specimen COMPLETED (session 69c8535e, 95 turns).
+            (
+                "API Error: Fable 5's safeguards flagged this message \
+                 (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards \
+                 allow us to deliver more capabilities faster, but can sometimes flag \
+                 legitimate coding, cybersecurity, and biology tasks. Claude Code can't \
+                 respond to this message with Fable 5.",
+                true,
+                "SafeguardsFlagged",
+            ),
         ] {
             let bus = EventBus::new();
             let mut bus_rx_for_drain = bus.subscribe();
@@ -3811,6 +3825,19 @@ mod tests {
                         reason.contains("fable-5"),
                         "reason carries the refusal: {reason}"
                     );
+                }
+                (
+                    "SafeguardsFlagged",
+                    DrainOutcome::SafeguardsFlagged {
+                        reason,
+                        turns_in_round,
+                    },
+                ) => {
+                    assert!(
+                        reason.contains("safeguards flagged"),
+                        "reason carries the flag banner: {reason}"
+                    );
+                    assert_eq!(turns_in_round, usize::from(feed_tool_start));
                 }
                 (expect, other) => panic!(
                     "expected {expect} (tool_start={feed_tool_start}), got {}",

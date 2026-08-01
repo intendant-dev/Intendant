@@ -18831,6 +18831,13 @@ html.ui-v2 #tab-sessions .session-card .ui-chip.err {
   border-color: transparent;
   color: var(--rose);
 }
+/* The safeguards-flagged terminal chip: err tone plus a dashed border —
+   this class needs a recast (never a retry), so its face must not read
+   as a generic failure. */
+html.ui-v2 #tab-sessions .session-card .ui-chip.sc-status.safeguards-flagged {
+  border-color: rgba(var(--rose-rgb), .55);
+  border-style: dashed;
+}
 html.ui-v2 #tab-sessions .session-card .ui-chip.warn {
   background: rgba(var(--amber-rgb), .14);
   border-color: transparent;
@@ -38267,7 +38274,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'ee53f229640920dd';
+const INTENDANT_APP_BUILD = 'a64d6872882ae0e1';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -61924,6 +61931,9 @@ function normalizeSessionBootEra(raw) {
 function normalizeSessionTerminalFacts(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const out = {};
+  // Served terminal class ("safeguards_flagged") — the distinct-face key.
+  const terminalClass = compactSessionText(raw.class);
+  if (terminalClass) out.class = terminalClass;
   const outcome = compactSessionText(raw.outcome);
   if (outcome) out.outcome = outcome;
   const endedAt = compactSessionText(raw.ended_at || raw.endedAt);
@@ -61977,14 +61987,21 @@ function sessionWindowTerminalStatement(sid) {
   const ghost = !!(boot && boot.ghost);
   const status = String(meta.status || '').toLowerCase();
   const failedTerminal = status === 'failed' || status === 'interrupted';
+  const terminal = (boot && boot.terminal) || meta.terminal || null;
+  // The safeguards class always states itself — including rows the
+  // pre-classifier bug journaled as clean completions.
+  const safeguardsFlagged = terminal?.class === 'safeguards_flagged';
   // Clean non-ghost completions keep today's look (the Done pill already
   // says it); the note exists for corpses and dishonest-looking ends.
-  if (!ghost && !failedTerminal) return null;
-  const terminal = (boot && boot.terminal) || meta.terminal || null;
+  if (!ghost && !failedTerminal && !safeguardsFlagged) return null;
   const when = terminal?.endedAt || meta.updatedAt || '';
   const lastError = terminal?.lastError?.message || '';
   let text;
-  if (terminal?.outcome) {
+  if (safeguardsFlagged) {
+    // States the class's whole law: what happened, what will NOT happen
+    // (no auto-retry, no model switch), and the owner's remedy.
+    text = `Flagged by provider safeguards${when ? ` ${when}` : ''} and ended${lastError ? ` (${lastError})` : ''}. Never auto-retried and never switched to another model — recast the task in a fresh session.`;
+  } else if (terminal?.outcome) {
     text = `Ended${when ? ` ${when}` : ''}: ${terminal.outcome}`;
   } else if (status === 'in_progress' || status === 'running') {
     text = `Died mid-turn${when ? ` — last activity ${when}` : ''}${lastError ? ` (${lastError})` : ''}`;
@@ -131887,8 +131904,17 @@ function buildSessionCard(m, derived, ctx) {
   top.appendChild(titleBlock);
 
   const statusEl = document.createElement('span');
-  statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
-  statusEl.textContent = displayStatus.replace('_', ' ');
+  // Safeguards terminals get their own honest face — never the generic
+  // interrupted/failed chip: this class needs a recast, not a retry.
+  const safeguardsFlagged = !!(s.terminal && s.terminal.class === 'safeguards_flagged');
+  if (safeguardsFlagged) {
+    statusEl.className = 'ui-chip err sc-status safeguards-flagged';
+    statusEl.textContent = 'safeguards-flagged';
+    statusEl.title = 'Provider safeguards flagged this conversation and it ended. Never auto-retried and never switched to another model — recast the task in a fresh session.';
+  } else {
+    statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
+    statusEl.textContent = displayStatus.replace('_', ' ');
+  }
   top.appendChild(statusEl);
 
   const sourceEl = document.createElement('span');

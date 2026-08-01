@@ -1468,6 +1468,26 @@ pub(crate) enum DrainOutcome {
         turns_in_round: usize,
         turn_had_started: bool,
     },
+    /// A fatal backend error whose cause classifies as a PROVIDER
+    /// SAFEGUARDS FLAG ([`safeguards_flag_condition`]) ended the round —
+    /// terminal for these bytes. The flag is the provider's judgment
+    /// about the conversation's content, so a retry, park, or resume of
+    /// the same context re-flags forever (2026-07-31 specimens: session
+    /// 69c8535e's flag rode a DoneSignal into a COMPLETED occurrence and
+    /// died invisible; a resume into session 77c8beaf's flagged context
+    /// re-flagged immediately, three times in one arc). The caller must
+    /// end the session with a FAILED terminal carrying the full cause,
+    /// stamp the durable flag on the session meta (the boot sweep and
+    /// readopt read it — they list, never nudge, this class), raise the
+    /// safeguards attention surfaces, and surface queued/injected input
+    /// as undelivered with the named reason. NO auto-retry lane exists
+    /// for this class, ever, and no model fallback anywhere — the remedy
+    /// is the owner's alone: a fresh session with the task RECAST in
+    /// their own words (a judgment act, not mechanics).
+    SafeguardsFlagged {
+        reason: String,
+        turns_in_round: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,6 +1811,50 @@ pub(crate) fn transient_service_condition(reason: &str) -> bool {
         "streamdisconnected",
         "connection reset",
         "fetch failed",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+}
+
+/// Classify a fatal round-ending backend error as the PROVIDER-SAFEGUARDS
+/// class: the provider's safety layer flagged the conversation and refused
+/// to continue it. This class is TERMINAL FOR THOSE BYTES — the flag
+/// judges the conversation's content, so mechanically retrying, parking,
+/// or resuming the same context re-flags forever (proven live 2026-07-31:
+/// a resume into a flagged context re-flagged immediately, three times in
+/// one arc — sessions 69c8535e/77c8beaf). House law (owner, standing):
+/// never fall back to another model without per-instance owner approval;
+/// the remedy is a FRESH session with the task RECAST in the owner's own
+/// words — a judgment act, not mechanics. This classifier outranks
+/// [`transient_service_condition`] in the round-outcome ladder and feeds
+/// the honest terminal (the safeguards-flagged chip and attention
+/// surfaces) and the recovery guards (boot readopt and the commission
+/// sweep LIST, never nudge, this class). It must never feed a retry lane.
+///
+/// Matching is deliberately conservative and marker-based, like its
+/// transient twin. The classifier is the one provider-general seam —
+/// other providers' flag shapes join this list as real specimens arrive,
+/// never speculatively. The observed shapes:
+///
+/// - Claude Code surfaces the Anthropic flag as a result whose text
+///   reads "API Error: <model>'s safeguards flagged this message
+///   (https://www.anthropic.com/legal/aup)…" (474-byte specimen,
+///   byte-identical across four 2026-07-31 firings) — "safeguards
+///   flagged" covers it, and the AUP URL also covers wording drift
+///   around the verb.
+/// - "flagged by our safeguards" is the same family's other phrasing
+///   ("Claude's response was flagged by our safeguards").
+/// - The API's structured refusal carries `stop_details.explanation`
+///   prose "…blocked under Anthropic's Usage Policy…" — matched for
+///   adapters that surface the structured explanation instead of the
+///   CLI banner.
+pub(crate) fn safeguards_flag_condition(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "safeguards flagged",
+        "flagged by our safeguards",
+        "anthropic.com/legal/aup",
+        "blocked under anthropic's usage policy",
     ]
     .iter()
     .any(|marker| reason.contains(marker))
