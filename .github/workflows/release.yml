@@ -307,6 +307,7 @@ jobs:
         run: cargo build --release --locked --bin intendant --bin intendant-runtime
 
       - name: Bundle, sign, notarize
+        if: github.ref_type == 'tag'
         shell: bash
         env:
           INSTALL_APP: "0"
@@ -323,6 +324,13 @@ jobs:
           rm -rf dist
           ./scripts/bundle-macos.sh
           ls -l dist
+
+      - name: Stage raw binaries (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/intendant target/release/intendant-runtime dist/
 
       # Always remove the key material and restore the runner's keychain
       # state, even when a build/notarization step failed.
