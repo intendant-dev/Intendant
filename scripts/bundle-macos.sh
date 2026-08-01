@@ -441,10 +441,14 @@ CN = Intendant Dev
 keyUsage = digitalSignature
 extendedKeyUsage = codeSigning
 CERTCONF
-            openssl req -x509 -newkey rsa:2048 -nodes \
+            # /usr/bin/openssl (LibreSSL) deliberately: Homebrew openssl@3's
+            # PKCS12 defaults (AES/PBKDF2) produce blobs SecKeychainItemImport
+            # rejects with "MAC verification failed", and PATH order decides
+            # which openssl a bare invocation resolves on runner accounts.
+            /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes \
                 -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
                 -days 3650 -config "$CERT_DIR/cert.conf" 2>/dev/null
-            openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
+            /usr/bin/openssl pkcs12 -export -out "$CERT_DIR/cert.p12" \
                 -inkey "$CERT_DIR/key.pem" -in "$CERT_DIR/cert.pem" \
                 -passout "pass:$SIGN_P12_PASS" 2>/dev/null
             security import "$CERT_DIR/cert.p12" -k "$SIGN_KEYCHAIN" -P "$SIGN_P12_PASS" -T /usr/bin/codesign -A
