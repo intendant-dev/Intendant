@@ -578,6 +578,63 @@ thread-resume machinery), that re-reads the fresh store (a mid-turn
 session is interrupted first; a rate-limit park is cancelled with its
 pending re-send preserved). All three ceremonies are local-daemon only.
 
+### The out-of-band credential watch
+
+Ceremonies are not the only way credentials change: an owner can
+re-authenticate a backend CLI directly in a terminal, and until
+2026-08 that change was invisible to the reload lane — reload
+candidates keyed on the daemon-witnessed ceremony and on backend
+announce events, so sessions parked on the old account offered no
+reload until some backend happened to speak. The **credential watch**
+(`credential_watch.rs`) closes that gap with the same bounded pattern
+as the binary update watch: a slow stat poll (60 s;
+`INTENDANT_CREDENTIAL_POLL_MS` for rigs) over the auth artifact each
+backend CLI maintains, and on a change **one bounded identity probe**
+— the CLI's own status subcommand, run under the external-child env
+policy (the daemon's provider keys never reach a CLI it merely
+observes) with a hard timeout.
+
+A probe-confirmed switch does three things: it **mints the credential
+era** by publishing the same `BackendCredentialAccount` announce the
+ceremonies publish (a second *source* for era changes, never a second
+store — era keying by process announces stays primary), it records the
+observation the auth-status payloads serve as an `out_of_band` block
+carrying the **same `reload_candidates` list and reload-all offer**
+the ceremony's success payload carries (the Vault card renders both
+stories through one reload panel), and it posts **one info
+notification** — account labels only, never secret material.
+
+Honesty properties, all pinned by tests: the watch never opens the
+credential file (detection is `fs::metadata` alone — no secret byte
+can cross the observation boundary); token refreshes that rewrite the
+artifact under the *same* account never fire; a live ceremony defers
+the watch and a ceremony's announce folds into its baseline, so the
+ceremony lane never double-fires; a ceremony success newer than the
+observation supersedes it (failed/cancelled ceremonies, which change
+nothing, do not); a sign-out notifies without a reload offer
+(reloading onto an empty store is a trap); and probe failures are
+budget-bounded, adopting the change *without* a verdict rather than
+guessing (surfaced as `probe_error`). A persisted era label also lets
+the **first** poll after boot catch a switch made while the daemon was
+down.
+
+Per-backend applicability is explicit, served on every auth-status
+payload as a `credential_watch` block: **Claude Code** and **Codex**
+are watched (`~/.claude/.credentials.json` and `~/.codex/auth.json`,
+honoring `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, with `claude auth status` /
+`codex login status` as the probes). **Kimi** is out of scope — its
+only identity probe is parsing the credential file itself, which stays
+ceremony-scoped; a background lane reading secret bytes on a timer is
+a custody posture change that needs its own ruling. **Pi** has no
+sign-in ceremony (API-key auth, no reload surface to mirror). A
+backend under an active `oauth:*` vault lease is not watched while the
+lease is active — sessions run the leased identity, and the lease
+lifecycle rewrites its own materialized files on its own clock. On
+macOS, Claude Code may keep credentials in the keychain with no
+on-disk artifact; the block says so (`artifact_present: false`), and
+keychain-side switches stay invisible to a stat poll until the backend
+next speaks.
+
 ## Local key custody: the daemon's own private keys
 
 Everything above moves *provider* credentials. The daemon also holds
