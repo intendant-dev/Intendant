@@ -690,8 +690,11 @@ mod tests {
         let chapter_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/src/web-dashboard.md");
         let chapter = std::fs::read_to_string(chapter_path)
             .expect("docs/src/web-dashboard.md is part of the checkout");
+        // The chapter hard-wraps prose, so match against the
+        // whitespace-normalized text.
+        let chapter_flat = chapter.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            chapter.matches(SENTENCE).count(),
+            chapter_flat.matches(SENTENCE).count(),
             1,
             "docs/src/web-dashboard.md must state the same update-copy \
              honesty sentence exactly once"
