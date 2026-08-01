@@ -28,13 +28,14 @@
 // module-level visibilitychange listener below is the stop/resume
 // conduit itself and must outlive any one activation to resume it.
 
-// Owner-raised 2026-07-31 (from the original 180): the O(n²) cost only
-// bites during the brief settle window and the per-frame budget tiers
-// keep that window's frame work roughly constant as n grows, so the
-// honest bound is legibility — and legibility is what the hubs/focus
-// projections and arrangement modes are for. Past THIS cap the settle
-// window itself stops fitting a frame budget worth defending.
-const AGENDA_GRAPH_NODE_CAP = 420;
+// NO node cap (owner-ruled 2026-07-31, after 180 and then 420 both got
+// hit within a day): density is a feature, and every projection always
+// renders. Cost stays flat through level of detail instead of refusal —
+// node glow comes from pre-baked sprites (drawImage, ~two orders
+// cheaper than per-arc shadowBlur), and past REPULSION_LOD nodes the
+// settle pass strides its O(n²) pair loop with a rotating offset
+// (approximate physics, same look, same 260-iteration budget).
+const AGENDA_GRAPH_REPULSION_LOD = 600;
 // Design-parity settle budget, amortized: the prototype ran 260
 // synchronous O(n²) relaxation iterations per relayout; here the same
 // total is spread over frames (agendaGraphSettleBudget per rAF) so a
@@ -53,7 +54,9 @@ let agendaGraphCanvas = null;
 let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
-let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+let agendaGraphCam = {
+  yaw: 0.6, pitch: -0.34, auto: true, zoom: 1, panX: 0, panY: 0,
+};
 // Projection state: 'all' (whole non-retired ledger), 'hubs' (the hub
 // overview — automatic past the node cap, or chosen), 'focus' (one
 // hub's placed subtree). The render pass decides the projection from
@@ -61,7 +64,7 @@ let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
 // overlays derived file/dir satellite nodes on the 'all'/'focus' pools.
 let agendaGraphFocus = null;
 let agendaGraphProjection = 'all';
-let agendaGraphChosen = null; // null = auto ('hubs' past the cap, else 'all')
+let agendaGraphChosen = null; // null = 'all'; 'hubs' only when chosen
 let agendaGraphTerritory = false;
 let agendaGraphSubtreeTerr = new Map();
 let agendaGraphTerrStats = { shown: 0, total: 0 };
@@ -98,12 +101,25 @@ function agendaGraphSetFullscreen(on) {
   agendaRenderTab();
 }
 
+// While graph-fullscreen is active a marker class on <html> lifts the
+// agenda inspector above the fixed panel (see ui2-agenda-inspector.css)
+// so node-click keeps its full behavior — inspector over constellation.
+function agendaGraphSyncFsMarker() {
+  document.documentElement.classList.toggle('ag2-graph-fs', agendaGraphFullscreen);
+}
+
 function agendaGraphEnsureEsc() {
   if (agendaGraphEscHook) return;
   agendaGraphEscHook = (e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented) {
-      agendaGraphSetFullscreen(false);
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    // Polite ordering: an open inspector consumes the first ESC;
+    // fullscreen exits on the next.
+    const insp = document.getElementById('ag2-inspector');
+    if (insp && insp.classList.contains('open')) {
+      agendaCloseInspector();
+      return;
     }
+    agendaGraphSetFullscreen(false);
   };
   document.addEventListener('keydown', agendaGraphEscHook);
 }
@@ -147,7 +163,7 @@ function agendaGraphPoolItems() {
   return all;
 }
 
-// The over-cap degradation: instead of refusing, the constellation
+// The chosen hubs projection: the constellation
 // becomes a hub overview — only items with placed children — and a
 // click focuses one hub's subtree. The projection stays functional at
 // any ledger size a real taxonomy produces.
@@ -172,28 +188,21 @@ function agendaGraphProjectionItems() {
 
 function agendaGraphRenderLens(host) {
   // Resolve the projection: an explicit chip choice wins; focus
-  // overrides the pool; auto degrades an over-cap ledger to the hub
-  // overview (the cap still bounds every projection; past it the
-  // settle window's O(n²) relaxation stops fitting the frame budget).
+  // overrides the pool. Every projection renders at any size — cost is
+  // handled by LOD (sprite glow, strided repulsion), never refusal.
   let items = agendaGraphPoolItems();
-  let overCapAll = false;
   if (agendaGraphFocus) {
     agendaGraphProjection = 'focus';
-  } else {
-    const wantHubs = agendaGraphChosen === 'hubs'
-      || (agendaGraphChosen !== 'all' && items.length > AGENDA_GRAPH_NODE_CAP);
-    agendaGraphProjection = 'all';
-    if (wantHubs) {
-      const hubs = agendaGraphHubOverviewItems(items);
-      if (hubs.length && hubs.length <= AGENDA_GRAPH_NODE_CAP) {
-        items = hubs;
-        agendaGraphProjection = 'hubs';
-      }
-    } else if (agendaGraphChosen === 'all' && items.length > AGENDA_GRAPH_NODE_CAP) {
-      // The owner explicitly asked for Everything past the cap: keep
-      // the panel and its chips, park the canvas, say why.
-      overCapAll = true;
+  } else if (agendaGraphChosen === 'hubs') {
+    const hubs = agendaGraphHubOverviewItems(items);
+    if (hubs.length) {
+      items = hubs;
+      agendaGraphProjection = 'hubs';
+    } else {
+      agendaGraphProjection = 'all';
     }
+  } else {
+    agendaGraphProjection = 'all';
   }
   if (!items.length) {
     agendaGraphFullscreen = false;
@@ -205,60 +214,38 @@ function agendaGraphRenderLens(host) {
     </div>`;
     return;
   }
-  if (!overCapAll && items.length > AGENDA_GRAPH_NODE_CAP) {
-    // A focused subtree past the cap has no cheaper projection to
-    // degrade to — the flat refusal names the way out (and drops any
-    // fullscreen so the refusal never fills the window).
-    agendaGraphFullscreen = false;
-    agendaGraphTeardown();
-    host.innerHTML = `<div class="ag2-graph-panel empty">
-      <div class="ag2-empty">
-        <div class="ag2-empty-glyph">◍</div>
-        <div class="ag2-empty-title">The constellation caps at ${AGENDA_GRAPH_NODE_CAP} items</div>
-        <div class="ag2-empty-hint">This subtree exceeds the cap — focus a narrower hub, or use By hub.</div>
-      </div>
-    </div>`;
-    return;
-  }
   let canvas = host.querySelector('#ag2-graph-canvas');
   if (!canvas) {
     host.innerHTML = agendaGraphPanelHtml();
     canvas = host.querySelector('#ag2-graph-canvas');
   }
-  agendaGraphWireChrome(host, overCapAll);
-  if (overCapAll) {
-    agendaGraphTeardown();
-    return;
-  }
+  agendaGraphWireChrome(host);
   agendaGraphBindCanvas(canvas);
   agendaGraphEnsureLoop();
 }
 
-// Per-projection static chrome: the projection chip row, the cap note,
-// and the hint line. Static strings only — no item text ever lands in
-// this markup (the painted badge carries titles as inert pixels).
-function agendaGraphWireChrome(host, overCapAll) {
+// Per-projection static chrome: the projection chip row and the hint
+// line. Static strings only — no item text ever lands in this markup
+// (the painted badge carries titles as inert pixels).
+function agendaGraphWireChrome(host) {
   const panel = host.querySelector('.ag2-graph-panel');
   if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  agendaGraphSyncFsMarker();
   if (agendaGraphFullscreen) agendaGraphEnsureEsc();
   else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
   if (hintLine) {
     const modeHint = (AGENDA_GRAPH_MODES.find(([m]) => m === agendaGraphMode) || [])[2];
-    hintLine.textContent = overCapAll
-      ? 'everything exceeds the cap — pick hubs, or focus one hub'
-      : modeHint
-        || (agendaGraphProjection === 'hubs'
-          ? 'hub overview — click a hub to focus its subtree'
-          : agendaGraphProjection === 'focus'
-            ? (agendaGraphTerritory
-              ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
-              : 'focused subtree — double-click empty space to clear')
-            : 'drag to orbit · click a node to open it · double-click a hub to focus');
+    hintLine.textContent = modeHint
+      || (agendaGraphProjection === 'hubs'
+        ? 'hub overview — click a hub to focus its subtree'
+        : agendaGraphProjection === 'focus'
+          ? (agendaGraphTerritory
+            ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
+            : 'focused subtree — double-click empty space to clear')
+          : 'drag to orbit · wheel to zoom · shift-drag to pan · click a node to open it · double-click a hub to focus');
   }
-  const note = host.querySelector('#ag2-graph-capnote');
-  if (note) note.hidden = !overCapAll;
-  const inHubs = !overCapAll && agendaGraphProjection === 'hubs';
+  const inHubs = agendaGraphProjection === 'hubs';
   const chips = host.querySelectorAll('.ag2-graph-projchip');
   chips.forEach((chip) => {
     const kind = chip.dataset.proj;
@@ -272,10 +259,9 @@ function agendaGraphWireChrome(host, overCapAll) {
         agendaRenderTab();
       };
     } else if (kind === 'all') {
-      chip.classList.toggle('active', overCapAll
-        || (!inHubs && agendaGraphProjection === 'all'));
+      chip.classList.toggle('active', !inHubs && agendaGraphProjection === 'all');
       chip.disabled = false;
-      chip.title = 'every non-retired item (bounded by the node cap)';
+      chip.title = 'every non-retired item';
       chip.onclick = () => {
         agendaGraphChosen = 'all';
         agendaGraphFocus = null;
@@ -283,7 +269,7 @@ function agendaGraphWireChrome(host, overCapAll) {
       };
     } else if (kind === 'terr') {
       chip.classList.toggle('active', agendaGraphTerritory && !inHubs);
-      chip.disabled = inHubs || overCapAll;
+      chip.disabled = inHubs;
       chip.title = inHubs
         ? 'territory needs a concrete pool — focus a hub or pick everything'
         : 'overlay file/dir satellites from the pool’s refs';
@@ -303,7 +289,7 @@ function agendaGraphWireChrome(host, overCapAll) {
     } else if (kind && kind.startsWith('mode-')) {
       const mode = kind.slice(5);
       chip.classList.toggle('active', agendaGraphMode === mode);
-      chip.disabled = overCapAll;
+      chip.disabled = false;
       chip.title = agendaGraphMode === mode
         ? 'back to the orbit arrangement'
         : (AGENDA_GRAPH_MODES.find(([m]) => m === mode) || [])[2] || mode;
@@ -351,9 +337,6 @@ function agendaGraphPanelHtml() {
       <span class="ag2-graph-projdiv"></span>
       <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
     </div>
-    <div class="ag2-graph-capnote" id="ag2-graph-capnote" hidden>
-      past the ${AGENDA_GRAPH_NODE_CAP}-node cap — the hubs projection or a focused hub keeps the map legible
-    </div>
     <div class="ag2-graph-legend">
       ${agendaGraphLegendChip('s-dot t-iris', 'open')}
       ${agendaGraphLegendChip('s-dot t-amber', 'question')}
@@ -388,9 +371,15 @@ function agendaGraphBindCanvas(canvas) {
       const nx = e.clientX - rect.left;
       const ny = e.clientY - rect.top;
       if (m.down) {
-        agendaGraphCam.yaw += (nx - m.x) * 0.005;
-        agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
-          agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        if (e.shiftKey) {
+          // Shift-drag pans in screen space (zoom's natural partner).
+          agendaGraphCam.panX += nx - m.x;
+          agendaGraphCam.panY += ny - m.y;
+        } else {
+          agendaGraphCam.yaw += (nx - m.x) * 0.005;
+          agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
+            agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        }
         m.moved += Math.abs(nx - m.x) + Math.abs(ny - m.y);
         agendaGraphCam.auto = false;
       }
@@ -426,14 +415,42 @@ function agendaGraphBindCanvas(canvas) {
     },
     dbl: () => {
       // Double-click a hub to focus its subtree; double-click empty
-      // space to clear an active focus.
+      // space to reset a zoom/pan first, then to clear an active focus.
       if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
         agendaGraphFocus = agendaGraphHover;
         agendaRenderTab();
-      } else if (!agendaGraphHover && agendaGraphFocus) {
-        agendaGraphFocus = null;
-        agendaRenderTab();
+      } else if (!agendaGraphHover) {
+        const cam = agendaGraphCam;
+        if (cam.zoom !== 1 || cam.panX || cam.panY) {
+          cam.zoom = 1;
+          cam.panX = 0;
+          cam.panY = 0;
+        } else if (agendaGraphFocus) {
+          agendaGraphFocus = null;
+          agendaRenderTab();
+        }
       }
+    },
+    wheel: (e) => {
+      // Wheel / trackpad-pinch (ctrl-wheel) zoom, anchored to the
+      // cursor: the world point under the pointer stays put via the
+      // screen-space pan. preventDefault keeps the page from scrolling
+      // — scoped to the canvas, removed on unbind.
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const cam = agendaGraphCam;
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0022));
+      const next = Math.max(0.35, Math.min(3.5, cam.zoom * factor));
+      const ratio = next / cam.zoom;
+      const ax = rect.width / 2;
+      const ay = rect.height / 2 + 8;
+      cam.panX = mx - ax - (mx - ax - cam.panX) * ratio;
+      cam.panY = my - ay - (my - ay - cam.panY) * ratio;
+      cam.zoom = next;
+      cam.auto = false;
+      agendaGraphArmAutoResume();
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -450,6 +467,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
   canvas.addEventListener('dblclick', hooks.dbl);
+  canvas.addEventListener('wheel', hooks.wheel, { passive: false });
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -462,6 +480,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
     canvas.removeEventListener('dblclick', hooks.dbl);
+    canvas.removeEventListener('wheel', hooks.wheel);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -532,6 +551,7 @@ function agendaGraphTeardown() {
   }
   agendaGraphUnbindCanvas();
   agendaGraphRemoveEsc();
+  document.documentElement.classList.remove('ag2-graph-fs');
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
@@ -569,10 +589,9 @@ function agendaGraphBuild() {
         entry.carrier = x.id;
       }
     }));
-    const room = Math.max(0, AGENDA_GRAPH_NODE_CAP - items.length);
     const all = [...best.values()].sort((a, b) =>
       b.newest - a.newest || (a.locator < b.locator ? -1 : 1));
-    satellites = all.slice(0, Math.min(60, room));
+    satellites = all.slice(0, 60);
     agendaGraphTerrStats = { shown: satellites.length, total: all.length };
   } else {
     agendaGraphTerrStats = { shown: 0, total: 0 };
@@ -768,18 +787,22 @@ function agendaGraphSettleBudget(count) {
   if (count <= 60) return 30;
   if (count <= 120) return 12;
   if (count <= 240) return 6;
-  // Keeps per-frame settle work roughly constant as n² grows: 420
-  // nodes at 4 iterations/frame ≈ 240 at 6 (the settle just takes a
-  // few more frames to spend its 260-iteration total).
+  // Together with the strided repulsion past REPULSION_LOD this keeps
+  // per-frame settle work roughly flat as n² grows; the settle just
+  // takes more frames to spend its 260-iteration total.
   return 4;
 }
 
 function agendaGraphRelax(iterations) {
   const nodes = agendaGraphNodes;
   const links = agendaGraphLinks;
+  // Past the LOD bound the pair loop strides with a rotating offset:
+  // each iteration touches 1/stride of the pairs, different ones each
+  // time, so big boards converge to the same shape at flat frame cost.
+  const stride = 1 + Math.floor(nodes.length / AGENDA_GRAPH_REPULSION_LOD);
   for (let it = 0; it < iterations; it++) {
     for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
+      for (let j = i + 1 + ((it + i) % stride); j < nodes.length; j += stride) {
         const A = nodes[i].p;
         const B = nodes[j].p;
         let dx = A[0] - B[0];
@@ -883,16 +906,40 @@ function agendaGraphDrawSatellite(g, node, q, hot, pal, w) {
   }
 }
 
+// Pre-baked glow sprites: one radial-gradient canvas per palette color,
+// drawImage-scaled per node. This is what removes the node cap — the
+// shadowBlur look at ~1/100th its cost, so a thousand glowing nodes
+// draw inside a frame. Keyed by the palette's rgb string, so theme
+// flips mint fresh sprites and stale ones just idle in the map.
+const agendaGraphGlowSprites = new Map();
+function agendaGraphGlowSprite(rgb) {
+  let sprite = agendaGraphGlowSprites.get(rgb);
+  if (!sprite) {
+    sprite = document.createElement('canvas');
+    sprite.width = 64;
+    sprite.height = 64;
+    const sg = sprite.getContext('2d');
+    const grad = sg.createRadialGradient(32, 32, 2, 32, 32, 30);
+    grad.addColorStop(0, `rgba(${rgb},.85)`);
+    grad.addColorStop(0.35, `rgba(${rgb},.28)`);
+    grad.addColorStop(1, `rgba(${rgb},0)`);
+    sg.fillStyle = grad;
+    sg.fillRect(0, 0, 64, 64);
+    agendaGraphGlowSprites.set(rgb, sprite);
+  }
+  return sprite;
+}
+
 // ---- Draw (3D-ish projection, hover picking, rings, labels) ----
 
 function agendaGraphDraw(ts) {
   const canvas = agendaGraphCanvas;
   if (!canvas) return;
   const items = agendaGraphBuild();
-  if (!items.length || items.length > AGENDA_GRAPH_NODE_CAP) {
-    // The ledger crossed a boundary between renders (event-lane merge):
-    // re-enter through the render pass, which owns projection choice,
-    // the cap, and the empty states (it tears this loop down).
+  if (!items.length) {
+    // The ledger emptied between renders (event-lane merge): re-enter
+    // through the render pass, which owns projection choice and the
+    // empty state (it tears this loop down).
     agendaRenderTab();
     return;
   }
@@ -937,7 +984,13 @@ function agendaGraphDraw(ts) {
     const ry = p[1] * cp - rz * sp;
     rz = p[1] * sp + rz * cp;
     const s = focal / (focal + rz + 40);
-    return { x: cx + rx * s * 1.35, y: cyy + ry * s * 1.35, s, z: rz };
+    const k = s * 1.35 * cam.zoom;
+    return {
+      x: cx + cam.panX + rx * k,
+      y: cyy + cam.panY + ry * k,
+      s: s * cam.zoom,
+      z: rz,
+    };
   };
   const nodes = agendaGraphNodes;
   const pts = nodes.map((n) => project(n.p));
@@ -1081,14 +1134,16 @@ function agendaGraphDraw(ts) {
     let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
     // Attention mode: needs-you items glow, the rest recede.
     if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
-    g.shadowColor = `rgba(${rgb},.8)`;
-    g.shadowBlur = hot ? 20
-      : (agendaGraphMode === 'attention' && node.attn ? 24 : 11 * q.s);
+    const glow = agendaGraphGlowSprite(rgb);
+    const gr = r * (hot ? 6.5
+      : agendaGraphMode === 'attention' && node.attn ? 7.5 : 4.5);
+    g.globalAlpha = alpha * (hot ? 0.95 : 0.6);
+    g.drawImage(glow, q.x - gr, q.y - gr, gr * 2, gr * 2);
+    g.globalAlpha = 1;
     g.beginPath();
     g.arc(q.x, q.y, r, 0, Math.PI * 2);
     g.fillStyle = `rgba(${rgb},${alpha})`;
     g.fill();
-    g.shadowBlur = 0;
     // Rings reuse slice A's derivations: blocked (uncleared blocker or
     // unmet prerequisite) rose; approved standing/armed green; suspended
     // amber with a slow pulse (static under reduced motion); pending
@@ -1157,7 +1212,10 @@ function agendaGraphDraw(ts) {
     : agendaGraphMode === 'attention'
       ? ` · attention — ${agendaGraphAttnCount} need you`
       : ` · ${agendaGraphMode}`;
-  if (agendaGraphProjection !== 'all' || terrBadge || modeBadge) {
+  const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
+    ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
+    : '';
+  {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
     ).length;
@@ -1175,7 +1233,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + modeBadge + terrBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge + zoomBadge, 14, 64);
   }
 }
 

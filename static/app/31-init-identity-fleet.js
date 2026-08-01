@@ -857,6 +857,10 @@ let currentSessionDetail = null;
 let currentSessionDetailContext = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
+// Host of the peer daemon that raised the shown approval; '' = local.
+// Peer approvals fold into the same panel + queue (RC-C2), decided via
+// api_peer_approval instead of the local session-control lane.
+let pendingApprovalHostId = '';
 let steerCounter = 0;
 let followUpCounter = 0;
 const pendingFollowUpsById = new Map();

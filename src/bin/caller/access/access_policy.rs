@@ -1235,6 +1235,25 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
             }
         }
     }
+    // The transcript fetch is a GET, but it is still acting *through* the
+    // peer — the daemon spends its own peer identity on an outbound
+    // authenticated fetch, and the peer authorizes the read against the
+    // profile it granted this daemon — so it rides peer.use with the
+    // other `/api/peers/{id}/<op>` quick controls, not the registry's
+    // peer.inspect below (which never leaves this daemon).
+    if method == "GET" {
+        let mut segments = path
+            .strip_prefix("/api/peers/")
+            .into_iter()
+            .flat_map(|rest| rest.split('/'));
+        if let (Some(id), Some("session-detail"), None) =
+            (segments.next(), segments.next(), segments.next())
+        {
+            if !id.is_empty() {
+                return Some(PeerOperation::PeerUse);
+            }
+        }
+    }
     if under("/api/peers") {
         if method == "GET" {
             return Some(PeerOperation::PeerInspect);
@@ -1602,6 +1621,52 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RC-C2 depth pins for the peer Timeline + merged approvals rail:
+    /// reading a peer session's transcript is `session.inspect` (the
+    /// target's classification of `GET /api/session/{id}`), resolving
+    /// its approvals is `approval.resolve` — and the profile ladder,
+    /// the sole control-depth authority, separates them. A read-class
+    /// profile can feed the Timeline view but can never decide an
+    /// approval; only Operator-and-up hold the Approval operation.
+    #[test]
+    fn rc_c2_transcript_read_and_approval_depths_are_separated() {
+        let read_only = [
+            "session-reader",
+            "shared-session-spectator",
+            "terminal-operator",
+        ];
+        for profile in read_only {
+            assert!(
+                profile_allows_operation(profile, PeerOperation::SessionInspect),
+                "{profile} reads session state (Timeline feed)"
+            );
+            assert!(
+                !profile_allows_operation(profile, PeerOperation::Approval),
+                "{profile} must NOT resolve approvals"
+            );
+        }
+        // task-runner acts (message/task) but neither reads transcripts
+        // nor decides approvals.
+        assert!(!profile_allows_operation(
+            "task-runner",
+            PeerOperation::SessionInspect
+        ));
+        assert!(!profile_allows_operation(
+            "task-runner",
+            PeerOperation::Approval
+        ));
+        for profile in ["peer-operator", "peer-root"] {
+            assert!(
+                profile_allows_operation(profile, PeerOperation::SessionInspect),
+                "{profile} reads transcripts"
+            );
+            assert!(
+                profile_allows_operation(profile, PeerOperation::Approval),
+                "{profile} resolves approvals"
+            );
+        }
+    }
 
     /// Structural invariants of [`FRAME_LANES`]: one row per frame kind
     /// (the lookup takes the first match, so a duplicate would shadow),

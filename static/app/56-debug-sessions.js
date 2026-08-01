@@ -470,8 +470,10 @@ function setSessionsHost(hostId) {
 // Whole-card action while browsing a peer: hand off to the peer's own
 // dashboard (its own auth applies there) rather than faking cross-daemon
 // session control this daemon has no authority for.
-function openPeerSessionExternally(s) {
-  const host = sessionsHostRowFor(currentSessionsHostId());
+function openPeerSessionExternally(s, hostId) {
+  // Explicit host when the caller knows it (the peer transcript banner);
+  // the Sessions pane's active host otherwise.
+  const host = sessionsHostRowFor(hostId || currentSessionsHostId());
   const base = String(host?.browser_tcp_via_url || host?.url || '').replace(/\/+$/, '');
   if (!base) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');

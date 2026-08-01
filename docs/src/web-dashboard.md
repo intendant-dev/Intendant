@@ -122,7 +122,25 @@ interrupt) routed through `api_peer_session_control` and derived from the
 peer-advertised grant, and media affordances (live display, file transfer,
 the browser↔peer control tunnel) render from the connected link's transport
 class — a relay-only peer gets an honest "no live media" note plus the
-federation-fold session list instead of dead pills. Agenda, Memory,
+federation-fold session list instead of dead pills. **Peer transcripts**
+(RC-C2): clicking a peer session card (or a Station peer node's transcript
+action) opens the session-detail overlay reading the transcript *from the
+peer* — over the browser↔peer tunnel when the link supports it, else the
+daemon-mediated `api_peer_session_detail` federation fetch that works on
+relay-only links — under a provenance banner naming the peer, the link
+class, and the snapshot's fetch time, with Refresh and an "Open on
+<peer>" hand-off; frames and recordings stay on the peer and render as
+absent, never as dead thumbnails. **Peer approvals** fold into the global
+rail: the bottom approval panel, its queue, and the attention center key
+every item by `(host, id)` — approval ids are per-daemon counters that
+collide across daemons — with a provenance line naming the governing
+daemon and the delegation lane; deciding routes through
+`api_peer_approval` under this daemon's peer grant (Approve all maps to
+`accept_for_session`), the peer's own profile gate authorizes it, and a
+grant known to lack `approval.resolve` is said up front instead of
+failing after the click. On a peer-link reconnect the fold clears and
+repopulates from the peer's bootstrap re-announce — older peers degrade
+to the session rows' `needs_approval` mark. Agenda, Memory,
 Vault/custody, Access/IAM, and Settings never route to a peer.
 
 The section headings below keep the internal pane names (`Video` is the Live
@@ -1998,8 +2016,8 @@ response omits the header.
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |
 | GET | `/api/daemon/handover` | StatsRead | own origin | none | Handover status: lease role, drain state, and co-homed daemons with probed liveness |
-| POST | `/api/daemon/update-lane/check` | Settings | own origin | ≤ 4 KiB | Self-update lane: run the bounded behind-origin-main / behind-latest-release check now |
-| POST | `/api/daemon/update-lane/produce` | Settings | own origin | ≤ 4 KiB | Self-update lane: produce the update artifact (source pull+build, or verified release download) for the swap chip |
+| POST | `/api/daemon/update-lane/check` | Settings | own origin | ≤ 4 KiB | Self-update lane: run the bounded behind-origin-main / behind-latest-release check now (optional body {"channel": "releases"|"dev"}; absent = the install's native lane) |
+| POST | `/api/daemon/update-lane/produce` | Settings | own origin | ≤ 4 KiB | Self-update lane: produce the update artifact on the named channel (dev = source pull+build, releases = verified release download) for the swap chip |
 | POST | `/api/daemon/update-swap` | Settings | own origin | ≤ 4 KiB | Ask the attached app supervisor for the one-click update swap (refused when no live supervisor is attached) |
 | POST | `/api/daemon/update-swap/claim` | Settings | own origin | ≤ 4 KiB | App supervisor poll: claim the pending one-click swap request (consuming; expired requests evaporate) |
 | POST | `/api/daemon/update-swap/result` | Settings | own origin | ≤ 4 KiB | App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane) |
@@ -2133,6 +2151,7 @@ response omits the header.
 | POST | `/api/peers/{peer_id}/task` | federation (per method/path) | own origin | bounded | Delegate a task to a connected peer |
 | POST | `/api/peers/{peer_id}/approval` | federation (per method/path) | own origin | bounded | Resolve a peer-forwarded approval request |
 | POST | `/api/peers/{peer_id}/session-control` | federation (per method/path) | own origin | bounded | Forward a session-lifecycle action to a connected peer's session |
+| GET | `/api/peers/{peer_id}/session-detail` | federation (per method/path) | own origin | bounded | Fetch a peer session's transcript page over the federation HTTP lane (peer-side IAM governs) |
 | POST | `/api/peers/{peer_id}/webrtc` | federation (per method/path) | own origin | bounded | Relay display WebRTC signaling to a connected peer |
 | POST | `/api/peers/{peer_id}/file-transfer-webrtc` | federation (per method/path) | own origin | bounded | Relay file-transfer WebRTC signaling to a connected peer |
 | POST | `/api/peers/{peer_id}/dashboard-control-webrtc` | federation (per method/path) | own origin | bounded | Relay dashboard-control WebRTC signaling to a connected peer |

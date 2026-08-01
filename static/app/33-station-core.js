@@ -578,7 +578,9 @@ function handleStationAction(action) {
       const map = { approve: 'approve', skip: 'skip', approve_all: 'approve_all', deny: 'deny' };
       if (app) processCommands(app.send_approval(map[decision] || 'approve'));
     } else {
-      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept', deny: 'decline' };
+      // approve_all maps to accept_for_session (→ ControlMsg::ApproveAll
+      // on the peer) — it used to silently degrade to a one-shot accept.
+      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept_for_session', deny: 'decline' };
       resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
     }
   } else if (action.type === 'open_display') {

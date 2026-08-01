@@ -1292,8 +1292,18 @@ function renderSessionDetailTitle(session) {
   titleText.title = primaryText;
   const titleId = document.createElement('span');
   titleId.className = 'sd-title-id';
-  titleId.textContent = `${sourceLabel} ${sessionId}`;
-  titleId.title = sessionId;
+  // Peer transcripts (RC-C2) name their governing daemon in the title —
+  // provenance is explicit even before the banner renders.
+  const peerHost = String(session.hostId || '').trim();
+  if (peerHost) {
+    const peerEntry = typeof peerEntryForHost === 'function' ? peerEntryForHost(peerHost) : null;
+    const peerLabel = peerEntry?.label || peerHost;
+    titleId.textContent = `${sourceLabel} ${sessionId} on ${peerLabel}`;
+    titleId.title = `${sessionId} — a session on ${peerLabel}, read over the federation link`;
+  } else {
+    titleId.textContent = `${sourceLabel} ${sessionId}`;
+    titleId.title = sessionId;
+  }
   titleLine.appendChild(titleKind);
   titleLine.appendChild(titleText);
   titleLine.appendChild(titleId);
@@ -1407,12 +1417,18 @@ function prepareSessionDetailContext(ctx, detailEl) {
   return true;
 }
 
-function openSessionDetail(sessionOrId, taskArg) {
+function openSessionDetail(sessionOrId, taskArg, opts) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
   const sessionId = session.session_id;
   const source = session.source || 'intendant';
+  // Peer transcript lane (RC-C2): `hostId` reads the session's transcript
+  // from a federated peer. Same overlay, same renderer, one extra rail of
+  // honesty: explicit target provenance, a fetched-at stamp with refresh,
+  // and peer-store-resident media (frames, recordings) rendered as absent
+  // instead of dead thumbnails.
+  const hostId = String(opts?.hostId || session.hostId || '').trim();
   const detailEl = document.getElementById('session-detail');
   const logsEl = document.getElementById('session-detail-logs');
   const detailSubtab = activeSessionsSubtab === 'deep' ? 'deep' : 'recent';
@@ -1420,7 +1436,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   if (!detailEl || !logsEl || !prepareSessionDetailContext(detailContext, detailEl)) return;
 
   detailEl.classList.remove('hidden');
-  currentSessionDetail = { ...session, source };
+  currentSessionDetail = { ...session, source, hostId };
   renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
   sessionDetailLogView = null;
@@ -1430,6 +1446,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   document.getElementById('sd-recordings').classList.add('hidden');
   document.getElementById('sd-frames').classList.add('hidden');
   document.getElementById('session-detail-frames').innerHTML = '';
+  renderPeerDetailBanner(hostId, sessionId, source, null);
 
   const detailSessionId = sessionId;
   const detailSource = source;
@@ -1441,19 +1458,30 @@ function openSessionDetail(sessionOrId, taskArg) {
     failure.textContent = message;
     logsEl.appendChild(failure);
   };
-  fetchSessionDetailPayload(detailSessionId, { source: detailSource, limit: SESSION_DETAIL_PAGE_LIMIT })
+  fetchSessionDetailPayload(detailSessionId, {
+    source: detailSource,
+    limit: SESSION_DETAIL_PAGE_LIMIT,
+    hostId,
+  })
     .then(data => {
+      if (currentSessionDetail?.session_id !== detailSessionId) return;
       if (data.error) {
         renderDetailFailure(String(data.error));
+        if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: String(data.error) });
         return;
       }
       const entries = data.entries || [];
-      applySessionIdentitiesFromReplayEntries(entries);
-      applySessionGoalsFromReplayEntries(entries);
-      applySessionPrsFromReplayEntries(entries);
+      if (!hostId) {
+        // Identity/goal/PR side-tables are LOCAL session state — a peer's
+        // entries must not pollute them (its session ids are not ours).
+        applySessionIdentitiesFromReplayEntries(entries);
+        applySessionGoalsFromReplayEntries(entries);
+        applySessionPrsFromReplayEntries(entries);
+      }
       renderSessionDetailLogs(entries, logsEl, {
         sessionId: detailSessionId,
         source: detailSource,
+        hostId,
         pageStart: data.page_start ?? data.pageStart,
         pageEnd: data.page_end ?? data.pageEnd,
         totalEntries: data.total_entries ?? data.totalEntries,
@@ -1461,26 +1489,121 @@ function openSessionDetail(sessionOrId, taskArg) {
       });
       updateSessionDetailLogsBadge(sessionDetailLogView, entries.length);
 
-      // Render frames gallery
+      // Render frames gallery. Peer frames live in the PEER's stores —
+      // the gallery would be dead thumbnails; the banner says so instead.
       const frames = data.frames || [];
-      if (frames.length > 0) {
+      if (frames.length > 0 && !hostId) {
         renderSessionFrames(sessionId, frames);
+      }
+      if (hostId) {
+        renderPeerDetailBanner(hostId, detailSessionId, detailSource, {
+          fetchedAt: Date.now(),
+          frameCount: frames.length,
+        });
       }
     })
     .catch(e => {
       renderDetailFailure(`Failed to load${e?.message ? ` — ${e.message}` : ''}`);
+      if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: e?.message || 'failed to load' });
     });
 
   // Lazy-load recordings for Intendant sessions. External CLI histories do not
-  // have Intendant media directories.
-  if (source === 'intendant') {
+  // have Intendant media directories; peer recordings live on the peer.
+  if (source === 'intendant' && !hostId) {
     loadSessionRecordings(sessionId);
+  }
+}
+
+// The provenance banner above a PEER transcript (RC-C2): names the
+// governing daemon and the link class, stamps when the page was fetched
+// (a transcript page is a snapshot, never a live stream), offers Refresh,
+// and links the peer's own dashboard for everything that stays there
+// (frames, recordings, full history). Every line says what is true NOW.
+function renderPeerDetailBanner(hostId, sessionId, source, state) {
+  const detailEl = document.getElementById('session-detail');
+  if (!detailEl) return;
+  let banner = document.getElementById('session-detail-peer-banner');
+  if (!hostId) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'session-detail-peer-banner';
+    banner.className = 'session-detail-peer-banner';
+    const titleEl = document.getElementById('session-detail-title');
+    if (titleEl && titleEl.parentElement) {
+      titleEl.insertAdjacentElement('afterend', banner);
+    } else {
+      detailEl.prepend(banner);
+    }
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkClass = entry?.link?.transport_class || '';
+  const linkDown = entry ? entry.connected === false : false;
+  banner.textContent = '';
+  const who = document.createElement('span');
+  who.className = 'sd-peer-who';
+  who.textContent = `Transcript from ${label}`;
+  who.title = `Fetched over the federation link under this daemon's peer identity; `
+    + `${label}'s own profile gate authorized the read.`;
+  banner.appendChild(who);
+  if (linkClass) {
+    const chip = document.createElement('span');
+    chip.className = 'sd-peer-link-chip';
+    chip.textContent = linkClass === 'relayed' ? 'relay link' : 'direct link';
+    chip.title = linkClass === 'relayed'
+      ? 'Reachability-relay link: request/response only — no live media or datachannels.'
+      : 'Direct federation link.';
+    banner.appendChild(chip);
+  }
+  const status = document.createElement('span');
+  status.className = 'sd-peer-status';
+  if (state?.error) {
+    status.textContent = `— ${state.error}`;
+    status.dataset.state = 'error';
+  } else if (state?.fetchedAt) {
+    const stamp = new Date(state.fetchedAt).toLocaleTimeString();
+    status.textContent = linkDown
+      ? `— snapshot from ${stamp}; peer link down, refresh will fail until it returns`
+      : `— snapshot fetched ${stamp}`;
+    if (state.frameCount > 0) {
+      status.textContent += ` · ${state.frameCount} frame${state.frameCount === 1 ? '' : 's'} on ${label} (not proxied)`;
+    }
+  } else {
+    status.textContent = linkDown ? '— peer link reconnecting…' : '— fetching…';
+  }
+  banner.appendChild(status);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'sd-peer-refresh';
+  refresh.textContent = 'Refresh';
+  refresh.title = `Re-fetch this transcript page from ${label} now.`;
+  refresh.addEventListener('click', () => {
+    if (currentSessionDetail?.session_id === sessionId) {
+      openSessionDetail(currentSessionDetail, null, { hostId });
+    }
+  });
+  banner.appendChild(refresh);
+  if (entry && typeof openPeerSessionExternally === 'function') {
+    const external = document.createElement('button');
+    external.type = 'button';
+    external.className = 'sd-peer-external';
+    external.textContent = `Open on ${label}`;
+    external.title = `Open ${label}'s own dashboard (full history, frames, recordings, live view).`;
+    external.addEventListener('click', () => {
+      openPeerSessionExternally({ session_id: sessionId, source }, hostId);
+    });
+    banner.appendChild(external);
   }
 }
 
 function closeSessionDetail() {
   // Clean up session recording player
   if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
+  const peerBanner = document.getElementById('session-detail-peer-banner');
+  if (peerBanner) peerBanner.remove();
   revokeSessionFrameObjectUrls();
   document.getElementById('session-detail-recordings').innerHTML = '';
   document.getElementById('session-detail-frames').innerHTML = '';
@@ -1827,6 +1950,7 @@ function updateSessionDetailViewPageState(view, info = {}) {
     ''
   ).trim();
   view.source = normalizeAgentId(info.source || view.source || currentSessionDetail?.source || 'intendant') || 'intendant';
+  view.hostId = String(info.hostId ?? view.hostId ?? currentSessionDetail?.hostId ?? '').trim();
 
   const pageStart = sessionDetailNumberOrNull(info.pageStart ?? info.page_start);
   if (pageStart !== null) {
@@ -2577,6 +2701,7 @@ function loadOlderRemoteSessionDetailRows(view) {
     limit: SESSION_DETAIL_PAGE_LIMIT,
     before,
     cache: 'no-store',
+    hostId: view.hostId || currentSessionDetail?.hostId || '',
   })
     .then(data => {
       if (sessionDetailLogView !== view || view.scroller?._sessionDetailView !== view || data?.error) return;

@@ -201,20 +201,35 @@ operations in the same append-only log:
 - **Dependencies** (`add_relies_on` / `remove_relies_on`) draw links to
   other items. A completed prerequisite satisfies the link by pure
   recomputation at read time; a **retired** prerequisite does not silently
-  satisfy — the dependent renders "prerequisite retired — review"; a target
-  missing from the fold renders "prerequisite missing"; cycles simply render
-  every member blocked (direct status lookup, nothing walks).
+  satisfy — the dependent renders "prerequisite retired — review"; cycles
+  simply render every member blocked (direct status lookup, nothing
+  walks). A target absent from the dashboard's live window resolves
+  against the served verdict: on an unblocked item it is provably done
+  ("done · archived"), on a blocked one it renders an honest id-only
+  "outside this live window" row — never a false "missing".
 
-**Blocked is derived presentation, never state.** An open item with any
-uncleared blocker or unsatisfied dependency renders a blocked chip, and
-list surfaces can filter on it (`ctl agenda list --blocked`, the dashboard
-filter). The judgment is never stored and never a notification trigger
-(the reminder lane remains the only thing that fires); since Track AS S5
-it IS served — the summary grain carries the `blocked` flag, and both
+**Blocked is derived presentation, never ledger state.** An open item
+with any uncleared blocker or unsatisfied dependency renders a blocked
+chip, and list surfaces can filter on it (`ctl agenda list --blocked`,
+the dashboard filter). The verdict is computed once at the serving seam
+against the full fold and served as a per-item flag (the "served flags"
+ruling below) — never stored in the ledger, and never a notification
+trigger: the reminder lane remains the only thing that fires. The chip
+explains itself at every depth: its tip and its tap name each gate —
+every uncleared blocker, every unsatisfied prerequisite by title with
+live status — and each named prerequisite is a door to its own card.
+A prerequisite that is still open but whose scheduled session's last
+run **completed with a self-reported `achieved`** renders as the
+actionable wait it is — "delivered · awaiting Complete" (sky, the
+self-report hue) — distinct from genuinely in-flight work; calm depth
+folds only the in-flight waits (a chip tap unfolds them), while stated
+blockers and delivered waits always render. All of it stays advisory:
+blocked gates neither approval nor firing. Beside the flag, both
 serving grains carry the **`blocked_on` decoration**: the named causes
-(each uncleared blocker's criterion; each unsatisfied prerequisite's live
-title and status), stamped at the serving seam beside the effects'
-fireability verdicts like `next_fire_ms`, never folded from ops.
+(each uncleared blocker's criterion; each unsatisfied prerequisite's
+live title and status), stamped at the serving seam beside the effects'
+fireability verdicts like `next_fire_ms`, never folded from ops — the
+served truth the approve-surface confirms below derive from.
 
 **Blocked never gates approval — advisory plus confirm.** Blocked-state
 is bookkeeping that lags reality in both directions (a finished

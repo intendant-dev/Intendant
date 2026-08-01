@@ -242,11 +242,30 @@ function processCommands(cmds) {
         break;
       }
       case 'peer_approval_requested':
-        addPendingApproval(c.host_id, c.id, c.command, c.category);
+        // RC-C2: peer approvals are first-class in the merged rail —
+        // the peers-panel fold, the bottom approval panel/queue, and
+        // the attention center, all keyed (host, id) since approval
+        // ids are per-daemon counters that collide across daemons.
+        addPendingApproval(c.host_id, c.id, c.command, c.category, c.session_id);
+        if (typeof attentionAdd === 'function') {
+          attentionAdd('approval', c.session_id, c.id, true, {
+            hostId: c.host_id,
+            text: c.command || '',
+          });
+        }
+        if (typeof showApproval === 'function') {
+          showApproval(c.id, c.command, c.category, c.session_id || '', c.host_id);
+        }
         stationScheduleUpdate();
         break;
       case 'peer_approval_resolved':
         removePendingApproval(c.host_id, c.id);
+        if (typeof attentionRemove === 'function') {
+          attentionRemove('approval', null, c.id, true, 'resolved', c.host_id);
+        }
+        if (typeof retirePanelPeerApproval === 'function') {
+          retirePanelPeerApproval(c.host_id, c.id);
+        }
         stationScheduleUpdate();
         break;
       // Folded per-session snapshots from a peer's event stream —

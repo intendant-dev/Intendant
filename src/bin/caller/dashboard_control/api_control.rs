@@ -2295,6 +2295,37 @@ pub(crate) async fn api_peer_session_control_response(
     http_body_response(id, status, body, "peer session control")
 }
 
+pub(crate) async fn api_peer_session_detail_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(registry) = runtime.peer_registry.as_ref() else {
+        return peer_registry_unavailable_response(id);
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let peer_id = string_param(&params, &["peer_id", "peerId", "host_id", "hostId", "id"]);
+    if peer_id.is_empty() {
+        return missing_param_response(id, "peer_id");
+    }
+    // Re-encode the remaining params as the query string the HTTP
+    // handler parses — one parser for both lanes.
+    let mut query = String::new();
+    for key in ["session_id", "source", "limit", "before"] {
+        let value = match params.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&format!("{key}={value}"));
+    }
+    let (status, body) = crate::web_gateway::peers_session_detail(registry, &peer_id, &query).await;
+    http_body_response(id, status, body, "peer session detail")
+}
+
 pub(crate) async fn api_peer_webrtc_signal_response(
     id: String,
     params: Option<&serde_json::Value>,

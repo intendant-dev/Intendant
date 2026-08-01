@@ -19783,6 +19783,41 @@ html.ui-v2 #tab-sessions .sd-meta-strip {
 html.ui-v2 #tab-sessions .sd-meta-strip .label { color: var(--text-3); }
 html.ui-v2 #tab-sessions .sd-meta-strip .value { color: var(--text-2); }
 
+/* Peer transcript provenance banner (RC-C2): explicit target
+   provenance on every peer view — who governs the transcript, over
+   which link class, and how fresh the snapshot is. */
+html.ui-v2 #tab-sessions .session-detail-peer-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-2, var(--surface-3));
+  border-radius: var(--r-card, 8px);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-who { font-weight: 600; color: var(--text); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-link-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2, var(--surface-3));
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status[data-state="error"] { color: var(--red, #d66); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner button {
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner button.sd-peer-external { margin-left: 0; }
+
 /* Detail actions: Resume leads (accent), Configure/Rename quiet. */
 html.ui-v2 #tab-sessions .session-detail-action-btn {
   padding: 6px 13px;
@@ -21778,6 +21813,15 @@ html.ui-v2 #approval-panel .approval-category {
 }
 /* keep v1's empty-hide winning */
 html.ui-v2 #approval-panel .approval-category:empty { display: none; }
+/* Peer provenance line (RC-C2): names the governing daemon under a
+   peer-raised approval — quiet but always legible. */
+html.ui-v2 #approval-panel .approval-provenance {
+  font-size: 11px;
+  color: var(--text-3);
+  margin: -4px 0 10px;
+  overflow-wrap: anywhere;
+}
+html.ui-v2 #approval-panel .approval-provenance[hidden] { display: none; }
 html.ui-v2 #approval-panel .approval-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 html.ui-v2 #approval-panel .approval-actions button {
   height: 33px;
@@ -23941,6 +23985,7 @@ html.ui-v2 .ag2-cards {
 /* ---- Cards ---- */
 
 html.ui-v2 .ag2-card {
+  position: relative; /* anchors the circle's revealed action pill */
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
@@ -24019,7 +24064,14 @@ html.ui-v2 .ag2-hub-link {
   cursor: pointer;
 }
 html.ui-v2 .ag2-hub-link:hover { color: var(--iris-2); }
-html.ui-v2 .ag2-blocked-line {
+/* Per-gate blocked rows (chip honesty): rose rule for real blocks, sky
+   when every wait is delivered-and-attested and only Complete taps are
+   missing (the achieved self-report hue — never transport green). */
+html.ui-v2 .ag2-blocked-detail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   font-size: 12px;
   color: var(--text-2);
   border-left: 2px solid rgba(var(--rose-rgb), 0.55);
@@ -24027,6 +24079,40 @@ html.ui-v2 .ag2-blocked-line {
   margin-top: 1px;
   overflow-wrap: anywhere;
 }
+html.ui-v2 .ag2-blocked-detail.delivered {
+  border-left-color: rgba(var(--sky-rgb), 0.55);
+}
+html.ui-v2 .ag2-blk-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-blk-mark {
+  color: var(--rose);
+  font-size: 8px;
+}
+html.ui-v2 .ag2-blk-hint { color: var(--text-3); }
+html.ui-v2 .ag2-blk-link {
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+html.ui-v2 .ag2-blk-link:hover { color: var(--text-1); }
+html.ui-v2 .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+}
+html.ui-v2 .ag2-blk-more {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-blk-more:hover { color: var(--text-2); }
 html.ui-v2 .ag2-ansline {
   font-size: 12px;
   color: var(--text-2);
@@ -24077,6 +24163,27 @@ html.ui-v2 .ag2-ctl.retired {
   border: 1.5px dashed var(--line-2);
   color: var(--text-3);
 }
+/* The circle's revealed state (press-and-hold, or first touch tap):
+   the action pill names what the next tap does — no hover-only. */
+html.ui-v2 .ag2-ctl.revealed {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), 0.18);
+}
+html.ui-v2 .ag2-ctl-label {
+  position: absolute;
+  left: 34px;
+  top: 7px;
+  z-index: 3;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  background: var(--surface-2);
+  color: var(--green);
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
 
 /* ---- Chips (tinted token families; rgba(var(--x-rgb), a) formula) ---- */
 
@@ -24120,6 +24227,15 @@ html.ui-v2 .ag2-chip.t-neutral {
   color: var(--text-2);
   background: var(--surface-3);
 }
+/* Tappable chip (the blocked chip): a real button in the chip family —
+   the reveal law forbids hover-only explanations, so the tap unfolds
+   the per-gate rows the tip names. */
+html.ui-v2 button.ag2-chip-btn {
+  appearance: none;
+  cursor: pointer;
+  line-height: inherit;
+}
+html.ui-v2 button.ag2-chip-btn:hover { filter: brightness(1.18); }
 html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
@@ -24682,19 +24798,6 @@ html.ui-v2 .ag2-graph-panel.fullscreen canvas {
   height: 100vh;
   height: 100dvh;
 }
-html.ui-v2 .ag2-graph-capnote {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text-3);
-  pointer-events: none;
-  padding: 0 40px;
-  text-align: center;
-}
 
 /* ---- Upcoming lens (slice C): the 14-day day-grouped timeline. Rows
    ride the shared .ag2-chip family; dots pulse via the shared ui2-pulse
@@ -25065,6 +25168,16 @@ html.ui-v2 .agenda-card-done {
   flex-shrink: 0;
 }
 html.ui-v2 .agenda-card-done:hover { color: var(--green); }
+/* Armed by a first touch tap: the circle names the action in place;
+   the second tap acts (no hover-only mysteries on touch). */
+html.ui-v2 .agenda-card-done.armed {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--green);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+}
 html.ui-v2 .agenda-card-row-title {
   font-size: 12px;
   color: var(--text-2);
@@ -25587,6 +25700,31 @@ html.ui-v2 .ag2-inspector-backdrop { display: none; }
     background: rgba(4, 5, 8, 0.45);
   }
 }
+/* Graph theater-mode fullscreen (ag2-graph-fs on <html>, managed by the
+   graph fragment): the fullscreen panel is fixed at z 600, so the
+   inspector lifts above it as a floating card — full functionality over
+   the constellation, any viewport width. Backdrop stays off so the map
+   remains interactive beside the card. */
+html.ui-v2.ag2-graph-fs .ag2-inspector {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: 0;
+  z-index: 620;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+  transition: none;
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector.open {
+  width: min(478px, calc(100vw - 40px));
+}
+html.ui-v2.ag2-graph-fs .ag2-inspector-backdrop {
+  display: none !important;
+}
+
 html.ui-v2 .ag2-insp-col {
   width: 100%;
   min-width: 280px;
@@ -26009,6 +26147,17 @@ html.ui-v2 .ag2-insp-dep {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* A delivered-awaiting-Complete prerequisite: the actionable wait —
+   sky (the achieved self-report hue), with its release affordance. */
+html.ui-v2 .ag2-insp-dep.delivered {
+  border-left: 2px solid rgba(var(--sky-rgb), 0.55);
+  padding-left: 7px;
+}
+html.ui-v2 .ag2-insp-dep .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+  flex-shrink: 0;
 }
 html.ui-v2 .ag2-insp-deplink {
   flex: 1;
@@ -27345,6 +27494,74 @@ html.ui-v2 .update-lane-btn {
 html.ui-v2 .update-lane-btn:disabled {
   opacity: 0.55;
   cursor: default;
+}
+
+/* ── update channels: the front door's two sections, the dev shortlog,
+   the Advanced fold, and the swap step ui2-handover renders in. ── */
+html.ui-v2 .update-lane-channel {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--surface2, rgba(90, 90, 104, 0.4));
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+}
+html.ui-v2 .update-lane-channel-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-shortlog {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  border-radius: 6px;
+  background: var(--surface0, rgba(24, 24, 30, 0.9));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted, #9aa4b2);
+}
+html.ui-v2 .update-lane-advanced {
+  margin-top: 8px;
+}
+html.ui-v2 .update-lane-advanced > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .update-lane-swap:not(:empty) {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+}
+html.ui-v2 .update-lane-swap-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text, #e6e6e6);
+}
+html.ui-v2 .update-lane-swap .handover-update-actions {
+  margin-top: 6px;
+}
+html.ui-v2 .update-lane-footer {
+  margin-top: 8px;
+  font-size: 10px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-update-panel-link {
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent, #62a0ea);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+  align-self: flex-start;
 }
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
@@ -32207,6 +32424,10 @@ html.ui-v2 .daemon-relay-note {
                   <div class="approval-title">Approval needed</div>
                   <div class="approval-command" id="approval-command"></div>
                   <div class="approval-category" id="approval-category"></div>
+                  <!-- Peer provenance (RC-C2): filled only for approvals
+                       raised on a federated peer — names the target daemon
+                       and the delegation lane the decision will transit. -->
+                  <div class="approval-provenance" id="approval-provenance" hidden></div>
                   <div class="approval-actions">
                     <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
                     <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>
@@ -37761,6 +37982,13 @@ function ui2StampApprovalSession() {
     chip.className = 'ui2-approval-session';
     title.appendChild(chip);
   }
+  // Peer approvals (RC-C2): the provenance line owns the naming — the
+  // chip's session badge styling keys off LOCAL session identity and
+  // would mislabel a peer's session id.
+  if (typeof pendingApprovalHostId !== 'undefined' && pendingApprovalHostId) {
+    chip.hidden = true;
+    return;
+  }
   const sid = (typeof pendingApprovalSessionId !== 'undefined' && pendingApprovalSessionId) || '';
   if (!sid) { chip.hidden = true; return; }
   chip.hidden = false;
@@ -38039,7 +38267,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5f105500dbba191c';
+const INTENDANT_APP_BUILD = '5a3688d7d109be87';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38883,6 +39111,10 @@ let currentSessionDetail = null;
 let currentSessionDetailContext = null;
 let pendingApprovalId = null;
 let pendingApprovalSessionId = '';
+// Host of the peer daemon that raised the shown approval; '' = local.
+// Peer approvals fold into the same panel + queue (RC-C2), decided via
+// api_peer_approval instead of the local session-control lane.
+let pendingApprovalHostId = '';
 let steerCounter = 0;
 let followUpCounter = 0;
 const pendingFollowUpsById = new Map();
@@ -40854,6 +41086,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_peer_task: { verb: 'POST', path: '/api/peers/{peer_id}/task' },
   api_peer_approval: { verb: 'POST', path: '/api/peers/{peer_id}/approval' },
   api_peer_session_control: { verb: 'POST', path: '/api/peers/{peer_id}/session-control' },
+  api_peer_session_detail: { verb: 'GET', path: '/api/peers/{peer_id}/session-detail', query: ['session_id', 'source', 'limit', 'before'] },
   api_peer_webrtc_signal: { verb: 'POST', path: '/api/peers/{peer_id}/webrtc' },
   api_peer_file_transfer_signal: { verb: 'POST', path: '/api/peers/{peer_id}/file-transfer-webrtc' },
   api_peer_dashboard_control_signal: { verb: 'POST', path: '/api/peers/{peer_id}/dashboard-control-webrtc' },
@@ -47408,7 +47641,9 @@ function handleStationAction(action) {
       const map = { approve: 'approve', skip: 'skip', approve_all: 'approve_all', deny: 'deny' };
       if (app) processCommands(app.send_approval(map[decision] || 'approve'));
     } else {
-      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept', deny: 'decline' };
+      // approve_all maps to accept_for_session (→ ControlMsg::ApproveAll
+      // on the peer) — it used to silently degrade to a one-shot accept.
+      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept_for_session', deny: 'decline' };
       resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
     }
   } else if (action.type === 'open_display') {
@@ -50656,8 +50891,21 @@ function stationHandleSessionAction(action) {
         .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
       return;
     }
-    // Anything else (transcript, thread ops, config) still lives on the
-    // peer's own dashboard — no silent no-ops.
+    if (op === 'transcript' && typeof openSessionDetail === 'function') {
+      // RC-C2: the transcript reads HERE, fetched over the federation
+      // link (the Sessions overlay's peer lane); routeTo surfaces it.
+      const peerSession = (daemons.find(d => d.host_id === peerHostId)?.sessions || [])
+        .find(ps => ps.session_id === sessionId);
+      openSessionDetail(
+        { session_id: sessionId, source: peerSession?.source || 'intendant' },
+        null,
+        { hostId: peerHostId }
+      );
+      if (typeof routeTo === 'function') { try { routeTo('sessions'); } catch (_) {} }
+      return;
+    }
+    // Anything else (thread ops, config) still lives on the peer's own
+    // dashboard — no silent no-ops.
     showControlToast?.('info', `${op} for peer sessions happens on ${peerName}'s own dashboard.`);
     return;
   }
@@ -53351,11 +53599,14 @@ function stationPhaseFromPeerSession(phase) {
   return 'idle';
 }
 
-// A peer's non-primary sessions as display-only scene nodes orbiting
-// that peer's host (v1: no action pills — the SessionAction handlers
-// assume local session ids). Newest first, capped: the scene is a
-// bounded constellation by design (same doctrine as the recent-session
-// nodes); the peer's own dashboard remains the exhaustive list.
+// A peer's non-primary sessions as scene nodes orbiting that peer's
+// host. Host-scoped actions ride the RC-C1 routing (focus/steer target
+// the composer, interrupt via api_peer_session_control) plus the RC-C2
+// transcript read; a session-attributed pending approval renders the
+// node's approval prompt keyed (host, id). Newest first, capped: the
+// scene is a bounded constellation by design (same doctrine as the
+// recent-session nodes); the peer's own dashboard remains the
+// exhaustive list.
 const PEER_SESSION_SCENE_NODES = 12;
 function stationPeerSessionAgents(d) {
   try {
@@ -53403,9 +53654,26 @@ function stationPeerSessionAgents(d) {
         worktree: '',
         parentId: parentNodeId,
         needsApproval: !!s.needs_approval,
-        approvalId: null,
-        approvalCommand: '',
-        approvalCategory: '',
+        // RC-C2: approvals are session-attributed in the fold — surface
+        // this session's pending ask on its node so the Station prompt
+        // can resolve it (host-keyed; ids collide across daemons).
+        ...(() => {
+          const pending = typeof peerPendingApprovals !== 'undefined'
+            ? peerPendingApprovals.get(d.host_id)
+            : null;
+          if (pending) {
+            for (const [aid, entry] of pending) {
+              if (entry.sessionId && entry.sessionId === id) {
+                return {
+                  approvalId: aid,
+                  approvalCommand: entry.command || '',
+                  approvalCategory: entry.category || '',
+                };
+              }
+            }
+          }
+          return { approvalId: null, approvalCommand: '', approvalCategory: '' };
+        })(),
         sessionId: id,
         source,
         relationshipKind: kind,
@@ -55814,11 +56082,30 @@ function processCommands(cmds) {
         break;
       }
       case 'peer_approval_requested':
-        addPendingApproval(c.host_id, c.id, c.command, c.category);
+        // RC-C2: peer approvals are first-class in the merged rail —
+        // the peers-panel fold, the bottom approval panel/queue, and
+        // the attention center, all keyed (host, id) since approval
+        // ids are per-daemon counters that collide across daemons.
+        addPendingApproval(c.host_id, c.id, c.command, c.category, c.session_id);
+        if (typeof attentionAdd === 'function') {
+          attentionAdd('approval', c.session_id, c.id, true, {
+            hostId: c.host_id,
+            text: c.command || '',
+          });
+        }
+        if (typeof showApproval === 'function') {
+          showApproval(c.id, c.command, c.category, c.session_id || '', c.host_id);
+        }
         stationScheduleUpdate();
         break;
       case 'peer_approval_resolved':
         removePendingApproval(c.host_id, c.id);
+        if (typeof attentionRemove === 'function') {
+          attentionRemove('approval', null, c.id, true, 'resolved', c.host_id);
+        }
+        if (typeof retirePanelPeerApproval === 'function') {
+          retirePanelPeerApproval(c.host_id, c.id);
+        }
         stationScheduleUpdate();
         break;
       // Folded per-session snapshots from a peer's event stream —
@@ -74915,20 +75202,22 @@ function scheduleShowNextQueuedApproval() {
     const next = approvalDisplayQueue.shift();
     if (!next) return;
     if (typeof attentionItems !== 'undefined' && typeof attentionKey === 'function') {
-      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id))
-        || attentionItems.has(attentionKey('approval', '', next.id));
+      const host = next.hostId || '';
+      const tracked = attentionItems.has(attentionKey('approval', next.sessionId, next.id, host))
+        || attentionItems.has(attentionKey('approval', '', next.id, host));
       if (!tracked) {
         scheduleShowNextQueuedApproval();
         return;
       }
     }
-    showApproval(next.id, next.command, next.category, next.sessionId);
+    showApproval(next.id, next.command, next.category, next.sessionId, next.hostId);
   }, 0);
 }
 
 function clearPendingApproval() {
   pendingApprovalId = null;
   pendingApprovalSessionId = '';
+  pendingApprovalHostId = '';
   stationCurrentApproval = null;
   stationScheduleUpdate();
   setApprovalIndicator(false);
@@ -74945,18 +75234,25 @@ function revealActivityLogPanel() {
   }
 }
 
-function showApproval(id, command, category, sessionId) {
+function showApproval(id, command, category, sessionId, hostId) {
   if (processingLogReplay) return;
+  const host = hostId || '';
   // Concurrent approvals: keep the one on screen, queue the newcomer, and
   // badge the count — a second approval used to silently replace the first.
-  if (pendingApprovalId !== null && String(pendingApprovalId) !== String(id)) {
+  // Peer approvals share the queue (RC-C2) but key on (host, id): approval
+  // ids are per-daemon counters and collide across daemons by construction.
+  if (
+    pendingApprovalId !== null
+    && !(String(pendingApprovalId) === String(id) && pendingApprovalHostId === host)
+  ) {
     const qid = String(id);
-    if (!approvalDisplayQueue.some(q => String(q.id) === qid)) {
+    if (!approvalDisplayQueue.some(q => String(q.id) === qid && (q.hostId || '') === host)) {
       approvalDisplayQueue.push({
         id,
         command,
         category,
-        sessionId: sessionId || approvalSessionIds.get(qid) || '',
+        sessionId: sessionId || (host ? '' : approvalSessionIds.get(qid)) || '',
+        hostId: host,
       });
     }
     updateApprovalPendingCount();
@@ -74964,25 +75260,39 @@ function showApproval(id, command, category, sessionId) {
   }
   hideAllPanels();
   pendingApprovalId = id;
-  pendingApprovalSessionId =
-    sessionId
-    || approvalSessionIds.get(String(id))
-    || currentSessionFullId
-    || '';
-  if (pendingApprovalSessionId) {
-    ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
-    focusSessionWindow(pendingApprovalSessionId);
+  pendingApprovalHostId = host;
+  if (host) {
+    // The session id is the PEER's — never resolve or focus it against
+    // local windows; the provenance line names the peer context instead.
+    pendingApprovalSessionId = sessionId || '';
+  } else {
+    pendingApprovalSessionId =
+      sessionId
+      || approvalSessionIds.get(String(id))
+      || currentSessionFullId
+      || '';
+    if (pendingApprovalSessionId) {
+      ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
+      focusSessionWindow(pendingApprovalSessionId);
+    }
   }
   document.getElementById('approval-command').textContent = command;
   const approvalCategoryEl = document.getElementById('approval-category');
   approvalCategoryEl.textContent = category || '';
   // No category (older sessions, rehydrated approvals) → no empty pill.
   approvalCategoryEl.style.display = category ? '' : 'none';
-  stationCurrentApproval = {
-    id: String(id),
-    command: command || '',
-    category: category || '',
-  };
+  renderApprovalProvenance(host, pendingApprovalSessionId);
+  if (host) {
+    // Station already renders peer approvals from peerPendingApprovals —
+    // mirroring one into stationCurrentApproval would draw it twice.
+    stationCurrentApproval = null;
+  } else {
+    stationCurrentApproval = {
+      id: String(id),
+      command: command || '',
+      category: category || '',
+    };
+  }
   stationScheduleUpdate();
   revealActivityLogPanel();
   // A re-show of the same approval (bootstrap replay) lands here with the
@@ -74991,6 +75301,123 @@ function showApproval(id, command, category, sessionId) {
   document.getElementById('approval-panel').classList.add('visible');
   setApprovalIndicator(true);
   updateApprovalPendingCount();
+}
+
+// The provenance line under a PEER approval: names the governing daemon
+// and what deciding does NOW — the decision transits this daemon's peer
+// grant; the peer's own profile gate authorizes it (or refuses, if this
+// daemon's grant lacks approval.resolve — surfaced up front, honestly).
+function renderApprovalProvenance(hostId, peerSessionId) {
+  const el = document.getElementById('approval-provenance');
+  if (!el) return;
+  if (!hostId) {
+    el.hidden = true;
+    el.textContent = '';
+    el.removeAttribute('title');
+    return;
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkDown = entry ? entry.connected === false : false;
+  const denied = typeof peerAllowsOperation === 'function'
+    && !peerAllowsOperation(hostId, 'approval.resolve');
+  let text = `on ${label}`;
+  if (peerSessionId) text += ` · session ${String(peerSessionId).slice(0, 8)}`;
+  if (denied) {
+    text += ` — this daemon's grant at ${label} does not include approval.resolve`;
+  } else if (linkDown) {
+    text += ' — peer link reconnecting; deciding will fail until it returns';
+  } else {
+    text += ' — deciding sends through this daemon’s peer grant';
+  }
+  el.textContent = text;
+  el.title = denied
+    ? `${label} granted this daemon a profile without approval.resolve — the buttons below `
+      + 'will be refused by the peer. Decide it on the peer’s own dashboard.'
+    : `This approval was raised on ${label}. Your decision is sent to ${label} over the `
+      + `federation link and authorized there against the profile ${label} granted this `
+      + 'daemon (the delegation lane — the peer’s audit names this daemon, not you).';
+  el.hidden = false;
+}
+
+// Decide the panel's PEER approval (RC-C2). The action vocabulary maps
+// onto the four-way ApprovalDecision the federation wire speaks —
+// including approve_all → accept_for_session (ApproveAll on the peer),
+// which the Station lane used to silently degrade to a one-shot accept.
+// The api_peer_approval response IS the ack: unlike local approvals
+// there is no local waiting-phase evidence to watch, so the panel's
+// sending state resolves on the reply (the peer's approval_resolved
+// event also arrives on the fold and is idempotent).
+const PEER_APPROVAL_DECISIONS = Object.freeze({
+  approve: 'accept',
+  approve_all: 'accept_for_session',
+  deny: 'decline',
+  skip: 'cancel',
+});
+
+// A peer approval resolved (by us, another dashboard, or the peer's own
+// policy) — retire it from the panel/queue surfaces. Session-agnostic:
+// the resolve event carries only (host, id).
+function retirePanelPeerApproval(hostId, approvalId) {
+  const host = hostId || '';
+  const qid = String(approvalId);
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i--) {
+    const q = approvalDisplayQueue[i];
+    if ((q.hostId || '') === host && String(q.id) === qid) approvalDisplayQueue.splice(i, 1);
+  }
+  updateApprovalPendingCount();
+  if (pendingApprovalHostId === host && String(pendingApprovalId) === qid) {
+    setApprovalPanelSending(false);
+    clearPendingApproval();
+    hidePanel('approval-panel');
+  }
+}
+async function sendPeerApprovalFromPanel(hostId, approvalId, action) {
+  const decision = PEER_APPROVAL_DECISIONS[action];
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  if (!decision) {
+    showControlToast('error', `'${action}' is not a peer-routable approval decision`);
+    return;
+  }
+  if (typeof peerAllowsOperation === 'function'
+      && !peerAllowsOperation(hostId, 'approval.resolve')) {
+    showControlToast(
+      'error',
+      `${label} granted this daemon a profile without approval.resolve — decide this on ${label}'s own dashboard`
+    );
+    return;
+  }
+  if (entry && entry.connected === false) {
+    showControlToast('error', `${label} is not connected — the peer link is reconnecting`);
+    return;
+  }
+  setApprovalPanelSending(true);
+  try {
+    const resp = await daemonApi.request('api_peer_approval', {
+      peer_id: hostId,
+      request_id: String(approvalId),
+      decision,
+    });
+    if (resp.ok) {
+      removePendingApproval(hostId, approvalId);
+      if (typeof attentionRemove === 'function') {
+        attentionRemove('approval', pendingApprovalSessionId, approvalId, true, 'resolved', hostId);
+      }
+      setApprovalPanelSending(false);
+      clearPendingApproval();
+      hidePanel('approval-panel');
+    } else {
+      setApprovalPanelSending(false);
+      showControlToast(
+        'error',
+        `${label} refused (${resp.status})${resp.body?.error ? ` — ${resp.body.error}` : ''}`
+      );
+    }
+  } catch (e) {
+    setApprovalPanelSending(false);
+    showControlToast('error', `Could not reach ${label}: ${e?.message || e}`);
+  }
 }
 
 function showHumanInput(question) {
@@ -92983,6 +93410,93 @@ window.qa = Object.assign(window.qa || {}, {
     await agendaHeal('qa-probe');
     return window.qa.agendaServing();
   },
+  // Blocked-chip honesty: the live derivation for one item — chip face,
+  // per-gate rows, and the depth fold plans — read through the same
+  // functions the renderer uses (advisory throughout; gates nothing).
+  agendaBlockedHonesty(itemId) {
+    const item = agendaFindItem(itemId);
+    if (!item) return null;
+    const explain = agendaBlockedExplain(item);
+    const card = document.querySelector(`#ag2-groups .ag2-card[data-item-id="${itemId}"]`);
+    return {
+      blocked: agendaItemIsBlocked(item),
+      chip: agendaBlockedChipSpec(explain),
+      tip: agendaBlockedTip(explain),
+      blockers: explain.blockers.map((b) => b.criterion),
+      prereqs: explain.prereqs.map((p) => ({
+        id: p.id, title: p.title, kind: p.kind, status: p.status, inWindow: !!p.target,
+      })),
+      allDelivered: explain.allDelivered,
+      unexplained: explain.unexplained,
+      dom: card ? {
+        chipButton: !!card.querySelector('[data-blocked-toggle]'),
+        detailRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row').length,
+        deliveredRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row.delivered').length,
+        foldedWaits: !!card.querySelector('.ag2-blk-more'),
+      } : null,
+      plans: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => [d, {
+        folded: agendaBlockedDetailPlan(explain, d, false),
+        tapped: agendaBlockedDetailPlan(explain, d, true),
+      }])),
+    };
+  },
+  // The synthetic depth × derivation matrix: fixture prerequisites in a
+  // local fold (never the live store) driven through the exact renderer
+  // derivations — the delivered distinction, the fold matrix, the
+  // honest out-of-window degrade, and the chip face for each shape.
+  agendaBlockedVectors() {
+    const fold = new Map();
+    const put = (it) => fold.set(it.id, it);
+    put({ id: 'P-run', title: 'running prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, last_run: { state: 'started', at_ms: 1 } }] });
+    put({ id: 'P-delivered', title: 'delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'achieved' } } }] });
+    put({ id: 'P-partial', title: 'partially delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'partial' } } }] });
+    put({ id: 'P-unattested', title: 'ran without a self-report', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1 } }] });
+    put({ id: 'P-retired', title: 'retired prerequisite', status: 'retired' });
+    const find = (id) => fold.get(id) || null;
+    const item = (extra) => ({ id: 'C', title: 'dependent', status: 'open', blocked: true, ...extra });
+    const cases = {
+      explicit_blocker: item({ blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }] }),
+      in_flight_wait: item({ relies_on: [{ target_id: 'P-run' }] }),
+      delivered_wait: item({ relies_on: [{ target_id: 'P-delivered' }] }),
+      partial_is_not_delivered: item({ relies_on: [{ target_id: 'P-partial' }] }),
+      unattested_is_not_delivered: item({ relies_on: [{ target_id: 'P-unattested' }] }),
+      mixed_delivered_and_in_flight: item({
+        relies_on: [{ target_id: 'P-delivered' }, { target_id: 'P-run' }] }),
+      blocker_beside_delivered: item({
+        blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }],
+        relies_on: [{ target_id: 'P-delivered' }] }),
+      retired_prereq: item({ relies_on: [{ target_id: 'P-retired' }] }),
+      outside_window_while_blocked: item({ relies_on: [{ target_id: '01GONE' }] }),
+      outside_window_unblocked: item({ blocked: false, relies_on: [{ target_id: '01GONE' }] }),
+      served_flag_without_visible_gate: item({}),
+    };
+    return Object.fromEntries(Object.entries(cases).map(([name, fixture]) => {
+      const explain = agendaBlockedExplain(fixture, find);
+      return [name, {
+        chip: agendaBlockedChipSpec(explain),
+        allDelivered: explain.allDelivered,
+        unexplained: explain.unexplained,
+        rows: explain.prereqs.map((p) => ({ kind: p.kind, status: p.status, inWindow: !!p.target })),
+        depths: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => {
+          const folded = agendaBlockedDetailPlan(explain, d, false);
+          const tapped = agendaBlockedDetailPlan(explain, d, true);
+          return [d, {
+            visible: folded.visible,
+            hiddenWaits: folded.rows.hiddenWaits,
+            tappedVisible: tapped.visible,
+            tappedHiddenWaits: tapped.rows.hiddenWaits,
+          }];
+        })),
+      }];
+    }));
+  },
 });
 
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
@@ -93300,7 +93814,9 @@ async function agendaApproveBlockedConfirm(params) {
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
-// callers escape.
+// callers escape. The cards now render the structured per-gate story
+// (agendaBlockedExplain + agendaBlockedDetailHtml below); this one-liner
+// remains for surfaces that want a single sentence.
 function agendaBlockedLine(item) {
   if (item.status !== 'open') return null;
   const blocker = (item.blockers || []).find((b) => !b.cleared);
@@ -93312,6 +93828,157 @@ function agendaBlockedLine(item) {
     if (target.status === 'open') return `Waits on “${target.title}” — still open`;
   }
   return null;
+}
+
+// ---- The blocked story (chip honesty) ----
+
+// Per-prerequisite render judgment for the blocked chip, the card's
+// per-gate rows, and the inspector's Blocked-on section: each
+// `relies_on` link joined client-side against the loaded window
+// (summaries already serve `relies_on[].target_id`, uncleared
+// `blockers`, and `effects[].last_run.attestation` — no second
+// server-side join). `kind` vocabulary:
+//   'satisfied'  target done — the link no longer waits
+//   'delivered'  target open, but its effect's last run COMPLETED and
+//                the session self-reported achieved — everything ran;
+//                only the owner's Complete tap is missing (an
+//                actionable wait, distinct from in-flight work)
+//   'waiting'    target open — genuinely in flight or parked; `status`
+//                carries the live word from the effect derivation
+//   'retired'    target retired — the link needs review
+//   'unknown'    target outside the live window while the served
+//                verdict says blocked — id-only, degrade honestly
+// A target absent from the window on an UNBLOCKED item is provably
+// done (the daemon's verdict is computed against the full ledger), so
+// it reads satisfied — never the old "missing — review" lie.
+// Advisory throughout: none of this gates approval or firing.
+function agendaPrereqStates(item, findItem) {
+  const find = findItem || agendaFindItem;
+  // The served verdict rides list summaries only — a full-grain item
+  // (the inspector's) reads its own window row for the flag.
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
+  return (item.relies_on || []).map((link) => {
+    const target = find(link.target_id) || null;
+    if (!target) {
+      const short = `${String(link.target_id).slice(0, 10)}…`;
+      return blocked
+        ? { id: link.target_id, target: null, title: short, kind: 'unknown',
+          tone: 'neutral', status: 'outside this live window',
+          detail: 'The daemon’s blocked verdict comes from the full ledger; this window carries open items plus the last 14 days.' }
+        : { id: link.target_id, target: null, title: short, kind: 'satisfied',
+          tone: 'green', status: 'done · archived',
+          detail: 'Nothing blocks this item, so this prerequisite completed — its row has aged out of the live window.' };
+    }
+    const base = { id: link.target_id, target, title: target.title };
+    if (target.status === 'done') {
+      return { ...base, kind: 'satisfied', status: 'satisfied', tone: 'green' };
+    }
+    if (target.status === 'retired') {
+      return { ...base, kind: 'retired', status: 'retired — review', tone: 'amber',
+        detail: 'A retired prerequisite never silently satisfies the link — drop it or reopen the target.' };
+    }
+    const run = ((target.effects || [])[0] || {}).last_run || null;
+    if (run && run.state === 'completed' && run.attestation
+      && run.attestation.outcome === 'achieved') {
+      return { ...base, kind: 'delivered', status: 'delivered — awaiting Complete',
+        tone: 'sky',
+        detail: `Ran ${agendaRelTime(run.at_ms)}, completed, self-reported achieved (not verified) — open it and Mark done to release this wait.` };
+    }
+    const st = agendaEffectState(target);
+    let status = 'still open';
+    let tone = 'neutral';
+    if (st) {
+      if (st.kind === 'running') { status = 'running now'; tone = 'iris'; }
+      else if (st.kind === 'ready') { status = 'fires momentarily'; tone = 'iris'; }
+      else if (st.kind === 'waiting') status = 'waiting on its own prerequisites';
+      else if (st.kind === 'watching') status = 'watching for matches';
+      else if (st.kind === 'pending') { status = 'awaiting approval'; tone = 'amber'; }
+      else if (st.kind === 'suspended') { status = 'suspended'; tone = 'amber'; }
+      else if (st.kind === 'standing') status = 'standing series';
+      else if (st.kind === 'armed') status = 'armed to run';
+      else if (st.kind === 'missed') { status = 'missed its window'; tone = 'amber'; }
+      else if (st.kind === 'withdrawn') status = 'proposal withdrawn';
+      else if (run && run.state === 'completed') {
+        status = run.attestation
+          ? `ran — self-reported ${run.attestation.outcome}` : 'ran — no self-report yet';
+      } else if (run && run.state === 'failed') { status = 'last run failed'; tone = 'amber'; }
+    }
+    return { ...base, kind: 'waiting', status, tone };
+  });
+}
+
+// The whole blocked story for one item, derived at render (never
+// stored): uncleared blockers plus every unsatisfied prerequisite
+// judgment. `allDelivered` marks the actionable-wait shape — nothing is
+// stuck, every unsatisfied prerequisite delivered and self-reported
+// achieved; only Complete taps are missing. `unexplained` is the honest
+// degrade: the served verdict says blocked but no gate is visible in
+// this window (freshness skew between the flag and the joined rows).
+function agendaBlockedExplain(item, findItem) {
+  const find = findItem || agendaFindItem;
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
+  const blockers = (item.blockers || []).filter((b) => !b.cleared);
+  const prereqs = agendaPrereqStates(item, findItem)
+    .filter((p) => p.kind !== 'satisfied');
+  const delivered = prereqs.filter((p) => p.kind === 'delivered');
+  return {
+    blockers,
+    prereqs,
+    delivered,
+    allDelivered: !blockers.length && prereqs.length > 0
+      && delivered.length === prereqs.length,
+    unexplained: blocked && !blockers.length && !prereqs.length,
+  };
+}
+
+// The chip face: 'blocked' (rose) — or, when every unsatisfied
+// prerequisite is delivered-and-attested and no blocker is stated,
+// 'delivered · awaiting Complete' (sky, the achieved self-report hue —
+// never transport green; the 'answered · awaiting pickup' twin). Pure
+// spec; the cards render it.
+function agendaBlockedChipSpec(explain) {
+  return explain.allDelivered
+    ? { label: 'delivered · awaiting Complete', tone: 'sky' }
+    : { label: 'blocked', tone: 'rose' };
+}
+
+// The chip's hover lane (the tap reveal is the primary — no
+// hover-only): one line per gate, every depth.
+function agendaBlockedTip(explain) {
+  const lines = [];
+  explain.blockers.forEach((b) => lines.push(`waiting on: “${b.criterion}”`));
+  explain.prereqs.forEach((p) => lines.push(`waits on “${p.title}” — ${p.status}`));
+  if (explain.unexplained) {
+    lines.push('The daemon judges this blocked, but no gate is visible in this window — it may have just changed.');
+  }
+  lines.push('Advisory — it gates neither approval nor firing. Tap to see each wait and jump to it.');
+  return lines.join('\n');
+}
+
+// Which gate rows render at a given depth (the fold matrix, pure — the
+// card renderer and the qa vectors read the same plan): uncleared
+// blockers, delivered-awaiting waits, and the unexplained degrade
+// always render; genuinely in-flight waits fold at calm depth until
+// the chip is tapped (`expanded`). Explicit blockers never fold.
+function agendaBlockedDetailPlan(explain, depth, expanded) {
+  const foldable = explain.prereqs.filter((p) => p.kind !== 'delivered');
+  const foldableVisible = depth !== 'calm' || !!expanded;
+  const always = !!(explain.blockers.length || explain.delivered.length
+    || explain.unexplained);
+  return {
+    always,
+    rows: {
+      blockers: explain.blockers,
+      delivered: explain.delivered,
+      waits: foldableVisible ? foldable : [],
+      hiddenWaits: foldableVisible ? 0 : foldable.length,
+    },
+    visible: always || (foldableVisible && foldable.length > 0),
+  };
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
@@ -94347,7 +95014,8 @@ function agendaRenderCard() {
       ? '<span class="agenda-card-q" aria-label="question">?</span>'
       : '';
     return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
-      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
+      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Mark done"
+        title="Mark done — completes this item; reopen any time">○</button>
       ${q}<span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
     </div>`;
   });
@@ -94356,11 +95024,32 @@ function agendaRenderCard() {
     : '';
   list.innerHTML = rows.join('') + more;
   list.querySelectorAll('.agenda-card-done').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn));
+    btn.addEventListener('click', () => {
+      // No hover-only mysteries: on a hover-less pointer the first tap
+      // names the action in place; the second tap acts. Hover pointers
+      // keep today's immediate action (the tooltip already explains).
+      if (window.matchMedia && window.matchMedia('(hover: none)').matches
+        && !btn.classList.contains('armed')) {
+        btn.classList.add('armed');
+        btn.textContent = 'Mark done';
+        setTimeout(() => {
+          if (btn.isConnected) {
+            btn.classList.remove('armed');
+            btn.textContent = '○';
+          }
+        }, 5000);
+        return;
+      }
+      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn);
+    });
   });
   list.querySelectorAll('.agenda-card-row-title').forEach((el) => {
-    el.addEventListener('click', () => routeTo('agenda'));
+    // Opening the row lands on the ITEM (its panel carries the labeled
+    // Mark done), not just the tab.
+    el.addEventListener('click', () => {
+      routeTo('agenda');
+      agendaOpenInspector(el.closest('[data-id]')?.dataset.id);
+    });
   });
   const moreEl = list.querySelector('.agenda-card-more');
   if (moreEl) moreEl.addEventListener('click', () => routeTo('agenda'));
@@ -95274,6 +95963,11 @@ function agendaWireScaffold() {
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
   groups.addEventListener('keydown', agendaGroupsKeydown);
+  // The status circle's press-and-hold reveal (self-explanation
+  // without acting) — pointer type feeds the touch first-tap arm.
+  groups.addEventListener('pointerdown', agendaCtlPointerDown);
+  groups.addEventListener('pointerup', agendaCtlPointerEnd);
+  groups.addEventListener('pointercancel', agendaCtlPointerEnd);
   // Tab-scoped keyboard: '/' focuses search, 'n' the composer, Escape
   // closes overlays inspector-last. Skips typing contexts; the approval
   // rail's y/n shortcuts live on the Activity tab so there is no overlap.
@@ -95786,6 +96480,72 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Blocked chip + per-gate detail (chip honesty) ----
+// Derivations live in ui2-agenda.js (agendaBlockedExplain and friends);
+// this section renders them. Advisory throughout — the chip and rows
+// gate nothing, exactly like the served flag they explain.
+
+// Cards whose in-flight waits the owner tapped open at calm depth
+// (render-time presentation state; blockers and delivered waits never
+// fold, so they need no entry here).
+const agendaBlockedOpen = new Set();
+
+// The blocked chip is a BUTTON (house law: every symbol self-explains
+// on tap — no hover-only): the tip names each gate, the tap unfolds
+// the per-gate rows under the card at any depth. When every
+// unsatisfied prerequisite is delivered-and-attested the face stops
+// crying wolf: 'delivered · awaiting Complete' (sky), nothing is
+// stuck — only Complete taps are missing.
+function agendaBlockedChipHtml(item) {
+  const explain = agendaBlockedExplain(item);
+  const spec = agendaBlockedChipSpec(explain);
+  return `<button type="button" class="ag2-chip ag2-chip-btn t-${spec.tone}" data-blocked-toggle="${escapeHtml(item.id)}"
+    title="${escapeHtml(agendaBlockedTip(explain))}">${escapeHtml(spec.label)}</button>`;
+}
+
+function agendaBlockedPrereqRowHtml(p) {
+  const chip = agendaChipHtml(p.status, p.tone,
+    p.detail || 'Live status, derived at render — advisory; it gates nothing');
+  const name = p.target
+    ? `<a class="ag2-blk-link" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span>waits on ${escapeHtml(p.title)}</span>`;
+  const go = p.kind === 'delivered'
+    ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+        title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+    : '';
+  return `<div class="ag2-blk-row${p.kind === 'delivered' ? ' delivered' : ''}">${chip}${name}${go}</div>`;
+}
+
+// The card's per-gate rows (replacing the old single-line first-gate
+// text): every uncleared blocker, every unsatisfied prerequisite with
+// its live status, each a door to the prerequisite itself. Fold rules
+// live in agendaBlockedDetailPlan; the chip toggles the calm-depth
+// fold. Renders from locally visible gates even when the served flag
+// is absent (never-summarized event rows), exactly like the old line.
+function agendaBlockedDetailHtml(item) {
+  if (item.status !== 'open') return '';
+  const explain = agendaBlockedExplain(item);
+  if (!explain.blockers.length && !explain.prereqs.length && !explain.unexplained) return '';
+  const plan = agendaBlockedDetailPlan(explain, agendaDepth, agendaBlockedOpen.has(item.id));
+  if (!plan.visible) return '';
+  const rows = [];
+  explain.blockers.forEach((b) => {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-mark" aria-hidden="true">●</span>
+      <span>waiting on: “${escapeHtml(b.criterion)}”
+        <span class="ag2-blk-hint">— stated blocker; nothing evaluates it, people do</span></span></div>`);
+  });
+  plan.rows.delivered.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  plan.rows.waits.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  if (explain.unexplained) {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-hint">the daemon judges this blocked,
+      but no gate is visible in this window — it may have just changed</span></div>`);
+  }
+  if (plan.rows.hiddenWaits) {
+    rows.push(`<button type="button" class="ag2-blk-more" data-blocked-toggle="${escapeHtml(item.id)}">+ ${plan.rows.hiddenWaits} in-flight wait${plan.rows.hiddenWaits === 1 ? '' : 's'} ›</button>`);
+  }
+  return `<div class="ag2-blocked-detail${explain.allDelivered ? ' delivered' : ''}">${rows.join('')}</div>`;
+}
+
 // ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
 // The self-report axis renders BESIDE the transport verdict, never as
 // it: every attestation surface says "self-reported" and carries the
@@ -95837,8 +96597,7 @@ function agendaCardChips(item) {
       `Reminder ${agendaAbsTime(item.due_ms)} — delivery follows your policy`));
   }
   if (agendaItemIsBlocked(item)) {
-    chips.push(agendaChipHtml('blocked', 'rose',
-      'Derived at render — an uncleared blocker or unmet prerequisite'));
+    chips.push(agendaBlockedChipHtml(item));
   }
   // Tier-1 PR join chips (render-time only — never stored, never ops):
   // draft state and rename divergence come from the scanner's last
@@ -96481,31 +97240,79 @@ function agendaDismissAsk(item) {
 
 // ---- Card ----
 
+// The status circle's tappable self-explanation (house law: no
+// hover-only): a press-and-hold on any pointer, or the first tap on a
+// hover-less one, REVEALS the action as a labeled pill beside the
+// circle instead of acting; the next tap (circle or pill) acts. Mouse
+// clicks keep today's immediate action — the reveal is additive.
+let agendaCtlReveal = null; // { id, until } — the one revealed circle
+let agendaCtlHoldTimer = null;
+let agendaCtlHoldFiredAt = 0;
+let agendaCtlPointerType = 'mouse';
+
+function agendaCtlAction(item) {
+  if (item.kind === 'question' && item.status === 'open') return null;
+  return item.status === 'open' ? 'Mark done' : 'Reopen';
+}
+
+function agendaCtlRevealShow(id) {
+  agendaCtlReveal = { id, until: Date.now() + 6000 };
+  agendaRenderTab();
+  setTimeout(() => {
+    if (agendaCtlReveal && agendaCtlReveal.until <= Date.now()) {
+      agendaCtlReveal = null;
+      agendaRenderTab();
+    }
+  }, 6200);
+}
+
+function agendaCtlPointerDown(e) {
+  agendaCtlPointerType = e.pointerType || 'mouse';
+  const ctl = e.target.closest('.ag2-ctl');
+  if (!ctl || !ctl.dataset.ctl) return;
+  const item = agendaFindItem(ctl.dataset.ctl);
+  if (!item || !agendaCtlAction(item)) return;
+  if (agendaCtlHoldTimer) clearTimeout(agendaCtlHoldTimer);
+  agendaCtlHoldTimer = setTimeout(() => {
+    agendaCtlHoldTimer = null;
+    agendaCtlHoldFiredAt = Date.now();
+    agendaCtlRevealShow(item.id);
+  }, 450);
+}
+
+function agendaCtlPointerEnd() {
+  if (agendaCtlHoldTimer) {
+    clearTimeout(agendaCtlHoldTimer);
+    agendaCtlHoldTimer = null;
+  }
+}
+
 function agendaCtlHtml(item) {
   const id = escapeHtml(item.id);
   if (item.kind === 'question' && item.status === 'open') {
-    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it">?</button>`;
+    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it" aria-label="Open question">?</button>`;
   }
-  if (item.status === 'open') {
-    return `<button type="button" class="ag2-ctl open" data-ctl="${id}" title="Mark done"></button>`;
-  }
-  if (item.status === 'done') {
-    return `<button type="button" class="ag2-ctl done" data-ctl="${id}" title="Reopen">✓</button>`;
-  }
-  return `<button type="button" class="ag2-ctl retired" data-ctl="${id}" title="Reopen (retired)"></button>`;
+  const [cls, glyph, tip] = item.status === 'open'
+    ? ['open', '', 'Mark done — completes this item; reopen any time']
+    : item.status === 'done'
+      ? ['done', '✓', 'Done — tap to reopen']
+      : ['retired', '', 'Retired — tap to reopen'];
+  const action = agendaCtlAction(item);
+  const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id;
+  const pill = revealed
+    ? `<button type="button" class="ag2-ctl-label" data-ctl="${id}">${escapeHtml(action)}</button>`
+    : '';
+  return `<button type="button" class="ag2-ctl ${cls}${revealed ? ' revealed' : ''}" data-ctl="${id}" title="${escapeHtml(tip)}" aria-label="${escapeHtml(action)}">${glyph}</button>${pill}`;
 }
 
 function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  // Calm depth folds prerequisite-only wait lines (the blocked chip
-  // still shows); an explicit uncleared blocker always renders — it
-  // names what someone must do.
-  const blockedRaw = agendaBlockedLine(item);
-  const blockedLine = blockedRaw
-    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
-    ? null : blockedRaw;
+  // Per-gate blocked rows: explicit blockers and delivered-awaiting
+  // waits always render; calm depth folds only the genuinely in-flight
+  // waits, and the blocked chip's tap unfolds them (agendaBlockedOpen).
+  const blockedDetail = agendaBlockedDetailHtml(item);
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -96522,7 +97329,7 @@ function agendaCardHtml(row) {
         ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
-      ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${blockedDetail}
       ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
@@ -96685,6 +97492,12 @@ function agendaLensFooterHtml(lensId) {
 // ---- List event delegation (wired once on #ag2-groups) ----
 
 function agendaGroupsClick(e) {
+  // The click a press-and-hold releases into already did its job (the
+  // reveal) — swallow it whole before any branch can act on it.
+  if (agendaCtlHoldFiredAt && Date.now() - agendaCtlHoldFiredAt < 800) {
+    agendaCtlHoldFiredAt = 0;
+    return;
+  }
   // S6 footer affordances: the Archive pager and the see-archive door.
   if (e.target.closest('[data-archive-more]')) {
     e.preventDefault();
@@ -96704,16 +97517,42 @@ function agendaGroupsClick(e) {
     return;
   }
   const ctl = e.target.closest('[data-ctl]');
+  // A revealed circle disarms on any click that isn't its own control.
+  if (agendaCtlReveal && !(ctl && ctl.dataset.ctl === agendaCtlReveal.id)) {
+    agendaCtlReveal = null;
+    agendaRenderTab();
+  }
   if (ctl) {
     const item = agendaFindItem(ctl.dataset.ctl);
     if (!item) return;
     if (item.kind === 'question' && item.status === 'open') {
       agendaOpenInspector(item.id);
-    } else if (item.status === 'open') {
+      return;
+    }
+    // Hover-less pointers: the first tap names the action; the second
+    // (circle or pill, while revealed) acts. Hover pointers act at
+    // once, exactly as today; keyboard activations (detail 0 — the
+    // aria-label already names them) always act.
+    const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id
+      && agendaCtlReveal.until > Date.now();
+    if (agendaCtlPointerType === 'touch' && !revealed && e.detail !== 0) {
+      agendaCtlRevealShow(item.id);
+      return;
+    }
+    agendaCtlReveal = null;
+    if (item.status === 'open') {
       agendaSendOp({ op: 'complete', id: item.id }, ctl);
     } else {
       agendaSendOp({ op: 'reopen', id: item.id }, ctl);
     }
+    return;
+  }
+  const blockedToggle = e.target.closest('[data-blocked-toggle]');
+  if (blockedToggle) {
+    const id = blockedToggle.dataset.blockedToggle;
+    if (agendaBlockedOpen.has(id)) agendaBlockedOpen.delete(id);
+    else agendaBlockedOpen.add(id);
+    agendaRenderTab();
     return;
   }
   const opBtn = e.target.closest('[data-op-btn]');
@@ -97570,19 +98409,22 @@ function agendaInspGatesHtml(item) {
       ${clear}
     </div>`;
   });
-  const deps = (item.relies_on || []).map((d) => {
-    const target = agendaFindItem(d.target_id);
-    const state = !target ? ['missing', 'rose']
-      : target.status === 'done' ? ['satisfied', 'green']
-        : target.status === 'retired' ? ['retired — review', 'amber']
-          : ['open', 'neutral'];
-    const title = target ? target.title : `${d.target_id.slice(0, 10)}…`;
-    return `<div class="ag2-insp-dep">
-      ${agendaChipHtml(state[0], state[1])}
-      ${target
-    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(target.id)}">waits on “${escapeHtml(title)}”</a>`
-    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(title)}</span>`}
-      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(d.target_id)}" title="Drop the link (the log keeps history)">×</button>
+  // The shared per-prerequisite judgment (ui2-agenda.js): live status
+  // on every link — the delivered-awaiting-Complete distinction, the
+  // in-flight word, and the honest out-of-window degrade (an absent
+  // target on an unblocked item is provably done, never "missing").
+  const deps = agendaPrereqStates(item).map((p) => {
+    const go = p.kind === 'delivered'
+      ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+          title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+      : '';
+    return `<div class="ag2-insp-dep${p.kind === 'delivered' ? ' delivered' : ''}">
+      ${agendaChipHtml(p.status, p.tone, p.detail)}
+      ${p.target
+    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(p.title)}</span>`}
+      ${go}
+      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(p.id)}" title="Drop the link (the log keeps history)">×</button>
     </div>`;
   });
   const empty = !blockers.length && !deps.length
@@ -99197,13 +100039,14 @@ function agendaBellRender() {
 // module-level visibilitychange listener below is the stop/resume
 // conduit itself and must outlive any one activation to resume it.
 
-// Owner-raised 2026-07-31 (from the original 180): the O(n²) cost only
-// bites during the brief settle window and the per-frame budget tiers
-// keep that window's frame work roughly constant as n grows, so the
-// honest bound is legibility — and legibility is what the hubs/focus
-// projections and arrangement modes are for. Past THIS cap the settle
-// window itself stops fitting a frame budget worth defending.
-const AGENDA_GRAPH_NODE_CAP = 420;
+// NO node cap (owner-ruled 2026-07-31, after 180 and then 420 both got
+// hit within a day): density is a feature, and every projection always
+// renders. Cost stays flat through level of detail instead of refusal —
+// node glow comes from pre-baked sprites (drawImage, ~two orders
+// cheaper than per-arc shadowBlur), and past REPULSION_LOD nodes the
+// settle pass strides its O(n²) pair loop with a rotating offset
+// (approximate physics, same look, same 260-iteration budget).
+const AGENDA_GRAPH_REPULSION_LOD = 600;
 // Design-parity settle budget, amortized: the prototype ran 260
 // synchronous O(n²) relaxation iterations per relayout; here the same
 // total is spread over frames (agendaGraphSettleBudget per rAF) so a
@@ -99222,7 +100065,9 @@ let agendaGraphCanvas = null;
 let agendaGraphCanvasHooks = null;
 let agendaGraphPaneObserver = null;
 let agendaGraphAutoTimer = null;
-let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
+let agendaGraphCam = {
+  yaw: 0.6, pitch: -0.34, auto: true, zoom: 1, panX: 0, panY: 0,
+};
 // Projection state: 'all' (whole non-retired ledger), 'hubs' (the hub
 // overview — automatic past the node cap, or chosen), 'focus' (one
 // hub's placed subtree). The render pass decides the projection from
@@ -99230,7 +100075,7 @@ let agendaGraphCam = { yaw: 0.6, pitch: -0.34, auto: true };
 // overlays derived file/dir satellite nodes on the 'all'/'focus' pools.
 let agendaGraphFocus = null;
 let agendaGraphProjection = 'all';
-let agendaGraphChosen = null; // null = auto ('hubs' past the cap, else 'all')
+let agendaGraphChosen = null; // null = 'all'; 'hubs' only when chosen
 let agendaGraphTerritory = false;
 let agendaGraphSubtreeTerr = new Map();
 let agendaGraphTerrStats = { shown: 0, total: 0 };
@@ -99267,12 +100112,25 @@ function agendaGraphSetFullscreen(on) {
   agendaRenderTab();
 }
 
+// While graph-fullscreen is active a marker class on <html> lifts the
+// agenda inspector above the fixed panel (see ui2-agenda-inspector.css)
+// so node-click keeps its full behavior — inspector over constellation.
+function agendaGraphSyncFsMarker() {
+  document.documentElement.classList.toggle('ag2-graph-fs', agendaGraphFullscreen);
+}
+
 function agendaGraphEnsureEsc() {
   if (agendaGraphEscHook) return;
   agendaGraphEscHook = (e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented) {
-      agendaGraphSetFullscreen(false);
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    // Polite ordering: an open inspector consumes the first ESC;
+    // fullscreen exits on the next.
+    const insp = document.getElementById('ag2-inspector');
+    if (insp && insp.classList.contains('open')) {
+      agendaCloseInspector();
+      return;
     }
+    agendaGraphSetFullscreen(false);
   };
   document.addEventListener('keydown', agendaGraphEscHook);
 }
@@ -99316,7 +100174,7 @@ function agendaGraphPoolItems() {
   return all;
 }
 
-// The over-cap degradation: instead of refusing, the constellation
+// The chosen hubs projection: the constellation
 // becomes a hub overview — only items with placed children — and a
 // click focuses one hub's subtree. The projection stays functional at
 // any ledger size a real taxonomy produces.
@@ -99341,28 +100199,21 @@ function agendaGraphProjectionItems() {
 
 function agendaGraphRenderLens(host) {
   // Resolve the projection: an explicit chip choice wins; focus
-  // overrides the pool; auto degrades an over-cap ledger to the hub
-  // overview (the cap still bounds every projection; past it the
-  // settle window's O(n²) relaxation stops fitting the frame budget).
+  // overrides the pool. Every projection renders at any size — cost is
+  // handled by LOD (sprite glow, strided repulsion), never refusal.
   let items = agendaGraphPoolItems();
-  let overCapAll = false;
   if (agendaGraphFocus) {
     agendaGraphProjection = 'focus';
-  } else {
-    const wantHubs = agendaGraphChosen === 'hubs'
-      || (agendaGraphChosen !== 'all' && items.length > AGENDA_GRAPH_NODE_CAP);
-    agendaGraphProjection = 'all';
-    if (wantHubs) {
-      const hubs = agendaGraphHubOverviewItems(items);
-      if (hubs.length && hubs.length <= AGENDA_GRAPH_NODE_CAP) {
-        items = hubs;
-        agendaGraphProjection = 'hubs';
-      }
-    } else if (agendaGraphChosen === 'all' && items.length > AGENDA_GRAPH_NODE_CAP) {
-      // The owner explicitly asked for Everything past the cap: keep
-      // the panel and its chips, park the canvas, say why.
-      overCapAll = true;
+  } else if (agendaGraphChosen === 'hubs') {
+    const hubs = agendaGraphHubOverviewItems(items);
+    if (hubs.length) {
+      items = hubs;
+      agendaGraphProjection = 'hubs';
+    } else {
+      agendaGraphProjection = 'all';
     }
+  } else {
+    agendaGraphProjection = 'all';
   }
   if (!items.length) {
     agendaGraphFullscreen = false;
@@ -99374,60 +100225,38 @@ function agendaGraphRenderLens(host) {
     </div>`;
     return;
   }
-  if (!overCapAll && items.length > AGENDA_GRAPH_NODE_CAP) {
-    // A focused subtree past the cap has no cheaper projection to
-    // degrade to — the flat refusal names the way out (and drops any
-    // fullscreen so the refusal never fills the window).
-    agendaGraphFullscreen = false;
-    agendaGraphTeardown();
-    host.innerHTML = `<div class="ag2-graph-panel empty">
-      <div class="ag2-empty">
-        <div class="ag2-empty-glyph">◍</div>
-        <div class="ag2-empty-title">The constellation caps at ${AGENDA_GRAPH_NODE_CAP} items</div>
-        <div class="ag2-empty-hint">This subtree exceeds the cap — focus a narrower hub, or use By hub.</div>
-      </div>
-    </div>`;
-    return;
-  }
   let canvas = host.querySelector('#ag2-graph-canvas');
   if (!canvas) {
     host.innerHTML = agendaGraphPanelHtml();
     canvas = host.querySelector('#ag2-graph-canvas');
   }
-  agendaGraphWireChrome(host, overCapAll);
-  if (overCapAll) {
-    agendaGraphTeardown();
-    return;
-  }
+  agendaGraphWireChrome(host);
   agendaGraphBindCanvas(canvas);
   agendaGraphEnsureLoop();
 }
 
-// Per-projection static chrome: the projection chip row, the cap note,
-// and the hint line. Static strings only — no item text ever lands in
-// this markup (the painted badge carries titles as inert pixels).
-function agendaGraphWireChrome(host, overCapAll) {
+// Per-projection static chrome: the projection chip row and the hint
+// line. Static strings only — no item text ever lands in this markup
+// (the painted badge carries titles as inert pixels).
+function agendaGraphWireChrome(host) {
   const panel = host.querySelector('.ag2-graph-panel');
   if (panel) panel.classList.toggle('fullscreen', agendaGraphFullscreen);
+  agendaGraphSyncFsMarker();
   if (agendaGraphFullscreen) agendaGraphEnsureEsc();
   else agendaGraphRemoveEsc();
   const hintLine = host.querySelector('#ag2-graph-hint');
   if (hintLine) {
     const modeHint = (AGENDA_GRAPH_MODES.find(([m]) => m === agendaGraphMode) || [])[2];
-    hintLine.textContent = overCapAll
-      ? 'everything exceeds the cap — pick hubs, or focus one hub'
-      : modeHint
-        || (agendaGraphProjection === 'hubs'
-          ? 'hub overview — click a hub to focus its subtree'
-          : agendaGraphProjection === 'focus'
-            ? (agendaGraphTerritory
-              ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
-              : 'focused subtree — double-click empty space to clear')
-            : 'drag to orbit · click a node to open it · double-click a hub to focus');
+    hintLine.textContent = modeHint
+      || (agendaGraphProjection === 'hubs'
+        ? 'hub overview — click a hub to focus its subtree'
+        : agendaGraphProjection === 'focus'
+          ? (agendaGraphTerritory
+            ? 'focused territory — squares are files/dirs; click one to open its newest carrier'
+            : 'focused subtree — double-click empty space to clear')
+          : 'drag to orbit · wheel to zoom · shift-drag to pan · click a node to open it · double-click a hub to focus');
   }
-  const note = host.querySelector('#ag2-graph-capnote');
-  if (note) note.hidden = !overCapAll;
-  const inHubs = !overCapAll && agendaGraphProjection === 'hubs';
+  const inHubs = agendaGraphProjection === 'hubs';
   const chips = host.querySelectorAll('.ag2-graph-projchip');
   chips.forEach((chip) => {
     const kind = chip.dataset.proj;
@@ -99441,10 +100270,9 @@ function agendaGraphWireChrome(host, overCapAll) {
         agendaRenderTab();
       };
     } else if (kind === 'all') {
-      chip.classList.toggle('active', overCapAll
-        || (!inHubs && agendaGraphProjection === 'all'));
+      chip.classList.toggle('active', !inHubs && agendaGraphProjection === 'all');
       chip.disabled = false;
-      chip.title = 'every non-retired item (bounded by the node cap)';
+      chip.title = 'every non-retired item';
       chip.onclick = () => {
         agendaGraphChosen = 'all';
         agendaGraphFocus = null;
@@ -99452,7 +100280,7 @@ function agendaGraphWireChrome(host, overCapAll) {
       };
     } else if (kind === 'terr') {
       chip.classList.toggle('active', agendaGraphTerritory && !inHubs);
-      chip.disabled = inHubs || overCapAll;
+      chip.disabled = inHubs;
       chip.title = inHubs
         ? 'territory needs a concrete pool — focus a hub or pick everything'
         : 'overlay file/dir satellites from the pool’s refs';
@@ -99472,7 +100300,7 @@ function agendaGraphWireChrome(host, overCapAll) {
     } else if (kind && kind.startsWith('mode-')) {
       const mode = kind.slice(5);
       chip.classList.toggle('active', agendaGraphMode === mode);
-      chip.disabled = overCapAll;
+      chip.disabled = false;
       chip.title = agendaGraphMode === mode
         ? 'back to the orbit arrangement'
         : (AGENDA_GRAPH_MODES.find(([m]) => m === mode) || [])[2] || mode;
@@ -99520,9 +100348,6 @@ function agendaGraphPanelHtml() {
       <span class="ag2-graph-projdiv"></span>
       <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
     </div>
-    <div class="ag2-graph-capnote" id="ag2-graph-capnote" hidden>
-      past the ${AGENDA_GRAPH_NODE_CAP}-node cap — the hubs projection or a focused hub keeps the map legible
-    </div>
     <div class="ag2-graph-legend">
       ${agendaGraphLegendChip('s-dot t-iris', 'open')}
       ${agendaGraphLegendChip('s-dot t-amber', 'question')}
@@ -99557,9 +100382,15 @@ function agendaGraphBindCanvas(canvas) {
       const nx = e.clientX - rect.left;
       const ny = e.clientY - rect.top;
       if (m.down) {
-        agendaGraphCam.yaw += (nx - m.x) * 0.005;
-        agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
-          agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        if (e.shiftKey) {
+          // Shift-drag pans in screen space (zoom's natural partner).
+          agendaGraphCam.panX += nx - m.x;
+          agendaGraphCam.panY += ny - m.y;
+        } else {
+          agendaGraphCam.yaw += (nx - m.x) * 0.005;
+          agendaGraphCam.pitch = Math.max(-1.2, Math.min(1.2,
+            agendaGraphCam.pitch + (ny - m.y) * 0.004));
+        }
         m.moved += Math.abs(nx - m.x) + Math.abs(ny - m.y);
         agendaGraphCam.auto = false;
       }
@@ -99595,14 +100426,42 @@ function agendaGraphBindCanvas(canvas) {
     },
     dbl: () => {
       // Double-click a hub to focus its subtree; double-click empty
-      // space to clear an active focus.
+      // space to reset a zoom/pan first, then to clear an active focus.
       if (agendaGraphHover && agendaChildrenOf(agendaGraphHover).length) {
         agendaGraphFocus = agendaGraphHover;
         agendaRenderTab();
-      } else if (!agendaGraphHover && agendaGraphFocus) {
-        agendaGraphFocus = null;
-        agendaRenderTab();
+      } else if (!agendaGraphHover) {
+        const cam = agendaGraphCam;
+        if (cam.zoom !== 1 || cam.panX || cam.panY) {
+          cam.zoom = 1;
+          cam.panX = 0;
+          cam.panY = 0;
+        } else if (agendaGraphFocus) {
+          agendaGraphFocus = null;
+          agendaRenderTab();
+        }
       }
+    },
+    wheel: (e) => {
+      // Wheel / trackpad-pinch (ctrl-wheel) zoom, anchored to the
+      // cursor: the world point under the pointer stays put via the
+      // screen-space pan. preventDefault keeps the page from scrolling
+      // — scoped to the canvas, removed on unbind.
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const cam = agendaGraphCam;
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0022));
+      const next = Math.max(0.35, Math.min(3.5, cam.zoom * factor));
+      const ratio = next / cam.zoom;
+      const ax = rect.width / 2;
+      const ay = rect.height / 2 + 8;
+      cam.panX = mx - ax - (mx - ax - cam.panX) * ratio;
+      cam.panY = my - ay - (my - ay - cam.panY) * ratio;
+      cam.zoom = next;
+      cam.auto = false;
+      agendaGraphArmAutoResume();
     },
     leave: () => {
       const wasDown = agendaGraphMouse.down;
@@ -99619,6 +100478,7 @@ function agendaGraphBindCanvas(canvas) {
   canvas.addEventListener('mouseup', hooks.up);
   canvas.addEventListener('mouseleave', hooks.leave);
   canvas.addEventListener('dblclick', hooks.dbl);
+  canvas.addEventListener('wheel', hooks.wheel, { passive: false });
   agendaGraphCanvasHooks = hooks;
 }
 
@@ -99631,6 +100491,7 @@ function agendaGraphUnbindCanvas() {
     canvas.removeEventListener('mouseup', hooks.up);
     canvas.removeEventListener('mouseleave', hooks.leave);
     canvas.removeEventListener('dblclick', hooks.dbl);
+    canvas.removeEventListener('wheel', hooks.wheel);
   }
   agendaGraphCanvas = null;
   agendaGraphCanvasHooks = null;
@@ -99701,6 +100562,7 @@ function agendaGraphTeardown() {
   }
   agendaGraphUnbindCanvas();
   agendaGraphRemoveEsc();
+  document.documentElement.classList.remove('ag2-graph-fs');
   agendaGraphMouse.down = false;
   agendaGraphMouse.moved = 0;
   agendaGraphHover = null;
@@ -99738,10 +100600,9 @@ function agendaGraphBuild() {
         entry.carrier = x.id;
       }
     }));
-    const room = Math.max(0, AGENDA_GRAPH_NODE_CAP - items.length);
     const all = [...best.values()].sort((a, b) =>
       b.newest - a.newest || (a.locator < b.locator ? -1 : 1));
-    satellites = all.slice(0, Math.min(60, room));
+    satellites = all.slice(0, 60);
     agendaGraphTerrStats = { shown: satellites.length, total: all.length };
   } else {
     agendaGraphTerrStats = { shown: 0, total: 0 };
@@ -99937,18 +100798,22 @@ function agendaGraphSettleBudget(count) {
   if (count <= 60) return 30;
   if (count <= 120) return 12;
   if (count <= 240) return 6;
-  // Keeps per-frame settle work roughly constant as n² grows: 420
-  // nodes at 4 iterations/frame ≈ 240 at 6 (the settle just takes a
-  // few more frames to spend its 260-iteration total).
+  // Together with the strided repulsion past REPULSION_LOD this keeps
+  // per-frame settle work roughly flat as n² grows; the settle just
+  // takes more frames to spend its 260-iteration total.
   return 4;
 }
 
 function agendaGraphRelax(iterations) {
   const nodes = agendaGraphNodes;
   const links = agendaGraphLinks;
+  // Past the LOD bound the pair loop strides with a rotating offset:
+  // each iteration touches 1/stride of the pairs, different ones each
+  // time, so big boards converge to the same shape at flat frame cost.
+  const stride = 1 + Math.floor(nodes.length / AGENDA_GRAPH_REPULSION_LOD);
   for (let it = 0; it < iterations; it++) {
     for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
+      for (let j = i + 1 + ((it + i) % stride); j < nodes.length; j += stride) {
         const A = nodes[i].p;
         const B = nodes[j].p;
         let dx = A[0] - B[0];
@@ -100052,16 +100917,40 @@ function agendaGraphDrawSatellite(g, node, q, hot, pal, w) {
   }
 }
 
+// Pre-baked glow sprites: one radial-gradient canvas per palette color,
+// drawImage-scaled per node. This is what removes the node cap — the
+// shadowBlur look at ~1/100th its cost, so a thousand glowing nodes
+// draw inside a frame. Keyed by the palette's rgb string, so theme
+// flips mint fresh sprites and stale ones just idle in the map.
+const agendaGraphGlowSprites = new Map();
+function agendaGraphGlowSprite(rgb) {
+  let sprite = agendaGraphGlowSprites.get(rgb);
+  if (!sprite) {
+    sprite = document.createElement('canvas');
+    sprite.width = 64;
+    sprite.height = 64;
+    const sg = sprite.getContext('2d');
+    const grad = sg.createRadialGradient(32, 32, 2, 32, 32, 30);
+    grad.addColorStop(0, `rgba(${rgb},.85)`);
+    grad.addColorStop(0.35, `rgba(${rgb},.28)`);
+    grad.addColorStop(1, `rgba(${rgb},0)`);
+    sg.fillStyle = grad;
+    sg.fillRect(0, 0, 64, 64);
+    agendaGraphGlowSprites.set(rgb, sprite);
+  }
+  return sprite;
+}
+
 // ---- Draw (3D-ish projection, hover picking, rings, labels) ----
 
 function agendaGraphDraw(ts) {
   const canvas = agendaGraphCanvas;
   if (!canvas) return;
   const items = agendaGraphBuild();
-  if (!items.length || items.length > AGENDA_GRAPH_NODE_CAP) {
-    // The ledger crossed a boundary between renders (event-lane merge):
-    // re-enter through the render pass, which owns projection choice,
-    // the cap, and the empty states (it tears this loop down).
+  if (!items.length) {
+    // The ledger emptied between renders (event-lane merge): re-enter
+    // through the render pass, which owns projection choice and the
+    // empty state (it tears this loop down).
     agendaRenderTab();
     return;
   }
@@ -100106,7 +100995,13 @@ function agendaGraphDraw(ts) {
     const ry = p[1] * cp - rz * sp;
     rz = p[1] * sp + rz * cp;
     const s = focal / (focal + rz + 40);
-    return { x: cx + rx * s * 1.35, y: cyy + ry * s * 1.35, s, z: rz };
+    const k = s * 1.35 * cam.zoom;
+    return {
+      x: cx + cam.panX + rx * k,
+      y: cyy + cam.panY + ry * k,
+      s: s * cam.zoom,
+      z: rz,
+    };
   };
   const nodes = agendaGraphNodes;
   const pts = nodes.map((n) => project(n.p));
@@ -100250,14 +101145,16 @@ function agendaGraphDraw(ts) {
     let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
     // Attention mode: needs-you items glow, the rest recede.
     if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
-    g.shadowColor = `rgba(${rgb},.8)`;
-    g.shadowBlur = hot ? 20
-      : (agendaGraphMode === 'attention' && node.attn ? 24 : 11 * q.s);
+    const glow = agendaGraphGlowSprite(rgb);
+    const gr = r * (hot ? 6.5
+      : agendaGraphMode === 'attention' && node.attn ? 7.5 : 4.5);
+    g.globalAlpha = alpha * (hot ? 0.95 : 0.6);
+    g.drawImage(glow, q.x - gr, q.y - gr, gr * 2, gr * 2);
+    g.globalAlpha = 1;
     g.beginPath();
     g.arc(q.x, q.y, r, 0, Math.PI * 2);
     g.fillStyle = `rgba(${rgb},${alpha})`;
     g.fill();
-    g.shadowBlur = 0;
     // Rings reuse slice A's derivations: blocked (uncleared blocker or
     // unmet prerequisite) rose; approved standing/armed green; suspended
     // amber with a slow pulse (static under reduced motion); pending
@@ -100326,7 +101223,10 @@ function agendaGraphDraw(ts) {
     : agendaGraphMode === 'attention'
       ? ` · attention — ${agendaGraphAttnCount} need you`
       : ` · ${agendaGraphMode}`;
-  if (agendaGraphProjection !== 'all' || terrBadge || modeBadge) {
+  const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
+    ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
+    : '';
+  {
     const allCount = (agendaItems || []).filter(
       (x) => x.status !== 'retired',
     ).length;
@@ -100344,7 +101244,7 @@ function agendaGraphDraw(ts) {
     }
     g.font = '10px "JetBrains Mono", monospace';
     g.fillStyle = pal.t3;
-    g.fillText(badge + modeBadge + terrBadge, 14, 64);
+    g.fillText(badge + modeBadge + terrBadge + zoomBadge, 14, 64);
   }
 }
 
@@ -102840,6 +103740,38 @@ async function memoryProposeFromForm(button) {
     if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
   };
 
+  // The update panel (ui2-update-lane) composes this SAME swap consumer
+  // instead of duplicating it: it hands over a mount element, and every
+  // chip-state render refills it — one implementation of the
+  // supervised / relay / hand-off logic, two surfaces. The mount is
+  // replaced wholesale per panel render; a disconnected mount is
+  // silently dropped.
+  let panelSwapMount = null;
+  function fillPanelSwapSection() {
+    const mount = panelSwapMount;
+    if (!mount) return;
+    if (!mount.isConnected) { panelSwapMount = null; return; }
+    mount.textContent = '';
+    const body = lastHandoverBody;
+    const update = body && body.update;
+    if (!update || body.draining) return;
+    const disk = update.on_disk;
+    const running = update.running || {};
+    const head = document.createElement('div');
+    head.className = 'update-lane-swap-head';
+    head.textContent = disk
+      ? `New build on disk: commit ${disk.git_sha || '?'} (${disk.version || '?'}, built ${disk.built_at || '?'}) — running ${running.git_sha || '?'}.`
+      : `The binary on disk changed but its provenance is unreadable${update.probe_error ? ` (${update.probe_error})` : ''}.`;
+    mount.appendChild(head);
+    if (update.honesty) {
+      const honesty = document.createElement('div');
+      honesty.className = 'handover-update-honesty';
+      honesty.textContent = update.honesty;
+      mount.appendChild(honesty);
+    }
+    mount.appendChild(handoverUpdateActions(body, disk));
+  }
+
   // The co-homed daemon a hand-off would drain toward: live, not this
   // boot, not already on its way out. Prefer one whose build matches the
   // on-disk update.
@@ -102939,6 +103871,7 @@ async function memoryProposeFromForm(button) {
   // come from probing a binary the daemon merely observed — never markup.
   function handoverUpdateRender(body) {
     lastHandoverBody = body;
+    fillPanelSwapSection();
     const update = body && body.update;
     if (!update || body.draining) { updateChipClear(); return; }
     const disk = update.on_disk;
@@ -103016,6 +103949,16 @@ async function memoryProposeFromForm(button) {
       el.appendChild(pending);
     }
     el.appendChild(handoverUpdateActions(body, disk));
+    // The pill expands into the full update panel: the chip stays the
+    // standing fact; channels, checks, and builds live there.
+    if (typeof routeTo === 'function') {
+      const panelLink = document.createElement('button');
+      panelLink.type = 'button';
+      panelLink.className = 'handover-update-panel-link';
+      panelLink.textContent = 'Open the update panel';
+      panelLink.addEventListener('click', () => routeTo('access', 'daemons'));
+      el.appendChild(panelLink);
+    }
   }
 
   function handoverBanner() {
@@ -103093,6 +104036,15 @@ async function memoryProposeFromForm(button) {
     stateKey: updateChipStateKey,
   };
 
+  // The update panel's composition hook (production, not QA): the panel
+  // registers its swap mount here and this module keeps it honest.
+  window.intendantHandoverUpdate = {
+    renderSwapSection: (mount) => {
+      panelSwapMount = mount;
+      fillPanelSwapSection();
+    },
+  };
+
   function handoverStart() {
     handoverPoll();
     setInterval(handoverPoll, HANDOVER_POLL_MS);
@@ -103104,21 +104056,30 @@ async function memoryProposeFromForm(button) {
   }
 })();
 /* ── static/app/ui2-update-lane.js ── */
-// ── ui2-update-lane — the self-update panel (Access → Daemons) ──────
-// Sits beside the daemons list's provenance rows and renders the
-// daemon's `update_lane` block from GET /api/daemon/handover: install
-// flavor, the bounded behind-origin-main / behind-latest-release check,
-// and the produce job's live phase + log tail. The buttons are the
-// owner's consent surface: POST /api/daemon/update-lane/{check,produce}
+// ── ui2-update-lane — the update panel (Access → Daemons) ───────────
+// The check-for-updates front door over the daemon's `update_lane`
+// block (GET /api/daemon/handover): running provenance, the two-channel
+// vocabulary — Releases (default; logged, PGP-verified builds) and
+// Dev — build from main (power-user lane behind the Advanced fold) —
+// each channel's bounded check as data (release compare; behind-count +
+// shortlog), and the produce job's live phase + log tail with real
+// errors verbatim. Which channel an install can check/produce comes
+// from the payload's `channels` catalog, never hardcoded here. The
+// buttons are the owner's consent surface: POST
+// /api/daemon/update-lane/{check,produce} with {"channel": …}
 // (HTTP-only by design — a tunnel-only remote surface watches progress
 // here but cannot click a build onto the box; the catch renders that
 // honestly). Producing lands a newer binary at the watched path; the
-// EXISTING update chip + one-click swap lane takes over from there.
-// textContent construction throughout: repo paths, versions, and child
-// process log lines are observed strings, never markup.
+// swap step below is the EXISTING chip consumer (ui2-handover renders
+// it into this panel's mount — one swap implementation, two surfaces).
+// Nothing here updates anything without an explicit click.
+// textContent construction throughout: repo paths, versions, commit
+// subjects, and child process log lines are observed strings, never
+// markup.
 (() => {
   const UPDATE_LANE_POLL_MS = 30000;
   const UPDATE_LANE_BUSY_POLL_MS = 3000;
+  const ADVANCED_OPEN_KEY = 'update-lane-advanced-open';
   const action = { inFlight: false, note: '' };
   let lastBlock = null;
   let pollTimer = null;
@@ -103127,7 +104088,17 @@ async function memoryProposeFromForm(button) {
     return document.getElementById('update-lane-card');
   }
 
-  async function updateLanePost(path) {
+  function advancedOpenStored() {
+    try { return localStorage.getItem(ADVANCED_OPEN_KEY) === '1'; } catch (_) { return false; }
+  }
+  function advancedOpenStore(open) {
+    try {
+      if (open) localStorage.setItem(ADVANCED_OPEN_KEY, '1');
+      else localStorage.removeItem(ADVANCED_OPEN_KEY);
+    } catch (_) { /* storage unavailable — the fold lives for this page only */ }
+  }
+
+  async function updateLanePost(path, channel) {
     if (action.inFlight) return;
     action.inFlight = true;
     action.note = '';
@@ -103136,7 +104107,7 @@ async function memoryProposeFromForm(button) {
       const resp = await authedFetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify({ channel }),
       });
       let body = null;
       try { body = await resp.json(); } catch (_) { /* non-JSON error body */ }
@@ -103155,12 +104126,12 @@ async function memoryProposeFromForm(button) {
     }
   }
 
-  function actionButton(label, path, disabled) {
+  function actionButton(label, path, channel, disabled) {
     const btn = document.createElement('button');
     btn.className = 'update-lane-btn';
     btn.textContent = label;
     btn.disabled = Boolean(disabled) || action.inFlight;
-    btn.addEventListener('click', () => updateLanePost(path));
+    btn.addEventListener('click', () => updateLanePost(path, channel));
     return btn;
   }
 
@@ -103172,49 +104143,104 @@ async function memoryProposeFromForm(button) {
     return el;
   }
 
-  function describeCheck(block, body) {
-    const check = block.check || {};
-    const running = block.running || {};
+  // ── Channel sections (availability + data come from the payload) ──
+
+  function channelInfo(block, name) {
+    return (block.channels && block.channels[name]) || { check: false, produce: false };
+  }
+  function channelCheck(block, name) {
+    return (block.checks && block.checks[name]) || {};
+  }
+
+  // The releases check as data: latest logged release vs the running
+  // package version.
+  function describeReleasesCheck(check, running, body) {
     if (check.error) {
-      line(body, 'update-lane-error', `Check failed: ${check.error}`);
+      line(body, 'update-lane-error', `Release check failed: ${check.error}`);
       return { behind: false };
     }
-    if (block.flavor === 'source') {
-      if (typeof check.behind !== 'number') {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking origin/main…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const capped = check.behind_capped ? '+' : '';
-      if (check.behind > 0) {
-        line(body, 'update-lane-status',
-          `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
-          + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
-      } else {
-        line(body, 'update-lane-note',
-          `Up to date with origin/main (running ${running.git_sha || '?'}).`);
-      }
-      if (check.dirty) {
-        line(body, 'update-lane-note',
-          'The checkout has local changes — the update will refuse to pull over them.');
-      }
-      return { behind: check.behind > 0 };
+    if (!check.latest_tag) {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Checking the latest logged release…'
+        : 'Not checked yet.');
+      return { behind: false };
     }
-    if (block.flavor === 'consumer-app') {
-      if (!check.latest_tag) {
-        line(body, 'update-lane-note', check.in_flight
-          ? 'Checking the latest logged release…'
-          : 'Not checked yet.');
-        return { behind: false };
-      }
-      const behind = Number(check.behind) > 0;
-      line(body, behind ? 'update-lane-status' : 'update-lane-note',
-        `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
-        + (check.compare_error ? ` ${check.compare_error}.` : ''));
-      return { behind };
+    const behind = Number(check.behind) > 0;
+    line(body, behind ? 'update-lane-status' : 'update-lane-note',
+      `Latest logged release: ${check.latest_tag} (${check.latest_version}) — running ${running.version || '?'}.`
+      + (check.compare_error ? ` ${check.compare_error}.` : ''));
+    return { behind };
+  }
+
+  // The dev check as data: behind-count + the bounded shortlog.
+  function describeDevCheck(check, running, body) {
+    if (check.error) {
+      line(body, 'update-lane-error', `Compare failed: ${check.error}`);
+      return { behind: false };
     }
-    return { behind: false };
+    if (typeof check.behind !== 'number') {
+      line(body, 'update-lane-note', check.in_flight
+        ? 'Fetching origin and comparing…'
+        : 'Not checked yet.');
+      return { behind: false };
+    }
+    const capped = check.behind_capped ? '+' : '';
+    if (check.behind > 0) {
+      line(body, 'update-lane-status',
+        `Behind origin/main by ${check.behind}${capped} commit${check.behind === 1 ? '' : 's'} `
+        + `(tip ${String(check.tip_sha || '').slice(0, 10)} — running ${running.git_sha || '?'}).`);
+      const shortlog = Array.isArray(check.shortlog) ? check.shortlog : [];
+      if (shortlog.length) {
+        const log = document.createElement('pre');
+        log.className = 'update-lane-shortlog';
+        log.textContent = shortlog.join('\n')
+          + (check.behind > shortlog.length ? `\n… and ${check.behind}${capped === '+' ? '+' : ''} total` : '');
+        body.appendChild(log);
+      }
+    } else {
+      line(body, 'update-lane-note',
+        `Up to date with origin/main (running ${running.git_sha || '?'}).`);
+    }
+    if (check.dirty) {
+      line(body, 'update-lane-note',
+        'The checkout has local changes to tracked files — a build will refuse to pull over them.');
+    }
+    return { behind: check.behind > 0 };
+  }
+
+  // One channel's section: data, then the consent buttons this install
+  // actually supports — an unavailable produce renders its reason
+  // instead of a button that cannot mean what it says.
+  function channelSection(block, name, title, jobRunning, describe, checkLabel, produceLabel) {
+    const info = channelInfo(block, name);
+    const check = channelCheck(block, name);
+    const section = document.createElement('div');
+    section.className = 'update-lane-channel';
+    line(section, 'update-lane-channel-title', title);
+    const body = document.createElement('div');
+    body.className = 'update-lane-body';
+    section.appendChild(body);
+    const verdict = info.check
+      ? describe(check, block.running || {}, body)
+      : { behind: false };
+    if (!info.produce && info.reason) {
+      line(body, 'update-lane-note', info.reason);
+    }
+    const actions = document.createElement('div');
+    actions.className = 'update-lane-actions';
+    if (info.check) {
+      actions.appendChild(actionButton(checkLabel, '/api/daemon/update-lane/check', name,
+        jobRunning || Boolean(check.in_flight)));
+    }
+    if (info.produce) {
+      actions.appendChild(actionButton(
+        jobRunning ? 'Working…' : produceLabel,
+        '/api/daemon/update-lane/produce', name,
+        jobRunning || !verdict.behind,
+      ));
+    }
+    if (actions.childElementCount) section.appendChild(actions);
+    return section;
   }
 
   function describeJob(block, body) {
@@ -103262,6 +104288,9 @@ async function memoryProposeFromForm(button) {
 
     const body = document.createElement('div');
     body.className = 'update-lane-body';
+    const running = block.running || {};
+    line(body, 'update-lane-note',
+      `Running: commit ${running.git_sha || '?'} · v${running.version || '?'} · built ${running.built_at || '?'}`);
     if (block.flavor === 'source' && block.repo_root) {
       line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
     } else if (block.flavor === 'consumer-app' && block.app_root) {
@@ -103271,33 +104300,51 @@ async function memoryProposeFromForm(button) {
       line(body, 'update-lane-note', block.unavailable);
     }
 
-    const verdict = describeCheck(block, body);
     const jobRunning = describeJob(block, body);
-
     if (action.note) line(body, 'update-lane-note', action.note);
-
-    const actions = document.createElement('div');
-    actions.className = 'update-lane-actions';
-    if (!block.unavailable) {
-      if (block.flavor === 'source') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Update from main',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      } else if (block.flavor === 'consumer-app') {
-        actions.appendChild(actionButton(
-          jobRunning ? 'Updating…' : 'Download & verify release',
-          '/api/daemon/update-lane/produce',
-          jobRunning || !verdict.behind,
-        ));
-      }
-      actions.appendChild(actionButton('Check now', '/api/daemon/update-lane/check',
-        jobRunning || Boolean(block.check && block.check.in_flight)));
-    }
     card.appendChild(body);
-    if (actions.childElementCount) card.appendChild(actions);
+
+    // Releases — the default channel, for everyone.
+    card.appendChild(channelSection(
+      block, 'releases', 'Releases — verified, signed builds (default)', jobRunning,
+      describeReleasesCheck, 'Check latest release', 'Download & install release',
+    ));
+
+    // Dev — build from main, one obvious click deeper.
+    const advanced = document.createElement('details');
+    advanced.className = 'update-lane-advanced';
+    if (advancedOpenStored()) advanced.open = true;
+    advanced.addEventListener('toggle', () => advancedOpenStore(advanced.open));
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced';
+    advanced.appendChild(summary);
+    advanced.appendChild(channelSection(
+      block, 'dev', 'Dev — build from main', jobRunning,
+      describeDevCheck, 'Fetch & compare', 'Pull & build from main',
+    ));
+    card.appendChild(advanced);
+
+    // The swap step: rendered by the EXISTING chip consumer
+    // (ui2-handover) into this mount — supervisor-claimed one-click
+    // when the daemon is app-supervised, its honest reach otherwise.
+    // Empty while no newer build sits on disk.
+    const swap = document.createElement('div');
+    swap.className = 'update-lane-swap';
+    card.appendChild(swap);
+    if (window.intendantHandoverUpdate
+        && typeof window.intendantHandoverUpdate.renderSwapSection === 'function') {
+      window.intendantHandoverUpdate.renderSwapSection(swap);
+    }
+
+    line(card, 'update-lane-footer',
+      'Updates happen only on your click here — nothing installs or restarts automatically.');
     mount.appendChild(card);
+  }
+
+  function anyCheckInFlight(block) {
+    if (!block || !block.checks) return false;
+    return ['releases', 'dev'].some((name) =>
+      block.checks[name] && block.checks[name].in_flight);
   }
 
   async function poll() {
@@ -103313,7 +104360,7 @@ async function memoryProposeFromForm(button) {
     if (pollTimer) clearTimeout(pollTimer);
     const busy = Boolean(lastBlock && (
       (lastBlock.job && !('ok' in lastBlock.job)) ||
-      (lastBlock.check && lastBlock.check.in_flight)));
+      anyCheckInFlight(lastBlock)));
     pollTimer = setTimeout(async () => {
       await poll();
       schedulePoll(false);
@@ -110583,6 +111630,12 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_peer_message':
     case 'api_peer_task':
     case 'api_peer_approval':
+    // Session-control and session-detail wait on a remote daemon's
+    // ack/fetch exactly like their siblings above — session-control
+    // previously fell through to the 5 s default and timed out on slow
+    // federation links (RC-C2 fix).
+    case 'api_peer_session_control':
+    case 'api_peer_session_detail':
     case 'api_peer_add':
     case 'api_peer_pairing_join':
     case 'api_peer_pairing_request_access':
@@ -110723,10 +111776,21 @@ function sessionDetailErrorIsMissing(data) {
 // fallback policy. Callers keep the payload-with-error contract this
 // helper always had — errors surface as data.error, never as throws for
 // delivered responses (sessionDetailErrorIsMissing keys off that).
+//
+// RC-C2: `options.hostId` targets a PEER session's transcript. Two
+// lanes, one response shape (the peer's own api_session_detail body):
+// the browser↔peer dashboard-control tunnel when the link supports it
+// (the `api_sessions {target}` precedent), else the daemon-mediated
+// federation HTTP lane (`api_peer_session_detail`) — the
+// request/response path that works on relay-only links where no
+// datachannel can form. A response the PEER delivered (including its
+// own 403/404 refusals) is returned honestly either way; only an
+// undelivered lane-1 attempt falls through to lane 2.
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
   const source = String(options.source || 'intendant').trim() || 'intendant';
+  const hostId = String(options.hostId || '').trim();
   const params = { session_id: sid, source };
   if (options.limit !== undefined && options.limit !== null) {
     params.limit = options.limit;
@@ -110734,17 +111798,40 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
+  const unwrap = (resp) => {
+    const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+      ? resp.body
+      : {};
+    if (!resp.ok && !data.error) {
+      data.error = `HTTP ${resp.status}`;
+    }
+    return data;
+  };
+  if (hostId) {
+    if (
+      typeof peerDashboardControlSignalAvailable === 'function'
+      && peerDashboardControlSignalAvailable(hostId)
+    ) {
+      const resp = await daemonApi.request('api_session_detail', params, {
+        target: hostId,
+        signal: options.signal,
+        cache: options.cache,
+      });
+      const delivered = resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body);
+      if (resp.ok || delivered) return unwrap(resp);
+      // fall through: the datachannel attempt died undelivered
+    }
+    return unwrap(await daemonApi.request(
+      'api_peer_session_detail',
+      { peer_id: hostId, ...params },
+      { signal: options.signal, cache: options.cache }
+    ));
+  }
   const resp = await daemonApi.request('api_session_detail', params, {
     signal: options.signal,
     cache: options.cache,
   });
-  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
-    ? resp.body
-    : {};
-  if (!resp.ok && !data.error) {
-    data.error = `HTTP ${resp.status}`;
-  }
-  return data;
+  return unwrap(resp);
 }
 
 // daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
@@ -111614,8 +112701,20 @@ function updateDaemonSnapshot(snap) {
   if (!snap || !snap.id) return;
   const idx = daemons.findIndex(d => d.host_id === snap.id);
   if (idx < 0) return;
+  const wasConnected = daemons[idx].connected;
   daemons[idx] = snapshotToDaemonEntry(snap);
   upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
+  // Reconnect transition (RC-C2): pending approvals learned before the
+  // link dropped are unverifiable — anything resolved while the link
+  // was down never produced an `approval_resolved` here. Clear the
+  // host's fold and let the peer's bootstrap re-announce repopulate it
+  // (targets predating the re-announce degrade to the sessions rail's
+  // `needs_approval` boolean — honest, not stale). Approval surfaces
+  // re-render via the helpers' own repaint calls.
+  if (!wasConnected && daemons[idx].connected
+      && typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(snap.id, 'link reconnected — awaiting re-announce');
+  }
   renderDaemonsList();
   if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
 }
@@ -111646,9 +112745,15 @@ function removeDaemonById(id) {
   removeDashboardAccessTarget(id);
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
-  // approvals — once the peer is gone there's nothing to resolve.
+  // approvals — once the peer is gone there's nothing to resolve
+  // (clearPeerApprovalsForHost also sweeps the merged rail surfaces:
+  // approval panel/queue + attention items).
   expandedDaemons.delete(id);
-  peerPendingApprovals.delete(id);
+  if (typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(id, 'peer removed');
+  } else {
+    peerPendingApprovals.delete(id);
+  }
   // Tear down any active per-peer display: the peer is gone, the
   // RTCPeerConnection has nowhere to send signaling, and leaving it
   // alive would just stall on ICE failure.
@@ -112057,16 +113162,25 @@ function applyDaemonExpandedState(hostId, expanded) {
 // Approval requests arrive over each peer's secondary WebSocket as
 // `approval_required` events. They're surfaced inline in the peer's
 // controls panel with approve / deny / skip buttons that POST to
-// /api/peers/{id}/approval. Buttons map to the four-way ApprovalDecision
-// vocabulary (accept / accept_for_session / decline / cancel) — the
-// dashboard surfaces three of them today; AcceptForSession can be added
-// when there's a use case. Wire-level encoding is in
-// peer::transport::intendant (ResolveApproval → ControlMsg::Approve|Deny|Skip).
+// /api/peers/{id}/approval, and (RC-C2) fold into the merged global
+// rail — the bottom approval panel/queue + the attention center — keyed
+// (host, id). Buttons map to the four-way ApprovalDecision vocabulary
+// (accept / accept_for_session / decline / cancel); the panel's
+// "Approve all" maps to accept_for_session (→ ControlMsg::ApproveAll on
+// the peer). Wire-level encoding is in peer::transport::intendant
+// (ResolveApproval → ControlMsg::Approve|ApproveAll|Deny|Skip).
 
-function addPendingApproval(hostId, approvalId, command, category) {
+function addPendingApproval(hostId, approvalId, command, category, sessionId) {
   let m = peerPendingApprovals.get(hostId);
   if (!m) { m = new Map(); peerPendingApprovals.set(hostId, m); }
-  m.set(String(approvalId), { command: command || '', category: category || '' });
+  m.set(String(approvalId), {
+    command: command || '',
+    category: category || '',
+    // The PEER's session id (RC-C2, additive on the wire) — lets the
+    // merged rail and Station session nodes attribute the ask; '' from
+    // peers predating the field.
+    sessionId: sessionId || '',
+  });
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }
@@ -112076,6 +113190,25 @@ function removePendingApproval(hostId, approvalId) {
   if (!m) return;
   m.delete(String(approvalId));
   if (m.size === 0) peerPendingApprovals.delete(hostId);
+  renderPeerApprovals(hostId);
+  stationScheduleUpdate();
+}
+
+// Sweep every approval surface for one host (RC-C2). Two callers with
+// the same honesty rationale: a reconnect (entries learned before the
+// drop are unverifiable — the peer's bootstrap re-announce repopulates
+// what is still pending; older peers degrade to the sessions rail's
+// needs_approval boolean) and peer removal (nothing left to resolve).
+function clearPeerApprovalsForHost(hostId, reason) {
+  const m = peerPendingApprovals.get(hostId);
+  const ids = m ? [...m.keys()] : [];
+  peerPendingApprovals.delete(hostId);
+  for (const id of ids) {
+    if (typeof retirePanelPeerApproval === 'function') retirePanelPeerApproval(hostId, id);
+    if (typeof attentionRemove === 'function') {
+      attentionRemove('approval', null, id, true, reason || 'link reset', hostId);
+    }
+  }
   renderPeerApprovals(hostId);
   stationScheduleUpdate();
 }
@@ -128348,8 +129481,10 @@ function setSessionsHost(hostId) {
 // Whole-card action while browsing a peer: hand off to the peer's own
 // dashboard (its own auth applies there) rather than faking cross-daemon
 // session control this daemon has no authority for.
-function openPeerSessionExternally(s) {
-  const host = sessionsHostRowFor(currentSessionsHostId());
+function openPeerSessionExternally(s, hostId) {
+  // Explicit host when the caller knows it (the peer transcript banner);
+  // the Sessions pane's active host otherwise.
+  const host = sessionsHostRowFor(hostId || currentSessionsHostId());
   const base = String(host?.browser_tcp_via_url || host?.url || '').replace(/\/+$/, '');
   if (!base) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');
@@ -131268,8 +132403,12 @@ function buildSessionCard(m, derived, ctx) {
 
   if (ctx.viewingPeer) {
     card.classList.add('sc-peer');
-    card.title = 'Open this session on the peer’s dashboard';
-    card.addEventListener('click', () => openPeerSessionExternally(s));
+    // RC-C2: the card opens the transcript HERE, fetched over the
+    // federation link — the peer's own dashboard stays one click away
+    // inside the overlay (frames/recordings/live view live there).
+    card.title = 'Read this session’s transcript (fetched from the peer)';
+    const peerHostForDetail = typeof currentSessionsHostId === 'function' ? currentSessionsHostId() : '';
+    card.addEventListener('click', () => openSessionDetail(s, null, { hostId: peerHostForDetail }));
   } else {
     card.addEventListener('click', () => openSessionDetail(s));
   }
@@ -133129,8 +134268,18 @@ function renderSessionDetailTitle(session) {
   titleText.title = primaryText;
   const titleId = document.createElement('span');
   titleId.className = 'sd-title-id';
-  titleId.textContent = `${sourceLabel} ${sessionId}`;
-  titleId.title = sessionId;
+  // Peer transcripts (RC-C2) name their governing daemon in the title —
+  // provenance is explicit even before the banner renders.
+  const peerHost = String(session.hostId || '').trim();
+  if (peerHost) {
+    const peerEntry = typeof peerEntryForHost === 'function' ? peerEntryForHost(peerHost) : null;
+    const peerLabel = peerEntry?.label || peerHost;
+    titleId.textContent = `${sourceLabel} ${sessionId} on ${peerLabel}`;
+    titleId.title = `${sessionId} — a session on ${peerLabel}, read over the federation link`;
+  } else {
+    titleId.textContent = `${sourceLabel} ${sessionId}`;
+    titleId.title = sessionId;
+  }
   titleLine.appendChild(titleKind);
   titleLine.appendChild(titleText);
   titleLine.appendChild(titleId);
@@ -133244,12 +134393,18 @@ function prepareSessionDetailContext(ctx, detailEl) {
   return true;
 }
 
-function openSessionDetail(sessionOrId, taskArg) {
+function openSessionDetail(sessionOrId, taskArg, opts) {
   const session = typeof sessionOrId === 'object'
     ? sessionOrId
     : { session_id: sessionOrId, task: taskArg, source: 'intendant' };
   const sessionId = session.session_id;
   const source = session.source || 'intendant';
+  // Peer transcript lane (RC-C2): `hostId` reads the session's transcript
+  // from a federated peer. Same overlay, same renderer, one extra rail of
+  // honesty: explicit target provenance, a fetched-at stamp with refresh,
+  // and peer-store-resident media (frames, recordings) rendered as absent
+  // instead of dead thumbnails.
+  const hostId = String(opts?.hostId || session.hostId || '').trim();
   const detailEl = document.getElementById('session-detail');
   const logsEl = document.getElementById('session-detail-logs');
   const detailSubtab = activeSessionsSubtab === 'deep' ? 'deep' : 'recent';
@@ -133257,7 +134412,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   if (!detailEl || !logsEl || !prepareSessionDetailContext(detailContext, detailEl)) return;
 
   detailEl.classList.remove('hidden');
-  currentSessionDetail = { ...session, source };
+  currentSessionDetail = { ...session, source, hostId };
   renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
   sessionDetailLogView = null;
@@ -133267,6 +134422,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   document.getElementById('sd-recordings').classList.add('hidden');
   document.getElementById('sd-frames').classList.add('hidden');
   document.getElementById('session-detail-frames').innerHTML = '';
+  renderPeerDetailBanner(hostId, sessionId, source, null);
 
   const detailSessionId = sessionId;
   const detailSource = source;
@@ -133278,19 +134434,30 @@ function openSessionDetail(sessionOrId, taskArg) {
     failure.textContent = message;
     logsEl.appendChild(failure);
   };
-  fetchSessionDetailPayload(detailSessionId, { source: detailSource, limit: SESSION_DETAIL_PAGE_LIMIT })
+  fetchSessionDetailPayload(detailSessionId, {
+    source: detailSource,
+    limit: SESSION_DETAIL_PAGE_LIMIT,
+    hostId,
+  })
     .then(data => {
+      if (currentSessionDetail?.session_id !== detailSessionId) return;
       if (data.error) {
         renderDetailFailure(String(data.error));
+        if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: String(data.error) });
         return;
       }
       const entries = data.entries || [];
-      applySessionIdentitiesFromReplayEntries(entries);
-      applySessionGoalsFromReplayEntries(entries);
-      applySessionPrsFromReplayEntries(entries);
+      if (!hostId) {
+        // Identity/goal/PR side-tables are LOCAL session state — a peer's
+        // entries must not pollute them (its session ids are not ours).
+        applySessionIdentitiesFromReplayEntries(entries);
+        applySessionGoalsFromReplayEntries(entries);
+        applySessionPrsFromReplayEntries(entries);
+      }
       renderSessionDetailLogs(entries, logsEl, {
         sessionId: detailSessionId,
         source: detailSource,
+        hostId,
         pageStart: data.page_start ?? data.pageStart,
         pageEnd: data.page_end ?? data.pageEnd,
         totalEntries: data.total_entries ?? data.totalEntries,
@@ -133298,26 +134465,121 @@ function openSessionDetail(sessionOrId, taskArg) {
       });
       updateSessionDetailLogsBadge(sessionDetailLogView, entries.length);
 
-      // Render frames gallery
+      // Render frames gallery. Peer frames live in the PEER's stores —
+      // the gallery would be dead thumbnails; the banner says so instead.
       const frames = data.frames || [];
-      if (frames.length > 0) {
+      if (frames.length > 0 && !hostId) {
         renderSessionFrames(sessionId, frames);
+      }
+      if (hostId) {
+        renderPeerDetailBanner(hostId, detailSessionId, detailSource, {
+          fetchedAt: Date.now(),
+          frameCount: frames.length,
+        });
       }
     })
     .catch(e => {
       renderDetailFailure(`Failed to load${e?.message ? ` — ${e.message}` : ''}`);
+      if (hostId) renderPeerDetailBanner(hostId, detailSessionId, detailSource, { error: e?.message || 'failed to load' });
     });
 
   // Lazy-load recordings for Intendant sessions. External CLI histories do not
-  // have Intendant media directories.
-  if (source === 'intendant') {
+  // have Intendant media directories; peer recordings live on the peer.
+  if (source === 'intendant' && !hostId) {
     loadSessionRecordings(sessionId);
+  }
+}
+
+// The provenance banner above a PEER transcript (RC-C2): names the
+// governing daemon and the link class, stamps when the page was fetched
+// (a transcript page is a snapshot, never a live stream), offers Refresh,
+// and links the peer's own dashboard for everything that stays there
+// (frames, recordings, full history). Every line says what is true NOW.
+function renderPeerDetailBanner(hostId, sessionId, source, state) {
+  const detailEl = document.getElementById('session-detail');
+  if (!detailEl) return;
+  let banner = document.getElementById('session-detail-peer-banner');
+  if (!hostId) {
+    if (banner) banner.remove();
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'session-detail-peer-banner';
+    banner.className = 'session-detail-peer-banner';
+    const titleEl = document.getElementById('session-detail-title');
+    if (titleEl && titleEl.parentElement) {
+      titleEl.insertAdjacentElement('afterend', banner);
+    } else {
+      detailEl.prepend(banner);
+    }
+  }
+  const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(hostId) : null;
+  const label = entry?.label || hostId;
+  const linkClass = entry?.link?.transport_class || '';
+  const linkDown = entry ? entry.connected === false : false;
+  banner.textContent = '';
+  const who = document.createElement('span');
+  who.className = 'sd-peer-who';
+  who.textContent = `Transcript from ${label}`;
+  who.title = `Fetched over the federation link under this daemon's peer identity; `
+    + `${label}'s own profile gate authorized the read.`;
+  banner.appendChild(who);
+  if (linkClass) {
+    const chip = document.createElement('span');
+    chip.className = 'sd-peer-link-chip';
+    chip.textContent = linkClass === 'relayed' ? 'relay link' : 'direct link';
+    chip.title = linkClass === 'relayed'
+      ? 'Reachability-relay link: request/response only — no live media or datachannels.'
+      : 'Direct federation link.';
+    banner.appendChild(chip);
+  }
+  const status = document.createElement('span');
+  status.className = 'sd-peer-status';
+  if (state?.error) {
+    status.textContent = `— ${state.error}`;
+    status.dataset.state = 'error';
+  } else if (state?.fetchedAt) {
+    const stamp = new Date(state.fetchedAt).toLocaleTimeString();
+    status.textContent = linkDown
+      ? `— snapshot from ${stamp}; peer link down, refresh will fail until it returns`
+      : `— snapshot fetched ${stamp}`;
+    if (state.frameCount > 0) {
+      status.textContent += ` · ${state.frameCount} frame${state.frameCount === 1 ? '' : 's'} on ${label} (not proxied)`;
+    }
+  } else {
+    status.textContent = linkDown ? '— peer link reconnecting…' : '— fetching…';
+  }
+  banner.appendChild(status);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'sd-peer-refresh';
+  refresh.textContent = 'Refresh';
+  refresh.title = `Re-fetch this transcript page from ${label} now.`;
+  refresh.addEventListener('click', () => {
+    if (currentSessionDetail?.session_id === sessionId) {
+      openSessionDetail(currentSessionDetail, null, { hostId });
+    }
+  });
+  banner.appendChild(refresh);
+  if (entry && typeof openPeerSessionExternally === 'function') {
+    const external = document.createElement('button');
+    external.type = 'button';
+    external.className = 'sd-peer-external';
+    external.textContent = `Open on ${label}`;
+    external.title = `Open ${label}'s own dashboard (full history, frames, recordings, live view).`;
+    external.addEventListener('click', () => {
+      openPeerSessionExternally({ session_id: sessionId, source }, hostId);
+    });
+    banner.appendChild(external);
   }
 }
 
 function closeSessionDetail() {
   // Clean up session recording player
   if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
+  const peerBanner = document.getElementById('session-detail-peer-banner');
+  if (peerBanner) peerBanner.remove();
   revokeSessionFrameObjectUrls();
   document.getElementById('session-detail-recordings').innerHTML = '';
   document.getElementById('session-detail-frames').innerHTML = '';
@@ -133664,6 +134926,7 @@ function updateSessionDetailViewPageState(view, info = {}) {
     ''
   ).trim();
   view.source = normalizeAgentId(info.source || view.source || currentSessionDetail?.source || 'intendant') || 'intendant';
+  view.hostId = String(info.hostId ?? view.hostId ?? currentSessionDetail?.hostId ?? '').trim();
 
   const pageStart = sessionDetailNumberOrNull(info.pageStart ?? info.page_start);
   if (pageStart !== null) {
@@ -134414,6 +135677,7 @@ function loadOlderRemoteSessionDetailRows(view) {
     limit: SESSION_DETAIL_PAGE_LIMIT,
     before,
     cache: 'no-store',
+    hostId: view.hostId || currentSessionDetail?.hostId || '',
   })
     .then(data => {
       if (sessionDetailLogView !== view || view.scroller?._sessionDetailView !== view || data?.error) return;
@@ -136002,7 +137266,7 @@ const ATTENTION_BADGE_KEY = 'intendant.attention.badge'; // 'off' disables; defa
 const ATTENTION_NOTIFY_KEY = 'intendant.attention.notify'; // 'on' enables; default off
 const ATTENTION_NOTIFY_DEBOUNCE_MS = 1500;
 
-// key "kind:sessionKey:id" -> { kind, sessionId, id, ts, title, text }
+// key "kind:host:sessionKey:id" -> { kind, sessionId, hostId, id, ts, title, text }
 // (`ts` is the item's arrival time in ms — the wire `ts` when the event
 // carries one, else receipt time; `title`/`text` are kept for `notify`
 // items so the inbox can still name the cause after the toast expired.)
@@ -136044,8 +137308,12 @@ function attentionSessionKey(sessionId) {
   return (sessionId && String(sessionId)) || 'main';
 }
 
-function attentionKey(kind, sessionId, id) {
-  return `${kind}:${attentionSessionKey(sessionId)}:${String(id)}`;
+// Keys carry a host dimension (RC-C2): peer approvals share the rail,
+// and approval ids are per-daemon counters that collide across daemons
+// — without the host a session-less peer approval and a session-less
+// local one with the same id would merge into one item.
+function attentionKey(kind, sessionId, id, hostId) {
+  return `${kind}:${hostId || 'local'}:${attentionSessionKey(sessionId)}:${String(id)}`;
 }
 
 function attentionTailPush(item, reason) {
@@ -136055,12 +137323,14 @@ function attentionTailPush(item, reason) {
 
 function attentionAdd(kind, sessionId, id, live, meta) {
   if (id === undefined || id === null) return;
-  const key = attentionKey(kind, sessionId, id);
+  const hostId = (meta && meta.hostId) || '';
+  const key = attentionKey(kind, sessionId, id, hostId);
   const prior = attentionItems.get(key);
   const wireTs = meta && Number(meta.ts);
   attentionItems.set(key, {
     kind,
     sessionId: sessionId || '',
+    hostId,
     id,
     ts: (prior && prior.ts)
       || (Number.isFinite(wireTs) && wireTs > 0 ? wireTs : Date.now()),
@@ -136075,9 +137345,24 @@ function attentionAdd(kind, sessionId, id, live, meta) {
 }
 
 // Removal driven by a wire event (`live` false while rebuilding from
-// replayed history, which never feeds the recent tail).
-function attentionRemove(kind, sessionId, id, live, reason) {
-  const key = attentionKey(kind, sessionId, id);
+// replayed history, which never feeds the recent tail). Peer removals
+// (RC-C2) may arrive session-blind — `peer_approval_resolved` carries
+// only (host, id) — so a host-scoped removal with a null sessionId
+// scans for the item instead of keying directly.
+function attentionRemove(kind, sessionId, id, live, reason, hostId) {
+  const host = hostId || '';
+  if (host && (sessionId === undefined || sessionId === null)) {
+    const sid = String(id);
+    for (const [key, item] of [...attentionItems]) {
+      if (item.kind === kind && item.hostId === host && String(item.id) === sid) {
+        attentionItems.delete(key);
+        if (live) attentionTailPush(item, reason || 'resolved');
+      }
+    }
+    attentionRepaint();
+    return;
+  }
+  const key = attentionKey(kind, sessionId, id, host);
   const item = attentionItems.get(key);
   if (!item) return;
   attentionItems.delete(key);
@@ -136087,7 +137372,9 @@ function attentionRemove(kind, sessionId, id, live, reason) {
 function attentionClearSession(sessionId, live) {
   const sessionKey = attentionSessionKey(sessionId);
   for (const [key, item] of [...attentionItems]) {
-    if (attentionSessionKey(item.sessionId) === sessionKey) {
+    // Local-lane sweep: peer items (RC-C2) retire on their own peer
+    // events / link transitions, never on local session lifecycle.
+    if (!item.hostId && attentionSessionKey(item.sessionId) === sessionKey) {
       attentionItems.delete(key);
       if (live) attentionTailPush(item, 'session ended');
     }
@@ -136178,7 +137465,8 @@ function attentionApplyEvent(d, live) {
     // them whenever the main session finished any turn.)
     const sessionKey = attentionSessionKey(d.session_id);
     for (const [key, item] of [...attentionItems]) {
-      if (attentionSessionKey(item.sessionId) === sessionKey
+      if (!item.hostId
+          && attentionSessionKey(item.sessionId) === sessionKey
           && item.kind !== 'display' && item.kind !== 'radar' && item.kind !== 'notify') {
         attentionItems.delete(key);
         if (live) attentionTailPush(item, 'turn ended');
@@ -136195,7 +137483,24 @@ function attentionApplyEvent(d, live) {
 // dead stream can't retract items, so a stale badge would lie — clear and
 // let the reconnect bootstrap rebuild what is still pending.
 function attentionOnServerState(connected) {
-  if (!connected) attentionClearAll();
+  if (!connected) {
+    attentionClearAll();
+    return;
+  }
+  // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
+  // but their source of truth — the browser-side peer fold — survived a
+  // local transport flap. Rebuild them; peer-link transitions own their
+  // real invalidation (clearPeerApprovalsForHost).
+  if (typeof peerPendingApprovals !== 'undefined') {
+    for (const [hostId, pending] of peerPendingApprovals) {
+      for (const [id, entry] of pending) {
+        attentionAdd('approval', entry.sessionId || '', id, false, {
+          hostId,
+          text: entry.command || '',
+        });
+      }
+    }
+  }
 }
 
 // ── Title + favicon badge ──
@@ -136278,6 +137583,17 @@ function attentionPaintChip() {
 
 function attentionSessionLabel(item) {
   const sid = String(item.sessionId || '').trim();
+  // Peer items (RC-C2): name the governing daemon — the session id is
+  // the PEER's and means nothing to local session metadata. Explicit
+  // target provenance on every peer-attributed item.
+  if (item.hostId) {
+    let label = item.hostId;
+    try {
+      const entry = typeof peerEntryForHost === 'function' ? peerEntryForHost(item.hostId) : null;
+      if (entry && entry.label) label = entry.label;
+    } catch (_) {}
+    return sid ? `on ${label} · ${sid.slice(0, 8)}` : `on ${label}`;
+  }
   // Session-less notifications are the agenda scheduler's (reminders,
   // scheduled-session outcomes) — name their home, not a session.
   if (!sid) return item.kind === 'notify' ? 'Agenda' : 'main session';
@@ -136312,6 +137628,24 @@ function attentionDefaultPrimary(kind) {
 // never call showPanel/hideAllPanels here (both clear pending ask state).
 function attentionNavigate(item) {
   attentionInboxSetOpen(false);
+  // Peer approvals (RC-C2): the handling surface is the merged approval
+  // panel — surface that entry (or its queue slot) and reveal the panel.
+  // The session id is the PEER's; never resolve it against local windows.
+  if (item.hostId) {
+    const pending = typeof peerPendingApprovals !== 'undefined'
+      ? peerPendingApprovals.get(item.hostId)
+      : null;
+    const entry = pending ? pending.get(String(item.id)) : null;
+    if (entry && typeof showApproval === 'function') {
+      showApproval(item.id, entry.command, entry.category, entry.sessionId || '', item.hostId);
+      if (typeof routeTo === 'function') { try { routeTo('activity'); } catch (_) {} }
+    } else if (typeof routeTo === 'function') {
+      // Not in the fold anymore (resolved elsewhere / link reset) — the
+      // peer row panel is the fallback surface.
+      try { routeTo('access'); } catch (_) {}
+    }
+    return;
+  }
   const sid = String(item.sessionId || '').trim();
   if (item.kind === 'notify') {
     // Click IS the acknowledgement — retire to the recent tail, then go
@@ -136339,7 +137673,7 @@ function attentionNavigate(item) {
 // Inbox-driven retirement (notify click/dismiss): the one removal path
 // that is a user act rather than a wire event.
 function attentionRetire(item, reason) {
-  const key = attentionKey(item.kind, item.sessionId, item.id);
+  const key = attentionKey(item.kind, item.sessionId, item.id, item.hostId);
   const found = attentionItems.get(key);
   if (!found) return;
   attentionItems.delete(key);
@@ -136378,7 +137712,9 @@ function attentionInboxItem(item, recent) {
       // the cleared cause may need follow-up.
       attentionInboxSetOpen(false);
       const sid = String(item.sessionId || '').trim();
-      if (sid && typeof focusSessionWindow === 'function') {
+      if (item.hostId) {
+        if (typeof routeTo === 'function') { try { routeTo('access'); } catch (_) {} }
+      } else if (sid && typeof focusSessionWindow === 'function') {
         try { focusSessionWindow(sid); } catch (_) {}
       } else if (item.kind === 'notify' && typeof routeTo === 'function') {
         try { routeTo('agenda'); } catch (_) {}
@@ -136690,6 +138026,16 @@ window.sendApproval = function(action) {
   // A send is already in flight for the shown approval — don't double-fire
   // (keyboard shortcuts stay wired; they just no-op while disabled).
   if (approvalSendPending) return;
+  // Peer approvals (RC-C2): decided via api_peer_approval under this
+  // daemon's peer grant — the local session-control lane, the detached-
+  // session guard, and the local ack tracker do not apply. The panel's
+  // sending state resolves on the peer's reply.
+  if (pendingApprovalHostId) {
+    const panel = document.getElementById('approval-panel');
+    if (panel && panel.classList.contains('approval-sending')) return;
+    sendPeerApprovalFromPanel(pendingApprovalHostId, pendingApprovalId, action);
+    return;
+  }
   if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
     showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
     approvalSessionIds.delete(String(pendingApprovalId));

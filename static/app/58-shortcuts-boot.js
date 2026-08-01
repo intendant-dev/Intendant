@@ -33,6 +33,16 @@ window.sendApproval = function(action) {
   // A send is already in flight for the shown approval — don't double-fire
   // (keyboard shortcuts stay wired; they just no-op while disabled).
   if (approvalSendPending) return;
+  // Peer approvals (RC-C2): decided via api_peer_approval under this
+  // daemon's peer grant — the local session-control lane, the detached-
+  // session guard, and the local ack tracker do not apply. The panel's
+  // sending state resolves on the peer's reply.
+  if (pendingApprovalHostId) {
+    const panel = document.getElementById('approval-panel');
+    if (panel && panel.classList.contains('approval-sending')) return;
+    sendPeerApprovalFromPanel(pendingApprovalHostId, pendingApprovalId, action);
+    return;
+  }
   if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
     showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
     approvalSessionIds.delete(String(pendingApprovalId));

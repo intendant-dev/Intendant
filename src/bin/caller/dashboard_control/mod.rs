@@ -522,6 +522,7 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_task"
         | "api_peer_approval"
         | "api_peer_session_control"
+        | "api_peer_session_detail"
         | "api_peer_webrtc_signal"
         | "api_peer_file_transfer_signal"
         | "api_peer_dashboard_control_signal"
@@ -5903,6 +5904,7 @@ mod tests {
             ("api_peer_task", Row, Some(Op::PeerUse)),
             ("api_peer_approval", Row, Some(Op::PeerUse)),
             ("api_peer_session_control", Row, Some(Op::PeerUse)),
+            ("api_peer_session_detail", Row, Some(Op::PeerUse)),
             ("api_peer_add", Row, Some(Op::PeerManage)),
             ("api_peer_remove", Row, Some(Op::PeerManage)),
             ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
@@ -6391,6 +6393,7 @@ mod tests {
             "api_peer_task",
             "api_peer_approval",
             "api_peer_session_control",
+            "api_peer_session_detail",
             "api_peer_webrtc_signal",
             "api_peer_file_transfer_signal",
             "api_peer_dashboard_control_signal",
@@ -6588,6 +6591,7 @@ mod tests {
             "api_peer_task",
             "api_peer_approval",
             "api_peer_session_control",
+            "api_peer_session_detail",
         ] {
             assert_eq!(
                 method_operation(method),

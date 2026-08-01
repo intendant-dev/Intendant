@@ -268,10 +268,12 @@ mod tests {
             session_id: None,
             id: 42,
             command: "rm -rf /tmp".to_string(),
+            category: Some("command_exec".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"approval_required\""));
         assert!(json.contains("\"id\":42"));
+        assert!(json.contains("\"category\":\"command_exec\""));
     }
 
     #[test]

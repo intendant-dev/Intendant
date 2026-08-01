@@ -304,6 +304,10 @@
                   <div class="approval-title">Approval needed</div>
                   <div class="approval-command" id="approval-command"></div>
                   <div class="approval-category" id="approval-category"></div>
+                  <!-- Peer provenance (RC-C2): filled only for approvals
+                       raised on a federated peer — names the target daemon
+                       and the delegation lane the decision will transit. -->
+                  <div class="approval-provenance" id="approval-provenance" hidden></div>
                   <div class="approval-actions">
                     <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
                     <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>

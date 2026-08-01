@@ -726,19 +726,22 @@ function agendaInspGatesHtml(item) {
       ${clear}
     </div>`;
   });
-  const deps = (item.relies_on || []).map((d) => {
-    const target = agendaFindItem(d.target_id);
-    const state = !target ? ['missing', 'rose']
-      : target.status === 'done' ? ['satisfied', 'green']
-        : target.status === 'retired' ? ['retired — review', 'amber']
-          : ['open', 'neutral'];
-    const title = target ? target.title : `${d.target_id.slice(0, 10)}…`;
-    return `<div class="ag2-insp-dep">
-      ${agendaChipHtml(state[0], state[1])}
-      ${target
-    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(target.id)}">waits on “${escapeHtml(title)}”</a>`
-    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(title)}</span>`}
-      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(d.target_id)}" title="Drop the link (the log keeps history)">×</button>
+  // The shared per-prerequisite judgment (ui2-agenda.js): live status
+  // on every link — the delivered-awaiting-Complete distinction, the
+  // in-flight word, and the honest out-of-window degrade (an absent
+  // target on an unblocked item is provably done, never "missing").
+  const deps = agendaPrereqStates(item).map((p) => {
+    const go = p.kind === 'delivered'
+      ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+          title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+      : '';
+    return `<div class="ag2-insp-dep${p.kind === 'delivered' ? ' delivered' : ''}">
+      ${agendaChipHtml(p.status, p.tone, p.detail)}
+      ${p.target
+    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(p.title)}</span>`}
+      ${go}
+      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(p.id)}" title="Drop the link (the log keeps history)">×</button>
     </div>`;
   });
   const empty = !blockers.length && !deps.length

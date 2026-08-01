@@ -1058,8 +1058,21 @@ function stationHandleSessionAction(action) {
         .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
       return;
     }
-    // Anything else (transcript, thread ops, config) still lives on the
-    // peer's own dashboard — no silent no-ops.
+    if (op === 'transcript' && typeof openSessionDetail === 'function') {
+      // RC-C2: the transcript reads HERE, fetched over the federation
+      // link (the Sessions overlay's peer lane); routeTo surfaces it.
+      const peerSession = (daemons.find(d => d.host_id === peerHostId)?.sessions || [])
+        .find(ps => ps.session_id === sessionId);
+      openSessionDetail(
+        { session_id: sessionId, source: peerSession?.source || 'intendant' },
+        null,
+        { hostId: peerHostId }
+      );
+      if (typeof routeTo === 'function') { try { routeTo('sessions'); } catch (_) {} }
+      return;
+    }
+    // Anything else (thread ops, config) still lives on the peer's own
+    // dashboard — no silent no-ops.
     showControlToast?.('info', `${op} for peer sessions happens on ${peerName}'s own dashboard.`);
     return;
   }

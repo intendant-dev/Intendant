@@ -91,6 +91,78 @@ fn websocket_owns_dashboard_control_session(session_ids: &[String], session_id: 
     !session_id.is_empty() && session_ids.iter().any(|owned| owned == session_id)
 }
 
+/// Describe an approval-rail resolution for delegation-lane audit
+/// attribution: `(session_id, approval_id, past-tense verb)` — or `None`
+/// for every other control message.
+///
+/// When a federated daemon resolves an approval over its peer `/ws`
+/// connection, the actor the audit trail must name is that daemon: the
+/// delegation lane spends the intermediary's peer grant, and this target
+/// cannot see which human (if any) sat behind it (trust-tiers doctrine —
+/// audit names the daemon, not the person). The generic journal entries
+/// (`approval` / `approval_resolved`) record the decision without a
+/// decider, so without the attribution note a peer-decided approval is
+/// indistinguishable from a locally decided one. Metadata only: the
+/// per-action authority gates ran before the caller consults this.
+fn peer_approval_attribution(ctrl: &ControlMsg) -> Option<(Option<String>, u64, &'static str)> {
+    match ctrl {
+        ControlMsg::Approve { session_id, id } => Some((session_id.clone(), *id, "approved")),
+        ControlMsg::Deny { session_id, id } => Some((session_id.clone(), *id, "denied")),
+        ControlMsg::Skip { session_id, id } => Some((session_id.clone(), *id, "skipped")),
+        ControlMsg::ApproveAll { session_id, id } => Some((
+            session_id.clone(),
+            *id,
+            "approved (with session auto-approve)",
+        )),
+        ControlMsg::AnswerQuestion { session_id, id, .. } => {
+            Some((session_id.clone(), *id, "answered"))
+        }
+        _ => None,
+    }
+}
+
+/// Emit the delegation-lane attribution for a peer-resolved approval:
+/// an Info presence-log line always, plus a persisted session note when
+/// the resolution names its session (the note renders in that session's
+/// Timeline and survives into replay). Split from the inbound loop so
+/// the emission is unit-testable without a WS lifecycle.
+fn emit_peer_approval_attribution(
+    bus: &EventBus,
+    identity: &PeerConnectionIdentity,
+    ctrl: &ControlMsg,
+) {
+    let Some((session_id, id, verbed)) = peer_approval_attribution(ctrl) else {
+        return;
+    };
+    let fp8: String = identity.fingerprint.chars().take(8).collect();
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[ws] approval {id} {verbed} via peer daemon '{}' ({fp8}) — delegation lane",
+            identity.label,
+        ),
+        level: Some(LogLevel::Info),
+        turn: None,
+    });
+    if let Some(session_id) = session_id {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        bus.send(AppEvent::SessionNote {
+            session_id: Some(session_id),
+            note_id: format!("peer-approval-{id}-{ts}"),
+            text: format!(
+                "Approval #{id} {verbed} via peer daemon '{}' — delegation lane: the \
+                 decision transited that daemon's peer grant, not a local operator.",
+                identity.label,
+            ),
+            attachments: Vec::new(),
+            source: Some(format!("peer:{}", identity.label)),
+            ts,
+        });
+    }
+}
+
 /// Bind the display-holder predicate to the exact IAM/peer grant and WebSocket
 /// lifetime that admitted this browser. The display queue retains this guard
 /// and checks it again immediately before injection, so buffered input dies on
@@ -2571,6 +2643,9 @@ pub(crate) async fn ws_inbound_task(
                                     level: Some(LogLevel::Debug),
                                     turn: None,
                                 });
+                                if let Some(identity) = peer_identity_inbound.as_ref() {
+                                    emit_peer_approval_attribution(&bus_inbound, identity, &ctrl);
+                                }
                                 bus_inbound.send(AppEvent::ControlCommand(ctrl));
                             }
                             Err(e) => {
@@ -3352,5 +3427,108 @@ mod outbound_bootstrap_ordering_tests {
         assert_eq!(live["state"], "other");
 
         h.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod peer_approval_attribution_tests {
+    use super::*;
+
+    fn identity(label: &str) -> PeerConnectionIdentity {
+        PeerConnectionIdentity {
+            fingerprint: "aabbccddeeff00112233".to_string(),
+            label: label.to_string(),
+            profile: "peer-root".to_string(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            record: None,
+        }
+    }
+
+    /// A peer-resolved approval emits the delegation-lane attribution:
+    /// an Info presence-log line naming the peer daemon, plus a
+    /// persisted session note when the resolution names its session.
+    #[tokio::test]
+    async fn peer_resolved_approval_emits_attribution_log_and_note() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        emit_peer_approval_attribution(
+            &bus,
+            &identity("workshop-mac"),
+            &ControlMsg::Approve {
+                session_id: Some("sess-1".to_string()),
+                id: 42,
+            },
+        );
+        let log = rx.try_recv().expect("presence log emitted");
+        match log {
+            AppEvent::PresenceLog { message, level, .. } => {
+                assert!(message.contains("approval 42 approved"), "{message}");
+                assert!(message.contains("workshop-mac"), "{message}");
+                assert!(message.contains("delegation lane"), "{message}");
+                assert_eq!(level, Some(LogLevel::Info));
+            }
+            other => panic!("expected PresenceLog, got {other:?}"),
+        }
+        let note = rx.try_recv().expect("session note emitted");
+        match note {
+            AppEvent::SessionNote {
+                session_id,
+                text,
+                source,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert!(text.contains("Approval #42 approved"), "{text}");
+                assert!(text.contains("peer daemon 'workshop-mac'"), "{text}");
+                assert!(text.contains("peer grant"), "{text}");
+                assert_eq!(source.as_deref(), Some("peer:workshop-mac"));
+            }
+            other => panic!("expected SessionNote, got {other:?}"),
+        }
+    }
+
+    /// A session-less resolution still logs the decider, but posts no
+    /// session note (there is no session journal to attribute it to).
+    #[tokio::test]
+    async fn sessionless_resolution_logs_without_note() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        emit_peer_approval_attribution(
+            &bus,
+            &identity("workshop-mac"),
+            &ControlMsg::Deny {
+                session_id: None,
+                id: 7,
+            },
+        );
+        assert!(matches!(
+            rx.try_recv().expect("presence log emitted"),
+            AppEvent::PresenceLog { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no session note for a session-less resolution"
+        );
+    }
+
+    /// Non-approval control messages emit nothing — the attribution
+    /// lane is scoped to the approval rail.
+    #[tokio::test]
+    async fn non_approval_control_msgs_emit_nothing() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        emit_peer_approval_attribution(&bus, &identity("workshop-mac"), &ControlMsg::Usage);
+        emit_peer_approval_attribution(
+            &bus,
+            &identity("workshop-mac"),
+            &ControlMsg::Interrupt {
+                session_id: None,
+                expected_turn: None,
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no attribution for non-approval msgs"
+        );
     }
 }

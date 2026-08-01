@@ -1411,6 +1411,41 @@ html.ui-v2 #tab-sessions .sd-meta-strip {
 html.ui-v2 #tab-sessions .sd-meta-strip .label { color: var(--text-3); }
 html.ui-v2 #tab-sessions .sd-meta-strip .value { color: var(--text-2); }
 
+/* Peer transcript provenance banner (RC-C2): explicit target
+   provenance on every peer view — who governs the transcript, over
+   which link class, and how fresh the snapshot is. */
+html.ui-v2 #tab-sessions .session-detail-peer-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 6px 0 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-2, var(--surface-3));
+  border-radius: var(--r-card, 8px);
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-who { font-weight: 600; color: var(--text); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-link-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2, var(--surface-3));
+  color: var(--text-3);
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner .sd-peer-status[data-state="error"] { color: var(--red, #d66); }
+html.ui-v2 #tab-sessions .session-detail-peer-banner button {
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+html.ui-v2 #tab-sessions .session-detail-peer-banner button.sd-peer-external { margin-left: 0; }
+
 /* Detail actions: Resume leads (accent), Configure/Rename quiet. */
 html.ui-v2 #tab-sessions .session-detail-action-btn {
   padding: 6px 13px;
