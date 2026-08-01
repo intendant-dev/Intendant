@@ -340,6 +340,39 @@ pub(crate) fn scan_store_candidates(
     watershed_secs: u64,
     live_wrapper_ids: &HashSet<String>,
 ) -> Vec<ReadoptCandidate> {
+    scan_midwork_candidates(home, live_wrapper_ids, |activity_secs| {
+        activity_secs < watershed_secs // current boot's era is not the dead boot's
+    })
+}
+
+/// Enumerate the mid-work sessions a dead DRAINING predecessor released
+/// (the predecessor-exit watch's scan). The era line inverts the boot
+/// pass's: candidacy requires the session's story to have FROZEN
+/// at-or-before the exit instant. A session a live co-homed daemon is
+/// driving keeps advancing its transcript, so after the settle window it
+/// sits past the bound and never becomes a candidate — the same
+/// anti-theft role the boot watershed plays at boot. (On the takeover
+/// topology the successor's boot pass never enumerated at all — it was
+/// a secondary at spawn instant — so this scan carries no lower era
+/// bound: the staleness guard in the ladder draws the archaeology line.)
+pub(crate) fn scan_released_candidates(
+    home: &Path,
+    released_before_secs: u64,
+    live_wrapper_ids: &HashSet<String>,
+) -> Vec<ReadoptCandidate> {
+    scan_midwork_candidates(home, live_wrapper_ids, |activity_secs| {
+        activity_secs <= released_before_secs
+    })
+}
+
+/// The shared store walk behind [`scan_store_candidates`] and
+/// [`scan_released_candidates`] — ONE reader of the mid-work vocabulary,
+/// two era lines.
+fn scan_midwork_candidates(
+    home: &Path,
+    live_wrapper_ids: &HashSet<String>,
+    era_keeps: impl Fn(u64) -> bool,
+) -> Vec<ReadoptCandidate> {
     let logs_dir = crate::platform::intendant_home_in(home).join("logs");
     let Ok(entries) = std::fs::read_dir(&logs_dir) else {
         return Vec::new();
@@ -361,8 +394,8 @@ pub(crate) fn scan_store_candidates(
             continue;
         }
         let activity_secs = activity_mtime_secs(&dir);
-        if activity_secs >= watershed_secs {
-            continue; // current boot's era — not the dead boot's
+        if !era_keeps(activity_secs) {
+            continue;
         }
         let Some(class) = midwork_class(&meta) else {
             continue; // idle in, idle out
@@ -870,6 +903,84 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "idle/done sessions stay down: {candidates:?}"
+        );
+    }
+
+    /// The released-set scan (the predecessor-exit watch): candidacy
+    /// requires the story to have FROZEN at-or-before the exit instant.
+    /// Frozen mid-work qualifies; a session still advancing (a live
+    /// co-homed daemon is driving it) sits past the bound and never
+    /// does; idle-in-idle-out and live-on-this-daemon skips hold.
+    #[test]
+    fn released_scan_keeps_frozen_midwork_only() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta(home.path(), "sess-released", "interrupted", None);
+        write_meta(home.path(), "sess-done", "completed", None);
+        write_meta(
+            home.path(),
+            "sess-parked",
+            "idle",
+            Some(SessionLimitParkMeta {
+                resets_at_epoch: Some(now_secs() + 600),
+                has_pending: true,
+            }),
+        );
+
+        // Exit instant in the future: every on-disk story is frozen
+        // at-or-before it.
+        let frozen = scan_released_candidates(home.path(), u64::MAX, &HashSet::new());
+        let ids: Vec<&str> = frozen
+            .iter()
+            .map(|candidate| candidate.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"sess-released"),
+            "frozen mid-turn is released mid-work"
+        );
+        assert!(
+            ids.contains(&"sess-parked"),
+            "frozen limit-park is released mid-work"
+        );
+        assert!(!ids.contains(&"sess-done"), "idle in, idle out");
+
+        // Exit instant at epoch zero: everything on disk advanced past
+        // it — still being written, i.e. still driven; never a candidate.
+        assert!(
+            scan_released_candidates(home.path(), 0, &HashSet::new()).is_empty(),
+            "a story that advanced past the exit instant is being driven"
+        );
+
+        // Live on THIS daemon: excluded whatever the meta says.
+        let live: HashSet<String> = ["sess-released".to_string()].into_iter().collect();
+        assert!(!scan_released_candidates(home.path(), u64::MAX, &live)
+            .iter()
+            .any(|candidate| candidate.session_id == "sess-released"));
+    }
+
+    /// The released summary is the handover-pickup story, not crash
+    /// recovery: its own notification key (per predecessor boot) and a
+    /// title naming the exit.
+    #[test]
+    fn released_summary_names_the_handover_pickup() {
+        let confirmed = vec![("aaaaaaaa-1111".to_string(), MidWorkClass::LimitPark)];
+        match released_summary_notification("pred-boot", &confirmed, &[], &[]) {
+            Some(AppEvent::UserNotification {
+                id, title, text, ..
+            }) => {
+                assert_eq!(id, "released-readopt-pred-boot");
+                let title = title.expect("titled");
+                assert!(
+                    title.contains("Draining daemon exited"),
+                    "the pickup story leads: {title}"
+                );
+                assert!(title.contains("1 released session(s) readopted"));
+                assert!(text.contains("aaaaaaaa"));
+            }
+            other => panic!("expected one UserNotification, got {other:?}"),
+        }
+        assert!(
+            released_summary_notification("pred-boot", &[], &[], &[]).is_none(),
+            "a clean release stays silent"
         );
     }
 
@@ -2046,4 +2157,293 @@ async fn fetch_live_wrapper_ids_with_retry() -> Option<HashSet<String>> {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     None
+}
+
+/// Settle window between a predecessor-exit edge and the scoped scan:
+/// [`scan_released_candidates`] keeps only sessions whose story froze
+/// at-or-before the exit instant, and the settle lets any session a
+/// live co-homed daemon is actively driving advance past that bound
+/// first (activity granularity is seconds). The daemon branch passes
+/// this; tests pass zero.
+pub(crate) const RELEASED_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The successor's half of spare-under-takeover (the drain-holdout
+/// commission's post-drain readopt gap): sessions a draining
+/// predecessor still holds are spared at this daemon's boot — on the
+/// takeover topology the boot pass doesn't even enumerate, because the
+/// successor is still a secondary at spawn instant — and RELEASED only
+/// when the drainer's process exits, possibly hours later. Nothing
+/// re-scanned at that moment, so released mid-work sessions sat
+/// unadopted until the next daemon restart (the 2026-07-31 specimen).
+///
+/// The trigger is edge-INDEPENDENT by design: each probe (lease-poll
+/// cadence) adjudicates, once per boot id, every co-homed presence
+/// record whose boot is provably dead (`boot_id_is_live` false — the
+/// per-boot lock is the liveness truth; the state JSON is display) and
+/// whose last recorded state carries the drain lineage (`draining` — a
+/// drainer killed mid-drain — or `exited`, the graceful drain
+/// terminal). The frozen-story bound is the record file's mtime:
+/// `mark_exited` rewrites the record at the exit instant, and a killed
+/// drainer's last wait-set write approximates its death. (Requiring a
+/// live-draining observation before the exit edge was the earlier
+/// shape; it structurally missed drains shorter than a poll, crashed
+/// drainers, and drainers that exited while this daemon was down or
+/// still arming — the exact gap class this watch exists to close.)
+///
+/// An exit found while this daemon is not the holder stays pending —
+/// adopting as a secondary would race the real holder's own pass — and
+/// is consumed on the first probe where holdership holds. A draining
+/// self ends the watch: drain is one-way, and a drainer never spawns
+/// work.
+pub(crate) async fn run_predecessor_exit_watch(
+    home: PathBuf,
+    bus: EventBus,
+    handover: std::sync::Arc<HandoverRuntime>,
+    enabled: bool,
+    dispatch_spacing: std::time::Duration,
+    settle: std::time::Duration,
+) {
+    if !enabled {
+        // The boot pass already logged the disable — one line per boot.
+        return;
+    }
+    let interval = crate::handover::lease_poll_interval();
+    eprintln!(
+        "[readopt] predecessor-exit watch armed (poll {}ms)",
+        interval.as_millis()
+    );
+    let mut pending_exits: Vec<(String, u64)> = Vec::new();
+    let mut adjudicated: HashSet<String> = HashSet::new();
+    loop {
+        tokio::time::sleep(interval).await;
+        if handover.is_draining() {
+            return;
+        }
+        let state_root = handover.state_root();
+        for record in crate::handover::read_presence_records(state_root) {
+            if record.boot_id == handover.boot_id()
+                || adjudicated.contains(&record.boot_id)
+                || pending_exits
+                    .iter()
+                    .any(|(boot, _)| *boot == record.boot_id)
+                || !matches!(record.state.as_str(), "draining" | "exited")
+                || crate::handover::boot_id_is_live(state_root, &record.boot_id)
+            {
+                continue;
+            }
+            // Dead, with drain lineage: the released set froze no later
+            // than the record's last rewrite (the exit stamp).
+            let record_path = state_root
+                .join("daemons")
+                .join(format!("{}.json", record.boot_id));
+            let exit_secs = std::fs::metadata(&record_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+                .unwrap_or_else(crate::session_activity::epoch_seconds);
+            eprintln!(
+                "[readopt] drained co-homed daemon {} is gone (last state {}) — \
+                 adjudicating its released set",
+                short_id(&record.boot_id),
+                record.state
+            );
+            pending_exits.push((record.boot_id, exit_secs));
+        }
+        if pending_exits.is_empty() || !handover.is_holder() {
+            continue;
+        }
+        for (boot_id, exit_secs) in std::mem::take(&mut pending_exits) {
+            adjudicated.insert(boot_id.clone());
+            if !settle.is_zero() {
+                tokio::time::sleep(settle).await;
+            }
+            if handover.is_draining() {
+                return;
+            }
+            let live: HashSet<String> =
+                crate::session_supervisor::published_live_session_registry()
+                    .and_then(|registry| registry.live_wrapper_ids())
+                    .unwrap_or_default();
+            run_released_readopt_pass(
+                &home,
+                &bus,
+                &handover,
+                dispatch_spacing,
+                &boot_id,
+                exit_secs,
+                &live,
+            )
+            .await;
+        }
+    }
+}
+
+/// One scoped readopt pass over the set a dead draining predecessor
+/// released: the store's mid-work sessions whose story froze
+/// at-or-before the exit instant, minus everything live on THIS daemon.
+/// The rails are the boot pass's, through the same shared functions —
+/// `midwork_class` (the one durable vocabulary), `decide_candidate`
+/// (Resume-not-Revive, owner-stop tombstones, staleness, live-tip
+/// refusals), the per-pass cap, one-resume-per-conversation dedupe, the
+/// dispatch stagger with the drain-mid-pass cut, and
+/// dispatches-are-not-outcomes verification. The summary names the
+/// predecessor so the owner can tell a handover pickup from crash
+/// recovery.
+async fn run_released_readopt_pass(
+    home: &Path,
+    bus: &EventBus,
+    handover: &HandoverRuntime,
+    dispatch_spacing: std::time::Duration,
+    predecessor_boot_id: &str,
+    released_before_secs: u64,
+    live: &HashSet<String>,
+) {
+    let candidates = scan_released_candidates(home, released_before_secs, live);
+    if candidates.is_empty() {
+        eprintln!(
+            "[readopt] draining daemon {} exited — nothing released mid-work",
+            short_id(predecessor_boot_id)
+        );
+        return;
+    }
+    let now_secs = crate::session_activity::epoch_seconds();
+    let mut dispatched: Vec<ReadoptDispatch> = Vec::new();
+    let mut dispatched_conversations: HashSet<(String, String)> = HashSet::new();
+    let mut left_dead: Vec<(String, String)> = Vec::new();
+    let mut draining_cut = false;
+    for candidate in candidates {
+        if draining_cut {
+            left_dead.push((
+                candidate.session_id,
+                "daemon began draining mid-pass".to_string(),
+            ));
+            continue;
+        }
+        if dispatched.len() >= READOPT_MAX_PER_BOOT {
+            left_dead.push((
+                candidate.session_id,
+                format!("per-pass readopt cap ({READOPT_MAX_PER_BOOT}) reached"),
+            ));
+            continue;
+        }
+        match decide_candidate(home, &candidate, now_secs, live) {
+            ReadoptDecision::Readopt(resume) => {
+                if let ControlMsg::ResumeSession {
+                    source, session_id, ..
+                } = resume.as_ref()
+                {
+                    if !dispatched_conversations.insert((source.clone(), session_id.clone())) {
+                        let reason =
+                            "already continued — its lineage's resume was dispatched this pass"
+                                .to_string();
+                        eprintln!(
+                            "[readopt] leaving {} dead: {reason}",
+                            short_id(&candidate.session_id)
+                        );
+                        left_dead.push((candidate.session_id, reason));
+                        continue;
+                    }
+                }
+                // Same stagger discipline as the boot pass: continuation
+                // cold-starts land one at a time, and a drain that began
+                // during the wait cuts the pass honestly.
+                if !dispatched.is_empty() && !dispatch_spacing.is_zero() {
+                    tokio::time::sleep(dispatch_spacing).await;
+                    if handover.is_draining() {
+                        draining_cut = true;
+                        left_dead.push((
+                            candidate.session_id,
+                            "daemon began draining mid-pass".to_string(),
+                        ));
+                        continue;
+                    }
+                }
+                eprintln!(
+                    "[readopt] resuming {} ({}) — released when draining daemon {} exited",
+                    short_id(&candidate.session_id),
+                    candidate.class.label(),
+                    short_id(predecessor_boot_id)
+                );
+                bus.send(AppEvent::ControlCommand(*resume));
+                dispatched.push(ReadoptDispatch {
+                    session_id: candidate.session_id,
+                    class: candidate.class,
+                });
+            }
+            ReadoptDecision::LeftDead(reason) => {
+                eprintln!(
+                    "[readopt] leaving {} dead: {reason}",
+                    short_id(&candidate.session_id)
+                );
+                left_dead.push((candidate.session_id, reason));
+            }
+        }
+    }
+    // Dispatches are not outcomes — the same verify window and honest
+    // reclassification as the boot pass.
+    let live_after = if dispatched.is_empty() {
+        None
+    } else {
+        tokio::time::sleep(READOPT_VERIFY_WINDOW).await;
+        fetch_live_wrapper_ids_with_retry().await
+    };
+    let outcomes = if dispatched.is_empty() {
+        VerifiedOutcomes::default()
+    } else {
+        let outcomes = verify_dispatches(home, &dispatched, live_after.as_ref());
+        for (id, _) in &outcomes.confirmed {
+            eprintln!(
+                "[readopt] confirmed {} alive after the verify window",
+                short_id(id)
+            );
+        }
+        for (id, reason) in &outcomes.died {
+            eprintln!("[readopt] reclassifying {}: {reason}", short_id(id));
+        }
+        outcomes
+    };
+    if let Some(notification) = released_summary_notification(
+        predecessor_boot_id,
+        &outcomes.confirmed,
+        &outcomes.died,
+        &left_dead,
+    ) {
+        bus.send(notification);
+    }
+}
+
+/// The released-set summary: [`summary_notification`]'s body with the
+/// handover provenance — keyed per predecessor boot so repeats never
+/// stack, titled as a pickup after a predecessor's exit rather than
+/// crash recovery (the owner should know which story happened).
+pub(crate) fn released_summary_notification(
+    predecessor_boot_id: &str,
+    confirmed: &[(String, MidWorkClass)],
+    died: &[(String, String)],
+    left_dead: &[(String, String)],
+) -> Option<AppEvent> {
+    let base = summary_notification(predecessor_boot_id, confirmed, died, left_dead)?;
+    let AppEvent::UserNotification {
+        text, urgency, ts, ..
+    } = base
+    else {
+        return None;
+    };
+    let mut title = format!(
+        "Draining daemon exited: {} released session(s) readopted",
+        confirmed.len()
+    );
+    if !died.is_empty() {
+        title.push_str(&format!(", {} resume(s) died", died.len()));
+    }
+    title.push_str(&format!(", {} left dead", left_dead.len()));
+    Some(AppEvent::UserNotification {
+        session_id: None,
+        id: format!("released-readopt-{predecessor_boot_id}"),
+        title: Some(title),
+        text,
+        urgency,
+        ts,
+    })
 }

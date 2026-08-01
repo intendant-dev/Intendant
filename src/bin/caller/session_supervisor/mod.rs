@@ -116,7 +116,27 @@ pub struct SessionSupervisor {
     /// bodies and the commands deferred behind them (see exec.rs and
     /// `dispatch_control_msg`).
     exec: Arc<exec::IntakeExecutor>,
+    /// Drain wait-set memo (see [`DrainWaitMemo`]): the exit check runs
+    /// on every bus event while draining, and the named holdout rows it
+    /// reports read durable meta — this gates the rebuild to real
+    /// changes plus a slow refresh beat.
+    drain_wait_memo: Arc<std::sync::Mutex<DrainWaitMemo>>,
 }
+
+/// Last reported drain wait set: its (session id, phase) fingerprint and
+/// when the rows were last rebuilt. Limit-park marker edges ride phase
+/// edges (parking and releasing both emit a status update), so the
+/// fingerprint catches every ordinary change; [`DRAIN_WAIT_REFRESH`]
+/// catches a marker whose durable write landed just after its phase
+/// event was observed.
+#[derive(Default)]
+struct DrainWaitMemo {
+    fingerprint: Vec<(String, String)>,
+    reported_at: Option<std::time::Instant>,
+}
+
+/// Refresh beat for the drain wait-set rows when nothing else changed.
+const DRAIN_WAIT_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The foreground web shape needs session supervision before its primary
 /// task ends (for parallel create/resume/fork requests), but must leave
@@ -714,6 +734,7 @@ impl SessionSupervisor {
             config: Arc::new(config),
             state: Arc::new(AsyncMutex::new(SupervisorState::default())),
             exec: exec::IntakeExecutor::new(),
+            drain_wait_memo: Arc::new(std::sync::Mutex::new(DrainWaitMemo::default())),
         }
     }
 
@@ -890,10 +911,15 @@ impl SessionSupervisor {
     /// every drain behind them forever. An `idle` session still holds
     /// (it may be pre-first-turn, or mid-conversation awaiting the
     /// owner — the intake's "steer or stop stragglers" lane); parked
-    /// conversations stay resumable on the successor. Mirrors the
-    /// holding count onto the presence record each check ("draining ·
-    /// N sessions"), and records the terminal `exited` presence state
-    /// when satisfied.
+    /// conversations stay resumable on the successor. A LIMIT-PARKED
+    /// wrapper also holds — for as long as its in-memory park runs
+    /// (potentially hours) — which is exactly why the wait set is
+    /// NAMED: the holdout rows (with each session's durable
+    /// `limit_park` marker) reach the status surface and the presence
+    /// record via [`HandoverRuntime::set_drain_wait_set`], so every
+    /// drain surface can say WHO holds and until WHEN instead of
+    /// rendering a silent banner. Records the terminal `exited`
+    /// presence state when satisfied.
     async fn drain_exit_ready(&self) -> bool {
         let Some(runtime) = self.config.handover.as_ref() else {
             return false;
@@ -901,16 +927,52 @@ impl SessionSupervisor {
         if !runtime.is_draining() {
             return false;
         }
-        let holding = self
+        let holding: Vec<(String, String, Option<String>, String, PathBuf)> = self
             .state
             .lock()
             .await
             .sessions
             .values()
             .filter(|session| session.phase != "done")
-            .count();
-        runtime.set_session_count(holding as u64);
-        if holding > 0 || self.exec.latest_pending_heavy_key().is_some() {
+            .map(|session| {
+                (
+                    session.session_id.clone(),
+                    session.source.clone(),
+                    session.name.clone(),
+                    session.phase.clone(),
+                    session.session_dir.clone(),
+                )
+            })
+            .collect();
+        // Rebuild + report the named rows only when the set moved or the
+        // refresh beat elapsed: this check runs per bus event, and the
+        // marker resolution reads each holding session's durable meta.
+        let rebuild = {
+            let mut memo = match self.drain_wait_memo.lock() {
+                Ok(memo) => memo,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let mut fingerprint: Vec<(String, String)> = holding
+                .iter()
+                .map(|(id, _, _, phase, _)| (id.clone(), phase.clone()))
+                .collect();
+            fingerprint.sort();
+            if memo.fingerprint != fingerprint
+                || memo
+                    .reported_at
+                    .is_none_or(|at| at.elapsed() >= DRAIN_WAIT_REFRESH)
+            {
+                memo.fingerprint = fingerprint;
+                memo.reported_at = Some(std::time::Instant::now());
+                true
+            } else {
+                false
+            }
+        };
+        if rebuild {
+            runtime.set_drain_wait_set(drain_holdout_rows(&holding));
+        }
+        if !holding.is_empty() || self.exec.latest_pending_heavy_key().is_some() {
             return false;
         }
         // Intake §3.3's exit parenthetical (the HS3 ruling's N5): a
@@ -978,6 +1040,44 @@ impl SessionSupervisor {
         )
         .await
     }
+}
+
+/// The named drain wait set: one row per holding session, with the
+/// durable limit-park marker resolved from its `session_meta.json` —
+/// "parked until T" is decisive information (an in-memory park can hold
+/// the drain for hours), so the reset instant must reach every surface
+/// that renders the drain. Parked rows sort first (earliest reset
+/// leading) so capped renders keep the decisive ones; the rest keep id
+/// order for stable rendering.
+fn drain_holdout_rows(
+    holding: &[(String, String, Option<String>, String, PathBuf)],
+) -> Vec<crate::handover::DrainHoldout> {
+    let mut rows: Vec<crate::handover::DrainHoldout> = holding
+        .iter()
+        .map(|(session_id, source, name, phase, session_dir)| {
+            let limit_park = std::fs::read_to_string(session_dir.join("session_meta.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<session_log::SessionMeta>(&raw).ok())
+                .and_then(|meta| meta.limit_park);
+            crate::handover::DrainHoldout {
+                session_id: session_id.clone(),
+                source: source.clone(),
+                name: name.clone(),
+                phase: normalize_supervisor_phase(phase),
+                limit_park,
+            }
+        })
+        .collect();
+    let park_key = |row: &crate::handover::DrainHoldout| match &row.limit_park {
+        Some(park) => (0u8, park.resets_at_epoch.unwrap_or(u64::MAX)),
+        None => (1u8, 0),
+    };
+    rows.sort_by(|a, b| {
+        park_key(a)
+            .cmp(&park_key(b))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    rows
 }
 
 fn normalize_supervisor_phase(phase: &str) -> String {
@@ -1207,7 +1307,10 @@ mod tests {
 
     /// Track HS3: the exit condition — draining with zero live sessions
     /// (and no launch body in flight) is ready; a live session holds the
-    /// daemon open and mirrors its count onto the presence record.
+    /// daemon open and the NAMED wait set — each holdout with its phase
+    /// and durable limit-park marker — reaches the status surface and
+    /// the presence record (the drain-holdout-honesty commission: the
+    /// banner must say WHO holds and until WHEN, never wait silently).
     #[tokio::test]
     async fn drain_exit_readiness_follows_live_sessions() {
         let home = tempfile::tempdir().unwrap();
@@ -1230,20 +1333,119 @@ mod tests {
             runtime.request_drain(None),
             crate::handover::DrainRequest::Entered
         );
-        supervisor
-            .state
-            .lock()
-            .await
-            .sessions
-            .insert("s-1".to_string(), managed_session("s-1", "intendant"));
+        let parked_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            parked_dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "s-1",
+                "created_at": "2026-08-01 09:00:00",
+                "status": "running",
+                "limit_park": {"resets_at_epoch": 1_754_000_000_u64, "has_pending": true},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut parked = managed_session("s-1", "claude-code");
+            parked.name = Some("nightly build".to_string());
+            parked.phase = "waiting_rate_limit".to_string();
+            parked.session_dir = parked_dir.path().to_path_buf();
+            state.sessions.insert("s-1".to_string(), parked);
+        }
         assert!(
             !supervisor.drain_exit_ready().await,
             "a live supervised session holds the drainer open"
         );
+        let status = runtime.status_json();
+        assert_eq!(status["holdouts"][0]["session_id"], "s-1");
+        assert_eq!(status["holdouts"][0]["source"], "claude-code");
+        assert_eq!(status["holdouts"][0]["name"], "nightly build");
+        assert_eq!(status["holdouts"][0]["phase"], "waiting_rate_limit");
+        assert_eq!(
+            status["holdouts"][0]["limit_park"]["resets_at_epoch"], 1_754_000_000_u64,
+            "the parked-until instant is the decisive fact — it must reach the surface"
+        );
+        let record = crate::handover::read_presence_records(home.path())
+            .into_iter()
+            .find(|record| record.state == "draining")
+            .expect("draining presence record");
+        assert_eq!(record.session_count, Some(1));
+        assert_eq!(
+            record.holdouts.as_ref().map(Vec::len),
+            Some(1),
+            "the successor-side channel carries the named rows"
+        );
+
         supervisor.state.lock().await.sessions.remove("s-1");
         assert!(
             supervisor.drain_exit_ready().await,
             "last session gone ⇒ graceful exit"
+        );
+        assert_eq!(
+            runtime.status_json()["holdouts"].as_array().map(Vec::len),
+            Some(0),
+            "an emptied wait set reports empty, never stale rows"
+        );
+    }
+
+    /// Parked holdouts sort first (earliest reset leading) so capped
+    /// renders keep the decisive rows; phases normalize; a dir with no
+    /// meta yields an honest markerless row rather than being dropped.
+    #[test]
+    fn drain_holdout_rows_resolve_markers_and_sort_parked_first() {
+        let write_meta = |resets_at: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": "x",
+                    "created_at": "2026-08-01 09:00:00",
+                    "limit_park": {"resets_at_epoch": resets_at, "has_pending": true},
+                })
+                .to_string(),
+            )
+            .unwrap();
+            dir
+        };
+        let late = write_meta(2_000);
+        let early = write_meta(1_000);
+        let rows = drain_holdout_rows(&[
+            (
+                "s-plain".to_string(),
+                "codex".to_string(),
+                None,
+                "Running-Agent".to_string(),
+                PathBuf::from("/nonexistent/session-dir"),
+            ),
+            (
+                "s-late".to_string(),
+                "claude-code".to_string(),
+                None,
+                "waiting_rate_limit".to_string(),
+                late.path().to_path_buf(),
+            ),
+            (
+                "s-early".to_string(),
+                "claude-code".to_string(),
+                Some("weekly digest".to_string()),
+                "waiting_rate_limit".to_string(),
+                early.path().to_path_buf(),
+            ),
+        ]);
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s-early", "s-late", "s-plain"]);
+        assert_eq!(
+            rows[0]
+                .limit_park
+                .as_ref()
+                .and_then(|park| park.resets_at_epoch),
+            Some(1_000)
+        );
+        assert_eq!(rows[2].limit_park, None);
+        assert_eq!(
+            rows[2].phase, "running",
+            "phases normalize for stable rendering"
         );
     }
 

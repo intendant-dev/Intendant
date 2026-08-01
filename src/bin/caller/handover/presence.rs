@@ -31,6 +31,32 @@ pub(crate) const DAEMONS_DIR: &str = "daemons";
 /// the create→lock→write window is microseconds.
 const UNPAIRED_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// One session still holding a drain open — the wait set the drain
+/// banner names. `limit_park` mirrors the session's durable marker
+/// (`SessionMeta::limit_park`): a parked-until-T holdout is decisive
+/// information (an in-memory park can hold the drain for hours), so the
+/// reset instant rides to every surface that renders the drain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DrainHoldout {
+    pub(crate) session_id: String,
+    /// Backend short-str (`claude-code`, `codex`, `intendant`, …) —
+    /// display currency.
+    pub(crate) source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    /// The supervisor's normalized phase (`running`, `idle`,
+    /// `waiting_rate_limit`, …). Readers must tolerate future phases.
+    pub(crate) phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limit_park: Option<crate::session_log::SessionLimitParkMeta>,
+}
+
+/// Presence-record cap on mirrored holdout rows: the record is a small
+/// display file read by every co-homed boot's status pass, and
+/// `session_count` carries the full truth — truncated renders say "and
+/// N more" from the difference.
+pub(crate) const PRESENCE_HOLDOUT_ROWS_CAP: usize = 16;
+
 /// `<boot_id>.json` — one daemon boot's self-description.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PresenceRecord {
@@ -46,6 +72,13 @@ pub(crate) struct PresenceRecord {
     /// absent = not reported, never "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_count: Option<u64>,
+    /// While draining: the sessions still holding the drain open, capped
+    /// at [`PRESENCE_HOLDOUT_ROWS_CAP`] rows (`session_count` stays the
+    /// full count) — the successor-side banner's only channel to NAME
+    /// the wait set. Absent = not reported. Additive: records written
+    /// before 2026-08 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) holdouts: Option<Vec<DrainHoldout>>,
     /// The REGISTRATION instant — the era watershed
     /// (`grid_envelope::resolve_current_boot` reads it as boot-start to
     /// split current-boot sessions from outage residue, the #638 class).
@@ -102,6 +135,7 @@ impl DaemonPresence {
             version: BuildVersion::current(),
             state: "running".to_string(),
             session_count: None,
+            holdouts: None,
             updated_ms: super::now_ms(),
         };
         let presence = DaemonPresence {
@@ -132,16 +166,25 @@ impl DaemonPresence {
         self.write_record()
     }
 
-    /// Rewrite this boot's record with the live supervised-session count
-    /// (the drain views' "draining · N sessions" source). Write-on-change
-    /// only — the drain exit check runs per supervisor event, and an
-    /// unchanged count must not churn the file. Never advances the era
-    /// watershed (F1).
-    pub(crate) fn update_session_count(&mut self, count: u64) -> std::io::Result<()> {
-        if self.record.session_count == Some(count) {
+    /// Rewrite this boot's record with the drain wait set: the live
+    /// supervised-session count (the drain views' "draining · N
+    /// sessions" source) plus the holdout rows themselves, capped at
+    /// [`PRESENCE_HOLDOUT_ROWS_CAP`]. Write-on-change only — the drain
+    /// exit check runs per supervisor event, and an unchanged set must
+    /// not churn the file. Never advances the era watershed (F1).
+    pub(crate) fn update_drain_wait_set(
+        &mut self,
+        count: u64,
+        holdouts: &[DrainHoldout],
+    ) -> std::io::Result<()> {
+        let capped = &holdouts[..holdouts.len().min(PRESENCE_HOLDOUT_ROWS_CAP)];
+        if self.record.session_count == Some(count)
+            && self.record.holdouts.as_deref() == Some(capped)
+        {
             return Ok(());
         }
         self.record.session_count = Some(count);
+        self.record.holdouts = Some(capped.to_vec());
         self.write_record()
     }
 
@@ -290,9 +333,23 @@ mod tests {
         };
         let watershed = read()["updated_ms"].as_u64().expect("registration instant");
 
+        let parked = DrainHoldout {
+            session_id: "sess-parked-1".to_string(),
+            source: "claude-code".to_string(),
+            name: Some("nightly build".to_string()),
+            phase: "waiting_rate_limit".to_string(),
+            limit_park: Some(crate::session_log::SessionLimitParkMeta {
+                resets_at_epoch: Some(1_754_000_000),
+                has_pending: true,
+            }),
+        };
         presence.update_state("draining").unwrap();
-        presence.update_session_count(3).unwrap();
-        presence.update_session_count(1).unwrap();
+        presence
+            .update_drain_wait_set(3, std::slice::from_ref(&parked))
+            .unwrap();
+        presence
+            .update_drain_wait_set(1, std::slice::from_ref(&parked))
+            .unwrap();
         presence.update_state("exited").unwrap();
         let after = read();
         assert_eq!(
@@ -302,17 +359,54 @@ mod tests {
         );
         assert_eq!(after["state"], "exited");
         assert_eq!(after["session_count"], 1);
+        assert_eq!(after["holdouts"][0]["session_id"], "sess-parked-1");
+        assert_eq!(after["holdouts"][0]["phase"], "waiting_rate_limit");
+        assert_eq!(
+            after["holdouts"][0]["limit_park"]["resets_at_epoch"], 1_754_000_000_u64,
+            "the parked-until instant rides the record — the decisive fact"
+        );
 
         // Write-on-change: unchanged values are no-ops. Scribble the file
         // externally; same-value updates must not clobber the scribble.
         std::fs::write(&json_path, b"{\"sentinel\":true}").unwrap();
-        presence.update_session_count(1).unwrap();
+        presence
+            .update_drain_wait_set(1, std::slice::from_ref(&parked))
+            .unwrap();
         presence.update_state("exited").unwrap();
         assert_eq!(
             read()["sentinel"],
             true,
             "unchanged lifecycle values never rewrite the file"
         );
+    }
+
+    /// The record is a small display file every co-homed boot reads:
+    /// rows cap at [`PRESENCE_HOLDOUT_ROWS_CAP`] while `session_count`
+    /// stays the full truth ("and N more" derives from the difference).
+    #[test]
+    fn holdout_rows_cap_but_the_count_stays_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut presence = DaemonPresence::register(dir.path(), "boot-a", 8765).expect("register");
+        let rows: Vec<DrainHoldout> = (0..PRESENCE_HOLDOUT_ROWS_CAP + 4)
+            .map(|n| DrainHoldout {
+                session_id: format!("sess-{n:02}"),
+                source: "codex".to_string(),
+                name: None,
+                phase: "running".to_string(),
+                limit_park: None,
+            })
+            .collect();
+        presence
+            .update_drain_wait_set(rows.len() as u64, &rows)
+            .unwrap();
+        let json_path = dir.path().join(DAEMONS_DIR).join("boot-a.json");
+        let record: PresenceRecord =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(
+            record.holdouts.as_ref().map(Vec::len),
+            Some(PRESENCE_HOLDOUT_ROWS_CAP)
+        );
+        assert_eq!(record.session_count, Some(rows.len() as u64));
     }
 
     #[test]

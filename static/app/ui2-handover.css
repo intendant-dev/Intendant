@@ -25,6 +25,62 @@ html.ui-v2 .handover-banner a {
   font-weight: 600;
 }
 
+/* ── drain holdout honesty: the banner names WHO holds the drain and
+   until WHEN, and the successor link is a doorway, not a footnote. ── */
+html.ui-v2 .handover-banner-head {
+  margin-bottom: 2px;
+}
+html.ui-v2 .handover-banner-note {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-successor-link {
+  display: inline-block;
+  margin: 4px 0 2px;
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-weight: 600;
+  text-decoration: none;
+}
+html.ui-v2 .handover-successor-link:hover {
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+html.ui-v2 .handover-holdouts {
+  margin-top: 4px;
+}
+html.ui-v2 .handover-holdout-list {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+html.ui-v2 .handover-holdout-list li {
+  font-size: 12px;
+  line-height: 1.45;
+}
+html.ui-v2 .handover-holdout-name {
+  font-weight: 600;
+}
+html.ui-v2 .handover-holdout-state {
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-holdout-state.parked {
+  color: var(--warning, #e5a50a);
+}
+html.ui-v2 .handover-holdout-more {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-predecessor + .handover-predecessor {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+}
+
 /* ── update-available chip (HS6): a quiet bottom-corner card — the fact
    of a newer on-disk build, its provenance, and (macOS unsigned builds)
    the keychain/TCC honesty line. Distinct from the drain banner: an

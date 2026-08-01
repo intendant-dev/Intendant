@@ -28,7 +28,7 @@ mod update_lane;
 mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
-pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence};
+pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence, DrainHoldout};
 pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane};
 pub(crate) use update_watch::spawn_update_watch;
 
@@ -64,6 +64,13 @@ pub(crate) struct HandoverRuntime {
     /// [`DrainState`] mutex carries the bookkeeping.
     draining: std::sync::atomic::AtomicBool,
     drain: std::sync::Mutex<DrainState>,
+    /// The drain wait set as last reported by the supervisor's exit
+    /// check — each holding session with its phase and durable
+    /// limit-park marker. The status surface serves it (`holdouts`) and
+    /// the presence record mirrors a capped copy for co-homed
+    /// successors. `None` until the first report; only reported while
+    /// draining.
+    drain_holdouts: std::sync::Mutex<Option<Vec<DrainHoldout>>>,
     /// Wakes the scheduler the instant a drain is requested, so
     /// drain-entry (which the scheduler performs BETWEEN passes — the
     /// structural "stop firing before the flock frees") does not wait
@@ -296,6 +303,7 @@ impl HandoverRuntime {
             presence_error,
             draining: std::sync::atomic::AtomicBool::new(false),
             drain: std::sync::Mutex::new(DrainState::default()),
+            drain_holdouts: std::sync::Mutex::new(None),
             drain_notify: tokio::sync::Notify::new(),
             scheduler_attached: std::sync::atomic::AtomicBool::new(false),
             drain_hooks: std::sync::Mutex::new(Vec::new()),
@@ -724,13 +732,20 @@ impl HandoverRuntime {
         (sidecar.boot_id != self.boot_id).then_some(sidecar.port)
     }
 
-    /// Live supervised-session count, mirrored onto the presence record
-    /// (the "draining · N sessions" surface).
-    pub(crate) fn set_session_count(&self, count: u64) {
+    /// The supervisor's drain wait set: served on the status surface
+    /// (`holdouts` — the banner's honest "waiting on WHOM"), and
+    /// mirrored onto the presence record (the "draining · N sessions"
+    /// count plus a capped row copy — the only channel a co-homed
+    /// successor has to name the spared set).
+    pub(crate) fn set_drain_wait_set(&self, holdouts: Vec<DrainHoldout>) {
+        let count = holdouts.len() as u64;
         if let Ok(mut presence) = self.presence.lock() {
             if let Some(presence) = presence.as_mut() {
-                let _ = presence.update_session_count(count);
+                let _ = presence.update_drain_wait_set(count, &holdouts);
             }
+        }
+        if let Ok(mut slot) = self.drain_holdouts.lock() {
+            *slot = Some(holdouts);
         }
     }
 
@@ -788,6 +803,15 @@ impl HandoverRuntime {
             }
             if drain.successor_gone_alerted {
                 obj.insert("successor_gone".into(), true.into());
+            }
+        }
+        // The drain wait set, uncapped: the drainer's own surface names
+        // every holdout (the presence mirror is the capped copy).
+        if let Ok(slot) = self.drain_holdouts.lock() {
+            if let Some(rows) = slot.as_ref() {
+                if let Ok(value) = serde_json::to_value(rows) {
+                    obj.insert("holdouts".into(), value);
+                }
             }
         }
         if let Some(generation) = generation {
@@ -983,6 +1007,35 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Commission pin (drain holdout honesty): the shipped dashboard
+    /// bundle carries the banner wiring — the named wait set, the
+    /// parked-until rendering, the prominent successor doorway, the
+    /// per-predecessor sections, and the tokenless QA hook — so the
+    /// honest banner cannot be silently gutted from the SPA (the HS6
+    /// artifact-scan pattern).
+    #[test]
+    fn spa_carries_the_drain_holdout_banner() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "handover-holdouts",
+            "handover-holdout-list",
+            "handover-successor-link",
+            "Open the successor daemon",
+            "rate-limit parked until",
+            "reset time unknown",
+            "No successor has acquired the lease yet.",
+            "still finishing there",
+            "Mid-work sessions it releases are picked up here when it exits.",
+            "body.holdouts",
+            "qa.handoverBanner",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the drain-holdout banner wiring: {needle}"
+            );
+        }
+    }
 
     #[test]
     fn initialize_registers_presence_and_takes_free_lease() {

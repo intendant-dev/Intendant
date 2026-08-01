@@ -27376,6 +27376,62 @@ html.ui-v2 .handover-banner a {
   font-weight: 600;
 }
 
+/* ── drain holdout honesty: the banner names WHO holds the drain and
+   until WHEN, and the successor link is a doorway, not a footnote. ── */
+html.ui-v2 .handover-banner-head {
+  margin-bottom: 2px;
+}
+html.ui-v2 .handover-banner-note {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-successor-link {
+  display: inline-block;
+  margin: 4px 0 2px;
+  padding: 3px 12px;
+  border: 1px solid var(--accent, #62a0ea);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent, #62a0ea);
+  font-weight: 600;
+  text-decoration: none;
+}
+html.ui-v2 .handover-successor-link:hover {
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+html.ui-v2 .handover-holdouts {
+  margin-top: 4px;
+}
+html.ui-v2 .handover-holdout-list {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+html.ui-v2 .handover-holdout-list li {
+  font-size: 12px;
+  line-height: 1.45;
+}
+html.ui-v2 .handover-holdout-name {
+  font-weight: 600;
+}
+html.ui-v2 .handover-holdout-state {
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-holdout-state.parked {
+  color: var(--warning, #e5a50a);
+}
+html.ui-v2 .handover-holdout-more {
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-predecessor + .handover-predecessor {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--surface2, rgba(90, 90, 104, 0.5));
+}
+
 /* ── update-available chip (HS6): a quiet bottom-corner card — the fact
    of a newer on-disk build, its provenance, and (macOS unsigned builds)
    the keychain/TCC honesty line. Distinct from the drain banner: an
@@ -38317,7 +38373,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '53c021ca70a06f3a';
+const INTENDANT_APP_BUILD = '4f1f5f15bb56cf65';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -104513,11 +104569,14 @@ async function memoryProposeFromForm(button) {
 // (HS6) ──────────────────────────────────────────────────────────────
 // Polls GET /api/daemon/handover (tunnel twin api_daemon_handover): the
 // scheduler-lease status block. Renders:
-//   - THIS daemon draining: a persistent banner — in-flight sessions
-//     finish here; new work continues on the successor (linked once the
-//     lease sidecar names it).
-//   - another co-homed daemon draining: a compact predecessor chip with
-//     its remaining session count.
+//   - THIS daemon draining: a persistent banner that NAMES the wait set
+//     (`holdouts`: each holding session with its state — a limit-parked
+//     holdout leads with its parked-until instant, the decisive fact)
+//     and carries a prominent doorway to the successor once the lease
+//     sidecar names it.
+//   - other co-homed daemons draining (all of them, not just the
+//     first): a predecessor section each, with its remaining count, its
+//     named holdout rows off the presence record, and a doorway to it.
 //   - a newer/changed binary on disk (the daemon's update watch): the
 //     bottom-corner update chip with both builds' provenance and the
 //     keychain/TCC honesty line where it applies. Collapsible to a
@@ -104872,6 +104931,104 @@ async function memoryProposeFromForm(button) {
     return Number.isFinite(port) && port > 0 ? port : null;
   }
 
+  // Render at most this many holdout rows; the rest fold into an honest
+  // "…and N more" (parked rows arrive sorted first from the daemon, so
+  // the decisive parked-until facts survive the fold).
+  const HOLDOUT_RENDER_CAP = 8;
+
+  function handoverShortId(id) {
+    const raw = String(id || '');
+    return raw.length > 8 ? raw.slice(0, 8) : raw;
+  }
+
+  // "9:10 PM (in ~42m)" from an epoch-seconds reset instant, in the
+  // viewer's locale; honest about a reset that is due or just passed.
+  function handoverParkedUntil(resetsAtEpoch) {
+    const epoch = Number(resetsAtEpoch);
+    if (!Number.isFinite(epoch) || epoch <= 0) return null;
+    const at = new Date(epoch * 1000);
+    const clock = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const deltaMin = Math.round((at.getTime() - Date.now()) / 60000);
+    if (deltaMin > 1) {
+      const spell = deltaMin >= 90 ? `~${Math.round(deltaMin / 60)}h` : `~${deltaMin}m`;
+      return `${clock} (in ${spell})`;
+    }
+    return `${clock} (due now)`;
+  }
+
+  // Owner-facing state words. A limit-parked holdout leads with the
+  // parked-until instant — the decisive fact (the park can hold the
+  // drain for hours). Unknown phases pass through rather than lie.
+  function handoverHoldoutState(holdout) {
+    const park = holdout && holdout.limit_park;
+    if (park) {
+      const until = handoverParkedUntil(park.resets_at_epoch);
+      return until
+        ? `rate-limit parked until ${until}`
+        : 'rate-limit parked — reset time unknown';
+    }
+    const phase = String((holdout && holdout.phase) || '');
+    switch (phase) {
+      case 'running':
+      case 'thinking': return 'working';
+      case 'waiting_approval': return 'waiting on an approval';
+      case 'waiting_human': return 'waiting on you';
+      case 'waiting_rate_limit': return 'rate-limit parked';
+      case 'waiting_service_recovery': return 'paused for provider recovery';
+      case 'idle': return 'idle — awaiting input';
+      case 'interrupting':
+      case 'interrupted': return 'interrupted';
+      default: return phase || 'unknown';
+    }
+  }
+
+  // The named wait set. textContent throughout — session names are
+  // agent/user-controlled and must never reach innerHTML (the update
+  // chip states the same rule).
+  function handoverHoldoutList(rows, totalCount) {
+    const wrap = document.createElement('div');
+    wrap.className = 'handover-holdouts';
+    const list = document.createElement('ul');
+    list.className = 'handover-holdout-list';
+    rows.slice(0, HOLDOUT_RENDER_CAP).forEach((holdout) => {
+      if (!holdout || typeof holdout !== 'object') return;
+      const item = document.createElement('li');
+      const who = document.createElement('span');
+      who.className = 'handover-holdout-name';
+      who.textContent = holdout.name || handoverShortId(holdout.session_id) || 'unnamed session';
+      item.appendChild(who);
+      const state = document.createElement('span');
+      state.className = 'handover-holdout-state';
+      if (holdout.limit_park) state.classList.add('parked');
+      state.textContent = ` — ${handoverHoldoutState(holdout)}`;
+      item.appendChild(state);
+      list.appendChild(item);
+    });
+    wrap.appendChild(list);
+    const total = Number(totalCount);
+    const shown = Math.min(rows.length, HOLDOUT_RENDER_CAP);
+    const folded = Number.isFinite(total) && total > shown ? total - shown : 0;
+    if (folded > 0) {
+      const more = document.createElement('div');
+      more.className = 'handover-holdout-more';
+      more.textContent = `…and ${folded} more`;
+      wrap.appendChild(more);
+    }
+    return wrap;
+  }
+
+  // A real doorway to a co-homed daemon — same-host port substitution,
+  // like the old inline link, but rendered as a prominent element.
+  function handoverDaemonLink(port, label) {
+    const link = document.createElement('a');
+    link.className = 'handover-successor-link';
+    link.href = `${location.protocol}//${location.hostname}:${port}/`;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = label;
+    return link;
+  }
+
   function handoverRender(body) {
     if (!body || body.available === false) { handoverClear(); updateChipClear(); return; }
     if (body.boot_id && typeof maybeNudgeDaemonBoot === 'function') {
@@ -104880,29 +105037,63 @@ async function memoryProposeFromForm(button) {
     handoverUpdateRender(body);
     if (body.draining) {
       const port = handoverSuccessorPort(body);
-      const link = port
-        ? `<a href="${location.protocol}//${location.hostname}:${port}/" target="_blank" rel="noopener">:${port}</a>`
-        : null;
       const el = handoverBanner();
       el.dataset.kind = 'draining';
-      el.innerHTML = link
-        ? `<strong>This daemon is draining.</strong> In-flight sessions finish here — continue new work on the successor at ${link}.`
-        : '<strong>This daemon is draining.</strong> In-flight sessions finish here — no successor has acquired the lease yet.';
+      el.textContent = '';
+      const head = document.createElement('div');
+      head.className = 'handover-banner-head';
+      const lead = document.createElement('strong');
+      lead.textContent = 'This daemon is draining.';
+      head.appendChild(lead);
+      const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
+      const tail = document.createElement('span');
+      tail.textContent = rows.length
+        ? ` Waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}, then it exits.`
+        : ' In-flight sessions finish here, then it exits.';
+      head.appendChild(tail);
+      el.appendChild(head);
+      if (port) {
+        el.appendChild(handoverDaemonLink(port, `Open the successor daemon (:${port}) →`));
+      } else {
+        const none = document.createElement('div');
+        none.className = 'handover-banner-note';
+        none.textContent = 'No successor has acquired the lease yet.';
+        el.appendChild(none);
+      }
+      if (rows.length) el.appendChild(handoverHoldoutList(rows, rows.length));
       return;
     }
     const others = Array.isArray(body.daemons)
       ? body.daemons.filter((d) => d && d.live && d.state === 'draining' && d.boot_id !== body.boot_id)
       : [];
     if (others.length) {
-      const d = others[0];
-      const port = Number(d.port);
-      const count = Number(d.session_count);
-      const sessions = Number.isFinite(count)
-        ? ` · ${count} session${count === 1 ? '' : 's'} left`
-        : '';
       const el = handoverBanner();
       el.dataset.kind = 'predecessor';
-      el.innerHTML = `Predecessor daemon draining${Number.isFinite(port) ? ` on :${port}` : ''}${sessions} — it exits when its last in-flight session ends.`;
+      el.textContent = '';
+      others.forEach((d) => {
+        const port = Number(d.port);
+        const count = Number(d.session_count);
+        const section = document.createElement('div');
+        section.className = 'handover-predecessor';
+        const head = document.createElement('div');
+        head.className = 'handover-banner-head';
+        const lead = document.createElement('span');
+        lead.textContent = `A predecessor daemon is draining${Number.isFinite(port) ? ` on :${port}` : ''}`
+          + `${Number.isFinite(count) ? ` — ${count} session${count === 1 ? '' : 's'} still finishing there` : ''}.`;
+        head.appendChild(lead);
+        if (Number.isFinite(port) && port > 0) {
+          head.appendChild(document.createTextNode(' '));
+          head.appendChild(handoverDaemonLink(port, `Open :${port} →`));
+        }
+        section.appendChild(head);
+        const rows = Array.isArray(d.holdouts) ? d.holdouts : [];
+        if (rows.length) section.appendChild(handoverHoldoutList(rows, count));
+        const note = document.createElement('div');
+        note.className = 'handover-banner-note';
+        note.textContent = 'Mid-work sessions it releases are picked up here when it exits.';
+        section.appendChild(note);
+        el.appendChild(section);
+      });
       return;
     }
     handoverClear();
@@ -104924,6 +105115,12 @@ async function memoryProposeFromForm(button) {
   window.qa.handoverUpdateChip = {
     render: (body) => handoverUpdateRender(body),
     stateKey: updateChipStateKey,
+  };
+  // Same tokenless-QA posture for the drain banner: probes feed a
+  // synthetic handover body and assert the named wait set + the
+  // successor doorway render.
+  window.qa.handoverBanner = {
+    render: (body) => handoverRender(body),
   };
 
   // The update panel's composition hook (production, not QA): the panel

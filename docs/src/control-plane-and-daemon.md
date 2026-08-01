@@ -427,10 +427,37 @@ successor without kill-and-relaunch:
   one place (`ControlMsg::creates_session`) and every surface consults it.
 - When its last work-holding session finishes (sessions parked after
   `done` do not hold; parked conversations resume on the successor), the
-  drainer records an `exited` presence state and the process exits. If the
-  successor dies while the drainer still drains, ONE loud notification
-  says standing automations are paused until someone relaunches or takes
-  over — the drainer never reclaims the lease.
+  drainer records an `exited` presence state and the process exits. **A
+  limit-parked wrapper holds the drain for as long as its in-memory park
+  runs** — potentially hours, until the provider reset — which is why
+  the wait set is named, never silent: the status payload carries
+  `holdouts` (each holding session's id, name, backend, phase, and its
+  durable `limit_park` marker with the reset instant), the drainer's
+  presence record mirrors a capped row copy beside `session_count`, and
+  the dashboard's drain banner lists WHO holds and until WHEN under a
+  prominent doorway to the successor. If the successor dies while the
+  drainer still drains, ONE loud notification says standing automations
+  are paused until someone relaunches or takes over — the drainer never
+  reclaims the lease.
+- Sessions the drainer still held at its exit (interrupted mid-work, or
+  limit-parked with pending work) are RELEASED, not lost: the holder's
+  **predecessor-exit watch** adjudicates, once per boot id, every
+  co-homed presence record whose boot is provably dead (per-boot lock
+  free) with drain lineage (`draining` — killed mid-drain — or
+  `exited`, the graceful terminal), and runs a **scoped readopt pass**
+  over the released set — the boot pass's mid-work classes, guard
+  ladder (Resume-not-Revive, owner-stop tombstones, staleness,
+  live-tip refusals), per-pass cap, dispatch stagger, and
+  dispatches-are-not-outcomes verification, scoped to sessions whose
+  story froze at-or-before the exit instant (the record's last rewrite;
+  anything a live co-homed daemon is still driving advances past that
+  bound and is never touched). The trigger is edge-independent, so a
+  drainer that exited while the successor was down, or crashed
+  mid-drain, is still adjudicated. The summary notification names the
+  predecessor, so a handover pickup reads apart from crash recovery.
+  While the predecessor still drains, the successor-side banner names
+  the spared set ("N sessions still finishing there", with the same
+  holdout rows), one section per draining co-homed daemon.
 
 `intendant ctl status` shows the whole story under `scheduler_lease`
 (role, drain state, and every co-homed boot with probed liveness).
