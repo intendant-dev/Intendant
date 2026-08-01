@@ -1009,7 +1009,7 @@ pub(crate) static ROUTES: &[Route] = &[
     public_route(
         RouteMethod::Post,
         PathPattern::Exact(crate::codex_cloud_attach::ENROLL_PATH),
-        BodyPolicy::Capped(8 * 1024),
+        BodyPolicy::Capped(crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES),
         RouteHandlerId::CodexCloudEnroll,
         "Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out)",
     ),

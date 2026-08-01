@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::codex_cloud::{record_attachment_state, state_path, AttachmentState, StoreLock};
 
@@ -37,6 +38,12 @@ pub(crate) const DEFAULT_IDENTITY_TTL_S: u64 = 3600;
 /// The public redemption doorbell's path — the one spelling shared by the
 /// route table, the certless carve-out predicate, and the worker's dial.
 pub(crate) const ENROLL_PATH: &str = "/api/codex-cloud/enroll";
+/// Bounded base64url copy of the enrollment JSON. Some managed egress
+/// proxies preserve request headers while dropping POST bodies; the worker
+/// sends both, and home requires byte equality whenever both arrive.
+pub(crate) const ENROLL_REQUEST_HEADER: &str = "x-intendant-cloud-enrollment";
+/// One limit shared by the HTTP body policy and the header fallback decoder.
+pub(crate) const ENROLL_REQUEST_MAX_BYTES: usize = 8 * 1024;
 /// Dedicated WebSocket target for Cloud attachments. Keeping the
 /// application-proof fallback off the dashboard's ordinary `/ws` target
 /// makes the zero-authority lane explicit even when a reverse proxy has
@@ -50,6 +57,10 @@ const ATTACH_PROOF_MAX_SKEW_MS: i64 = 5 * 60 * 1000;
 const ATTACH_PROOF_REPLAY_TTL_MS: u64 = 10 * 60 * 1000;
 const ATTACH_PROOF_REPLAY_GLOBAL_CAP: usize = 4096;
 const ATTACH_PROOF_REPLAY_PER_WORKER_CAP: usize = 64;
+/// Stay comfortably below the five-minute idle teardown observed on managed
+/// Cloud egress paths. Both endpoints originate pings, so a half-open write
+/// fails promptly and long silent commands keep their control socket.
+const ATTACHMENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 const CLOUD_WORKER_HEADER: &str = "x-intendant-cloud-worker";
 const CLOUD_WORKER_FINGERPRINT_HEADER: &str = "x-intendant-cloud-worker-fingerprint";
@@ -57,6 +68,15 @@ const CLOUD_WORKER_TASK_HEADER: &str = "x-intendant-cloud-worker-task";
 const CLOUD_WORKER_NONCE_HEADER: &str = "x-intendant-cloud-worker-nonce";
 const CLOUD_WORKER_TIMESTAMP_HEADER: &str = "x-intendant-cloud-worker-timestamp";
 const CLOUD_WORKER_PROOF_HEADER: &str = "x-intendant-cloud-worker-proof";
+
+fn attachment_keepalive_timer() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + ATTACHMENT_KEEPALIVE_INTERVAL,
+        ATTACHMENT_KEEPALIVE_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 
 // ── Broker store ───────────────────────────────────────────────────────
 
@@ -797,6 +817,7 @@ pub(crate) async fn serve_attachment_socket<S>(
     );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
     let (mut write, mut read) = ws_stream.split();
+    let mut keepalive = attachment_keepalive_timer();
     loop {
         tokio::select! {
             frame = read.next() => match frame {
@@ -820,6 +841,15 @@ pub(crate) async fn serve_attachment_socket<S>(
                     }
                 }
                 None => break,
+            },
+            _ = keepalive.tick() => {
+                if write
+                    .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             },
             _ = tokio::time::sleep_until(deadline) => {
                 eprintln!(
@@ -924,6 +954,18 @@ pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String
     // with old direct-mTLS daemons and sharply scopes the proxy proof on new
     // ones, so normalize rather than making every operator rewrite config.
     parsed.set_path(ATTACH_PATH);
+    Ok(parsed.to_string())
+}
+
+fn enrollment_url_from_home(home: &str) -> Result<String, String> {
+    let mut parsed = url::Url::parse(home).map_err(|e| format!("invalid home URL: {e}"))?;
+    parsed
+        .set_scheme("https")
+        .map_err(|_| "home URL cannot be converted to HTTPS".to_string())?;
+    // Enrollment and attachment share one origin but deliberately use
+    // different routes. Replace the normalized attachment path instead of
+    // appending to it.
+    parsed.set_path(ENROLL_PATH);
     Ok(parsed.to_string())
 }
 
@@ -1238,26 +1280,49 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("write {}: {e}", key_path.display()))?;
 
     // 2. Redeem the token for a certificate at the public enroll route.
-    let http_base = crate::peer::transport::ws_url_to_http_base(&home);
-    let enroll_url = format!("{http_base}{ENROLL_PATH}");
-    let client = crate::peer::transport::tls_client::reqwest_client(
-        std::time::Duration::from_secs(20),
-        &pinned,
-        None,
-    )
+    let enroll_url = enrollment_url_from_home(&home)?;
+    let client = if tls_terminated_proxy {
+        // Managed Cloud egress can terminate TLS under a private CA that is
+        // installed in the worker's native trust store. This mode already
+        // makes that proxy an explicit trust decision; use the same roots
+        // for enrollment that the WebSocket leg uses below.
+        crate::peer::transport::tls_client::reqwest_client_with_native_roots(
+            std::time::Duration::from_secs(20),
+        )
+    } else {
+        crate::peer::transport::tls_client::reqwest_client(
+            std::time::Duration::from_secs(20),
+            &pinned,
+            None,
+        )
+    }
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
+    let enrollment_payload = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "token": &token,
+        "public_key_pem": key_pair.public_key_pem(),
+        "worker": &worker_fingerprint,
+    }))
+    .map_err(|e| format!("serialize enrollment request: {e}"))?;
+    if enrollment_payload.len() > ENROLL_REQUEST_MAX_BYTES {
+        return Err(format!(
+            "enrollment request is too large ({} bytes; limit {ENROLL_REQUEST_MAX_BYTES})",
+            enrollment_payload.len()
+        ));
+    }
+    let enrollment_header = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enrollment_payload)
+    };
     let enrollment_deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(DEFAULT_TOKEN_TTL_S);
     let text = loop {
         let response = client
             .post(&enroll_url)
-            .json(&serde_json::json!({
-                "version": 1,
-                "token": &token,
-                "public_key_pem": key_pair.public_key_pem(),
-                "worker": &worker_fingerprint,
-            }))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(ENROLL_REQUEST_HEADER, &enrollment_header)
+            .body(enrollment_payload.clone())
             .send()
             .await
             .map_err(|e| format!("POST {enroll_url}: {e}"))?;
@@ -1984,6 +2049,7 @@ async fn hold_attachment(
         tokio::task::JoinHandle<()>,
     > = std::collections::HashMap::new();
     let (mut sink, mut stream) = ws.split();
+    let mut keepalive = attachment_keepalive_timer();
     loop {
         tokio::select! {
             frame = stream.next() => match frame {
@@ -2010,6 +2076,11 @@ async fn hold_attachment(
                         .map_err(|e| format!("send frame: {e}"))?;
                 }
                 None => break,
+            },
+            _ = keepalive.tick() => {
+                sink.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|e| format!("send attachment keepalive: {e}"))?;
             },
             _ = remote_commands.retired() => {
                 let _ = sink.close().await;
@@ -2494,6 +2565,17 @@ mod tests {
         assert_eq!(attachment_remaining_ms(-5, 0), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn attachment_keepalive_waits_then_repeats() {
+        let started = tokio::time::Instant::now();
+        let mut keepalive = attachment_keepalive_timer();
+        keepalive.tick().await;
+        assert_eq!(started.elapsed(), ATTACHMENT_KEEPALIVE_INTERVAL);
+        keepalive.tick().await;
+        assert_eq!(started.elapsed(), ATTACHMENT_KEEPALIVE_INTERVAL * 2);
+        assert!(ATTACHMENT_KEEPALIVE_INTERVAL < Duration::from_secs(5 * 60));
+    }
+
     #[test]
     fn home_urls_must_be_wss() {
         let err = home_url_from(Some("ws://127.0.0.1:8765/ws".into())).unwrap_err();
@@ -2501,6 +2583,14 @@ mod tests {
         assert_eq!(
             home_url_from(Some("wss://home.example:8443/ws".into())).unwrap(),
             "wss://home.example:8443/api/codex-cloud/attach"
+        );
+    }
+
+    #[test]
+    fn enrollment_replaces_the_attachment_path_on_the_same_origin() {
+        assert_eq!(
+            enrollment_url_from_home("wss://home.example:8443/api/codex-cloud/attach").unwrap(),
+            "https://home.example:8443/api/codex-cloud/enroll"
         );
     }
 

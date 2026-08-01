@@ -169,23 +169,73 @@ pub(crate) fn is_public_codex_cloud_enroll_path(request_line: &str) -> bool {
 pub(crate) async fn handle_codex_cloud_enroll(
     stream: DemuxStream,
     body: String,
+    enrollment_header: Option<String>,
     cert_dir: PathBuf,
     source_hint: String,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = codex_cloud_enroll_response(body, cert_dir, source_hint).await;
+    let response =
+        codex_cloud_enroll_response(body, enrollment_header, cert_dir, source_hint).await;
     write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+fn enrollment_request_payload(body: &str, encoded_header: Option<&str>) -> Result<Vec<u8>, String> {
+    let body = body.as_bytes();
+    if body.len() > crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES {
+        return Err(format!(
+            "body exceeds {} bytes",
+            crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES
+        ));
+    }
+    let header = encoded_header
+        .map(|encoded| {
+            let max_encoded_len =
+                (crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES * 4).div_ceil(3);
+            if encoded.len() > max_encoded_len {
+                return Err(format!(
+                    "fallback header exceeds {} decoded bytes",
+                    crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES
+                ));
+            }
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| "fallback header is not valid base64url".to_string())?;
+            if decoded.len() > crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES {
+                return Err(format!(
+                    "fallback header exceeds {} decoded bytes",
+                    crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES
+                ));
+            }
+            Ok(decoded)
+        })
+        .transpose()?;
+
+    match (body.is_empty(), header) {
+        (false, None) => Ok(body.to_vec()),
+        (true, Some(header)) => Ok(header),
+        (false, Some(header)) if header == body => Ok(body.to_vec()),
+        (false, Some(_)) => Err("body and fallback header disagree".to_string()),
+        (true, None) => Err("body is empty and fallback header is missing".to_string()),
+    }
 }
 
 async fn codex_cloud_enroll_response(
     body: String,
+    enrollment_header: Option<String>,
     cert_dir: PathBuf,
     source_hint: String,
 ) -> ApiResponse {
     // Parse before counting: unparseable spray never consumes the
     // allowance, so it cannot starve well-formed redemptions.
-    let request: crate::codex_cloud_attach::EnrollRequest = match serde_json::from_str(&body) {
+    let payload = match enrollment_request_payload(&body, enrollment_header.as_deref()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return ApiResponse::json_error(400, format!("invalid enrollment request: {error}"))
+        }
+    };
+    let request: crate::codex_cloud_attach::EnrollRequest = match serde_json::from_slice(&payload) {
         Ok(request) => request,
         Err(error) => {
             return ApiResponse::json_error(400, format!("invalid enrollment request: {error}"))
@@ -230,7 +280,12 @@ async fn codex_cloud_enroll_response(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_codex_cloud_submit_body;
+    use super::{enrollment_request_payload, parse_codex_cloud_submit_body};
+
+    fn encode_enrollment_header(payload: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    }
 
     #[test]
     fn submit_body_defaults_mirror_the_exec_verb() {
@@ -273,5 +328,56 @@ mod tests {
         .expect("blank optionals parse");
         assert_eq!(request.branch, None);
         assert_eq!(request.title, None);
+    }
+
+    #[test]
+    fn enrollment_payload_accepts_the_normal_body() {
+        assert_eq!(
+            enrollment_request_payload(r#"{"token":"one"}"#, None).unwrap(),
+            br#"{"token":"one"}"#
+        );
+    }
+
+    #[test]
+    fn enrollment_payload_falls_back_to_the_header_when_the_body_is_empty() {
+        let payload = br#"{"token":"one"}"#;
+        let header = encode_enrollment_header(payload);
+        assert_eq!(
+            enrollment_request_payload("", Some(&header)).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn enrollment_payload_requires_duplicate_copies_to_match() {
+        let payload = br#"{"token":"one"}"#;
+        let matching = encode_enrollment_header(payload);
+        assert_eq!(
+            enrollment_request_payload(std::str::from_utf8(payload).unwrap(), Some(&matching))
+                .unwrap(),
+            payload
+        );
+
+        let conflicting = encode_enrollment_header(br#"{"token":"two"}"#);
+        assert!(enrollment_request_payload(
+            std::str::from_utf8(payload).unwrap(),
+            Some(&conflicting)
+        )
+        .unwrap_err()
+        .contains("disagree"));
+    }
+
+    #[test]
+    fn enrollment_payload_rejects_missing_invalid_and_oversized_headers() {
+        assert!(enrollment_request_payload("", None).is_err());
+        assert!(enrollment_request_payload("", Some("%%%"))
+            .unwrap_err()
+            .contains("base64url"));
+
+        let oversized = vec![b'x'; crate::codex_cloud_attach::ENROLL_REQUEST_MAX_BYTES + 1];
+        let header = encode_enrollment_header(&oversized);
+        assert!(enrollment_request_payload("", Some(&header))
+            .unwrap_err()
+            .contains("exceeds"));
     }
 }

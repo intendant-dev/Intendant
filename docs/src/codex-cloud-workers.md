@@ -283,7 +283,12 @@ INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1
 In that mode the worker validates the public endpoint with normal WebPKI
 instead of pinning Intendant's inner TLS certificate. It still generates the
 same task-local P-256 key and receives the same zero-authority client
-certificate. Every WebSocket attempt signs a transcript containing the exact
+certificate. The enrollment request carries the same bounded JSON in its
+normal POST body and in a base64url header because some managed egress proxies
+have been observed to preserve request headers while dropping POST bodies.
+Home accepts the header only as a body fallback and requires the two byte
+copies to agree when both arrive; the single-use token never enters the URL.
+Every WebSocket attempt signs a transcript containing the exact
 attachment path, certificate fingerprint, task id, random nonce, and current
 timestamp. Home verifies it against the public key stored at enrollment and
 atomically consumes the nonce; a captured request cannot be replayed. The
@@ -430,7 +435,9 @@ The contract is intentionally stricter than an interactive terminal:
 - Commands are transported as an argv array and are not implicitly parsed by
   a shell. `cwd`, when present, is repository-relative and cannot escape the
   selected checkout. Explicit environment entries are additions to the
-  worker's agent-phase environment.
+  worker's agent-phase environment. The command does not inherit the
+  attachment agent's private `INTENDANT_HOME`; a caller may deliberately
+  supply a different value in the explicit environment.
 - `source: "git_revision"` is the default and requires
   `expected_revision`. The worker refuses a different checkout; abbreviated
   object ids are accepted from 7 hexadecimal characters.
@@ -683,7 +690,9 @@ live worker to home over direct mTLS or an explicitly trusted, proof-bound
 HTTPS reverse proxy. The attachment carries terminal, tile display,
 computer-use, bounded source-transfer, and provider-neutral remote-command
 frames in addition to liveness; each direction has a closed allowlist, and
-worker replies are never dispatched as authority on home. Workers are
+worker replies are never dispatched as authority on home. Both endpoints send
+periodic WebSocket pings so a long command with no output survives idle egress
+proxies and a dead connection surfaces promptly. Workers are
 ephemeral enrollments with zero-authority expiring identities, not static
 `[[peer]]` registry entries, and home must be reachable from the worker's
 egress allowlist (there is no relay tier).
