@@ -878,10 +878,13 @@ impl RadarTask {
         // Registry members grouped by space: every supervised session
         // participates in git-scan detection, declared or not (§2.8).
         // Session ids ride along for the rail-badge flags — the bus
-        // works in writer ids, the dashboard in session ids.
+        // works in writer ids, the dashboard in session ids. LIVE
+        // targets only: boot-restored ghosts are not being worked, so
+        // they contribute no observed working set (and no git spawns)
+        // until live evidence upgrades them.
         let mut members_by_space: BTreeMap<String, Vec<(String, String, PathBuf)>> =
             BTreeMap::new();
-        for (session_id, root) in self.targets.snapshot() {
+        for (session_id, root) in self.targets.snapshot_live() {
             let key = self.space_key_for(&root);
             let writer_id = writer_id_for_session(&session_id);
             members_by_space

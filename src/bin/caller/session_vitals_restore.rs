@@ -827,6 +827,10 @@ pub(crate) struct RestoredSessionCandidate {
 /// sessions regain their chips the moment they are resumed. Both boot
 /// restore lanes — git-target registration and vitals hydration — run
 /// over exactly this candidate list, so their coverage can't drift.
+/// Registration is one-shot on the probe side: each restored target is
+/// painted once and then holds off-cadence until live evidence
+/// upgrades it (`session_vitals::TargetOrigin`), so the cap bounds a
+/// single boot pass, not a standing per-tick git bill.
 pub(crate) const RESTORED_TARGET_CAP: usize = 64;
 
 /// Walk the session store for restore candidates: non-ended sessions
