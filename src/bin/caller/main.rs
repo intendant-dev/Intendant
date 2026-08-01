@@ -35,6 +35,7 @@ mod cli_descriptor;
 mod credential_audit;
 mod credential_egress;
 mod credential_leases;
+mod credential_watch;
 mod ctl;
 mod cu_observation;
 mod cu_readiness;
