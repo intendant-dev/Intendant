@@ -70,19 +70,22 @@ let agendaGraphSubtreeTerr = new Map();
 let agendaGraphTerrStats = { shown: 0, total: 0 };
 // Arrangement mode over the current pool: 'orbit' (the default force
 // constellation) or one of the ontology lenses — 'flow' (relies_on
-// layered left→right), 'time' (age as radius, newest center), 'actor'
-// (clustered by parking provenance), 'attention' (needs-you gravity).
+// layered left→right), 'time' (tree rings: log-scaled age as radius,
+// now at the center), 'actor' (clustered by parking provenance),
+// 'attention' (needs-you gravity).
 // Modes bias the layout and emphasis only; pool, links, picking, caps,
 // and card-lens parity are untouched. Build computes the active mode's
 // per-node targets; relax applies them as one extra spring.
 let agendaGraphMode = 'orbit';
 const AGENDA_GRAPH_MODES = [
   ['flow', 'flow', 'dependency flow — prerequisites left, dependents right'],
-  ['time', 'time', 'age as radius — newest at the center'],
+  ['time', 'time', 'tree rings of age — now at the center, log rings out to the oldest'],
   ['actor', 'actor', 'clustered by who parked it'],
   ['attention', 'attention', 'needs-you gravity — attention items pull center'],
 ];
 let agendaGraphTimeMarks = [];
+let agendaGraphTimeOldest = 0;
+let agendaGraphTimeCheckAt = 0;
 let agendaGraphActorMarks = [];
 let agendaGraphAttnCount = 0;
 let agendaGraphFullscreen = false;
@@ -557,6 +560,93 @@ function agendaGraphTeardown() {
   agendaGraphHover = null;
 }
 
+// ---- Time lens (tree rings of age, anchored at NOW) ----
+
+// Radius is log-scaled age: r = INNER + STEP·log2(1 + age/1h). The busy
+// recent hours and days get generous space and a years-old tail still
+// fits on the same disc; the mapping is fixed (never fitted to the
+// pool), so a given ring always means the same age and the empty bands
+// between rings are information, not waste.
+const AGENDA_GRAPH_TIME_HOUR = 3600e3;
+const AGENDA_GRAPH_TIME_INNER = 30;
+const AGENDA_GRAPH_TIME_STEP = 15;
+// The age boundaries worth naming: [hours, label, minor]. Minor rings
+// paint fainter and their labels yield first when zoom packs them.
+const AGENDA_GRAPH_TIME_LADDER = [
+  [1, '1h', false], [6, '6h', true], [24, '1d', false], [72, '3d', true],
+  [168, '1w', false], [336, '2w', true], [720, '1mo', false],
+  [2190, '3mo', false], [4380, '6mo', true], [8760, '1y', false],
+  [17520, '2y', false], [43800, '5y', false],
+];
+
+function agendaGraphTimeRadius(ageMs) {
+  return AGENDA_GRAPH_TIME_INNER + AGENDA_GRAPH_TIME_STEP
+    * Math.log2(1 + Math.max(0, ageMs) / AGENDA_GRAPH_TIME_HOUR);
+}
+
+// The ladder rings inside the pool's age span, plus a dashed ring at
+// the oldest item itself labeled with its real date. Ladder rings that
+// would hug the oldest ring are dropped so the outer labels never
+// stack.
+function agendaGraphTimeRebuildMarks(now) {
+  const oldestAge = Math.max(0, now - agendaGraphTimeOldest);
+  const outerR = agendaGraphTimeRadius(oldestAge);
+  const marks = [];
+  AGENDA_GRAPH_TIME_LADDER.forEach(([hours, label, minor]) => {
+    const age = hours * AGENDA_GRAPH_TIME_HOUR;
+    const r = agendaGraphTimeRadius(age);
+    if (age <= oldestAge && outerR - r > 6) {
+      marks.push({ r, label, minor, oldest: false });
+    }
+  });
+  const d = new Date(agendaGraphTimeOldest || now);
+  const sameYear = d.getFullYear() === new Date(now).getFullYear();
+  marks.push({
+    r: outerR,
+    label: `oldest · ${d.toISOString().slice(sameYear ? 5 : 0, 10)}`,
+    minor: false,
+    oldest: true,
+  });
+  agendaGraphTimeMarks = marks;
+}
+
+// Ages advance while the tab sits open: every few seconds compare each
+// node's ASSIGNED ring against its current age, and once the fastest
+// mover has drifted a visible amount, re-target the springs, refresh
+// the marks, and re-arm a small settle budget. A fresh item migrates
+// off the center honestly; a quiet ledger re-arms roughly never.
+// (Assigned-vs-computed keeps this independent of the springs'
+// equilibrium error, which would otherwise re-arm every check.)
+function agendaGraphTimeTick() {
+  const now = Date.now();
+  if (now - agendaGraphTimeCheckAt < 5000) return;
+  agendaGraphTimeCheckAt = now;
+  let drift = 0;
+  agendaGraphNodes.forEach((n) => {
+    if (n.sat || n.born === undefined) return;
+    const d = Math.abs(agendaGraphTimeRadius(now - n.born) - n.tr);
+    if (d > drift) drift = d;
+  });
+  if (drift <= 2.5) return;
+  agendaGraphNodes.forEach((n) => {
+    if (n.sat || n.born === undefined) return;
+    n.tr = agendaGraphTimeRadius(now - n.born);
+  });
+  agendaGraphTimeRebuildMarks(now);
+  agendaGraphSettleLeft = Math.max(agendaGraphSettleLeft, 32);
+}
+
+// Humane span for the projection badge: how far back the disc reaches.
+function agendaGraphTimeSpanLabel() {
+  const h = Math.max(0, Date.now() - agendaGraphTimeOldest) / AGENDA_GRAPH_TIME_HOUR;
+  const span = h < 1 ? 'under an hour'
+    : h < 48 ? `${Math.round(h)}h`
+      : h < 24 * 90 ? `${Math.round(h / 24)}d`
+        : h < 24 * 730 ? `${Math.round(h / (24 * 30.44))}mo`
+          : `${(h / (24 * 365.25)).toFixed(1)}y`;
+  return `spans ${span}`;
+}
+
 // ---- Layout (topology-keyed force relaxation) ----
 
 // Rebuild nodes/links only when the topology key changes; surviving
@@ -693,22 +783,25 @@ function agendaGraphBuild() {
       if (!n.sat) n.tx = (rank.get(n.id) - maxRank / 2) * 72;
     });
   } else if (agendaGraphMode === 'time') {
+    // Anchored at NOW, not at the newest item: the center is the
+    // present, and an item's ring is its actual age — an untouched
+    // ledger reads old at a glance instead of being stretched to fill.
+    const now = Date.now();
     const born = (x) => (x.provenance && x.provenance.created_ms) || x.updated_ms || 0;
-    const times = items.map(born);
-    const newest = Math.max(...times, 1);
-    const oldest = Math.min(...times, newest);
-    const span = Math.max(1, newest - oldest);
+    let oldest = now;
+    items.forEach((x) => {
+      const b = born(x);
+      if (b > 0 && b < oldest) oldest = b;
+    });
+    agendaGraphTimeOldest = oldest;
     agendaGraphNodes.forEach((n) => {
       if (n.sat) return;
-      const x = byIdBuild.get(n.id);
-      n.tr = 36 + ((newest - born(x)) / span) * 150;
+      const b = born(byIdBuild.get(n.id)) || oldest;
+      n.born = b;
+      n.tr = agendaGraphTimeRadius(now - b);
     });
-    const day = (ms) => new Date(ms).toISOString().slice(5, 10);
-    agendaGraphTimeMarks = [
-      { r: 36, label: `newest · ${day(newest)}` },
-      { r: 36 + 75, label: day(oldest + span / 2) },
-      { r: 186, label: `oldest · ${day(oldest)}` },
-    ];
+    agendaGraphTimeRebuildMarks(now);
+    agendaGraphTimeCheckAt = now;
   } else if (agendaGraphMode === 'actor') {
     const who = (x) => (x.provenance
       && (x.provenance.source || x.provenance.kind
@@ -842,11 +935,21 @@ function agendaGraphRelax(iterations) {
         n.p[0] += (n.tx - n.p[0]) * 0.03;
       }
       if (n.tr !== undefined) {
+        // In the time lens the radius IS the datum (age), so it is
+        // enforced as a near-pin: links and repulsion may only slide a
+        // node around its ring or off-plane, never lie about its age.
+        // Attention keeps the soft pull — there the radius is emphasis,
+        // not measurement.
+        const strength = agendaGraphMode === 'time' ? 0.5 : 0.035;
         const cur = Math.hypot(n.p[0], n.p[2]) + 0.01;
-        const f = ((n.tr - cur) * 0.035) / cur;
+        const f = ((n.tr - cur) * strength) / cur;
         n.p[0] += n.p[0] * f;
         n.p[2] += n.p[2] * f;
-        n.p[1] *= 0.97;
+        // With the radius pinned, repulsion would escape into the free
+        // vertical axis and smear the disc — clamp y hard in time mode
+        // so crowding spreads AROUND a ring instead (beads, not fuzz),
+        // leaving just a whisper of off-plane shimmer.
+        n.p[1] *= agendaGraphMode === 'time' ? 0.6 : 0.97;
       }
       if (n.anchor) {
         n.p[0] += (n.anchor[0] - n.p[0]) * 0.025;
@@ -930,6 +1033,96 @@ function agendaGraphGlowSprite(rgb) {
   return sprite;
 }
 
+// Time-lens chrome, drawn through the SAME projection as the nodes so
+// the rings, their labels, and the "now" anchor track orbit, zoom, and
+// pan exactly. (The first painter drew screen-space circles at the
+// fixed canvas center — correct only while the camera never zoomed or
+// panned; the moment it did, the disc of nodes left the rings behind
+// and the present stopped being centered.)
+const AGENDA_GRAPH_TIME_RING_STEPS = 72;
+function agendaGraphDrawTimeChrome(g, project, pal, w, h, reduced, ts) {
+  // Rings: world-space polylines on the layout plane (y = 0),
+  // depth-faded per segment so the far side recedes like the nodes do.
+  agendaGraphTimeMarks.forEach((mark) => {
+    const pts = [];
+    for (let i = 0; i <= AGENDA_GRAPH_TIME_RING_STEPS; i++) {
+      const a = (i / AGENDA_GRAPH_TIME_RING_STEPS) * Math.PI * 2;
+      pts.push(project([Math.cos(a) * mark.r, 0, Math.sin(a) * mark.r]));
+    }
+    g.setLineDash(mark.oldest ? [2, 4] : []);
+    g.lineWidth = 1;
+    const base = mark.minor ? 0.05 : 0.1;
+    for (let i = 0; i < AGENDA_GRAPH_TIME_RING_STEPS; i++) {
+      const a = pts[i];
+      const b = pts[i + 1];
+      const depth = Math.max(0.35, Math.min(1, ((a.s + b.s) / 2) * 1.1 - 0.18));
+      g.beginPath();
+      g.moveTo(a.x, a.y);
+      g.lineTo(b.x, b.y);
+      g.strokeStyle = `rgba(${pal.text},${base * depth})`;
+      g.stroke();
+    }
+  });
+  g.setLineDash([]);
+  // The "now" beacon at the world origin: a small iris core with a
+  // breathing pulse (static halo under reduced motion). The pulse is a
+  // screen-space emitter, not plane geometry, so plain arcs are right.
+  const q0 = project([0, 0, 0]);
+  const pr = Math.max(1.7, 2.4 * q0.s);
+  if (!reduced) {
+    for (let k = 0; k < 2; k++) {
+      const t = (ts / 2800 + k * 0.5) % 1;
+      g.beginPath();
+      g.arc(q0.x, q0.y, pr + 2 + t * 30 * q0.s, 0, Math.PI * 2);
+      g.strokeStyle = `rgba(${pal.iris},${(1 - t) * 0.3})`;
+      g.lineWidth = 1.1;
+      g.stroke();
+    }
+  } else {
+    g.beginPath();
+    g.arc(q0.x, q0.y, pr + 4, 0, Math.PI * 2);
+    g.strokeStyle = `rgba(${pal.iris},.35)`;
+    g.lineWidth = 1.1;
+    g.stroke();
+  }
+  g.beginPath();
+  g.arc(q0.x, q0.y, pr, 0, Math.PI * 2);
+  g.fillStyle = `rgba(${pal.iris},.9)`;
+  g.fill();
+  g.font = '700 9px "JetBrains Mono", monospace';
+  g.fillStyle = `rgba(${pal.text},.75)`;
+  g.fillText('now', q0.x + pr + 5, q0.y + 3);
+  // Ring labels ride the ray from the center toward screen-right: the
+  // world point at angle yaw projects to the ellipse's right extreme at
+  // mid-depth, so every label shares one baseline that pans and zooms
+  // with the disc. Collision is resolved on that shared axis — "now"
+  // first, then the oldest date, then majors inner→outer, minors last —
+  // so when zoom packs rings together the least important labels yield,
+  // and they return as soon as there is room again.
+  g.font = '9px "JetBrains Mono", monospace';
+  const yaw = agendaGraphCam.yaw;
+  const placed = [[q0.x + pr + 3, q0.x + pr + 5 + g.measureText('now').width + 4]];
+  const candidates = [...agendaGraphTimeMarks].sort(
+    (a, b) => (b.oldest - a.oldest) || (a.minor - b.minor));
+  candidates.forEach((mark) => {
+    const q = project([Math.cos(yaw) * mark.r, 0, Math.sin(yaw) * mark.r]);
+    if (q.y < 12 || q.y > h - 6) return;
+    const width = g.measureText(mark.label).width;
+    let lx = Math.min(q.x + 5, w - 8 - width);
+    if (lx < 8 || q.x > w - 8 || q.x < 8) return;
+    const x0 = lx - 2;
+    const x1 = lx + width + 4;
+    if (placed.some(([a, b]) => x0 < b && x1 > a)) return;
+    placed.push([x0, x1]);
+    g.fillStyle = mark.oldest ? `rgba(${pal.text},.6)`
+      : mark.minor ? `rgba(${pal.text},.34)` : pal.t3;
+    g.fillText(mark.label, lx, q.y - 5);
+    // A short tick from the baseline up to the label roots it to its
+    // ring even when labels sit close.
+    g.fillRect(q.x - 0.5, q.y - 3.5, 1, 3.5);
+  });
+}
+
 // ---- Draw (3D-ish projection, hover picking, rings, labels) ----
 
 function agendaGraphDraw(ts) {
@@ -943,12 +1136,14 @@ function agendaGraphDraw(ts) {
     agendaRenderTab();
     return;
   }
+  if (agendaGraphMode === 'time') agendaGraphTimeTick();
   if (agendaGraphSettleLeft > 0) {
     const step = Math.min(agendaGraphSettleLeft,
       agendaGraphSettleBudget(agendaGraphNodes.length));
     agendaGraphRelax(step);
     agendaGraphSettleLeft -= step;
   }
+  const nowMs = Date.now();
   const reduced = agendaGraphReducedMotion();
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
@@ -1094,18 +1289,8 @@ function agendaGraphDraw(ts) {
     }
   });
   // Mode orientation marks: painted, inert pixels like every label.
-  if (agendaGraphMode === 'time' && agendaGraphTimeMarks.length) {
-    g.font = '9px "JetBrains Mono", monospace';
-    agendaGraphTimeMarks.forEach((mark) => {
-      const sr = mark.r * 1.28;
-      g.beginPath();
-      g.arc(cx, cyy, sr, 0, Math.PI * 2);
-      g.strokeStyle = `rgba(${pal.text},.07)`;
-      g.lineWidth = 1;
-      g.stroke();
-      g.fillStyle = pal.t3;
-      g.fillText(mark.label, cx + sr * 0.72, cyy - sr * 0.72);
-    });
+  if (agendaGraphMode === 'time') {
+    agendaGraphDrawTimeChrome(g, project, pal, w, h, reduced, ts);
   }
   if (agendaGraphMode === 'actor') {
     g.font = '600 9.5px "JetBrains Mono", monospace';
@@ -1135,8 +1320,14 @@ function agendaGraphDraw(ts) {
     // Attention mode: needs-you items glow, the rest recede.
     if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
     const glow = agendaGraphGlowSprite(rgb);
-    const gr = r * (hot ? 6.5
-      : agendaGraphMode === 'attention' && node.attn ? 7.5 : 4.5);
+    let glowK = hot ? 6.5
+      : agendaGraphMode === 'attention' && node.attn ? 7.5 : 4.5;
+    if (!hot && agendaGraphMode === 'time' && node.born) {
+      // Recency emphasis: items parked within the last hour breathe a
+      // little brighter around the "now" beacon, fading out as they age.
+      glowK += Math.max(0, 1 - (nowMs - node.born) / AGENDA_GRAPH_TIME_HOUR) * 2.5;
+    }
+    const gr = r * glowK;
     g.globalAlpha = alpha * (hot ? 0.95 : 0.6);
     g.drawImage(glow, q.x - gr, q.y - gr, gr * 2, gr * 2);
     g.globalAlpha = 1;
@@ -1211,7 +1402,9 @@ function agendaGraphDraw(ts) {
   const modeBadge = agendaGraphMode === 'orbit' ? ''
     : agendaGraphMode === 'attention'
       ? ` · attention — ${agendaGraphAttnCount} need you`
-      : ` · ${agendaGraphMode}`;
+      : agendaGraphMode === 'time'
+        ? ` · time — ${agendaGraphTimeSpanLabel()}`
+        : ` · ${agendaGraphMode}`;
   const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
     ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
     : '';
