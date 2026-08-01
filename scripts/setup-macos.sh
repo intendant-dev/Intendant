@@ -213,6 +213,34 @@ check_recording() {
     $all_ok
 }
 
+# Release-lane deps: the macOS release workflow (release.yml) runs on a
+# fleet Mac provisioned by this script — gnupg detach-signs the release
+# artifacts, the gh CLI publishes them. Both were absent on the fleet
+# runner and each cost a v0.1.0 release run (2026-08-01): the same
+# missing-machine-dep class as the libvpx incident.
+check_release_lane() {
+    local all_ok=true
+
+    echo ""
+    echo "Release-lane dependencies (CI release signing/publish):"
+
+    if has_cmd gpg; then
+        ok "gnupg ($(gpg --version 2>/dev/null | head -n1 | awk '{print $3}'))"
+    else
+        miss "gnupg" "brew install gnupg"
+        all_ok=false
+    fi
+
+    if has_cmd gh; then
+        ok "gh ($(gh --version 2>/dev/null | head -n1 | awk '{print $3}'))"
+    else
+        miss "gh" "brew install gh"
+        all_ok=false
+    fi
+
+    $all_ok
+}
+
 check_managed_browser() {
     local all_ok=true
 
@@ -435,12 +463,13 @@ run_check() {
     echo "  Intendant macOS Dependency Check"
     echo "════════════════════════════════════════════════════════"
 
-    local core_ok cu_ok audio_ok rec_ok browser_ok
+    local core_ok cu_ok audio_ok rec_ok browser_ok release_ok
     check_core         && core_ok=true  || core_ok=false
     check_computer_use && cu_ok=true    || cu_ok=false
     check_audio        && audio_ok=true || audio_ok=false
     check_recording    && rec_ok=true   || rec_ok=false
     check_managed_browser && browser_ok=true || browser_ok=false
+    check_release_lane && release_ok=true || release_ok=false
 
     check_wasm
 
@@ -471,6 +500,12 @@ run_check() {
         echo "  Browser workspaces: missing managed browser"
     fi
 
+    if $release_ok; then
+        echo "  Release lane (gpg/gh): ready"
+    else
+        echo "  Release lane (gpg/gh): missing dependencies"
+    fi
+
     echo ""
 }
 
@@ -493,6 +528,10 @@ run_install() {
     brew_install ffmpeg
     brew_install switchaudio-osx
     brew_install sox
+    # Release-lane tools (check_release_lane): gnupg's command is `gpg`,
+    # so gate on the command, not the formula name.
+    has_cmd gpg || brew_install gnupg
+    brew_install gh
 
     # Phase 3: Audio routing
     # Try Vortex first (preferred), fall back to BlackHole

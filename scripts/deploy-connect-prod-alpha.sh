@@ -91,6 +91,12 @@ SSH_OPTS=(
     -i "$CONNECT_SSH_KEY"
     -o IdentitiesOnly=yes
     -o StrictHostKeyChecking=accept-new
+    # Keepalives: the remote build/restart legs sit at the far end of a
+    # long-idle connection, and a half-dead session once hung 35 minutes
+    # past a completed remote build. 15s probes × 4 misses ≈ fail within
+    # a minute instead.
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=4
 )
 
 remote_quote() {
