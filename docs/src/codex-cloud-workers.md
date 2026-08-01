@@ -47,6 +47,24 @@ observation does not establish an eviction timeout, but it proves the loss
 mode is real: **an external build cache is a requirement for reuse that must
 survive replacement, not an optimization.**
 
+### Compute capacity is a lease property
+
+Do not treat the environment name as a machine size. OpenAI's published Cloud
+environment contract describes isolated containers and setup caching, but does
+not specify a fixed CPU/RAM allocation or expose a machine-size selector.
+Measured capacity has varied between tasks. Intendant therefore records the
+worker's current effective parallelism in every attachment fingerprint; that
+number is evidence about this lease, not a promise about the next one.
+
+For example, the 2026-08-01 acceptance worker exposed CPUs `0-2`, so Linux
+`nproc` reported 3, while its cgroup `cpu.max` was `200000 100000`: a hard
+quota of two CPU-core equivalents. Rust's quota-aware
+`available_parallelism()` and the Intendant fingerprint correctly reported 2.
+Use the fingerprint value for scheduling and performance expectations. Remote
+execution can still be worthwhile when its purpose is to remove load from
+home, but it must not be advertised as faster than a particular local machine
+without a measurement from the attached lease.
+
 Consequences Intendant encodes:
 
 - **An environment is a template, not a machine.** New tasks — sequential or
