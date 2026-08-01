@@ -111,7 +111,7 @@ use crate::event::ControlMsg;
 use crate::peer::card::{AgentCard, TransportSpec};
 use crate::peer::event::{ApprovalDecision, MessageContent, MessageId, PeerEvent, TaskId};
 use crate::peer::traits::{check_feature, PeerOp, PeerOpAck, PeerTransport, TransportFeatures};
-use crate::peer::transport::tls_client::ClientIdentityPaths;
+use crate::peer::transport::tls_client::{ClientIdentityPaths, EffectiveTlsPolicy};
 use crate::peer::upcast::WireEventUpcaster;
 use crate::peer::PeerError;
 use crate::types::OutboundEvent;
@@ -163,6 +163,26 @@ pub struct IntendantWsTransport {
 /// additions (per-peer signing key, issued scoped certs, etc.) extend cleanly.
 #[derive(Clone, Debug, Default)]
 pub struct TransportCredentials {
+    /// The peer daemon's Ed25519 identity public key (base64url,
+    /// unpadded), persisted at pairing. When present, candidates whose
+    /// host is a DNS name verify the presented server certificate through
+    /// the peer's identity-bound leaf attestation (RC-B2; see
+    /// [`crate::access::identity_attestation`]) instead of the raw pin
+    /// list, and fail closed when the attestation is missing, invalid,
+    /// wrong-key, or stale — no WebPKI fallback, no unpinned fallback.
+    /// Absent (legacy pairings): every candidate keeps raw-pin behavior.
+    pub identity_public_key: Option<String>,
+    /// Directory for the per-paired-identity attestation high-water marks
+    /// (anti-rollback, A4). `None` (tests, ad-hoc dials) keeps
+    /// monotonicity in-memory-only for the process.
+    pub attestation_state_dir: Option<std::path::PathBuf>,
+    /// The verification policy the last successful
+    /// [`resolve_tls_policy`](IntendantWsTransport::resolve_tls_policy)
+    /// produced, shared across clones (like [`TransportCredentials::tls`])
+    /// so HTTP side-channels (`/mcp`, the certificate-witness fetch)
+    /// ride the same trust decision as the live link instead of the raw
+    /// stored pins.
+    pub effective_tls: std::sync::Arc<std::sync::Mutex<Option<EffectiveTlsPolicy>>>,
     /// Outbound bearer token sent as `Authorization: Bearer <token>`
     /// on both the agent-card HTTP fetch and the WebSocket upgrade.
     /// `None` means no bearer enforcement on the peer side; matches
@@ -193,6 +213,23 @@ pub struct TransportCredentials {
     pub tls: super::tls_client::TlsClientCache,
 }
 
+impl TransportCredentials {
+    /// The verification policy HTTP side-channels should dial under: the
+    /// policy the transport's last connect resolved when one exists
+    /// (clones share the cell), else the raw stored pins — pre-B2
+    /// behavior for peers that never resolved an attested policy.
+    pub fn effective_tls_policy(&self) -> EffectiveTlsPolicy {
+        self.effective_tls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| EffectiveTlsPolicy {
+                pins: self.pinned_fingerprints.clone(),
+                require_tls13: false,
+            })
+    }
+}
+
 impl IntendantWsTransport {
     #[allow(dead_code)]
     pub fn new(url: String, events_tx: mpsc::Sender<PeerEvent>) -> Self {
@@ -206,8 +243,28 @@ impl IntendantWsTransport {
         events_tx: mpsc::Sender<PeerEvent>,
         creds: TransportCredentials,
     ) -> Self {
+        Self::with_spec(
+            TransportSpec::IntendantWs { url, relay: false },
+            events_tx,
+            creds,
+        )
+    }
+
+    /// Construct from a full [`TransportSpec`] so candidate metadata the
+    /// registry parsed off the card (the relay-class flag) survives onto
+    /// the live transport — [`PeerTransport::spec`] is what the actor
+    /// classifies the link from after connect.
+    pub fn with_spec(
+        spec: TransportSpec,
+        events_tx: mpsc::Sender<PeerEvent>,
+        creds: TransportCredentials,
+    ) -> Self {
+        debug_assert!(
+            matches!(spec, TransportSpec::IntendantWs { .. }),
+            "IntendantWsTransport requires an IntendantWs spec"
+        );
         Self {
-            spec: TransportSpec::IntendantWs { url },
+            spec,
             events_tx,
             ws_write: None,
             reader_handle: None,
@@ -232,9 +289,7 @@ impl IntendantWsTransport {
             events_tx,
             TransportCredentials {
                 bearer_token,
-                pinned_fingerprints: Vec::new(),
-                client_identity: None,
-                tls: Default::default(),
+                ..Default::default()
             },
         )
     }
@@ -256,11 +311,130 @@ impl IntendantWsTransport {
 
     fn ws_url(&self) -> Result<&str, PeerError> {
         match &self.spec {
-            TransportSpec::IntendantWs { url } => Ok(url.as_str()),
+            TransportSpec::IntendantWs { url, .. } => Ok(url.as_str()),
             _ => Err(PeerError::Transport(
                 "IntendantWsTransport constructed with non-IntendantWs spec".into(),
             )),
         }
+    }
+
+    /// Resolve the server-verification policy for this candidate (RC-B2).
+    ///
+    /// - **Legacy / direct-IP fast path** (no paired identity key, an IP
+    ///   literal host, or a cleartext `ws://` URL): the stored raw pin
+    ///   list under the default protocol offer — byte-identical to the
+    ///   pre-B2 behavior.
+    /// - **Identity-attested path** (paired identity key AND a DNS-name
+    ///   host on a TLS URL): prefetch the peer's agent card over a
+    ///   content-signed probe (the transport is untrusted; no client
+    ///   certificate is presented), verify its `identity_attestation`
+    ///   against the PAIRED key only (A1), enforce the persisted
+    ///   monotonic `issued_at` floor (A4), and pin exactly the attested
+    ///   leaf fingerprints with a TLS 1.3 floor (client-certificate
+    ///   metadata privacy against the relay). Every failure fails this
+    ///   candidate outright (A2): no WebPKI fallback, no unpinned
+    ///   fallback, no raw-pin fallback — `MultiTransport` walks on to
+    ///   the next candidate, and the reconnect walk refetches a fresh
+    ///   attestation next attempt (rotation self-heals, A5).
+    async fn resolve_tls_policy(&self) -> Result<EffectiveTlsPolicy, PeerError> {
+        let ws_url = self.ws_url()?.to_string();
+        let legacy = EffectiveTlsPolicy {
+            pins: self.creds.pinned_fingerprints.clone(),
+            require_tls13: false,
+        };
+        let paired_key = self
+            .creds
+            .identity_public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        let policy = match paired_key {
+            Some(paired_key)
+                if super::tls_client::url_uses_tls(&ws_url)
+                    && super::tls_client::url_host_is_dns_name(&ws_url) =>
+            {
+                let attestation = self.fetch_identity_attestation(&ws_url).await?;
+                let pins = crate::access::identity_attestation::verify_attestation(
+                    &attestation,
+                    paired_key,
+                )
+                .map_err(|e| {
+                    PeerError::Auth(format!(
+                        "peer identity attestation for {ws_url} refused: {e}"
+                    ))
+                })?;
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                self.attestation_high_water_store()
+                    .enforce_monotonic(paired_key, &attestation, now_unix_ms)
+                    .map_err(|e| {
+                        PeerError::Auth(format!(
+                            "peer identity attestation for {ws_url} refused: {e}"
+                        ))
+                    })?;
+                EffectiveTlsPolicy {
+                    pins,
+                    require_tls13: true,
+                }
+            }
+            _ => legacy,
+        };
+        *self
+            .creds
+            .effective_tls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(policy.clone());
+        Ok(policy)
+    }
+
+    fn attestation_high_water_store(&self) -> crate::access::identity_attestation::HighWaterStore {
+        let dir = match &self.creds.attestation_state_dir {
+            Some(dir) => dir.clone(),
+            // No injected state root (ad-hoc/test dials): keep the floor
+            // under the OS temp dir so monotonicity still spans this
+            // machine's processes without touching the access store.
+            None => std::env::temp_dir().join("intendant-attestation-state"),
+        };
+        crate::access::identity_attestation::HighWaterStore::new(dir)
+    }
+
+    /// Prefetch the candidate's agent card for its `identity_attestation`
+    /// block. The probe accepts any transport certificate — the document
+    /// is content-signed and verified by the caller against the paired
+    /// key — and presents no client certificate, so nothing about this
+    /// daemon leaks to an unverified endpoint.
+    async fn fetch_identity_attestation(
+        &self,
+        ws_url: &str,
+    ) -> Result<crate::access::identity_attestation::DaemonIdentityAttestation, PeerError> {
+        let http_base = super::ws_url_to_http_base(ws_url);
+        let card_url = format!("{http_base}/.well-known/agent-card.json");
+        let client = super::tls_client::content_signed_probe_client(CARD_FETCH_TIMEOUT)?;
+        let response = client
+            .get(&card_url)
+            .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE)
+            .send()
+            .await
+            .map_err(|e| PeerError::Auth(format!("attestation prefetch GET {card_url}: {e}")))?;
+        if !response.status().is_success() {
+            return Err(PeerError::Auth(format!(
+                "attestation prefetch GET {card_url}: HTTP {}",
+                response.status()
+            )));
+        }
+        let card: AgentCard = response
+            .json()
+            .await
+            .map_err(|e| PeerError::Auth(format!("attestation prefetch parse {card_url}: {e}")))?;
+        card.identity_attestation.ok_or_else(|| {
+            PeerError::Auth(format!(
+                "peer at {card_url} serves no identity attestation but this peer is \
+                 identity-paired — refusing the public-name candidate (re-pair, or dial a \
+                 direct address)"
+            ))
+        })
     }
 
     /// Fetch the peer's Agent Card via HTTP GET on the derived HTTP
@@ -278,15 +452,15 @@ impl IntendantWsTransport {
     /// pins the server cert's SHA-256 fingerprint via
     /// [`pinned_client_config`] — same verifier the WebSocket
     /// connect path uses, so HTTP and WS share the trust decision.
-    async fn fetch_agent_card(&self) -> Result<AgentCard, PeerError> {
+    async fn fetch_agent_card(&self, policy: &EffectiveTlsPolicy) -> Result<AgentCard, PeerError> {
         let ws_url = self.ws_url()?.to_string();
         let http_base = super::ws_url_to_http_base(&ws_url);
         let card_url = format!("{http_base}/.well-known/agent-card.json");
 
-        let client = self.creds.tls.http_client(
-            &self.creds.pinned_fingerprints,
-            self.creds.client_identity.as_ref(),
-        )?;
+        let client = self
+            .creds
+            .tls
+            .http_client_for_policy(policy, self.creds.client_identity.as_ref())?;
 
         let mut request = client
             .get(&card_url)
@@ -296,10 +470,9 @@ impl IntendantWsTransport {
             request = request.bearer_auth(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| PeerError::CardFetch(format!("GET {card_url}: {e}")))?;
+        let response = request.send().await.map_err(|e| {
+            PeerError::CardFetch(format!("GET {card_url}: {}", describe_error_chain(&e)))
+        })?;
 
         if !response.status().is_success() {
             return Err(PeerError::CardFetch(format!(
@@ -329,7 +502,10 @@ impl IntendantWsTransport {
     /// identity, the connect goes through `connect_async_tls_with_config` with
     /// a custom rustls Connector. For `ws://` URLs (no TLS layer at all), the
     /// connector is irrelevant, so trusted-LAN cleartext tests keep working.
-    async fn open_ws(&self) -> Result<(WsSink, JoinHandle<()>), PeerError> {
+    async fn open_ws(
+        &self,
+        policy: &EffectiveTlsPolicy,
+    ) -> Result<(WsSink, JoinHandle<()>), PeerError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::Connector;
 
@@ -364,10 +540,7 @@ impl IntendantWsTransport {
         let connector: Option<Connector> = self
             .creds
             .tls
-            .client_config(
-                &self.creds.pinned_fingerprints,
-                self.creds.client_identity.as_ref(),
-            )?
+            .client_config_for_policy(policy, self.creds.client_identity.as_ref())?
             .map(Connector::Rustls);
 
         let (ws_stream, _response) =
@@ -407,6 +580,22 @@ fn message_text(content: &MessageContent) -> Result<String, PeerError> {
                 .into(),
         )),
     }
+}
+
+/// Flatten an error's source chain into one line. reqwest's `Display`
+/// stops at "error sending request", burying the cause that matters for
+/// diagnosis — for pinned/attested peer dials that cause is typically
+/// the rustls refusal ("server cert fingerprint … doesn't match any
+/// pinned"), which the operator (and the tests) need to see verbatim.
+fn describe_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// Parse a peer approval `request_id` string as the `u64` Intendant's
@@ -578,8 +767,13 @@ impl PeerTransport for IntendantWsTransport {
             let _ = write.close().await;
         }
 
-        let card = self.fetch_agent_card().await?;
-        let (write, reader_handle) = self.open_ws().await?;
+        // One verification policy per connect attempt: both legs — the
+        // agent-card fetch and the WebSocket attach — resolve their TLS
+        // material through the same [`TlsClientCache`] entry built from
+        // this policy, so the trust decision cannot diverge between them.
+        let policy = self.resolve_tls_policy().await?;
+        let card = self.fetch_agent_card(&policy).await?;
+        let (write, reader_handle) = self.open_ws(&policy).await?;
 
         self.card = Some(card.clone());
         self.ws_write = Some(write);
@@ -1463,6 +1657,432 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(PeerError::NotConnected)));
+    }
+
+    // ── RC-B2: identity-bound verification of public-name candidates ──
+
+    /// A TLS test peer whose gateway serves the identity attestation and
+    /// whose acceptor presents exactly the leaf the attestation binds
+    /// (`server.crt` in the gateway's access store IS the served cert,
+    /// so `read_server_cert_fingerprint` hashes the presented leaf).
+    struct AttestedTlsPeer {
+        task: tokio::task::JoinHandle<()>,
+        port: u16,
+        /// The target's signing identity — created at the injected path
+        /// BEFORE spawn so the gateway loads this exact key.
+        identity: crate::daemon_identity::DaemonIdentity,
+        server_cert_fp_hex: String,
+        _access_dir: tempfile::TempDir,
+    }
+
+    impl Drop for AttestedTlsPeer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_attested_tls_peer(serve_attestation: bool) -> AttestedTlsPeer {
+        spawn_tls_peer_inner(serve_attestation, false, None).await
+    }
+
+    /// `mismatched_leaf`: the acceptor presents a DIFFERENT certificate
+    /// than the one written to `server.crt` (what the attestation
+    /// binds) — the relay-swapped-endpoint shape.
+    /// `tls12_only`: floor the ACCEPTOR at TLS 1.2 so 1.3-floored
+    /// clients cannot complete a handshake.
+    async fn spawn_tls_peer_inner(
+        serve_attestation: bool,
+        mismatched_leaf: bool,
+        max_tls12: Option<()>,
+    ) -> AttestedTlsPeer {
+        let access_dir = tempfile::tempdir().expect("attested peer access store");
+        let served = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let attested_cert_pem = if mismatched_leaf {
+            let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            other.cert.pem()
+        } else {
+            served.cert.pem()
+        };
+        std::fs::write(access_dir.path().join("server.crt"), attested_cert_pem).unwrap();
+        let cert_path = access_dir.path().join("served.crt");
+        let key_path = access_dir.path().join("served.key");
+        std::fs::write(&cert_path, served.cert.pem()).unwrap();
+        std::fs::write(&key_path, served.signing_key.serialize_pem()).unwrap();
+        let acceptor = if max_tls12.is_some() {
+            let (chain, key) =
+                crate::web_tls::load_pem_cert_and_key(&cert_path, &key_path).unwrap();
+            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config))
+        } else {
+            crate::web_tls::build_single_cert_acceptor(&crate::web_tls::TlsCertSource::Files {
+                cert_path,
+                key_path,
+            })
+            .unwrap()
+        };
+
+        let identity_path = access_dir.path().join("attest-identity.pk8");
+        // Create the identity BEFORE spawn so the test and the gateway
+        // hold the same key.
+        let identity =
+            crate::daemon_identity::DaemonIdentity::load_or_create(&identity_path).unwrap();
+        let mut config = WebGatewayConfig::default();
+        if serve_attestation {
+            config.attestation_identity_path = Some(identity_path);
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let task = crate::web_gateway::spawn_web_gateway_from_cert_dir(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            Some(acceptor),
+            access_dir.path().to_path_buf(),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        AttestedTlsPeer {
+            task,
+            port,
+            identity,
+            server_cert_fp_hex: crate::access::pinning::format_fingerprint(
+                &crate::access::pinning::fingerprint_of_der(served.cert.der().as_ref()),
+            ),
+            _access_dir: access_dir,
+        }
+    }
+
+    fn attested_credentials(
+        paired_key: String,
+        state_dir: &std::path::Path,
+    ) -> TransportCredentials {
+        TransportCredentials {
+            // Deliberately NO raw pins: only the identity-attested pin
+            // set can admit the self-signed leaf, so a successful
+            // connect proves both legs rode the attested policy.
+            identity_public_key: Some(paired_key),
+            attestation_state_dir: Some(state_dir.to_path_buf()),
+            ..test_loopback_credentials()
+        }
+    }
+
+    /// Checklist 6 + A3/A5 serve half: a `localhost` (DNS-name)
+    /// candidate of an identity-paired peer verifies through the card
+    /// attestation for BOTH legs — the card fetch and the WS attach —
+    /// with no raw pin configured, and records the attested policy
+    /// (TLS 1.3 floor included) on the shared credentials cell.
+    #[tokio::test]
+    async fn attested_public_name_candidate_connects_both_legs() {
+        let peer = spawn_attested_tls_peer(true).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        let effective = creds.effective_tls.clone();
+        let mut transport = IntendantWsTransport::with_credentials(url, tx, creds);
+
+        let card = transport.connect().await.expect("attested connect");
+        assert!(
+            card.identity_attestation.is_some(),
+            "the verified card fetch leg returns the attestation block"
+        );
+        assert!(transport.is_connected(), "WS attach leg completed");
+
+        let policy = effective
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("resolved policy recorded for side-channels");
+        assert!(policy.require_tls13, "attested path floors TLS 1.3");
+        assert_eq!(
+            policy.pins,
+            vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()],
+            "pins are exactly the attested leaf set"
+        );
+
+        // A4 residue: the monotonicity floor persisted beside the peer
+        // credentials, so replay protection survives a restart.
+        let store = crate::access::identity_attestation::HighWaterStore::new(state_dir.path());
+        assert!(
+            store
+                .highest_issued_at(&peer.identity.public_key_b64u())
+                .is_some(),
+            "verified attestation ratchets the persisted floor"
+        );
+
+        // Reconnect re-fetches and re-verifies (equal issued_at accepted).
+        transport.connect().await.expect("reconnect verifies again");
+        transport.disconnect().await.unwrap();
+    }
+
+    /// A1 negative at the transport level: the peer's attestation is
+    /// signed by ITS identity key, but this dialer paired a DIFFERENT
+    /// key — the candidate fails outright, with no fallback.
+    #[tokio::test]
+    async fn attestation_signed_by_wrong_key_fails_candidate() {
+        let peer = spawn_attested_tls_peer(true).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other =
+            crate::daemon_identity::DaemonIdentity::load_or_create(other_dir.path().join("k.pk8"))
+                .unwrap();
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let mut transport = IntendantWsTransport::with_credentials(
+            url,
+            tx,
+            attested_credentials(other.public_key_b64u(), state_dir.path()),
+        );
+
+        let err = transport.connect().await.expect_err("wrong key refuses");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not match the identity key paired"),
+            "got: {msg}"
+        );
+        assert!(!transport.is_connected());
+    }
+
+    /// A4 negative at the transport level: a dialer that has already
+    /// verified a newer attestation refuses the (replayed) older one.
+    #[tokio::test]
+    async fn stale_attestation_refuses_candidate() {
+        let peer = spawn_attested_tls_peer(true).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let paired_key = peer.identity.public_key_b64u();
+
+        // Ratchet the floor a minute into the future by verifying a
+        // synthetic newer attestation from the same identity — as if a
+        // previous connect saw a post-rotation document the relay is
+        // now rolling back from.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let newer = crate::access::identity_attestation::sign_attestation(
+            &peer.identity,
+            None,
+            Some(&peer.server_cert_fp_hex),
+            None,
+            now_ms + 60_000,
+        );
+        let store = crate::access::identity_attestation::HighWaterStore::new(state_dir.path());
+        store
+            .enforce_monotonic(&paired_key, &newer, now_ms + 60_000)
+            .unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let mut transport = IntendantWsTransport::with_credentials(
+            url,
+            tx,
+            attested_credentials(paired_key, state_dir.path()),
+        );
+        let err = transport.connect().await.expect_err("stale refuses");
+        let msg = format!("{err}");
+        assert!(msg.contains("older than the highest"), "got: {msg}");
+    }
+
+    /// A2 fail-closed: an identity-paired dialer refuses a public-name
+    /// candidate whose card serves NO attestation — no WebPKI fallback,
+    /// no unpinned fallback, no raw-pin fallback.
+    #[tokio::test]
+    async fn missing_attestation_fails_closed_on_name_candidate() {
+        let peer = spawn_attested_tls_peer(false).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        // Even a correct raw pin must not rescue the candidate: the
+        // paired identity key commits public-name dials to attestation.
+        creds.pinned_fingerprints =
+            vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()];
+        let mut transport = IntendantWsTransport::with_credentials(url, tx, creds);
+
+        let err = transport.connect().await.expect_err("fail closed");
+        let msg = format!("{err}");
+        assert!(msg.contains("serves no identity attestation"), "got: {msg}");
+    }
+
+    /// An attestation that verifies but binds a DIFFERENT leaf than the
+    /// endpoint presents (a relay splicing to a different terminator)
+    /// fails the TLS handshake on the attested pin.
+    #[tokio::test]
+    async fn attested_fingerprint_mismatch_refuses_handshake() {
+        let peer = spawn_tls_peer_inner(true, true, None).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let mut transport = IntendantWsTransport::with_credentials(
+            url,
+            tx,
+            attested_credentials(peer.identity.public_key_b64u(), state_dir.path()),
+        );
+        let err = transport.connect().await.expect_err("pin mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("doesn't match any pinned"),
+            "the attested pin set must reject the presented leaf (on the FIRST verified leg, \
+             the card fetch): {msg}"
+        );
+        assert!(
+            !msg.contains("attestation refused") && !msg.contains("serves no identity"),
+            "attestation resolution itself succeeded — the refusal is the TLS pin: {msg}"
+        );
+    }
+
+    /// Direct-IP fast path stays byte-identical: an IP-literal candidate
+    /// of the SAME identity-paired peer uses the raw pin, succeeds with
+    /// no attestation served anywhere, and records the legacy policy
+    /// (no TLS 1.3 floor).
+    #[tokio::test]
+    async fn direct_ip_candidate_keeps_raw_pin_behavior() {
+        let peer = spawn_attested_tls_peer(false).await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://127.0.0.1:{}/ws", peer.port);
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        creds.pinned_fingerprints =
+            vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()];
+        let effective = creds.effective_tls.clone();
+        let mut transport = IntendantWsTransport::with_credentials(url, tx, creds);
+
+        transport.connect().await.expect("raw pin admits IP dial");
+        let policy = effective.lock().unwrap().clone().expect("policy recorded");
+        assert!(
+            !policy.require_tls13,
+            "no protocol floor on the direct-IP path"
+        );
+        assert_eq!(
+            policy.pins,
+            vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()],
+            "raw stored pins verbatim"
+        );
+        transport.disconnect().await.unwrap();
+    }
+
+    /// Cleartext `ws://` candidates carry no TLS layer at all — a paired
+    /// identity key changes nothing there (trusted-LAN test topologies
+    /// keep working).
+    #[tokio::test]
+    async fn cleartext_ws_candidate_ignores_identity_key() {
+        let (port, gateway) = spawn_test_peer().await;
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let mut creds = test_loopback_credentials();
+        creds.identity_public_key = Some("bm90LWEtcmVhbC1rZXk".to_string());
+        let mut transport = IntendantWsTransport::with_credentials(url, tx, creds);
+        transport.connect().await.expect("cleartext dial unchanged");
+        transport.disconnect().await.unwrap();
+        gateway.abort();
+    }
+
+    /// Checklist 8 scoping, both directions on one TLS-1.2-only
+    /// endpoint: the attested (public-name) path refuses below TLS 1.3,
+    /// while the raw-pin direct-IP path still completes at 1.2 —
+    /// byte-identical legacy behavior.
+    #[tokio::test]
+    async fn tls13_floor_rides_the_attested_path_only() {
+        let peer = spawn_tls_peer_inner(true, false, Some(())).await;
+        let state_dir = tempfile::tempdir().unwrap();
+
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let url = format!("wss://localhost:{}/ws", peer.port);
+        let mut transport = IntendantWsTransport::with_credentials(
+            url,
+            tx,
+            attested_credentials(peer.identity.public_key_b64u(), state_dir.path()),
+        );
+        let err = transport
+            .connect()
+            .await
+            .expect_err("1.2-only endpoint cannot satisfy the 1.3 floor");
+        let msg = format!("{err}");
+        // The refusal is the floored TLS handshake on the first verified
+        // leg (the card fetch) — attestation resolution itself succeeded
+        // (the unfloored probe fetched and verified the card fine).
+        assert!(
+            msg.contains("agent card fetch failed") || msg.contains("ws connect"),
+            "failure is a verified-leg handshake: {msg}"
+        );
+        assert!(
+            !msg.contains("attestation"),
+            "attestation resolution must not be the failure here: {msg}"
+        );
+
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
+        let ip_url = format!("wss://127.0.0.1:{}/ws", peer.port);
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        creds.pinned_fingerprints =
+            vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()];
+        let mut transport = IntendantWsTransport::with_credentials(ip_url, tx, creds);
+        transport
+            .connect()
+            .await
+            .expect("direct-IP raw-pin path still negotiates TLS 1.2");
+        transport.disconnect().await.unwrap();
+    }
+
+    /// Checklist 9 (as re-scoped by the RC-C1 ruling): the relay
+    /// candidate's class survives from the card-parsed spec onto the
+    /// live transport — `spec()` is what the actor hands to
+    /// `PeerLinkInfo::from_spec` after connect, so a link on this
+    /// candidate renders `relayed` on the dashboard honesty rails.
+    #[test]
+    fn with_spec_preserves_relay_class_for_link_classification() {
+        let spec = TransportSpec::IntendantWs {
+            url: "wss://d-0123456789.fleet.example:443/ws".into(),
+            relay: true,
+        };
+        let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
+        let transport =
+            IntendantWsTransport::with_spec(spec.clone(), tx, TransportCredentials::default());
+        assert_eq!(transport.spec(), &spec);
+        let link = crate::peer::handle::PeerLinkInfo::from_spec(transport.spec())
+            .expect("intendant-ws spec classifies");
+        assert_eq!(
+            link.transport_class,
+            crate::peer::handle::PeerTransportClass::Relayed
+        );
+        // The wire form the dashboard rails read (pinned by RC-C1;
+        // extended here to the genuinely Relayed constructor arm).
+        assert_eq!(
+            serde_json::to_value(&link).unwrap()["transport_class"],
+            "relayed"
+        );
+    }
+
+    /// Side-channel policy fallback: before any connect resolves a
+    /// policy, `/mcp`-style consumers dial under the raw stored pins —
+    /// pre-B2 behavior verbatim.
+    #[test]
+    fn effective_policy_falls_back_to_raw_pins() {
+        let creds = TransportCredentials {
+            pinned_fingerprints: vec![[7u8; 32]],
+            ..Default::default()
+        };
+        let policy = creds.effective_tls_policy();
+        assert_eq!(policy.pins, vec![[7u8; 32]]);
+        assert!(!policy.require_tls13);
     }
 
     /// Forward-compat: a peer sending an event variant we don't

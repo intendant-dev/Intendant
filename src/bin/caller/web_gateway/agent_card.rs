@@ -218,7 +218,7 @@ pub fn build_local_agent_card(
     use crate::peer::{Capability, TransportSpec};
     let transports: Vec<TransportSpec> = advertise_urls
         .into_iter()
-        .map(|url| TransportSpec::IntendantWs { url })
+        .map(|url| TransportSpec::IntendantWs { url, relay: false })
         .collect();
     crate::peer::AgentCard::local_intendant(
         crate::access::resolve_host_label(),
@@ -228,6 +228,216 @@ pub fn build_local_agent_card(
         vec![Capability::ComputerUse, Capability::Display],
         auth,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Live card rendering (RC-B2): identity attestation + relay candidate
+// ---------------------------------------------------------------------------
+
+/// Pure compose step for the card's dynamic blocks, split from
+/// [`AgentCardLive`] so it is unit-testable without process-global
+/// certificate or fleet state.
+///
+/// - `attestation` grafts the `identity_attestation` block (see
+///   [`crate::access::identity_attestation`]).
+/// - `relay_candidate_url` appends one relay-classed `intendant-ws`
+///   transport **last** — operator overrides and auto-detected entries
+///   in `base` keep walk-order precedence (`MultiTransport` probes in
+///   card order) — deduplicated against URLs the operator already
+///   listed (their verbatim entry wins, unmarked).
+pub(crate) fn render_card_with_dynamics(
+    base: &serde_json::Value,
+    attestation: Option<&crate::access::identity_attestation::DaemonIdentityAttestation>,
+    relay_candidate_url: Option<&str>,
+) -> serde_json::Value {
+    let mut value = base.clone();
+    if let Some(attestation) = attestation {
+        if let Ok(block) = serde_json::to_value(attestation) {
+            value["identity_attestation"] = block;
+        }
+    }
+    if let Some(url) = relay_candidate_url {
+        if let Some(transports) = value
+            .get_mut("transports")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let already_listed = transports
+                .iter()
+                .any(|t| t.get("url").and_then(serde_json::Value::as_str) == Some(url));
+            if !already_listed {
+                transports.push(serde_json::json!({
+                    "type": "intendant-ws",
+                    "url": url,
+                    "relay": true,
+                }));
+            }
+        }
+    }
+    value
+}
+
+/// Inputs that decide one rendered card revision. Re-rendering (and
+/// re-signing the attestation) happens exactly when one of them moves —
+/// which is how certificate rotation re-signs on the
+/// `install_fleet_certificate` hook path (B0 ruling A5): the hook swaps
+/// the resolver state this key is derived from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CardRenderKey {
+    access_fingerprint: Option<String>,
+    fleet_fingerprint: Option<String>,
+    fleet_name: Option<String>,
+}
+
+/// The live agent card: the spawn-built base plus the dynamic blocks —
+/// the daemon-identity attestation over the *current* TLS leaves, and
+/// the relay-mode fleet-name candidate. Serve-time state because both
+/// inputs move while the gateway runs (certificate renewal; the fleet
+/// name arriving from Connect registration after spawn).
+pub(crate) struct AgentCardLive {
+    base: serde_json::Value,
+    fallback_json: Arc<String>,
+    /// Injection point for the signing identity (the
+    /// `hosted_control_identity_path` pattern): production wires the
+    /// daemon identity store's key path; tests inject a temp path or
+    /// leave `None`, which serves the card without an attestation.
+    attestation_identity_path: Option<std::path::PathBuf>,
+    identity: std::sync::OnceLock<Option<crate::daemon_identity::DaemonIdentity>>,
+    daemon_id: Option<String>,
+    access_cert_dir: std::path::PathBuf,
+    /// `Some(port)` exactly when the relay candidate is advertised:
+    /// `[connect] relay_enabled` AND `relay_peer_admission` (the B0
+    /// ruling's OPEN-3 auto-append condition), with the port taken from
+    /// the relay endpoint. The fleet name itself is read live per
+    /// render — it only exists after Connect registration.
+    relay_candidate_port: Option<u16>,
+    cache: Mutex<Option<(CardRenderKey, Arc<String>)>>,
+}
+
+impl AgentCardLive {
+    pub(crate) fn new(
+        base: serde_json::Value,
+        config: &WebGatewayConfig,
+        access_cert_dir: std::path::PathBuf,
+    ) -> Self {
+        let fallback_json =
+            Arc::new(serde_json::to_string(&base).unwrap_or_else(|_| "{}".to_string()));
+        let relay_candidate_port = (config.connect.relay_enabled
+            && config.connect.relay_peer_admission)
+            .then(|| relay_public_port(config.connect.relay_endpoint.as_deref()))
+            .flatten();
+        Self {
+            base,
+            fallback_json,
+            attestation_identity_path: config.attestation_identity_path.clone(),
+            identity: std::sync::OnceLock::new(),
+            daemon_id: config
+                .connect
+                .daemon_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            access_cert_dir,
+            relay_candidate_port,
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn identity(&self) -> Option<&crate::daemon_identity::DaemonIdentity> {
+        self.identity
+            .get_or_init(|| {
+                let path = self.attestation_identity_path.as_ref()?;
+                match crate::daemon_identity::DaemonIdentity::load_or_create(path) {
+                    Ok(identity) => Some(identity),
+                    Err(e) => {
+                        // Served-without-attestation is the honest
+                        // degradation: identity-paired dialers then fail
+                        // closed on public-name candidates (A2) instead
+                        // of trusting an unattested leaf.
+                        eprintln!(
+                            "[agent-card] daemon identity unavailable ({e}); serving the card without an identity attestation"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// This daemon's identity public key, for pairing surfaces that
+    /// stamp it into approval results (the doorbell).
+    pub(crate) fn identity_public_key(&self) -> Option<String> {
+        self.identity()
+            .map(crate::daemon_identity::DaemonIdentity::public_key_b64u)
+    }
+
+    /// The card JSON to serve right now. Cached; re-rendered (and the
+    /// attestation re-signed) when the live inputs move.
+    pub(crate) fn render_json(&self) -> Arc<String> {
+        let access_fingerprint =
+            crate::access::certs::read_server_cert_fingerprint(&self.access_cert_dir);
+        let fleet_fingerprint = crate::web_tls::current_fleet_leaf_fingerprint();
+        let fleet_name = self.relay_candidate_port.and_then(|_| {
+            crate::fleet_cert::status_snapshot()
+                .name
+                .filter(|name| !name.trim().is_empty())
+        });
+        let key = CardRenderKey {
+            access_fingerprint,
+            fleet_fingerprint,
+            fleet_name,
+        };
+        {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_key, json)) = cache.as_ref() {
+                if *cached_key == key {
+                    return json.clone();
+                }
+            }
+        }
+
+        let attestation = match self.identity() {
+            Some(identity)
+                if key.access_fingerprint.is_some() || key.fleet_fingerprint.is_some() =>
+            {
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                Some(crate::access::identity_attestation::sign_attestation(
+                    identity,
+                    self.daemon_id.as_deref(),
+                    key.access_fingerprint.as_deref(),
+                    key.fleet_fingerprint.as_deref(),
+                    now_unix_ms,
+                ))
+            }
+            _ => None,
+        };
+        let relay_url = match (&key.fleet_name, self.relay_candidate_port) {
+            (Some(name), Some(port)) => Some(format!("wss://{name}:{port}/ws")),
+            _ => None,
+        };
+        if attestation.is_none() && relay_url.is_none() {
+            return self.fallback_json.clone();
+        }
+        let value =
+            render_card_with_dynamics(&self.base, attestation.as_ref(), relay_url.as_deref());
+        let json = Arc::new(serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()));
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, json.clone()));
+        json
+    }
+}
+
+/// The public dial-in port of the relay, from the daemon's own
+/// `[connect] relay_endpoint` (`host:port`; a bare host means 443, the
+/// wss default). The relay serves dial-ins and daemon dial-backs on the
+/// same listener, so the endpoint this daemon tunnels to is also where
+/// peers dial its fleet name.
+fn relay_public_port(relay_endpoint: Option<&str>) -> Option<u16> {
+    let endpoint = relay_endpoint.map(str::trim).filter(|e| !e.is_empty())?;
+    let url = url::Url::parse(&format!("wss://{endpoint}")).ok()?;
+    Some(url.port().unwrap_or(443))
 }
 
 pub(crate) fn build_config_inner(
@@ -318,6 +528,225 @@ pub(crate) fn build_config_inner(
 mod tests {
     use super::*;
     use crate::web_gateway::tests::{http_request, setup_peer_op_test};
+
+    fn base_card_value() -> serde_json::Value {
+        serde_json::to_value(build_local_agent_card(
+            vec![
+                "ws://operator.example:9000/ws".to_string(),
+                "ws://192.168.1.42:8765/ws".to_string(),
+            ],
+            crate::peer::AuthRequirements::none(),
+        ))
+        .unwrap()
+    }
+
+    /// OPEN-3 as ruled: the relay candidate appends LAST — operator and
+    /// auto-detected entries keep walk-order precedence — carrying the
+    /// `relay: true` class stamp, and the whole card still parses as a
+    /// typed `AgentCard` whose last transport classifies `Relayed`.
+    #[test]
+    fn relay_candidate_appends_last_with_class_stamp() {
+        let base = base_card_value();
+        let rendered = render_card_with_dynamics(
+            &base,
+            None,
+            Some("wss://d-0123456789abcdef0123.fleet.example:443/ws"),
+        );
+        let transports = rendered["transports"].as_array().unwrap();
+        assert_eq!(transports.len(), 3);
+        assert_eq!(
+            transports[0]["url"], "ws://operator.example:9000/ws",
+            "operator entry keeps first position"
+        );
+        let last = &transports[2];
+        assert_eq!(
+            last["url"],
+            "wss://d-0123456789abcdef0123.fleet.example:443/ws"
+        );
+        assert_eq!(last["relay"], true);
+
+        let card: crate::peer::AgentCard = serde_json::from_value(rendered).unwrap();
+        let last_spec = card.transports.last().unwrap();
+        assert!(
+            matches!(
+                last_spec,
+                crate::peer::TransportSpec::IntendantWs { relay: true, .. }
+            ),
+            "parsed spec carries the relay class: {last_spec:?}"
+        );
+        let link = crate::peer::handle::PeerLinkInfo::from_spec(last_spec).unwrap();
+        assert_eq!(
+            link.transport_class,
+            crate::peer::handle::PeerTransportClass::Relayed,
+            "the relay-candidate constructor is the one Relayed classifier"
+        );
+        // The other entries stay Direct — the class rides the spec, not
+        // the peer.
+        let first = crate::peer::handle::PeerLinkInfo::from_spec(&card.transports[0]).unwrap();
+        assert_eq!(
+            first.transport_class,
+            crate::peer::handle::PeerTransportClass::Direct
+        );
+    }
+
+    /// A URL the operator already listed is never duplicated — their
+    /// verbatim entry wins (unmarked).
+    #[test]
+    fn relay_candidate_dedupes_operator_listed_url() {
+        let base = serde_json::to_value(build_local_agent_card(
+            vec!["wss://d-aa.fleet.example:443/ws".to_string()],
+            crate::peer::AuthRequirements::none(),
+        ))
+        .unwrap();
+        let rendered =
+            render_card_with_dynamics(&base, None, Some("wss://d-aa.fleet.example:443/ws"));
+        let transports = rendered["transports"].as_array().unwrap();
+        assert_eq!(transports.len(), 1, "no duplicate: {transports:?}");
+        assert!(
+            transports[0].get("relay").is_none(),
+            "the operator's verbatim entry stays unmarked"
+        );
+    }
+
+    /// The attestation block grafts verifiably and the no-dynamics
+    /// render is the base card unchanged.
+    #[test]
+    fn attestation_grafts_and_verifies_on_the_rendered_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity =
+            crate::daemon_identity::DaemonIdentity::load_or_create(dir.path().join("id.pk8"))
+                .unwrap();
+        let attestation = crate::access::identity_attestation::sign_attestation(
+            &identity,
+            Some("daemon-1"),
+            Some("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"),
+            None,
+            42,
+        );
+        let base = base_card_value();
+        let rendered = render_card_with_dynamics(&base, Some(&attestation), None);
+        let card: crate::peer::AgentCard = serde_json::from_value(rendered).unwrap();
+        let block = card.identity_attestation.expect("block grafted");
+        assert!(crate::access::identity_attestation::verify_attestation(
+            &block,
+            &identity.public_key_b64u()
+        )
+        .is_ok());
+
+        assert_eq!(
+            render_card_with_dynamics(&base, None, None),
+            base,
+            "no dynamics = the base card byte-identically"
+        );
+    }
+
+    /// The live renderer signs with the injected identity, binds the
+    /// access store's current `server.crt`, re-signs when the leaf
+    /// changes (the A5 rotation shape), and caches between renders (a
+    /// stable `issued_at` while inputs hold still).
+    #[test]
+    fn agent_card_live_signs_caches_and_resigns_on_rotation() {
+        let access_dir = tempfile::tempdir().unwrap();
+        let first_leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(access_dir.path().join("server.crt"), first_leaf.cert.pem()).unwrap();
+        let identity_path = access_dir.path().join("id.pk8");
+        let identity =
+            crate::daemon_identity::DaemonIdentity::load_or_create(&identity_path).unwrap();
+
+        let mut config = WebGatewayConfig::default();
+        config.attestation_identity_path = Some(identity_path);
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
+
+        let first = live.render_json();
+        let card: crate::peer::AgentCard = serde_json::from_str(&first).unwrap();
+        let block = card.identity_attestation.expect("attestation served");
+        let expected_fp = crate::access::pinning::format_fingerprint(
+            &crate::access::pinning::fingerprint_of_der(first_leaf.cert.der().as_ref()),
+        );
+        assert_eq!(
+            block.access_cert_fingerprint.as_deref(),
+            Some(&*expected_fp)
+        );
+        assert!(crate::access::identity_attestation::verify_attestation(
+            &block,
+            &identity.public_key_b64u()
+        )
+        .is_ok());
+
+        // Unchanged inputs: the cached render (same issued_at).
+        let second = live.render_json();
+        assert_eq!(*first, *second, "stable inputs serve the cached render");
+
+        // Rotate the access leaf on disk: the next render re-signs over
+        // the new fingerprint with a fresh (monotonic) stamp.
+        let second_leaf = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(access_dir.path().join("server.crt"), second_leaf.cert.pem()).unwrap();
+        let third = live.render_json();
+        let rotated: crate::peer::AgentCard = serde_json::from_str(&third).unwrap();
+        let rotated_block = rotated.identity_attestation.expect("re-signed");
+        assert_eq!(
+            rotated_block.access_cert_fingerprint.as_deref(),
+            Some(&*crate::access::pinning::format_fingerprint(
+                &crate::access::pinning::fingerprint_of_der(second_leaf.cert.der().as_ref())
+            )),
+            "rotation re-binds the CURRENT leaf"
+        );
+        assert!(
+            rotated_block.issued_at_unix_ms >= block.issued_at_unix_ms,
+            "re-signs move forward"
+        );
+    }
+
+    /// No identity path (the test default): the card serves without an
+    /// attestation instead of loading machine-global identity state.
+    #[test]
+    fn agent_card_live_without_identity_serves_base() {
+        let access_dir = tempfile::tempdir().unwrap();
+        let live = AgentCardLive::new(
+            base_card_value(),
+            &WebGatewayConfig::default(),
+            access_dir.path().to_path_buf(),
+        );
+        let json = live.render_json();
+        let card: crate::peer::AgentCard = serde_json::from_str(&json).unwrap();
+        assert!(card.identity_attestation.is_none());
+        assert!(live.identity_public_key().is_none());
+    }
+
+    /// The auto-append arming condition is (relay live AND admission
+    /// key on); the port comes from the relay endpoint with the wss
+    /// default.
+    #[test]
+    fn relay_candidate_arms_only_with_relay_and_admission() {
+        let access_dir = tempfile::tempdir().unwrap();
+        let mut config = WebGatewayConfig::default();
+        config.connect.relay_enabled = true;
+        config.connect.relay_endpoint = Some("relay.example.com:9443".to_string());
+        // Admission off: no candidate port.
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
+        assert_eq!(live.relay_candidate_port, None);
+        // Both on: armed with the endpoint's port.
+        config.connect.relay_peer_admission = true;
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
+        assert_eq!(live.relay_candidate_port, Some(9443));
+        // Relay off (admission alone): no candidate.
+        config.connect.relay_enabled = false;
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
+        assert_eq!(live.relay_candidate_port, None);
+    }
+
+    #[test]
+    fn relay_public_port_parses_endpoint_shapes() {
+        assert_eq!(relay_public_port(Some("relay.example.com:443")), Some(443));
+        assert_eq!(
+            relay_public_port(Some("relay.example.com:9443")),
+            Some(9443)
+        );
+        assert_eq!(relay_public_port(Some("relay.example.com")), Some(443));
+        assert_eq!(relay_public_port(Some("[fdc2::1]:8443")), Some(8443));
+        assert_eq!(relay_public_port(Some("  ")), None);
+        assert_eq!(relay_public_port(None), None);
+    }
 
     /// A specific bind address is preserved verbatim in the
     /// advertised URL. The operator chose it; we trust them.

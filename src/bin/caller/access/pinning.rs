@@ -234,20 +234,33 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 /// `PinnedMutualTls`.
 #[allow(dead_code)]
 pub fn pinned_client_config(verifier: PinnedFingerprintVerifier) -> rustls::ClientConfig {
-    pinned_client_config_with_client_auth(verifier, None)
+    pinned_client_config_with_client_auth(verifier, None, false)
         .expect("pinned client config without client auth is valid")
 }
 
 /// Build a rustls `ClientConfig` with server-cert pinning and optional client
 /// certificate authentication.
+///
+/// `require_tls13` floors the connection at TLS 1.3. The peer dialer sets it
+/// on identity-attested public-name candidates (Track RC Stage B2): under
+/// TLS 1.2 the client `Certificate` message crosses the wire in cleartext,
+/// so a relay in the path could observe which peer identity is connecting —
+/// 1.3 keeps that metadata inside the encrypted handshake. Every other
+/// caller passes `false` and keeps the default 1.2+1.3 offer.
 pub fn pinned_client_config_with_client_auth(
     verifier: PinnedFingerprintVerifier,
     client_identity: Option<crate::web_tls::RustlsIdentity>,
+    require_tls13: bool,
 ) -> Result<rustls::ClientConfig, RustlsError> {
     let provider = verifier.provider.clone();
+    let versions: &[&rustls::SupportedProtocolVersion] = if require_tls13 {
+        &[&rustls::version::TLS13]
+    } else {
+        rustls::DEFAULT_VERSIONS
+    };
     let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-        .expect("default rustls protocol versions are valid")
+        .with_protocol_versions(versions)
+        .expect("supported rustls protocol versions are valid")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
     match client_identity {

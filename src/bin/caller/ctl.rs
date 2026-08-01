@@ -6938,6 +6938,7 @@ mod tests {
             client_cert: None,
             client_key: None,
             pinned_fingerprints: Vec::new(),
+            identity_public_key: None,
             browser_tcp_via_url: None,
             certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
         }

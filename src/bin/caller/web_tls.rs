@@ -468,6 +468,23 @@ pub fn register_custom_domain_server_name(name: &str) {
     fleet_sni_resolver().register_custom_name(name);
 }
 
+/// SHA-256 fingerprint (lowercase hex) of the fleet leaf currently
+/// installed in the live SNI resolver, if any. This is the certificate a
+/// fleet-name dial is answered with, so it is what the daemon-identity
+/// attestation (`access::identity_attestation`) must bind; deriving it
+/// from the resolver state means the `install_fleet_certificate` hook
+/// path — startup-restore, first issuance, every renewal — feeds the
+/// next attestation render automatically (B0 ruling A5).
+pub fn current_fleet_leaf_fingerprint() -> Option<String> {
+    let resolver = fleet_sni_resolver();
+    let fleet = resolver.fleet.read().expect("tls resolver poisoned");
+    let (_, key) = fleet.as_ref()?;
+    let leaf = key.cert.first()?;
+    Some(crate::access::pinning::format_fingerprint(
+        &crate::access::pinning::fingerprint_of_der(leaf.as_ref()),
+    ))
+}
+
 /// Install (or replace) the fleet certificate served for `name` —
 /// called by `fleet_cert.rs` at startup-restore, first issuance, and
 /// every renewal. Applies to live acceptors immediately.

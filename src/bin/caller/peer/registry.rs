@@ -115,6 +115,11 @@ struct PeerRegistryInner {
     peers: RwLock<HashMap<PeerId, PeerHandle>>,
     log_sink: mpsc::Sender<EnqueuedPeerEvent>,
     events: broadcast::Sender<RegistryEvent>,
+    /// Root for the per-paired-identity attestation high-water marks
+    /// (RC-B2 anti-rollback). Threaded into every peer's
+    /// [`TransportCredentials`]; `None` (tests, ad-hoc registries)
+    /// leaves the transport on its temp-dir fallback.
+    attestation_state_dir: RwLock<Option<std::path::PathBuf>>,
 }
 
 impl PeerRegistry {
@@ -125,8 +130,16 @@ impl PeerRegistry {
                 peers: RwLock::new(HashMap::new()),
                 log_sink,
                 events,
+                attestation_state_dir: RwLock::new(None),
             }),
         }
+    }
+
+    /// Set the durable root for attestation high-water marks (A4).
+    /// Called once at boot with the access-store location; peers added
+    /// afterwards persist their monotonicity floors there.
+    pub fn set_attestation_state_dir(&self, dir: std::path::PathBuf) {
+        *self.inner.attestation_state_dir.write().unwrap() = Some(dir);
     }
 
     /// Subscribe to the registry's push event stream. The receiver
@@ -338,6 +351,37 @@ impl PeerRegistry {
         label_override: Option<String>,
         certificate_witness_vantage: crate::peer::PeerWitnessVantage,
     ) -> Result<PeerId, PeerError> {
+        self.add_peer_full(
+            card_url,
+            via_urls,
+            bearer_token,
+            override_pinned_fingerprints,
+            browser_tcp_via_url,
+            explicit_client_identity,
+            label_override,
+            certificate_witness_vantage,
+            None,
+        )
+        .await
+    }
+
+    /// The full config-driven entry point: everything the `[[peer]]`
+    /// block can express, including the paired daemon-identity public
+    /// key that switches DNS-name candidates onto identity-attested
+    /// verification (RC-B2).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_peer_full(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+        override_pinned_fingerprints: Vec<String>,
+        browser_tcp_via_url: Option<String>,
+        explicit_client_identity: Option<ClientIdentityPaths>,
+        label_override: Option<String>,
+        certificate_witness_vantage: crate::peer::PeerWitnessVantage,
+        identity_public_key: Option<String>,
+    ) -> Result<PeerId, PeerError> {
         let label_override = label_override
             .map(|label| label.trim().to_string())
             .filter(|label| !label.is_empty());
@@ -367,7 +411,7 @@ impl PeerRegistry {
             card.transports = via_urls
                 .iter()
                 .cloned()
-                .map(|url| TransportSpec::IntendantWs { url })
+                .map(|url| TransportSpec::IntendantWs { url, relay: false })
                 .collect();
         }
         if !override_pinned_fingerprints.is_empty() {
@@ -386,6 +430,7 @@ impl PeerRegistry {
             explicit_client_identity,
             label_override,
             certificate_witness_vantage,
+            identity_public_key,
         )
         .await
     }
@@ -430,6 +475,7 @@ impl PeerRegistry {
             None,
             None,
             crate::peer::PeerWitnessVantage::Unknown,
+            None,
         )
         .await
     }
@@ -444,6 +490,7 @@ impl PeerRegistry {
         explicit_client_identity: Option<ClientIdentityPaths>,
         label_override: Option<String>,
         certificate_witness_vantage: crate::peer::PeerWitnessVantage,
+        identity_public_key: Option<String>,
     ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
@@ -496,6 +543,11 @@ impl PeerRegistry {
             bearer_token,
             pinned_fingerprints,
             client_identity,
+            identity_public_key: identity_public_key
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty()),
+            attestation_state_dir: self.inner.attestation_state_dir.read().unwrap().clone(),
+            effective_tls: Default::default(),
             tls: Default::default(),
         };
         let transport_factory_credentials = transport_credentials.clone();
@@ -747,8 +799,8 @@ fn build_transport(
     credentials: crate::peer::transport::intendant::TransportCredentials,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
-        TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_credentials(
-            url.clone(),
+        TransportSpec::IntendantWs { .. } => Box::new(IntendantWsTransport::with_spec(
+            spec.clone(),
             events_tx,
             credentials,
         )),
@@ -781,7 +833,7 @@ fn client_identity_for_transports(specs: &[TransportSpec]) -> Option<ClientIdent
 
 fn transports_use_tls(specs: &[TransportSpec]) -> bool {
     specs.iter().any(|spec| match spec {
-        TransportSpec::IntendantWs { url } => tls_client::url_uses_tls(url),
+        TransportSpec::IntendantWs { url, .. } => tls_client::url_uses_tls(url),
         _ => false,
     })
 }
@@ -872,9 +924,11 @@ mod tests {
             git_sha: Some("test".into()),
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.to_string(),
+                relay: false,
             }],
             capabilities: vec![Capability::ComputerUse],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -965,6 +1019,7 @@ mod tests {
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
 
         match reg.add_peer_with_card(card).await {
@@ -1346,7 +1401,7 @@ mod tests {
             card.transports
         );
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert_eq!(
                     url, &via_url,
                     "via URL should persist across the actor's connect-time card refresh"
@@ -1384,7 +1439,7 @@ mod tests {
         // Transports replaced with the via URLs verbatim.
         assert_eq!(card.transports.len(), 1);
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert_eq!(url, "ws://override.example:9999/ws");
             }
             other => panic!("expected IntendantWs, got {other:?}"),
@@ -1463,7 +1518,7 @@ mod tests {
             .transports
             .iter()
             .filter_map(|t| match t {
-                TransportSpec::IntendantWs { url } => Some(url),
+                TransportSpec::IntendantWs { url, .. } => Some(url),
                 _ => None,
             })
             .collect();
@@ -1700,6 +1755,7 @@ mod tests {
             },
             TransportSpec::IntendantWs {
                 url: "ws://x/ws".into(),
+                relay: false,
             },
         ];
         let picked = pick_supported_transports(&transports);
@@ -1716,18 +1772,23 @@ mod tests {
         let transports = vec![
             TransportSpec::IntendantWs {
                 url: "ws://lan/ws".into(),
+                relay: false,
             },
             TransportSpec::A2A {
                 url: "https://x".into(),
             },
             TransportSpec::IntendantWs {
                 url: "ws://tail/ws".into(),
+                relay: false,
             },
         ];
         let picked = pick_supported_transports(&transports);
         assert_eq!(picked.len(), 2);
         match (&picked[0], &picked[1]) {
-            (TransportSpec::IntendantWs { url: a }, TransportSpec::IntendantWs { url: b }) => {
+            (
+                TransportSpec::IntendantWs { url: a, .. },
+                TransportSpec::IntendantWs { url: b, .. },
+            ) => {
                 assert_eq!(a, "ws://lan/ws");
                 assert_eq!(b, "ws://tail/ws");
             }
