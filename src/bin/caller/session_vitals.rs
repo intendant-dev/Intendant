@@ -1431,7 +1431,9 @@ enum TargetOrigin {
     /// `painted` flips after the one-shot boot probe attempt, success or
     /// failure — a restored checkout that stopped existing must not be
     /// re-spawned against every tick either.
-    Restored { painted: bool },
+    Restored {
+        painted: bool,
+    },
 }
 
 /// One session's probe target: the registered root (the session's durable
@@ -1634,9 +1636,7 @@ impl GitVitalsTargets {
             .lock()
             .expect("git vitals targets lock")
             .iter()
-            .filter(|(_, target)| {
-                target.origin != TargetOrigin::Restored { painted: true }
-            })
+            .filter(|(_, target)| target.origin != TargetOrigin::Restored { painted: true })
             .map(|(id, target)| (id.clone(), target.effective()))
             .collect()
     }
@@ -3199,9 +3199,8 @@ mod tests {
         // the prober must not follow: the change-gated hub would emit
         // if a probe ran, so silence across a full cadence is the skip.
         std::fs::write(repo.path().join("dirty.txt"), "x\n").unwrap();
-        let silence = tokio::time::timeout(
-            PROBE_INTERVAL + std::time::Duration::from_secs(2),
-            async {
+        let silence =
+            tokio::time::timeout(PROBE_INTERVAL + std::time::Duration::from_secs(2), async {
                 loop {
                     if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
                         if session_id == "ghost"
@@ -3211,9 +3210,8 @@ mod tests {
                         }
                     }
                 }
-            },
-        )
-        .await;
+            })
+            .await;
         assert!(
             silence.is_err(),
             "a painted restored target must not be re-probed without live evidence"
