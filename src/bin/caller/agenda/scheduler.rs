@@ -72,6 +72,23 @@ const LINEAGE_QUIET_GRACE_MS: u64 = 60_000;
 /// regenerates a bounded successor attempt (Track AO §2.5 — the
 /// deliberate amendment of RFC §7.5's blanket rule).
 const DISPATCH_ABANDON_AFTER_MS: u64 = 10 * 60_000;
+/// Spawn governor (the occurrence-dispatch burst limiter): under
+/// contention, governed session spawns start at most one per this
+/// interval, so worktree creation and backend warmup serialize instead
+/// of overlapping (2026-07-30: eight manifests approved in seven
+/// seconds all carried the same +5m floor, and the same-second
+/// eight-way dispatch pinned the daemon at 230% CPU, starved its
+/// control plane for ~10 minutes, and burned the account window in one
+/// wave). A tuned constant, never a knob. Same philosophy as the rustc
+/// governor, different resource — that one spaces compiles/links, this
+/// one spaces session spawns; the future headroom/admission program is
+/// the LEVEL limiter this burst limiter composes with (headroom decides
+/// how much may run, this decides how fast it may start).
+const SPAWN_STAGGER_INTERVAL_MS: u64 = 30_000;
+/// Contention at which the stagger engages: the pass's pending due
+/// spawns plus any governed start still inside the trailing interval.
+/// Below it — a SOLO fire — dispatch is immediate, always.
+const SPAWN_STAGGER_ENGAGE_AT: usize = 2;
 
 /// A session's terminal event observed BEFORE its `TaskReceived` receipt
 /// — the fast-spawn inversion: `start_new_session` dispatches the child
@@ -131,6 +148,32 @@ struct PendingDispatch {
     last_attempt_ms: u64,
 }
 
+/// Spawn-start pacing memory for the governor (see
+/// [`dispatch_governed`]). One instant suffices: contention serializes
+/// starts, so at most one governed start ever sits inside the trailing
+/// interval. In-memory like the rest of [`SchedulerState`] — after a
+/// restart the first due spawn starts ungoverned and the stagger
+/// re-engages behind it, which is the solo rule applied honestly.
+#[derive(Default)]
+struct SpawnGovernor {
+    /// Most recent governed spawn start, `None` before the first.
+    last_start_ms: Option<u64>,
+}
+
+impl SpawnGovernor {
+    /// Governed starts inside the trailing stagger interval (0 or 1).
+    fn starts_in_window(&self, now: u64) -> usize {
+        usize::from(
+            self.last_start_ms
+                .is_some_and(|last| now.saturating_sub(last) < SPAWN_STAGGER_INTERVAL_MS),
+        )
+    }
+
+    fn note_start(&mut self, now: u64) {
+        self.last_start_ms = Some(now);
+    }
+}
+
 /// In-flight scheduled-session bookkeeping (in-memory; the journal is the
 /// durable truth, and a restart resolves both maps fail-closed).
 #[derive(Default)]
@@ -160,6 +203,9 @@ struct SchedulerState {
     /// be readopted (see [`ReadoptWatch`]); swept on every wake, expire
     /// after [`READOPT_WATCH_WINDOW_MS`].
     readopt_watch: Vec<ReadoptWatch>,
+    /// Spawn-governor pacing memory (the occurrence-dispatch burst
+    /// limiter — see [`dispatch_governed`]).
+    governor: SpawnGovernor,
 }
 
 impl SchedulerState {
@@ -516,6 +562,7 @@ fn resolve_lost_sessions(
                                     goal: effect.manifest.goal.clone(),
                                     orchestrate: effect.manifest.orchestrate,
                                     fire_at_ms: 0,
+                                    approved_at_ms: 0,
                                     recurring: effect.manifest.recurrence.is_some(),
                                     interactive: effect.manifest.interactive,
                                     project_root: effect.manifest.project_root.clone(),
@@ -769,9 +816,7 @@ async fn run_pass(
     if !planned.digest.is_empty() {
         deliver_digest(handle, journal, &planned.digest, now);
     }
-    for spawn in planned.spawn {
-        dispatch_session(handle, journal, state, spawn, now);
-    }
+    let governor_wake = dispatch_governed(handle, journal, state, planned.spawn, now);
     for missed in planned.missed_sessions {
         // A standing series needs no ceremony to continue; a one-shot
         // needs a fresh approval (the pre-G3-pre message, unchanged).
@@ -803,7 +848,67 @@ async fn run_pass(
             why,
         );
     }
-    planned.next_wake_ms
+    [planned.next_wake_ms, governor_wake]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// The spawn governor at the occurrence-dispatch seam. Under contention
+/// (see [`SPAWN_STAGGER_ENGAGE_AT`]), governed dispatches serialize at
+/// one per [`SPAWN_STAGGER_INTERVAL_MS`] in due-instant-then-approval
+/// order; a solo fire dispatches immediately. A held occurrence is NOT
+/// journaled — it stays due, the next pass re-plans it (so completion,
+/// retirement, and revocation between slots are honored for free), and
+/// its eventual `prepared` row records the actual dispatch instant,
+/// never the instant it became due. Cadence, trigger, and requested
+/// fires all arrive through the one `plan.spawn` lane, so every kind
+/// rides the same governor. Returns the next slot's wake when anything
+/// was held. A dispatch that resolves spawnless (unresolvable project,
+/// broken seal) consumes no slot — nothing spawned, so the next
+/// occurrence in governed order goes now.
+fn dispatch_governed(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    mut due: Vec<SpawnOccurrence>,
+    now: u64,
+) -> Option<u64> {
+    due.sort_by(|a, b| {
+        (a.fire_at_ms, a.approved_at_ms, &a.occurrence_id).cmp(&(
+            b.fire_at_ms,
+            b.approved_at_ms,
+            &b.occurrence_id,
+        ))
+    });
+    let mut queue = due.into_iter();
+    loop {
+        let pending = queue.len();
+        if pending == 0 {
+            return None;
+        }
+        let recent = state.governor.starts_in_window(now);
+        if pending + recent >= SPAWN_STAGGER_ENGAGE_AT && recent > 0 {
+            let next_slot = state
+                .governor
+                .last_start_ms
+                .expect("recent > 0 implies a recorded start")
+                + SPAWN_STAGGER_INTERVAL_MS;
+            eprintln!(
+                "[agenda] spawn governor: holding {pending} due occurrence{} — one spawn \
+                 start per {}s under contention (due-time then approval order); next slot \
+                 in {}s",
+                if pending == 1 { "" } else { "s" },
+                SPAWN_STAGGER_INTERVAL_MS / 1000,
+                next_slot.saturating_sub(now) / 1000,
+            );
+            return Some(next_slot);
+        }
+        let spawn = queue.next().expect("pending > 0");
+        if dispatch_session(handle, journal, state, spawn, now) {
+            state.governor.note_start(now);
+        }
+    }
 }
 
 /// Journal `prepared` (fsync'd) → dispatch a NORMAL supervised session via
@@ -2231,6 +2336,275 @@ mod tests {
         );
     }
 
+    fn drain_start_tasks(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> Vec<String> {
+        let mut tasks = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
+                tasks.push(task);
+            }
+        }
+        tasks
+    }
+
+    /// Opens the next governed slot without waiting it out: ages the
+    /// recorded start past the stagger interval, exactly as wall time
+    /// would.
+    fn open_next_slot(state: &mut SchedulerState) {
+        state.governor.last_start_ms = state
+            .governor
+            .last_start_ms
+            .map(|last| last.saturating_sub(SPAWN_STAGGER_INTERVAL_MS + 1));
+    }
+
+    /// The spawn governor at the dispatch seam, pinned on the storm
+    /// shape (2026-07-30: eight manifests approved in seven seconds all
+    /// carried the same +5m floor and dispatched in one second): eight
+    /// same-instant dues start one per slot in approval order; a replan
+    /// inside a slot holds (no double dispatch); each pass wakes exactly
+    /// at the next slot; and every journal row records the ACTUAL
+    /// dispatch instant beside the due instant it was held from.
+    #[tokio::test]
+    async fn eight_simultaneous_dues_stagger_in_approval_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let due = now_ms() - 60_000;
+        let mut approval_order = Vec::new();
+        for _ in 0..8 {
+            let (item_id, _, _) = approved_effect_item(&handle, due);
+            approval_order.push(item_id);
+            // The approval instant is the tie-break key: let the ms
+            // clock tick between approvals so the order is observable.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let dispatch_epoch = now_ms();
+        let mut rx = handle.bus().subscribe();
+        let mut dispatched = Vec::new();
+        for slot in 0..8u32 {
+            let wake = run_pass(&handle, &mut journal, &mut state, None).await;
+            let drained = drain_start_tasks(&mut rx);
+            assert_eq!(
+                drained.len(),
+                1,
+                "exactly one spawn start per slot (slot {slot}): {drained:?}"
+            );
+            dispatched.extend(drained);
+            if slot < 7 {
+                assert_eq!(
+                    wake,
+                    Some(state.governor.last_start_ms.unwrap() + SPAWN_STAGGER_INTERVAL_MS),
+                    "the pass wakes exactly at the next governed slot"
+                );
+                // A replan inside the slot (any handle nudge) holds.
+                run_pass(&handle, &mut journal, &mut state, None).await;
+                assert!(
+                    drain_start_tasks(&mut rx).is_empty(),
+                    "replanning inside the slot must not double-dispatch"
+                );
+                open_next_slot(&mut state);
+            }
+        }
+        let fired_items: Vec<String> = dispatched
+            .iter()
+            .map(|task| {
+                task.split("Fired from agenda item ")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .expect("every fired task names its source item")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            fired_items, approval_order,
+            "same-instant dues break the tie by approval order"
+        );
+
+        // Honest times: each row records the instant it was actually
+        // written — the shared due instant stays in `due_ms`, and no
+        // staggered row is backdated to it.
+        let journal_text = std::fs::read_to_string(handle.dir().join("occurrences.jsonl")).unwrap();
+        let mut prepared_rows = 0;
+        for row in journal_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        {
+            if row["state"] == "prepared" {
+                prepared_rows += 1;
+                assert_eq!(
+                    row["due_ms"].as_u64(),
+                    Some(due),
+                    "the row keeps the due instant it was held from: {row}"
+                );
+                assert!(
+                    row["at_ms"].as_u64().is_some_and(|at| at >= dispatch_epoch),
+                    "the row records the actual dispatch instant: {row}"
+                );
+            }
+        }
+        assert_eq!(prepared_rows, 8, "all eight dispatched, one row each");
+    }
+
+    /// A SOLO fire never waits: below the engage threshold dispatch is
+    /// immediate — on a fresh governor and equally once the previous
+    /// start's interval has fully elapsed.
+    #[tokio::test]
+    async fn solo_due_dispatches_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        // A prior start whose interval has elapsed is not contention.
+        state
+            .governor
+            .note_start(now_ms().saturating_sub(SPAWN_STAGGER_INTERVAL_MS + 1));
+        approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        assert_eq!(
+            drain_start_tasks(&mut rx).len(),
+            1,
+            "a solo due dispatches on the pass that plans it"
+        );
+    }
+
+    /// The sliding storm (approvals seconds apart, so each pass sees
+    /// one "solo" due): a due landing inside the previous start's
+    /// interval is contention, not a solo — it waits for the slot, then
+    /// fires.
+    #[tokio::test]
+    async fn due_landing_mid_window_waits_for_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        approved_effect_item(&handle, now_ms() - 60_000);
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        assert_eq!(
+            drain_start_tasks(&mut rx).len(),
+            1,
+            "the first due is a solo and fires immediately"
+        );
+
+        // A second manifest approved seconds later — mid-warmup of the
+        // first — is the storm's sliding shape.
+        approved_effect_item(&handle, now_ms() - 60_000);
+        let wake = run_pass(&handle, &mut journal, &mut state, None).await;
+        assert!(
+            drain_start_tasks(&mut rx).is_empty(),
+            "a due landing mid-window waits for the slot"
+        );
+        assert_eq!(
+            wake,
+            Some(state.governor.last_start_ms.unwrap() + SPAWN_STAGGER_INTERVAL_MS),
+            "the held due bounds the sleep at the slot"
+        );
+
+        open_next_slot(&mut state);
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        assert_eq!(
+            drain_start_tasks(&mut rx).len(),
+            1,
+            "the held due fires at its slot"
+        );
+    }
+
+    /// One governor for every lane: a standing cadence due and a
+    /// trigger-armed (on_unblock) due contend in the same wave — one
+    /// slot each, due-instant order, no lane bypasses the stagger.
+    #[tokio::test]
+    async fn cadence_and_trigger_fires_ride_the_same_governor() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        // Standing cadence with its latest series instant due.
+        approved_sealed_item(
+            &handle,
+            now_ms() - 60_000,
+            "cadence sweep",
+            Vec::new(),
+            Some(RecurrenceSpec {
+                every_ms: super::super::types::RECURRENCE_MIN_EVERY_MS,
+                until_ms: None,
+                max_occurrences: None,
+                suspend_after_failures: None,
+            }),
+        );
+        // Trigger lane: an on_unblock node with no prerequisites is
+        // vacuously satisfied — armed and due on approval.
+        let node = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "workflow node".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    recurrence: None,
+                    id: node.id.clone(),
+                    goal: "trigger node".into(),
+                    fire_at_ms: now_ms() - 60_000,
+                    orchestrate: false,
+                    interactive: None,
+                    source: None,
+                    agent_config: None,
+                    trigger: Some(super::super::types::TriggerSpec::OnUnblock),
+                    project_root: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: node.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        let first = drain_start_tasks(&mut rx);
+        assert_eq!(first.len(), 1, "one slot for the wave: {first:?}");
+        assert!(
+            first[0].starts_with("cadence sweep"),
+            "the earlier due instant goes first: {first:?}"
+        );
+        open_next_slot(&mut state);
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        let second = drain_start_tasks(&mut rx);
+        assert_eq!(
+            second.len(),
+            1,
+            "the held lane fires at the next slot: {second:?}"
+        );
+        assert!(
+            second[0].starts_with("trigger node"),
+            "the trigger fire rode the same governor: {second:?}"
+        );
+    }
+
     /// Sealed refs (PR B): the preservation shape. A live file amended —
     /// or deleted — under an armed approval no longer refuses the fire:
     /// the SEALED snapshot is the binding content, the rider line points
@@ -2276,6 +2650,13 @@ mod tests {
         std::fs::remove_file(&vanishing).unwrap();
 
         let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        // Two simultaneous dues: the spawn governor holds the second for
+        // the next slot — age the window and pass again so both fire.
+        state.governor.last_start_ms = state
+            .governor
+            .last_start_ms
+            .map(|last| last.saturating_sub(SPAWN_STAGGER_INTERVAL_MS + 1));
         run_pass(&handle, &mut journal, &mut state, None).await;
         let mut tasks = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -2667,6 +3048,8 @@ mod tests {
                 owner(),
             )
             .unwrap();
+        // The first fire is still inside the governor's stagger window.
+        open_next_slot(&mut state);
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state, None).await;
         let mut second = None;
@@ -2842,6 +3225,8 @@ mod tests {
                 message: Some("old firing done".into()),
             },
         );
+        // The settled firing is still inside the governor's stagger window.
+        open_next_slot(&mut state);
         let mut rx = handle.bus().subscribe();
         run_pass(&handle, &mut journal, &mut state, None).await;
         let mut second = None;
@@ -3750,6 +4135,7 @@ mod tests {
             goal: "rule the parked gates".into(),
             orchestrate: false,
             fire_at_ms: 1_000,
+            approved_at_ms: 0,
             recurring: true,
             interactive: false,
             project_root: None,
@@ -3892,6 +4278,10 @@ mod tests {
             state: &mut SchedulerState,
             config: &crate::event::AgentLaunchConfig,
         ) -> Option<String> {
+            // Sequential fires land inside the governor's stagger window
+            // on the test clock; this helper's callers test outcomes,
+            // not pacing.
+            open_next_slot(state);
             let mut rx = handle.bus().subscribe();
             run_pass(handle, journal, state, None).await;
             let mut delegation = None;
@@ -4295,6 +4685,13 @@ mod tests {
         approved_effect_item(&handle, now_ms() - 60_000);
         approved_effect_item(&handle, now_ms() - 60_000);
 
+        run_pass(&handle, &mut journal, &mut state, None).await;
+        // The spawn governor holds the second simultaneous due for the
+        // next slot — age the window and pass again to get both in flight.
+        state.governor.last_start_ms = state
+            .governor
+            .last_start_ms
+            .map(|last| last.saturating_sub(SPAWN_STAGGER_INTERVAL_MS + 1));
         run_pass(&handle, &mut journal, &mut state, None).await;
         assert_eq!(state.awaiting.len(), 2);
         let running_occurrence = state.awaiting.keys().next().unwrap().clone();
@@ -4970,6 +5367,7 @@ mod tests {
                 goal: "run the nightly sweep".to_string(),
                 orchestrate: false,
                 fire_at_ms: 0,
+                approved_at_ms: 0,
                 recurring: false,
                 interactive: false,
                 project_root: None,
@@ -5029,6 +5427,7 @@ mod tests {
                 goal: "run the nightly sweep".to_string(),
                 orchestrate: false,
                 fire_at_ms: 0,
+                approved_at_ms: 0,
                 recurring: false,
                 interactive: false,
                 project_root: None,

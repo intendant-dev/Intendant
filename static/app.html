@@ -38267,7 +38267,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '0d50dfbe09b248d1';
+const INTENDANT_APP_BUILD = '6c60c89d1012a8c5';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -44150,6 +44150,166 @@ function agentSigninReloadLifecycleChip(reload) {
   return null;
 }
 
+/* The reload panel: the served candidate list + reload-all, rendered
+   identically for a ceremony success and an out-of-band change — one
+   panel, one daemon corpus (the `reload_candidates` riding the same
+   status body as whichever story offered them). */
+function agentSigninReloadPanel(provider, spec) {
+  const frag = document.createDocumentFragment();
+  const panelNote = (text, cls = 'vault-note') => {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = text;
+    frag.appendChild(el);
+    return el;
+  };
+  const reloadCandidates = agentSigninReloadCandidates(provider);
+  const reloadHead = document.createElement('div');
+  reloadHead.className = 'vault-status-line';
+  const reloadTitle = document.createElement('span');
+  reloadTitle.className = 'lbl';
+  reloadTitle.style.fontWeight = '600';
+  reloadTitle.textContent = spec.sessionsTitle;
+  reloadHead.appendChild(reloadTitle);
+  if (reloadCandidates.length > 1) {
+    const allActions = document.createElement('span');
+    allActions.className = 'vault-entry-actions';
+    allActions.appendChild(
+      vaultButton(`Reload all ${reloadCandidates.length}`, () =>
+        agentSigninReloadAllSessions(provider)
+      )
+    );
+    reloadHead.appendChild(allActions);
+  }
+  frag.appendChild(reloadHead);
+  if (!reloadCandidates.length) {
+    panelNote(spec.noSessionsNote);
+    return frag;
+  }
+  panelNote('Live sessions — including parked and rate-limited ones — keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
+  const list = document.createElement('div');
+  list.className = 'vault-entry-list';
+  for (const session of reloadCandidates) {
+    const sessionId = String(session.session_id || '');
+    const row = document.createElement('div');
+    row.className = 'vault-entry-row';
+    row.title = sessionId;
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = session.name || 'session';
+    // The short-id chip (the session grid's first-8 dialect): with
+    // derived names, duplicate labels are otherwise unidentifiable —
+    // the id is what `intendant ctl` and the grid speak.
+    const idChip = document.createElement('span');
+    idChip.className = 'vault-chip';
+    idChip.textContent = sessionId.slice(0, 8) || '—';
+    idChip.title = sessionId;
+    const kindChip = document.createElement('span');
+    kindChip.className = 'vault-chip';
+    kindChip.textContent = spec.sessionKind;
+    const sessionState = agentSigninSessionStateChip(session);
+    const stateChip = document.createElement('span');
+    stateChip.className = 'vault-chip' + (sessionState.cls ? ` ${sessionState.cls}` : '');
+    stateChip.textContent = sessionState.label;
+    stateChip.title =
+      sessionState.label === 'rate-limited'
+        ? 'Rate-limit park — the backend is alive and stays on the old account until reloaded'
+        : 'Session state — alive sessions stay on the old account until reloaded';
+    const actions = document.createElement('span');
+    actions.className = 'vault-entry-actions';
+    // The actions cell renders the daemon's served lifecycle, and
+    // ONLY that: in-flight states stand in for the button; terminal
+    // states (done/failed) sit beside it as history. The button is
+    // therefore always available again the moment the daemon stops
+    // working — nothing client-side can latch a row.
+    const lifecycle = agentSigninReloadLifecycleChip(session.reload);
+    if (lifecycle) {
+      const chip = document.createElement('span');
+      chip.className = 'vault-chip' + (lifecycle.cls ? ` ${lifecycle.cls}` : '');
+      chip.textContent = lifecycle.label;
+      chip.title = lifecycle.title;
+      actions.appendChild(chip);
+    }
+    if (!lifecycle || !lifecycle.inFlight) {
+      actions.appendChild(
+        vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
+      );
+    }
+    row.append(lbl, idChip, kindChip, stateChip, actions);
+    list.appendChild(row);
+  }
+  frag.appendChild(list);
+  return frag;
+}
+
+/* The out-of-band story: the daemon's credential watch confirmed the
+   backend's auth store changed OUTSIDE any sign-in ceremony (a direct
+   CLI re-auth or sign-out). The daemon serves `out_of_band` only while
+   it is the NEWEST credential truth — a later ceremony success
+   supersedes it — and the block rides the same reload_candidates the
+   ceremony success rides, so the same reload panel renders them. */
+function agentSigninOutOfBandSection(provider, spec, status) {
+  const block = status?.out_of_band;
+  if (!block) return null;
+  const frag = document.createDocumentFragment();
+  const ago = agentSigninAgo(Number(block.detected_at_unix_ms)) || 'just now';
+  const notice = document.createElement('div');
+  notice.className = 'vault-warning';
+  const was = block.prior_account_label ? ` (was ${block.prior_account_label})` : '';
+  notice.textContent = block.signed_out
+    ? `${spec.label} was signed out outside Intendant ${ago}${was}. Live sessions keep the old account in-process until they restart.`
+    : `${spec.label} credentials changed outside Intendant ${ago}${was}. Live sessions keep the old account until reloaded.`;
+  frag.appendChild(notice);
+  const account = block.account || null;
+  if (account) {
+    const row = document.createElement('div');
+    row.className = 'vault-entry-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'lbl';
+    lbl.textContent = account.email || 'Signed in';
+    row.appendChild(lbl);
+    if (account.subscription_type) {
+      const plan = document.createElement('span');
+      plan.className = 'vault-chip ok';
+      plan.textContent = account.subscription_type;
+      row.appendChild(plan);
+    }
+    if (account.org_name) {
+      const org = document.createElement('span');
+      org.className = 'vault-chip';
+      org.textContent = account.org_name;
+      row.appendChild(org);
+    }
+    frag.appendChild(row);
+  }
+  if (block.reload_offer) {
+    frag.appendChild(agentSigninReloadPanel(provider, spec));
+  }
+  return frag;
+}
+
+/* Applicability honesty for the credential watch, rendered only where
+   it says something actionable: an unwatched backend names its reason
+   (tooltip carries the full text), a watched-but-fileless artifact
+   admits the stat poll's blind spot, and a probe give-up is surfaced
+   instead of silently unverified changes. */
+function agentSigninWatchNotes(status, note) {
+  const watch = status?.credential_watch;
+  if (!watch) return;
+  if (watch.watching === false && watch.reason) {
+    const el = note('Out-of-band credential changes are not watched for this backend.');
+    el.title = String(watch.reason);
+  } else if (watch.watching === true && watch.artifact_present === false) {
+    note(
+      'No on-disk auth file to watch — credential changes made outside Intendant (e.g. via the OS keychain) may go unnoticed until this backend next speaks.'
+    );
+  }
+  if (watch.probe_error) {
+    const el = note('The credential store changed but its identity probe is failing — the change was adopted unverified.', 'vault-error');
+    el.title = String(watch.probe_error);
+  }
+}
+
 function renderAgentSigninSection() {
   const mount = document.getElementById('agent-signin-section');
   if (!mount) return;
@@ -44246,6 +44406,11 @@ function agentSigninProviderCard(provider) {
   }
 
   if (phase === 'idle' || ['failed', 'cancelled', 'timed_out'].includes(phase)) {
+    // A confirmed out-of-band change renders first — it is the newest
+    // credential truth, and it carries the reload panel with it.
+    const outOfBand = agentSigninOutOfBandSection(provider, spec, status);
+    if (outOfBand) card.appendChild(outOfBand);
+    agentSigninWatchNotes(status, note);
     // The shared single-flight slot: the daemon reports which provider
     // holds it, and a start here would 409 until that ceremony ends.
     const busyWith = String(status?.busy_with || '');
@@ -44399,6 +44564,16 @@ function agentSigninProviderCard(provider) {
   }
 
   if (phase === 'success') {
+    const outOfBand = agentSigninOutOfBandSection(provider, spec, status);
+    if (outOfBand) {
+      // The daemon serves out_of_band only when it is NEWER than this
+      // success — the store changed again, directly at the CLI, after
+      // the ceremony. The stale success story yields to it.
+      card.appendChild(outOfBand);
+      agentSigninWatchNotes(status, note);
+      actionsRow(vaultButton('Sign in again', () => agentSigninStart(provider)));
+      return card;
+    }
     const account = status?.account || null;
     if (account) {
       const row = document.createElement('div');
@@ -44434,85 +44609,10 @@ function agentSigninProviderCard(provider) {
     // rate-limit-parked — keep the OLD account until their backend
     // process restarts. Offer the per-session reload (graceful in-place
     // respawn, resume-attached); parked sessions are the ones pinned to
-    // the old account longest, so they matter most here. The list is the
-    // status payload's reload_candidates — the daemon's live registry,
-    // exactly as fresh as the success phase it arrived with.
-    const reloadCandidates = agentSigninReloadCandidates(provider);
-    const reloadHead = document.createElement('div');
-    reloadHead.className = 'vault-status-line';
-    const reloadTitle = document.createElement('span');
-    reloadTitle.className = 'lbl';
-    reloadTitle.style.fontWeight = '600';
-    reloadTitle.textContent = spec.sessionsTitle;
-    reloadHead.appendChild(reloadTitle);
-    if (reloadCandidates.length > 1) {
-      const allActions = document.createElement('span');
-      allActions.className = 'vault-entry-actions';
-      allActions.appendChild(
-        vaultButton(`Reload all ${reloadCandidates.length}`, () =>
-          agentSigninReloadAllSessions(provider)
-        )
-      );
-      reloadHead.appendChild(allActions);
-    }
-    card.appendChild(reloadHead);
-    if (!reloadCandidates.length) {
-      note(spec.noSessionsNote);
-    } else {
-      note('Live sessions — including parked and rate-limited ones — keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
-      const list = document.createElement('div');
-      list.className = 'vault-entry-list';
-      for (const session of reloadCandidates) {
-        const sessionId = String(session.session_id || '');
-        const row = document.createElement('div');
-        row.className = 'vault-entry-row';
-        row.title = sessionId;
-        const lbl = document.createElement('span');
-        lbl.className = 'lbl';
-        lbl.textContent = session.name || 'session';
-        // The short-id chip (the session grid's first-8 dialect): with
-        // derived names, duplicate labels are otherwise unidentifiable —
-        // the id is what `intendant ctl` and the grid speak.
-        const idChip = document.createElement('span');
-        idChip.className = 'vault-chip';
-        idChip.textContent = sessionId.slice(0, 8) || '—';
-        idChip.title = sessionId;
-        const kindChip = document.createElement('span');
-        kindChip.className = 'vault-chip';
-        kindChip.textContent = spec.sessionKind;
-        const sessionState = agentSigninSessionStateChip(session);
-        const stateChip = document.createElement('span');
-        stateChip.className = 'vault-chip' + (sessionState.cls ? ` ${sessionState.cls}` : '');
-        stateChip.textContent = sessionState.label;
-        stateChip.title =
-          sessionState.label === 'rate-limited'
-            ? 'Rate-limit park — the backend is alive and stays on the old account until reloaded'
-            : 'Session state — alive sessions stay on the old account until reloaded';
-        const actions = document.createElement('span');
-        actions.className = 'vault-entry-actions';
-        // The actions cell renders the daemon's served lifecycle, and
-        // ONLY that: in-flight states stand in for the button; terminal
-        // states (done/failed) sit beside it as history. The button is
-        // therefore always available again the moment the daemon stops
-        // working — nothing client-side can latch a row.
-        const lifecycle = agentSigninReloadLifecycleChip(session.reload);
-        if (lifecycle) {
-          const chip = document.createElement('span');
-          chip.className = 'vault-chip' + (lifecycle.cls ? ` ${lifecycle.cls}` : '');
-          chip.textContent = lifecycle.label;
-          chip.title = lifecycle.title;
-          actions.appendChild(chip);
-        }
-        if (!lifecycle || !lifecycle.inFlight) {
-          actions.appendChild(
-            vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
-          );
-        }
-        row.append(lbl, idChip, kindChip, stateChip, actions);
-        list.appendChild(row);
-      }
-      card.appendChild(list);
-    }
+    // the old account longest, so they matter most here. The panel is
+    // the status payload's reload_candidates — the daemon's live
+    // registry, exactly as fresh as the success phase it arrived with.
+    card.appendChild(agentSigninReloadPanel(provider, spec));
     actionsRow(vaultButton('Sign in again', () => agentSigninStart(provider)));
     return card;
   }

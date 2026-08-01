@@ -297,7 +297,10 @@ pub enum AppEvent {
     /// hub consumes this to open a new credential era for the backend —
     /// sessions spawned or credential-reloaded from here on report their
     /// rate-limit windows under the new account instead of overwriting
-    /// the old one's.
+    /// the old one's. Two producers, one meaning: the sign-in ceremonies
+    /// (`auth_ceremony::announce_ceremony_success`) and the out-of-band
+    /// credential watch (`credential_watch`), which announces the same
+    /// era boundary for changes made directly at the backend CLI.
     BackendCredentialAccount {
         source: String,
         account: Option<String>,
