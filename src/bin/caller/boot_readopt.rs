@@ -2026,17 +2026,25 @@ pub(crate) const RELEASED_SETTLE: std::time::Duration = std::time::Duration::fro
 /// re-scanned at that moment, so released mid-work sessions sat
 /// unadopted until the next daemon restart (the 2026-07-31 specimen).
 ///
-/// This watch tracks co-homed DRAINING boots through their presence
-/// records on the lease-poll cadence and, when one's per-boot lock
-/// frees (`boot_id_is_live` — the liveness truth; the state JSON is
-/// display), runs ONE scoped readopt pass over the released set. An
-/// exit observed while this daemon is not the holder stays pending —
+/// The trigger is edge-INDEPENDENT by design: each probe (lease-poll
+/// cadence) adjudicates, once per boot id, every co-homed presence
+/// record whose boot is provably dead (`boot_id_is_live` false — the
+/// per-boot lock is the liveness truth; the state JSON is display) and
+/// whose last recorded state carries the drain lineage (`draining` — a
+/// drainer killed mid-drain — or `exited`, the graceful drain
+/// terminal). The frozen-story bound is the record file's mtime:
+/// `mark_exited` rewrites the record at the exit instant, and a killed
+/// drainer's last wait-set write approximates its death. (Requiring a
+/// live-draining observation before the exit edge was the earlier
+/// shape; it structurally missed drains shorter than a poll, crashed
+/// drainers, and drainers that exited while this daemon was down or
+/// still arming — the exact gap class this watch exists to close.)
+///
+/// An exit found while this daemon is not the holder stays pending —
 /// adopting as a secondary would race the real holder's own pass — and
 /// is consumed on the first probe where holdership holds. A draining
 /// self ends the watch: drain is one-way, and a drainer never spawns
-/// work. (A drain shorter than one poll interval can pass unobserved;
-/// its released set then waits for the next daemon restart, exactly as
-/// before this watch existed.)
+/// work.
 pub(crate) async fn run_predecessor_exit_watch(
     home: PathBuf,
     bus: EventBus,
@@ -2049,11 +2057,15 @@ pub(crate) async fn run_predecessor_exit_watch(
         // The boot pass already logged the disable — one line per boot.
         return;
     }
-    let mut draining_seen: HashSet<String> = HashSet::new();
+    let interval = crate::handover::lease_poll_interval();
+    eprintln!(
+        "[readopt] predecessor-exit watch armed (poll {}ms)",
+        interval.as_millis()
+    );
     let mut pending_exits: Vec<(String, u64)> = Vec::new();
     let mut adjudicated: HashSet<String> = HashSet::new();
     loop {
-        tokio::time::sleep(crate::handover::lease_poll_interval()).await;
+        tokio::time::sleep(interval).await;
         if handover.is_draining() {
             return;
         }
@@ -2061,28 +2073,32 @@ pub(crate) async fn run_predecessor_exit_watch(
         for record in crate::handover::read_presence_records(state_root) {
             if record.boot_id == handover.boot_id()
                 || adjudicated.contains(&record.boot_id)
-                || draining_seen.contains(&record.boot_id)
+                || pending_exits
+                    .iter()
+                    .any(|(boot, _)| *boot == record.boot_id)
+                || !matches!(record.state.as_str(), "draining" | "exited")
+                || crate::handover::boot_id_is_live(state_root, &record.boot_id)
             {
                 continue;
             }
-            if record.state == "draining"
-                && crate::handover::boot_id_is_live(state_root, &record.boot_id)
-            {
-                eprintln!(
-                    "[readopt] watching draining co-homed daemon {} for its exit",
-                    short_id(&record.boot_id)
-                );
-                draining_seen.insert(record.boot_id);
-            }
-        }
-        let exited: Vec<String> = draining_seen
-            .iter()
-            .filter(|boot_id| !crate::handover::boot_id_is_live(state_root, boot_id))
-            .cloned()
-            .collect();
-        for boot_id in exited {
-            draining_seen.remove(&boot_id);
-            pending_exits.push((boot_id, crate::session_activity::epoch_seconds()));
+            // Dead, with drain lineage: the released set froze no later
+            // than the record's last rewrite (the exit stamp).
+            let record_path = state_root
+                .join("daemons")
+                .join(format!("{}.json", record.boot_id));
+            let exit_secs = std::fs::metadata(&record_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+                .unwrap_or_else(crate::session_activity::epoch_seconds);
+            eprintln!(
+                "[readopt] drained co-homed daemon {} is gone (last state {}) — \
+                 adjudicating its released set",
+                short_id(&record.boot_id),
+                record.state
+            );
+            pending_exits.push((record.boot_id, exit_secs));
         }
         if pending_exits.is_empty() || !handover.is_holder() {
             continue;

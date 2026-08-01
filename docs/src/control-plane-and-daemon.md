@@ -440,20 +440,24 @@ successor without kill-and-relaunch:
   are paused until someone relaunches or takes over — the drainer never
   reclaims the lease.
 - Sessions the drainer still held at its exit (interrupted mid-work, or
-  limit-parked with pending work) are RELEASED, not lost: the holder
-  watches co-homed **draining** boots through their presence records
-  and, when one's per-boot lock frees, runs a **scoped readopt pass**
+  limit-parked with pending work) are RELEASED, not lost: the holder's
+  **predecessor-exit watch** adjudicates, once per boot id, every
+  co-homed presence record whose boot is provably dead (per-boot lock
+  free) with drain lineage (`draining` — killed mid-drain — or
+  `exited`, the graceful terminal), and runs a **scoped readopt pass**
   over the released set — the boot pass's mid-work classes, guard
   ladder (Resume-not-Revive, owner-stop tombstones, staleness,
   live-tip refusals), per-pass cap, dispatch stagger, and
   dispatches-are-not-outcomes verification, scoped to sessions whose
-  story froze at-or-before the exit instant (anything a live co-homed
-  daemon is still driving advances past that bound and is never
-  touched). The summary notification names the predecessor, so a
-  handover pickup reads apart from crash recovery. While the
-  predecessor still drains, the successor-side banner names the spared
-  set ("N sessions still finishing there", with the same holdout rows),
-  one section per draining co-homed daemon.
+  story froze at-or-before the exit instant (the record's last rewrite;
+  anything a live co-homed daemon is still driving advances past that
+  bound and is never touched). The trigger is edge-independent, so a
+  drainer that exited while the successor was down, or crashed
+  mid-drain, is still adjudicated. The summary notification names the
+  predecessor, so a handover pickup reads apart from crash recovery.
+  While the predecessor still drains, the successor-side banner names
+  the spared set ("N sessions still finishing there", with the same
+  holdout rows), one section per draining co-homed daemon.
 
 `intendant ctl status` shows the whole story under `scheduler_lease`
 (role, drain state, and every co-homed boot with probed liveness).

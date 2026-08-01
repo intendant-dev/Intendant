@@ -7128,21 +7128,22 @@ async fn drainer_exits_at_last_session_end() {
     assert_eq!(presence["state"], "exited");
 
     // The successor's predecessor-exit watch closed the post-drain
-    // readopt gap: it observed the draining boot while it lived, and
-    // after the exit it ran the scoped pass over the released set. In
+    // readopt gap: the drainer's dead presence record (drain lineage,
+    // lock free) triggers ONE scoped pass over the released set. In
     // this leg the drained session COMPLETED, so the honest outcome is
     // an empty release ("nothing released mid-work") — but any
     // per-candidate adjudication line equally proves the pass ran; the
-    // point pinned here is that the exit instant is ACTED on, not slept
-    // through until the next restart.
+    // point pinned here is that the exit is ACTED on, not slept
+    // through until the next restart. The armed line proves the watch
+    // task itself is alive (and names its poll cadence for diagnosis).
     let b_log_path = daemon_a.rig.home.path().join("daemon-b.log");
     poll_until(
-        "the successor's watch observing the draining predecessor",
+        "the successor's predecessor-exit watch arming",
         RUN_TIMEOUT,
         || async {
             std::fs::read_to_string(&b_log_path)
                 .unwrap_or_default()
-                .contains("watching draining co-homed daemon")
+                .contains("predecessor-exit watch armed")
                 .then_some(())
         },
         || {
