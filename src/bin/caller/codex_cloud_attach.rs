@@ -9,10 +9,12 @@
 //! root, redeems `{token, public key}` at a public gateway route, and
 //! receives a client certificate whose identity record carries the
 //! zero-authority `cloud-worker` system profile and a hard expiry. It
-//! then dials home's gateway over mTLS and the accepted socket *is* the
-//! attachment: the lease flips `connected` while it lives, `disconnected`
-//! when it dies. Authority over the worker flows home→worker in later
-//! slices; the worker's inbound authority on home stays nothing.
+//! then dials home's gateway. Direct mTLS is preferred; an explicitly
+//! trusted TLS-terminating reverse proxy uses a signed, replay-protected
+//! proof from the same enrolled key. The accepted socket *is* the attachment:
+//! the lease flips `connected` while it lives, `disconnected` when it dies.
+//! Authority over the worker flows home→worker in later slices; the worker's
+//! inbound authority on home stays nothing.
 //!
 //! Private keys never transit (the daemon signs a public key, never
 //! mints one for the worker), tokens are stored hashed and burned
@@ -35,9 +37,26 @@ pub(crate) const DEFAULT_IDENTITY_TTL_S: u64 = 3600;
 /// The public redemption doorbell's path — the one spelling shared by the
 /// route table, the certless carve-out predicate, and the worker's dial.
 pub(crate) const ENROLL_PATH: &str = "/api/codex-cloud/enroll";
+/// Dedicated WebSocket target for Cloud attachments. Keeping the
+/// application-proof fallback off the dashboard's ordinary `/ws` target
+/// makes the zero-authority lane explicit even when a reverse proxy has
+/// terminated the worker's client-certificate handshake.
+pub(crate) const ATTACH_PATH: &str = "/api/codex-cloud/attach";
 /// The worker's first frame after the socket opens. Informational — the
 /// identity was already established by the client certificate.
 const HELLO_KIND: &str = "cloud-worker-hello";
+const ATTACH_PROOF_PROTOCOL: &str = "intendant-cloud-worker-attach-v1";
+const ATTACH_PROOF_MAX_SKEW_MS: i64 = 5 * 60 * 1000;
+const ATTACH_PROOF_REPLAY_TTL_MS: u64 = 10 * 60 * 1000;
+const ATTACH_PROOF_REPLAY_GLOBAL_CAP: usize = 4096;
+const ATTACH_PROOF_REPLAY_PER_WORKER_CAP: usize = 64;
+
+const CLOUD_WORKER_HEADER: &str = "x-intendant-cloud-worker";
+const CLOUD_WORKER_FINGERPRINT_HEADER: &str = "x-intendant-cloud-worker-fingerprint";
+const CLOUD_WORKER_TASK_HEADER: &str = "x-intendant-cloud-worker-task";
+const CLOUD_WORKER_NONCE_HEADER: &str = "x-intendant-cloud-worker-nonce";
+const CLOUD_WORKER_TIMESTAMP_HEADER: &str = "x-intendant-cloud-worker-timestamp";
+const CLOUD_WORKER_PROOF_HEADER: &str = "x-intendant-cloud-worker-proof";
 
 // ── Broker store ───────────────────────────────────────────────────────
 
@@ -53,6 +72,11 @@ struct BrokerStore {
     /// resolves an attaching socket to its task through this map.
     #[serde(default)]
     bindings: BTreeMap<String, WorkerBinding>,
+    /// Hashes of accepted application-layer attachment proof nonces. The
+    /// reverse-proxy lane is proof-of-possession, not a replayable bearer:
+    /// a signed request is consumed once across daemon/CLI processes.
+    #[serde(default)]
+    proof_replay: BTreeMap<String, UsedAttachProof>,
 }
 
 fn broker_version() -> u32 {
@@ -65,6 +89,7 @@ impl Default for BrokerStore {
             version: BROKER_VERSION,
             pending: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            proof_replay: BTreeMap::new(),
         }
     }
 }
@@ -88,6 +113,17 @@ pub struct WorkerBinding {
     pub label: String,
     pub issued_at_unix_ms: u64,
     pub identity_expires_at_unix: i64,
+    /// Raw uncompressed P-256 point, base64url. New workers use the same
+    /// private key for mTLS and for the proxy-safe attachment proof. `None`
+    /// keeps old broker files readable; those identities remain mTLS-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_public_key_b64u: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UsedAttachProof {
+    fingerprint: String,
+    consumed_at_unix_ms: u64,
 }
 
 /// The broker store lives beside the lease store and follows the same
@@ -148,6 +184,10 @@ fn prune_expired(store: &mut BrokerStore, now_ms: u64) {
     store
         .pending
         .retain(|_, pending| pending.expires_at_unix_ms > now_ms);
+    let replay_floor = now_ms.saturating_sub(ATTACH_PROOF_REPLAY_TTL_MS);
+    store
+        .proof_replay
+        .retain(|_, proof| proof.consumed_at_unix_ms >= replay_floor);
 }
 
 /// Mint a single-use enrollment token for a task. Returns the plaintext
@@ -287,6 +327,162 @@ pub(crate) fn binding_for_fingerprint(
         .cloned()
 }
 
+/// Whether this WebSocket request explicitly names the reserved Cloud-worker
+/// lane. Browsers cannot set arbitrary WebSocket headers; native callers that
+/// do set it either authenticate as a cloud-worker or fail closed instead of
+/// falling through to dashboard authentication.
+pub(crate) fn proxy_attachment_requested(header_text: &str) -> bool {
+    crate::web_gateway::http_header_value(header_text, CLOUD_WORKER_HEADER).is_some()
+}
+
+/// Verify one application-layer Cloud-worker attachment proof and consume its
+/// nonce. This is the narrow fallback for an explicitly trusted HTTPS reverse
+/// proxy that terminates TLS before Intendant, so the worker's mTLS certificate
+/// cannot reach the listener. The result is only a broker fingerprint; the
+/// listener routes it directly to [`serve_attachment_socket`] and never turns
+/// it into a dashboard principal or grant.
+pub(crate) fn verify_proxy_attachment_request(
+    header_text: &str,
+    now_ms: u64,
+) -> Result<String, String> {
+    let lease_store = state_path();
+    verify_proxy_attachment_request_at(&broker_path(&lease_store), header_text, now_ms)
+}
+
+fn verify_proxy_attachment_request_at(
+    broker_path: &Path,
+    header_text: &str,
+    now_ms: u64,
+) -> Result<String, String> {
+    let mut request = header_text.lines().next().unwrap_or("").split_whitespace();
+    if request.next() != Some("GET") || request.next() != Some(ATTACH_PATH) {
+        return Err(format!(
+            "cloud-worker proof is valid only on GET {ATTACH_PATH}"
+        ));
+    }
+    if crate::web_gateway::http_header_value(header_text, CLOUD_WORKER_HEADER) != Some("1") {
+        return Err("cloud-worker marker is invalid".to_string());
+    }
+    let required = |name: &str| {
+        crate::web_gateway::http_header_value(header_text, name)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing {name} header"))
+    };
+    let fingerprint = required(CLOUD_WORKER_FINGERPRINT_HEADER)?.to_ascii_lowercase();
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("cloud-worker fingerprint has an invalid shape".to_string());
+    }
+    let task_id = required(CLOUD_WORKER_TASK_HEADER)?;
+    if task_id.len() > 256 {
+        return Err("cloud-worker task id is too long".to_string());
+    }
+    let nonce = required(CLOUD_WORKER_NONCE_HEADER)?;
+    if nonce.len() != 43
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("cloud-worker proof nonce has an invalid shape".to_string());
+    }
+    let timestamp_unix_ms: i64 = required(CLOUD_WORKER_TIMESTAMP_HEADER)?
+        .parse()
+        .map_err(|_| "cloud-worker proof timestamp is invalid".to_string())?;
+    let now_i64 = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    if now_i64.saturating_sub(timestamp_unix_ms).unsigned_abs() > ATTACH_PROOF_MAX_SKEW_MS as u64 {
+        return Err(format!(
+            "cloud-worker proof timestamp is outside the {ATTACH_PROOF_MAX_SKEW_MS}ms window"
+        ));
+    }
+    let signature_b64u = required(CLOUD_WORKER_PROOF_HEADER)?;
+    use base64::Engine as _;
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature_b64u)
+        .map_err(|_| "cloud-worker proof signature is invalid base64url".to_string())?;
+    if !(64..=80).contains(&signature.len()) {
+        return Err("cloud-worker proof signature has an invalid shape".to_string());
+    }
+
+    let _lock = broker_lock(broker_path)?;
+    let mut store = load_broker(broker_path)?;
+    prune_expired(&mut store, now_ms);
+    let binding = store
+        .bindings
+        .get(&fingerprint)
+        .cloned()
+        .ok_or_else(|| "cloud-worker proof does not name an active binding".to_string())?;
+    if binding.task_id != task_id {
+        return Err("cloud-worker proof task binding does not match".to_string());
+    }
+    if binding.identity_expires_at_unix <= now_i64 / 1000 {
+        return Err("cloud-worker proof identity has expired".to_string());
+    }
+    let public_key_b64u = binding
+        .proof_public_key_b64u
+        .as_deref()
+        .ok_or_else(|| "cloud-worker identity supports mTLS attachment only".to_string())?;
+    let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(public_key_b64u)
+        .map_err(|_| "cloud-worker proof public key is invalid".to_string())?;
+    if public_key.len() != 65 || public_key.first() != Some(&0x04) {
+        return Err("cloud-worker proof public key has an invalid shape".to_string());
+    }
+    let payload =
+        attachment_proof_payload(ATTACH_PATH, &fingerprint, task_id, nonce, timestamp_unix_ms);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| "cloud-worker proof signature verification failed".to_string())?;
+
+    let replay_key = attach_proof_replay_key(&fingerprint, nonce);
+    if store.proof_replay.contains_key(&replay_key) {
+        return Err("cloud-worker proof nonce was already used".to_string());
+    }
+    if store.proof_replay.len() >= ATTACH_PROOF_REPLAY_GLOBAL_CAP
+        || store
+            .proof_replay
+            .values()
+            .filter(|proof| proof.fingerprint == fingerprint)
+            .count()
+            >= ATTACH_PROOF_REPLAY_PER_WORKER_CAP
+    {
+        return Err("cloud-worker proof replay window is full".to_string());
+    }
+    store.proof_replay.insert(
+        replay_key,
+        UsedAttachProof {
+            fingerprint: fingerprint.clone(),
+            consumed_at_unix_ms: now_ms,
+        },
+    );
+    save_broker(broker_path, &store)?;
+    Ok(fingerprint)
+}
+
+fn attachment_proof_payload(
+    target: &str,
+    fingerprint: &str,
+    task_id: &str,
+    nonce: &str,
+    timestamp_unix_ms: i64,
+) -> String {
+    format!(
+        "{ATTACH_PROOF_PROTOCOL}\nGET\n{target}\n{fingerprint}\n{task_id}\n{nonce}\n{timestamp_unix_ms}"
+    )
+}
+
+fn attach_proof_replay_key(fingerprint: &str, nonce: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(fingerprint.as_bytes());
+    digest.update(b"\0");
+    digest.update(nonce.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 // ── Redemption (the public enroll route's core) ────────────────────────
 
 /// Doorbell limiter, per-source first (the pairing doorbell's design in
@@ -403,8 +599,16 @@ pub fn redeem_enrollment(
     if public_key_pem.len() > 4096 {
         return Err("public key PEM is too large".to_string());
     }
-    rcgen::SubjectPublicKeyInfo::from_pem(public_key_pem)
+    use rcgen::PublicKeyData as _;
+    let proof_public_key = rcgen::SubjectPublicKeyInfo::from_pem(public_key_pem)
         .map_err(|e| format!("public_key_pem is not a valid SPKI public key: {e}"))?;
+    if proof_public_key.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256
+        || proof_public_key.der_bytes().len() != 65
+        || proof_public_key.der_bytes().first() != Some(&0x04)
+    {
+        return Err("cloud-worker public key must be an uncompressed P-256 key".to_string());
+    }
+    let proof_public_key_b64u = crate::daemon_identity::b64u(proof_public_key.der_bytes());
 
     let broker = broker_path(lease_store_path);
     let pending = consume_enrollment(&broker, token, now_ms)?;
@@ -442,6 +646,7 @@ pub fn redeem_enrollment(
             label,
             issued_at_unix_ms: now_ms,
             identity_expires_at_unix,
+            proof_public_key_b64u: Some(proof_public_key_b64u),
         },
     )?;
     // The ceremony is under way: the lease shows `awaiting` until the
@@ -677,6 +882,19 @@ fn attachment_remaining_ms(identity_expires_at_unix: i64, now_ms: u64) -> u64 {
 
 // ── Attach verb (home side) ────────────────────────────────────────────
 
+pub(crate) const TLS_TERMINATED_PROXY_ENV: &str = "INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY";
+
+pub(crate) fn tls_terminated_proxy_from_env() -> bool {
+    std::env::var(TLS_TERMINATED_PROXY_ENV)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String> {
     let url = args_value
         .or_else(|| std::env::var("INTENDANT_CODEX_CLOUD_HOME_URL").ok())
@@ -686,15 +904,27 @@ pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String
             "attach needs the daemon's reachable WSS URL: pass --home-url wss://host:port or set INTENDANT_CODEX_CLOUD_HOME_URL"
                 .to_string()
         })?;
-    // wss:// only: the ceremony's token would ride plain HTTP on a ws://
-    // base, and a plaintext socket can present no client certificate, so
-    // the attachment could never form anyway.
-    if !url.starts_with("wss://") {
+    let mut parsed = url::Url::parse(&url).map_err(|e| format!("invalid home URL: {e}"))?;
+    // wss:// only: both direct mTLS and an explicitly trusted
+    // TLS-terminating proxy need an encrypted public hop.
+    if parsed.scheme() != "wss" {
         return Err(format!(
-            "home URL must be wss://… (the enrollment token and the mTLS attachment both require TLS), got '{url}'"
+            "home URL must be wss://… (enrollment and attachment require TLS), got '{url}'"
         ));
     }
-    Ok(url)
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("home URL must contain only wss://host[:port][/path]".to_string());
+    }
+    // Old examples named `/ws`; the dedicated path is listener-compatible
+    // with old direct-mTLS daemons and sharply scopes the proxy proof on new
+    // ones, so normalize rather than making every operator rewrite config.
+    parsed.set_path(ATTACH_PATH);
+    Ok(parsed.to_string())
 }
 
 /// The attach follow-up prompt: everything in it is public except the
@@ -702,15 +932,24 @@ pub(crate) fn home_url_from(args_value: Option<String>) -> Result<String, String
 pub fn attach_prompt(
     task_id: &str,
     home_url: &str,
-    server_fingerprint: &str,
+    server_fingerprint: Option<&str>,
     token: &str,
+    tls_terminated_proxy: bool,
 ) -> String {
+    let transport_args = if tls_terminated_proxy {
+        "--tls-terminated-proxy".to_string()
+    } else {
+        format!(
+            "--home-fingerprint {}",
+            server_fingerprint.expect("direct mTLS prompt needs the server fingerprint")
+        )
+    };
     format!(
         "Run this exact command in the repository root and keep it running in the foreground until this turn is cancelled. Do not modify any files, do not run builds, and do not print the token back:\n\n\
 ```bash\n\
 \"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/libexec/intendant-cloud/run-worker.sh\" -- \\\n\
   \"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/bin/intendant\" codex-cloud agent \\\n\
-  --home {home_url} --home-fingerprint {server_fingerprint} --task {task_id} --token-stdin <<'INTENDANT_ATTACH_TOKEN'\n\
+  --home {home_url} {transport_args} --task {task_id} --token-stdin <<'INTENDANT_ATTACH_TOKEN'\n\
 {token}\n\
 INTENDANT_ATTACH_TOKEN\n\
 ```\n\n\
@@ -723,15 +962,24 @@ If the command fails because a destination is blocked by the environment's netwo
 /// enrollment response after home binds the token.
 pub(crate) fn automatic_attach_prompt(
     home_url: &str,
-    server_fingerprint: &str,
+    server_fingerprint: Option<&str>,
     token: &str,
+    tls_terminated_proxy: bool,
 ) -> String {
+    let transport_args = if tls_terminated_proxy {
+        "--tls-terminated-proxy".to_string()
+    } else {
+        format!(
+            "--home-fingerprint {}",
+            server_fingerprint.expect("direct mTLS prompt needs the server fingerprint")
+        )
+    };
     format!(
         "Run this exact command in the repository root and keep it running in the foreground until home retires the worker. Do not modify repository files, do not run builds on your own, and do not print the token back:\n\n\
 ```bash\n\
 \"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/libexec/intendant-cloud/run-worker.sh\" -- \\\n\
   \"${{INTENDANT_CLOUD_INSTALL_ROOT:-$HOME/.local}}/bin/intendant\" codex-cloud agent \\\n\
-  --home {home_url} --home-fingerprint {server_fingerprint} --token-stdin <<'INTENDANT_ATTACH_TOKEN'\n\
+  --home {home_url} {transport_args} --token-stdin <<'INTENDANT_ATTACH_TOKEN'\n\
 {token}\n\
 INTENDANT_ATTACH_TOKEN\n\
 ```\n\n\
@@ -746,10 +994,10 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
             .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
     {
         println!(
-            "Usage:\n  intendant codex-cloud attach TASK_ID [--home-url wss://host:port] [--token-ttl-s {DEFAULT_TOKEN_TTL_S}] [--identity-ttl-s {DEFAULT_IDENTITY_TTL_S}] [--send] [--json]"
+            "Usage:\n  intendant codex-cloud attach TASK_ID [--home-url wss://host:port] [--tls-terminated-proxy] [--token-ttl-s {DEFAULT_TOKEN_TTL_S}] [--identity-ttl-s {DEFAULT_IDENTITY_TTL_S}] [--send] [--json]"
         );
         println!(
-            "Mints a single-use enrollment token bound to the task and composes the attach prompt (printed by default; --send delivers it as a follow-up turn into the warm worker). The worker redeems the token for a zero-authority cloud-worker certificate and dials back; the lease's attachment lane tracks the socket."
+            "Mints a single-use enrollment token bound to the task and composes the attach prompt (printed by default; --send delivers it as a follow-up turn into the warm worker). The worker redeems the token for a zero-authority cloud-worker certificate and dials back; the lease's attachment lane tracks the socket. --tls-terminated-proxy explicitly trusts the home URL's WebPKI HTTPS reverse proxy and authenticates the worker with a signed, replay-protected application proof when mTLS cannot pass through."
         );
         return Ok(());
     }
@@ -759,6 +1007,7 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
     let mut identity_ttl_s = DEFAULT_IDENTITY_TTL_S;
     let mut send = false;
     let mut json = false;
+    let mut tls_terminated_proxy = tls_terminated_proxy_from_env();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -788,6 +1037,7 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
             }
             "--send" => send = true,
             "--json" => json = true,
+            "--tls-terminated-proxy" => tls_terminated_proxy = true,
             other if task_id.is_none() && !other.starts_with('-') => {
                 task_id = Some(other.to_string());
             }
@@ -806,12 +1056,17 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
             "task {task_id} is not in the local lease store — `intendant codex-cloud list` (or `status {task_id}`) tracks it first"
         ));
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let server_fingerprint = crate::access::certs::read_server_cert_fingerprint(&cert_dir)
-        .ok_or_else(|| {
-            "no gateway server certificate found — start the daemon once (it mints the TLS identity workers must pin), then retry"
-                .to_string()
-        })?;
+    let server_fingerprint = if tls_terminated_proxy {
+        None
+    } else {
+        let cert_dir = crate::access::backend::select_backend().cert_dir();
+        Some(
+            crate::access::certs::read_server_cert_fingerprint(&cert_dir).ok_or_else(|| {
+                "no gateway server certificate found — start the daemon once (it mints the TLS identity workers must pin), then retry"
+                    .to_string()
+            })?,
+        )
+    };
 
     let broker = broker_path(&lease_store);
     let (token, pending) = mint_enrollment(
@@ -822,7 +1077,13 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
         crate::codex_cloud::now_unix_ms(),
     )?;
     let _ = record_attachment_state(&lease_store, &task_id, AttachmentState::Awaiting);
-    let prompt = attach_prompt(&task_id, &home_url, &server_fingerprint, &token);
+    let prompt = attach_prompt(
+        &task_id,
+        &home_url,
+        server_fingerprint.as_deref(),
+        &token,
+        tls_terminated_proxy,
+    );
 
     if send {
         let receipt = crate::codex_cloud::follow_up_task(&lease_store, &task_id, &prompt).await?;
@@ -833,6 +1094,7 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
                     "task_id": task_id,
                     "token_expires_at_unix_ms": pending.expires_at_unix_ms,
                     "identity_ttl_s": identity_ttl_s,
+                    "tls_terminated_proxy": tls_terminated_proxy,
                     "delivered": true,
                     "parent_turn_id": receipt.parent_turn_id,
                 })
@@ -852,6 +1114,7 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
                 "task_id": task_id,
                 "token_expires_at_unix_ms": pending.expires_at_unix_ms,
                 "identity_ttl_s": identity_ttl_s,
+                "tls_terminated_proxy": tls_terminated_proxy,
                 "delivered": false,
                 "prompt": prompt,
             })
@@ -875,10 +1138,10 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
             .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
     {
         println!(
-            "Usage:\n  intendant codex-cloud agent --home wss://host:port --home-fingerprint SHA256 [--task TASK_ID] --token-stdin [--state-dir DIR]"
+            "Usage:\n  intendant codex-cloud agent --home wss://host:port (--home-fingerprint SHA256 | --tls-terminated-proxy) [--task TASK_ID] --token-stdin [--state-dir DIR]"
         );
         println!(
-            "Runs inside a Codex Cloud worker: generates a task-local keypair, redeems the enrollment token at the home daemon's public enroll route, then dials home over mTLS and holds the attachment socket in the foreground. --task verifies a manual ceremony; automatic acquisition learns the task id from enrollment. Launch it through run-worker.sh so all state stays task-local."
+            "Runs inside a Codex Cloud worker: generates a task-local keypair, redeems the enrollment token at the home daemon's public enroll route, then dials home and holds the authenticated attachment socket in the foreground. Direct mode pins home and presents mTLS; --tls-terminated-proxy explicitly trusts the URL's WebPKI reverse proxy and proves possession of the enrolled key in signed, one-use request headers. --task verifies a manual ceremony; automatic acquisition learns the task id from enrollment. Launch it through run-worker.sh so all state stays task-local."
         );
         return Ok(());
     }
@@ -887,6 +1150,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     let mut task: Option<String> = None;
     let mut token_stdin = false;
     let mut state_dir: Option<PathBuf> = None;
+    let mut tls_terminated_proxy = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -907,6 +1171,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
                 task = Some(args.get(i).cloned().ok_or("--task requires a task id")?);
             }
             "--token-stdin" => token_stdin = true,
+            "--tls-terminated-proxy" => tls_terminated_proxy = true,
             "--state-dir" => {
                 i += 1;
                 state_dir = Some(PathBuf::from(
@@ -917,14 +1182,19 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         }
         i += 1;
     }
-    let home = home.ok_or("agent requires --home wss://host:port")?;
-    if !home.starts_with("wss://") {
-        return Err(format!(
-            "--home must be wss://… (the enrollment token and the mTLS attachment both require TLS), got '{home}'"
-        ));
+    let home = home_url_from(Some(home.ok_or("agent requires --home wss://host:port")?))?;
+    if tls_terminated_proxy && home_fingerprint.is_some() {
+        return Err(
+            "agent accepts either --home-fingerprint or --tls-terminated-proxy, not both"
+                .to_string(),
+        );
     }
-    let home_fingerprint = home_fingerprint
-        .ok_or("agent requires --home-fingerprint (pin the daemon's TLS identity)")?;
+    if !tls_terminated_proxy && home_fingerprint.is_none() {
+        return Err(
+            "agent requires --home-fingerprint unless --tls-terminated-proxy was explicitly selected"
+                .to_string(),
+        );
+    }
     if !token_stdin {
         return Err("agent requires --token-stdin (the token never rides argv)".to_string());
     }
@@ -950,8 +1220,13 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&state_dir)
         .map_err(|e| format!("create agent state dir {}: {e}", state_dir.display()))?;
 
-    let pinned = vec![crate::access::pinning::parse_fingerprint(&home_fingerprint)
-        .map_err(|e| format!("--home-fingerprint: {e}"))?];
+    let pinned = home_fingerprint
+        .as_deref()
+        .map(crate::access::pinning::parse_fingerprint)
+        .transpose()
+        .map_err(|e| format!("--home-fingerprint: {e}"))?
+        .into_iter()
+        .collect::<Vec<_>>();
 
     // 1. Task-local keypair; the private key never leaves this directory.
     let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("generate keypair: {e}"))?;
@@ -1025,6 +1300,8 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         .get("client_cert_pem")
         .and_then(serde_json::Value::as_str)
         .ok_or("enrollment response carried no client_cert_pem")?;
+    let fingerprint = crate::access::access_policy::fingerprint_pem(cert_pem)
+        .map_err(|e| format!("fingerprint enrolled client certificate: {e}"))?;
     std::fs::write(&cert_path, cert_pem)
         .map_err(|e| format!("write {}: {e}", cert_path.display()))?;
     eprintln!(
@@ -1059,7 +1336,10 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
             &home,
             &pinned,
             &identity,
+            &key_pair,
+            &fingerprint,
             &task,
+            tls_terminated_proxy,
             &terminal_registry,
             &remote_commands,
             &mut display_state,
@@ -1419,11 +1699,192 @@ fn collect_worker_fingerprint(now_ms: u64) -> crate::codex_cloud::WorkerFingerpr
     }
 }
 
+trait AttachmentIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+
+impl<T> AttachmentIo for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+type BoxedAttachmentIo = Box<dyn AttachmentIo>;
+
+/// Open the TCP leg beneath the worker's WSS handshake. Codex Cloud exposes
+/// agent-phase Internet access through the conventional HTTPS proxy
+/// environment; tungstenite does not consult those variables itself, so a
+/// direct `connect_async` silently bypasses the allowed lane. CONNECT only
+/// establishes the byte tunnel — the subsequent rustls handshake still pins
+/// Intendant in direct mode or validates the explicitly trusted WebPKI proxy
+/// endpoint in TLS-terminated mode.
+async fn open_attachment_transport(home: &str) -> Result<BoxedAttachmentIo, String> {
+    let home_url = url::Url::parse(home).map_err(|e| format!("parse home URL: {e}"))?;
+    let host = home_url
+        .host_str()
+        .ok_or("home URL has no host")?
+        .to_string();
+    let port = home_url
+        .port_or_known_default()
+        .ok_or("home URL has no port")?;
+    let destination = authority(&host, port);
+    let timeout = std::time::Duration::from_secs(20);
+
+    let Some(proxy) = attachment_proxy_from_env(&host, port)? else {
+        let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&destination))
+            .await
+            .map_err(|_| format!("dial {destination}: timed out"))?
+            .map_err(|e| format!("dial {destination}: {e}"))?;
+        return Ok(Box::new(stream));
+    };
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let proxy_host = proxy
+        .host_str()
+        .ok_or("HTTPS proxy URL has no host")?
+        .to_string();
+    let proxy_port = proxy.port_or_known_default().unwrap_or(80);
+    let proxy_authority = authority(&proxy_host, proxy_port);
+    let mut stream =
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&proxy_authority))
+            .await
+            .map_err(|_| "dial HTTPS proxy: timed out".to_string())?
+            .map_err(|e| format!("dial HTTPS proxy: {e}"))?;
+    let proxy_auth = if proxy.username().is_empty() {
+        String::new()
+    } else {
+        use base64::Engine as _;
+        let credentials = format!(
+            "{}:{}",
+            proxy.username(),
+            proxy.password().unwrap_or_default()
+        );
+        format!(
+            "Proxy-Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(credentials)
+        )
+    };
+    let connect = format!(
+        "CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\nProxy-Connection: Keep-Alive\r\n{proxy_auth}\r\n"
+    );
+    tokio::time::timeout(timeout, stream.write_all(connect.as_bytes()))
+        .await
+        .map_err(|_| "write HTTPS proxy CONNECT: timed out".to_string())?
+        .map_err(|e| format!("write HTTPS proxy CONNECT: {e}"))?;
+
+    const MAX_PROXY_RESPONSE_HEAD: usize = 16 * 1024;
+    let mut response = Vec::with_capacity(1024);
+    let header_end = loop {
+        if let Some(end) = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        {
+            break end;
+        }
+        if response.len() >= MAX_PROXY_RESPONSE_HEAD {
+            return Err("HTTPS proxy CONNECT response headers are too large".to_string());
+        }
+        let mut chunk = [0u8; 1024];
+        let read = tokio::time::timeout(timeout, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "read HTTPS proxy CONNECT: timed out".to_string())?
+            .map_err(|e| format!("read HTTPS proxy CONNECT: {e}"))?;
+        if read == 0 {
+            return Err("HTTPS proxy closed during CONNECT".to_string());
+        }
+        response.extend_from_slice(&chunk[..read]);
+    };
+    let head = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| "HTTPS proxy CONNECT response is not HTTP text".to_string())?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or("HTTPS proxy CONNECT response has no status")?;
+    if status != 200 {
+        return Err(format!("HTTPS proxy CONNECT refused with HTTP {status}"));
+    }
+    let prefetched = response[header_end..].to_vec();
+    Ok(Box::new(crate::web_tls::PrefixedStream::new(
+        prefetched, stream,
+    )))
+}
+
+fn attachment_proxy_from_env(host: &str, port: u16) -> Result<Option<url::Url>, String> {
+    let no_proxy = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok());
+    if no_proxy
+        .as_deref()
+        .is_some_and(|rules| no_proxy_matches(rules, host, port))
+    {
+        return Ok(None);
+    }
+    let raw = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let proxy = url::Url::parse(&raw).map_err(|_| "HTTPS proxy URL is invalid".to_string())?;
+    if proxy.scheme() != "http" {
+        return Err(
+            "cloud-worker WebSocket supports an http:// CONNECT proxy; HTTPS_PROXY used another scheme"
+                .to_string(),
+        );
+    }
+    if proxy.host_str().is_none() || proxy.query().is_some() || proxy.fragment().is_some() {
+        return Err("HTTPS proxy URL has an invalid shape".to_string());
+    }
+    Ok(Some(proxy))
+}
+
+fn no_proxy_matches(rules: &str, host: &str, port: u16) -> bool {
+    let host = host
+        .trim_matches(|ch| matches!(ch, '[' | ']'))
+        .to_ascii_lowercase();
+    rules.split(',').any(|raw| {
+        let raw = raw.trim().to_ascii_lowercase();
+        if raw == "*" {
+            return true;
+        }
+        let (rule_host, rule_port) = match raw.rsplit_once(':') {
+            Some((candidate, raw_port)) if raw_port.parse::<u16>().is_ok() => {
+                (candidate, raw_port.parse::<u16>().ok())
+            }
+            _ => (raw.as_str(), None),
+        };
+        if rule_port.is_some_and(|rule_port| rule_port != port) {
+            return false;
+        }
+        let rule_host = rule_host
+            .trim_matches(|ch| matches!(ch, '[' | ']'))
+            .trim_start_matches('.');
+        !rule_host.is_empty()
+            && (host == rule_host
+                || host
+                    .strip_suffix(rule_host)
+                    .is_some_and(|prefix| prefix.ends_with('.')))
+    })
+}
+
+fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 async fn hold_attachment(
     home: &str,
     pinned: &[crate::access::pinning::Fingerprint],
     identity: &crate::peer::transport::tls_client::ClientIdentityPaths,
+    key_pair: &rcgen::KeyPair,
+    fingerprint: &str,
     task: &str,
+    tls_terminated_proxy: bool,
     registry: &crate::terminal::TerminalRegistry,
     remote_commands: &crate::remote_compute::WorkerRemoteCommands,
     display: &mut WorkerDisplayState,
@@ -1434,16 +1895,49 @@ async fn hold_attachment(
     let mut request = home
         .into_client_request()
         .map_err(|e| format!("bad home URL: {e}"))?;
-    request.headers_mut().insert(
-        "x-intendant-cloud-worker",
-        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("1"),
+    let nonce = random_token()?;
+    let timestamp_unix_ms = i64::try_from(crate::codex_cloud::now_unix_ms()).unwrap_or(i64::MAX);
+    let target = request
+        .uri()
+        .path_and_query()
+        .map(|target| target.as_str())
+        .unwrap_or(ATTACH_PATH);
+    if target != ATTACH_PATH {
+        return Err(format!(
+            "cloud-worker attachment URL must target {ATTACH_PATH}, got {target}"
+        ));
+    }
+    let payload = attachment_proof_payload(target, fingerprint, task, &nonce, timestamp_unix_ms);
+    use rcgen::SigningKey as _;
+    let proof = crate::daemon_identity::b64u(
+        &key_pair
+            .sign(payload.as_bytes())
+            .map_err(|e| format!("sign attachment proof: {e}"))?,
     );
+    let mut insert = |name: &'static str, value: &str| -> Result<(), String> {
+        request.headers_mut().insert(
+            name,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(value)
+                .map_err(|_| format!("attachment header {name} has an invalid value"))?,
+        );
+        Ok(())
+    };
+    insert(CLOUD_WORKER_HEADER, "1")?;
+    insert(CLOUD_WORKER_FINGERPRINT_HEADER, fingerprint)?;
+    insert(CLOUD_WORKER_TASK_HEADER, task)?;
+    insert(CLOUD_WORKER_NONCE_HEADER, &nonce)?;
+    insert(
+        CLOUD_WORKER_TIMESTAMP_HEADER,
+        &timestamp_unix_ms.to_string(),
+    )?;
+    insert(CLOUD_WORKER_PROOF_HEADER, &proof)?;
     let connector =
         crate::peer::transport::tls_client::rustls_client_config(pinned, Some(identity), false)
             .map_err(|e| format!("build TLS config: {e}"))?
             .map(|config| tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config)));
+    let transport = open_attachment_transport(home).await?;
     let (mut ws, _resp) =
-        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+        tokio_tungstenite::client_async_tls_with_config(request, transport, None, connector)
             .await
             .map_err(|e| format!("dial {home}: {e}"))?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1453,7 +1947,13 @@ async fn hold_attachment(
     ))
     .await
     .map_err(|e| format!("send hello: {e}"))?;
-    eprintln!("[cloud-agent] attached; holding the socket");
+    if tls_terminated_proxy {
+        eprintln!(
+            "[cloud-agent] attached through the explicitly trusted TLS-terminating proxy; holding the socket"
+        );
+    } else {
+        eprintln!("[cloud-agent] attached over direct mTLS; holding the socket");
+    }
     // Replies and PTY output share one bounded outbound lane so forwarder
     // tasks never interleave partial writes on the sink.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(LINK_FROM_WORKER_CAP);
@@ -1866,6 +2366,35 @@ mod tests {
         // The binding lets the listener resolve the socket to its task.
         let binding = binding_for_fingerprint(&broker, &fingerprint).expect("binding recorded");
         assert_eq!(binding.task_id, "task_e_enroll");
+        assert_eq!(
+            binding.proof_public_key_b64u.as_deref(),
+            Some(crate::daemon_identity::b64u(key.public_key_raw()).as_str())
+        );
+
+        // A TLS-terminating proxy cannot forward the client certificate, so
+        // the same enrolled key proves possession in the WebSocket request.
+        // The proof is one-use even if every header is replayed byte-for-byte.
+        let nonce = "n".repeat(43);
+        let request = signed_proxy_request(&key, &fingerprint, "task_e_enroll", &nonce, 6_000);
+        assert_eq!(
+            verify_proxy_attachment_request_at(&broker, &request, 6_100).unwrap(),
+            fingerprint
+        );
+        let replay = verify_proxy_attachment_request_at(&broker, &request, 6_200).unwrap_err();
+        assert!(replay.contains("already used"), "{replay}");
+
+        let wrong_task = signed_proxy_request(
+            &key,
+            &fingerprint,
+            "task_e_someone_else",
+            &"m".repeat(43),
+            6_300,
+        );
+        assert!(
+            verify_proxy_attachment_request_at(&broker, &wrong_task, 6_300)
+                .unwrap_err()
+                .contains("task binding")
+        );
 
         // A second redemption with the burned token fails.
         let err = redeem_enrollment(
@@ -1887,16 +2416,32 @@ mod tests {
     fn attach_prompt_carries_the_ceremony_and_nothing_extra() {
         let prompt = attach_prompt(
             "task_e_p",
-            "wss://home.example:8443/ws",
-            "ab".repeat(32).as_str(),
+            "wss://home.example:8443/api/codex-cloud/attach",
+            Some("ab".repeat(32).as_str()),
             "tok-secret",
+            false,
         );
         assert!(prompt.contains("codex-cloud agent"));
-        assert!(prompt.contains("--home wss://home.example:8443/ws"));
+        assert!(prompt.contains("--home wss://home.example:8443/api/codex-cloud/attach"));
+        assert!(prompt.contains("--home-fingerprint"));
+        assert!(!prompt.contains("--tls-terminated-proxy"));
         assert!(prompt.contains("--task task_e_p"));
         assert!(prompt.contains("tok-secret"));
         assert!(prompt.contains("run-worker.sh"));
         assert!(prompt.contains("foreground"));
+    }
+
+    #[test]
+    fn proxy_prompt_is_explicit_and_does_not_claim_to_pin_home() {
+        let prompt = attach_prompt(
+            "task_e_p",
+            "wss://home.example/api/codex-cloud/attach",
+            None,
+            "tok-secret",
+            true,
+        );
+        assert!(prompt.contains("--tls-terminated-proxy"));
+        assert!(!prompt.contains("--home-fingerprint"));
     }
 
     #[test]
@@ -1929,7 +2474,48 @@ mod tests {
     fn home_urls_must_be_wss() {
         let err = home_url_from(Some("ws://127.0.0.1:8765/ws".into())).unwrap_err();
         assert!(err.contains("wss://"), "{err}");
-        assert!(home_url_from(Some("wss://home.example:8443/ws".into())).is_ok());
+        assert_eq!(
+            home_url_from(Some("wss://home.example:8443/ws".into())).unwrap(),
+            "wss://home.example:8443/api/codex-cloud/attach"
+        );
+    }
+
+    #[test]
+    fn no_proxy_matching_covers_exact_suffix_port_and_wildcard() {
+        assert!(no_proxy_matches(
+            "localhost,.example.test",
+            "api.example.test",
+            443
+        ));
+        assert!(no_proxy_matches(
+            "home.example.test:8443",
+            "home.example.test",
+            8443
+        ));
+        assert!(!no_proxy_matches(
+            "home.example.test:8443",
+            "home.example.test",
+            443
+        ));
+        assert!(!no_proxy_matches("example.test", "notexample.test", 443));
+        assert!(no_proxy_matches("*", "anything.invalid", 443));
+        assert_eq!(authority("2001:db8::1", 443), "[2001:db8::1]:443");
+    }
+
+    fn signed_proxy_request(
+        key: &rcgen::KeyPair,
+        fingerprint: &str,
+        task_id: &str,
+        nonce: &str,
+        timestamp_unix_ms: i64,
+    ) -> String {
+        use rcgen::SigningKey as _;
+        let payload =
+            attachment_proof_payload(ATTACH_PATH, fingerprint, task_id, nonce, timestamp_unix_ms);
+        let signature = crate::daemon_identity::b64u(&key.sign(payload.as_bytes()).unwrap());
+        format!(
+            "GET {ATTACH_PATH} HTTP/1.1\r\nHost: home.example\r\n{CLOUD_WORKER_HEADER}: 1\r\n{CLOUD_WORKER_FINGERPRINT_HEADER}: {fingerprint}\r\n{CLOUD_WORKER_TASK_HEADER}: {task_id}\r\n{CLOUD_WORKER_NONCE_HEADER}: {nonce}\r\n{CLOUD_WORKER_TIMESTAMP_HEADER}: {timestamp_unix_ms}\r\n{CLOUD_WORKER_PROOF_HEADER}: {signature}\r\n\r\n"
+        )
     }
 
     #[test]
