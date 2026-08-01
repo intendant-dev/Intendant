@@ -41,7 +41,7 @@ use super::messages::{self, MessageMeta, MessageSpace, RadarNoteInput};
 use super::scan::{self, ReadBudget};
 use super::{sanitize_key, CoordinationError, MAX_SCAN_ENTRIES};
 use crate::session_vitals::{
-    parse_status_v2, run_git, GitVitalsTargets, GIT_PROBE_TIMEOUT, GIT_STATUS_ARGS,
+    parse_status_v2, run_git, GitStatusLedger, GitVitalsTargets, GIT_PROBE_TIMEOUT, GIT_STATUS_ARGS,
 };
 
 /// Detection cadence. The protocol names no radar cadence, so the task
@@ -674,19 +674,36 @@ pub(crate) fn parse_pr_list_json(bytes: &[u8]) -> Option<Vec<PrFileSet>> {
 
 /// Observed dirty sets for one space's supervised members, one
 /// `git status` per distinct checkout toplevel (the vitals prober's
-/// dedup shape). A member outside any checkout, or a wedged/failed
-/// git, simply contributes no observed set — declarations still cover
-/// it.
+/// dedup shape). The producer's per-tick [`GitStatusLedger`] is
+/// consulted first — a checkout the vitals prober already statused
+/// this tick costs no second spawn (and a ledger-recorded status
+/// FAILURE contributes no observed set, exactly like a failed own
+/// spawn); only members the ledger doesn't cover fall back to this
+/// function's own subprocesses. A member outside any checkout, or a
+/// wedged/failed git, simply contributes no observed set —
+/// declarations still cover it.
 async fn collect_observed(
     git_program: &std::ffi::OsStr,
     members: &[(String, PathBuf)],
     toplevel_cache: &mut HashMap<PathBuf, PathBuf>,
+    ledger: &GitStatusLedger,
 ) -> Vec<ObservedSet> {
     let mut status_by_toplevel: HashMap<PathBuf, Option<BTreeSet<String>>> = HashMap::new();
     let mut merged: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (writer_id, root) in members {
-        let toplevel = match toplevel_cache.get(root) {
-            Some(cached) => cached.clone(),
+        let toplevel = match ledger.toplevel_by_cwd.get(root).or_else(|| {
+            // Fall back to our own cache only past the ledger — the
+            // producer's resolution is this tick's truth.
+            toplevel_cache.get(root)
+        }) {
+            Some(cached) => {
+                let top = cached.clone();
+                if toplevel_cache.len() > 256 {
+                    toplevel_cache.clear(); // vitals prober's cheap cap
+                }
+                toplevel_cache.insert(root.clone(), top.clone());
+                top
+            }
             None => {
                 let out = run_git(
                     git_program,
@@ -709,26 +726,31 @@ async fn collect_observed(
                 top
             }
         };
-        let dirty = match status_by_toplevel.get(&toplevel) {
-            Some(cached) => cached.clone(),
-            None => {
-                let out =
-                    run_git(git_program, GIT_PROBE_TIMEOUT, &toplevel, &GIT_STATUS_ARGS).await;
-                let dirty = out.filter(|o| o.status.success()).map(|o| {
-                    parse_status_v2(&String::from_utf8_lossy(&o.stdout))
-                        .entries
-                        .into_iter()
-                        .map(|e| e.path)
-                        .collect::<BTreeSet<String>>()
-                });
-                if dirty.is_none() {
-                    // The cached toplevel may be stale (checkout gone):
-                    // drop it so the next tick re-resolves.
-                    toplevel_cache.remove(root);
+        let dirty = match ledger.dirty_by_toplevel.get(&toplevel) {
+            // The producer already statused this checkout this tick —
+            // same arguments, same parser; no second spawn.
+            Some(from_ledger) => from_ledger.clone(),
+            None => match status_by_toplevel.get(&toplevel) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let out =
+                        run_git(git_program, GIT_PROBE_TIMEOUT, &toplevel, &GIT_STATUS_ARGS).await;
+                    let dirty = out.filter(|o| o.status.success()).map(|o| {
+                        parse_status_v2(&String::from_utf8_lossy(&o.stdout))
+                            .entries
+                            .into_iter()
+                            .map(|e| e.path)
+                            .collect::<BTreeSet<String>>()
+                    });
+                    if dirty.is_none() {
+                        // The cached toplevel may be stale (checkout gone):
+                        // drop it so the next tick re-resolves.
+                        toplevel_cache.remove(root);
+                    }
+                    status_by_toplevel.insert(toplevel.clone(), dirty.clone());
+                    dirty
                 }
-                status_by_toplevel.insert(toplevel.clone(), dirty.clone());
-                dirty
-            }
+            },
         };
         if let Some(paths) = dirty {
             merged.entry(writer_id.clone()).or_default().extend(paths);
@@ -773,6 +795,14 @@ struct RadarTask {
     /// `gh` participation — disabled only in tests via [`RadarTask`]
     /// construction (unit tests never spawn the task at all).
     gh_enabled: bool,
+    /// The vitals producer's per-tick status harvest (see
+    /// [`GitStatusLedger`]): detection consumes the producer's status
+    /// runs instead of spawning its own per checkout.
+    status_feed: tokio::sync::watch::Receiver<GitStatusLedger>,
+    /// Last consumed ledger seq — a ledger that hasn't advanced since
+    /// our previous look (fallback-timer wake, producer stalled) reads
+    /// as absent rather than as fresh truth.
+    last_ledger_seq: u64,
     space_key_cache: HashMap<PathBuf, String>,
     toplevel_cache: HashMap<PathBuf, PathBuf>,
     pr_cache: HashMap<String, PrCacheEntry>,
@@ -873,8 +903,25 @@ impl RadarTask {
         keys
     }
 
+    /// The freshest producer ledger, when it carries a NEW tick since
+    /// our last look. A ledger that hasn't advanced (we woke on the
+    /// fallback timer while the producer stalled) reads as an empty
+    /// ledger, steering [`collect_observed`] back to its own spawns —
+    /// detection never consumes staler data than it would have
+    /// gathered itself.
+    fn consume_ledger(&mut self) -> GitStatusLedger {
+        let ledger = self.status_feed.borrow().clone();
+        if ledger.seq != 0 && ledger.seq != self.last_ledger_seq {
+            self.last_ledger_seq = ledger.seq;
+            ledger
+        } else {
+            GitStatusLedger::default()
+        }
+    }
+
     async fn tick(&mut self) {
         let now_ms = super::now_ms();
+        let ledger = self.consume_ledger();
         // Registry members grouped by space: every supervised session
         // participates in git-scan detection, declared or not (§2.8).
         // Session ids ride along for the rail-badge flags — the bus
@@ -931,9 +978,13 @@ impl RadarTask {
                 .iter()
                 .map(|(_, writer_id, root)| (writer_id.clone(), root.clone()))
                 .collect();
-            let observed =
-                collect_observed(&self.git_program, &writer_members, &mut self.toplevel_cache)
-                    .await;
+            let observed = collect_observed(
+                &self.git_program,
+                &writer_members,
+                &mut self.toplevel_cache,
+                &ledger,
+            )
+            .await;
             let pr_sets = self.pr_sets(&key, &roots, now_ms).await;
             let snapshot = compute_space_snapshot(
                 &RadarSpaceInputs {
@@ -976,12 +1027,18 @@ impl RadarTask {
 
 /// Spawn the periodic radar task (daemon startup). Resolves the real
 /// coordination root at this edge — everything below takes explicit
-/// paths — publishes the state handle for the read side, and ticks
-/// forever on [`RADAR_TICK`]. `bus` carries the §2.8 rail-badge
+/// paths — publishes the state handle for the read side, and ticks in
+/// step with the vitals producer's published [`GitStatusLedger`]
+/// (same rhythm as [`RADAR_TICK`], plus the producer's VCS-notice
+/// wakes), so detection consumes the tick's status runs instead of
+/// spawning its own. A quiet or dead producer degrades to the old
+/// self-paced timer — with the ledger seq-guard steering the tick back
+/// to its own subprocesses. `bus` carries the §2.8 rail-badge
 /// transitions to the normal outbound broadcaster path.
 pub(crate) fn spawn_radar_task(
     targets: GitVitalsTargets,
     bus: crate::event::EventBus,
+    status_feed: tokio::sync::watch::Receiver<GitStatusLedger>,
 ) -> tokio::task::JoinHandle<()> {
     let state = RadarState::default();
     publish_radar_state(&state);
@@ -993,6 +1050,8 @@ pub(crate) fn spawn_radar_task(
         flags: RadarFlagTracker::default(),
         git_program: "git".into(),
         gh_enabled: true,
+        status_feed,
+        last_ledger_seq: 0,
         space_key_cache: HashMap::new(),
         toplevel_cache: HashMap::new(),
         pr_cache: HashMap::new(),
@@ -1001,7 +1060,17 @@ pub(crate) fn spawn_radar_task(
     tokio::spawn(async move {
         loop {
             task.tick().await;
-            tokio::time::sleep(RADAR_TICK).await;
+            match tokio::time::timeout(RADAR_TICK, task.status_feed.changed()).await {
+                // A new ledger landed: tick with it.
+                Ok(Ok(())) => {}
+                // Producer gone (no daemon runs without one today, but
+                // fail safe): pure timer cadence.
+                Ok(Err(_)) => tokio::time::sleep(RADAR_TICK).await,
+                // Producer quiet past a full cadence (wedged git, empty
+                // registry): tick anyway — disk spaces and messages
+                // still need scanning.
+                Err(_elapsed) => {}
+            }
         }
     })
 }
@@ -1396,7 +1465,13 @@ mod tests {
             ("s-none".to_string(), tmp.path().join("not-a-repo")),
         ];
         let mut cache = HashMap::new();
-        let observed = collect_observed(std::ffi::OsStr::new("git"), &members, &mut cache).await;
+        let observed = collect_observed(
+            std::ffi::OsStr::new("git"),
+            &members,
+            &mut cache,
+            &GitStatusLedger::default(),
+        )
+        .await;
         assert_eq!(observed.len(), 2, "{observed:?}");
         for set in &observed {
             assert!(set.paths.contains("tracked.rs"), "{observed:?}");
@@ -1404,6 +1479,48 @@ mod tests {
         }
         assert!(observed.iter().any(|s| s.writer_id == "s-one"));
         assert!(observed.iter().any(|s| s.writer_id == "s-two"));
+    }
+
+    #[tokio::test]
+    async fn collect_observed_consumes_the_producer_ledger_without_spawning() {
+        // Members covered by the producer's per-tick ledger must cost
+        // no git subprocess at all: the git program here is a path
+        // that cannot execute, so any spawn attempt would yield no
+        // observed set — the sets can only have come from the ledger.
+        // A ledger-recorded status FAILURE (None) contributes no
+        // observed set, exactly like a failed own spawn.
+        let tmp = tempfile::tempdir().unwrap();
+        let worked = tmp.path().join("worked");
+        let broken = tmp.path().join("broken");
+        let members = vec![
+            ("s-live".to_string(), worked.join("sub")),
+            ("s-broken".to_string(), broken.clone()),
+        ];
+        let ledger = GitStatusLedger {
+            seq: 7,
+            dirty_by_toplevel: Arc::new(HashMap::from([
+                (worked.clone(), Some(BTreeSet::from(["lib.rs".to_string()]))),
+                (broken.clone(), None),
+            ])),
+            toplevel_by_cwd: Arc::new(HashMap::from([
+                (worked.join("sub"), worked.clone()),
+                (broken.clone(), broken.clone()),
+            ])),
+        };
+        let mut cache = HashMap::new();
+        let observed = collect_observed(
+            std::ffi::OsStr::new("/nonexistent/never-a-git"),
+            &members,
+            &mut cache,
+            &ledger,
+        )
+        .await;
+        assert_eq!(observed.len(), 1, "{observed:?}");
+        assert_eq!(observed[0].writer_id, "s-live");
+        assert!(observed[0].paths.contains("lib.rs"));
+        // The ledger's resolutions warm the radar's own cwd → toplevel
+        // cache for ledger-less ticks.
+        assert_eq!(cache.get(&worked.join("sub")), Some(&worked));
     }
 
     #[test]
@@ -1585,6 +1702,8 @@ mod tests {
             flags: RadarFlagTracker::default(),
             git_program: "git".into(),
             gh_enabled: false,
+            status_feed: tokio::sync::watch::channel(GitStatusLedger::default()).1,
+            last_ledger_seq: 0,
             space_key_cache: HashMap::new(),
             toplevel_cache: HashMap::new(),
             pr_cache: HashMap::new(),

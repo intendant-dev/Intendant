@@ -52,7 +52,7 @@
 //! every write — one entry, and one complete emitted snapshot, per
 //! logical session.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -422,7 +422,24 @@ impl GitVitalsProber {
         Some(toplevel)
     }
 
+    /// Probe one cwd to the vitals shape alone — the prober contract's
+    /// test seam (production flows through [`Self::probe_resolved`],
+    /// which additionally yields the ledger harvest).
+    #[cfg(test)]
     pub(crate) async fn probe(&mut self, cwd: &Path) -> Option<SessionGitVitals> {
+        self.probe_resolved(cwd).await.map(|(_, vitals, _)| vitals)
+    }
+
+    /// Like [`Self::probe`], but also yields the checkout toplevel and
+    /// the dirty entry paths the status run saw — the per-tick harvest
+    /// the producer publishes as the [`GitStatusLedger`], so
+    /// same-cadence consumers (the coordination radar's observed
+    /// working sets) ride the SAME status invocation as the chip
+    /// instead of spawning their own.
+    async fn probe_resolved(
+        &mut self,
+        cwd: &Path,
+    ) -> Option<(PathBuf, SessionGitVitals, BTreeSet<String>)> {
         let toplevel = self.toplevel_for(cwd).await?;
         let probed = self.probe_checkout(&toplevel).await;
         if probed.is_none() {
@@ -432,10 +449,13 @@ impl GitVitalsProber {
             self.toplevel_cache.remove(cwd);
             self.primary_cache.remove(&toplevel);
         }
-        probed
+        probed.map(|(vitals, paths)| (toplevel, vitals, paths))
     }
 
-    async fn probe_checkout(&mut self, toplevel: &Path) -> Option<SessionGitVitals> {
+    async fn probe_checkout(
+        &mut self,
+        toplevel: &Path,
+    ) -> Option<(SessionGitVitals, BTreeSet<String>)> {
         self.checkout_probes += 1;
         let status = self.git(toplevel, &GIT_STATUS_ARGS).await?;
         let facts = parse_status_v2(&status);
@@ -493,20 +513,28 @@ impl GitVitalsProber {
             }
         }
 
-        Some(SessionGitVitals {
-            dirty_files: facts.dirty_files(),
-            branch: facts.branch,
-            ahead,
-            behind,
-            primary_ref,
-            merge_parity,
-            unpushed,
-            primary_unpushed,
-            checkout: toplevel
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        })
+        let dirty_paths: BTreeSet<String> = facts
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        Some((
+            SessionGitVitals {
+                dirty_files: facts.dirty_files(),
+                branch: facts.branch,
+                ahead,
+                behind,
+                primary_ref,
+                merge_parity,
+                unpushed,
+                primary_unpushed,
+                checkout: toplevel
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
+            dirty_paths,
+        ))
     }
 
     /// Primary-branch discovery, cached per checkout: origin's default
@@ -1780,6 +1808,35 @@ pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVital
         .count()
 }
 
+/// One tick's working-tree status harvest, published by the vitals
+/// producer over a `watch` channel for same-cadence consumers — the
+/// coordination radar's observed working sets ride the SAME
+/// `git status` invocations as the session chips instead of spawning
+/// their own (one status per checkout per tick, daemon-wide).
+///
+/// `dirty_by_toplevel`: per probed checkout toplevel, the status run's
+/// entry paths — `None` records that the status probe FAILED there this
+/// tick, so consumers state nothing rather than something stale.
+/// `toplevel_by_cwd`: the cwd → toplevel resolutions the tick performed
+/// (consumers skip their own `rev-parse` spawns).
+/// `seq` increments per tick: a consumer that already saw this seq
+/// holds no fresher data than its own last look and should fall back
+/// to probing rather than re-reading a stalled ledger.
+#[derive(Clone, Default)]
+pub(crate) struct GitStatusLedger {
+    pub(crate) seq: u64,
+    pub(crate) dirty_by_toplevel: Arc<HashMap<PathBuf, Option<BTreeSet<String>>>>,
+    pub(crate) toplevel_by_cwd: Arc<HashMap<PathBuf, PathBuf>>,
+}
+
+/// The per-tick accumulation behind [`GitStatusLedger`] (unshared: the
+/// tick fills plain maps and Arcs them once at publish).
+#[derive(Default)]
+struct TickLedger {
+    dirty_by_toplevel: HashMap<PathBuf, Option<BTreeSet<String>>>,
+    toplevel_by_cwd: HashMap<PathBuf, PathBuf>,
+}
+
 /// Probe `cwd` through the per-tick cache, keyed by checkout TOPLEVEL:
 /// sessions sharing a checkout (the common shape once restored sessions
 /// register at boot — many idle sessions per project root, or the root
@@ -1792,6 +1849,7 @@ pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVital
 async fn probe_cached(
     prober: &mut GitVitalsProber,
     tick_cache: &mut HashMap<PathBuf, Option<SessionGitVitals>>,
+    ledger: &mut TickLedger,
     cwd: &Path,
 ) -> Option<SessionGitVitals> {
     if let Some(cached) = tick_cache.get(cwd) {
@@ -1801,14 +1859,30 @@ async fn probe_cached(
         tick_cache.insert(cwd.to_path_buf(), None);
         return None;
     };
+    ledger
+        .toplevel_by_cwd
+        .insert(cwd.to_path_buf(), key.clone());
     if let Some(cached) = tick_cache.get(&key) {
         return cached.clone();
     }
     // Re-resolves the toplevel through the prober's cache (no
     // subprocess) — keeps the drop-caches-on-failure path in one place.
-    let probed = prober.probe(cwd).await;
-    tick_cache.insert(key, probed.clone());
-    probed
+    match prober.probe_resolved(cwd).await {
+        Some((toplevel, vitals, dirty_paths)) => {
+            ledger
+                .dirty_by_toplevel
+                .insert(toplevel.clone(), Some(dirty_paths));
+            tick_cache.insert(toplevel, Some(vitals.clone()));
+            Some(vitals)
+        }
+        None => {
+            // Status failed (or the checkout vanished): the ledger
+            // records the failure so consumers claim nothing here.
+            ledger.dirty_by_toplevel.insert(key.clone(), None);
+            tick_cache.insert(key, None);
+            None
+        }
+    }
 }
 
 /// Vitals producer: spawns the cache listener and runs the periodic git
@@ -1826,11 +1900,20 @@ async fn probe_cached(
 /// [`crate::session_vitals_restore::account_limit_store_path`]) makes the
 /// per-account rate-limit window store survive restarts: restored here,
 /// rewritten on change. `None` keeps the store memory-only.
+///
+/// The returned `watch` receiver carries the per-tick
+/// [`GitStatusLedger`] — the status harvest same-cadence consumers (the
+/// coordination radar) read instead of spawning their own `git status`
+/// per checkout.
 pub(crate) fn spawn_session_vitals_producer(
     bus: EventBus,
     seed_targets: Vec<(String, PathBuf)>,
     limit_store: Option<PathBuf>,
-) -> (GitVitalsTargets, tokio::task::JoinHandle<()>) {
+) -> (
+    GitVitalsTargets,
+    tokio::sync::watch::Receiver<GitStatusLedger>,
+    tokio::task::JoinHandle<()>,
+) {
     let registry = GitVitalsTargets::default();
     for (session_id, cwd) in seed_targets {
         registry.register(&session_id, cwd);
@@ -1840,28 +1923,40 @@ pub(crate) fn spawn_session_vitals_producer(
     let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
     let _target_maintainer =
         spawn_git_target_maintainer(bus, registry.clone(), hub.clone(), wake.clone());
+    let (status_tx, status_rx) = tokio::sync::watch::channel(GitStatusLedger::default());
     let handle = tokio::spawn({
         let registry = registry.clone();
         async move {
             let mut prober = GitVitalsProber::default();
+            let mut tick_seq: u64 = 0;
             loop {
                 let mut tick_cache: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
+                let mut tick_ledger = TickLedger::default();
                 // Live targets every tick; restored targets exactly once
                 // (the boot paint) until live evidence upgrades them —
                 // see [`TargetOrigin`].
                 for (session_id, cwd) in registry.snapshot_probe() {
-                    let mut probed = probe_cached(&mut prober, &mut tick_cache, &cwd).await;
+                    let mut probed =
+                        probe_cached(&mut prober, &mut tick_cache, &mut tick_ledger, &cwd).await;
                     if probed.is_none() {
                         // A dead activity locus (worktree deleted, checkout
                         // gone) falls back to the registered root in the
                         // same tick so the chip never blanks.
                         if let Some(root) = registry.demote_locus(&session_id, &cwd) {
-                            probed = probe_cached(&mut prober, &mut tick_cache, &root).await;
+                            probed =
+                                probe_cached(&mut prober, &mut tick_cache, &mut tick_ledger, &root)
+                                    .await;
                         }
                     }
                     hub.apply(&session_id, |vitals| vitals.git = probed);
                     registry.mark_probed(&session_id);
                 }
+                tick_seq += 1;
+                status_tx.send_replace(GitStatusLedger {
+                    seq: tick_seq,
+                    dirty_by_toplevel: Arc::new(tick_ledger.dirty_by_toplevel),
+                    toplevel_by_cwd: Arc::new(tick_ledger.toplevel_by_cwd),
+                });
                 // Wait out the cadence, or probe immediately when the
                 // maintainer sees a backend VCS notice. `Notify` holds at
                 // most one stored permit, so a burst of notices (a merge
@@ -1874,7 +1969,7 @@ pub(crate) fn spawn_session_vitals_producer(
             }
         }
     });
-    (registry, handle)
+    (registry, status_rx, handle)
 }
 
 /// Bus maintenance for the git-target registry:
@@ -2271,8 +2366,20 @@ mod tests {
 
         let mut prober = GitVitalsProber::default();
         let mut tick_cache: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
-        let at_root = probe_cached(&mut prober, &mut tick_cache, root).await;
-        let at_subdir = probe_cached(&mut prober, &mut tick_cache, &root.join("src")).await;
+        let at_root = probe_cached(
+            &mut prober,
+            &mut tick_cache,
+            &mut TickLedger::default(),
+            root,
+        )
+        .await;
+        let at_subdir = probe_cached(
+            &mut prober,
+            &mut tick_cache,
+            &mut TickLedger::default(),
+            &root.join("src"),
+        )
+        .await;
         assert_eq!(at_root.as_ref().map(|g| g.branch.as_str()), Some("main"));
         assert_eq!(at_root, at_subdir, "one checkout, one shared result");
         assert_eq!(
@@ -2284,20 +2391,42 @@ mod tests {
         // Next tick: fresh per-tick cache, still one probe per checkout —
         // the path→toplevel resolutions are already cached.
         let mut next_tick: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
-        probe_cached(&mut prober, &mut next_tick, &root.join("src")).await;
-        probe_cached(&mut prober, &mut next_tick, root).await;
+        probe_cached(
+            &mut prober,
+            &mut next_tick,
+            &mut TickLedger::default(),
+            &root.join("src"),
+        )
+        .await;
+        probe_cached(
+            &mut prober,
+            &mut next_tick,
+            &mut TickLedger::default(),
+            root,
+        )
+        .await;
         assert_eq!(prober.checkout_probes, 2);
 
         // Paths outside any checkout cache their per-tick miss under the
         // raw path and never reach a checkout probe.
         let outside = tempfile::tempdir().expect("tempdir");
         let mut tick: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
-        assert!(probe_cached(&mut prober, &mut tick, outside.path())
-            .await
-            .is_none());
-        assert!(probe_cached(&mut prober, &mut tick, outside.path())
-            .await
-            .is_none());
+        assert!(probe_cached(
+            &mut prober,
+            &mut tick,
+            &mut TickLedger::default(),
+            outside.path()
+        )
+        .await
+        .is_none());
+        assert!(probe_cached(
+            &mut prober,
+            &mut tick,
+            &mut TickLedger::default(),
+            outside.path()
+        )
+        .await
+        .is_none());
         assert_eq!(prober.checkout_probes, 2);
         assert!(tick.contains_key(outside.path()), "miss cached per tick");
     }
@@ -3095,7 +3224,8 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         assert_eq!(
             register_restored_session_targets(home.path(), &targets),
             1,
@@ -3174,7 +3304,8 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         assert_eq!(register_restored_session_targets(home.path(), &targets), 1);
 
         let deadline = std::time::Duration::from_secs(20);
@@ -3243,6 +3374,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn producer_publishes_the_status_ledger_each_tick() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        git_cmd(repo.path(), &["add", "."]);
+        git_cmd(repo.path(), &["commit", "-qm", "base"]);
+
+        let bus = EventBus::new();
+        let (_targets, mut status_feed, _producer) = spawn_session_vitals_producer(
+            bus.clone(),
+            vec![("ledger-session".to_string(), repo.path().to_path_buf())],
+            None,
+        );
+
+        let deadline = std::time::Duration::from_secs(20);
+        tokio::time::timeout(deadline, status_feed.changed())
+            .await
+            .expect("a ledger arrives within the cadence")
+            .expect("producer alive");
+        let (toplevel, first_seq) = {
+            let ledger = status_feed.borrow();
+            assert!(ledger.seq > 0);
+            // The probed cwd resolves in the ledger (the toplevel may be
+            // a canonicalized spelling of the tempdir — consumers key by
+            // the mapping, never by textual equality).
+            let toplevel = ledger
+                .toplevel_by_cwd
+                .get(repo.path())
+                .cloned()
+                .expect("the probed cwd resolves in the ledger");
+            assert_eq!(
+                ledger.dirty_by_toplevel.get(&toplevel),
+                Some(&Some(BTreeSet::new())),
+                "clean checkout publishes an empty dirty set"
+            );
+            (toplevel, ledger.seq)
+        };
+
+        // Dirty the checkout: a later tick's ledger carries the path.
+        std::fs::write(repo.path().join("dirty.txt"), "x\n").unwrap();
+        let dirty = tokio::time::timeout(deadline, async {
+            loop {
+                status_feed.changed().await.expect("producer alive");
+                let ledger = status_feed.borrow().clone();
+                assert!(ledger.seq > first_seq, "seq is monotonic");
+                if let Some(Some(paths)) = ledger.dirty_by_toplevel.get(&toplevel) {
+                    if !paths.is_empty() {
+                        return paths.clone();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a later ledger sees the dirty file");
+        assert!(dirty.contains("dirty.txt"));
+    }
+
+    #[tokio::test]
     async fn vcs_activity_seeds_locus_and_wakes_prober() {
         // A backend's commit notice must retarget the probe to the
         // checkout the backend named (first-hand, like
@@ -3264,7 +3453,7 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (_targets, _producer) = spawn_session_vitals_producer(
+        let (_targets, _status_feed, _producer) = spawn_session_vitals_producer(
             bus.clone(),
             vec![("vcs-session".to_string(), repo_a.path().to_path_buf())],
             None,
@@ -3413,7 +3602,8 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("shared-a", repo.path().to_path_buf());
         targets.register("shared-b", repo.path().to_path_buf());
 
@@ -3463,7 +3653,8 @@ mod tests {
         // Subscribed before the producer spawns, so every change-only hub
         // emission is queued here — sequential waits never miss one.
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("s-fork", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -3530,7 +3721,8 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("s-announce", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -3597,7 +3789,8 @@ mod tests {
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         targets.register("supervised-1", root.to_path_buf());
 
         let deadline = std::time::Duration::from_secs(20);
@@ -3638,7 +3831,8 @@ mod tests {
         // (regression: the listener used to die with the git gating,
         // blanking the dashboard's Prompt cache row daemon-wide).
         let bus = EventBus::new();
-        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        let (_targets, _status_feed, _producer) =
+            spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
         let mut rx = bus.subscribe();
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("cc-session".into()),

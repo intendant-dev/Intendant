@@ -148,11 +148,12 @@ pub(crate) async fn run_daemon(
         (Some(session_id), Some(root)) => vec![(session_id, root)],
         _ => Vec::new(),
     };
-    let (vitals_git_targets, _vitals_producer) = session_vitals::spawn_session_vitals_producer(
-        bus.clone(),
-        vitals_git_seed,
-        Some(crate::session_vitals_restore::account_limit_store_path()),
-    );
+    let (vitals_git_targets, vitals_status_feed, _vitals_producer) =
+        session_vitals::spawn_session_vitals_producer(
+            bus.clone(),
+            vitals_git_seed,
+            Some(crate::session_vitals_restore::account_limit_store_path()),
+        );
     // Publish the live registry for read-side lanes: the Changes tab's
     // working-tree list resolves a session's checkout through the SAME
     // effective target the dirty chip probes (activity locus included),
@@ -169,12 +170,17 @@ pub(crate) async fn run_daemon(
     crate::credential_watch::spawn_credential_watch(bus.clone(), project_root.clone());
     // Collision radar (Track C, C2 — ruled §2.1): periodic zero-LLM
     // detection over bus declarations ∪ observed git status (the same
-    // registry the vitals prober probes) ∪ open-PR file sets; publishes
-    // per-space snapshots for the injection seam, writes deduplicated
-    // radar notes to flagged parties, and broadcasts the §2.8 rail-badge
+    // registry the vitals prober probes, consumed from the producer's
+    // per-tick status ledger — one `git status` per checkout per tick,
+    // daemon-wide) ∪ open-PR file sets; publishes per-space snapshots
+    // for the injection seam, writes deduplicated radar notes to
+    // flagged parties, and broadcasts the §2.8 rail-badge
     // raise/resolve transitions on the bus.
-    let _radar_task =
-        crate::coordination::radar::spawn_radar_task(vitals_git_targets.clone(), bus.clone());
+    let _radar_task = crate::coordination::radar::spawn_radar_task(
+        vitals_git_targets.clone(),
+        bus.clone(),
+        vitals_status_feed,
+    );
     // Restored sessions: a restart empties the target registry, so idle
     // session windows lose their git/health chips until the next resume.
     // One bounded walk (newest-first, insert-if-absent — see
