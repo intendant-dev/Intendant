@@ -23941,6 +23941,7 @@ html.ui-v2 .ag2-cards {
 /* ---- Cards ---- */
 
 html.ui-v2 .ag2-card {
+  position: relative; /* anchors the circle's revealed action pill */
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
@@ -24019,7 +24020,14 @@ html.ui-v2 .ag2-hub-link {
   cursor: pointer;
 }
 html.ui-v2 .ag2-hub-link:hover { color: var(--iris-2); }
-html.ui-v2 .ag2-blocked-line {
+/* Per-gate blocked rows (chip honesty): rose rule for real blocks, sky
+   when every wait is delivered-and-attested and only Complete taps are
+   missing (the achieved self-report hue — never transport green). */
+html.ui-v2 .ag2-blocked-detail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   font-size: 12px;
   color: var(--text-2);
   border-left: 2px solid rgba(var(--rose-rgb), 0.55);
@@ -24027,6 +24035,40 @@ html.ui-v2 .ag2-blocked-line {
   margin-top: 1px;
   overflow-wrap: anywhere;
 }
+html.ui-v2 .ag2-blocked-detail.delivered {
+  border-left-color: rgba(var(--sky-rgb), 0.55);
+}
+html.ui-v2 .ag2-blk-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-blk-mark {
+  color: var(--rose);
+  font-size: 8px;
+}
+html.ui-v2 .ag2-blk-hint { color: var(--text-3); }
+html.ui-v2 .ag2-blk-link {
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+html.ui-v2 .ag2-blk-link:hover { color: var(--text-1); }
+html.ui-v2 .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+}
+html.ui-v2 .ag2-blk-more {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-blk-more:hover { color: var(--text-2); }
 html.ui-v2 .ag2-ansline {
   font-size: 12px;
   color: var(--text-2);
@@ -24077,6 +24119,27 @@ html.ui-v2 .ag2-ctl.retired {
   border: 1.5px dashed var(--line-2);
   color: var(--text-3);
 }
+/* The circle's revealed state (press-and-hold, or first touch tap):
+   the action pill names what the next tap does — no hover-only. */
+html.ui-v2 .ag2-ctl.revealed {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), 0.18);
+}
+html.ui-v2 .ag2-ctl-label {
+  position: absolute;
+  left: 34px;
+  top: 7px;
+  z-index: 3;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  background: var(--surface-2);
+  color: var(--green);
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
 
 /* ---- Chips (tinted token families; rgba(var(--x-rgb), a) formula) ---- */
 
@@ -24120,6 +24183,15 @@ html.ui-v2 .ag2-chip.t-neutral {
   color: var(--text-2);
   background: var(--surface-3);
 }
+/* Tappable chip (the blocked chip): a real button in the chip family —
+   the reveal law forbids hover-only explanations, so the tap unfolds
+   the per-gate rows the tip names. */
+html.ui-v2 button.ag2-chip-btn {
+  appearance: none;
+  cursor: pointer;
+  line-height: inherit;
+}
+html.ui-v2 button.ag2-chip-btn:hover { filter: brightness(1.18); }
 html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
@@ -25052,6 +25124,16 @@ html.ui-v2 .agenda-card-done {
   flex-shrink: 0;
 }
 html.ui-v2 .agenda-card-done:hover { color: var(--green); }
+/* Armed by a first touch tap: the circle names the action in place;
+   the second tap acts (no hover-only mysteries on touch). */
+html.ui-v2 .agenda-card-done.armed {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--green);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+}
 html.ui-v2 .agenda-card-row-title {
   font-size: 12px;
   color: var(--text-2);
@@ -26021,6 +26103,17 @@ html.ui-v2 .ag2-insp-dep {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* A delivered-awaiting-Complete prerequisite: the actionable wait —
+   sky (the achieved self-report hue), with its release affordance. */
+html.ui-v2 .ag2-insp-dep.delivered {
+  border-left: 2px solid rgba(var(--sky-rgb), 0.55);
+  padding-left: 7px;
+}
+html.ui-v2 .ag2-insp-dep .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+  flex-shrink: 0;
 }
 html.ui-v2 .ag2-insp-deplink {
   flex: 1;
@@ -38119,7 +38212,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'baf64664081c95ae';
+const INTENDANT_APP_BUILD = 'acf0f24920ab7f8c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -93063,6 +93156,93 @@ window.qa = Object.assign(window.qa || {}, {
     await agendaHeal('qa-probe');
     return window.qa.agendaServing();
   },
+  // Blocked-chip honesty: the live derivation for one item — chip face,
+  // per-gate rows, and the depth fold plans — read through the same
+  // functions the renderer uses (advisory throughout; gates nothing).
+  agendaBlockedHonesty(itemId) {
+    const item = agendaFindItem(itemId);
+    if (!item) return null;
+    const explain = agendaBlockedExplain(item);
+    const card = document.querySelector(`#ag2-groups .ag2-card[data-item-id="${itemId}"]`);
+    return {
+      blocked: agendaItemIsBlocked(item),
+      chip: agendaBlockedChipSpec(explain),
+      tip: agendaBlockedTip(explain),
+      blockers: explain.blockers.map((b) => b.criterion),
+      prereqs: explain.prereqs.map((p) => ({
+        id: p.id, title: p.title, kind: p.kind, status: p.status, inWindow: !!p.target,
+      })),
+      allDelivered: explain.allDelivered,
+      unexplained: explain.unexplained,
+      dom: card ? {
+        chipButton: !!card.querySelector('[data-blocked-toggle]'),
+        detailRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row').length,
+        deliveredRows: card.querySelectorAll('.ag2-blocked-detail .ag2-blk-row.delivered').length,
+        foldedWaits: !!card.querySelector('.ag2-blk-more'),
+      } : null,
+      plans: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => [d, {
+        folded: agendaBlockedDetailPlan(explain, d, false),
+        tapped: agendaBlockedDetailPlan(explain, d, true),
+      }])),
+    };
+  },
+  // The synthetic depth × derivation matrix: fixture prerequisites in a
+  // local fold (never the live store) driven through the exact renderer
+  // derivations — the delivered distinction, the fold matrix, the
+  // honest out-of-window degrade, and the chip face for each shape.
+  agendaBlockedVectors() {
+    const fold = new Map();
+    const put = (it) => fold.set(it.id, it);
+    put({ id: 'P-run', title: 'running prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, last_run: { state: 'started', at_ms: 1 } }] });
+    put({ id: 'P-delivered', title: 'delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'achieved' } } }] });
+    put({ id: 'P-partial', title: 'partially delivered prerequisite', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'partial' } } }] });
+    put({ id: 'P-unattested', title: 'ran without a self-report', status: 'open',
+      effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
+        last_run: { state: 'completed', at_ms: 1 } }] });
+    put({ id: 'P-retired', title: 'retired prerequisite', status: 'retired' });
+    const find = (id) => fold.get(id) || null;
+    const item = (extra) => ({ id: 'C', title: 'dependent', status: 'open', blocked: true, ...extra });
+    const cases = {
+      explicit_blocker: item({ blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }] }),
+      in_flight_wait: item({ relies_on: [{ target_id: 'P-run' }] }),
+      delivered_wait: item({ relies_on: [{ target_id: 'P-delivered' }] }),
+      partial_is_not_delivered: item({ relies_on: [{ target_id: 'P-partial' }] }),
+      unattested_is_not_delivered: item({ relies_on: [{ target_id: 'P-unattested' }] }),
+      mixed_delivered_and_in_flight: item({
+        relies_on: [{ target_id: 'P-delivered' }, { target_id: 'P-run' }] }),
+      blocker_beside_delivered: item({
+        blockers: [{ blocker_id: 'b1', criterion: 'api access granted' }],
+        relies_on: [{ target_id: 'P-delivered' }] }),
+      retired_prereq: item({ relies_on: [{ target_id: 'P-retired' }] }),
+      outside_window_while_blocked: item({ relies_on: [{ target_id: '01GONE' }] }),
+      outside_window_unblocked: item({ blocked: false, relies_on: [{ target_id: '01GONE' }] }),
+      served_flag_without_visible_gate: item({}),
+    };
+    return Object.fromEntries(Object.entries(cases).map(([name, fixture]) => {
+      const explain = agendaBlockedExplain(fixture, find);
+      return [name, {
+        chip: agendaBlockedChipSpec(explain),
+        allDelivered: explain.allDelivered,
+        unexplained: explain.unexplained,
+        rows: explain.prereqs.map((p) => ({ kind: p.kind, status: p.status, inWindow: !!p.target })),
+        depths: Object.fromEntries(['calm', 'standard', 'everything'].map((d) => {
+          const folded = agendaBlockedDetailPlan(explain, d, false);
+          const tapped = agendaBlockedDetailPlan(explain, d, true);
+          return [d, {
+            visible: folded.visible,
+            hiddenWaits: folded.rows.hiddenWaits,
+            tappedVisible: tapped.visible,
+            tappedHiddenWaits: tapped.rows.hiddenWaits,
+          }];
+        })),
+      }];
+    }));
+  },
 });
 
 // Parked rich asks (ask↔agenda unification, slice 1) re-surface on the
@@ -93335,7 +93515,9 @@ function agendaItemIsBlocked(item) {
 }
 
 // The card's one-line blocked statement (first gate wins). Plain TEXT —
-// callers escape.
+// callers escape. The cards now render the structured per-gate story
+// (agendaBlockedExplain + agendaBlockedDetailHtml below); this one-liner
+// remains for surfaces that want a single sentence.
 function agendaBlockedLine(item) {
   if (item.status !== 'open') return null;
   const blocker = (item.blockers || []).find((b) => !b.cleared);
@@ -93347,6 +93529,157 @@ function agendaBlockedLine(item) {
     if (target.status === 'open') return `Waits on “${target.title}” — still open`;
   }
   return null;
+}
+
+// ---- The blocked story (chip honesty) ----
+
+// Per-prerequisite render judgment for the blocked chip, the card's
+// per-gate rows, and the inspector's Blocked-on section: each
+// `relies_on` link joined client-side against the loaded window
+// (summaries already serve `relies_on[].target_id`, uncleared
+// `blockers`, and `effects[].last_run.attestation` — no second
+// server-side join). `kind` vocabulary:
+//   'satisfied'  target done — the link no longer waits
+//   'delivered'  target open, but its effect's last run COMPLETED and
+//                the session self-reported achieved — everything ran;
+//                only the owner's Complete tap is missing (an
+//                actionable wait, distinct from in-flight work)
+//   'waiting'    target open — genuinely in flight or parked; `status`
+//                carries the live word from the effect derivation
+//   'retired'    target retired — the link needs review
+//   'unknown'    target outside the live window while the served
+//                verdict says blocked — id-only, degrade honestly
+// A target absent from the window on an UNBLOCKED item is provably
+// done (the daemon's verdict is computed against the full ledger), so
+// it reads satisfied — never the old "missing — review" lie.
+// Advisory throughout: none of this gates approval or firing.
+function agendaPrereqStates(item, findItem) {
+  const find = findItem || agendaFindItem;
+  // The served verdict rides list summaries only — a full-grain item
+  // (the inspector's) reads its own window row for the flag.
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
+  return (item.relies_on || []).map((link) => {
+    const target = find(link.target_id) || null;
+    if (!target) {
+      const short = `${String(link.target_id).slice(0, 10)}…`;
+      return blocked
+        ? { id: link.target_id, target: null, title: short, kind: 'unknown',
+          tone: 'neutral', status: 'outside this live window',
+          detail: 'The daemon’s blocked verdict comes from the full ledger; this window carries open items plus the last 14 days.' }
+        : { id: link.target_id, target: null, title: short, kind: 'satisfied',
+          tone: 'green', status: 'done · archived',
+          detail: 'Nothing blocks this item, so this prerequisite completed — its row has aged out of the live window.' };
+    }
+    const base = { id: link.target_id, target, title: target.title };
+    if (target.status === 'done') {
+      return { ...base, kind: 'satisfied', status: 'satisfied', tone: 'green' };
+    }
+    if (target.status === 'retired') {
+      return { ...base, kind: 'retired', status: 'retired — review', tone: 'amber',
+        detail: 'A retired prerequisite never silently satisfies the link — drop it or reopen the target.' };
+    }
+    const run = ((target.effects || [])[0] || {}).last_run || null;
+    if (run && run.state === 'completed' && run.attestation
+      && run.attestation.outcome === 'achieved') {
+      return { ...base, kind: 'delivered', status: 'delivered — awaiting Complete',
+        tone: 'sky',
+        detail: `Ran ${agendaRelTime(run.at_ms)}, completed, self-reported achieved (not verified) — open it and Mark done to release this wait.` };
+    }
+    const st = agendaEffectState(target);
+    let status = 'still open';
+    let tone = 'neutral';
+    if (st) {
+      if (st.kind === 'running') { status = 'running now'; tone = 'iris'; }
+      else if (st.kind === 'ready') { status = 'fires momentarily'; tone = 'iris'; }
+      else if (st.kind === 'waiting') status = 'waiting on its own prerequisites';
+      else if (st.kind === 'watching') status = 'watching for matches';
+      else if (st.kind === 'pending') { status = 'awaiting approval'; tone = 'amber'; }
+      else if (st.kind === 'suspended') { status = 'suspended'; tone = 'amber'; }
+      else if (st.kind === 'standing') status = 'standing series';
+      else if (st.kind === 'armed') status = 'armed to run';
+      else if (st.kind === 'missed') { status = 'missed its window'; tone = 'amber'; }
+      else if (st.kind === 'withdrawn') status = 'proposal withdrawn';
+      else if (run && run.state === 'completed') {
+        status = run.attestation
+          ? `ran — self-reported ${run.attestation.outcome}` : 'ran — no self-report yet';
+      } else if (run && run.state === 'failed') { status = 'last run failed'; tone = 'amber'; }
+    }
+    return { ...base, kind: 'waiting', status, tone };
+  });
+}
+
+// The whole blocked story for one item, derived at render (never
+// stored): uncleared blockers plus every unsatisfied prerequisite
+// judgment. `allDelivered` marks the actionable-wait shape — nothing is
+// stuck, every unsatisfied prerequisite delivered and self-reported
+// achieved; only Complete taps are missing. `unexplained` is the honest
+// degrade: the served verdict says blocked but no gate is visible in
+// this window (freshness skew between the flag and the joined rows).
+function agendaBlockedExplain(item, findItem) {
+  const find = findItem || agendaFindItem;
+  const blocked = item.blocked !== undefined
+    ? item.blocked === true
+    : ((find(item.id) || {}).blocked === true);
+  const blockers = (item.blockers || []).filter((b) => !b.cleared);
+  const prereqs = agendaPrereqStates(item, findItem)
+    .filter((p) => p.kind !== 'satisfied');
+  const delivered = prereqs.filter((p) => p.kind === 'delivered');
+  return {
+    blockers,
+    prereqs,
+    delivered,
+    allDelivered: !blockers.length && prereqs.length > 0
+      && delivered.length === prereqs.length,
+    unexplained: blocked && !blockers.length && !prereqs.length,
+  };
+}
+
+// The chip face: 'blocked' (rose) — or, when every unsatisfied
+// prerequisite is delivered-and-attested and no blocker is stated,
+// 'delivered · awaiting Complete' (sky, the achieved self-report hue —
+// never transport green; the 'answered · awaiting pickup' twin). Pure
+// spec; the cards render it.
+function agendaBlockedChipSpec(explain) {
+  return explain.allDelivered
+    ? { label: 'delivered · awaiting Complete', tone: 'sky' }
+    : { label: 'blocked', tone: 'rose' };
+}
+
+// The chip's hover lane (the tap reveal is the primary — no
+// hover-only): one line per gate, every depth.
+function agendaBlockedTip(explain) {
+  const lines = [];
+  explain.blockers.forEach((b) => lines.push(`waiting on: “${b.criterion}”`));
+  explain.prereqs.forEach((p) => lines.push(`waits on “${p.title}” — ${p.status}`));
+  if (explain.unexplained) {
+    lines.push('The daemon judges this blocked, but no gate is visible in this window — it may have just changed.');
+  }
+  lines.push('Advisory — it gates neither approval nor firing. Tap to see each wait and jump to it.');
+  return lines.join('\n');
+}
+
+// Which gate rows render at a given depth (the fold matrix, pure — the
+// card renderer and the qa vectors read the same plan): uncleared
+// blockers, delivered-awaiting waits, and the unexplained degrade
+// always render; genuinely in-flight waits fold at calm depth until
+// the chip is tapped (`expanded`). Explicit blockers never fold.
+function agendaBlockedDetailPlan(explain, depth, expanded) {
+  const foldable = explain.prereqs.filter((p) => p.kind !== 'delivered');
+  const foldableVisible = depth !== 'calm' || !!expanded;
+  const always = !!(explain.blockers.length || explain.delivered.length
+    || explain.unexplained);
+  return {
+    always,
+    rows: {
+      blockers: explain.blockers,
+      delivered: explain.delivered,
+      waits: foldableVisible ? foldable : [],
+      hiddenWaits: foldableVisible ? 0 : foldable.length,
+    },
+    visible: always || (foldableVisible && foldable.length > 0),
+  };
 }
 
 // The item's scheduled-session effect, judged for render: kind is one of
@@ -94382,7 +94715,8 @@ function agendaRenderCard() {
       ? '<span class="agenda-card-q" aria-label="question">?</span>'
       : '';
     return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
-      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
+      <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Mark done"
+        title="Mark done — completes this item; reopen any time">○</button>
       ${q}<span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
     </div>`;
   });
@@ -94391,11 +94725,32 @@ function agendaRenderCard() {
     : '';
   list.innerHTML = rows.join('') + more;
   list.querySelectorAll('.agenda-card-done').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn));
+    btn.addEventListener('click', () => {
+      // No hover-only mysteries: on a hover-less pointer the first tap
+      // names the action in place; the second tap acts. Hover pointers
+      // keep today's immediate action (the tooltip already explains).
+      if (window.matchMedia && window.matchMedia('(hover: none)').matches
+        && !btn.classList.contains('armed')) {
+        btn.classList.add('armed');
+        btn.textContent = 'Mark done';
+        setTimeout(() => {
+          if (btn.isConnected) {
+            btn.classList.remove('armed');
+            btn.textContent = '○';
+          }
+        }, 5000);
+        return;
+      }
+      agendaSendOp({ op: 'complete', id: btn.dataset.id }, btn);
+    });
   });
   list.querySelectorAll('.agenda-card-row-title').forEach((el) => {
-    el.addEventListener('click', () => routeTo('agenda'));
+    // Opening the row lands on the ITEM (its panel carries the labeled
+    // Mark done), not just the tab.
+    el.addEventListener('click', () => {
+      routeTo('agenda');
+      agendaOpenInspector(el.closest('[data-id]')?.dataset.id);
+    });
   });
   const moreEl = list.querySelector('.agenda-card-more');
   if (moreEl) moreEl.addEventListener('click', () => routeTo('agenda'));
@@ -95309,6 +95664,11 @@ function agendaWireScaffold() {
   groups.addEventListener('click', agendaGroupsClick);
   groups.addEventListener('input', agendaGroupsInput);
   groups.addEventListener('keydown', agendaGroupsKeydown);
+  // The status circle's press-and-hold reveal (self-explanation
+  // without acting) — pointer type feeds the touch first-tap arm.
+  groups.addEventListener('pointerdown', agendaCtlPointerDown);
+  groups.addEventListener('pointerup', agendaCtlPointerEnd);
+  groups.addEventListener('pointercancel', agendaCtlPointerEnd);
   // Tab-scoped keyboard: '/' focuses search, 'n' the composer, Escape
   // closes overlays inspector-last. Skips typing contexts; the approval
   // rail's y/n shortcuts live on the Activity tab so there is no overlap.
@@ -95821,6 +96181,72 @@ function agendaChipHtml(label, tone, tip, dashed) {
   return `<span class="${cls.join(' ')}"${tip ? ` title="${escapeHtml(tip)}"` : ''}>${escapeHtml(label)}</span>`;
 }
 
+// ---- Blocked chip + per-gate detail (chip honesty) ----
+// Derivations live in ui2-agenda.js (agendaBlockedExplain and friends);
+// this section renders them. Advisory throughout — the chip and rows
+// gate nothing, exactly like the served flag they explain.
+
+// Cards whose in-flight waits the owner tapped open at calm depth
+// (render-time presentation state; blockers and delivered waits never
+// fold, so they need no entry here).
+const agendaBlockedOpen = new Set();
+
+// The blocked chip is a BUTTON (house law: every symbol self-explains
+// on tap — no hover-only): the tip names each gate, the tap unfolds
+// the per-gate rows under the card at any depth. When every
+// unsatisfied prerequisite is delivered-and-attested the face stops
+// crying wolf: 'delivered · awaiting Complete' (sky), nothing is
+// stuck — only Complete taps are missing.
+function agendaBlockedChipHtml(item) {
+  const explain = agendaBlockedExplain(item);
+  const spec = agendaBlockedChipSpec(explain);
+  return `<button type="button" class="ag2-chip ag2-chip-btn t-${spec.tone}" data-blocked-toggle="${escapeHtml(item.id)}"
+    title="${escapeHtml(agendaBlockedTip(explain))}">${escapeHtml(spec.label)}</button>`;
+}
+
+function agendaBlockedPrereqRowHtml(p) {
+  const chip = agendaChipHtml(p.status, p.tone,
+    p.detail || 'Live status, derived at render — advisory; it gates nothing');
+  const name = p.target
+    ? `<a class="ag2-blk-link" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span>waits on ${escapeHtml(p.title)}</span>`;
+  const go = p.kind === 'delivered'
+    ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+        title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+    : '';
+  return `<div class="ag2-blk-row${p.kind === 'delivered' ? ' delivered' : ''}">${chip}${name}${go}</div>`;
+}
+
+// The card's per-gate rows (replacing the old single-line first-gate
+// text): every uncleared blocker, every unsatisfied prerequisite with
+// its live status, each a door to the prerequisite itself. Fold rules
+// live in agendaBlockedDetailPlan; the chip toggles the calm-depth
+// fold. Renders from locally visible gates even when the served flag
+// is absent (never-summarized event rows), exactly like the old line.
+function agendaBlockedDetailHtml(item) {
+  if (item.status !== 'open') return '';
+  const explain = agendaBlockedExplain(item);
+  if (!explain.blockers.length && !explain.prereqs.length && !explain.unexplained) return '';
+  const plan = agendaBlockedDetailPlan(explain, agendaDepth, agendaBlockedOpen.has(item.id));
+  if (!plan.visible) return '';
+  const rows = [];
+  explain.blockers.forEach((b) => {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-mark" aria-hidden="true">●</span>
+      <span>waiting on: “${escapeHtml(b.criterion)}”
+        <span class="ag2-blk-hint">— stated blocker; nothing evaluates it, people do</span></span></div>`);
+  });
+  plan.rows.delivered.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  plan.rows.waits.forEach((p) => rows.push(agendaBlockedPrereqRowHtml(p)));
+  if (explain.unexplained) {
+    rows.push(`<div class="ag2-blk-row"><span class="ag2-blk-hint">the daemon judges this blocked,
+      but no gate is visible in this window — it may have just changed</span></div>`);
+  }
+  if (plan.rows.hiddenWaits) {
+    rows.push(`<button type="button" class="ag2-blk-more" data-blocked-toggle="${escapeHtml(item.id)}">+ ${plan.rows.hiddenWaits} in-flight wait${plan.rows.hiddenWaits === 1 ? '' : 's'} ›</button>`);
+  }
+  return `<div class="ag2-blocked-detail${explain.allDelivered ? ' delivered' : ''}">${rows.join('')}</div>`;
+}
+
 // ---- Attestation chips (Track AO — the Q8 labeling law, binding) ----
 // The self-report axis renders BESIDE the transport verdict, never as
 // it: every attestation surface says "self-reported" and carries the
@@ -95872,8 +96298,7 @@ function agendaCardChips(item) {
       `Reminder ${agendaAbsTime(item.due_ms)} — delivery follows your policy`));
   }
   if (agendaItemIsBlocked(item)) {
-    chips.push(agendaChipHtml('blocked', 'rose',
-      'Derived at render — an uncleared blocker or unmet prerequisite'));
+    chips.push(agendaBlockedChipHtml(item));
   }
   // Tier-1 PR join chips (render-time only — never stored, never ops):
   // draft state and rename divergence come from the scanner's last
@@ -96516,31 +96941,79 @@ function agendaDismissAsk(item) {
 
 // ---- Card ----
 
+// The status circle's tappable self-explanation (house law: no
+// hover-only): a press-and-hold on any pointer, or the first tap on a
+// hover-less one, REVEALS the action as a labeled pill beside the
+// circle instead of acting; the next tap (circle or pill) acts. Mouse
+// clicks keep today's immediate action — the reveal is additive.
+let agendaCtlReveal = null; // { id, until } — the one revealed circle
+let agendaCtlHoldTimer = null;
+let agendaCtlHoldFiredAt = 0;
+let agendaCtlPointerType = 'mouse';
+
+function agendaCtlAction(item) {
+  if (item.kind === 'question' && item.status === 'open') return null;
+  return item.status === 'open' ? 'Mark done' : 'Reopen';
+}
+
+function agendaCtlRevealShow(id) {
+  agendaCtlReveal = { id, until: Date.now() + 6000 };
+  agendaRenderTab();
+  setTimeout(() => {
+    if (agendaCtlReveal && agendaCtlReveal.until <= Date.now()) {
+      agendaCtlReveal = null;
+      agendaRenderTab();
+    }
+  }, 6200);
+}
+
+function agendaCtlPointerDown(e) {
+  agendaCtlPointerType = e.pointerType || 'mouse';
+  const ctl = e.target.closest('.ag2-ctl');
+  if (!ctl || !ctl.dataset.ctl) return;
+  const item = agendaFindItem(ctl.dataset.ctl);
+  if (!item || !agendaCtlAction(item)) return;
+  if (agendaCtlHoldTimer) clearTimeout(agendaCtlHoldTimer);
+  agendaCtlHoldTimer = setTimeout(() => {
+    agendaCtlHoldTimer = null;
+    agendaCtlHoldFiredAt = Date.now();
+    agendaCtlRevealShow(item.id);
+  }, 450);
+}
+
+function agendaCtlPointerEnd() {
+  if (agendaCtlHoldTimer) {
+    clearTimeout(agendaCtlHoldTimer);
+    agendaCtlHoldTimer = null;
+  }
+}
+
 function agendaCtlHtml(item) {
   const id = escapeHtml(item.id);
   if (item.kind === 'question' && item.status === 'open') {
-    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it">?</button>`;
+    return `<button type="button" class="ag2-ctl q" data-ctl="${id}" title="Open question — answering resolves it" aria-label="Open question">?</button>`;
   }
-  if (item.status === 'open') {
-    return `<button type="button" class="ag2-ctl open" data-ctl="${id}" title="Mark done"></button>`;
-  }
-  if (item.status === 'done') {
-    return `<button type="button" class="ag2-ctl done" data-ctl="${id}" title="Reopen">✓</button>`;
-  }
-  return `<button type="button" class="ag2-ctl retired" data-ctl="${id}" title="Reopen (retired)"></button>`;
+  const [cls, glyph, tip] = item.status === 'open'
+    ? ['open', '', 'Mark done — completes this item; reopen any time']
+    : item.status === 'done'
+      ? ['done', '✓', 'Done — tap to reopen']
+      : ['retired', '', 'Retired — tap to reopen'];
+  const action = agendaCtlAction(item);
+  const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id;
+  const pill = revealed
+    ? `<button type="button" class="ag2-ctl-label" data-ctl="${id}">${escapeHtml(action)}</button>`
+    : '';
+  return `<button type="button" class="ag2-ctl ${cls}${revealed ? ' revealed' : ''}" data-ctl="${id}" title="${escapeHtml(tip)}" aria-label="${escapeHtml(action)}">${glyph}</button>${pill}`;
 }
 
 function agendaCardHtml(row) {
   const item = row.item;
   const opts = row;
   const id = escapeHtml(item.id);
-  // Calm depth folds prerequisite-only wait lines (the blocked chip
-  // still shows); an explicit uncleared blocker always renders — it
-  // names what someone must do.
-  const blockedRaw = agendaBlockedLine(item);
-  const blockedLine = blockedRaw
-    && agendaDepthCalm() && !(item.blockers || []).some((b) => !b.cleared)
-    ? null : blockedRaw;
+  // Per-gate blocked rows: explicit blockers and delivered-awaiting
+  // waits always render; calm depth folds only the genuinely in-flight
+  // waits, and the blocked chip's tap unfolds them (agendaBlockedOpen).
+  const blockedDetail = agendaBlockedDetailHtml(item);
   const answerLine = opts.showAnswer && item.answer && item.answer.text
     ? `<div class="ag2-ansline">${escapeHtml(item.answer.text.length > 180 ? `${item.answer.text.slice(0, 180)}…` : item.answer.text)}</div>`
     : '';
@@ -96557,7 +97030,7 @@ function agendaCardHtml(row) {
         ${agendaDepthAll() ? `<span class="ag2-ulid" title="ulid prefix — creation-ordered; the full id is on the item panel">${escapeHtml(item.id.slice(0, 10).toLowerCase())}</span>` : ''}
       </div>
       <div class="ag2-card-meta">${agendaCardByline(item, opts)}</div>
-      ${blockedLine ? `<div class="ag2-blocked-line">${escapeHtml(blockedLine)}</div>` : ''}
+      ${blockedDetail}
       ${agendaPipelineStripHtml(item)}
       ${opts.automation ? agendaAutomationStripHtml(item) : agendaCardEffectStrip(item)}
       ${qa}${answerLine}
@@ -96720,6 +97193,12 @@ function agendaLensFooterHtml(lensId) {
 // ---- List event delegation (wired once on #ag2-groups) ----
 
 function agendaGroupsClick(e) {
+  // The click a press-and-hold releases into already did its job (the
+  // reveal) — swallow it whole before any branch can act on it.
+  if (agendaCtlHoldFiredAt && Date.now() - agendaCtlHoldFiredAt < 800) {
+    agendaCtlHoldFiredAt = 0;
+    return;
+  }
   // S6 footer affordances: the Archive pager and the see-archive door.
   if (e.target.closest('[data-archive-more]')) {
     e.preventDefault();
@@ -96739,16 +97218,42 @@ function agendaGroupsClick(e) {
     return;
   }
   const ctl = e.target.closest('[data-ctl]');
+  // A revealed circle disarms on any click that isn't its own control.
+  if (agendaCtlReveal && !(ctl && ctl.dataset.ctl === agendaCtlReveal.id)) {
+    agendaCtlReveal = null;
+    agendaRenderTab();
+  }
   if (ctl) {
     const item = agendaFindItem(ctl.dataset.ctl);
     if (!item) return;
     if (item.kind === 'question' && item.status === 'open') {
       agendaOpenInspector(item.id);
-    } else if (item.status === 'open') {
+      return;
+    }
+    // Hover-less pointers: the first tap names the action; the second
+    // (circle or pill, while revealed) acts. Hover pointers act at
+    // once, exactly as today; keyboard activations (detail 0 — the
+    // aria-label already names them) always act.
+    const revealed = agendaCtlReveal && agendaCtlReveal.id === item.id
+      && agendaCtlReveal.until > Date.now();
+    if (agendaCtlPointerType === 'touch' && !revealed && e.detail !== 0) {
+      agendaCtlRevealShow(item.id);
+      return;
+    }
+    agendaCtlReveal = null;
+    if (item.status === 'open') {
       agendaSendOp({ op: 'complete', id: item.id }, ctl);
     } else {
       agendaSendOp({ op: 'reopen', id: item.id }, ctl);
     }
+    return;
+  }
+  const blockedToggle = e.target.closest('[data-blocked-toggle]');
+  if (blockedToggle) {
+    const id = blockedToggle.dataset.blockedToggle;
+    if (agendaBlockedOpen.has(id)) agendaBlockedOpen.delete(id);
+    else agendaBlockedOpen.add(id);
+    agendaRenderTab();
     return;
   }
   const opBtn = e.target.closest('[data-op-btn]');
@@ -97605,19 +98110,22 @@ function agendaInspGatesHtml(item) {
       ${clear}
     </div>`;
   });
-  const deps = (item.relies_on || []).map((d) => {
-    const target = agendaFindItem(d.target_id);
-    const state = !target ? ['missing', 'rose']
-      : target.status === 'done' ? ['satisfied', 'green']
-        : target.status === 'retired' ? ['retired — review', 'amber']
-          : ['open', 'neutral'];
-    const title = target ? target.title : `${d.target_id.slice(0, 10)}…`;
-    return `<div class="ag2-insp-dep">
-      ${agendaChipHtml(state[0], state[1])}
-      ${target
-    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(target.id)}">waits on “${escapeHtml(title)}”</a>`
-    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(title)}</span>`}
-      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(d.target_id)}" title="Drop the link (the log keeps history)">×</button>
+  // The shared per-prerequisite judgment (ui2-agenda.js): live status
+  // on every link — the delivered-awaiting-Complete distinction, the
+  // in-flight word, and the honest out-of-window degrade (an absent
+  // target on an unblocked item is provably done, never "missing").
+  const deps = agendaPrereqStates(item).map((p) => {
+    const go = p.kind === 'delivered'
+      ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+          title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+      : '';
+    return `<div class="ag2-insp-dep${p.kind === 'delivered' ? ' delivered' : ''}">
+      ${agendaChipHtml(p.status, p.tone, p.detail)}
+      ${p.target
+    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
+    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(p.title)}</span>`}
+      ${go}
+      <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(p.id)}" title="Drop the link (the log keeps history)">×</button>
     </div>`;
   });
   const empty = !blockers.length && !deps.length

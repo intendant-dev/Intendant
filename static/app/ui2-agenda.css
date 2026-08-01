@@ -351,6 +351,7 @@ html.ui-v2 .ag2-cards {
 /* ---- Cards ---- */
 
 html.ui-v2 .ag2-card {
+  position: relative; /* anchors the circle's revealed action pill */
   border: 1px solid var(--line);
   border-radius: 13px;
   background: var(--surface);
@@ -429,7 +430,14 @@ html.ui-v2 .ag2-hub-link {
   cursor: pointer;
 }
 html.ui-v2 .ag2-hub-link:hover { color: var(--iris-2); }
-html.ui-v2 .ag2-blocked-line {
+/* Per-gate blocked rows (chip honesty): rose rule for real blocks, sky
+   when every wait is delivered-and-attested and only Complete taps are
+   missing (the achieved self-report hue — never transport green). */
+html.ui-v2 .ag2-blocked-detail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
   font-size: 12px;
   color: var(--text-2);
   border-left: 2px solid rgba(var(--rose-rgb), 0.55);
@@ -437,6 +445,40 @@ html.ui-v2 .ag2-blocked-line {
   margin-top: 1px;
   overflow-wrap: anywhere;
 }
+html.ui-v2 .ag2-blocked-detail.delivered {
+  border-left-color: rgba(var(--sky-rgb), 0.55);
+}
+html.ui-v2 .ag2-blk-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .ag2-blk-mark {
+  color: var(--rose);
+  font-size: 8px;
+}
+html.ui-v2 .ag2-blk-hint { color: var(--text-3); }
+html.ui-v2 .ag2-blk-link {
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+html.ui-v2 .ag2-blk-link:hover { color: var(--text-1); }
+html.ui-v2 .ag2-blk-go {
+  font-size: 11px;
+  padding: 1px 8px;
+}
+html.ui-v2 .ag2-blk-more {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ag2-blk-more:hover { color: var(--text-2); }
 html.ui-v2 .ag2-ansline {
   font-size: 12px;
   color: var(--text-2);
@@ -487,6 +529,27 @@ html.ui-v2 .ag2-ctl.retired {
   border: 1.5px dashed var(--line-2);
   color: var(--text-3);
 }
+/* The circle's revealed state (press-and-hold, or first touch tap):
+   the action pill names what the next tap does — no hover-only. */
+html.ui-v2 .ag2-ctl.revealed {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), 0.18);
+}
+html.ui-v2 .ag2-ctl-label {
+  position: absolute;
+  left: 34px;
+  top: 7px;
+  z-index: 3;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  background: var(--surface-2);
+  color: var(--green);
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
 
 /* ---- Chips (tinted token families; rgba(var(--x-rgb), a) formula) ---- */
 
@@ -530,6 +593,15 @@ html.ui-v2 .ag2-chip.t-neutral {
   color: var(--text-2);
   background: var(--surface-3);
 }
+/* Tappable chip (the blocked chip): a real button in the chip family —
+   the reveal law forbids hover-only explanations, so the tap unfolds
+   the per-gate rows the tip names. */
+html.ui-v2 button.ag2-chip-btn {
+  appearance: none;
+  cursor: pointer;
+  line-height: inherit;
+}
+html.ui-v2 button.ag2-chip-btn:hover { filter: brightness(1.18); }
 html.ui-v2 .ag2-chip.dashed {
   background: none;
   border-style: dashed;
@@ -1462,6 +1534,16 @@ html.ui-v2 .agenda-card-done {
   flex-shrink: 0;
 }
 html.ui-v2 .agenda-card-done:hover { color: var(--green); }
+/* Armed by a first touch tap: the circle names the action in place;
+   the second tap acts (no hover-only mysteries on touch). */
+html.ui-v2 .agenda-card-done.armed {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--green);
+  border: 1px solid rgba(var(--green-rgb), 0.45);
+  border-radius: var(--r-pill);
+  padding: 1px 8px;
+}
 html.ui-v2 .agenda-card-row-title {
   font-size: 12px;
   color: var(--text-2);
