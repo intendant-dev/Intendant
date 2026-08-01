@@ -117,7 +117,7 @@ jobs:
           # This short-lived operations branch exists only to drive a
           # manual acceptance artifact; compile the exact candidate under
           # live testing, not this workflow-only commit.
-          ref: 224f1e962bac4662986675253fdea8b03b217a16
+          ref: 02edeb825cc1e934db1d90338e55c39b93832518
           # The default persisted token grants every later step push access;
           # nothing in these jobs pushes.
           persist-credentials: false
