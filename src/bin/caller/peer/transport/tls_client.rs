@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn rustls_client_config_none_without_pin_or_identity() {
-        let config = rustls_client_config(&[], None).unwrap();
+        let config = rustls_client_config(&[], None, false).unwrap();
         assert!(config.is_none());
     }
 
@@ -468,7 +468,7 @@ mod tests {
             cert_path: dir.path().join("client.crt"),
             key_path: dir.path().join("client.key"),
         };
-        let config = rustls_client_config(&[[0u8; 32]], Some(&identity));
+        let config = rustls_client_config(&[[0u8; 32]], Some(&identity), false);
         assert!(config.is_ok(), "config should build: {:?}", config.err());
         assert!(config.unwrap().is_some());
     }

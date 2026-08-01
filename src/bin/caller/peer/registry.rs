@@ -924,9 +924,11 @@ mod tests {
             git_sha: Some("test".into()),
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.to_string(),
+                relay: false,
             }],
             capabilities: vec![Capability::ComputerUse],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -1017,6 +1019,7 @@ mod tests {
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
 
         match reg.add_peer_with_card(card).await {
@@ -1398,7 +1401,7 @@ mod tests {
             card.transports
         );
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert_eq!(
                     url, &via_url,
                     "via URL should persist across the actor's connect-time card refresh"
@@ -1436,7 +1439,7 @@ mod tests {
         // Transports replaced with the via URLs verbatim.
         assert_eq!(card.transports.len(), 1);
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert_eq!(url, "ws://override.example:9999/ws");
             }
             other => panic!("expected IntendantWs, got {other:?}"),
@@ -1515,7 +1518,7 @@ mod tests {
             .transports
             .iter()
             .filter_map(|t| match t {
-                TransportSpec::IntendantWs { url } => Some(url),
+                TransportSpec::IntendantWs { url, .. } => Some(url),
                 _ => None,
             })
             .collect();
@@ -1752,6 +1755,7 @@ mod tests {
             },
             TransportSpec::IntendantWs {
                 url: "ws://x/ws".into(),
+                relay: false,
             },
         ];
         let picked = pick_supported_transports(&transports);
@@ -1768,18 +1772,20 @@ mod tests {
         let transports = vec![
             TransportSpec::IntendantWs {
                 url: "ws://lan/ws".into(),
+                relay: false,
             },
             TransportSpec::A2A {
                 url: "https://x".into(),
             },
             TransportSpec::IntendantWs {
                 url: "ws://tail/ws".into(),
+                relay: false,
             },
         ];
         let picked = pick_supported_transports(&transports);
         assert_eq!(picked.len(), 2);
         match (&picked[0], &picked[1]) {
-            (TransportSpec::IntendantWs { url: a }, TransportSpec::IntendantWs { url: b }) => {
+            (TransportSpec::IntendantWs { url: a, .. }, TransportSpec::IntendantWs { url: b, .. }) => {
                 assert_eq!(a, "ws://lan/ws");
                 assert_eq!(b, "ws://tail/ws");
             }

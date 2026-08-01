@@ -2442,6 +2442,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     client_cert: None,
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
+                    identity_public_key: None,
                     browser_tcp_via_url: None,
                     certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
                 },
@@ -2455,6 +2456,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
+                    identity_public_key: None,
                     browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
                     certificate_witness_vantage: crate::peer::PeerWitnessVantage::Remote,
                 },

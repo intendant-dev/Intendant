@@ -469,10 +469,9 @@ impl IntendantWsTransport {
             request = request.bearer_auth(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| PeerError::CardFetch(format!("GET {card_url}: {e}")))?;
+        let response = request.send().await.map_err(|e| {
+            PeerError::CardFetch(format!("GET {card_url}: {}", describe_error_chain(&e)))
+        })?;
 
         if !response.status().is_success() {
             return Err(PeerError::CardFetch(format!(
@@ -580,6 +579,22 @@ fn message_text(content: &MessageContent) -> Result<String, PeerError> {
                 .into(),
         )),
     }
+}
+
+/// Flatten an error's source chain into one line. reqwest's `Display`
+/// stops at "error sending request", burying the cause that matters for
+/// diagnosis — for pinned/attested peer dials that cause is typically
+/// the rustls refusal ("server cert fingerprint … doesn't match any
+/// pinned"), which the operator (and the tests) need to see verbatim.
+fn describe_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
 }
 
 /// Parse a peer approval `request_id` string as the `u64` Intendant's
@@ -1927,7 +1942,12 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("doesn't match any pinned"),
-            "the attested pin set must reject the presented leaf: {msg}"
+            "the attested pin set must reject the presented leaf (on the FIRST verified leg, \
+             the card fetch): {msg}"
+        );
+        assert!(
+            !msg.contains("attestation refused") && !msg.contains("serves no identity"),
+            "attestation resolution itself succeeded — the refusal is the TLS pin: {msg}"
         );
     }
 
@@ -1999,9 +2019,16 @@ mod tests {
             .await
             .expect_err("1.2-only endpoint cannot satisfy the 1.3 floor");
         let msg = format!("{err}");
+        // The refusal is the floored TLS handshake on the first verified
+        // leg (the card fetch) — attestation resolution itself succeeded
+        // (the unfloored probe fetched and verified the card fine).
         assert!(
-            msg.contains("ws connect") || msg.contains("handshake"),
-            "failure is the TLS handshake, not attestation resolution: {msg}"
+            msg.contains("agent card fetch failed") || msg.contains("ws connect"),
+            "failure is a verified-leg handshake: {msg}"
+        );
+        assert!(
+            !msg.contains("attestation"),
+            "attestation resolution must not be the failure here: {msg}"
         );
 
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);

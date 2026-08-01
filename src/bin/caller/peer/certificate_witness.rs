@@ -332,6 +332,7 @@ mod tests {
             transports,
             capabilities: Vec::new(),
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -341,12 +342,15 @@ mod tests {
             certificate_ledger_endpoints(&card(vec![
                 TransportSpec::IntendantWs {
                     url: "wss://dead.example.test:9443/ws".to_string(),
+                    relay: false,
                 },
                 TransportSpec::IntendantWs {
                     url: "wss://peer.example.test:9443/ws".to_string(),
+                    relay: false,
                 },
                 TransportSpec::IntendantWs {
                     url: "wss://dead.example.test:9443/ws".to_string(),
+                    relay: false,
                 },
             ])),
             vec![

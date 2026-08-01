@@ -212,6 +212,7 @@ mod tests {
             transports,
             capabilities: Vec::new(),
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
         let card = card_with(vec![
             TransportSpec::IntendantWs {
                 url: "wss://peer.example:8443/ws".into(),
+                relay: false,
             },
             TransportSpec::Mcp {
                 url: "https://peer.example:9000/mcp".into(),
@@ -243,6 +245,7 @@ mod tests {
             },
             TransportSpec::IntendantWs {
                 url: "wss://peer.example:8443/ws".into(),
+                relay: false,
             },
         ]);
         assert_eq!(
@@ -255,6 +258,7 @@ mod tests {
     fn endpoint_maps_plain_ws_to_http() {
         let card = card_with(vec![TransportSpec::IntendantWs {
             url: "ws://127.0.0.1:8765/ws".into(),
+            relay: false,
         }]);
         assert_eq!(
             mcp_endpoint(&card).as_deref(),
@@ -394,6 +398,7 @@ mod tests {
                 tokio::sync::mpsc::channel(crate::peer::LOG_CHANNEL_CAPACITY);
             let card = card_with(vec![TransportSpec::IntendantWs {
                 url: format!("ws://{addr}/ws"),
+                relay: false,
             }]);
             let url_for_closure = format!("ws://{addr}/ws");
             let handle = crate::peer::handle::spawn_peer(

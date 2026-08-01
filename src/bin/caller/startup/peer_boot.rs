@@ -231,6 +231,7 @@ mod tests {
             client_cert: client_cert.map(str::to_string),
             client_key: client_key.map(str::to_string),
             pinned_fingerprints: Vec::new(),
+            identity_public_key: None,
             browser_tcp_via_url: None,
             certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
         }

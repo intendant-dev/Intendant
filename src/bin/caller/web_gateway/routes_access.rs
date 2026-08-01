@@ -3942,9 +3942,11 @@ mod tests {
                 git_sha: None,
                 transports: vec![crate::peer::TransportSpec::IntendantWs {
                     url: "ws://127.0.0.1:9/ws".to_string(),
+                    relay: false,
                 }],
                 capabilities: Vec::new(),
                 auth: crate::peer::AuthRequirements::none(),
+                identity_attestation: None,
             })
             .await
             .expect("register colliding same-host peer");

@@ -205,7 +205,7 @@ mod tests {
     impl StubTransport {
         fn new(url: &str, connect_succeeds: bool) -> Self {
             Self {
-                spec: TransportSpec::IntendantWs { url: url.into() },
+                spec: TransportSpec::IntendantWs { url: url.into(), relay: false },
                 connect_succeeds,
                 connected: AtomicBool::new(false),
                 connect_count: Arc::new(AtomicUsize::new(0)),
@@ -223,6 +223,7 @@ mod tests {
             transports: vec![],
             capabilities: vec![Capability::ComputerUse],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -246,7 +247,7 @@ mod tests {
                 Ok(dummy_card())
             } else {
                 let url = match &self.spec {
-                    TransportSpec::IntendantWs { url } => url.clone(),
+                    TransportSpec::IntendantWs { url, .. } => url.clone(),
                     _ => "?".into(),
                 };
                 Err(PeerError::Transport(format!("stub {url} fail")))
@@ -285,7 +286,7 @@ mod tests {
         assert!(multi.is_connected());
         assert_eq!(multi.active_index(), Some(0));
         match multi.spec() {
-            TransportSpec::IntendantWs { url } => assert_eq!(url, "ws://a"),
+            TransportSpec::IntendantWs { url, .. } => assert_eq!(url, "ws://a"),
             _ => panic!("wrong spec variant"),
         }
     }
@@ -299,7 +300,7 @@ mod tests {
         multi.connect().await.unwrap();
         assert_eq!(multi.active_index(), Some(1));
         match multi.spec() {
-            TransportSpec::IntendantWs { url } => assert_eq!(url, "ws://b"),
+            TransportSpec::IntendantWs { url, .. } => assert_eq!(url, "ws://b"),
             _ => panic!("wrong spec variant"),
         }
     }

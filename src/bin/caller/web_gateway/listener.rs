@@ -5201,7 +5201,7 @@ mod tests {
         assert_eq!(card.transports.len(), 1, "expected one transport");
         let expected_url_prefix = format!("ws://127.0.0.1:{port}");
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert!(
                     url.starts_with(&expected_url_prefix) && url.ends_with("/ws"),
                     "transport URL {url} should start with {expected_url_prefix} and end with /ws"

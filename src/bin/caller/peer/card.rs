@@ -535,6 +535,7 @@ mod tests {
             transports: vec![
                 TransportSpec::IntendantWs {
                     url: "wss://nicks-mac.local:8443/ws".to_string(),
+                    relay: false,
                 },
                 TransportSpec::Mcp {
                     url: "https://nicks-mac.local:8443/mcp".to_string(),
@@ -548,6 +549,7 @@ mod tests {
                 Capability::Custom("vortex-audio".to_string()),
             ],
             auth: AuthRequirements::mutual_tls(),
+            identity_attestation: None,
         };
         let json = serde_json::to_string(&card).unwrap();
         let parsed: AgentCard = serde_json::from_str(&json).unwrap();
@@ -599,6 +601,7 @@ mod tests {
             (
                 TransportSpec::IntendantWs {
                     url: "wss://x".into(),
+                    relay: false,
                 },
                 "intendant-ws",
             ),

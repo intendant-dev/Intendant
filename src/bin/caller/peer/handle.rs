@@ -1240,9 +1240,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.clone(),
+                relay: false,
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(
@@ -1357,9 +1359,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.clone(),
+                relay: false,
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(
@@ -1503,9 +1507,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.clone(),
+                relay: false,
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(
@@ -1621,9 +1627,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.clone(),
+                relay: false,
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
         let browser_url = "ws://192.168.1.42:8766/ws".to_string();
         let url_for_closure = ws_url.clone();
@@ -1692,9 +1700,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.clone(),
+                relay: false,
             }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         };
         let url_for_closure = ws_url.clone();
         let handle = spawn_peer(
@@ -1768,9 +1778,10 @@ mod tests {
             label: name.into(),
             version: "0.0.0".into(),
             git_sha: None,
-            transports: vec![TransportSpec::IntendantWs { url: ws_url.into() }],
+            transports: vec![TransportSpec::IntendantWs { url: ws_url.into(), relay: false }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
