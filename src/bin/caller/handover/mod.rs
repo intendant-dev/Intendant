@@ -1037,6 +1037,83 @@ mod tests {
         }
     }
 
+    /// The Cmd/Ctrl-K palette's update verbs are pure affordance
+    /// re-exposure — the emission-shape law: the chip module keeps the
+    /// only swap emissions (one relay POST, one webview bridge, one
+    /// takeover POST), the panel module the only check POSTs through
+    /// its one `updateLanePost`, and the palette fragment carries no
+    /// update wire shape at all — it reaches both solely through the
+    /// named composition surfaces. The dynamic entry is served by the
+    /// chip module itself (`paletteEntry`), so its label tracks exactly
+    /// the state the chip renders, and the chip's drain suppression is
+    /// inherited, never re-derived.
+    #[test]
+    fn palette_reexposes_update_affordances_through_one_emitter() {
+        let chrome = include_str!("../../../../static/app/ui2-chrome.js");
+        let chip = include_str!("../../../../static/app/ui2-handover.js");
+        let lane = include_str!("../../../../static/app/ui2-update-lane.js");
+        // Both entries exist and their labels carry 'update' — the
+        // palette matches labels only (users type what they see).
+        assert!(chrome.contains("label: 'Check for updates'"));
+        assert!(chrome.contains("updateChipSurface.paletteEntry"));
+        assert!(chrome.contains("window.qa.paletteUpdateActions"));
+        // The chip module serves the dynamic entry; its labels state
+        // the live arm (install / installing / hand off), and its
+        // suppression rule is the chip's own.
+        for needle in [
+            "paletteEntry: updatePaletteEntry",
+            "`Install ${what}`",
+            "`Installing ${what}…`",
+            "Update: hand off to :${successor.port}",
+            "if (!update || body.draining) return null;",
+        ] {
+            assert!(
+                chip.contains(needle),
+                "ui2-handover lost the palette snapshot wiring: {needle}"
+            );
+        }
+        // Emission shapes, unweakened and unduplicated: the swap wires
+        // live once each in the chip module (chip buttons and palette
+        // runs all route through the two named perform* functions), and
+        // every lane POST goes through the panel's one authedFetch.
+        assert_eq!(chip.matches("/api/daemon/update-swap").count(), 1);
+        assert_eq!(chip.matches("/api/daemon/takeover").count(), 1);
+        assert_eq!(chip.matches("messageHandlers.updateSwap").count(), 1);
+        assert_eq!(chip.matches("authedFetch(").count(), 2);
+        assert_eq!(lane.matches("authedFetch(").count(), 1);
+        // Two call sites for the check path — the panel button and the
+        // palette seam — one POST function between them.
+        assert_eq!(lane.matches("'/api/daemon/update-lane/check'").count(), 2);
+        // The palette fragment carries none of the wire shapes: it may
+        // only reach the update lanes through the composition surfaces.
+        for banned in [
+            "/api/daemon/update-swap",
+            "/api/daemon/takeover",
+            "/api/daemon/update-lane",
+            "messageHandlers.updateSwap",
+            "authedFetch(",
+        ] {
+            assert_eq!(
+                chrome.matches(banned).count(),
+                0,
+                "ui2-chrome must not carry the update wire shape {banned:?}"
+            );
+        }
+        // And the served bundle carries the whole wiring.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "label: 'Check for updates'",
+            "window.qa.paletteUpdateActions",
+            "paletteEntry: updatePaletteEntry",
+            "window.intendantUpdateLane",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the palette update actions: {needle}"
+            );
+        }
+    }
+
     #[test]
     fn initialize_registers_presence_and_takes_free_lease() {
         let dir = tempfile::tempdir().unwrap();

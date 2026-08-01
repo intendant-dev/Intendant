@@ -706,6 +706,38 @@ function ui2PaletteActionEntries(q) {
       }
     }
   }
+  // Update verbs (CONTRACT: ui2-handover.js and ui2-update-lane.js are
+  // later fragments — their surfaces are read by name at event time,
+  // hidden entirely when absent. The chip module stays the ONE swap
+  // emitter and the panel the one check path; these entries only
+  // re-expose them). The dynamic install entry exists exactly while the
+  // chip serves a one-click affordance — its label carries the live
+  // state, and a busy affordance renders inert, like the chip's
+  // disabled button.
+  const updateChipSurface = window.intendantHandoverUpdate;
+  if (updateChipSurface && typeof updateChipSurface.paletteEntry === 'function') {
+    let served = null;
+    try { served = updateChipSurface.paletteEntry(); } catch (_) { served = null; }
+    if (served && served.label && typeof served.run === 'function') {
+      entries.push({
+        section: 'Actions', icon: 'daemon', label: String(served.label),
+        inert: served.busy === true,
+        run: () => { try { served.run(); } catch (e) { console.warn('[ui2] update action failed', e); } },
+      });
+    }
+  }
+  const updateLane = window.intendantUpdateLane;
+  if (updateLane && typeof updateLane.check === 'function') {
+    entries.push({
+      section: 'Actions', icon: 'daemon', label: 'Check for updates',
+      run: () => {
+        routeTo('access', 'daemons');
+        try { updateLane.check(); } catch (e) { console.warn('[ui2] update check failed', e); }
+        const card = document.getElementById('update-lane-card');
+        if (card) card.scrollIntoView({ block: 'start' });
+      },
+    });
+  }
   // The theme toggle keeps its palette seat.
   const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
   entries.push({
@@ -878,6 +910,17 @@ function ui2WirePalette() {
     }
   }, true);
 }
+
+// QA vector (tokenless posture): the palette's update verbs as data —
+// exactly what a palette query 'update' yields from the Actions lane,
+// through the same label-only match the palette itself applies. The
+// dynamic entry tracks the chip-served state; probes drive that state
+// synthetically via qa.handoverUpdateChip.render(body), then re-read
+// this.
+window.qa = window.qa || {};
+window.qa.paletteUpdateActions = () => ui2PaletteActionEntries('update')
+  .filter((item) => !item.matchless && String(item.label).toLowerCase().includes('update'))
+  .map((item) => ({ label: String(item.label), inert: item.inert === true }));
 
 // ── Fuel/lease chip (display-only) ─────────────────────────────────────
 // When the daemon's status reports the built-in agent unfueled but the
