@@ -71,7 +71,8 @@ let agendaGraphTerrStats = { shown: 0, total: 0 };
 // Arrangement mode over the current pool: 'orbit' (the default force
 // constellation) or one of the ontology lenses — 'flow' (relies_on
 // layered left→right), 'time' (tree rings: log-scaled age as radius,
-// now at the center), 'actor' (clustered by parking provenance),
+// now at the center), 'files' (clustered by directory-prefix
+// territory), 'actor' (clustered by parking provenance),
 // 'attention' (needs-you gravity).
 // Modes bias the layout and emphasis only; pool, links, picking, caps,
 // and card-lens parity are untouched. Build computes the active mode's
@@ -80,6 +81,7 @@ let agendaGraphMode = 'orbit';
 const AGENDA_GRAPH_MODES = [
   ['flow', 'flow', 'dependency flow — prerequisites left, dependents right'],
   ['time', 'time', 'tree rings of age — now at the center, log rings out to the oldest'],
+  ['files', 'files', 'clustered by the code they touch — territory shows the files themselves'],
   ['actor', 'actor', 'clustered by who parked it'],
   ['attention', 'attention', 'needs-you gravity — attention items pull center'],
 ];
@@ -87,6 +89,7 @@ let agendaGraphTimeMarks = [];
 let agendaGraphTimeOldest = 0;
 let agendaGraphTimeCheckAt = 0;
 let agendaGraphActorMarks = [];
+let agendaGraphFilesMarks = [];
 let agendaGraphAttnCount = 0;
 let agendaGraphFullscreen = false;
 let agendaGraphEscHook = null;
@@ -731,6 +734,12 @@ function agendaGraphBuild() {
     (x.relates_to || []).map((l) => `${l.target_id}~${l.link_kind || ''}`).join(','),
     (x.relies_on || []).length,
     x.kind,
+    // Files mode lays out from refs, so ref changes must re-key; the
+    // other modes ignore refs (territory satellites carry their own
+    // key segment above).
+    agendaGraphMode === 'files'
+      ? (x.refs || []).map((r) => `${r.ref_type}:${r.locator}`).join('+')
+      : '',
   ].join('|')).join(';');
   if (key === agendaGraphKey && agendaGraphNodes.length) return items;
   agendaGraphKey = key;
@@ -767,6 +776,7 @@ function agendaGraphBuild() {
   const byIdBuild = new Map(items.map((x) => [x.id, x]));
   agendaGraphTimeMarks = [];
   agendaGraphActorMarks = [];
+  agendaGraphFilesMarks = [];
   agendaGraphAttnCount = 0;
   if (agendaGraphMode === 'flow') {
     // relies_on rank: prerequisites left of dependents. Bounded passes
@@ -809,6 +819,81 @@ function agendaGraphBuild() {
     });
     agendaGraphTimeRebuildMarks(now);
     agendaGraphTimeCheckAt = now;
+  } else if (agendaGraphMode === 'files') {
+    // Cluster by the AREA of the codebase an item touches: each
+    // file/dir locator collapses to its directory prefix (≤3 path
+    // segments; a file drops its basename first, a dir keeps its leaf),
+    // the top eight prefixes by item count take anchors on a wide
+    // circle, and an item springs to the AVERAGE of its prefixes'
+    // anchors — work spanning two areas honestly sits between them.
+    // Items with no declared territory gather in a neutral core at the
+    // center; with no territory anywhere the mode degrades to the plain
+    // orbit (no anchors assigned at all).
+    const prefixOf = (r) => {
+      const parts = String(r.locator).replace(/\/+$/, '').split('/').filter(Boolean);
+      if (r.ref_type === 'file' && parts.length) parts.pop();
+      return parts.slice(0, 3).join('/') || '/';
+    };
+    const perItem = new Map();
+    const counts = new Map();
+    items.forEach((x) => {
+      // Per-item ref tally by prefix; the DOMINANT prefix places the
+      // item. (Averaging multi-area anchors was tried first and lands
+      // spanning items near the center — where the midpoint of far-
+      // apart rim anchors falls — which reads as "no territory".)
+      const tally = new Map();
+      (x.refs || []).forEach((r) => {
+        if (r.ref_type !== 'file' && r.ref_type !== 'dir') return;
+        const p = prefixOf(r);
+        tally.set(p, (tally.get(p) || 0) + 1);
+      });
+      if (tally.size) {
+        perItem.set(x.id, tally);
+        tally.forEach((_, p) => counts.set(p, (counts.get(p) || 0) + 1));
+      }
+    });
+    const top = [...counts.entries()].sort((a, b) =>
+      b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 8);
+    if (top.length) {
+      // The anchor circle clears the neutral core's own footprint (the
+      // core is usually the majority — items with no declared refs), so
+      // clusters read as satellites around it instead of bleeding in.
+      const coreCount = items.length - perItem.size;
+      const anchorR = 120 + 9 * Math.sqrt(Math.max(1, coreCount));
+      const anchors = new Map(top.map(([name], i) => {
+        const angle = (i / top.length) * Math.PI * 2;
+        return [name, [Math.cos(angle) * anchorR, 0, Math.sin(angle) * anchorR]];
+      }));
+      agendaGraphFilesMarks = top.map(([name, count], i) => ({
+        name, count, angle: (i / top.length) * Math.PI * 2, r: anchorR,
+      }));
+      agendaGraphNodes.forEach((n) => {
+        if (n.sat) return;
+        const tally = perItem.get(n.id);
+        if (!tally) {
+          // The neutral core must stay compact enough to leave a gap
+          // under the rim clusters — a loose leash smears it into the
+          // same annulus and the areas stop reading as areas.
+          n.anchor = [0, 0, 0];
+          n.anchorK = 0.03;
+          return;
+        }
+        let bestPrefix = null;
+        let bestScore = -1;
+        tally.forEach((score, p) => {
+          if (anchors.has(p)
+            && (score > bestScore
+              || (score === bestScore && counts.get(p) > counts.get(bestPrefix)))) {
+            bestPrefix = p;
+            bestScore = score;
+          }
+        });
+        // Territory entirely outside the top eight areas parks in the
+        // neutral core too, rather than inventing a ninth cluster.
+        n.anchor = bestPrefix ? anchors.get(bestPrefix) : [0, 0, 0];
+        n.anchorK = bestPrefix ? 0.07 : 0.012;
+      });
+    }
   } else if (agendaGraphMode === 'actor') {
     const who = (x) => (x.provenance
       && (x.provenance.source || x.provenance.kind
@@ -932,7 +1017,13 @@ function agendaGraphRelax(iterations) {
       const rest = link.t === 'place' ? 74
         : link.t === 'terr' ? 52
           : link.t === 'dep' ? 96 : 116;
-      const k = link.t === 'place' ? 0.014 : link.t === 'terr' ? 0.012 : 0.007;
+      let k = link.t === 'place' ? 0.014 : link.t === 'terr' ? 0.012 : 0.007;
+      // Files mode: territory anchors, not links, own the geometry — a
+      // cluster member's springs to its (usually refs-less, core-
+      // parked) hub and to cross-field see-also partners would
+      // otherwise streak every cluster toward the middle. The links
+      // still draw; they just pull less here.
+      if (agendaGraphMode === 'files') k *= link.t === 'place' ? 0.25 : 0.5;
       const dx = B[0] - A[0];
       const dy = B[1] - A[1];
       const dz = B[2] - A[2];
@@ -971,9 +1062,13 @@ function agendaGraphRelax(iterations) {
           ? Math.min(0.82, 0.6 + nodes.length / 1200) : 0.97;
       }
       if (n.anchor) {
-        n.p[0] += (n.anchor[0] - n.p[0]) * 0.025;
+        // anchorK: per-node cluster-spring strength (files mode sets a
+        // firm pull for clustered items, a loose leash for the neutral
+        // core); actor mode leaves it unset and keeps the default.
+        const ak = n.anchorK || 0.025;
+        n.p[0] += (n.anchor[0] - n.p[0]) * ak;
         n.p[1] += (n.anchor[1] - n.p[1]) * 0.02;
-        n.p[2] += (n.anchor[2] - n.p[2]) * 0.025;
+        n.p[2] += (n.anchor[2] - n.p[2]) * ak;
       }
     });
   }
@@ -1239,8 +1334,11 @@ function agendaGraphDraw(ts) {
     g.moveTo(a.x, a.y);
     g.lineTo(b.x, b.y);
     if (link.t === 'place') {
+      // Files mode: the six hub fans would visually unify the whole
+      // field and bury the territory clusters — recede unless hot.
+      const placeAlpha = agendaGraphMode === 'files' && !hot ? 0.13 : hot ? 0.75 : 0.38;
       g.setLineDash([]);
-      g.strokeStyle = `rgba(${pal.iris},${depth * (hot ? 0.75 : 0.38)})`;
+      g.strokeStyle = `rgba(${pal.iris},${depth * placeAlpha})`;
       g.lineWidth = hot ? 1.6 : 1.1;
     } else if (link.t === 'terr') {
       g.setLineDash([1.5, 3.5]);
@@ -1319,6 +1417,44 @@ function agendaGraphDraw(ts) {
       g.fillText(`${mark.name} · ${mark.count}`, q.x - 20, q.y);
     });
   }
+  if (agendaGraphMode === 'files') {
+    // Each area gets a dotted boundary circle sized to its population
+    // (world-space, depth-faded like the time rings) with its label
+    // floating above — the wash that makes a cluster read as a place.
+    agendaGraphFilesMarks.forEach((mark) => {
+      const ax = Math.cos(mark.angle) * mark.r;
+      const az = Math.sin(mark.angle) * mark.r;
+      const cr = 16 + 9 * Math.sqrt(mark.count);
+      const steps = 36;
+      // A barely-there wash inside the boundary makes the area read as
+      // a region (a country on a map), not just a line.
+      g.beginPath();
+      for (let i = 0; i <= steps; i++) {
+        const a = (i / steps) * Math.PI * 2;
+        const p = project([ax + Math.cos(a) * cr, 0, az + Math.sin(a) * cr]);
+        if (i === 0) g.moveTo(p.x, p.y);
+        else g.lineTo(p.x, p.y);
+      }
+      g.closePath();
+      g.fillStyle = `rgba(${pal.iris},.045)`;
+      g.fill();
+      g.setLineDash([2, 4]);
+      g.lineWidth = 1;
+      for (let i = 0; i < steps; i++) {
+        const a0 = (i / steps) * Math.PI * 2;
+        const a1 = ((i + 1) / steps) * Math.PI * 2;
+        const p0 = project([ax + Math.cos(a0) * cr, 0, az + Math.sin(a0) * cr]);
+        const p1 = project([ax + Math.cos(a1) * cr, 0, az + Math.sin(a1) * cr]);
+        const depth = Math.max(0.3, Math.min(1, ((p0.s + p1.s) / 2) * 1.1 - 0.18));
+        g.beginPath();
+        g.moveTo(p0.x, p0.y);
+        g.lineTo(p1.x, p1.y);
+        g.strokeStyle = `rgba(${pal.text},${0.22 * depth})`;
+        g.stroke();
+      }
+      g.setLineDash([]);
+    });
+  }
   // Nodes far → near.
   const order = nodes.map((n, i) => i).sort((a, b) => pts[b].z - pts[a].z);
   order.forEach((i) => {
@@ -1340,6 +1476,12 @@ function agendaGraphDraw(ts) {
     let alpha = Math.max(0.35, Math.min(1, q.s * 1.15 - 0.1));
     // Attention mode: needs-you items glow, the rest recede.
     if (agendaGraphMode === 'attention' && !node.attn && !hot) alpha *= 0.45;
+    // Files mode: the no-territory core is context, not subject — it
+    // recedes so the area clusters carry the figure-ground. (Core
+    // nodes are exactly the ones on the loose 0.03 leash.)
+    if (agendaGraphMode === 'files' && !hot && node.anchorK === 0.03) {
+      alpha *= 0.5;
+    }
     const glow = agendaGraphGlowSprite(rgb);
     // Halo budget shrinks on crowded boards — past ~150 nodes the full
     // glow tiles the disc into one nebula and drowns the geometry.
@@ -1381,13 +1523,15 @@ function agendaGraphDraw(ts) {
     }
     if (st && st.kind === 'pending') ring(pal.amber, 5.4, 0.75 * alpha);
     // Territory halo: a dotted outer ring on nodes carrying file/dir
-    // refs — the declared working set made visible.
+    // refs — the declared working set made visible. Suppressed in
+    // files mode, where nearly every clustered node would carry one
+    // and the area boundary circles already say it.
     const territory = agendaGraphProjection === 'hubs'
       ? agendaGraphSubtreeTerr.get(node.id) || 0
       : (item.refs || []).filter(
         (r) => r.ref_type === 'file' || r.ref_type === 'dir',
       ).length;
-    if (territory) {
+    if (territory && agendaGraphMode !== 'files') {
       g.setLineDash([1.5, 3.2]);
       ring(pal.text, 7.6, 0.3 * alpha);
       g.setLineDash([]);
@@ -1418,6 +1562,44 @@ function agendaGraphDraw(ts) {
       }
     }
   });
+  // Files-mode area labels paint over the nodes, on the outer rim at
+  // each area's own angle with a short leader to its wash — outside is
+  // where the empty pixels are, and the leader keeps the association
+  // unambiguous at any camera.
+  if (agendaGraphMode === 'files') {
+    g.font = '600 9.5px "JetBrains Mono", monospace';
+    const origin = project([0, 0, 0]);
+    agendaGraphFilesMarks.forEach((mark) => {
+      const cr = 16 + 9 * Math.sqrt(mark.count);
+      const cosA = Math.cos(mark.angle);
+      const sinA = Math.sin(mark.angle);
+      const rim = project([cosA * (mark.r + cr), 0, sinA * (mark.r + cr)]);
+      // Extend the leader in SCREEN space: world-radial extension
+      // forshortens to nothing at the disc's top and bottom under
+      // pitch, stranding those labels inside the node field.
+      let dx = rim.x - origin.x;
+      let dy = rim.y - origin.y;
+      const dl = Math.hypot(dx, dy) || 1;
+      dx /= dl;
+      dy /= dl;
+      const tip = { x: rim.x + dx * 20, y: rim.y + dy * 20 };
+      g.beginPath();
+      g.moveTo(rim.x, rim.y);
+      g.lineTo(tip.x, tip.y);
+      g.strokeStyle = `rgba(${pal.text},.25)`;
+      g.lineWidth = 1;
+      g.stroke();
+      const label = `${mark.name} · ${mark.count}`;
+      const tw = g.measureText(label).width;
+      const leftSide = dx < -0.25;
+      g.fillStyle = pal.t3;
+      g.fillText(
+        label,
+        leftSide ? tip.x - tw - 4 : Math.abs(dx) <= 0.25 ? tip.x - tw / 2 : tip.x + 4,
+        tip.y + (dy > 0.3 ? 10 : dy < -0.3 ? -4 : 3),
+      );
+    });
+  }
   // Projection badge (painted, inert pixels like every label): what the
   // constellation is currently showing.
   const terrBadge = agendaGraphTerrStats.shown
@@ -1428,7 +1610,11 @@ function agendaGraphDraw(ts) {
       ? ` · attention — ${agendaGraphAttnCount} need you`
       : agendaGraphMode === 'time'
         ? ` · time — ${agendaGraphTimeSpanLabel()}`
-        : ` · ${agendaGraphMode}`;
+        : agendaGraphMode === 'files'
+          ? ` · files — ${agendaGraphFilesMarks.length
+            ? `${agendaGraphFilesMarks.length} areas`
+            : 'no declared territory yet'}`
+          : ` · ${agendaGraphMode}`;
   const zoomBadge = Math.abs(cam.zoom - 1) > 0.01
     ? ` · ${cam.zoom.toFixed(1)}× (double-click empty to reset)`
     : '';
