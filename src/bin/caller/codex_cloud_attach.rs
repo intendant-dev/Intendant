@@ -2395,6 +2395,12 @@ mod tests {
                 .unwrap_err()
                 .contains("task binding")
         );
+        let valid_after_refusal =
+            signed_proxy_request(&key, &fingerprint, "task_e_enroll", &"m".repeat(43), 6_300);
+        assert!(
+            verify_proxy_attachment_request_at(&broker, &valid_after_refusal, 6_400).is_ok(),
+            "a refused proof must not consume its nonce"
+        );
 
         // A second redemption with the burned token fails.
         let err = redeem_enrollment(
