@@ -538,4 +538,90 @@ mod tests {
         assert_eq!(status, 409);
         assert!(body["error"].as_str().unwrap().contains("no sign-in"));
     }
+
+    /// The out-of-band lane rides the same body discipline as the
+    /// ceremony success: a credential-watch observation with a reload
+    /// offer makes the payload carry `reload_candidates` at any ceremony
+    /// phase — the SAME list, the same atomic body — while a sign-out
+    /// observation (nothing to reload onto) offers none, and a payload
+    /// without the block keeps the success-only rule.
+    #[test]
+    fn out_of_band_observations_carry_the_same_reload_surface() {
+        let base = serde_json::json!({ "phase": "idle" });
+        assert!(!status_wants_reload_candidates(&base));
+
+        let switched = crate::credential_watch::OutOfBandObservation {
+            account: Some(crate::auth_ceremony::CeremonyAccount {
+                email: Some("b@x".to_string()),
+                subscription_type: Some("max".to_string()),
+                org_name: None,
+                auth_method: Some("claudeai".to_string()),
+            }),
+            prior_label: Some("a@x".to_string()),
+            signed_out: false,
+            detected_at_unix_ms: 5_000,
+        };
+        let mut status = base.clone();
+        status["out_of_band"] = crate::credential_watch::out_of_band_block(&base, &switched)
+            .expect("idle payloads serve the block");
+        assert!(
+            status_wants_reload_candidates(&status),
+            "an out-of-band switch offers the reload surface"
+        );
+        let merged = status_with_reload_candidates(
+            status,
+            vec![crate::session_supervisor::ReloadCandidate {
+                session_id: "wrapper-1".to_string(),
+                source: "claude-code".to_string(),
+                name: Some("steward pass".to_string()),
+                phase: "waiting_rate_limit".to_string(),
+                reload: None,
+            }],
+        );
+        assert_eq!(merged["out_of_band"]["account"]["email"], "b@x");
+        assert_eq!(merged["out_of_band"]["prior_account_label"], "a@x");
+        assert_eq!(merged["reload_candidates"][0]["session_id"], "wrapper-1");
+
+        let signed_out = crate::credential_watch::OutOfBandObservation {
+            account: None,
+            prior_label: Some("b@x".to_string()),
+            signed_out: true,
+            detected_at_unix_ms: 6_000,
+        };
+        let mut status = base.clone();
+        status["out_of_band"] = crate::credential_watch::out_of_band_block(&base, &signed_out)
+            .expect("sign-out still serves the block");
+        assert!(
+            !status_wants_reload_candidates(&status),
+            "reloading onto an empty store is a trap, not a remedy"
+        );
+    }
+
+    /// The Vault card renders the out-of-band story with the SAME reload
+    /// panel the ceremony success renders: one implementation
+    /// (`agentSigninReloadPanel`), called from both stories, plus the
+    /// out-of-band notice copy and the watch's applicability honesty.
+    #[test]
+    fn out_of_band_renders_the_same_reload_panel_on_the_vault_card() {
+        let fragment = vault_fragment();
+        assert!(
+            fragment.contains("agentSigninOutOfBandSection"),
+            "the out-of-band section must exist"
+        );
+        assert!(
+            fragment.contains("changed outside Intendant"),
+            "the notice copy must name the out-of-band fact"
+        );
+        assert!(
+            fragment.contains("agentSigninWatchNotes"),
+            "the applicability honesty notes must render"
+        );
+        // One panel, ≥2 call sites (success + out-of-band) besides the
+        // definition — the ceremony and watch stories may never drift
+        // into separate reload lists.
+        assert!(
+            fragment.matches("agentSigninReloadPanel(provider, spec)").count() >= 3,
+            "the reload panel must be one shared implementation"
+        );
+    }
 }
