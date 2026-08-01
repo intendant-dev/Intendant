@@ -2209,6 +2209,128 @@ async fn agenda_start_now_fires_one_occurrence_and_writes_back() {
     // (`start_now_is_owner_surface_and_binds_its_own_digest`).
 }
 
+/// The spawn governor's responsiveness rig leg (2026-07-30: eight
+/// manifests approved in seven seconds dispatched in one second — the
+/// spawn storm pinned the daemon at 230% CPU and starved its control
+/// plane for ~10 minutes, session chips STALLED and ctl hanging): an
+/// eight-fire start-now wave against the real binaries dispatches
+/// exactly ONE occurrence inside the first stagger interval — the
+/// governor holds the rest for their slots — and the daemon keeps
+/// answering mid-wave (`ctl status` under the card's 2s bound). The
+/// stagger cadence and approval ordering are pinned at unit level
+/// (`eight_simultaneous_dues_stagger_in_approval_order`); waiting out
+/// 30s slots has no place in CI, so this leg pins the wave shape and
+/// the responsiveness floor, not the drip.
+#[tokio::test]
+async fn eight_fire_wave_staggers_and_daemon_stays_responsive() {
+    let script = serde_json::json!({
+        "profiles": [
+            { "match": "Agenda follow-through for item", "steps": [
+                { "content": "Working the wave item.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "wave item done" } }] }
+            ]},
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon = spawn_daemon(&client, &script).await;
+
+    // Eight items, eight start-now gestures in quick succession — the
+    // storm's sliding shape (approvals seconds apart, all due at once).
+    let mut item_ids = Vec::new();
+    for n in 0..8 {
+        let added = ctl(
+            &daemon,
+            &["--json", "agenda", "add", &format!("wave-item-{n}"), "--task"],
+        )
+        .await;
+        assert!(added.status.success(), "{}", text_of(&added));
+        let item_id = stdout_json(&added)["item"]["id"]
+            .as_str()
+            .expect("minted item id")
+            .to_string();
+        let started = ctl(&daemon, &["agenda", "start", &item_id]).await;
+        assert!(started.status.success(), "{}", text_of(&started));
+        item_ids.push(item_id);
+    }
+
+    let journal_path = daemon
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("agenda")
+        .join("occurrences.jsonl");
+    let prepared_count = |journal: &str| {
+        journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|row| row["state"] == "prepared")
+            .count()
+    };
+    // The wave's head dispatches...
+    poll_until(
+        "the wave's first governed dispatch",
+        RUN_TIMEOUT,
+        || async {
+            let journal = std::fs::read_to_string(&journal_path).ok()?;
+            (prepared_count(&journal) >= 1).then_some(())
+        },
+        || daemon.log_tail(),
+    )
+    .await;
+
+    // ...and the daemon keeps answering mid-wave, under the card's 2s
+    // bound.
+    let asked = std::time::Instant::now();
+    let status = ctl(&daemon, &["status"]).await;
+    let answered_in = asked.elapsed();
+    assert!(status.status.success(), "{}", text_of(&status));
+    assert!(
+        answered_in < Duration::from_secs(2),
+        "status must answer under 2s during the wave (took {answered_in:?})"
+    );
+
+    // The governor held the rest of the wave: exactly one occurrence
+    // dispatched inside the first stagger interval, while every gesture
+    // armed its manifest.
+    let journal = std::fs::read_to_string(&journal_path).expect("occurrence journal");
+    assert_eq!(
+        prepared_count(&journal),
+        1,
+        "one spawn start per slot — the wave must not burst:\n{journal}"
+    );
+    let agenda = http_get_json(
+        &daemon.authed_client(),
+        &format!("http://127.0.0.1:{}/api/agenda", daemon.port),
+    )
+    .await
+    .expect("GET /api/agenda");
+    let approved = agenda["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| {
+            item_ids.iter().any(|id| item["id"] == id.as_str())
+                && item
+                    .pointer("/effects/0/approval")
+                    .is_some_and(|approval| !approval.is_null())
+        })
+        .count();
+    assert_eq!(
+        approved, 8,
+        "all eight gestures armed their manifests: {agenda}"
+    );
+}
+
 /// Task #6 end to end, against the real binaries: a resumable upload
 /// rides direct HTTP as job create → capped raw chunks → commit,
 /// survives a "client restart" (re-list by handle, resume at the
