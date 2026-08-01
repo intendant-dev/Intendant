@@ -266,6 +266,67 @@ direct-dialed and relay-transiting links (it rides the federation control
 WS, never the browser↔peer datachannel). Fire-and-forget like approvals:
 outcomes come back on the event stream.
 
+### Peer session transcripts — `session-detail` (RC-C2)
+
+Reading a peer session's conversation is a request/response fetch, never a
+standing subscription: `GET /api/peers/{peer_id}/session-detail
+?session_id=…&source=…&limit=…&before=…` (tunnel twin
+`api_peer_session_detail`; dialer-side IAM `peer.use` like its siblings)
+makes one authenticated GET against the peer's own `GET /api/session/{id}`
+route over the **federation HTTP lane** — the same gateway origin that
+serves the peer's `/ws`, dialed with the federation transport's mTLS
+identity, pins, and bearer (`peer/http_api.rs`, the `/mcp` side-channel
+pattern). The peer's route IAM evaluates the profile it granted this
+daemon's identity for `session.inspect`, and its own status + JSON body —
+transcript page, 403 profile refusal, 404 unknown session — pass through
+verbatim, so the dashboard always surfaces the governing daemon's honest
+answer. Because the lane is request/response over an ordinary HTTPS dial,
+it works on every link class the control WS works on, including a
+reachability relay where the browser↔peer datachannel cannot form; the
+response is the same paged `api_session_detail` body the peer's own
+dashboard reads (`entries[]` + paging cursors), so one renderer serves
+local and peer transcripts. Frame images and recordings referenced by a
+page resolve against the *peer's* stores and are not proxied — dashboards
+render their absence honestly instead of dead thumbnails. A transcript
+page is a **snapshot**: dashboards stamp when it was fetched, refresh on
+peer session events and reconnects, and never present a fetched page as a
+live stream.
+
+### Peer approvals in one rail — session attribution, recovery, audit
+
+A peer's pending approvals have always ridden its `/ws` event stream
+(`approval_required` / `approval_resolved`, folded into
+`PeerEvent::ApprovalRequested/Resolved` and the sessions rail's
+`needs_approval`). RC-C2 makes them first-class in a *merged* dashboard
+rail without moving any authority:
+
+- **Session attribution.** The wire event has always carried the session
+  id; the fold now passes it through (`ApprovalRequest.session_id`,
+  additive) together with the real action category (`approval_required`
+  gained an additive `category` field — older peers omit it and consumers
+  keep the historical `command_exec` default). A merged rail keys peer
+  approvals by `(peer, approval id)` — approval ids are per-daemon
+  counters and collide across daemons by construction.
+- **Reconnect recovery.** The target's bootstrap replays currently-pending
+  `approval_required` / `user_question` lines to every reconnecting client
+  (the bootstrap-cache lane), federation transports included, so a dialer
+  that reconnects re-learns the pending set with real ids and previews.
+  Against a peer predating the cache the dialer degrades to the folded
+  `needs_approval` boolean — the honest "details on the peer's own
+  dashboard" rendering.
+- **Deciding is unchanged.** The resolve path stays `POST
+  /api/peers/{peer_id}/approval` → `PeerOp::ResolveApproval` → the
+  target's ordinary per-action `Approval`-class gate under the profile it
+  granted this daemon. Who can approve, and the peer grant, do not move.
+- **Delegation-lane audit.** When a *target* daemon receives an
+  approval-rail resolution over a peer-identified `/ws` connection, it
+  now records the intermediary honestly: an Info log line naming the peer
+  daemon's label + key fingerprint, and — when the resolution names its
+  session — a persisted session note in that session's journal
+  ("…via peer daemon '<label>' — delegation lane"). The trust-tiers
+  doctrine rendered concrete: the audit names the daemon, because the
+  target cannot see which human sat behind the intermediary's grant.
+
 ### The grant echo and the connected link — honesty rails
 
 Two `PeerSnapshot` fields exist so the dashboard renders what a peer row
