@@ -24719,6 +24719,49 @@ html.ui-v2 .ag2-graph-legend {
   gap: 6px;
   pointer-events: none;
 }
+html.ui-v2 .ag2-graph-timebar {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 3;
+}
+html.ui-v2 .ag2-graph-timebar-oldest {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-3);
+  pointer-events: none;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"] {
+  flex: 1;
+  height: 3px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(var(--iris-rgb), .25);
+  border-radius: 2px;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--iris-rgb));
+  border: 2px solid var(--bg-1);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), .5);
+  cursor: ew-resize;
+}
+html.ui-v2 .ag2-graph-timebar input[type="range"]::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--iris-rgb));
+  border: 2px solid var(--bg-1);
+  box-shadow: 0 0 0 1px rgba(var(--iris-rgb), .5);
+  cursor: ew-resize;
+}
 html.ui-v2 .ag2-graph-chip {
   display: inline-flex;
   align-items: center;
@@ -38274,7 +38317,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '9c4c7ffd3b4c0977';
+const INTENDANT_APP_BUILD = 'e4be023e05005c5b';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -100208,7 +100251,7 @@ let agendaGraphTerrStats = { shown: 0, total: 0 };
 let agendaGraphMode = 'orbit';
 const AGENDA_GRAPH_MODES = [
   ['flow', 'flow', 'dependency flow — prerequisites left, dependents right'],
-  ['time', 'time', 'tree rings of age — now at the center, log rings out to the oldest'],
+  ['time', 'time', 'tree rings of age — now at the center, wedges by hub; drag the bar to replay the ledger'],
   ['files', 'files', 'clustered by the code they touch — territory shows the files themselves'],
   ['actor', 'actor', 'clustered by who parked it'],
   ['attention', 'attention', 'needs-you gravity — attention items pull center'],
@@ -100216,6 +100259,32 @@ const AGENDA_GRAPH_MODES = [
 let agendaGraphTimeMarks = [];
 let agendaGraphTimeOldest = 0;
 let agendaGraphTimeCheckAt = 0;
+// Scrub state: null = live; an epoch-ms value replays the ledger as of
+// that moment — later-born items leave the pool and every ring
+// recomputes against the scrubbed "now", so dragging the bar unwinds
+// the tree rings. Wedges: the time disc's angular sectors, one per
+// top hub (recomputed per build).
+let agendaGraphTimeScrub = null;
+let agendaGraphTimeWedges = [];
+
+function agendaGraphTimeNow() {
+  return agendaGraphTimeScrub === null ? Date.now() : agendaGraphTimeScrub;
+}
+
+// The camera's focal length dilates with the time disc: the 760 base
+// was tuned for a ±200-world scene, and a density-dilated outer ring
+// otherwise swings through the near field where fixed-focal
+// perspective balloons it off-frame. Scaling focal with the world
+// keeps angular proportions steady at every board size.
+function agendaGraphFocal() {
+  return 760 * (agendaGraphMode === 'time' ? agendaGraphTimeScale : 1);
+}
+
+// One born definition for the pool filter, the layout, and the
+// scrubber's domain: creation time, falling back to last update.
+function agendaGraphItemBorn(x) {
+  return (x.provenance && x.provenance.created_ms) || x.updated_ms || 0;
+}
 let agendaGraphActorMarks = [];
 let agendaGraphFilesMarks = [];
 let agendaGraphAttnCount = 0;
@@ -100318,8 +100387,14 @@ function agendaGraphHubOverviewItems(all) {
 }
 
 // The active projection's node pool — the one truth build and draw use.
+// A time-mode scrub replays the ledger as of the scrubbed moment:
+// items born later leave the pool. The scrubber clamps to the oldest
+// item's birth, so the pool can never scrub down to empty.
 function agendaGraphProjectionItems() {
-  const pool = agendaGraphPoolItems();
+  let pool = agendaGraphPoolItems();
+  if (agendaGraphMode === 'time' && agendaGraphTimeScrub !== null) {
+    pool = pool.filter((x) => agendaGraphItemBorn(x) <= agendaGraphTimeScrub);
+  }
   if (agendaGraphProjection === 'hubs' && !agendaGraphFocus) {
     return agendaGraphHubOverviewItems(pool);
   }
@@ -100443,6 +100518,8 @@ function agendaGraphWireChrome(host) {
         : (AGENDA_GRAPH_MODES.find(([m]) => m === mode) || [])[2] || mode;
       chip.onclick = () => {
         agendaGraphMode = agendaGraphMode === mode ? 'orbit' : mode;
+        // A replay belongs to the time lens; leaving it returns to live.
+        if (agendaGraphMode !== 'time') agendaGraphTimeScrub = null;
         agendaRenderTab();
       };
     } else if (kind === 'full') {
@@ -100457,6 +100534,48 @@ function agendaGraphWireChrome(host) {
       };
     }
   });
+  // The time scrubber: slider position maps linearly in the disc's
+  // log-age domain (the same log the rings use), so a pixel of travel
+  // means the same fraction of a ring everywhere. Right end = live;
+  // sliding left replays the ledger as of that moment. Input only
+  // mutates scrub state — the draw loop re-keys and re-settles on its
+  // own, so the slider keeps focus and drags stay smooth.
+  const timebar = host.querySelector('#ag2-graph-timebar');
+  if (timebar) {
+    timebar.hidden = agendaGraphMode !== 'time';
+    const scrubEl = host.querySelector('#ag2-graph-scrub');
+    const liveChip = host.querySelector('#ag2-graph-live');
+    if (scrubEl && !timebar.hidden) {
+      const domain = () => Math.max(0.001,
+        Math.log2(1 + Math.max(0, Date.now() - agendaGraphTimeOldest) / AGENDA_GRAPH_TIME_HOUR));
+      if (agendaGraphTimeScrub === null) {
+        scrubEl.value = '1000';
+      } else {
+        const t = Math.log2(1 + Math.max(0, Date.now() - agendaGraphTimeScrub)
+          / AGENDA_GRAPH_TIME_HOUR) / domain();
+        scrubEl.value = String(Math.round(1000 * (1 - Math.min(1, t))));
+      }
+      scrubEl.oninput = () => {
+        const v = Math.max(0, Math.min(1000, parseInt(scrubEl.value, 10) || 0));
+        if (v >= 1000) {
+          agendaGraphTimeScrub = null;
+        } else {
+          const age = (2 ** (((1000 - v) / 1000) * domain()) - 1) * AGENDA_GRAPH_TIME_HOUR;
+          agendaGraphTimeScrub = Math.max(agendaGraphTimeOldest, Date.now() - age);
+        }
+        if (liveChip) liveChip.hidden = agendaGraphTimeScrub === null;
+      };
+    }
+    if (liveChip) {
+      liveChip.hidden = timebar.hidden || agendaGraphTimeScrub === null;
+      liveChip.title = 'return to the live present';
+      liveChip.onclick = () => {
+        agendaGraphTimeScrub = null;
+        if (scrubEl) scrubEl.value = '1000';
+        liveChip.hidden = true;
+      };
+    }
+  }
 }
 
 function agendaGraphLegendChip(swatchClass, label) {
@@ -100485,6 +100604,12 @@ function agendaGraphPanelHtml() {
     `<button type="button" class="ag2-graph-projchip" data-proj="mode-${mode}">${label}</button>`).join('\n      ')}
       <span class="ag2-graph-projdiv"></span>
       <button type="button" class="ag2-graph-projchip" data-proj="full">⛶ full</button>
+    </div>
+    <div class="ag2-graph-timebar" id="ag2-graph-timebar" hidden>
+      <span class="ag2-graph-timebar-oldest">oldest</span>
+      <input type="range" id="ag2-graph-scrub" min="0" max="1000" step="1" value="1000"
+        aria-label="time scrub — drag left to replay the ledger as of an earlier moment">
+      <button type="button" class="ag2-graph-projchip" id="ag2-graph-live" hidden>⏵ live</button>
     </div>
     <div class="ag2-graph-legend">
       ${agendaGraphLegendChip('s-dot t-iris', 'open')}
@@ -100650,7 +100775,7 @@ function agendaGraphFitAll() {
   const sy = Math.sin(cam.yaw);
   const cp = Math.cos(cam.pitch);
   const sp = Math.sin(cam.pitch);
-  const focal = 760;
+  const focal = agendaGraphFocal();
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
@@ -100812,6 +100937,9 @@ function agendaGraphTimeRebuildMarks(now) {
 // (Assigned-vs-computed keeps this independent of the springs'
 // equilibrium error, which would otherwise re-arm every check.)
 function agendaGraphTimeTick() {
+  // A scrubbed disc is a frozen moment — ages do not advance, so
+  // there is no drift to chase.
+  if (agendaGraphTimeScrub !== null) return;
   const now = Date.now();
   if (now - agendaGraphTimeCheckAt < 5000) return;
   agendaGraphTimeCheckAt = now;
@@ -100830,8 +100958,14 @@ function agendaGraphTimeTick() {
   agendaGraphSettleLeft = Math.max(agendaGraphSettleLeft, 32);
 }
 
-// Humane span for the projection badge: how far back the disc reaches.
+// Humane span for the projection badge: how far back the disc reaches
+// — or, while scrubbed, which moment is being replayed.
 function agendaGraphTimeSpanLabel() {
+  if (agendaGraphTimeScrub !== null) {
+    const d = new Date(agendaGraphTimeScrub);
+    const pad = (v) => String(v).padStart(2, '0');
+    return `viewing ${d.toISOString().slice(0, 10)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
   const h = Math.max(0, Date.now() - agendaGraphTimeOldest) / AGENDA_GRAPH_TIME_HOUR;
   const span = h < 1 ? 'under an hour'
     : h < 48 ? `${Math.round(h)}h`
@@ -100925,7 +101059,12 @@ function agendaGraphBuild() {
     agendaGraphMode === 'files'
       ? (x.refs || []).map((r) => `${r.ref_type}:${r.locator}`).join('+')
       : '',
-  ].join('|')).join(';');
+  ].join('|')).join(';')
+    // A scrub step re-keys the whole build: the pool re-filters, ring
+    // targets recompute against the scrubbed now, and surviving nodes
+    // keep their positions — dragging the bar replays growth.
+    + (agendaGraphMode === 'time' && agendaGraphTimeScrub !== null
+      ? `|scrub:${agendaGraphTimeScrub}` : '');
   if (key === agendaGraphKey && agendaGraphNodes.length) return items;
   agendaGraphKey = key;
   const previous = new Map(agendaGraphNodes.map((n) => [n.id, n.p]));
@@ -100984,26 +101123,79 @@ function agendaGraphBuild() {
       if (!n.sat) n.tx = (rank.get(n.id) - maxRank / 2) * 72;
     });
   } else if (agendaGraphMode === 'time') {
-    // Anchored at NOW, not at the newest item: the center is the
-    // present, and an item's ring is its actual age — an untouched
-    // ledger reads old at a glance instead of being stretched to fill.
-    const now = Date.now();
-    const born = (x) => (x.provenance && x.provenance.created_ms) || x.updated_ms || 0;
+    // Anchored at NOW (or the scrubbed moment), not at the newest
+    // item: the center is the present, and an item's ring is its
+    // actual age — an untouched ledger reads old at a glance instead
+    // of being stretched to fill.
+    const now = agendaGraphTimeNow();
     let oldest = now;
     items.forEach((x) => {
-      const b = born(x);
+      const b = agendaGraphItemBorn(x);
       if (b > 0 && b < oldest) oldest = b;
     });
     agendaGraphTimeOldest = oldest;
     agendaGraphTimeScale = Math.max(1, Math.sqrt(items.length / 90));
     agendaGraphNodes.forEach((n) => {
       if (n.sat) return;
-      const b = born(byIdBuild.get(n.id)) || oldest;
+      const b = agendaGraphItemBorn(byIdBuild.get(n.id)) || oldest;
       n.born = b;
       n.tr = agendaGraphTimeRadius(now - b);
     });
     agendaGraphTimeRebuildMarks(now);
     agendaGraphTimeCheckAt = now;
+    // Wedges: the disc's angular dimension becomes placement — each
+    // top hub (by subtree population in the current pool) owns an
+    // even sector, and its subtree steers toward the sector's center
+    // angle at whatever ring its age pins. Unplaced items and small
+    // hubs stay angularly free. Rings answer "when", wedges "where".
+    const kidsOf = new Map();
+    items.forEach((x) => {
+      if (x.part_of) {
+        const list = kidsOf.get(x.part_of.parent_id) || [];
+        list.push(x.id);
+        kidsOf.set(x.part_of.parent_id, list);
+      }
+    });
+    const subtreeSize = (rootId) => {
+      let count = 0;
+      const seen = new Set();
+      const queue = [...(kidsOf.get(rootId) || [])];
+      while (queue.length) {
+        const id = queue.pop();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        count += 1;
+        (kidsOf.get(id) || []).forEach((k) => queue.push(k));
+      }
+      return count;
+    };
+    const hubs = items
+      .filter((x) => kidsOf.has(x.id) && !x.part_of)
+      .map((x) => ({ id: x.id, title: String(x.title || ''), size: subtreeSize(x.id) }))
+      .filter((h) => h.size >= 2)
+      .sort((a, b) => b.size - a.size || (a.id < b.id ? -1 : 1))
+      .slice(0, 6);
+    agendaGraphTimeWedges = [];
+    if (hubs.length >= 2) {
+      const wedgeOf = new Map();
+      hubs.forEach((h, i) => {
+        const angle = (i / hubs.length) * Math.PI * 2;
+        agendaGraphTimeWedges.push({ ...h, angle, half: Math.PI / hubs.length });
+        wedgeOf.set(h.id, angle);
+      });
+      const rootWedge = (x) => {
+        let cur = x;
+        for (let hop = 0; hop < 16 && cur; hop++) {
+          if (wedgeOf.has(cur.id)) return wedgeOf.get(cur.id);
+          cur = cur.part_of ? byIdBuild.get(cur.part_of.parent_id) : null;
+        }
+        return undefined;
+      };
+      agendaGraphNodes.forEach((n) => {
+        if (n.sat) return;
+        n.ta = rootWedge(byIdBuild.get(n.id));
+      });
+    }
   } else if (agendaGraphMode === 'files') {
     // Cluster by the AREA of the codebase an item touches: each
     // file/dir locator collapses to its directory prefix (≤3 path
@@ -101266,6 +101458,21 @@ function agendaGraphRelax(iterations) {
         n.p[1] += (n.anchor[1] - n.p[1]) * 0.02;
         n.p[2] += (n.anchor[2] - n.p[2]) * ak;
       }
+      if (n.ta !== undefined) {
+        // Wedge spring (time mode): rotate around the center toward
+        // the sector's angle by the shortest arc, radius untouched —
+        // the age pin owns the radius, this owns the bearing.
+        const theta = Math.atan2(n.p[2], n.p[0]);
+        let dTheta = n.ta - theta;
+        while (dTheta > Math.PI) dTheta -= Math.PI * 2;
+        while (dTheta < -Math.PI) dTheta += Math.PI * 2;
+        const rot = dTheta * 0.05;
+        const cosR = Math.cos(rot);
+        const sinR = Math.sin(rot);
+        const px = n.p[0];
+        n.p[0] = px * cosR - n.p[2] * sinR;
+        n.p[2] = px * sinR + n.p[2] * cosR;
+      }
     });
   }
 }
@@ -101374,6 +101581,31 @@ function agendaGraphDrawTimeChrome(g, project, pal, w, h, reduced, ts) {
     }
   });
   g.setLineDash([]);
+  // Hub wedges: faint boundary spokes tile the disc into sectors, one
+  // per top hub. The sectors carry no rim names — each wedge hub's own
+  // node label always renders inside its sector and names the region
+  // (and a hub absent from the pool never mints a wedge), so a rim
+  // name could only ever duplicate it.
+  if (agendaGraphTimeWedges.length) {
+    const outerR = agendaGraphTimeMarks.length
+      ? agendaGraphTimeMarks[agendaGraphTimeMarks.length - 1].r
+      : AGENDA_GRAPH_TIME_INNER * agendaGraphTimeScale;
+    const innerR = AGENDA_GRAPH_TIME_INNER * agendaGraphTimeScale * 0.6;
+    g.lineWidth = 1;
+    agendaGraphTimeWedges.forEach((wedge) => {
+      const boundary = wedge.angle - wedge.half;
+      const cosB = Math.cos(boundary);
+      const sinB = Math.sin(boundary);
+      const p0 = project([cosB * innerR, 0, sinB * innerR]);
+      const p1 = project([cosB * outerR, 0, sinB * outerR]);
+      const depth = Math.max(0.3, Math.min(1, ((p0.s + p1.s) / 2) * 1.1 - 0.18));
+      g.beginPath();
+      g.moveTo(p0.x, p0.y);
+      g.lineTo(p1.x, p1.y);
+      g.strokeStyle = `rgba(${pal.text},${0.06 * depth})`;
+      g.stroke();
+    });
+  }
   // The "now" beacon at the world origin: a small iris core with a
   // breathing pulse (static halo under reduced motion). The pulse is a
   // screen-space emitter, not plane geometry, so plain arcs are right.
@@ -101480,7 +101712,7 @@ function agendaGraphDraw(ts) {
   const sy = Math.sin(cam.yaw);
   const cp = Math.cos(cam.pitch);
   const sp = Math.sin(cam.pitch);
-  const focal = 760;
+  const focal = agendaGraphFocal();
   const cx = w / 2;
   const cyy = h / 2 + 8;
   const project = (p) => {
