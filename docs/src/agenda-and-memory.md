@@ -224,7 +224,31 @@ actionable wait it is — "delivered · awaiting Complete" (sky, the
 self-report hue) — distinct from genuinely in-flight work; calm depth
 folds only the in-flight waits (a chip tap unfolds them), while stated
 blockers and delivered waits always render. All of it stays advisory:
-blocked gates neither approval nor firing.
+blocked gates neither approval nor firing. Beside the flag, both
+serving grains carry the **`blocked_on` decoration**: the named causes
+(each uncleared blocker's criterion; each unsatisfied prerequisite's
+live title and status), stamped at the serving seam beside the effects'
+fireability verdicts like `next_fire_ms`, never folded from ops — the
+served truth the approve-surface confirms below derive from.
+
+**Blocked never gates approval — advisory plus confirm.** Blocked-state
+is bookkeeping that lags reality in both directions (a finished
+prerequisite awaiting its Complete tap; a completed-but-unfinished one),
+and blocker criteria are explicitly unevaluated — so approving a
+scheduled session on a currently blocked item is always allowed, and the
+approve/deny lever stays the owner's absolute call. What every approve
+surface adds is one NAMED confirm when the manifest is time-floored:
+the dashboard strips and inspector ask "prerequisite *title* is still
+open — approve anyway?" (derived from the served `blocked_on` truth,
+never a client-side join), and `ctl agenda approve` prints the same
+named warning and proceeds. Nothing refuses; the fireability validator
+is a separate, unchanged concern. The mechanically right enforcement
+point for dependents is **fire-time trigger semantics**: propose the
+manifest with the `on_unblock` trigger (the manifest editor sheet and
+`ctl agenda schedule` suggest it for items with `relies_on` edges) and
+approval-anytime becomes safe by construction — approve early, the fire
+waits for the real unblock. Event-triggered manifests therefore skip
+the confirm entirely, which also keeps workflow batch approvals quiet.
 
 ### Typed references (G1)
 
