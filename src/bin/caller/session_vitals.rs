@@ -8,8 +8,9 @@
 //!   branch, dirty count, ahead/behind vs `origin/<primary>` (local
 //!   fallback), a merge-parity preview via in-memory
 //!   `git merge-tree --write-tree` (git ≥ 2.38, cached by SHA pair), and
-//!   unpushed counts for the current and primary branches. Periodic, for
-//!   the live target registry. Each target follows the session's write
+//!   unpushed counts for the current and primary branches. Periodic for
+//!   live targets; boot-restored targets get one paint and then wait for
+//!   live evidence (see [`TargetOrigin`]). Each target follows the session's write
 //!   activity: when `AppEvent::SessionFileActivity` paths resolve inside a
 //!   different git checkout than the registered root (e.g. a worktree the
 //!   session entered by absolute path without registering it), the probe
@@ -1409,6 +1410,30 @@ fn resolve_git_checkout_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Where a registry entry came from — the probe-cadence discriminator.
+///
+/// `Live` entries (launch/resume registrations, the primary seed, or
+/// restored entries upgraded by live bus evidence) ride the full periodic
+/// cadence. `Restored` entries (the boot scan over the on-disk session
+/// store) are probed ONCE, to paint the idle session card's git chips
+/// with boot-instant state, and then left alone: until something live
+/// touches the session, its card renders as a pre-boot ghost whose
+/// vitals the dashboard already refuses to present as live claims, so a
+/// standing cadence would spend git subprocesses on chips no surface
+/// shows as current (observed live 2026-08-01: two daemons statusing
+/// ~16 distinct checkouts every tick, the large majority for sessions
+/// whose cards render Ended/Died). Any live evidence — a launch/resume
+/// registration, observed file activity, a backend cwd or VCS announce —
+/// upgrades the entry to `Live` and full cadence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetOrigin {
+    Live,
+    /// `painted` flips after the one-shot boot probe attempt, success or
+    /// failure — a restored checkout that stopped existing must not be
+    /// re-spawned against every tick either.
+    Restored { painted: bool },
+}
+
 /// One session's probe target: the registered root (the session's durable
 /// identity — never lost) plus the activity-locus overlay.
 struct GitTarget {
@@ -1422,6 +1447,8 @@ struct GitTarget {
     /// proposal is "switch back to the registered root". Reset whenever an
     /// event confirms the current target instead.
     candidate: Option<(Option<PathBuf>, u32)>,
+    /// Probe-cadence class (see [`TargetOrigin`]).
+    origin: TargetOrigin,
 }
 
 impl GitTarget {
@@ -1430,6 +1457,14 @@ impl GitTarget {
             registered_root,
             active_locus: None,
             candidate: None,
+            origin: TargetOrigin::Live,
+        }
+    }
+
+    fn new_restored(registered_root: PathBuf) -> Self {
+        Self {
+            origin: TargetOrigin::Restored { painted: false },
+            ..Self::new(registered_root)
         }
     }
 
@@ -1512,7 +1547,9 @@ impl GitTarget {
 /// sessions and on projectless daemons (whose primary has no repo) —
 /// and a boot-time scan restores targets for the store's non-ended
 /// sessions (see [`register_restored_session_targets`]) so idle
-/// session windows keep their chips across daemon restarts.
+/// session windows keep their chips across daemon restarts — painted
+/// once at boot, then off-cadence until live evidence upgrades them
+/// (see [`TargetOrigin`]).
 /// `SessionEnded` prunes entries, so a handle owner only has to register.
 ///
 /// Each entry also tracks the session's activity locus: write paths from
@@ -1546,7 +1583,9 @@ impl GitVitalsTargets {
     /// launch/resume registrations (and the primary seed) carry the
     /// freshest root and an explicit statement of where the session
     /// lives, so the restore scan must never clobber one or reset its
-    /// activity locus. Returns whether the target was inserted.
+    /// activity locus. The entry enters at [`TargetOrigin::Restored`]:
+    /// one boot paint, then no standing cadence until live evidence
+    /// upgrades it. Returns whether the target was inserted.
     pub(crate) fn register_restored(&self, session_id: &str, cwd: PathBuf) -> bool {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -1560,7 +1599,7 @@ impl GitVitalsTargets {
         {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(GitTarget::new(cwd));
+                slot.insert(GitTarget::new_restored(cwd));
                 true
             }
         }
@@ -1574,7 +1613,11 @@ impl GitVitalsTargets {
     }
 
     /// Effective probe targets: the activity locus where one is active,
-    /// the registered root otherwise.
+    /// the registered root otherwise. The FULL registry view — restored
+    /// entries included — for identity resolution (the maintainer's
+    /// alias walks) and read-side lookups; the periodic prober draws
+    /// from [`Self::snapshot_probe`] and the radar from
+    /// [`Self::snapshot_live`] instead.
     pub(crate) fn snapshot(&self) -> Vec<(String, PathBuf)> {
         self.targets
             .lock()
@@ -1582,6 +1625,58 @@ impl GitVitalsTargets {
             .iter()
             .map(|(id, target)| (id.clone(), target.effective()))
             .collect()
+    }
+
+    /// The periodic prober's tick domain: every live entry, plus each
+    /// restored entry that still owes its one-shot boot paint.
+    pub(crate) fn snapshot_probe(&self) -> Vec<(String, PathBuf)> {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .iter()
+            .filter(|(_, target)| {
+                target.origin != TargetOrigin::Restored { painted: true }
+            })
+            .map(|(id, target)| (id.clone(), target.effective()))
+            .collect()
+    }
+
+    /// Live entries only — the coordination radar's scan domain. Overlap
+    /// detection covers sessions being WORKED (§2.8's supervised set);
+    /// boot-restored ghosts contribute no observed working set until
+    /// live evidence upgrades them.
+    pub(crate) fn snapshot_live(&self) -> Vec<(String, PathBuf)> {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .iter()
+            .filter(|(_, target)| target.origin == TargetOrigin::Live)
+            .map(|(id, target)| (id.clone(), target.effective()))
+            .collect()
+    }
+
+    /// The periodic prober finished this session's probe attempt: a
+    /// restored entry's one-shot boot paint is now spent, whatever the
+    /// outcome (no-op for live entries and unregistered ids).
+    fn mark_probed(&self, session_id: &str) {
+        let mut targets = self.targets.lock().expect("git vitals targets lock");
+        if let Some(target) = targets.get_mut(session_id.trim()) {
+            if let TargetOrigin::Restored { painted } = &mut target.origin {
+                *painted = true;
+            }
+        }
+    }
+
+    /// Live evidence arrived on the bus for this session — observed file
+    /// activity, a backend cwd or VCS announce: upgrade a restored entry
+    /// to full probe cadence (no-op for live entries and unregistered
+    /// ids). Launch/resume lanes upgrade through [`Self::register`],
+    /// which overwrites the entry outright.
+    fn mark_live(&self, session_id: &str) {
+        let mut targets = self.targets.lock().expect("git vitals targets lock");
+        if let Some(target) = targets.get_mut(session_id.trim()) {
+            target.origin = TargetOrigin::Live;
+        }
     }
 
     /// One session's effective probe target — the checkout the dirty chip
@@ -1659,7 +1754,9 @@ pub(crate) fn published_git_vitals_targets() -> Option<&'static GitVitalsTargets
 /// session store (`<home>/.intendant/logs`) — the daemon-boot
 /// complement to the supervisor's launch/resume registration. Without
 /// it a restart empties the registry, and idle session windows lose
-/// their git/health chips until the next resume touches them.
+/// their git/health chips until the next resume touches them. Restored
+/// targets are painted once and then rest off-cadence until live
+/// evidence upgrades them (see [`TargetOrigin`]).
 ///
 /// The candidate walk (scope, recency cap, worktree-checkout roots)
 /// lives in [`crate::session_vitals_restore::restored_session_candidates`]
@@ -1749,7 +1846,10 @@ pub(crate) fn spawn_session_vitals_producer(
             let mut prober = GitVitalsProber::default();
             loop {
                 let mut tick_cache: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
-                for (session_id, cwd) in registry.snapshot() {
+                // Live targets every tick; restored targets exactly once
+                // (the boot paint) until live evidence upgrades them —
+                // see [`TargetOrigin`].
+                for (session_id, cwd) in registry.snapshot_probe() {
                     let mut probed = probe_cached(&mut prober, &mut tick_cache, &cwd).await;
                     if probed.is_none() {
                         // A dead activity locus (worktree deleted, checkout
@@ -1760,6 +1860,7 @@ pub(crate) fn spawn_session_vitals_producer(
                         }
                     }
                     hub.apply(&session_id, |vitals| vitals.git = probed);
+                    registry.mark_probed(&session_id);
                 }
                 // Wait out the cadence, or probe immediately when the
                 // maintainer sees a backend VCS notice. `Notify` holds at
@@ -1821,6 +1922,9 @@ fn spawn_git_target_maintainer(
                     let canonical = hub.resolve(&session_id);
                     for (id, _) in registry.snapshot() {
                         if hub.resolve(&id) == canonical {
+                            // A session writing files is live: a restored
+                            // entry rejoins the probe cadence.
+                            registry.mark_live(&id);
                             registry.observe_write_activity(&id, &paths);
                         }
                     }
@@ -1832,6 +1936,12 @@ fn spawn_git_target_maintainer(
                     let canonical = hub.resolve(&session_id);
                     for (id, _) in registry.snapshot() {
                         if hub.resolve(&id) == canonical {
+                            // A backend announcing its cwd is live — this
+                            // is also how readopted sessions (which skip
+                            // the launch/resume registration lane) rejoin
+                            // the probe cadence: every backend re-announces
+                            // on adoption.
+                            registry.mark_live(&id);
                             registry.seed_locus(&id, Path::new(&cwd));
                         }
                     }
@@ -1848,6 +1958,9 @@ fn spawn_git_target_maintainer(
                         let canonical = hub.resolve(&session_id);
                         for (id, _) in registry.snapshot() {
                             if hub.resolve(&id) == canonical {
+                                // A backend reporting its own VCS
+                                // operation is live.
+                                registry.mark_live(&id);
                                 registry.seed_locus(&id, Path::new(cwd));
                             }
                         }
@@ -3007,6 +3120,127 @@ mod tests {
         .await
         .expect("restored session emits git vitals on the first tick");
         assert_eq!(vitals.git.expect("git section").branch, "main");
+    }
+
+    #[test]
+    fn restored_targets_leave_probe_and_radar_domains_until_live() {
+        let targets = GitVitalsTargets::default();
+        let root = PathBuf::from("/tmp/checkout");
+        assert!(targets.register_restored("restored", root.clone()));
+
+        // Full view keeps the entry — identity resolution and read-side
+        // lanes (the Changes tab) must still resolve restored sessions.
+        assert_eq!(targets.snapshot().len(), 1);
+        assert_eq!(targets.effective_for("restored"), Some(root.clone()));
+        // The radar never sees it; the prober sees it while the boot
+        // paint is owed…
+        assert!(targets.snapshot_live().is_empty());
+        assert_eq!(targets.snapshot_probe().len(), 1);
+        // …and stops seeing it once the paint is spent.
+        targets.mark_probed("restored");
+        assert!(targets.snapshot_probe().is_empty());
+        assert!(targets.snapshot_live().is_empty());
+        assert_eq!(targets.snapshot().len(), 1, "read-side view survives");
+
+        // Live bus evidence restores full cadence, and a spent paint
+        // never returns: live entries ignore mark_probed.
+        targets.mark_live("restored");
+        assert_eq!(targets.snapshot_probe().len(), 1);
+        assert_eq!(targets.snapshot_live().len(), 1);
+        targets.mark_probed("restored");
+        assert_eq!(targets.snapshot_probe().len(), 1);
+
+        // A launch/resume registration overwrites a restored entry
+        // outright — the other upgrade lane.
+        let resumed = GitVitalsTargets::default();
+        assert!(resumed.register_restored("resumed", root.clone()));
+        resumed.mark_probed("resumed");
+        resumed.register("resumed", root);
+        assert_eq!(resumed.snapshot_live().len(), 1);
+        assert_eq!(resumed.snapshot_probe().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restored_target_paints_once_and_rejoins_cadence_on_live_evidence() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        git_cmd(repo.path(), &["add", "."]);
+        git_cmd(repo.path(), &["commit", "-qm", "base"]);
+
+        write_restored_meta(home.path(), "ghost", "idle", Some(repo.path()), None);
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new(), None);
+        assert_eq!(register_restored_session_targets(home.path(), &targets), 1);
+
+        let deadline = std::time::Duration::from_secs(20);
+        let painted = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "ghost" {
+                        if let Some(git) = vitals.git {
+                            return git;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("restored session gets its one-shot boot paint");
+        assert_eq!(painted.branch, "main");
+        assert_eq!(painted.dirty_files, 0);
+
+        // Dirty the checkout AFTER the paint (the emission implies the
+        // probe completed and the paint is spent — no await point sits
+        // between the hub apply and mark_probed). With no live evidence
+        // the prober must not follow: the change-gated hub would emit
+        // if a probe ran, so silence across a full cadence is the skip.
+        std::fs::write(repo.path().join("dirty.txt"), "x\n").unwrap();
+        let silence = tokio::time::timeout(
+            PROBE_INTERVAL + std::time::Duration::from_secs(2),
+            async {
+                loop {
+                    if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                        if session_id == "ghost"
+                            && vitals.git.as_ref().is_some_and(|git| git.dirty_files > 0)
+                        {
+                            return;
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            silence.is_err(),
+            "a painted restored target must not be re-probed without live evidence"
+        );
+
+        // Observed file activity upgrades the entry; the next tick sees
+        // the dirty file.
+        bus.send(AppEvent::SessionFileActivity {
+            session_id: Some("ghost".to_string()),
+            paths: vec![repo.path().join("dirty.txt").to_string_lossy().into_owned()],
+        });
+        let refreshed = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "ghost" {
+                        if let Some(git) = vitals.git {
+                            if git.dirty_files > 0 {
+                                return git;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("live evidence returns the target to the probe cadence");
+        assert_eq!(refreshed.dirty_files, 1);
     }
 
     #[tokio::test]
