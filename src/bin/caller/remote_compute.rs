@@ -34,10 +34,15 @@ const WORKER_JOB_CAP: usize = 8;
 const WORKER_SEND_TIMEOUT_S: u64 = 5;
 const WORKER_WATCHDOG_GRACE_S: u64 = 60;
 const CACHE_SERVER_IDLE_TIMEOUT_S: u64 = 600;
+const WORKER_PRIVATE_STATE_ENV: &str = "INTENDANT_HOME";
 
 pub(crate) const REMOTE_COMMAND_START_KIND: &str = "remote_command_start";
 pub(crate) const REMOTE_COMMAND_CANCEL_KIND: &str = "remote_command_cancel";
 pub(crate) const REMOTE_COMMAND_RESULT_KIND: &str = "remote_command_result";
+
+fn remove_worker_private_state(command: &mut tokio::process::Command) {
+    command.env_remove(WORKER_PRIVATE_STATE_ENV);
+}
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
@@ -1273,6 +1278,11 @@ async fn run_worker_command(
     };
 
     let mut command = crate::platform::spawn_command(&spec.argv[0]);
+    // The attachment agent's INTENDANT_HOME contains its ephemeral client
+    // identity. Remote workloads must not inherit that private control-plane
+    // state. Apply the caller's explicit environment afterwards so a workload
+    // that deliberately needs its own INTENDANT_HOME can still request one.
+    remove_worker_private_state(&mut command);
     command
         .args(&spec.argv[1..])
         .current_dir(cwd)
@@ -1931,6 +1941,30 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("invalid dedicated cache"));
+    }
+
+    #[test]
+    fn remote_command_does_not_inherit_worker_private_state() {
+        let mut command = tokio::process::Command::new("unused");
+        remove_worker_private_state(&mut command);
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == WORKER_PRIVATE_STATE_ENV)
+                .map(|(_, value)| value),
+            Some(None)
+        );
+
+        command.env(WORKER_PRIVATE_STATE_ENV, "/caller-selected-state");
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == WORKER_PRIVATE_STATE_ENV)
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("/caller-selected-state"))
+        );
     }
 
     #[test]

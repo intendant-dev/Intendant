@@ -435,7 +435,9 @@ The contract is intentionally stricter than an interactive terminal:
 - Commands are transported as an argv array and are not implicitly parsed by
   a shell. `cwd`, when present, is repository-relative and cannot escape the
   selected checkout. Explicit environment entries are additions to the
-  worker's agent-phase environment.
+  worker's agent-phase environment. The command does not inherit the
+  attachment agent's private `INTENDANT_HOME`; a caller may deliberately
+  supply a different value in the explicit environment.
 - `source: "git_revision"` is the default and requires
   `expected_revision`. The worker refuses a different checkout; abbreviated
   object ids are accepted from 7 hexadecimal characters.

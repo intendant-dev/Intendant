@@ -44,6 +44,7 @@ export XDG_DATA_HOME="$task_root/data"
 export XDG_CACHE_HOME="$task_root/cache"
 export INTENDANT_HOME="$task_root/intendant"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$INTENDANT_HOME"
+chmod 0700 "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$INTENDANT_HOME"
 
 echo "Intendant Cloud worker runtime: $task_root" >&2
 exec "$@"
