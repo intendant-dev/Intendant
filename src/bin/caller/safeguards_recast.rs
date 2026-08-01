@@ -98,7 +98,10 @@ pub(crate) struct RecastRef {
 impl RecastRef {
     /// The durable session-meta marker for this flag (what the boot
     /// pass and the session catalog read).
-    pub(crate) fn meta(&self, flagged_at_epoch: u64) -> crate::session_log::SessionSafeguardsFlagMeta {
+    pub(crate) fn meta(
+        &self,
+        flagged_at_epoch: u64,
+    ) -> crate::session_log::SessionSafeguardsFlagMeta {
         crate::session_log::SessionSafeguardsFlagMeta {
             flagged_at_epoch,
             reason_preview: reason_preview(&self.reason),
@@ -229,7 +232,11 @@ fn park_needs_recast(handle: &AgendaHandle, text: String) -> Result<String, Stri
     anchors.sort_by(|a, b| a.id.cmp(&b.id));
     let item_id = match anchors.first() {
         Some(item) => {
-            if item.annotations.last().is_some_and(|note| note.text == text) {
+            if item
+                .annotations
+                .last()
+                .is_some_and(|note| note.text == text)
+            {
                 return Ok(item.id.clone());
             }
             item.id.clone()
@@ -371,7 +378,10 @@ mod tests {
         assert!(text.contains("safeguards flagged"), "{text}");
         assert!(text.contains("never switches"), "{text}");
         assert!(text.contains("recast the task in your own words"), "{text}");
-        assert!(matches!(urgency, crate::types::NotificationUrgency::Attention));
+        assert!(matches!(
+            urgency,
+            crate::types::NotificationUrgency::Attention
+        ));
     }
 
     #[test]

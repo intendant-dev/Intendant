@@ -666,9 +666,17 @@ impl SessionLog {
         let existing = fs::read_to_string(self.dir.join("session_meta.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok());
-        let (existing_name, existing_worktree, existing_limit_park) = existing
-            .map(|meta| (meta.name, meta.worktree, meta.limit_park))
-            .unwrap_or((None, None, None));
+        let (existing_name, existing_worktree, existing_limit_park, existing_safeguards_flag) =
+            existing
+                .map(|meta| {
+                    (
+                        meta.name,
+                        meta.worktree,
+                        meta.limit_park,
+                        meta.safeguards_flag,
+                    )
+                })
+                .unwrap_or((None, None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -687,6 +695,9 @@ impl SessionLog {
             // mid-park (a credential-reload respawn's write_meta) must
             // not silently release it.
             limit_park: existing_limit_park,
+            // The safeguards flag is terminal for the conversation — no
+            // meta rewrite may ever drop it.
+            safeguards_flag: existing_safeguards_flag,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -1850,6 +1861,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -1960,6 +1972,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -1982,6 +1995,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -2045,6 +2059,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

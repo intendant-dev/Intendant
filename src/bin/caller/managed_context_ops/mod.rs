@@ -13,9 +13,9 @@ use crate::{
     emit_user_message_log, fission_anchor_cut_line, fission_anchor_first_lines,
     fission_anchor_reachable_after_rewind, fission_detach_parent_candidates,
     is_codex_injected_user_text_for_main, safeguards_flag_condition, transient_service_condition,
-    CodexThreadActionDedupe,
-    DrainOutcome, ExternalBackendRecovery, ExternalContextSnapshotState, ExternalDiffDeltaTracker,
-    FatalRoundError, PendingRuntimeSteer, UserAttachments, UserTurnRevisionState,
+    CodexThreadActionDedupe, DrainOutcome, ExternalBackendRecovery, ExternalContextSnapshotState,
+    ExternalDiffDeltaTracker, FatalRoundError, PendingRuntimeSteer, UserAttachments,
+    UserTurnRevisionState,
 };
 use crate::{
     context_rewind, external_wrapper_index, fission_ledger, fission_lifecycle, frontend,

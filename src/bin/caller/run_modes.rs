@@ -3826,9 +3826,10 @@ pub(crate) async fn run_with_presence(
                                 &reason,
                             );
                         slog(&session_log, |l| l.error(&line));
+                        let follow_up_session = session_log_id(&session_log);
                         emit_follow_up_status(
                             &bus,
-                            session_log_id(&session_log),
+                            follow_up_session.as_deref(),
                             &active_followup.follow_up_id,
                             Some(&merged_text),
                             "failed",

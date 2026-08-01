@@ -287,7 +287,7 @@ pub(crate) fn surface_undelivered_input_at_terminal(
         failed_follow_ups += 1;
         emit_follow_up_status(
             bus,
-            session_id.clone(),
+            session_id.as_deref(),
             &parked.follow_up_id,
             Some(&parked.text),
             "failed",
@@ -3415,18 +3415,15 @@ pub(crate) async fn run_external_agent_mode(
                 // key on the meta marker, so it must survive whatever
                 // happens after this point.
                 slog(&session_log, |l| {
-                    l.set_safeguards_flag(
-                        entry.meta(crate::session_activity::epoch_seconds()),
-                    )
+                    l.set_safeguards_flag(entry.meta(crate::session_activity::epoch_seconds()))
                 });
-                let (retired_steers, failed_follow_ups) =
-                    surface_undelivered_input_at_terminal(
-                        &bus,
-                        &live_session_id,
-                        &mut pending_runtime_steers,
-                        &mut parked_follow_ups,
-                        crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL,
-                    );
+                let (retired_steers, failed_follow_ups) = surface_undelivered_input_at_terminal(
+                    &bus,
+                    &live_session_id,
+                    &mut pending_runtime_steers,
+                    &mut parked_follow_ups,
+                    crate::safeguards_recast::SAFEGUARDS_UNDELIVERED_DETAIL,
+                );
                 if retired_steers + failed_follow_ups > 0 {
                     slog(&session_log, |l| {
                         l.info(&format!(

@@ -3619,7 +3619,10 @@ async fn reader_task(
                 // latched bool kept "awaiting the model's next activity"
                 // alive indefinitely).
                 reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
-                reader_state.shared.turn_active.store(false, Ordering::SeqCst);
+                reader_state
+                    .shared
+                    .turn_active
+                    .store(false, Ordering::SeqCst);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }
@@ -3638,7 +3641,10 @@ async fn reader_task(
                 // Same turn-close as the EOF arm: an IO-error death must
                 // not leave either latch claiming a running turn.
                 reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
-                reader_state.shared.turn_active.store(false, Ordering::SeqCst);
+                reader_state
+                    .shared
+                    .turn_active
+                    .store(false, Ordering::SeqCst);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }

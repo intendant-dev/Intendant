@@ -2003,9 +2003,7 @@ pub(crate) async fn run_boot_readopt_pass(
                     .and_then(|meta| meta.safeguards_flag)
                     .map(|flag| flag.reason_preview)
                     .or_else(|| session_summary_outcome(&home, session_id))
-                    .unwrap_or_else(|| {
-                        "provider safeguards flagged the conversation".to_string()
-                    });
+                    .unwrap_or_else(|| "provider safeguards flagged the conversation".to_string());
                 crate::safeguards_recast::RecastRef {
                     session_id: session_id.clone(),
                     source,
