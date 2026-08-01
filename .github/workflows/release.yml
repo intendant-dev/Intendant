@@ -216,14 +216,6 @@ jobs:
             echo "::warning::No PGP signing secrets configured — this dry-run produces an unsigned-dev artifact with no signatures."
           fi
 
-      - name: Install manual-dispatch release prerequisites
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          if ! command -v gpg >/dev/null; then
-            brew install gnupg
-          fi
-
       # Throwaway keychain: created fresh, added to the FRONT of the user
       # search list (codesign cannot find identities in a keychain outside
       # the search list — verified empirically; --keychain alone is not
@@ -285,7 +277,7 @@ jobs:
       # later step failed. The passphrase reaches gpg via a 0600 file and
       # loopback pinentry — never argv, never the log.
       - name: Import PGP release signing key (throwaway GNUPGHOME)
-        if: steps.gate.outputs.pgp == 'true'
+        if: github.ref_type == 'tag' && steps.gate.outputs.pgp == 'true'
         shell: bash
         env:
           PGP_KEY_B64: ${{ secrets.PGP_SIGN_KEY_B64 }}
@@ -405,7 +397,7 @@ jobs:
       # dispatch dry-runs too; a credential-less dispatch skips it and
       # keeps only the explicitly -unsigned-dev artifact.
       - name: PGP-sign release artifacts
-        if: steps.gate.outputs.pgp == 'true'
+        if: github.ref_type == 'tag' && steps.gate.outputs.pgp == 'true'
         id: pgp_sign
         shell: bash
         run: |
