@@ -1330,16 +1330,19 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     // worker-launched Xvfb) survives reconnects; per-viewer stream state
     // dies with each socket.
     let mut display_state = WorkerDisplayState::default();
+    let endpoint = AttachmentEndpoint {
+        home: &home,
+        pinned: &pinned,
+        identity: &identity,
+        key_pair: &key_pair,
+        fingerprint: &fingerprint,
+        task: &task,
+        tls_terminated_proxy,
+    };
     let mut attempt: u32 = 0;
     loop {
         let held = hold_attachment(
-            &home,
-            &pinned,
-            &identity,
-            &key_pair,
-            &fingerprint,
-            &task,
-            tls_terminated_proxy,
+            &endpoint,
             &terminal_registry,
             &remote_commands,
             &mut display_state,
@@ -1877,14 +1880,18 @@ fn authority(host: &str, port: u16) -> String {
     }
 }
 
-async fn hold_attachment(
-    home: &str,
-    pinned: &[crate::access::pinning::Fingerprint],
-    identity: &crate::peer::transport::tls_client::ClientIdentityPaths,
-    key_pair: &rcgen::KeyPair,
-    fingerprint: &str,
-    task: &str,
+struct AttachmentEndpoint<'a> {
+    home: &'a str,
+    pinned: &'a [crate::access::pinning::Fingerprint],
+    identity: &'a crate::peer::transport::tls_client::ClientIdentityPaths,
+    key_pair: &'a rcgen::KeyPair,
+    fingerprint: &'a str,
+    task: &'a str,
     tls_terminated_proxy: bool,
+}
+
+async fn hold_attachment(
+    endpoint: &AttachmentEndpoint<'_>,
     registry: &crate::terminal::TerminalRegistry,
     remote_commands: &crate::remote_compute::WorkerRemoteCommands,
     display: &mut WorkerDisplayState,
@@ -1892,7 +1899,8 @@ async fn hold_attachment(
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-    let mut request = home
+    let mut request = endpoint
+        .home
         .into_client_request()
         .map_err(|e| format!("bad home URL: {e}"))?;
     let nonce = random_token()?;
@@ -1907,10 +1915,17 @@ async fn hold_attachment(
             "cloud-worker attachment URL must target {ATTACH_PATH}, got {target}"
         ));
     }
-    let payload = attachment_proof_payload(target, fingerprint, task, &nonce, timestamp_unix_ms);
+    let payload = attachment_proof_payload(
+        target,
+        endpoint.fingerprint,
+        endpoint.task,
+        &nonce,
+        timestamp_unix_ms,
+    );
     use rcgen::SigningKey as _;
     let proof = crate::daemon_identity::b64u(
-        &key_pair
+        &endpoint
+            .key_pair
             .sign(payload.as_bytes())
             .map_err(|e| format!("sign attachment proof: {e}"))?,
     );
@@ -1923,31 +1938,34 @@ async fn hold_attachment(
         Ok(())
     };
     insert(CLOUD_WORKER_HEADER, "1")?;
-    insert(CLOUD_WORKER_FINGERPRINT_HEADER, fingerprint)?;
-    insert(CLOUD_WORKER_TASK_HEADER, task)?;
+    insert(CLOUD_WORKER_FINGERPRINT_HEADER, endpoint.fingerprint)?;
+    insert(CLOUD_WORKER_TASK_HEADER, endpoint.task)?;
     insert(CLOUD_WORKER_NONCE_HEADER, &nonce)?;
     insert(
         CLOUD_WORKER_TIMESTAMP_HEADER,
         &timestamp_unix_ms.to_string(),
     )?;
     insert(CLOUD_WORKER_PROOF_HEADER, &proof)?;
-    let connector =
-        crate::peer::transport::tls_client::rustls_client_config(pinned, Some(identity), false)
-            .map_err(|e| format!("build TLS config: {e}"))?
-            .map(|config| tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config)));
-    let transport = open_attachment_transport(home).await?;
+    let connector = crate::peer::transport::tls_client::rustls_client_config(
+        endpoint.pinned,
+        Some(endpoint.identity),
+        false,
+    )
+    .map_err(|e| format!("build TLS config: {e}"))?
+    .map(|config| tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config)));
+    let transport = open_attachment_transport(endpoint.home).await?;
     let (mut ws, _resp) =
         tokio_tungstenite::client_async_tls_with_config(request, transport, None, connector)
             .await
-            .map_err(|e| format!("dial {home}: {e}"))?;
+            .map_err(|e| format!("dial {}: {e}", endpoint.home))?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({ "v": 2, "kind": HELLO_KIND, "task_id": task, "terminal": true })
+        serde_json::json!({ "v": 2, "kind": HELLO_KIND, "task_id": endpoint.task, "terminal": true })
             .to_string()
             .into(),
     ))
     .await
     .map_err(|e| format!("send hello: {e}"))?;
-    if tls_terminated_proxy {
+    if endpoint.tls_terminated_proxy {
         eprintln!(
             "[cloud-agent] attached through the explicitly trusted TLS-terminating proxy; holding the socket"
         );
