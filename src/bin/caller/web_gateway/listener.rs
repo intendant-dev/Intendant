@@ -2145,6 +2145,73 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
+                    // Cloud workers are a separate, zero-authority socket
+                    // lane — never dashboard clients. Prefer the enrolled
+                    // mTLS identity. An explicitly trusted HTTPS reverse
+                    // proxy may terminate that client-certificate handshake,
+                    // so the dedicated attachment target also accepts a
+                    // signed, timestamped, one-use proof from the SAME
+                    // enrolled worker key. Route either proof before public
+                    // dashboard/hosted-control classification; the result is
+                    // passed only to the attachment broker and never minted
+                    // into an IAM principal or dashboard grant.
+                    let direct_worker_fingerprint = peer_connection_identity
+                        .as_ref()
+                        .filter(|identity| {
+                            identity.profile == crate::access::access_policy::CLOUD_WORKER_PROFILE
+                        })
+                        .map(|identity| identity.fingerprint.clone());
+                    let proxy_attachment_requested =
+                        crate::codex_cloud_attach::proxy_attachment_requested(&header_text);
+                    if (direct_worker_fingerprint.is_some() || proxy_attachment_requested)
+                        && extract_origin_header(&header_text).is_some()
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "browser-originated cloud-worker attachments are not allowed",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+                    let attachment_fingerprint = if direct_worker_fingerprint.is_some() {
+                        direct_worker_fingerprint
+                    } else if proxy_attachment_requested {
+                        let verified = if is_tls && gateway_ingress == GatewayIngress::Direct {
+                            crate::codex_cloud_attach::verify_proxy_attachment_request(
+                                &header_text,
+                                crate::codex_cloud::now_unix_ms(),
+                            )
+                        } else {
+                            Err("cloud-worker proxy attachment requires direct TLS ingress".into())
+                        };
+                        match verified {
+                            Ok(fingerprint) => Some(fingerprint),
+                            Err(_) => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = json_error(
+                                    "401 Unauthorized",
+                                    "cloud-worker attachment proof was not accepted",
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(fingerprint) = attachment_fingerprint {
+                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => ws,
+                            Err(_) => return,
+                        };
+                        crate::codex_cloud_attach::serve_attachment_socket(ws_stream, &fingerprint)
+                            .await;
+                        return;
+                    }
+
                     let base_discovery_only_ws = gateway_ingress.is_reachability_relay()
                         || tls_fleet_origin.is_some()
                         || request_names_known_fleet_origin(&header_text);
@@ -2302,29 +2369,6 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
-                        return;
-                    }
-                    // Enrolled Codex Cloud workers never reach the dashboard
-                    // stream: their zero-authority `cloud-worker` profile
-                    // exists only to authenticate this socket, which becomes
-                    // the lease's attachment heartbeat and nothing else. The
-                    // profile is an authenticated fact from the identity
-                    // store (never a client header), so route on it before
-                    // the bearer gate — the mTLS identity is strictly
-                    // stronger auth than a federation bearer — and before
-                    // any dashboard grant is minted for it.
-                    if let Some(worker_identity) =
-                        peer_connection_identity.as_ref().filter(|identity| {
-                            identity.profile == crate::access::access_policy::CLOUD_WORKER_PROFILE
-                        })
-                    {
-                        let fingerprint = worker_identity.fingerprint.clone();
-                        let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws) => ws,
-                            Err(_) => return,
-                        };
-                        crate::codex_cloud_attach::serve_attachment_socket(ws_stream, &fingerprint)
-                            .await;
                         return;
                     }
                     // Bearer enforcement on /ws — dual-mode (Authorization
