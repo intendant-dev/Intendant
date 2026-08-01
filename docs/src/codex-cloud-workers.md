@@ -472,6 +472,8 @@ The contract is intentionally stricter than an interactive terminal:
   `INTENDANT_REMOTE_CACHE_MAX_BYTES` may set a 256 MiB–1 TiB byte ceiling.
   Intendant configures `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, and a
   stable `SCCACHE_BASEDIRS`, then reports hit/miss/write/error deltas. The
+  loopback sidecar is automatically added to both `NO_PROXY` spellings so a
+  Cloud egress proxy cannot intercept its worker-local HTTP traffic. The
   default remains `cache: "none"`. The Cloud environment must provide
   sccache 0.14 or newer; an explicit durable-cache job fails before the
   requested command when sccache or its relay cannot start. During a running

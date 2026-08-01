@@ -1577,6 +1577,22 @@ fn cache_lane_digest(config: &BTreeMap<String, String>, selected_root: &Path) ->
         .collect()
 }
 
+fn no_proxy_with_loopback(existing: Option<&str>) -> String {
+    let mut value = existing.unwrap_or_default().trim().to_string();
+    for host in ["127.0.0.1", "localhost"] {
+        let present = value
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(host));
+        if !present {
+            if !value.is_empty() {
+                value.push(',');
+            }
+            value.push_str(host);
+        }
+    }
+    value
+}
+
 async fn prepare_cache(
     spec: &RemoteCommandSpec,
     selected_root: &Path,
@@ -1596,6 +1612,19 @@ async fn prepare_cache(
                 "SCCACHE_WEBDAV_ENDPOINT".to_string(),
                 sidecar.endpoint().to_string(),
             );
+            // Codex Cloud injects HTTP(S) proxy variables. Without an
+            // explicit bypass, sccache sends even this loopback WebDAV URL
+            // through the egress proxy, which correctly rejects private
+            // targets. Preserve any caller/worker bypasses while making the
+            // attachment-local sidecar unconditionally direct.
+            for name in ["NO_PROXY", "no_proxy"] {
+                let inherited = spec
+                    .env
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok());
+                env.insert(name.to_string(), no_proxy_with_loopback(inherited.as_deref()));
+            }
             (env, Some(sidecar), true)
         }
         (None, None) if !spec.cache_env.is_empty() => (spec.cache_env.clone(), None, false),
@@ -2026,6 +2055,19 @@ mod tests {
         assert!(output[OUTPUT_LIMIT_BYTES - tail.len()..]
             .iter()
             .all(|byte| *byte == b't'));
+    }
+
+    #[test]
+    fn loopback_cache_proxy_bypass_preserves_existing_hosts() {
+        assert_eq!(
+            no_proxy_with_loopback(Some("registry.example, localhost")),
+            "registry.example, localhost,127.0.0.1"
+        );
+        assert_eq!(
+            no_proxy_with_loopback(Some("127.0.0.1,LOCALHOST")),
+            "127.0.0.1,LOCALHOST"
+        );
+        assert_eq!(no_proxy_with_loopback(None), "127.0.0.1,localhost");
     }
 
     #[test]
