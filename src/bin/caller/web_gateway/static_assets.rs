@@ -1043,6 +1043,52 @@ mod tests {
     /// served run truth — `last_run.state === 'completed'` AND a
     /// self-reported `achieved` — never from transport state alone.
     /// Advisory throughout: nothing here gates approval or firing.
+    /// The safeguards-flagged terminal renders its OWN face — never the
+    /// generic interrupted/failed chip — and every surface states the
+    /// law: never auto-retried, never a model switch, the remedy is a
+    /// fresh-session recast. Daemon side the served key is
+    /// `terminal.class == "safeguards_flagged"` (session_catalog row,
+    /// lifted verbatim by the grid envelope); these needles hold the
+    /// fragments to it.
+    #[test]
+    fn safeguards_flagged_terminal_is_distinct_and_never_generic() {
+        let list = include_str!("../../../../static/app/57a-sessions-list.js");
+        let windows = include_str!("../../../../static/app/39-session-windows.js");
+        let css = include_str!("../../../../static/app/ui2-sessions.css");
+        assert!(
+            list.contains("s.terminal.class === 'safeguards_flagged'"),
+            "the sessions-list chip derives the distinct face from the served terminal class"
+        );
+        assert!(
+            list.contains("'ui-chip err sc-status safeguards-flagged'"),
+            "the distinct chip class replaces the generic status chip for this class"
+        );
+        assert!(
+            list.contains("statusEl.textContent = 'safeguards-flagged'"),
+            "the chip says what happened, never a generic status word"
+        );
+        assert!(
+            list.contains("recast the task in a fresh session"),
+            "the chip's tooltip states the remedy"
+        );
+        assert!(
+            windows.contains("out.class = terminalClass"),
+            "the terminal-facts normalizer forwards the served class key"
+        );
+        assert!(
+            windows.contains("terminal?.class === 'safeguards_flagged'"),
+            "the dead-window statement branches on the served class"
+        );
+        assert!(
+            windows.contains("Never auto-retried and never switched to another model"),
+            "the terminal statement states the no-retry / no-fallback law"
+        );
+        assert!(
+            css.contains(".ui-chip.sc-status.safeguards-flagged"),
+            "the distinct chip face has its own style hook"
+        );
+    }
+
     #[test]
     fn blocked_chip_explains_every_gate_and_the_delivered_wait() {
         let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");

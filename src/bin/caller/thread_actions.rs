@@ -3505,6 +3505,24 @@ pub(crate) async fn drain_external_child_turn(
                 turn: None,
             });
         }
+        DrainOutcome::SafeguardsFlagged { reason, .. } => {
+            // The provider's safeguards flagged the child conversation:
+            // terminal for those bytes — report the law (no retry, no
+            // model switch, recast is the remedy) and emit no child
+            // completion; the flag is the turn's honest outcome.
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "error".to_string(),
+                source: backend_label.clone(),
+                content: format!(
+                    "{} conversation ended on a provider safeguards flag ({}); never \
+                     auto-retried and never switched to another model — recast the request \
+                     in a fresh conversation",
+                    conversation_kind, reason
+                ),
+                turn: None,
+            });
+        }
         DrainOutcome::LimitRejected {
             resets_at_epoch,
             message,

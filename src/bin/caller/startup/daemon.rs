@@ -293,6 +293,23 @@ pub(crate) async fn run_daemon(
             // the wiring edge (tests inject their own handles).
             crate::agenda::published_agenda_handle(),
         ));
+        // The successor's half of spare-under-takeover: sessions a
+        // draining predecessor still holds are spared (on the takeover
+        // topology the boot pass above never even enumerates — the
+        // successor is a secondary at spawn instant), then RELEASED
+        // when the drainer exits, possibly hours later. This watch runs
+        // the scoped readopt pass at that instant instead of leaving
+        // the released set down until the next restart.
+        let watch_bus = startup_bus.clone();
+        let watch_handover = gateway.handover.clone();
+        tokio::spawn(crate::boot_readopt::run_predecessor_exit_watch(
+            crate::platform::home_dir(),
+            watch_bus,
+            watch_handover,
+            readopt_enabled,
+            crate::boot_readopt::READOPT_DISPATCH_SPACING,
+            crate::boot_readopt::RELEASED_SETTLE,
+        ));
     }
     let _ = supervisor_handle.await;
     Ok(())

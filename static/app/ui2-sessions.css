@@ -459,6 +459,13 @@ html.ui-v2 #tab-sessions .session-card .ui-chip.err {
   border-color: transparent;
   color: var(--rose);
 }
+/* The safeguards-flagged terminal chip: err tone plus a dashed border —
+   this class needs a recast (never a retry), so its face must not read
+   as a generic failure. */
+html.ui-v2 #tab-sessions .session-card .ui-chip.sc-status.safeguards-flagged {
+  border-color: rgba(var(--rose-rgb), .55);
+  border-style: dashed;
+}
 html.ui-v2 #tab-sessions .session-card .ui-chip.warn {
   background: rgba(var(--amber-rgb), .14);
   border-color: transparent;

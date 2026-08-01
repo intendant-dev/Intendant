@@ -1856,9 +1856,11 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
     let mut updated_at_secs = session_activity_mtime_secs(dir);
     let mut last_error: Option<(String, String)> = None;
+    let mut safeguards_flag_meta = false;
 
     if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            safeguards_flag_meta = meta.get("safeguards_flag").is_some();
             task = meta
                 .get("task")
                 .and_then(|v| v.as_str())
@@ -2316,6 +2318,20 @@ pub(crate) fn intendant_session_list_row_from_dir(
     // class that never got a summary. Dir-local by construction, so the
     // fingerprint row cache stays correct.
     let mut terminal = serde_json::Map::new();
+    // The safeguards class is served distinctly: the durable meta marker
+    // (stamped at flag time) or — for rows that predate the marker — the
+    // classifier's prose match on the end facts. The chip must never
+    // render this class as generic interrupted/failed.
+    let safeguards_flagged = safeguards_flag_meta
+        || summary_facts
+            .as_ref()
+            .is_some_and(|facts| crate::safeguards_flag_condition(&facts.outcome))
+        || last_error
+            .as_ref()
+            .is_some_and(|(_, message)| crate::safeguards_flag_condition(message));
+    if safeguards_flagged {
+        terminal.insert("class".to_string(), "safeguards_flagged".into());
+    }
     if let Some(facts) = summary_facts {
         terminal.insert("outcome".to_string(), facts.outcome.into());
         if let Some(ended_at) = facts.ended_at {
@@ -3112,6 +3128,81 @@ mod tests {
         .unwrap();
         let row = intendant_session_list_row_from_dir(dir.path(), "ghost-1").unwrap();
         assert_eq!(row["status"], "abandoned");
+    }
+
+    /// The safeguards class is served distinctly on the terminal block —
+    /// from the durable meta marker, and (for rows that predate it) from
+    /// the classifier's prose match on the end facts — so the chip can
+    /// never render this class as a generic terminal.
+    #[test]
+    fn safeguards_flagged_rows_serve_the_terminal_class() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "flagged-1",
+                "created_at": "2026-07-31T00:41:00",
+                "status": "interrupted",
+                "task": "specimen",
+                "safeguards_flag": {
+                    "flagged_at_epoch": 1785400000u64,
+                    "reason_preview": "API Error: Fable 5's safeguards flagged this message",
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let row = intendant_session_list_row_from_dir(dir.path(), "flagged-1").unwrap();
+        assert_eq!(row["terminal"]["class"], "safeguards_flagged");
+
+        // The pre-marker lane: summary-outcome prose (specimen 69c8535e
+        // journaled the flag as its whole outcome).
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir2.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "flagged-2",
+                "created_at": "2026-07-31T00:41:00",
+                "status": "completed",
+                "task": "specimen",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir2.path().join("summary.json"),
+            serde_json::json!({
+                "outcome": "claude-code backend error (success): API Error: Fable 5's \
+                            safeguards flagged this message \
+                            (https://www.anthropic.com/legal/aup).",
+                "ended_at": "2026-07-31T01:25:00",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let row2 = intendant_session_list_row_from_dir(dir2.path(), "flagged-2").unwrap();
+        assert_eq!(row2["terminal"]["class"], "safeguards_flagged");
+
+        // An ordinary failure never wears the class.
+        let dir3 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir3.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "plain-1",
+                "created_at": "2026-07-31T00:41:00",
+                "status": "failed",
+                "task": "plain",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir3.path().join("summary.json"),
+            serde_json::json!({ "outcome": "External agent terminated: exit 1" }).to_string(),
+        )
+        .unwrap();
+        let row3 = intendant_session_list_row_from_dir(dir3.path(), "plain-1").unwrap();
+        assert!(row3["terminal"].get("class").is_none());
     }
 
     /// The daemon session's log carries the bus tee's copies of every

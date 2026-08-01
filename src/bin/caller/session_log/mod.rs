@@ -116,6 +116,28 @@ pub struct SessionMeta {
     /// before 2026-07 lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_park: Option<SessionLimitParkMeta>,
+    /// Durable mark that the provider's safeguards flagged this session's
+    /// conversation and the run ended on it. Terminal for these bytes:
+    /// retrying, parking, or resuming the flagged context re-flags
+    /// forever, so every recovery lane (boot auto-readopt, the
+    /// commission sweep) must LIST a session wearing this marker as
+    /// needs-recast and never nudge it, and no auto-retry lane may ever
+    /// exist for the class. Never cleared automatically — the remedy is
+    /// the owner's fresh-session recast, not a state transition here.
+    /// Additive: metas written before 2026-08 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safeguards_flag: Option<SessionSafeguardsFlagMeta>,
+}
+
+/// A provider-safeguards flag recorded durably (see
+/// [`SessionMeta::safeguards_flag`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionSafeguardsFlagMeta {
+    /// Epoch seconds when the flag ended the run.
+    pub flagged_at_epoch: u64,
+    /// First line of the formatted cause, truncated for one-row surfaces
+    /// (the full text is in the session log's error row).
+    pub reason_preview: String,
 }
 
 /// A parked rate-limit wait recorded durably (see
@@ -644,9 +666,17 @@ impl SessionLog {
         let existing = fs::read_to_string(self.dir.join("session_meta.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok());
-        let (existing_name, existing_worktree, existing_limit_park) = existing
-            .map(|meta| (meta.name, meta.worktree, meta.limit_park))
-            .unwrap_or((None, None, None));
+        let (existing_name, existing_worktree, existing_limit_park, existing_safeguards_flag) =
+            existing
+                .map(|meta| {
+                    (
+                        meta.name,
+                        meta.worktree,
+                        meta.limit_park,
+                        meta.safeguards_flag,
+                    )
+                })
+                .unwrap_or((None, None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -665,6 +695,9 @@ impl SessionLog {
             // mid-park (a credential-reload respawn's write_meta) must
             // not silently release it.
             limit_park: existing_limit_park,
+            // The safeguards flag is terminal for the conversation — no
+            // meta rewrite may ever drop it.
+            safeguards_flag: existing_safeguards_flag,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -711,6 +744,29 @@ impl SessionLog {
             return;
         }
         meta.limit_park = park;
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record the durable provider-safeguards flag in `session_meta.json`
+    /// (see [`SessionMeta::safeguards_flag`]). Set-only — the flag is
+    /// terminal for the conversation and no lane clears it. Missing or
+    /// unreadable meta is a quiet no-op, like [`Self::set_limit_park`].
+    pub fn set_safeguards_flag(&self, flag: SessionSafeguardsFlagMeta) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta.safeguards_flag.as_ref() == Some(&flag) {
+            return;
+        }
+        meta.safeguards_flag = Some(flag);
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
@@ -1805,6 +1861,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -1915,6 +1972,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -1937,6 +1995,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -2000,6 +2059,7 @@ mod tests {
             rounds: None,
             worktree: None,
             limit_park: None,
+            safeguards_flag: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

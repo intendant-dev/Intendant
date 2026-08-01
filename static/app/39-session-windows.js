@@ -628,6 +628,9 @@ function normalizeSessionBootEra(raw) {
 function normalizeSessionTerminalFacts(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const out = {};
+  // Served terminal class ("safeguards_flagged") — the distinct-face key.
+  const terminalClass = compactSessionText(raw.class);
+  if (terminalClass) out.class = terminalClass;
   const outcome = compactSessionText(raw.outcome);
   if (outcome) out.outcome = outcome;
   const endedAt = compactSessionText(raw.ended_at || raw.endedAt);
@@ -681,14 +684,21 @@ function sessionWindowTerminalStatement(sid) {
   const ghost = !!(boot && boot.ghost);
   const status = String(meta.status || '').toLowerCase();
   const failedTerminal = status === 'failed' || status === 'interrupted';
+  const terminal = (boot && boot.terminal) || meta.terminal || null;
+  // The safeguards class always states itself — including rows the
+  // pre-classifier bug journaled as clean completions.
+  const safeguardsFlagged = terminal?.class === 'safeguards_flagged';
   // Clean non-ghost completions keep today's look (the Done pill already
   // says it); the note exists for corpses and dishonest-looking ends.
-  if (!ghost && !failedTerminal) return null;
-  const terminal = (boot && boot.terminal) || meta.terminal || null;
+  if (!ghost && !failedTerminal && !safeguardsFlagged) return null;
   const when = terminal?.endedAt || meta.updatedAt || '';
   const lastError = terminal?.lastError?.message || '';
   let text;
-  if (terminal?.outcome) {
+  if (safeguardsFlagged) {
+    // States the class's whole law: what happened, what will NOT happen
+    // (no auto-retry, no model switch), and the owner's remedy.
+    text = `Flagged by provider safeguards${when ? ` ${when}` : ''} and ended${lastError ? ` (${lastError})` : ''}. Never auto-retried and never switched to another model — recast the task in a fresh session.`;
+  } else if (terminal?.outcome) {
     text = `Ended${when ? ` ${when}` : ''}: ${terminal.outcome}`;
   } else if (status === 'in_progress' || status === 'running') {
     text = `Died mid-turn${when ? ` — last activity ${when}` : ''}${lastError ? ` (${lastError})` : ''}`;
