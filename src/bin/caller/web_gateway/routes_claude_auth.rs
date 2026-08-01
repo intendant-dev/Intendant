@@ -620,7 +620,10 @@ mod tests {
         // definition — the ceremony and watch stories may never drift
         // into separate reload lists.
         assert!(
-            fragment.matches("agentSigninReloadPanel(provider, spec)").count() >= 3,
+            fragment
+                .matches("agentSigninReloadPanel(provider, spec)")
+                .count()
+                >= 3,
             "the reload panel must be one shared implementation"
         );
     }

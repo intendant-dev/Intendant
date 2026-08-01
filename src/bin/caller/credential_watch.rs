@@ -223,7 +223,9 @@ pub(crate) enum Identity {
     /// here adopts silently and can never fire.
     Unknown,
     SignedOut,
-    SignedIn { label: Option<String> },
+    SignedIn {
+        label: Option<String>,
+    },
 }
 
 impl Identity {
@@ -616,10 +618,8 @@ pub(crate) async fn run_identity_probe(
         .map_err(|e| format!("identity probe failed to spawn: {e}"))?;
     match provider {
         Provider::Claude => {
-            crate::claude_auth_ceremony::parse_auth_status(&String::from_utf8_lossy(
-                &output.stdout,
-            ))
-            .ok_or_else(|| "auth status output did not parse".to_string())
+            crate::claude_auth_ceremony::parse_auth_status(&String::from_utf8_lossy(&output.stdout))
+                .ok_or_else(|| "auth status output did not parse".to_string())
         }
         Provider::Codex => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -643,9 +643,9 @@ fn persisted_identity(
     source: &str,
 ) -> Identity {
     match current.get(source).cloned().flatten() {
-        Some(label) if !crate::session_vitals::is_minted_era_label(&label) => Identity::SignedIn {
-            label: Some(label),
-        },
+        Some(label) if !crate::session_vitals::is_minted_era_label(&label) => {
+            Identity::SignedIn { label: Some(label) }
+        }
         _ => Identity::Unknown,
     }
 }
