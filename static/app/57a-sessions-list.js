@@ -1112,8 +1112,12 @@ function buildSessionCard(m, derived, ctx) {
 
   if (ctx.viewingPeer) {
     card.classList.add('sc-peer');
-    card.title = 'Open this session on the peer’s dashboard';
-    card.addEventListener('click', () => openPeerSessionExternally(s));
+    // RC-C2: the card opens the transcript HERE, fetched over the
+    // federation link — the peer's own dashboard stays one click away
+    // inside the overlay (frames/recordings/live view live there).
+    card.title = 'Read this session’s transcript (fetched from the peer)';
+    const peerHostForDetail = typeof currentSessionsHostId === 'function' ? currentSessionsHostId() : '';
+    card.addEventListener('click', () => openSessionDetail(s, null, { hostId: peerHostForDetail }));
   } else {
     card.addEventListener('click', () => openSessionDetail(s));
   }

@@ -1840,10 +1840,21 @@ function sessionDetailErrorIsMissing(data) {
 // fallback policy. Callers keep the payload-with-error contract this
 // helper always had — errors surface as data.error, never as throws for
 // delivered responses (sessionDetailErrorIsMissing keys off that).
+//
+// RC-C2: `options.hostId` targets a PEER session's transcript. Two
+// lanes, one response shape (the peer's own api_session_detail body):
+// the browser↔peer dashboard-control tunnel when the link supports it
+// (the `api_sessions {target}` precedent), else the daemon-mediated
+// federation HTTP lane (`api_peer_session_detail`) — the
+// request/response path that works on relay-only links where no
+// datachannel can form. A response the PEER delivered (including its
+// own 403/404 refusals) is returned honestly either way; only an
+// undelivered lane-1 attempt falls through to lane 2.
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
   const source = String(options.source || 'intendant').trim() || 'intendant';
+  const hostId = String(options.hostId || '').trim();
   const params = { session_id: sid, source };
   if (options.limit !== undefined && options.limit !== null) {
     params.limit = options.limit;
@@ -1851,17 +1862,40 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
+  const unwrap = (resp) => {
+    const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+      ? resp.body
+      : {};
+    if (!resp.ok && !data.error) {
+      data.error = `HTTP ${resp.status}`;
+    }
+    return data;
+  };
+  if (hostId) {
+    if (
+      typeof peerDashboardControlSignalAvailable === 'function'
+      && peerDashboardControlSignalAvailable(hostId)
+    ) {
+      const resp = await daemonApi.request('api_session_detail', params, {
+        target: hostId,
+        signal: options.signal,
+        cache: options.cache,
+      });
+      const delivered = resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body);
+      if (resp.ok || delivered) return unwrap(resp);
+      // fall through: the datachannel attempt died undelivered
+    }
+    return unwrap(await daemonApi.request(
+      'api_peer_session_detail',
+      { peer_id: hostId, ...params },
+      { signal: options.signal, cache: options.cache }
+    ));
+  }
   const resp = await daemonApi.request('api_session_detail', params, {
     signal: options.signal,
     cache: options.cache,
   });
-  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
-    ? resp.body
-    : {};
-  if (!resp.ok && !data.error) {
-    data.error = `HTTP ${resp.status}`;
-  }
-  return data;
+  return unwrap(resp);
 }
 
 // daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
@@ -2731,8 +2765,20 @@ function updateDaemonSnapshot(snap) {
   if (!snap || !snap.id) return;
   const idx = daemons.findIndex(d => d.host_id === snap.id);
   if (idx < 0) return;
+  const wasConnected = daemons[idx].connected;
   daemons[idx] = snapshotToDaemonEntry(snap);
   upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
+  // Reconnect transition (RC-C2): pending approvals learned before the
+  // link dropped are unverifiable — anything resolved while the link
+  // was down never produced an `approval_resolved` here. Clear the
+  // host's fold and let the peer's bootstrap re-announce repopulate it
+  // (targets predating the re-announce degrade to the sessions rail's
+  // `needs_approval` boolean — honest, not stale). Approval surfaces
+  // re-render via the helpers' own repaint calls.
+  if (!wasConnected && daemons[idx].connected
+      && typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(snap.id, 'link reconnected — awaiting re-announce');
+  }
   renderDaemonsList();
   if (typeof renderSessionsHostStrip === 'function') renderSessionsHostStrip();
 }
@@ -2763,9 +2809,15 @@ function removeDaemonById(id) {
   removeDashboardAccessTarget(id);
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
-  // approvals — once the peer is gone there's nothing to resolve.
+  // approvals — once the peer is gone there's nothing to resolve
+  // (clearPeerApprovalsForHost also sweeps the merged rail surfaces:
+  // approval panel/queue + attention items).
   expandedDaemons.delete(id);
-  peerPendingApprovals.delete(id);
+  if (typeof clearPeerApprovalsForHost === 'function') {
+    clearPeerApprovalsForHost(id, 'peer removed');
+  } else {
+    peerPendingApprovals.delete(id);
+  }
   // Tear down any active per-peer display: the peer is gone, the
   // RTCPeerConnection has nowhere to send signaling, and leaving it
   // alive would just stall on ICE failure.

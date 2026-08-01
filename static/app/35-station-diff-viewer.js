@@ -1672,11 +1672,14 @@ function stationPhaseFromPeerSession(phase) {
   return 'idle';
 }
 
-// A peer's non-primary sessions as display-only scene nodes orbiting
-// that peer's host (v1: no action pills — the SessionAction handlers
-// assume local session ids). Newest first, capped: the scene is a
-// bounded constellation by design (same doctrine as the recent-session
-// nodes); the peer's own dashboard remains the exhaustive list.
+// A peer's non-primary sessions as scene nodes orbiting that peer's
+// host. Host-scoped actions ride the RC-C1 routing (focus/steer target
+// the composer, interrupt via api_peer_session_control) plus the RC-C2
+// transcript read; a session-attributed pending approval renders the
+// node's approval prompt keyed (host, id). Newest first, capped: the
+// scene is a bounded constellation by design (same doctrine as the
+// recent-session nodes); the peer's own dashboard remains the
+// exhaustive list.
 const PEER_SESSION_SCENE_NODES = 12;
 function stationPeerSessionAgents(d) {
   try {
@@ -1724,9 +1727,26 @@ function stationPeerSessionAgents(d) {
         worktree: '',
         parentId: parentNodeId,
         needsApproval: !!s.needs_approval,
-        approvalId: null,
-        approvalCommand: '',
-        approvalCategory: '',
+        // RC-C2: approvals are session-attributed in the fold — surface
+        // this session's pending ask on its node so the Station prompt
+        // can resolve it (host-keyed; ids collide across daemons).
+        ...(() => {
+          const pending = typeof peerPendingApprovals !== 'undefined'
+            ? peerPendingApprovals.get(d.host_id)
+            : null;
+          if (pending) {
+            for (const [aid, entry] of pending) {
+              if (entry.sessionId && entry.sessionId === id) {
+                return {
+                  approvalId: aid,
+                  approvalCommand: entry.command || '',
+                  approvalCategory: entry.category || '',
+                };
+              }
+            }
+          }
+          return { approvalId: null, approvalCommand: '', approvalCategory: '' };
+        })(),
         sessionId: id,
         source,
         relationshipKind: kind,
