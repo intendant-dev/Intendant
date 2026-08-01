@@ -1037,14 +1037,18 @@ mod tests {
         let mut malformed = invite_v2("not-32-bytes");
         malformed.version = 2;
         let err = decode_invite(&encode_invite(&malformed).unwrap()).unwrap_err();
-        assert!(err.to_string().contains("invalid identity key"), "got: {err}");
+        assert!(
+            err.to_string().contains("invalid identity key"),
+            "got: {err}"
+        );
 
         // Future version: refused loudly (fail closed).
         let mut v3 = invite_v2(&key);
         v3.version = 3;
         let err = decode_invite(&encode_invite(&v3).unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported peer invite version 3"),
+            err.to_string()
+                .contains("unsupported peer invite version 3"),
             "got: {err}"
         );
     }
@@ -1057,12 +1061,9 @@ mod tests {
         ensure_certs(tmp.path(), &names("10.0.0.9"), "peer", false).unwrap();
         let identity = test_identity(tmp.path());
 
-        let outcome = create_invite_from_cert_dir(
-            tmp.path(),
-            InviteOptions::default(),
-            Some(&identity),
-        )
-        .unwrap();
+        let outcome =
+            create_invite_from_cert_dir(tmp.path(), InviteOptions::default(), Some(&identity))
+                .unwrap();
         assert_eq!(outcome.invite.version, 2);
         assert_eq!(
             outcome.invite.daemon_identity_public_key.as_deref(),
@@ -1070,8 +1071,8 @@ mod tests {
         );
         decode_invite(&outcome.encoded).expect("v2 invite validates");
 
-        let legacy = create_invite_from_cert_dir(tmp.path(), InviteOptions::default(), None)
-            .unwrap();
+        let legacy =
+            create_invite_from_cert_dir(tmp.path(), InviteOptions::default(), None).unwrap();
         assert_eq!(legacy.invite.version, 1);
         assert!(legacy.invite.daemon_identity_public_key.is_none());
     }

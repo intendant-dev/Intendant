@@ -424,9 +424,10 @@ impl IntendantWsTransport {
                 response.status()
             )));
         }
-        let card: AgentCard = response.json().await.map_err(|e| {
-            PeerError::Auth(format!("attestation prefetch parse {card_url}: {e}"))
-        })?;
+        let card: AgentCard = response
+            .json()
+            .await
+            .map_err(|e| PeerError::Auth(format!("attestation prefetch parse {card_url}: {e}")))?;
         card.identity_attestation.ok_or_else(|| {
             PeerError::Auth(format!(
                 "peer at {card_url} serves no identity attestation but this peer is \
@@ -1697,8 +1698,7 @@ mod tests {
         let access_dir = tempfile::tempdir().expect("attested peer access store");
         let served = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let attested_cert_pem = if mismatched_leaf {
-            let other =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
             other.cert.pem()
         } else {
             served.cert.pem()
@@ -1911,8 +1911,7 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("wss://localhost:{}/ws", peer.port);
-        let mut creds =
-            attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
         // Even a correct raw pin must not rescue the candidate: the
         // paired identity key commits public-name dials to attestation.
         creds.pinned_fingerprints =
@@ -1961,8 +1960,7 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let url = format!("wss://127.0.0.1:{}/ws", peer.port);
-        let mut creds =
-            attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
         creds.pinned_fingerprints =
             vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()];
         let effective = creds.effective_tls.clone();
@@ -2033,8 +2031,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<PeerEvent>(64);
         let ip_url = format!("wss://127.0.0.1:{}/ws", peer.port);
-        let mut creds =
-            attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
+        let mut creds = attested_credentials(peer.identity.public_key_b64u(), state_dir.path());
         creds.pinned_fingerprints =
             vec![crate::access::pinning::parse_fingerprint(&peer.server_cert_fp_hex).unwrap()];
         let mut transport = IntendantWsTransport::with_credentials(ip_url, tx, creds);

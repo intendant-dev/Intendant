@@ -936,9 +936,7 @@ fn status_response(stored: &StoredAccessRequest) -> AccessRequestStatusResponse 
                     .clone()
                     .unwrap_or_else(|| DEFAULT_PROFILE.to_string()),
                 approved_at_unix: stored.approved_at_unix.unwrap_or(stored.created_at_unix),
-                target_daemon_identity_public_key: stored
-                    .target_daemon_identity_public_key
-                    .clone(),
+                target_daemon_identity_public_key: stored.target_daemon_identity_public_key.clone(),
             })
     } else {
         None

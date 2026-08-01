@@ -655,11 +655,7 @@ mod tests {
 
         let mut config = WebGatewayConfig::default();
         config.attestation_identity_path = Some(identity_path);
-        let live = AgentCardLive::new(
-            base_card_value(),
-            &config,
-            access_dir.path().to_path_buf(),
-        );
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
 
         let first = live.render_json();
         let card: crate::peer::AgentCard = serde_json::from_str(&first).unwrap();
@@ -667,7 +663,10 @@ mod tests {
         let expected_fp = crate::access::pinning::format_fingerprint(
             &crate::access::pinning::fingerprint_of_der(first_leaf.cert.der().as_ref()),
         );
-        assert_eq!(block.access_cert_fingerprint.as_deref(), Some(&*expected_fp));
+        assert_eq!(
+            block.access_cert_fingerprint.as_deref(),
+            Some(&*expected_fp)
+        );
         assert!(crate::access::identity_attestation::verify_attestation(
             &block,
             &identity.public_key_b64u()
@@ -687,11 +686,9 @@ mod tests {
         let rotated_block = rotated.identity_attestation.expect("re-signed");
         assert_eq!(
             rotated_block.access_cert_fingerprint.as_deref(),
-            Some(
-                &*crate::access::pinning::format_fingerprint(
-                    &crate::access::pinning::fingerprint_of_der(second_leaf.cert.der().as_ref())
-                )
-            ),
+            Some(&*crate::access::pinning::format_fingerprint(
+                &crate::access::pinning::fingerprint_of_der(second_leaf.cert.der().as_ref())
+            )),
             "rotation re-binds the CURRENT leaf"
         );
         assert!(
@@ -726,34 +723,25 @@ mod tests {
         config.connect.relay_enabled = true;
         config.connect.relay_endpoint = Some("relay.example.com:9443".to_string());
         // Admission off: no candidate port.
-        let live = AgentCardLive::new(
-            base_card_value(),
-            &config,
-            access_dir.path().to_path_buf(),
-        );
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
         assert_eq!(live.relay_candidate_port, None);
         // Both on: armed with the endpoint's port.
         config.connect.relay_peer_admission = true;
-        let live = AgentCardLive::new(
-            base_card_value(),
-            &config,
-            access_dir.path().to_path_buf(),
-        );
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
         assert_eq!(live.relay_candidate_port, Some(9443));
         // Relay off (admission alone): no candidate.
         config.connect.relay_enabled = false;
-        let live = AgentCardLive::new(
-            base_card_value(),
-            &config,
-            access_dir.path().to_path_buf(),
-        );
+        let live = AgentCardLive::new(base_card_value(), &config, access_dir.path().to_path_buf());
         assert_eq!(live.relay_candidate_port, None);
     }
 
     #[test]
     fn relay_public_port_parses_endpoint_shapes() {
         assert_eq!(relay_public_port(Some("relay.example.com:443")), Some(443));
-        assert_eq!(relay_public_port(Some("relay.example.com:9443")), Some(9443));
+        assert_eq!(
+            relay_public_port(Some("relay.example.com:9443")),
+            Some(9443)
+        );
         assert_eq!(relay_public_port(Some("relay.example.com")), Some(443));
         assert_eq!(relay_public_port(Some("[fdc2::1]:8443")), Some(8443));
         assert_eq!(relay_public_port(Some("  ")), None);

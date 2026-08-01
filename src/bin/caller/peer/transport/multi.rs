@@ -205,7 +205,10 @@ mod tests {
     impl StubTransport {
         fn new(url: &str, connect_succeeds: bool) -> Self {
             Self {
-                spec: TransportSpec::IntendantWs { url: url.into(), relay: false },
+                spec: TransportSpec::IntendantWs {
+                    url: url.into(),
+                    relay: false,
+                },
                 connect_succeeds,
                 connected: AtomicBool::new(false),
                 connect_count: Arc::new(AtomicUsize::new(0)),

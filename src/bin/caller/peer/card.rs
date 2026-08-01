@@ -119,7 +119,8 @@ pub struct AgentCard {
     /// identity; grafted at serve time, so locally constructed cards
     /// leave it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_attestation: Option<crate::access::identity_attestation::DaemonIdentityAttestation>,
+    pub identity_attestation:
+        Option<crate::access::identity_attestation::DaemonIdentityAttestation>,
 }
 
 /// One way to reach a peer.
@@ -795,7 +796,10 @@ mod tests {
         // Old-shape wire form (no field) parses as direct.
         let legacy: TransportSpec =
             serde_json::from_str(r#"{ "type": "intendant-ws", "url": "wss://x/ws" }"#).unwrap();
-        assert!(matches!(legacy, TransportSpec::IntendantWs { relay: false, .. }));
+        assert!(matches!(
+            legacy,
+            TransportSpec::IntendantWs { relay: false, .. }
+        ));
     }
 
     /// The `identity_attestation` block is additive: absent parses to

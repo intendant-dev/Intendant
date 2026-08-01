@@ -1785,7 +1785,10 @@ mod tests {
         let picked = pick_supported_transports(&transports);
         assert_eq!(picked.len(), 2);
         match (&picked[0], &picked[1]) {
-            (TransportSpec::IntendantWs { url: a, .. }, TransportSpec::IntendantWs { url: b, .. }) => {
+            (
+                TransportSpec::IntendantWs { url: a, .. },
+                TransportSpec::IntendantWs { url: b, .. },
+            ) => {
                 assert_eq!(a, "ws://lan/ws");
                 assert_eq!(b, "ws://tail/ws");
             }

@@ -274,7 +274,11 @@ impl HighWaterStore {
         Ok(())
     }
 
-    fn persist(&self, paired_identity_public_key: &str, issued_at_unix_ms: u64) -> Result<(), String> {
+    fn persist(
+        &self,
+        paired_identity_public_key: &str,
+        issued_at_unix_ms: u64,
+    ) -> Result<(), String> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| format!("create attestation state dir {}: {e}", self.dir.display()))?;
         let record = HighWaterRecord {
@@ -284,8 +288,8 @@ impl HighWaterStore {
         };
         let path = self.record_path(paired_identity_public_key);
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec(&record)
-            .map_err(|e| format!("serialize attestation state: {e}"))?;
+        let bytes =
+            serde_json::to_vec(&record).map_err(|e| format!("serialize attestation state: {e}"))?;
         std::fs::write(&tmp, &bytes)
             .map_err(|e| format!("write attestation state {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
@@ -376,9 +380,8 @@ mod tests {
         let key = identity.public_key_b64u();
 
         let mut tampered = att.clone();
-        tampered.fleet_cert_fingerprint = Some(
-            "9999999999999999999999999999999999999999999999999999999999999999".into(),
-        );
+        tampered.fleet_cert_fingerprint =
+            Some("9999999999999999999999999999999999999999999999999999999999999999".into());
         assert!(verify_attestation(&tampered, &key).is_err());
 
         let mut tampered = att.clone();

@@ -1778,7 +1778,10 @@ mod tests {
             label: name.into(),
             version: "0.0.0".into(),
             git_sha: None,
-            transports: vec![TransportSpec::IntendantWs { url: ws_url.into(), relay: false }],
+            transports: vec![TransportSpec::IntendantWs {
+                url: ws_url.into(),
+                relay: false,
+            }],
             capabilities: vec![],
             auth: AuthRequirements::none(),
             identity_attestation: None,
