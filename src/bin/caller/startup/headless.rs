@@ -495,7 +495,7 @@ pub(crate) async fn run_headless_mode(
     } else {
         None
     };
-    let vitals_git_targets = vitals.as_ref().map(|(targets, _)| targets.clone());
+    let vitals_git_targets = vitals.as_ref().map(|(targets, _, _)| targets.clone());
     // Publish for read-side lanes (the Changes tab's working-tree list) —
     // mirrors daemon boot: the tab resolves a session's checkout through
     // the same effective target the dirty chip probes.
