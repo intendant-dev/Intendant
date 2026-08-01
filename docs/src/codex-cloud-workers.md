@@ -283,7 +283,12 @@ INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1
 In that mode the worker validates the public endpoint with normal WebPKI
 instead of pinning Intendant's inner TLS certificate. It still generates the
 same task-local P-256 key and receives the same zero-authority client
-certificate. Every WebSocket attempt signs a transcript containing the exact
+certificate. The enrollment request carries the same bounded JSON in its
+normal POST body and in a base64url header because some managed egress proxies
+have been observed to preserve request headers while dropping POST bodies.
+Home accepts the header only as a body fallback and requires the two byte
+copies to agree when both arrive; the single-use token never enters the URL.
+Every WebSocket attempt signs a transcript containing the exact
 attachment path, certificate fingerprint, task id, random nonce, and current
 timestamp. Home verifies it against the public key stored at enrollment and
 atomically consumes the nonce; a captured request cannot be replayed. The

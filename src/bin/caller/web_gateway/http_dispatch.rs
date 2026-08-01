@@ -1224,9 +1224,14 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::CodexCloudEnroll => {
+                let enrollment_header = extract_header_value(
+                    header_text,
+                    crate::codex_cloud_attach::ENROLL_REQUEST_HEADER,
+                );
                 return handle_codex_cloud_enroll(
                     stream,
                     route_body,
+                    enrollment_header,
                     cert_dir,
                     source_hint.clone(),
                     route.cors,

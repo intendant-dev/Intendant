@@ -37,6 +37,12 @@ pub(crate) const DEFAULT_IDENTITY_TTL_S: u64 = 3600;
 /// The public redemption doorbell's path — the one spelling shared by the
 /// route table, the certless carve-out predicate, and the worker's dial.
 pub(crate) const ENROLL_PATH: &str = "/api/codex-cloud/enroll";
+/// Bounded base64url copy of the enrollment JSON. Some managed egress
+/// proxies preserve request headers while dropping POST bodies; the worker
+/// sends both, and home requires byte equality whenever both arrive.
+pub(crate) const ENROLL_REQUEST_HEADER: &str = "x-intendant-cloud-enrollment";
+/// One limit shared by the HTTP body policy and the header fallback decoder.
+pub(crate) const ENROLL_REQUEST_MAX_BYTES: usize = 8 * 1024;
 /// Dedicated WebSocket target for Cloud attachments. Keeping the
 /// application-proof fallback off the dashboard's ordinary `/ws` target
 /// makes the zero-authority lane explicit even when a reverse proxy has
@@ -1268,17 +1274,31 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
+    let enrollment_payload = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "token": &token,
+        "public_key_pem": key_pair.public_key_pem(),
+        "worker": &worker_fingerprint,
+    }))
+    .map_err(|e| format!("serialize enrollment request: {e}"))?;
+    if enrollment_payload.len() > ENROLL_REQUEST_MAX_BYTES {
+        return Err(format!(
+            "enrollment request is too large ({} bytes; limit {ENROLL_REQUEST_MAX_BYTES})",
+            enrollment_payload.len()
+        ));
+    }
+    let enrollment_header = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&enrollment_payload)
+    };
     let enrollment_deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(DEFAULT_TOKEN_TTL_S);
     let text = loop {
         let response = client
             .post(&enroll_url)
-            .json(&serde_json::json!({
-                "version": 1,
-                "token": &token,
-                "public_key_pem": key_pair.public_key_pem(),
-                "worker": &worker_fingerprint,
-            }))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(ENROLL_REQUEST_HEADER, &enrollment_header)
+            .body(enrollment_payload.clone())
             .send()
             .await
             .map_err(|e| format!("POST {enroll_url}: {e}"))?;
