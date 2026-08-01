@@ -266,7 +266,10 @@ impl PeerActor {
             card.transports = self
                 .via_urls
                 .iter()
-                .map(|url| crate::peer::card::TransportSpec::IntendantWs { url: url.clone() })
+                .map(|url| crate::peer::card::TransportSpec::IntendantWs {
+                    url: url.clone(),
+                    relay: false,
+                })
                 .collect();
         }
     }
@@ -898,6 +901,7 @@ mod tests {
         actor.transport = Box::new(KeepaliveProbeTransport {
             spec: crate::peer::card::TransportSpec::IntendantWs {
                 url: "ws://127.0.0.1:1/ws".into(),
+                relay: false,
             },
             pings: Arc::clone(&pings),
             fail_on: 3,
@@ -969,6 +973,7 @@ mod tests {
             transports: Vec::new(),
             capabilities: Vec::new(),
             auth: crate::peer::card::AuthRequirements::none(),
+            identity_attestation: None,
         };
         let (card_tx, _card_rx) = watch::channel(Arc::new(card));
         let (sessions_tx, _sessions_rx) = watch::channel(Arc::new(Vec::new()));
@@ -981,6 +986,7 @@ mod tests {
             transport: Box::new(StubTransport(
                 crate::peer::card::TransportSpec::IntendantWs {
                     url: "ws://127.0.0.1:1/ws".into(),
+                    relay: false,
                 },
             )),
             commands_rx,

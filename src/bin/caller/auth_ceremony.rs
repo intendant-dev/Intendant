@@ -628,6 +628,18 @@ impl CeremonyManager {
         inner.state.as_ref().filter(|s| s.id == id).map(|s| s.phase)
     }
 
+    /// The provider of a live (non-terminal) ceremony, `None` when the
+    /// slot is idle or terminal — the credential watch's "the ceremony
+    /// owns the credential store right now" question.
+    pub(crate) fn live_provider(&self) -> Option<Provider> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .state
+            .as_ref()
+            .filter(|s| !s.phase.is_terminal())
+            .map(|s| s.provider)
+    }
+
     #[cfg(test)]
     pub(crate) fn current_phase(&self) -> Option<CeremonyPhase> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

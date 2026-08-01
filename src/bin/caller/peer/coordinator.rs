@@ -243,9 +243,11 @@ mod tests {
             git_sha: None,
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.to_string(),
+                relay: false,
             }],
             capabilities: caps,
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 

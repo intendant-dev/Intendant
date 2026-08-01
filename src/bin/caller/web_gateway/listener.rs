@@ -718,8 +718,15 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             }
         }
     }
-    let agent_card_json =
-        serde_json::to_string(&agent_card_value).unwrap_or_else(|_| "{}".to_string());
+    // Live card renderer (RC-B2): the spawn-built base above plus the
+    // dynamic blocks — the daemon-identity attestation over the current
+    // TLS leaves and the relay-mode fleet-name candidate — re-rendered
+    // when those inputs move (certificate renewal, Connect registration).
+    let agent_card_live = Arc::new(AgentCardLive::new(
+        agent_card_value.clone(),
+        &config,
+        access_cert_dir.clone(),
+    ));
     // Arc'd once at spawn: the per-request `HttpRequestCtx` rebuild used to
     // deep-clone this multi-KB JSON tree for every request since keep-alive.
     let agent_card_value_for_targets = Arc::new(agent_card_value.clone());
@@ -801,7 +808,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // startup (hostnames may not resolve at boot for Tailscale /
     // mDNS / etc).
     let relay_advertise_url: Option<String> = agent_card.transports.iter().find_map(|t| match t {
-        crate::peer::TransportSpec::IntendantWs { url } => Some(url.clone()),
+        crate::peer::TransportSpec::IntendantWs { url, .. } => Some(url.clone()),
         _ => None,
     });
 
@@ -1526,7 +1533,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let bus = bus.clone();
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
-            let agent_card_json = agent_card_json.clone();
+            let agent_card_live = agent_card_live.clone();
             let agent_card_value_for_targets = agent_card_value_for_targets.clone();
             let peer_access_request_config = peer_access_request_config.clone();
             let peer_registry = peer_registry.clone();
@@ -2063,7 +2070,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
                         session_model: session_model.clone(),
-                        agent_card_json: agent_card_json.clone(),
+                        agent_card_live: agent_card_live.clone(),
                         agent_card_value_for_targets: agent_card_value_for_targets.clone(),
                         app_html: app_html.clone(),
                         app_html_override: app_html_override.clone(),
@@ -5194,7 +5201,7 @@ mod tests {
         assert_eq!(card.transports.len(), 1, "expected one transport");
         let expected_url_prefix = format!("ws://127.0.0.1:{port}");
         match &card.transports[0] {
-            TransportSpec::IntendantWs { url } => {
+            TransportSpec::IntendantWs { url, .. } => {
                 assert!(
                     url.starts_with(&expected_url_prefix) && url.ends_with("/ws"),
                     "transport URL {url} should start with {expected_url_prefix} and end with /ws"

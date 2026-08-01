@@ -344,9 +344,11 @@ can actually do *now*, instead of guessing from the row's existence:
   treat unknown as "act and report", never as denial.
 - **`link`** — after each successful connect the actor records which
   transport candidate won (`MultiTransport` re-walks candidates per
-  reconnect) as `{url, transport_class}`. `transport_class` is `direct`
-  for every candidate built today; the Stage-B relay candidate (RC-B2)
-  classifies `relayed`. Media and datachannel affordances — live display,
+  reconnect) as `{url, transport_class}`. The class rides the candidate's
+  own `TransportSpec`: operator/card URLs classify `direct`, and the
+  relay-mode fleet-name candidate — stamped `"relay": true` on the card
+  by its one constructor, the target's card render — classifies
+  `relayed`. Media and datachannel affordances — live display,
   file-transfer bytes, the browser↔peer dashboard-control tunnel — are
   rendered from this class: a relay-only link carries signaling and
   request/response but nothing ICE-borne without a direct route or
@@ -585,6 +587,78 @@ client. Each use rechecks the client certificate/key file identity (including
 inode identity on Unix) and the pin set, so an atomic certificate rotation
 rebuilds the TLS material on the next request without requiring a daemon
 restart.
+
+### Identity-bound verification — fleet names and relayed dials
+
+The raw pin verifies exactly one certificate, and a **fleet-name dial is
+not answered by it**: the target's SNI resolver serves the WebPKI fleet
+certificate for its fleet name (and rotates it at every ACME renewal), so
+an invite-pinned peer fails its pin against any fleet-name candidate —
+relayed through Connect or dialed direct. Pinning the current fleet leaf
+by hand "works" until the next renewal; it is deliberately not the
+product answer.
+
+The product answer generalizes the pin to the peer's **daemon identity**
+(`daemon_identity.rs` — an Ed25519 key that survives IP and certificate
+rotation). Pairing persists the target's identity public key on the
+dialer — version 2 invites and doorbell approval results carry it under
+exactly the custody the `server_cert_fingerprint` pin rides today (the
+out-of-band invite; the fingerprint-pinned approval channel) — and the
+target serves a signed **identity attestation** on its agent card
+(`access/identity_attestation.rs`): a versioned, domain-separated
+transcript binding its Connect daemon id, the identity public key, the
+SHA-256 fingerprints of its *current* access and fleet leaves, and
+`issued_at_unix_ms`. The block is content-signed discovery data — the
+fetch transport carries no trust.
+
+For a candidate whose host is a **DNS name**, a dialer holding the paired
+identity key resolves its verification per connect attempt:
+
+1. Prefetch the candidate's card over an accept-any-certificate probe
+   (no client certificate is presented — nothing about the dialer leaks
+   to an unverified endpoint).
+2. Verify the attestation **against the paired key only** — a document
+   signed by any other identity key refuses, however self-consistent.
+3. Enforce the persisted per-identity `issued_at` floor: the highest
+   verified stamp is stored beside the peer credentials
+   (`<access-certs>/peers/attestation-state/`), so a replayed older
+   attestation — a relay re-serving a rotated-away leaf — refuses, across
+   daemon restarts. Stamps beyond ten minutes of future skew refuse
+   without ratcheting the floor.
+4. Pin exactly the attested leaf fingerprints for **both** connect legs
+   (card fetch + WebSocket attach — one shared TLS-cache entry), with a
+   **TLS 1.3 floor** so the client certificate never crosses a relay in
+   cleartext (TLS 1.2 sends it in the clear).
+
+Every failure — no attestation block, wrong key, bad signature, stale
+stamp — **fails that candidate outright**: no WebPKI fallback, no
+unpinned fallback, no raw-pin fallback. `MultiTransport` walks on to the
+next candidate, and the next reconnect fetches a fresh attestation, so a
+mid-rotation race self-heals on the ordinary backoff walk. The target
+re-signs whenever its live leaves change (the `install_fleet_certificate`
+hot-swap path feeds the next card render), which is what makes fleet-name
+federation rotation-proof.
+
+Candidates whose host is an **IP literal**, cleartext `ws://` candidates,
+and every peer paired without an identity key keep the raw-pin behavior
+byte-for-byte. Legacy pairings therefore work exactly as before — and
+still fail on fleet-name candidates; re-pair (a fresh invite or doorbell
+round) to pick up the identity key.
+
+### The relay candidate
+
+A daemon with the Connect relay live **and** `[connect]
+relay_peer_admission` on advertises one extra transport, appended **last**
+on its card once registration reports its fleet name:
+`{"type": "intendant-ws", "url": "wss://<fleet-name>:<relay-port>/ws",
+"relay": true}`. Operator `via_urls` / `--advertise-url` entries keep
+walk-order precedence (the card lists them first, and dialer-side
+`via_urls` still replace card transports entirely), and a URL the
+operator already listed is never duplicated. The `relay: true` stamp is
+what classifies the link `relayed` on `PeerSnapshot.link`; old daemons
+ignore the unknown field and treat the entry as a plain URL. Because the
+candidate is a fleet-name dial, it verifies through the identity
+attestation — which is why relay reachability requires a v2 pairing.
 
 ## Cross-Machine Display
 
@@ -890,6 +964,11 @@ cert store and writes or updates an outbound `[[peer]]` block in
 - `card_url` — where to fetch the peer's Agent Card
 - `client_cert` / `client_key` — the peer-issued mTLS keycard this daemon presents
 - `pinned_fingerprints` — the accepting daemon's exact server certificate pin
+- `identity_public_key` — the accepting daemon's Ed25519 identity key (version 2
+  invites; pre-B2 issuers emit version 1 without it, and pre-B2 joiners refuse a
+  version 2 invite loudly rather than dropping the key). With it stored, DNS-name
+  candidates verify through the identity attestation above; without it, every
+  candidate keeps raw-pin behavior
 
 If `--card-url` is omitted, `invite` derives
 `https://<access-primary-ip>:8765/.well-known/agent-card.json` from

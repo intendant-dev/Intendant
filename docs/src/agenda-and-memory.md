@@ -224,7 +224,31 @@ actionable wait it is — "delivered · awaiting Complete" (sky, the
 self-report hue) — distinct from genuinely in-flight work; calm depth
 folds only the in-flight waits (a chip tap unfolds them), while stated
 blockers and delivered waits always render. All of it stays advisory:
-blocked gates neither approval nor firing.
+blocked gates neither approval nor firing. Beside the flag, both
+serving grains carry the **`blocked_on` decoration**: the named causes
+(each uncleared blocker's criterion; each unsatisfied prerequisite's
+live title and status), stamped at the serving seam beside the effects'
+fireability verdicts like `next_fire_ms`, never folded from ops — the
+served truth the approve-surface confirms below derive from.
+
+**Blocked never gates approval — advisory plus confirm.** Blocked-state
+is bookkeeping that lags reality in both directions (a finished
+prerequisite awaiting its Complete tap; a completed-but-unfinished one),
+and blocker criteria are explicitly unevaluated — so approving a
+scheduled session on a currently blocked item is always allowed, and the
+approve/deny lever stays the owner's absolute call. What every approve
+surface adds is one NAMED confirm when the manifest is time-floored:
+the dashboard strips and inspector ask "prerequisite *title* is still
+open — approve anyway?" (derived from the served `blocked_on` truth,
+never a client-side join), and `ctl agenda approve` prints the same
+named warning and proceeds. Nothing refuses; the fireability validator
+is a separate, unchanged concern. The mechanically right enforcement
+point for dependents is **fire-time trigger semantics**: propose the
+manifest with the `on_unblock` trigger (the manifest editor sheet and
+`ctl agenda schedule` suggest it for items with `relies_on` edges) and
+approval-anytime becomes safe by construction — approve early, the fire
+waits for the real unblock. Event-triggered manifests therefore skip
+the confirm entirely, which also keeps workflow batch approvals quiet.
 
 ### Typed references (G1)
 
@@ -440,6 +464,24 @@ Agent sessions and peer daemons may propose manifests but cannot approve or
 revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
+
+**The spawn governor (2026-08-01): simultaneous fires stagger.** When
+several due occurrences would dispatch at once — eight approvals in seven
+seconds once fired eight seats in one second, pinning the daemon at 230%
+CPU and starving its control plane for ten minutes — the dispatch seam
+serializes spawn starts at one per 30s (a tuned constant, never a knob)
+in due-instant-then-approval order, so worktree creation and backend
+warmup never overlap. A solo fire never waits: the stagger engages only
+under contention, meaning a second spawn wants in while the previous
+start's interval still runs (run-now gestures included). A held
+occurrence is not journaled — it stays due and re-plans on the next
+pass, so completing or retiring the item or revoking the approval
+between slots cancels it for free, and its eventual journal row records
+the actual dispatch instant beside the due instant it was held from.
+Cadence, trigger, and requested fires all ride the same governor. This
+is the burst limiter: distinct from the rustc compile governor (same
+philosophy, different resource) and composable with a future
+headroom/admission program (the level limiter).
 
 **Withdrawing a pending proposal (`withdraw_effect`,
 `ctl agenda withdraw ID [--reason]`, the card's Decline).** A

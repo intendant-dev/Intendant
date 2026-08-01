@@ -127,6 +127,13 @@ fn default_identity_path() -> PathBuf {
     default_identity_dir().join(ED25519_PKCS8_FILE)
 }
 
+/// The default key path [`DaemonIdentity::load_or_create_default`] uses,
+/// for callers that inject the path through a config edge instead of
+/// loading here (the gateway's attestation signer).
+pub fn default_identity_key_path() -> PathBuf {
+    default_identity_path()
+}
+
 #[cfg(unix)]
 fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write as _;

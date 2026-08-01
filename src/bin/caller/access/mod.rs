@@ -25,6 +25,7 @@ pub mod client_key;
 pub mod enrollment;
 pub mod hosted_control;
 pub mod iam;
+pub mod identity_attestation;
 pub mod org;
 pub mod pinning;
 pub mod state;

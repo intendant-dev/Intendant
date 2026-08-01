@@ -41,7 +41,7 @@ pub struct PeerApiReply {
 /// card snapshot by the actor.
 fn gateway_http_base(card: &super::card::AgentCard) -> Option<String> {
     for spec in &card.transports {
-        if let super::card::TransportSpec::IntendantWs { url } = spec {
+        if let super::card::TransportSpec::IntendantWs { url, .. } = spec {
             return Some(ws_url_to_http_base(url));
         }
     }
@@ -108,9 +108,16 @@ pub async fn fetch_peer_session_detail(
         url.push_str(&format!("before={before}"));
     }
     let creds = handle.transport_credentials();
+    // Ride the live link's resolved verification policy (RC-B2): for an
+    // identity-attested peer the raw stored pin no longer matches what a
+    // fleet-name endpoint presents, so this side-channel shares the
+    // transport's trust decision like `/mcp` and the witness fetch.
     let client = creds
         .tls
-        .http_client(&creds.pinned_fingerprints, creds.client_identity.as_ref())
+        .http_client_for_policy(
+            &creds.effective_tls_policy(),
+            creds.client_identity.as_ref(),
+        )
         .map_err(|e| format!("build peer http client: {e}"))?;
     // The peer-client marker opts into fail-closed handling on the
     // gateway: an unresolvable client cert is a 403, never a silent
@@ -164,6 +171,7 @@ mod tests {
             transports,
             capabilities: Vec::new(),
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -171,6 +179,7 @@ mod tests {
     fn gateway_base_derives_from_ws_transport() {
         let card = card_with(vec![TransportSpec::IntendantWs {
             url: "wss://peer.example:8443/ws".into(),
+            relay: false,
         }]);
         assert_eq!(
             gateway_http_base(&card).as_deref(),
@@ -232,6 +241,7 @@ mod tests {
             let (log_tx, _log_rx) = tokio::sync::mpsc::channel(crate::peer::LOG_CHANNEL_CAPACITY);
             let card = card_with(vec![TransportSpec::IntendantWs {
                 url: format!("ws://{addr}/ws"),
+                relay: false,
             }]);
             let url_for_closure = format!("ws://{addr}/ws");
             let handle = crate::peer::handle::spawn_peer(
@@ -288,6 +298,7 @@ mod tests {
             let (log_tx, _log_rx) = tokio::sync::mpsc::channel(crate::peer::LOG_CHANNEL_CAPACITY);
             let card = card_with(vec![TransportSpec::IntendantWs {
                 url: "ws://127.0.0.1:1/ws".into(),
+                relay: false,
             }]);
             let handle = crate::peer::handle::spawn_peer(
                 card.id.clone(),

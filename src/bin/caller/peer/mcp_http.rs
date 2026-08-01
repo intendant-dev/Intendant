@@ -69,7 +69,7 @@ pub fn mcp_endpoint(card: &AgentCard) -> Option<String> {
         }
     }
     for spec in &card.transports {
-        if let TransportSpec::IntendantWs { url } = spec {
+        if let TransportSpec::IntendantWs { url, .. } = spec {
             return Some(format!("{}/mcp", ws_url_to_http_base(url)));
         }
     }
@@ -98,10 +98,16 @@ pub async fn call_peer_mcp_tool(
     // Shared with the transport's card fetch: one pooled client per
     // credentials bundle, so a CU loop's dozens of tool calls reuse the
     // TCP+TLS connection instead of a fresh handshake (and root-store
-    // load) per call.
+    // load) per call. The effective policy keeps this side-channel on
+    // the same trust decision as the live link — for an identity-
+    // attested peer the raw stored pin no longer matches what a
+    // fleet-name endpoint presents.
     let client = creds
         .tls
-        .http_client(&creds.pinned_fingerprints, creds.client_identity.as_ref())
+        .http_client_for_policy(
+            &creds.effective_tls_policy(),
+            creds.client_identity.as_ref(),
+        )
         .map_err(|e| format!("build peer http client: {e}"))?;
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -206,6 +212,7 @@ mod tests {
             transports,
             capabilities: Vec::new(),
             auth: AuthRequirements::none(),
+            identity_attestation: None,
         }
     }
 
@@ -214,6 +221,7 @@ mod tests {
         let card = card_with(vec![
             TransportSpec::IntendantWs {
                 url: "wss://peer.example:8443/ws".into(),
+                relay: false,
             },
             TransportSpec::Mcp {
                 url: "https://peer.example:9000/mcp".into(),
@@ -237,6 +245,7 @@ mod tests {
             },
             TransportSpec::IntendantWs {
                 url: "wss://peer.example:8443/ws".into(),
+                relay: false,
             },
         ]);
         assert_eq!(
@@ -249,6 +258,7 @@ mod tests {
     fn endpoint_maps_plain_ws_to_http() {
         let card = card_with(vec![TransportSpec::IntendantWs {
             url: "ws://127.0.0.1:8765/ws".into(),
+            relay: false,
         }]);
         assert_eq!(
             mcp_endpoint(&card).as_deref(),
@@ -388,6 +398,7 @@ mod tests {
                 tokio::sync::mpsc::channel(crate::peer::LOG_CHANNEL_CAPACITY);
             let card = card_with(vec![TransportSpec::IntendantWs {
                 url: format!("ws://{addr}/ws"),
+                relay: false,
             }]);
             let url_for_closure = format!("ws://{addr}/ws");
             let handle = crate::peer::handle::spawn_peer(

@@ -271,6 +271,10 @@ pub(crate) fn spawn_mode_web_gateway(
         }),
     };
     config.connect = connect_base.effective_with_env();
+    // The agent card's identity attestation signs with the ordinary
+    // daemon identity key; wired as a path here (the production edge) so
+    // the gateway never resolves machine-global stores itself.
+    config.attestation_identity_path = Some(crate::daemon_identity::default_identity_key_path());
     config.presence_enabled = runtime_presence_enabled;
     config.external_agent = initial_agent_backend
         .as_ref()
