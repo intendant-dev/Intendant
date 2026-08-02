@@ -918,6 +918,13 @@ impl HandoverRuntime {
         }
         if let Some(lane) = self.update_lane.get() {
             obj.insert("update_lane".into(), lane.status_block());
+            // The release-availability fact (docked chip lane): a
+            // DISTINCT block beside the on-disk `update` chip's — "a
+            // newer release is logged" and "a newer build sits on disk"
+            // may both be true, and each renders as itself.
+            if let Some(release) = lane.release_update_status() {
+                obj.insert("release_update".into(), release);
+            }
         }
         if let Some(lane) = self.successor_exec.get() {
             obj.insert("successor_exec".into(), lane.status_block());
@@ -1192,8 +1199,14 @@ mod tests {
         assert_eq!(chip.matches("authedFetch(").count(), 3);
         assert_eq!(lane.matches("authedFetch(").count(), 1);
         // Two call sites for the check path — the panel button and the
-        // palette seam — one POST function between them.
+        // palette seam — one POST function between them. Same shape for
+        // produce: the panel button and the release chip's composition
+        // member, and the chip module carries no lane path at all — its
+        // one-click reaches produce only through the named surface.
         assert_eq!(lane.matches("'/api/daemon/update-lane/check'").count(), 2);
+        assert_eq!(lane.matches("'/api/daemon/update-lane/produce'").count(), 2);
+        assert_eq!(chip.matches("/api/daemon/update-lane").count(), 0);
+        assert!(chip.contains("window.intendantUpdateLane.produce('releases')"));
         // The palette fragment carries none of the wire shapes: it may
         // only reach the update lanes through the composition surfaces.
         for banned in [
@@ -1713,6 +1726,66 @@ mod tests {
         );
     }
 
+    /// Slice-6 presentation pins (release-availability card): the
+    /// release chip rides the SAME docked chip/pill lane as the on-disk
+    /// chip — per-tag expand-once persistence, collapse-to-pill,
+    /// deliberately no dismiss — as a DISTINCT fact: its own element in
+    /// the shared dock (both may stack), its own title, and its
+    /// one-click reaching the panel's produce emitter only through the
+    /// named composition surface. The no-one-click arm renders the
+    /// server's honest reason plus the panel doorway.
+    #[test]
+    fn release_chip_promotes_availability_into_the_docked_lane() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            // The distinct fact + the shared dock.
+            "handover-release-chip",
+            "handover-chip-dock",
+            "'New release available'",
+            "body.release_update",
+            // Per-tag standing-fact persistence — the on-disk chip's
+            // per-sha pattern verbatim (expand-once, prune-on-write).
+            "handover-release-chip:",
+            "releaseChipStoreState(tag, 'collapsed')",
+            "releaseChipStoreState(tag, 'expanded')",
+            "releaseChipStoredState(tag) === 'collapsed'",
+            "indexOf('handover-release-chip:') === 0",
+            // The one-click rides the panel's one produce emitter; the
+            // no-one-click arm is honest instead of imperative.
+            "window.intendantUpdateLane.produce('releases')",
+            "release.one_click === true",
+            "release.reason",
+            // The QA round-trip driver.
+            "qa.handoverReleaseChip",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the release chip lost its machinery: {needle}"
+            );
+        }
+        let styles = include_str!("../../../../static/app/ui2-handover.css");
+        assert!(
+            styles.contains("#handover-chip-dock"),
+            "the chip dock lost its styles"
+        );
+        assert!(
+            styles.contains(".handover-release-chip"),
+            "the release chip lost its distinct accent"
+        );
+        // The served bundle carries the whole wiring.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "handover-release-chip",
+            "release_update",
+            "New release available",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the release chip: {needle}"
+            );
+        }
+    }
+
     /// The presentation half of card 01KYZSPQ6Q… (second strike of the
     /// banner-wall class): BOTH handover banner kinds — draining and
     /// predecessor — collapse to a pill persisted per (kind, boot id),
@@ -1749,7 +1822,7 @@ mod tests {
         }
         // Emission shapes stay singular: one stored-state write per
         // transition (definition + two call sites), one class toggle
-        // shared by both kinds (the chip keeps its own).
+        // shared by both kinds (each chip keeps its own).
         assert_eq!(fragment.matches("bannerStoreState(").count(), 3);
         assert_eq!(
             fragment
@@ -1763,12 +1836,13 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(fragment.matches("classList.toggle('collapsed'").count(), 2);
-        // Both collapse buttons stop their click from bubbling into
-        // the expand handler the collapsed re-render installs on the
-        // container — without this the collapse self-reverts on the
-        // same click (probe-caught live on the banner AND the chip).
-        assert_eq!(fragment.matches("ev.stopPropagation()").count(), 2);
+        assert_eq!(fragment.matches("classList.toggle('collapsed'").count(), 3);
+        // All three collapse buttons (banner, update chip, release
+        // chip) stop their click from bubbling into the expand handler
+        // the collapsed re-render installs on the container — without
+        // this the collapse self-reverts on the same click
+        // (probe-caught live on the banner AND the chip).
+        assert_eq!(fragment.matches("ev.stopPropagation()").count(), 3);
         // Both kinds still emit their identity for the styling split.
         assert!(fragment.contains("el.dataset.kind = 'draining';"));
         assert!(fragment.contains("el.dataset.kind = 'predecessor';"));
