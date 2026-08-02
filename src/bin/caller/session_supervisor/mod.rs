@@ -943,16 +943,10 @@ impl SessionSupervisor {
                 .sessions
                 .values()
                 .filter(|session| {
-                    // A session whose ONLY hold is a died-with-restart
-                    // park is releasable: its wait is on tasks that no
-                    // longer exist, and re-running them is an owner
-                    // decision the successor daemon serves just as well
-                    // (the durable bg_park marker survives the exit).
-                    // Any other phase — an approval, a live turn, an
-                    // interrupt — still holds like before.
-                    session.phase != "done"
-                        && !(session.phase == "idle"
-                            && state.died_park_sessions.contains(&session.session_id))
+                    session_holds_drain(
+                        &session.phase,
+                        state.died_park_sessions.contains(&session.session_id),
+                    )
                 })
                 .map(|session| {
                     (
@@ -1063,6 +1057,19 @@ impl SessionSupervisor {
     }
 }
 
+/// The one drain-hold rule ([`SessionSupervisor::drain_exit_ready`]'s
+/// filter): holding work is any phase but `done` — EXCEPT an idle
+/// session whose background-task park DIED with a backend restart
+/// (`died_park`). Its wait is on tasks that no longer exist; re-running
+/// them is an owner decision the successor daemon serves just as well
+/// (the durable `bg_park` marker survives the exit), so counting it as
+/// held work would strand the drain behind a wait that can never end.
+/// Any other phase — an approval, a live turn, an interrupt — holds
+/// regardless of the died mark.
+pub(crate) fn session_holds_drain(phase: &str, died_park: bool) -> bool {
+    phase != "done" && !(phase == "idle" && died_park)
+}
+
 /// The named drain wait set: one row per holding session, with the
 /// durable limit-park marker resolved from its `session_meta.json` —
 /// "parked until T" is decisive information (an in-memory park can hold
@@ -1145,6 +1152,102 @@ pub(crate) fn short_session(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drain wait-set arithmetic with a died-park member (the
+    /// parked-task respawn honesty card's pin): an idle session whose
+    /// bg park died is RELEASABLE — every other hold stands, including
+    /// a died-marked session that still owes an approval or a turn.
+    #[test]
+    fn drain_holding_arithmetic_releases_only_the_died_park_idle() {
+        // (phase, died_park, holds)
+        for (phase, died_park, holds) in [
+            ("done", false, false),
+            ("done", true, false),
+            ("idle", false, true),
+            ("idle", true, false), // the died park: its wait is on nobody
+            ("running", false, true),
+            ("running", true, true), // mid-turn work holds regardless
+            ("waiting_approval", true, true),
+            ("waiting_human", true, true),
+            ("interrupted", true, true),
+        ] {
+            assert_eq!(
+                session_holds_drain(phase, died_park),
+                holds,
+                "phase={phase} died_park={died_park}"
+            );
+        }
+        // Arithmetic over a mixed set: one done, one live idle, one
+        // died-park idle, one died-marked approval-waiter → 2 hold.
+        let sessions = [
+            ("done", false),
+            ("idle", false),
+            ("idle", true),
+            ("waiting_approval", true),
+        ];
+        let holding = sessions
+            .iter()
+            .filter(|(phase, died)| session_holds_drain(phase, *died))
+            .count();
+        assert_eq!(holding, 2);
+    }
+
+    /// Died-park membership follows the activity carrier: non-empty
+    /// died fields set it (managed sessions only), any later publish
+    /// without them clears it, and removal purges it.
+    #[tokio::test]
+    async fn died_park_membership_follows_session_activity() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("s-died".to_string(), managed_session("s-died", "claude-code"));
+        }
+        let died = crate::types::SessionActivityVitals {
+            died_background_tasks: vec!["cargo test battery".into()],
+            died_tasks_cause: Some("the credential-reload restart".into()),
+            ..Default::default()
+        };
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionActivity {
+                session_id: Some("s-died".into()),
+                activity: died.clone(),
+            })
+            .await;
+        assert!(supervisor
+            .state
+            .lock()
+            .await
+            .died_park_sessions
+            .contains("s-died"));
+        // A foreign session's died fields never grow the set.
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionActivity {
+                session_id: Some("s-foreign".into()),
+                activity: died,
+            })
+            .await;
+        assert!(!supervisor
+            .state
+            .lock()
+            .await
+            .died_park_sessions
+            .contains("s-foreign"));
+        // Work resumes (any publish without died fields) → cleared.
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionActivity {
+                session_id: Some("s-died".into()),
+                activity: crate::types::SessionActivityVitals::default(),
+            })
+            .await;
+        assert!(supervisor
+            .state
+            .lock()
+            .await
+            .died_park_sessions
+            .is_empty());
+    }
 
     pub(crate) fn managed_session(id: &str, source: &str) -> ManagedSession {
         let (tx, _rx) = mpsc::channel(1);

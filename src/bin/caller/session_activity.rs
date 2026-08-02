@@ -723,6 +723,58 @@ mod tests {
         assert!(m.observe(Obs::TurnDispatched, 70).is_some());
     }
 
+    /// The hub-side sticky fold: died-with-restart attention fields
+    /// survive a fresh machine's quiet idle publishes (the respawned
+    /// backend knows nothing of its predecessor's deaths) and clear on
+    /// demonstrable work — any turn state, or a new tasks claim.
+    #[test]
+    fn died_attention_folds_sticky_across_idle_and_clears_on_work() {
+        let died = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            since_epoch: 100,
+            died_background_tasks: vec!["cargo test".into()],
+            died_tasks_cause: Some("the credential-reload restart".into()),
+            ..Default::default()
+        };
+        // A later quiet idle keeps the attention fields.
+        let idle = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            since_epoch: 200,
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), idle);
+        assert_eq!(folded.died_background_tasks, vec!["cargo test".to_string()]);
+        assert_eq!(
+            folded.died_tasks_cause.as_deref(),
+            Some("the credential-reload restart")
+        );
+        assert_eq!(folded.since_epoch, 200, "only the died fields stick");
+
+        // A turn state clears them — the session works again.
+        let working = SessionActivityVitals {
+            state: SessionActivityState::AwaitingApi,
+            since_epoch: 300,
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), working);
+        assert!(folded.died_background_tasks.is_empty());
+        assert!(folded.died_tasks_cause.is_none());
+
+        // A fresh parked claim (new tasks armed — a turn ran) clears too.
+        let parked = SessionActivityVitals {
+            state: SessionActivityState::ParkedOnTasks,
+            background_tasks: vec!["new job".into()],
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), parked);
+        assert!(folded.died_background_tasks.is_empty());
+
+        // No previous attention → pass-through.
+        let idle2 = SessionActivityVitals::default();
+        let folded = fold_died_tasks_attention(None, idle2.clone());
+        assert_eq!(folded, idle2);
+    }
+
     #[test]
     fn wire_shape_serializes_kebab_states_and_camel_fields() {
         // The dashboard consumes these exact strings; pin them.

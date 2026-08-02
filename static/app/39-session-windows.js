@@ -1447,8 +1447,30 @@ function vitalsLimitLabelShort(label) {
 function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
   if (!activity || typeof activity !== 'object') return null;
   const state = String(activity.state || 'idle').trim();
-  if (!state || state === 'idle') return null;
   const since = Number(activity.sinceEpoch) || 0;
+  // Background tasks that DIED with a backend restart (wire
+  // `diedBackgroundTasks` + `diedTasksCause`): the daemon publishes them
+  // on an honest `idle` (nothing is running), and the dashboard derives
+  // the attention presentation — like `stalled`, a display state the
+  // producer never sends. Non-idle states ignore the fields: a working
+  // session has already resolved the attention.
+  const diedTasks = Array.isArray(activity.diedBackgroundTasks)
+    ? activity.diedBackgroundTasks.map((t) => String(t || '').trim()).filter(Boolean)
+    : [];
+  if (!state || state === 'idle') {
+    if (!diedTasks.length) return null;
+    return {
+      state: 'died-tasks',
+      rawState: state,
+      elapsed: since ? Math.max(0, nowSec - since) : 0,
+      quiet: 0,
+      hasHeartbeat: false,
+      resetsAtEpoch: 0,
+      backgroundTasks: [],
+      diedTasks,
+      diedCause: String(activity.diedTasksCause || '').trim() || 'a backend restart',
+    };
+  }
   const lastByte = Number(activity.lastStreamByteEpoch) || 0;
   const threshold = Number(activity.stalledAfterSeconds) || 0;
   const quiet = lastByte ? Math.max(0, nowSec - lastByte) : 0;
@@ -1467,6 +1489,8 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
     backgroundTasks: Array.isArray(activity.backgroundTasks)
       ? activity.backgroundTasks.map((t) => String(t || '').trim()).filter(Boolean)
       : [],
+    diedTasks: [],
+    diedCause: '',
   };
 }
 
@@ -1494,15 +1518,28 @@ const ACTIVITY_STATE_LABELS = {
   'parked-on-tasks': 'Parked',
   'rate-limited': 'Rate-limited',
   stalled: 'Stalled',
+  'died-tasks': 'Task died',
 };
 
 // Status-pill label for a parked session: plain words, with the count the
-// wire vouches for. Shared by the pill upgrade and anything else that
-// needs the one-line parked phrasing.
+// wire vouches for — and ONLY what it vouches for: a parked claim whose
+// task list is empty (a stale marker whose tasks the registry no longer
+// knows) renders nothing rather than inventing "1 task" (the
+// post-respawn unknown-task latch).
 function sessionParkedPillLabel(act) {
   if (!act || act.state !== 'parked-on-tasks') return '';
-  const n = (act.backgroundTasks || []).length || 1;
+  const n = (act.backgroundTasks || []).length;
+  if (!n) return '';
   return `Parked · ${n} task${n === 1 ? '' : 's'}`;
+}
+
+// Status-pill label for the died-with-restart attention state: the wait
+// is over and an owner decision is pending, so the pill says so instead
+// of "Parked" or a bare "Idle".
+function sessionDiedTasksPillLabel(act) {
+  if (!act || act.state !== 'died-tasks') return '';
+  const n = (act.diedTasks || []).length;
+  return n === 1 ? 'Task died with restart' : `${n} tasks died with restart`;
 }
 
 function formatActivityElapsed(seconds) {
@@ -1693,6 +1730,7 @@ const VITALS_SYMBOLS = {
       'parked-on-tasks': 'pause',
       stalled: 'clock',
       'rate-limited': 'slash',
+      'died-tasks': 'triangle',
     }[v.state] || 'clock'),
     chip: (v) => {
       if (v.state === 'reasoning') return `🧠 Thinking${v.effort ? ` · ${v.effort}` : ''} · ${v.elapsedText}`;
@@ -1702,6 +1740,11 @@ const VITALS_SYMBOLS = {
       if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
       if (v.state === 'stalled') return `⚠ Stalled · quiet ${v.quietText}`;
       if (v.state === 'rate-limited') return `⛔ Rate-limited${v.reset ? ` · resets in ${v.reset}` : ''}`;
+      if (v.state === 'died-tasks') {
+        return v.diedCount === 1
+          ? `⚠ Task died · ${v.diedCause}`
+          : `⚠ ${v.diedCount} tasks died · ${v.diedCause}`;
+      }
       return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
     },
     explain: (v) => {
@@ -1748,6 +1791,21 @@ const VITALS_SYMBOLS = {
           'Nothing is broken: the session continues on its own once the window resets.',
         ];
       }
+      if (v.state === 'died-tasks') {
+        const n = v.diedCount;
+        const lines = [
+          n === 1
+            ? `This session was parked waiting on a background task, but the backend restarted (${v.diedCause}) and the task died with it — the wait was never going to end:`
+            : `This session was parked waiting on ${n} background tasks, but the backend restarted (${v.diedCause}) and they died with it — the wait was never going to end:`,
+        ];
+        for (const task of v.diedTasks || []) lines.push(`• ${task}`);
+        lines.push(
+          n === 1
+            ? 'Nothing was re-run automatically (commands are not known safe to repeat). Use “Ask the session to re-run it” below if the work still needs it, or ignore this if it doesn’t.'
+            : 'Nothing was re-run automatically (commands are not known safe to repeat). Use “Ask the session to re-run them” below if the work still needs them, or ignore this if it doesn’t.'
+        );
+        return lines;
+      }
       return [`The model reports “${v.state}”.`];
     },
     // Short attention phrase for the health verdict's culprit list —
@@ -1755,7 +1813,22 @@ const VITALS_SYMBOLS = {
     brief: (v) => {
       if (v.state === 'rate-limited') return `Rate-limited${v.reset ? ` — resets in ~${v.reset}` : ''}`;
       if (v.state === 'stalled') return `Model stalled — nothing received for ${v.quietText}`;
+      if (v.state === 'died-tasks') {
+        return v.diedCount === 1
+          ? `A background task died with ${v.diedCause} — re-run is one tap away`
+          : `${v.diedCount} background tasks died with ${v.diedCause} — re-run is one tap away`;
+      }
       return '';
+    },
+    // The one-tap re-run: an OWNER action that asks the session (a
+    // normal follow-up through the existing lane) — the daemon never
+    // re-executes a died command itself.
+    action: (v, sessionId) => {
+      if (v.state !== 'died-tasks' || !(v.diedTasks || []).length) return null;
+      return {
+        label: v.diedCount === 1 ? 'Ask the session to re-run it' : 'Ask the session to re-run them',
+        run: () => sendDiedTaskRerun(sessionId, v.diedTasks, v.diedCause),
+      };
     },
   },
   // ── Session facts (wire `config` section: model, effort,
@@ -2321,14 +2394,18 @@ function vitalsChipModels(vitals, meta, sessionId) {
       reset: act.resetsAtEpoch ? formatLimitResetExact(act.resetsAtEpoch) : '',
       bgTasks: act.backgroundTasks,
       bgCount: act.backgroundTasks.length,
+      diedTasks: act.diedTasks || [],
+      diedCount: (act.diedTasks || []).length,
+      diedCause: act.diedCause || '',
     }, {
       // Calm while genuinely working (parked included — waiting on its
-      // own background work is normal); attention (health dot) only for
-      // stalled and rate-limited — the two states that mean "waiting on
-      // something other than the model's own work".
-      severity: act.state === 'stalled' || act.state === 'rate-limited' ? 'warn' : '',
+      // own background work is normal); attention (health dot) for
+      // stalled, rate-limited, and died-tasks — the states that mean
+      // "waiting on something other than the model's own work" (and for
+      // died-tasks, a wait that already ended without its work).
+      severity: act.state === 'stalled' || act.state === 'rate-limited' || act.state === 'died-tasks' ? 'warn' : '',
       ticking: true,
-      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
+      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}|${(act.diedTasks || []).join(';')}|${act.diedCause || ''}`,
     });
   }
 
@@ -3475,10 +3552,15 @@ async function appendSessionBackgroundTaskRows(sessionId, panel, container = pan
     const status = String(task.status || '');
     const started = Number(task.startedAtEpoch) || 0;
     const ended = Number(task.endedAtEpoch) || 0;
-    // Running rows show elapsed-so-far; finished rows their outcome.
+    // Running rows show elapsed-so-far; finished rows their outcome. A
+    // died-with-restart row names the restart that killed it (the wire's
+    // `diedCause`) — the honest ending, never a bare status word.
+    const diedCause = String(task.diedCause || '').trim();
     const meta = status === 'running'
       ? (started ? `running · ${formatActivityElapsed(nowSec - started)}` : 'running')
-      : `${status}${started && ended ? ` · ${formatActivityElapsed(ended - started)}` : ''}`;
+      : status === 'died-with-restart' && diedCause
+        ? `died with ${diedCause}${started && ended ? ` · after ${formatActivityElapsed(ended - started)}` : ''}`
+        : `${status}${started && ended ? ` · ${formatActivityElapsed(ended - started)}` : ''}`;
     row.appendChild(desc);
     row.appendChild(vxEl('span', 'vx-bgtask-meta', meta));
     if (task.hasOutput && task.taskId) {

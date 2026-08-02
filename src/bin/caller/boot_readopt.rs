@@ -934,6 +934,176 @@ mod tests {
         crate::session_activity::epoch_seconds()
     }
 
+    fn write_meta_with_bg_park(
+        home: &Path,
+        session: &str,
+        status: &str,
+        bg_park: serde_json::Value,
+    ) {
+        let dir = logs_root(home).join(session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "session_id": session,
+            "created_at": "2026-07-28T00:00:00",
+            "status": status,
+            "bg_park": bg_park,
+        });
+        std::fs::write(
+            dir.join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The daemon-restart respawn class: a dead-boot session parked on
+    /// background tasks (idle meta, live bg-park marker — NEVER a
+    /// readopt candidate) gets its marker flipped to died-with-restart
+    /// and the attention snapshot published; live wrappers, this boot's
+    /// era, and already-died markers stay untouched. Nothing dispatches.
+    #[test]
+    fn boot_pass_marks_dead_boot_bg_parks_died() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-parked-dead",
+            "idle",
+            serde_json::json!({ "tasks": ["cargo test battery"] }),
+        );
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-live-wrapper",
+            "idle",
+            serde_json::json!({ "tasks": ["still mine"] }),
+        );
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-already-died",
+            "idle",
+            serde_json::json!({
+                "tasks": ["old battery"],
+                "died_cause": "the credential-reload restart",
+                "died_at_epoch": 50,
+            }),
+        );
+        let bus = crate::event::EventBus::new();
+        let mut events = bus.subscribe();
+        let mut live = HashSet::new();
+        live.insert("sess-live-wrapper".to_string());
+
+        let marked = mark_dead_bg_parks(home.path(), &live, |_| true, &bus);
+        assert_eq!(marked, 1, "exactly the dead parked session marks");
+
+        let park_of = |session: &str| -> crate::session_log::SessionBgParkMeta {
+            serde_json::from_str::<SessionMeta>(
+                &std::fs::read_to_string(
+                    logs_root(home.path())
+                        .join(session)
+                        .join("session_meta.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .bg_park
+            .expect("marker present")
+        };
+        assert_eq!(
+            park_of("sess-parked-dead").died_cause.as_deref(),
+            Some(crate::external_supervision::DAEMON_RESTART_CAUSE)
+        );
+        assert!(
+            park_of("sess-live-wrapper").died_cause.is_none(),
+            "live wrappers own their own state"
+        );
+        assert_eq!(
+            park_of("sess-already-died").died_cause.as_deref(),
+            Some("the credential-reload restart"),
+            "the first, most specific cause stands"
+        );
+
+        // The one bus emission is the attention snapshot — never a
+        // dispatch (no automatic re-execution at boot either).
+        let mut activity_seen = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AppEvent::SessionActivity {
+                    session_id,
+                    activity,
+                } => {
+                    activity_seen += 1;
+                    assert_eq!(session_id.as_deref(), Some("sess-parked-dead"));
+                    assert_eq!(
+                        activity.died_background_tasks,
+                        vec!["cargo test battery".to_string()]
+                    );
+                    assert_eq!(
+                        activity.died_tasks_cause.as_deref(),
+                        Some(crate::external_supervision::DAEMON_RESTART_CAUSE)
+                    );
+                }
+                other => panic!("boot bg-park marking emitted {other:?}"),
+            }
+        }
+        assert_eq!(activity_seen, 1);
+
+        // Era line: a session the predicate excludes stays untouched.
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-this-boot",
+            "idle",
+            serde_json::json!({ "tasks": ["fresh work"] }),
+        );
+        assert_eq!(
+            mark_dead_bg_parks(home.path(), &live, |_| false, &bus),
+            0,
+            "the era predicate gates everything"
+        );
+        assert!(park_of("sess-this-boot").died_cause.is_none());
+    }
+
+    /// Readopted candidates carry the died-task re-run OFFER on the
+    /// continuation nudge they already receive — and only then: no died
+    /// marker (or a live park) leaves the nudge untouched.
+    #[test]
+    fn readopt_continuation_carries_the_died_task_offer() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-died-park",
+            "running",
+            serde_json::json!({
+                "tasks": ["cargo test battery"],
+                "died_cause": "the daemon restart",
+                "died_at_epoch": 100,
+            }),
+        );
+        let text =
+            readopt_continuation_with_died_tasks(home.path(), "sess-died-park", ResumeLens::MidWork);
+        assert!(text.starts_with(READOPT_CONTINUATION_TEXT), "{text}");
+        assert!(text.contains("cargo test battery"), "{text}");
+        assert!(text.contains("NOT re-run automatically"), "{text}");
+
+        write_meta_with_bg_park(
+            home.path(),
+            "sess-live-park",
+            "running",
+            serde_json::json!({ "tasks": ["still running elsewhere"] }),
+        );
+        assert_eq!(
+            readopt_continuation_with_died_tasks(
+                home.path(),
+                "sess-live-park",
+                ResumeLens::MidWork
+            ),
+            READOPT_CONTINUATION_TEXT,
+            "a live park adds nothing"
+        );
+        assert_eq!(
+            readopt_continuation_with_died_tasks(home.path(), "sess-absent", ResumeLens::MidWork),
+            READOPT_CONTINUATION_TEXT,
+            "no meta, no addendum"
+        );
+    }
+
     /// The enumeration takes only the DEAD boot's mid-work sessions:
     /// a mid-turn (`running`) meta and a parked-with-pending meta are
     /// candidates when their activity predates the boot watershed, and

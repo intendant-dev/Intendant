@@ -2281,6 +2281,167 @@ pub(crate) fn shared_codex_config_from_project(
 mod tests {
     use super::*;
 
+    /// THE no-auto-re-execution pin for the died-with-restart class: the
+    /// marking seam flips registry records and publishes SURFACES only —
+    /// a log row and the honest activity snapshot. It never emits a
+    /// dispatch-shaped event, never constructs a FollowUpMessage, and the
+    /// re-run OFFER composer mints nothing on its own (`None` without
+    /// died tasks; text-only with them). Anyone adding a re-run lane for
+    /// this class must delete this pin first.
+    #[test]
+    fn died_with_restart_marking_never_arms_delivery() {
+        let sid = "cc-died-pin-session";
+        crate::background_tasks::clear_session(sid);
+        crate::background_tasks::record_started(sid, "task-1", "toolu_1", "cargo test battery", 100);
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("s")).unwrap(),
+        ));
+        slog(&log, |l| l.write_meta(None, Some("seat")));
+
+        let descs = mark_parked_tasks_died_with_restart(
+            &bus,
+            &log,
+            &Some("wrapper-1".to_string()),
+            Some(sid),
+            SERVICE_RECOVERY_RESTART_CAUSE,
+        );
+        assert_eq!(descs, vec!["cargo test battery".to_string()]);
+
+        // The registry flipped with the named cause and RETAINED the row.
+        let task = crate::background_tasks::find_task(sid, "task-1").expect("retained");
+        assert_eq!(
+            task.status,
+            crate::background_tasks::BackgroundTaskStatus::DiedWithRestart
+        );
+        assert_eq!(task.died_cause.as_deref(), Some(SERVICE_RECOVERY_RESTART_CAUSE));
+
+        // The durable marker flipped to its died form.
+        let meta_park = log
+            .lock()
+            .unwrap()
+            .dir()
+            .join("session_meta.json");
+        let meta: session_log::SessionMeta =
+            serde_json::from_str(&std::fs::read_to_string(meta_park).unwrap()).unwrap();
+        let park = meta.bg_park.expect("died marker stamped");
+        assert_eq!(park.died_cause.as_deref(), Some(SERVICE_RECOVERY_RESTART_CAUSE));
+        assert_eq!(park.tasks, vec!["cargo test battery".to_string()]);
+
+        // THE PIN: the bus carries surfaces only. No follow-up, steer,
+        // task-start, or any other dispatch-shaped event exists on it.
+        let mut saw_log = false;
+        let mut saw_activity = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::LogEntry { .. } => saw_log = true,
+                AppEvent::SessionActivity { activity, .. } => {
+                    saw_activity = true;
+                    assert_eq!(
+                        activity.died_background_tasks,
+                        vec!["cargo test battery".to_string()]
+                    );
+                    assert_eq!(
+                        activity.died_tasks_cause.as_deref(),
+                        Some(SERVICE_RECOVERY_RESTART_CAUSE)
+                    );
+                    assert_eq!(activity.state, crate::types::SessionActivityState::Idle);
+                    assert!(activity.background_tasks.is_empty());
+                }
+                other => panic!(
+                    "died-with-restart marking emitted a non-surface event: {other:?} — \
+                     no automatic re-execution lane may exist for this class"
+                ),
+            }
+        }
+        assert!(saw_log && saw_activity, "both surfaces publish");
+
+        // The offer composer never mints a message of its own.
+        assert!(died_tasks_nudge_addendum(&[], SERVICE_RECOVERY_RESTART_CAUSE).is_none());
+        let one = died_tasks_nudge_addendum(
+            &["cargo test battery".to_string()],
+            SERVICE_RECOVERY_RESTART_CAUSE,
+        )
+        .expect("addendum text");
+        assert!(one.contains("NOT re-run automatically"), "{one}");
+        assert!(one.contains(SERVICE_RECOVERY_RESTART_CAUSE), "{one}");
+
+        // Marking with nothing running is silent — no surfaces, no churn.
+        let again = mark_parked_tasks_died_with_restart(
+            &bus,
+            &log,
+            &Some("wrapper-1".to_string()),
+            Some(sid),
+            RATE_LIMIT_RESTART_CAUSE,
+        );
+        assert!(again.is_empty());
+        assert!(rx.try_recv().is_err(), "no re-mark, no surfaces");
+        crate::background_tasks::clear_session(sid);
+    }
+
+    /// The durable bg-park marker follows the activity claims: parked
+    /// stamps the live form, quiet idle clears only a live marker (a
+    /// died statement survives a respawned backend settling), and any
+    /// turn state clears everything — work demonstrably resumed.
+    #[test]
+    fn bg_park_marker_follows_activity_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("s")).unwrap(),
+        ));
+        slog(&log, |l| l.write_meta(None, Some("seat")));
+        let meta_path = { log.lock().unwrap().dir().join("session_meta.json") };
+        let read_park = || -> Option<session_log::SessionBgParkMeta> {
+            serde_json::from_str::<session_log::SessionMeta>(
+                &std::fs::read_to_string(&meta_path).unwrap(),
+            )
+            .unwrap()
+            .bg_park
+        };
+        let activity = |state: crate::types::SessionActivityState,
+                        tasks: Vec<String>|
+         -> crate::types::SessionActivityVitals {
+            crate::types::SessionActivityVitals {
+                state,
+                background_tasks: tasks,
+                ..Default::default()
+            }
+        };
+        use crate::types::SessionActivityState as S;
+
+        // Parked claim stamps the live marker.
+        stamp_bg_park_marker_from_activity(
+            &log,
+            &activity(S::ParkedOnTasks, vec!["cargo test".into()]),
+        );
+        let park = read_park().expect("live marker");
+        assert!(park.died_cause.is_none());
+        assert_eq!(park.tasks, vec!["cargo test".to_string()]);
+
+        // Quiet idle clears the LIVE marker (tasks drained normally).
+        stamp_bg_park_marker_from_activity(&log, &activity(S::Idle, Vec::new()));
+        assert!(read_park().is_none());
+
+        // A died statement survives quiet idle settling…
+        slog(&log, |l| {
+            l.set_bg_park(Some(session_log::SessionBgParkMeta {
+                tasks: vec!["cargo test".into()],
+                died_cause: Some(DAEMON_RESTART_CAUSE.to_string()),
+                died_at_epoch: Some(100),
+            }))
+        });
+        stamp_bg_park_marker_from_activity(&log, &activity(S::Idle, Vec::new()));
+        assert!(
+            read_park().is_some_and(|p| p.died_cause.is_some()),
+            "idle settling never erases the died statement"
+        );
+        // …and clears on demonstrable work.
+        stamp_bg_park_marker_from_activity(&log, &activity(S::AwaitingApi, Vec::new()));
+        assert!(read_park().is_none(), "a turn state resolves the attention");
+    }
+
     fn rejected_park_message() -> FollowUpMessage {
         let mut rejected = FollowUpMessage::text("the whole goal, re-merged".to_string());
         rejected.follow_up_id = Some("f-goal".to_string());

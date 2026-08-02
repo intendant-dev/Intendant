@@ -1089,6 +1089,57 @@ mod tests {
         );
     }
 
+    /// Parked-task respawn honesty (the died-with-restart class): the
+    /// dashboard derives the attention state from the wire's died
+    /// fields, never invents a parked count the registry doesn't vouch
+    /// for (the post-respawn unknown-task "Parked · 1 task" latch), and
+    /// the one-tap re-run is an OWNER-tapped follow-up through the
+    /// existing lane — the copy states that nothing re-runs
+    /// automatically. These needles hold the fragments to it.
+    #[test]
+    fn died_tasks_attention_is_derived_offered_and_never_auto_rerun() {
+        let windows = include_str!("../../../../static/app/39-session-windows.js");
+        let actions = include_str!("../../../../static/app/41-session-window-actions.js");
+        let lifecycle = include_str!("../../../../static/app/54-session-lifecycle.js");
+        let handover = include_str!("../../../../static/app/ui2-handover.js");
+        assert!(
+            windows.contains("diedBackgroundTasks"),
+            "the attention state derives from the wire's died fields"
+        );
+        assert!(
+            windows.contains("state: 'died-tasks'"),
+            "died tasks derive a display state (like stalled), producers never send it"
+        );
+        assert!(
+            windows.contains("Nothing was re-run automatically"),
+            "the explainer states the no-auto-rerun law"
+        );
+        assert!(
+            windows.contains("const n = (act.backgroundTasks || []).length;\n  if (!n) return '';"),
+            "a parked claim with no vouched tasks renders NO parked pill (the unknown-task latch)"
+        );
+        assert!(
+            windows.contains("sendDiedTaskRerun(sessionId, v.diedTasks, v.diedCause)"),
+            "the one-tap re-run rides the activity chip action"
+        );
+        assert!(
+            lifecycle.contains("function sendDiedTaskRerun"),
+            "the tap sends a normal follow-up through the existing start_task lane"
+        );
+        assert!(
+            lifecycle.contains("not re-run automatically"),
+            "the composed follow-up tells the model the daemon re-ran nothing"
+        );
+        assert!(
+            actions.contains("sessionDiedTasksPillLabel"),
+            "the status pill states the died ending instead of a bare Idle"
+        );
+        assert!(
+            handover.contains("parked on a background task"),
+            "a live bg-park holdout says what the idle session waits on"
+        );
+    }
+
     #[test]
     fn blocked_chip_explains_every_gate_and_the_delivered_wait() {
         let cards = include_str!("../../../../static/app/ui2-agenda-cards.js");

@@ -400,7 +400,10 @@
 
   // Owner-facing state words. A limit-parked holdout leads with the
   // parked-until instant — the decisive fact (the park can hold the
-  // drain for hours). Unknown phases pass through rather than lie.
+  // drain for hours). A live background-task park says what the idle
+  // session actually waits on (a DIED park never reaches this list —
+  // those sessions are releasable and leave the wait set). Unknown
+  // phases pass through rather than lie.
   function handoverHoldoutState(holdout) {
     const park = holdout && holdout.limit_park;
     if (park) {
@@ -408,6 +411,13 @@
       return until
         ? `rate-limit parked until ${until}`
         : 'rate-limit parked — reset time unknown';
+    }
+    const bgPark = holdout && holdout.bg_park;
+    if (bgPark && !bgPark.died_cause) {
+      const n = Array.isArray(bgPark.tasks) ? bgPark.tasks.length : 0;
+      return n === 1
+        ? 'parked on a background task'
+        : `parked on ${n || 'its'} background tasks`;
     }
     const phase = String((holdout && holdout.phase) || '');
     switch (phase) {

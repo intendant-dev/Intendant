@@ -1962,6 +1962,50 @@ mod tests {
         assert_eq!(log.session_id(), "test-session-123");
     }
 
+    /// The bg-park marker survives every meta rewrite (the same law as
+    /// `limit_park` — a credential-reload respawn's `write_meta` mid-park
+    /// must not silently release the wait or erase a died-with-restart
+    /// statement), and `clear_bg_park_if_live` clears only the live form.
+    #[test]
+    fn bg_park_marker_survives_meta_rewrites_and_died_form_outlives_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let read = || -> SessionMeta {
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap()
+        };
+
+        log.set_bg_park(Some(SessionBgParkMeta {
+            tasks: vec!["cargo test battery".into()],
+            died_cause: None,
+            died_at_epoch: None,
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task again"));
+        assert!(
+            read().bg_park.is_some(),
+            "a meta rewrite must not release the park"
+        );
+
+        log.clear_bg_park_if_live();
+        assert!(read().bg_park.is_none(), "idle clears a LIVE marker");
+
+        log.set_bg_park(Some(SessionBgParkMeta {
+            tasks: vec!["cargo test battery".into()],
+            died_cause: Some("the daemon restart".into()),
+            died_at_epoch: Some(100),
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        log.clear_bg_park_if_live();
+        let park = read().bg_park.expect("died statement survives");
+        assert_eq!(park.died_cause.as_deref(), Some("the daemon restart"));
+        assert_eq!(park.died_at_epoch, Some(100));
+
+        log.set_bg_park(None);
+        assert!(read().bg_park.is_none(), "real work clears everything");
+    }
+
     #[test]
     fn write_meta_creates_file() {
         let dir = tempfile::tempdir().unwrap();
