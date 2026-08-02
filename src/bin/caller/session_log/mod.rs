@@ -824,10 +824,10 @@ impl SessionLog {
         else {
             return;
         };
-        if !meta
+        if meta
             .bg_park
             .as_ref()
-            .is_some_and(|park| park.died_cause.is_none())
+            .is_none_or(|park| park.died_cause.is_some())
         {
             return;
         }

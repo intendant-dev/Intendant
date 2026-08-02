@@ -5332,15 +5332,29 @@ mod tests {
             Some(std::path::Path::new(&structured_path))
         );
 
-        // A fresh reader adopting the same backend id clears the records.
+        // A fresh reader adopting the same backend id does not own the
+        // previous process's background children — but it no longer
+        // FORGETS them either: still-running records flip to
+        // died-with-restart (retained history the owner can inspect and
+        // choose to re-run; the wrapper's respawn seams usually pre-mark
+        // with the specific restart cause), and finished records stay as
+        // they were.
         let mut resumed = test_reader();
         resumed.process_line(&format!(
             r#"{{"type":"system","subtype":"init","session_id":"{sid}"}}"#,
         ));
+        let survived = background_tasks::find_task(sid, "breg2")
+            .expect("the running record is retained, flipped — never cleared");
+        assert_eq!(survived.status, BackgroundTaskStatus::DiedWithRestart);
+        assert_eq!(survived.died_cause.as_deref(), Some("a backend restart"));
+        assert!(survived.ended_at_epoch.is_some());
+        let done = background_tasks::find_task(sid, "breg1").expect("finished record retained");
+        assert_eq!(done.status, BackgroundTaskStatus::Completed);
         assert!(
-            !background_tasks::session_known(sid),
-            "re-adoption clears a previous process's records"
+            done.died_cause.is_none(),
+            "finished records never gain a cause"
         );
+        background_tasks::clear_session(sid);
     }
 
     /// The `system:init` `cwd` echo emits ONE `CwdAnnounced` per distinct
