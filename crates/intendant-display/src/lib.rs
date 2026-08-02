@@ -2162,12 +2162,16 @@ impl DisplaySession {
                 }
             }),
         };
+        let pool_for_federated_respec = Arc::clone(&pool_arc);
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
             Arc::clone(&self.peers),
             get_current_rids,
             is_layer_paused,
             on_action,
             on_demand_hooks,
+            Box::new(move |rung| {
+                pool_for_federated_respec.respec_federated(rung);
+            }),
             Arc::clone(&self.layer_policy_kick),
             aggregator::CapacityPolicyConfig::default(),
             self.shutdown.clone(),

@@ -146,7 +146,7 @@
 use crate::{visual_marker, EncodedFrame};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -1222,7 +1222,10 @@ impl EncoderPool {
     /// release against their recorded generation and are ignored).
     /// Returns `true` when a change was applied.
     pub fn respec_federated(&self, rung: FederatedRung) -> bool {
-        let prev = self.inner.federated_rung.swap(rung.as_u8(), Ordering::Relaxed);
+        let prev = self
+            .inner
+            .federated_rung
+            .swap(rung.as_u8(), Ordering::Relaxed);
         if prev == rung.as_u8() {
             return false;
         }
@@ -3285,6 +3288,28 @@ mod tests {
             pool.on_demand_refcount(CodecKind::H264, SimulcastRid::federated()),
             Some(1),
         );
+    }
+
+    /// respec_federated evicts the live fed slot so reconnecting
+    /// subscribers rebuild it at the new rung; unchanged rungs no-op.
+    #[tokio::test]
+    async fn respec_federated_evicts_and_rebuilds_at_new_rung() {
+        use super::types::FederatedRung;
+        let pool = EncoderPool::new(640, 360, 30, |_, _| vec![], None);
+        let prefs = PeerCodecPreferences::new_federated(vec![CodecKind::H264]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
+        assert_eq!(subs[0].layer.width, 160, "quarter of 640");
+        assert!(!pool.respec_federated(FederatedRung::Quarter), "no-op");
+        assert!(pool.respec_federated(FederatedRung::Half));
+        assert_eq!(pool.federated_rung(), FederatedRung::Half);
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::federated()),
+            None,
+            "old slot evicted"
+        );
+        let (subs2, _lease2) = pool.subscribe(&prefs).expect("resubscribe");
+        assert_eq!(subs2[0].layer.width, 320, "half of 640");
+        assert_eq!(subs2[0].layer.target_bitrate_kbps, 1000);
     }
 
     /// Windows twin of the fed-slot contract: H.264 is the always-on
