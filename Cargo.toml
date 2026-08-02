@@ -16,7 +16,7 @@ members = [
 
 [package]
 name = "intendant"
-version = "0.2.0-alpha.2"
+version = "0.2.0-alpha.3"
 edition = "2021"
 license = "MIT"
 
