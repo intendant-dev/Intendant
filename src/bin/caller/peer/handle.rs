@@ -1347,6 +1347,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -1494,6 +1495,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1766,6 +1768,7 @@ mod tests {
             None,
             AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;

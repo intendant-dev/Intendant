@@ -121,6 +121,7 @@ mod vault_deposits;
 mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
+mod voice_broker;
 mod web_gateway;
 mod web_tls;
 #[cfg(windows)]

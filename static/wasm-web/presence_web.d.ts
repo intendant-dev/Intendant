@@ -19,6 +19,12 @@ export class PresenceWeb {
      * Get the active voice provider name (e.g. "gemini", "openai", or "").
      */
     active_voice_provider(): string;
+    /**
+     * Event from the JS RTC glue for the ChatGPT voice lane
+     * (offer_ready / pc_connected / pc_terminated / mic_error /
+     * dc_event / tick). The glue executes verbs; policy stays here.
+     */
+    chatgpt_rtc_event(kind: string, payload: string): void;
     clear_server_sender(): void;
     connect_server(url: string): void;
     connect_voice(provider: string, token: string, model?: string | null, input_sample_rate?: number | null): void;
@@ -269,6 +275,8 @@ export class PresenceWeb {
     set_on_voice_audio(f: Function): void;
     set_on_voice_interrupted(f: Function): void;
     set_on_voice_ready(f: Function): void;
+    set_on_voice_rtc(f: Function): void;
+    set_on_voice_status(f: Function): void;
     set_on_voice_text(f: Function): void;
     set_on_voice_tool_call(f: Function): void;
     set_on_voice_transcript(f: Function): void;
@@ -294,6 +302,15 @@ export class PresenceWeb {
      */
     take_display(display_id: bigint): void;
     update_from_event(event: any): any;
+    voice_signaling_lost(): void;
+    /**
+     * The presence WS dropped. Call-terminal for a live ChatGPT
+     * voice call: mic stops now, the peer connection closes within
+     * the bounded grace (a dead daemon must never leave a live mic
+     * streaming).
+     * Owner purge lever for the durable voice presence thread (D1).
+     */
+    voice_thread_purge(): void;
 }
 
 /**
@@ -370,6 +387,7 @@ export interface InitOutput {
     readonly __wbg_presenceweb_free: (a: number, b: number) => void;
     readonly presenceweb_active_voice_model: (a: number) => [number, number];
     readonly presenceweb_active_voice_provider: (a: number) => [number, number];
+    readonly presenceweb_chatgpt_rtc_event: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly presenceweb_clear_server_sender: (a: number) => void;
     readonly presenceweb_connect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_connect_voice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
@@ -440,6 +458,8 @@ export interface InitOutput {
     readonly presenceweb_set_on_voice_audio: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_ready: (a: number, b: any) => void;
+    readonly presenceweb_set_on_voice_rtc: (a: number, b: any) => void;
+    readonly presenceweb_set_on_voice_status: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_text: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_tool_call: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_transcript: (a: number, b: any) => void;
@@ -449,6 +469,8 @@ export interface InitOutput {
     readonly presenceweb_set_verbosity: (a: number, b: number, c: number) => any;
     readonly presenceweb_take_display: (a: number, b: bigint) => void;
     readonly presenceweb_update_from_event: (a: number, b: any) => any;
+    readonly presenceweb_voice_signaling_lost: (a: number) => void;
+    readonly presenceweb_voice_thread_purge: (a: number) => void;
     readonly __wbg_wasmpresence_free: (a: number, b: number) => void;
     readonly get_presence_prompt: () => [number, number];
     readonly get_presence_tools: () => any;

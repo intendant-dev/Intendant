@@ -482,6 +482,7 @@ function ui2SettingsBuild() {
         { value: '', label: 'Auto', note: 'Pick a live-voice provider from available keys' },
         { value: 'gemini', label: 'Gemini Live' },
         { value: 'openai', label: 'OpenAI Realtime' },
+        { value: 'chatgpt', label: 'ChatGPT', note: 'Subscription voice via the daemon voice broker (no API key)' },
       ], 'Live voice provider');
       if (seg) {
         const segRow = ui2SettingsEl('div', 'ui2-seg-row');
