@@ -363,9 +363,16 @@ error for crash-frozen dirs), the window states them plainly ("Ended
 … : outcome" / "Died mid-turn — last activity …") instead of freezing
 on a mid-execution look, the status pill reads `Ended`/`Died` rather
 than a stale active phase, and a ghost whose lineage continued shows a
-clickable "continued as …" pointer derived from the shared
-resume-lineage resolver (`boot.continued_as`; the successor's state is
-joined client-side from its own card). Liveness itself stays
+"continued as …" pointer derived from the shared resume-lineage
+resolver (`boot.continued_as`; the successor's state is joined
+client-side from its own card). The pointer is shape-aware — never a
+link with no effect: when its target is folded into the same window
+(the dominant resume shape — the successor shares the backend id, so
+the chip already wears it and its transcript streams below the note)
+the pointer renders as prose ("this window continues live below") whose
+click scrolls to the tail; only a target in another window renders as a
+link, and its click force-focuses (opening if needed) that window and
+says so on hover. Liveness itself stays
 event/boot-derived — hydration never flips `ended` (the #637 stop-hide
 law), and the note is presentation of served facts. Fired sessions keep their derived names (the source
 item's title, or `workflow - node` for workflow nodes); an owner
