@@ -28,6 +28,10 @@ pub struct PresenceConfig {
     /// Context window for the live model.
     #[serde(default = "default_live_context_window")]
     pub live_context_window: u64,
+
+    /// ChatGPT-subscription voice lane pins (`[presence.voice]`).
+    #[serde(default)]
+    pub voice: crate::voice::PresenceVoiceConfig,
 }
 
 fn default_true() -> bool {
@@ -61,6 +65,7 @@ impl Default for PresenceConfig {
             live_provider: None,
             live_model: None,
             live_context_window: default_live_context_window(),
+            voice: crate::voice::PresenceVoiceConfig::default(),
         }
     }
 }

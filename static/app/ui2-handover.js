@@ -189,6 +189,67 @@
     }
   }
 
+  // The successor-exec lane's live in-flight fact (payload-side, so it
+  // survives reloads and other tabs' clicks).
+  function successorExecBusy(body) {
+    const exec = body && body.successor_exec;
+    return Boolean(exec && exec.in_flight === true);
+  }
+
+  // The ruled unsupervised one-click (successor exec, 2026-07-31): ask
+  // THIS daemon to spawn the verified on-disk build as its successor,
+  // confirm readiness, then drain toward it. The click names the build
+  // it offers (expected_git_sha) — the daemon refuses if the artifact
+  // changed under the button or the swap would be build-neutral. One
+  // named emitter for every surface; the daemon's phase/verdict comes
+  // back through the payload's successor_exec block.
+  async function performSuccessorExec(body, disk) {
+    if (updateAction.inFlight || successorExecBusy(body)) return;
+    updateAction.inFlight = true;
+    updateAction.note = 'Starting the new daemon from the built binary — this daemon drains toward it once it is ready; in-flight sessions finish here.';
+    handoverUpdateRender(body);
+    try {
+      const resp = await authedFetch('/api/daemon/successor-exec', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          expected_git_sha: disk.git_sha,
+          requested_by: 'dashboard update chip',
+        }),
+      });
+      if (!resp.ok) {
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const err = await resp.json();
+          if (err && err.detail) detail = err.detail;
+        } catch (_) { /* non-JSON error body */ }
+        updateAction.note = `The spawn was refused: ${detail}`;
+      }
+    } catch (err) {
+      updateAction.note = `This surface could not reach the daemon: ${(err && err.message) || err}`;
+    } finally {
+      updateAction.inFlight = false;
+      if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
+    }
+  }
+
+  // Why no spawn button renders, said honestly for the arm we are in —
+  // the pre-ruling copy survives only where it is still true (no
+  // successor-exec lane on this daemon).
+  function successorExecReachCopy(body, disk) {
+    const exec = body && body.successor_exec;
+    if (!exec || exec.available !== true) {
+      return 'No other daemon is running to hand off to — this daemon cannot launch one itself. The macOS app (and a service-managed install) can do this in one click.';
+    }
+    if (!disk || !disk.git_sha) {
+      return 'The changed binary on disk has no readable provenance — it cannot be started as a successor until a verifiable build lands.';
+    }
+    if (body && body.held === false) {
+      return 'This daemon is not the scheduler-lease holder — hand-offs happen from the holder’s own dashboard (the handover status names it).';
+    }
+    return 'No successor lane is available right now.';
+  }
+
   // The unsupervised arm's hand-off, equally named for both surfaces:
   // ask THIS daemon to drain toward an already-running newer daemon.
   async function performTakeoverHandoff(successor, body) {
@@ -249,6 +310,7 @@
       actions.appendChild(btn);
     } else {
       const successor = handoverSuccessorCandidate(body, disk);
+      const exec = body && body.successor_exec;
       if (successor) {
         const matches = disk && successor.version && successor.version.git_sha === disk.git_sha;
         const btn = document.createElement('button');
@@ -256,10 +318,21 @@
         btn.disabled = updateAction.inFlight;
         btn.addEventListener('click', () => performTakeoverHandoff(successor, body));
         actions.appendChild(btn);
+      } else if (exec && exec.available === true && disk && disk.git_sha && body.held !== false) {
+        // The ruled spawn (successor exec): no successor is running yet
+        // — start one from the verified build, then drain toward it.
+        const busy = updateAction.inFlight || successorExecBusy(body);
+        const btn = document.createElement('button');
+        btn.textContent = busy
+          ? 'Starting the new daemon…'
+          : `Start the new daemon & hand off (${String(disk.git_sha).slice(0, 10)})`;
+        btn.disabled = busy;
+        btn.addEventListener('click', () => performSuccessorExec(body, disk));
+        actions.appendChild(btn);
       } else {
         const reach = document.createElement('div');
         reach.className = 'handover-update-reach';
-        reach.textContent = 'No other daemon is running to hand off to — this daemon cannot launch one itself. The macOS app (and a service-managed install) can do this in one click.';
+        reach.textContent = successorExecReachCopy(body, disk);
         actions.appendChild(reach);
       }
     }
@@ -268,6 +341,23 @@
       note.className = 'handover-update-note';
       note.textContent = updateAction.note;
       actions.appendChild(note);
+    } else {
+      // The successor-exec flow's own story (another tab's click, a
+      // finished attempt): the payload block renders when no local
+      // click feedback outranks it. A drain in motion suppresses the
+      // whole chip, so the success arm shows only briefly.
+      const exec = body && body.successor_exec;
+      const execText = !exec || !exec.phase ? ''
+        : exec.in_flight ? `Successor exec: ${exec.phase}…`
+        : exec.ok === true ? (exec.detail || 'Successor exec completed.')
+        : exec.ok === false ? `Successor exec failed: ${exec.error || 'see the daemon log'}`
+        : '';
+      if (execText) {
+        const note = document.createElement('div');
+        note.className = 'handover-update-note';
+        note.textContent = execText;
+        actions.appendChild(note);
+      }
     }
     return actions;
   }
@@ -513,11 +603,26 @@
     return `${others.length} predecessor daemons are draining${finishing}`;
   }
 
-  function handoverSuccessorPort(body) {
+  // The §5.1 live-holder resolution rule (update-abstraction intake) —
+  // the ONE place a successor doorway target may come from. The lease
+  // sidecar names the most recent acquirer OR the most recent drainer
+  // during the entry→acquisition window (6c), so the sidecar target
+  // counts only while its daemons entry is live and neither draining
+  // nor exited; otherwise the hand-off candidate rule is the fallback
+  // (live, non-draining, on-disk build preferred). Null means "nobody
+  // yet": render the pending line, never a doorway into a drain.
+  function resolveLiveHolder(body) {
+    const daemons = Array.isArray(body && body.daemons) ? body.daemons : [];
     const sidecar = body && body.sidecar;
-    if (!sidecar || !body.boot_id || sidecar.boot_id === body.boot_id) return null;
-    const port = Number(sidecar.port);
-    return Number.isFinite(port) && port > 0 ? port : null;
+    if (sidecar && body.boot_id && sidecar.boot_id !== body.boot_id) {
+      const entry = daemons.find((d) => d && d.boot_id === sidecar.boot_id);
+      if (entry && entry.live && entry.state !== 'draining' && entry.state !== 'exited') {
+        const port = Number(entry.port);
+        if (Number.isFinite(port) && port > 0) return entry;
+      }
+    }
+    const update = body && body.update;
+    return handoverSuccessorCandidate(body, update ? update.on_disk : null);
   }
 
   // Render at most this many holdout rows; the rest fold into an honest
@@ -617,14 +722,28 @@
   }
 
   // A real doorway to a co-homed daemon — same-host port substitution,
-  // like the old inline link, but rendered as a prominent element.
+  // like the old inline link, but rendered as a prominent element. On
+  // the loopback posture a sibling refuses tokenless pages, so the
+  // click decorates the URL through the same-home token map
+  // (withSiblingLoopbackToken, the fleet-links lane) and lands authed
+  // instead of on the named 401; non-loopback surfaces pass through
+  // untouched. Modifier/middle clicks keep their native semantics on
+  // the bare href.
   function handoverDaemonLink(port, label) {
     const link = document.createElement('a');
     link.className = 'handover-successor-link';
-    link.href = `${location.protocol}//${location.hostname}:${port}/`;
+    const bare = `${location.protocol}//${location.hostname}:${port}/`;
+    link.href = bare;
     link.target = '_blank';
     link.rel = 'noopener';
     link.textContent = label;
+    link.addEventListener('click', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+      ev.preventDefault();
+      Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
+        window.open(url, '_blank', 'noopener');
+      });
+    });
     return link;
   }
 
@@ -635,7 +754,7 @@
     }
     handoverUpdateRender(body);
     if (body.draining) {
-      const port = handoverSuccessorPort(body);
+      const holder = resolveLiveHolder(body);
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
@@ -660,8 +779,10 @@
         : ' In-flight sessions finish here, then it exits.';
       head.appendChild(tail);
       el.appendChild(head);
-      if (port) {
-        el.appendChild(handoverDaemonLink(port, `Open the successor daemon (:${port}) →`));
+      if (holder) {
+        el.appendChild(
+          handoverDaemonLink(holder.port, `Open the successor daemon (:${holder.port}) →`)
+        );
       } else {
         const none = document.createElement('div');
         none.className = 'handover-banner-note';

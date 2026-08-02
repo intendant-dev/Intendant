@@ -164,6 +164,8 @@ macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
 scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
 skills/         # agenda, memory, operating/log search, visual collaboration, calls, E2E guides
+plugins/        # bundled first-party plugin packages (skills materialized only while enabled — plugin_registry.rs)
+skills-internal/ # dev-fleet-only skills (symlinked by scripts/install-dev-skills.sh; NEVER embedded or installed by product code)
 docs/src/       # this project's mdBook — the deep reference (see the table above)
 SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, research, implementation, presence, live audio)
 ```

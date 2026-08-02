@@ -50,6 +50,20 @@ export class PresenceWeb {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
+    /**
+     * Event from the JS RTC glue for the ChatGPT voice lane
+     * (offer_ready / pc_connected / pc_terminated / mic_error /
+     * dc_event / tick). The glue executes verbs; policy stays here.
+     * @param {string} kind
+     * @param {string} payload
+     */
+    chatgpt_rtc_event(kind, payload) {
+        const ptr0 = passStringToWasm0(kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(payload, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.presenceweb_chatgpt_rtc_event(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+    }
     clear_server_sender() {
         wasm.presenceweb_clear_server_sender(this.__wbg_ptr);
     }
@@ -700,6 +714,18 @@ export class PresenceWeb {
     /**
      * @param {Function} f
      */
+    set_on_voice_rtc(f) {
+        wasm.presenceweb_set_on_voice_rtc(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_voice_status(f) {
+        wasm.presenceweb_set_on_voice_status(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
     set_on_voice_text(f) {
         wasm.presenceweb_set_on_voice_text(this.__wbg_ptr, f);
     }
@@ -764,6 +790,19 @@ export class PresenceWeb {
     update_from_event(event) {
         const ret = wasm.presenceweb_update_from_event(this.__wbg_ptr, event);
         return ret;
+    }
+    voice_signaling_lost() {
+        wasm.presenceweb_voice_signaling_lost(this.__wbg_ptr);
+    }
+    /**
+     * The presence WS dropped. Call-terminal for a live ChatGPT
+     * voice call: mic stops now, the peer connection closes within
+     * the bounded grace (a dead daemon must never leave a live mic
+     * streaming).
+     * Owner purge lever for the durable voice presence thread (D1).
+     */
+    voice_thread_purge() {
+        wasm.presenceweb_voice_thread_purge(this.__wbg_ptr);
     }
 }
 if (Symbol.dispose) PresenceWeb.prototype[Symbol.dispose] = PresenceWeb.prototype.free;
@@ -1244,17 +1283,17 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 114, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 115, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h84265cdc34ad334d, wasm_bindgen__convert__closures_____invoke__h1323b7d8cb126930);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 114, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 115, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h84265cdc34ad334d, wasm_bindgen__convert__closures_____invoke__h1323b7d8cb126930);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [], shim_idx: 111, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 114, function: Function { arguments: [], shim_idx: 117, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h84265cdc34ad334d, wasm_bindgen__convert__closures_____invoke__hbd1bbb6a7583757b);
             return ret;
         },

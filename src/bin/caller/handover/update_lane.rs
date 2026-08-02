@@ -28,15 +28,19 @@
 //!   unverified bytes are deleted, never installed.
 //!
 //! Boundary (the commission's first-class gate line): the daemon never
-//! self-execs the build or fetch and NEVER execs a successor daemon —
-//! the work runs as supervised, timeout-bounded, env-curated child
-//! processes (`git`, `cargo`, `bash scripts/bundle-macos.sh`, `gpg`,
-//! `ditto`) plus the already-ruled hosted-verify fetch machinery, with
-//! progress and failure rendered honestly on the handover status
-//! payload. The update stays two phases: this module PRODUCES the
-//! artifact on disk; the shipped watch/chip/one-click lane performs the
-//! swap. The owner's click is the consent surface — nothing here runs
-//! without it except the bounded behind-ness check.
+//! self-execs the build or fetch, and this module never execs a
+//! successor daemon — the work runs as supervised, timeout-bounded,
+//! env-curated child processes (`git`, `cargo`,
+//! `bash scripts/bundle-macos.sh`, `gpg`, `ditto`) plus the
+//! already-ruled hosted-verify fetch machinery, with progress and
+//! failure rendered honestly on the handover status payload. The update
+//! stays two phases: this module PRODUCES the artifact on disk; the
+//! shipped watch/chip/one-click lane performs the swap (the app
+//! supervisor's spawn when one is attached, or — ruled 2026-07-31, its
+//! own explicit click, NEVER a side effect of produce — the
+//! [`super::successor_exec`] lane on CLI-launched daemons). The owner's
+//! click is the consent surface — nothing here runs without it except
+//! the bounded behind-ness check.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -993,6 +997,12 @@ impl UpdateLane {
         Ok(self.status_block())
     }
 
+    /// Is a produce job running right now? The successor-exec lane
+    /// refuses to exec an artifact a job may be mid-writing.
+    pub(super) fn job_in_flight(&self) -> bool {
+        self.job_running.load(Ordering::Acquire)
+    }
+
     /// The owner's click: start the produce job on `channel` (the
     /// install's native lane when unnamed). Refuses (honestly) while one
     /// runs and on any channel/install mismatch — the guard runs before
@@ -1065,8 +1075,7 @@ impl UpdateLane {
         let tip = self
             .git(repo_root, &["rev-parse", "--verify", "origin/main"])
             .await?;
-        let running_sha =
-            mock_running_sha_override().unwrap_or_else(|| crate::build_info::git_sha().to_string());
+        let running_sha = running_sha_for_compare();
         let range = format!("{running_sha}..origin/main");
         let max_count = format!("--max-count={BEHIND_COUNT_CAP}");
         let count = self
@@ -1563,6 +1572,15 @@ fn mock_build_override() -> Option<String> {
          (the override is a mock-rig knob, never a production redirect)"
     );
     None
+}
+
+/// The running build's commit as every update surface compares it: the
+/// compiled-in provenance, except under the PROVIDER=mock rig knob
+/// below. Shared by the source-lane behind compare, the update watch's
+/// same-build suppression, and the successor-exec lane's build-neutral
+/// refusal — one answer to "what is running", never three.
+pub(super) fn running_sha_for_compare() -> String {
+    mock_running_sha_override().unwrap_or_else(|| crate::build_info::git_sha().to_string())
 }
 
 /// Rig knob (PROVIDER=mock only): the "running" commit for the compare.

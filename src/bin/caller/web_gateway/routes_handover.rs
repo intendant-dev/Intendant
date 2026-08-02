@@ -161,11 +161,78 @@ pub(crate) async fn handle_daemon_update_lane(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Transport-neutral core of `POST /api/daemon/successor-exec` (ruled
+/// 2026-07-31; NO tunnel twin — ruling binding 4): on a CLI-launched
+/// daemon the owner's explicit click spawns the verified on-disk build
+/// as a successor secondary, confirms readiness, then drains toward
+/// it. Body (JSON): `{"expected_git_sha": "<offered build>",
+/// "requested_by": "<display label>"}` — the sha is REQUIRED (the exec
+/// target is pinned by path AND hash; a click that cannot name the
+/// build it offered does not run), the label is display currency.
+pub(crate) async fn daemon_successor_exec_api_response(
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let runtime = match mcp_server {
+        Some(server) => server.handover_runtime().await,
+        None => None,
+    };
+    let lane = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.successor_exec_lane());
+    let Some(lane) = lane else {
+        return ApiResponse::json_error(503, "the successor-exec lane is not wired on this daemon");
+    };
+    let body = serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_default();
+    let Some(expected) = body
+        .get("expected_git_sha")
+        .and_then(|value| value.as_str())
+    else {
+        return ApiResponse::json_error(
+            400,
+            "the body must name the offered build: {\"expected_git_sha\": …} — the spawn \
+             targets an exact verified artifact, never \"whatever is on disk\"",
+        );
+    };
+    let requested_by = body
+        .get("requested_by")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    match lane.request_spawn(expected, requested_by) {
+        Ok(block) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "started": true, "successor_exec": block })),
+        ),
+        Err(refusal) => ApiResponse::json(
+            409,
+            JsonBody::Value(serde_json::json!({
+                "error": "successor_exec_refused",
+                "detail": refusal,
+                "successor_exec": lane.status_block(),
+            })),
+        ),
+    }
+}
+
+/// `POST /api/daemon/successor-exec` — the HTTP wrapper.
+pub(crate) async fn handle_daemon_successor_exec(
+    stream: DemuxStream,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = daemon_successor_exec_api_response(&body_text, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 /// The one-click swap relay's three actions: a dashboard surface asks
 /// (`request`), the app supervisor's health tick claims (`claim`), and
 /// the supervisor reports the attempt's outcome (`result`). The daemon
 /// only parks and serves the request — the supervisor performs the
-/// swap; the daemon never execs a successor (Q8 holds).
+/// swap; on an app-supervised daemon the daemon still never execs a
+/// successor (the ruled successor-exec route above is the UNSUPERVISED
+/// counterpart, and refuses while a supervisor is attached).
 pub(crate) enum UpdateSwapAction {
     Request,
     Claim,

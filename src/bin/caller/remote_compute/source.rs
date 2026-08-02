@@ -1195,6 +1195,9 @@ mod tests {
     fn base_repo() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "--quiet"]);
+        // Tests own the bytes they write. Do not let a machine-wide Git
+        // setting rewrite LF fixtures to CRLF in derived worktrees.
+        git(dir.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
         git(dir.path(), &["add", "tracked.txt"]);
         git(
@@ -1222,6 +1225,7 @@ mod tests {
             worker.path(),
             &["clone", "--quiet", home.path().to_str().unwrap(), "."],
         );
+        git(worker.path(), &["config", "core.autocrlf", "false"]);
 
         std::fs::write(home.path().join("tracked.txt"), "changed\n").unwrap();
         std::fs::write(home.path().join("new.txt"), "new\n").unwrap();
@@ -1310,6 +1314,7 @@ mod tests {
             worker.path(),
             &["clone", "--quiet", home.path().to_str().unwrap(), "."],
         );
+        git(worker.path(), &["config", "core.autocrlf", "false"]);
         std::fs::write(home.path().join("tracked.txt"), "remote\n").unwrap();
         let snapshot = capture_working_tree(home.path(), Some(&revision)).unwrap();
         let sources = WorkerSources::new(worker.path().to_path_buf()).unwrap();

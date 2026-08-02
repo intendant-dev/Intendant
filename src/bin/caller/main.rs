@@ -121,6 +121,7 @@ mod vault_deposits;
 mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
+mod voice_broker;
 mod web_gateway;
 mod web_tls;
 #[cfg(windows)]
@@ -290,6 +291,11 @@ struct CliFlags {
     no_tui: bool,
     mcp: bool,
     autonomy: AutonomyLevel,
+    /// Whether `--autonomy` was passed explicitly (vs the parser
+    /// default). Only [`CliFlags::successor_replay_args`] reads this:
+    /// an unpassed default must not be replayed onto a successor, where
+    /// it would override the config file's choice.
+    autonomy_explicit: bool,
     log_file: Option<String>,
     /// --continue / -c: resume the most recent session for this project.
     continue_last: bool,
@@ -361,6 +367,78 @@ struct CliFlags {
     /// replaces both the `[server.advertise]` config value and the
     /// auto-detected single URL — operator at the CLI wins.
     advertise_urls: Vec<String>,
+}
+
+impl CliFlags {
+    /// The argv a spawned successor daemon boots with (the ruled
+    /// successor-exec lane): every STANDING daemon-shaping flag the
+    /// owner passed explicitly — bind/TLS posture, autonomy, provider
+    /// selection, the external-agent default — replayed verbatim, so
+    /// the successor's exposure and behavior do not silently reset to
+    /// defaults. ONE-SHOT argv never replays: the task and --task-file
+    /// (would re-run work), --continue/--resume (would hijack a session
+    /// the drainer still serves), --takeover (the successor must never
+    /// race the incumbent at boot — ruling binding 3), and the --web
+    /// port (the successor binds its own via `--web 0`). Flags absent
+    /// here re-resolve from config/env on the successor, which is the
+    /// point: only explicit CLI choices pin. A NEW daemon-shaping flag
+    /// must be added here to survive a successor hand-off.
+    pub(crate) fn successor_replay_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        let mut valued = |flag: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                args.push(flag.to_string());
+                args.push(value.clone());
+            }
+        };
+        valued("--provider", &self.provider);
+        valued("--openai-auth", &self.openai_auth);
+        valued("--model", &self.model);
+        valued("--log-file", &self.log_file);
+        valued("--tls-cert", &self.tls_cert);
+        valued("--tls-key", &self.tls_key);
+        valued("--mtls-ca", &self.mtls_ca);
+        if self.autonomy_explicit {
+            args.push("--autonomy".to_string());
+            // Display renders "Full"; from_str_loose reads it back
+            // case-insensitively — lowercase for the conventional argv.
+            args.push(self.autonomy.to_string().to_lowercase());
+        }
+        if let Some(bind) = self.web_bind {
+            args.push("--bind".to_string());
+            args.push(bind.to_string());
+        }
+        if let Some(backend) = &self.agent_backend {
+            args.push("--agent".to_string());
+            args.push(backend.as_short_str().to_string());
+        }
+        for flag in [
+            ("--verbose", self.verbose),
+            ("--control-socket", self.control_socket),
+            ("--sandbox", self.sandbox),
+            ("--no-sandbox", self.no_sandbox),
+            ("--no-presence", self.no_presence),
+            ("--no-tls", self.no_tls),
+            ("--allow-public-plaintext", self.allow_public_plaintext),
+            ("--tls", self.tls),
+            ("--mtls", self.mtls),
+            ("--transcription", self.transcription),
+        ]
+        .into_iter()
+        .filter_map(|(flag, set)| set.then_some(flag))
+        {
+            args.push(flag.to_string());
+        }
+        for url in &self.advertise_urls {
+            args.push("--advertise-url".to_string());
+            args.push(url.clone());
+        }
+        for id in &self.record_displays {
+            args.push("--record-display".to_string());
+            args.push(id.to_string());
+        }
+        args
+    }
 }
 
 fn print_help() {
@@ -495,6 +573,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         no_tui: false,
         mcp: false,
         autonomy: AutonomyLevel::Medium,
+        autonomy_explicit: false,
         log_file: None,
         continue_last: false,
         resume_id: None,
@@ -588,6 +667,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
             "--autonomy" => {
                 if i + 1 < args.len() {
                     flags.autonomy = AutonomyLevel::from_str_loose(&args[i + 1]);
+                    flags.autonomy_explicit = true;
                     i += 2;
                 } else {
                     return Err(CallerError::Config(
@@ -1782,6 +1862,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -1808,6 +1889,65 @@ Also: {"source": "bare"}"#;
             no_web: false,
             advertise_urls: Vec::new(),
         }
+    }
+
+    /// Successor replay (the successor-exec lane): explicitly passed
+    /// STANDING daemon-shaping flags replay verbatim; one-shot argv —
+    /// the task, --takeover, --continue/--resume, the --web port — and
+    /// unpassed defaults never do (an unpassed --autonomy must not
+    /// override the successor's config resolution).
+    #[test]
+    fn successor_replay_carries_standing_flags_and_drops_one_shot_argv() {
+        let parsed = parse_cli_flags_from(cli(&[
+            "--web",
+            "8801",
+            "--bind",
+            "127.0.0.1",
+            "--no-tls",
+            "--autonomy",
+            "full",
+            "--agent",
+            "codex",
+            "--takeover",
+            "--continue",
+            "--verbose",
+            "--advertise-url",
+            "wss://example.test/ws",
+            "do the one-shot task",
+        ]))
+        .expect("flags parse");
+        let replay = parsed.successor_replay_args();
+        assert_eq!(
+            replay,
+            vec![
+                "--autonomy",
+                "full",
+                "--bind",
+                "127.0.0.1",
+                "--agent",
+                "codex",
+                "--verbose",
+                "--no-tls",
+                "--advertise-url",
+                "wss://example.test/ws",
+            ],
+            "standing flags replay; task/--takeover/--continue/--web never do"
+        );
+        let replayed = replay.join(" ");
+        for one_shot in ["8801", "--takeover", "--continue", "one-shot"] {
+            assert!(
+                !replayed.contains(one_shot),
+                "one-shot argv leaked into the successor replay: {one_shot}"
+            );
+        }
+
+        // Unpassed flags replay nothing at all — the successor
+        // re-resolves config/env defaults itself.
+        let bare = parse_cli_flags_from(cli(&["--web", "0"])).expect("bare flags parse");
+        assert!(
+            bare.successor_replay_args().is_empty(),
+            "an unflagged boot replays nothing"
+        );
     }
 
     #[test]
@@ -2038,6 +2178,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -2096,6 +2237,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -2141,6 +2283,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,

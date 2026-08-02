@@ -22,7 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, MasterPty, PtySize};
@@ -723,9 +723,10 @@ impl OutputHub {
     }
 }
 
-/// A single live PTY-backed shell session. Internally shared via `Arc` so
-/// the reader task and any number of attached listeners can hold a
-/// reference without lifetime gymnastics.
+/// A single live PTY-backed shell session. Callers share it via `Arc`;
+/// the blocking reader and child-exit waiter keep only `Weak` references so
+/// neither can pin a killed ConPTY whose output pipe remains open until the
+/// master drops.
 pub struct PtySession {
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
@@ -853,12 +854,33 @@ impl PtySession {
             shared: std::sync::atomic::AtomicBool::new(shared),
         });
 
-        // Reader: dedicated OS thread (portable_pty's reader is blocking).
-        // Copies bytes into scrollback and fans out to listeners.
-        let session_clone = session.clone();
-        std::thread::spawn(move || {
-            Self::reader_loop(session_clone, reader, child);
-        });
+        // portable_pty's reader and child wait are both blocking. On Windows,
+        // ConPTY can retain the output pipe after an orderly shell exit while
+        // this session still owns the master handle, so waiting for EOF before
+        // waiting for the child loses the exit forever. Monitor the child on a
+        // separate thread there; both threads are weak owners, so Drop can
+        // still kill the child and release the master. Unix keeps the original
+        // drain-before-exit ordering, where PTY EOF is reliable and guarantees
+        // all final output precedes Exited.
+        #[cfg(windows)]
+        {
+            let reader_session = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::reader_loop(&reader_session, reader);
+            });
+            let exit_session = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::wait_for_child(exit_session, child);
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let session_clone = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::reader_loop(&session_clone, reader);
+                Self::wait_for_child(session_clone, child);
+            });
+        }
 
         Ok(session)
     }
@@ -973,11 +995,7 @@ impl PtySession {
         }
     }
 
-    fn reader_loop(
-        session: Arc<Self>,
-        mut reader: Box<dyn Read + Send>,
-        mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    ) {
+    fn reader_loop(session: &Weak<Self>, mut reader: Box<dyn Read + Send>) {
         // 64 KiB reads: bulk shell output at 4 KiB paid 16× the syscalls,
         // and the per-read Vec was pure overhead — `fan_out` copies into
         // each listener's queue itself.
@@ -986,6 +1004,9 @@ impl PtySession {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let Some(session) = session.upgrade() else {
+                        break;
+                    };
                     let chunk = &buf[..n];
                     // Answer ConPTY's startup cursor-position query so the shell
                     // doesn't block waiting for it (Windows only; no-op on Unix
@@ -1009,18 +1030,18 @@ impl PtySession {
                 Err(_) => break,
             }
         }
+    }
 
-        // Shell exited. Capture exit status if available and notify
-        // listeners so the UI can mark the session as closed.
+    /// Wait for the shell process independently of ConPTY output EOF and
+    /// notify listeners exactly once when it exits.
+    fn wait_for_child(session: Weak<Self>, mut child: Box<dyn portable_pty::Child + Send + Sync>) {
         let status = match child.wait() {
             Ok(s) => s.exit_code() as i32,
             Err(_) => -1,
         };
-        if let Ok(mut alive) = session.alive.lock() {
-            *alive = false;
+        if let Some(session) = session.upgrade() {
+            session.mark_exited(status);
         }
-        let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
-        hub.fan_out_exit(status);
     }
 
     /// Write bytes to the PTY stdin. Silently drops if the writer has
@@ -1063,6 +1084,26 @@ impl PtySession {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let _ = killer.kill();
+        drop(killer);
+        // ConPTY may retain its output pipe until the master handle is
+        // dropped, so its reader is not a reliable exit notifier after a
+        // forced kill. Publish the forced exit here; the reader's later
+        // observation is deduplicated by `mark_exited`.
+        self.mark_exited(-1);
+    }
+
+    fn mark_exited(&self, status: i32) {
+        let transitioned = if let Ok(mut alive) = self.alive.lock() {
+            let transitioned = *alive;
+            *alive = false;
+            transitioned
+        } else {
+            false
+        };
+        if transitioned {
+            let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
+            hub.fan_out_exit(status);
+        }
     }
 
     pub fn shared(&self) -> bool {
@@ -1101,10 +1142,13 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        // The session (registry entry + reader thread) is gone: wake every
-        // parked listener so `recv` drains what's queued and returns
-        // `None` — the same end-of-stream the old dropped-sender channels
-        // signalled.
+        // The reader is deliberately weak: the last registry/listener
+        // owner dropping must stop the child and close the master PTY,
+        // which in turn releases a blocked ConPTY read.
+        self.terminate();
+        // Wake every parked listener so `recv` drains what's queued and
+        // returns `None` — the same end-of-stream the old dropped-sender
+        // channels signalled.
         if let Ok(hub) = self.output.lock() {
             hub.detach_all();
         }
@@ -1435,8 +1479,8 @@ impl TerminalRegistry {
         }
         if let Some(SessionSlot::Live(session)) = guard.remove(key) {
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
-            // cleanly; if it ignores, the session is simply dropped and
-            // the reader thread hits read error → broadcasts Exited.
+            // cleanly; if it ignores, dropping the final owner invokes
+            // the forced-termination fallback and releases the master PTY.
             session.write_input(&[0x04]);
         }
         true
@@ -1576,6 +1620,70 @@ mod tests {
         // token can only come from the replay.
         let mut rx2 = session.attach();
         expect_output(&mut rx2, Some("scroll_token_abc"), "scrollback replay").await;
+    }
+
+    /// Drain `rx` until the shell's `Exited` event arrives, returning its
+    /// status. Panics loudly on deadline or channel close.
+    async fn expect_exited(rx: &mut TerminalListener, phase: &str) -> i32 {
+        let deadline = tokio::time::Instant::now() + OUTPUT_BUDGET;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(TerminalEvent::Output(_))) => {}
+                Ok(Some(TerminalEvent::Exited { status })) => return status,
+                Ok(None) => panic!("{phase}: event channel closed before Exited"),
+                Err(_) => panic!("{phase}: no Exited within {OUTPUT_BUDGET:?}"),
+            }
+        }
+    }
+
+    /// The Ctrl-D / `exit` lifecycle the dashboard depends on: a session
+    /// whose shell exited stays visible (scrollback replayable) but is
+    /// REPLACED by the next open of the same key with a fresh, working
+    /// shell — the way back into a terminal after the old one dies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exited_session_is_replaced_by_next_open() {
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let key = TerminalKey::local("respawn-after-exit");
+        let (first, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, spawn_all())
+            .await
+            .unwrap();
+        assert!(created);
+        let mut rx = first.attach();
+        // Wait for the shell to paint before typing (startup can flush
+        // pending input — see open_attach_write_and_receive_output).
+        expect_output(&mut rx, None, "first shell startup").await;
+        first.write_input(b"exit\r");
+        expect_exited(&mut rx, "first shell exit").await;
+        assert!(!first.is_alive());
+
+        // Dead but still visible: the scrollback stays replayable until
+        // something replaces the session.
+        assert!(registry
+            .get_visible(&key, &TerminalActor::Root)
+            .await
+            .is_some());
+
+        // The next open of the same key replaces the dead session with a
+        // fresh spawn (replacement follows spawn rules, so `created`).
+        let (second, respawned) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, spawn_all())
+            .await
+            .unwrap();
+        assert!(respawned, "a dead session must be replaced, not attached");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the replacement is a new session"
+        );
+        assert!(second.is_alive());
+        assert_eq!(registry.len().await, 1);
+
+        // And the replacement is a working shell, not a husk.
+        let mut rx2 = second.attach();
+        expect_output(&mut rx2, None, "respawned shell startup").await;
+        second.write_input(b"echo respawn_ok_5173\r");
+        expect_output(&mut rx2, Some("respawn_ok_5173"), "respawned echo").await;
+        registry.close_visible(&key, &TerminalActor::Root).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

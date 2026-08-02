@@ -10961,7 +10961,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   padding: 4px 8px;
 }
 
-.shell-share-btn {
+.shell-share-btn,
+.shell-restart-btn {
   background: var(--bg-tertiary, #2a2a2e);
   color: var(--text-secondary, #b8b8bc);
   border: 1px solid var(--border-color, #3a3a3e);
@@ -10971,7 +10972,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   cursor: pointer;
 }
 
-.shell-share-btn:hover {
+.shell-share-btn:hover,
+.shell-restart-btn:hover {
   color: var(--text-primary, #e8e8ec);
 }
 
@@ -14553,6 +14555,30 @@ html.ui-v2 .ui2-vp-cam-slot .video-preview-info {
 html.ui-v2 .ui2-vp-cam-slot .video-preview-info .frame-id { color: var(--sky); }
 html.ui-v2 .ui2-vp-cam-slot #videoFps { display: none; } /* dead readout (never updated) — hidden under v2 */
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+
+/* ── ChatGPT-lane voice card ── */
+.vp-chatgpt-card {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface0, rgba(127, 127, 127, 0.12));
+  font-size: 11px;
+  line-height: 1.5;
+}
+.vp-chatgpt-card .vp-cg-row { opacity: 0.85; }
+.vp-chatgpt-card .vp-cg-usage { opacity: 0.6; }
+.vp-chatgpt-card .vp-cg-err { color: var(--red, #d20f39); }
+.vp-chatgpt-card .vp-cg-purge {
+  margin-top: 4px;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--surface2, rgba(127, 127, 127, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.vp-chatgpt-card .vp-cg-purge:hover { border-color: var(--red, #d20f39); }
 /* ── static/app/ui2-access.css ── */
 /* ── ui-v2 Access surface re-skin (design-overhaul P2) ─────────────────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -16131,7 +16157,8 @@ html.ui-v2 .shell-host-status.error { color: var(--rose); }
 html.ui-v2 .shell-host-status.warn { color: var(--amber); }
 html.ui-v2 .shell-host-status.ok { color: var(--green); }
 
-html.ui-v2 .shell-share-btn {
+html.ui-v2 .shell-share-btn,
+html.ui-v2 .shell-restart-btn {
   min-height: 32px; /* match the 32px Target select — one control height per row */
   padding: 6px 12px;
   border: 1px solid var(--line);
@@ -16141,7 +16168,8 @@ html.ui-v2 .shell-share-btn {
   font: 600 12px var(--sans);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-html.ui-v2 .shell-share-btn:hover {
+html.ui-v2 .shell-share-btn:hover,
+html.ui-v2 .shell-restart-btn:hover {
   background: var(--surface-2);
   border-color: var(--line-2);
   color: var(--text);
@@ -16150,6 +16178,17 @@ html.ui-v2 .shell-share-btn.is-shared {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
   color: var(--green);
+}
+/* The re-entry affordance is the exited pane's one live control — accent
+   it so a dead terminal visibly offers the way back in. */
+html.ui-v2 .shell-restart-btn {
+  border-color: rgba(var(--iris-rgb), .38);
+  color: var(--iris);
+}
+html.ui-v2 .shell-restart-btn:hover {
+  background: rgba(var(--iris-rgb), .12);
+  border-color: rgba(var(--iris-rgb), .55);
+  color: var(--iris-2);
 }
 
 html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
@@ -33634,6 +33673,7 @@ html.ui-v2 .daemon-relay-note {
             <label for="shell-host-select">Target</label>
             <select id="shell-host-select" title="Shell target"></select>
             <span class="shell-host-status" id="shell-host-status"></span>
+            <button id="shell-restart-btn" class="shell-restart-btn hidden" title="Start a fresh shell session">New shell</button>
             <button id="shell-share-btn" class="shell-share-btn hidden" title="Share this shell session so scoped collaborators (terminal.view / terminal.write) can attach">Share</button>
             <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
           </div>
@@ -35256,6 +35296,7 @@ html.ui-v2 .daemon-relay-note {
                   <option value="">Auto</option>
                   <option value="gemini">Gemini</option>
                   <option value="openai">OpenAI</option>
+                  <option value="chatgpt">ChatGPT (subscription)</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -38753,7 +38794,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '63184705f53d318b';
+const INTENDANT_APP_BUILD = 'dd211736abef6613';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38957,6 +38998,44 @@ function getLoopbackToken() {
     return bareFetch(input, init);
   };
 })();
+
+// ── Same-home sibling loopback-token handoff ──
+//
+// Sibling daemons on THIS home refuse tokenless loopback like every
+// daemon, and this page holds only its own daemon's token (per-origin
+// storage). Opening a loopback sibling therefore asks the reached
+// daemon for its same-home instance map (/api/local-daemons/tokens —
+// owner-posture only; served per-request, never persisted) and opens
+// the sibling's own tokened URL so its page seeds its own origin.
+// Non-loopback and mTLS targets pass through untouched. Cached per
+// page load; a stale map (sibling rebooted) degrades to the bare URL
+// and the sibling's named 401 guidance. Shared: the Access fleet links
+// (43-access-panes) and the handover doorways (ui2-handover) both
+// route through this one helper.
+let accessSiblingTokenMapPromise = null;
+
+async function withSiblingLoopbackToken(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const loopback =
+      host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
+    if (!loopback || url.searchParams.has('token')) return rawUrl;
+    if (!accessSiblingTokenMapPromise) {
+      accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
+        .then(resp => (resp.ok ? resp.json() : { instances: [] }))
+        .catch(() => ({ instances: [] }));
+    }
+    const map = await accessSiblingTokenMapPromise;
+    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+    const entry = (map.instances || []).find(inst => String(inst.port) === String(port));
+    if (!entry || !entry.token) return rawUrl;
+    url.searchParams.set('token', entry.token);
+    return url.toString();
+  } catch {
+    return rawUrl;
+  }
+}
 
 function getFederationToken() {
   try {
@@ -46750,6 +46829,16 @@ let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
+// Whether the toolbar's "New shell" re-entry affordance is showing (the
+// shell exited or the open errored; a sent open clears it).
+let shellRestartOffered = false;
+// Shell events (output/exit) that arrived before xterm.js finished
+// loading: the open frame is sent the moment the Terminal tab is entered
+// so the PTY's startup overlaps the script fetch, and nothing from that
+// window may be dropped. Bounded; oldest output falls off first.
+let shellPreInitEvents = [];
+let shellPreInitEventBytes = 0;
+const SHELL_PRE_INIT_MAX_BYTES = 512 * 1024;
 let activeTermSubtab = 'shell';
 
 // Files editor state. Declared here, far above the editor's functions,
@@ -55303,6 +55392,7 @@ function stopVideo() {
 function hasVoiceCredentials() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   if (provider === 'openai') return true; // server mints token from OPENAI_API_KEY
+  if (provider === 'chatgpt') return true; // subscription lane: daemon brokers signaling, no browser key
   return !!voiceApiKeyGet();
 }
 
@@ -55391,6 +55481,11 @@ async function connectVoice() {
       showVoiceStatus('Failed to get session token', true);
       return;
     }
+  } else if (provider === 'chatgpt') {
+    // Subscription lane: the daemon brokers signaling; media flows
+    // browser-to-provider over WebRTC. No token, no capture worklet, no
+    // playback queue - the RTC glue owns mic + audio element.
+    token = '';
   } else {
     // Gemini: vault entry when unlocked, else the per-origin localStorage key
     token = voiceApiKeyGet();
@@ -55398,8 +55493,10 @@ async function connectVoice() {
   }
 
   voiceConnecting = true;
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (provider !== 'chatgpt') {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
   showVoiceStatus('Connecting...');
   app.connect_voice(provider, token, model, inputRate);
   voiceConnecting = false;
@@ -55985,6 +56082,10 @@ async function main() {
     // A dead event stream can't retract pending-request items — drop the
     // attention badge; the reconnect bootstrap rebuilds what still stands.
     try { attentionOnServerState(connected); } catch (_) {}
+    // ChatGPT-lane calls treat signaling loss as call-terminal (the
+    // machine stops the mic now and closes the pc within its bounded
+    // grace - a dead daemon must never leave a live mic streaming).
+    if (!connected && app.voice_signaling_lost) app.voice_signaling_lost();
   });
 
   // ── Voice Callbacks ──
@@ -56003,7 +56104,11 @@ async function main() {
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus(isReconnect ? 'Reconnected' : 'Voice ready');
     setTimeout(hideVoiceStatus, 3000);
-    if (isReconnect) {
+    if (provider === 'chatgpt') {
+      // Context is daemon-seeded (checkpoint seeds initialItems); no
+      // browser-side grounding text exists on this lane.
+      sendDashboardVoiceDiagnostic('connected', 'chatgpt voice call active');
+    } else if (isReconnect) {
       // Reconnected after a disconnect — this is a fresh session with no prior
       // context. Send a strong grounding message to prevent the model from
       // confabulating a continuation of a conversation that no longer exists.
@@ -56024,6 +56129,14 @@ async function main() {
   });
 
   app.set_on_voice_audio((b64) => playAudioChunk(b64));
+
+  // ChatGPT lane: RTC verbs for the glue + voice card status.
+  app.set_on_voice_rtc((cmd) => {
+    if (window.voiceChatGptExec) voiceChatGptExec(cmd);
+  });
+  app.set_on_voice_status((statusJson) => {
+    if (window.voiceCardUpdate) voiceCardUpdate(statusJson);
+  });
 
   app.set_on_voice_text((text) => {
     sendDashboardVoiceLog(text, undefined);
@@ -56070,6 +56183,18 @@ async function main() {
 
   app.set_on_diagnostic((kind, detail) => {
     sendDashboardVoiceDiagnostic(kind, detail);
+    if (kind === 'voice_call_ended') {
+      // Terminal close on the chatgpt lane: run the same disconnect
+      // path the stop button uses (idempotent - the machine is already
+      // Closed) so presence bookkeeping and UI state reset.
+      disconnectDashboardVoice();
+      modelConnected = false;
+      micActive = false;
+      document.getElementById('micBtn').classList.remove('active');
+      document.getElementById('sb-voice').className = 'voice-dot err';
+      showVoiceStatus('Voice ended: ' + (detail || 'closed'));
+      setTimeout(hideVoiceStatus, 4000);
+    }
   });
 
   app.set_on_session_changed(() => {
@@ -56342,7 +56467,11 @@ async function main() {
     }
     micActive = !micActive;
     document.getElementById('micBtn').classList.toggle('active', micActive);
-    if (micActive) await startMic(); else stopMic();
+    const liveProvider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+    if (liveProvider === 'chatgpt') {
+      // The RTC glue owns the mic on this lane; un-toggling stops the call.
+      if (!micActive) disconnectDashboardVoice();
+    } else if (micActive) { await startMic(); } else { stopMic(); }
   });
 
   // ── Video Button ──
@@ -56429,6 +56558,174 @@ async function main() {
     if (modelConnected && app) disconnectDashboardVoice();
   });
 }
+/* ── static/app/36b-voice-chatgpt-rtc.js ── */
+// ── ChatGPT-lane voice: WebRTC glue + voice card ──
+//
+// Dumb executor for the WASM provider's RTC verbs (create_call /
+// apply_answer / stop_mic / close_pc). Every policy decision — when the
+// mic stops, when the peer connection closes, the drain grace for the
+// final usage flush, signaling-loss handling — lives in the natively
+// tested Rust call state machine; this file only performs browser API
+// calls and reports events back via app.chatgpt_rtc_event().
+//
+// Media flows browser⇄provider. The daemon relays SDP only and never
+// carries audio.
+
+(() => {
+  const st = { pc: null, mic: null, dc: null, audioEl: null, tick: null };
+
+  function evt(kind, payload) {
+    try {
+      if (window.app && app.chatgpt_rtc_event) app.chatgpt_rtc_event(kind, payload || '');
+    } catch (e) {
+      console.warn('[voice-chatgpt] event dispatch failed', kind, e);
+    }
+  }
+
+  function startTick() {
+    if (!st.tick) st.tick = setInterval(() => evt('tick'), 500);
+  }
+  function stopTick() {
+    if (st.tick) { clearInterval(st.tick); st.tick = null; }
+  }
+
+  async function createCall() {
+    startTick();
+    try {
+      st.mic = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+    } catch (e) {
+      evt('mic_error', String((e && e.message) || e));
+      return;
+    }
+    const pc = new RTCPeerConnection();
+    st.pc = pc;
+    for (const track of st.mic.getTracks()) pc.addTrack(track, st.mic);
+    const dc = pc.createDataChannel('oai-events');
+    st.dc = dc;
+    dc.onmessage = (e) => { if (typeof e.data === 'string') evt('dc_event', e.data); };
+    pc.ontrack = (e) => {
+      if (!st.audioEl) {
+        st.audioEl = document.createElement('audio');
+        st.audioEl.autoplay = true;
+        st.audioEl.style.display = 'none';
+        document.body.appendChild(st.audioEl);
+      }
+      st.audioEl.srcObject = (e.streams && e.streams[0]) || new MediaStream([e.track]);
+    };
+    pc.onconnectionstatechange = () => {
+      if (!st.pc || pc !== st.pc) return;
+      if (pc.connectionState === 'connected') evt('pc_connected');
+      else if (pc.connectionState === 'failed') evt('pc_terminated', 'failed');
+    };
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // The provider endpoint is ice-lite (candidates ride the SDP, no
+      // trickle) — wait for gathering, bounded.
+      if (pc.iceGatheringState !== 'complete') {
+        await new Promise((resolve) => {
+          const done = () => {
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', done);
+              resolve();
+            }
+          };
+          pc.addEventListener('icegatheringstatechange', done);
+          setTimeout(resolve, 3000);
+        });
+      }
+      evt('offer_ready', (pc.localDescription && pc.localDescription.sdp) || '');
+    } catch (e) {
+      evt('pc_terminated', 'offer: ' + String((e && e.message) || e));
+    }
+  }
+
+  function stopMicTracks() {
+    if (st.mic) {
+      for (const t of st.mic.getTracks()) t.stop();
+      st.mic = null;
+    }
+  }
+
+  function closePc() {
+    try { if (st.dc) st.dc.close(); } catch (_) {}
+    try { if (st.pc) st.pc.close(); } catch (_) {}
+    st.dc = null;
+    st.pc = null;
+    if (st.audioEl) st.audioEl.srcObject = null;
+    stopMicTracks();
+    stopTick();
+  }
+
+  window.voiceChatGptExec = function (cmdJson) {
+    let cmd;
+    try { cmd = JSON.parse(cmdJson); } catch (_) { return; }
+    switch (cmd.kind) {
+      case 'create_call':
+        createCall();
+        break;
+      case 'apply_answer':
+        if (st.pc) {
+          st.pc
+            .setRemoteDescription({ type: 'answer', sdp: cmd.sdp })
+            .catch((e) => evt('pc_terminated', 'answer: ' + String((e && e.message) || e)));
+        }
+        break;
+      case 'stop_mic':
+        stopMicTracks();
+        break;
+      case 'close_pc':
+        closePc();
+        break;
+      default:
+        break;
+    }
+  };
+
+  // ── Voice card (minimal): resolved pins + provider-reported usage +
+  // the owner's thread purge lever. Renders into the ui2 voice panel
+  // when present.
+  window.voiceCardUpdate = function (statusJson) {
+    let status;
+    try { status = JSON.parse(statusJson); } catch (_) { return; }
+    const host = document.getElementById('ui2-vp-note') || document.getElementById('voiceStatus');
+    if (!host) return;
+    let card = document.getElementById('vp-chatgpt-card');
+    if (!card) {
+      card = document.createElement('div');
+      card.id = 'vp-chatgpt-card';
+      card.className = 'vp-chatgpt-card';
+      host.parentNode.insertBefore(card, host.nextSibling);
+    }
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+    ));
+    const usage = status.last_usage && status.last_usage.tokens
+      ? `tokens ${esc(JSON.stringify(status.last_usage.tokens))} (provider-reported)`
+      : '';
+    card.innerHTML = [
+      `<div class="vp-cg-row">ChatGPT voice · ${status.active ? 'live' : 'idle'}${status.available ? '' : ' · not configured'}</div>`,
+      status.resolved_model
+        ? `<div class="vp-cg-row">backing ${esc(status.resolved_model)}${status.resolved_effort ? ' @ ' + esc(status.resolved_effort) : ''}</div>`
+        : '',
+      `<div class="vp-cg-row">${esc(status.realtime_version || 'v3')}${status.voice ? ' · voice ' + esc(status.voice) : ''}${status.thread_id ? ' · thread ' + esc(String(status.thread_id).slice(0, 8)) : ''}${status.thread_lineage_count ? ' · lineage ' + status.thread_lineage_count : ''}</div>`,
+      usage ? `<div class="vp-cg-row vp-cg-usage">${usage}</div>` : '',
+      status.last_error ? `<div class="vp-cg-row vp-cg-err">${esc(status.last_error)}</div>` : '',
+      `<div class="vp-cg-row"><button id="vp-cg-purge" class="vp-cg-purge" title="Delete the durable presence thread (provider-side) and reset its local identity">Purge presence thread</button></div>`,
+    ].join('');
+    const purge = card.querySelector('#vp-cg-purge');
+    if (purge) {
+      purge.addEventListener('click', () => {
+        if (!window.app || !app.voice_thread_purge) return;
+        if (window.confirm('Delete the durable voice presence thread? The next call starts fresh from the checkpoint.')) {
+          app.voice_thread_purge();
+        }
+      });
+    }
+  };
+})();
 /* ── static/app/37-uicommand-changes-control.js ── */
 // ── UiCommand Processor ──
 function processCommands(cmds) {
@@ -81302,41 +81599,9 @@ function accessDiagnosticsCards() {
    request (never authority), and the target DAEMON decides via its
    local IAM. Roles get warmer colors the more they can do. */
 
-// ── Same-home sibling loopback-token handoff ──
-//
-// Sibling daemons on THIS home refuse tokenless loopback like every
-// daemon, and this page holds only its own daemon's token (per-origin
-// storage). Opening a loopback sibling therefore asks the reached
-// daemon for its same-home instance map (/api/local-daemons/tokens —
-// owner-posture only; served per-request, never persisted) and opens
-// the sibling's own tokened URL so its page seeds its own origin.
-// Non-loopback and mTLS targets pass through untouched. Cached per
-// page load; a stale map (sibling rebooted) degrades to the bare URL
-// and the sibling's named 401 guidance.
-let accessSiblingTokenMapPromise = null;
-
-async function withSiblingLoopbackToken(rawUrl) {
-  try {
-    const url = new URL(rawUrl, location.href);
-    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-    const loopback =
-      host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
-    if (!loopback || url.searchParams.has('token')) return rawUrl;
-    if (!accessSiblingTokenMapPromise) {
-      accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
-        .then(resp => (resp.ok ? resp.json() : { instances: [] }))
-        .catch(() => ({ instances: [] }));
-    }
-    const map = await accessSiblingTokenMapPromise;
-    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-    const entry = (map.instances || []).find(inst => String(inst.port) === String(port));
-    if (!entry || !entry.token) return rawUrl;
-    url.searchParams.set('token', entry.token);
-    return url.toString();
-  } catch {
-    return rawUrl;
-  }
-}
+// The same-home sibling loopback-token handoff (withSiblingLoopbackToken)
+// lives in 31-init-identity-fleet.js beside the loopback-token machinery
+// it extends; the fleet links below and the handover doorways share it.
 
 const ACCESS_ROLE_META = {
   'role:root': { cls: 'role-root', warn: true, short: 'Full control of this daemon, including access administration.' },
@@ -83959,6 +84224,11 @@ function resetShellConnectionStateForHostChange() {
   shellPendingResize = null;
   shellOutputQueue = [];
   shellOutputQueuedBytes = 0;
+  // Buffered pre-init output belongs to the previous host; the exited/
+  // retry affordance does too.
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  offerShellRestart(false);
 }
 
 function refreshShellHostOptions() {
@@ -84029,7 +84299,10 @@ function setShellHost(hostId) {
 // Called when the server sends {"t":"terminal_output", "data":"<base64>"}
 // for this host/terminal pair.
 function handleShellOutput(base64data) {
-  if (!shellTerm) return;
+  if (!shellTerm) {
+    bufferPreInitShellEvent({ kind: 'output', data: base64data });
+    return;
+  }
   const bytes = base64ToBytes(base64data);
   shellOutputQueue.push(bytes);
   shellOutputQueuedBytes += bytes.byteLength;
@@ -84067,21 +84340,72 @@ function flushShellOutput() {
   shellTerm.write(merged);
 }
 
+// ── Pre-init event buffer ──
+// initShell sends terminal_open before the xterm scripts have loaded (the
+// PTY's shell startup then overlaps the fetch). Output or an exit landing
+// in that window is held here — bounded, oldest output dropped first —
+// and replayed into xterm by initShell's start().
+function bufferPreInitShellEvent(evt) {
+  if (evt.kind === 'output') shellPreInitEventBytes += evt.data.length;
+  shellPreInitEvents.push(evt);
+  while (shellPreInitEventBytes > SHELL_PRE_INIT_MAX_BYTES && shellPreInitEvents.length > 1) {
+    const dropped = shellPreInitEvents.shift();
+    if (dropped.kind === 'output') shellPreInitEventBytes -= dropped.data.length;
+  }
+}
+
+function flushPreInitShellEvents() {
+  if (!shellTerm || shellPreInitEvents.length === 0) return;
+  const events = shellPreInitEvents;
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  for (const evt of events) {
+    if (evt.kind === 'output') handleShellOutput(evt.data);
+    else if (evt.kind === 'exited') handleShellExited(evt.status);
+  }
+}
+
 function handleShellExited(status) {
-  if (!shellTerm) return;
+  if (!shellTerm) {
+    bufferPreInitShellEvent({ kind: 'exited', status });
+    return;
+  }
   flushShellOutput();
   shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
-  setShellHostStatus(`Shell exited on ${shellHostLabel()}`, 'warn');
+  shellTerm.write('\x1b[90m[press Enter to start a new shell]\x1b[0m\r\n');
+  setShellHostStatus(`Shell exited (status ${status}) on ${shellHostLabel()}`, 'warn');
   shellOpenSent = false;
   shellOpenAcked = false;
   shellQueuedInput = '';
   shellWaitingNoticeShown = false;
+  offerShellRestart(true);
+}
+
+// ── Shell re-entry (exited state) ──
+// The dead session stays replayable server-side until the next open
+// replaces it with a fresh spawn (terminal.rs open_or_attach). Typing has
+// always re-opened; the button and the in-terminal hint make the way back
+// in visible instead of a hidden gesture.
+function offerShellRestart(on) {
+  shellRestartOffered = !!on;
+  const btn = document.getElementById('shell-restart-btn');
+  if (btn) btn.classList.toggle('hidden', !shellRestartOffered);
+}
+
+function restartShellSession() {
+  if (!shellInitialized) {
+    initShell();
+    return;
+  }
+  openShellSessionIfPossible();
+  if (shellTerm) shellTerm.focus();
 }
 
 function handleShellOpened(ack) {
   shellOpenSent = true;
   shellOpenAcked = true;
   shellWaitingNoticeShown = false;
+  offerShellRestart(false);
   shellShared = !!(ack && ack.shared);
   shellCanShare = !!(ack && ack.can_share);
   renderShellShareState();
@@ -84132,6 +84456,9 @@ function handleShellError(error) {
     const message = String(error || 'shell unavailable');
     shellTerm.write(`\r\n\x1b[31m[shell error: ${message}]\x1b[0m\r\n`);
   }
+  // The open failed or the session broke: the button doubles as the
+  // visible retry (clicking sends a fresh terminal_open).
+  offerShellRestart(true);
 }
 
 function showShellWaitingNotice() {
@@ -84581,13 +84908,18 @@ function queueShellInput(bytes) {
 }
 
 function openShellSessionIfPossible(force = false) {
-  if (!shellTerm) return false;
+  // shellInitialized (not shellTerm): the open is sent as soon as the
+  // Terminal tab is entered, before the xterm scripts finish loading —
+  // shellOpenFrame falls back to 80x24 and the post-ack resize corrects.
+  if (!shellInitialized) return false;
   if (shellOpenSent && !force) return true;
   const sent = sendShellMessage(shellOpenFrame());
   if (sent) {
     shellOpenSent = true;
     shellOpenAcked = false;
     shellWaitingNoticeShown = false;
+    offerShellRestart(false);
+    setShellHostStatus(`Connecting to ${shellHostLabel()}…`, '');
     return true;
   }
   shellOpenSent = false;
@@ -84597,7 +84929,7 @@ function openShellSessionIfPossible(force = false) {
 
 function maybeOpenShellAfterTransportReady() {
   if (activeTab !== 'terminal' || activeTermSubtab !== 'shell') return;
-  if (!shellInitialized || !shellTerm || shellOpenSent) return;
+  if (!shellInitialized || shellOpenSent) return;
   openShellSessionIfPossible();
 }
 
@@ -84712,6 +85044,15 @@ function initShell() {
   // Ensure the xterm.js stylesheet is active.
   document.getElementById('xterm-css').removeAttribute('disabled');
 
+  // Ask the server to open (or reattach to) the session NOW, before the
+  // xterm scripts load, so the shell's own startup (login rc files are
+  // the slow part) overlaps the fetch instead of following it. Output
+  // that beats the scripts lands in the pre-init buffer and replays in
+  // start(). In Connect mode the dashboard-control tunnel may still be
+  // negotiating; if so, this is retried from
+  // dashboardUpdateTransportStatus() once terminal frames are ready.
+  openShellSessionIfPossible();
+
   const start = () => {
     // Theme from the design tokens (blinking block cursor per the
     // design); `|| undefined` keeps xterm's built-in default as the net
@@ -84785,31 +85126,41 @@ function initShell() {
       }
     }).observe(document.getElementById('shell-container'));
 
-    // Ask the server to open (or reattach to) the session. In Connect mode the
-    // dashboard-control tunnel may still be negotiating; if so, this is retried
-    // from dashboardUpdateTransportStatus() once terminal frames are ready.
+    // Replay everything the early open produced while the scripts loaded,
+    // then re-ask in case the early send found no transport (no-op when
+    // the open is already in flight or acked).
+    flushPreInitShellEvents();
     openShellSessionIfPossible();
   };
 
   // If xterm.js is already loaded, start immediately. Otherwise load the
-  // vendored copies (embedded static assets — no external fetch) and start.
+  // vendored copies (embedded static assets — no external fetch) in
+  // PARALLEL — the fit addon's UMD wrapper only touches Terminal when an
+  // addon instance is loaded, not at parse time — and start once both are
+  // in.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
   }
-  const script = document.createElement('script');
-  script.src = '/xterm.min.js';
-  script.onload = () => {
-    const fitScript = document.createElement('script');
-    fitScript.src = '/xterm-addon-fit.min.js';
-    fitScript.onload = start;
-    document.head.appendChild(fitScript);
+  let scriptsRemaining = 2;
+  const scriptArrived = () => {
+    scriptsRemaining -= 1;
+    if (scriptsRemaining === 0) start();
   };
-  document.head.appendChild(script);
+  for (const src of ['/xterm.min.js', '/xterm-addon-fit.min.js']) {
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = scriptArrived;
+    document.head.appendChild(script);
+  }
 }
 
 function switchTerminalSubtab(name) {
   if (activeTermSubtab === name) {
+    // Re-entering the already-active Shell sub-tab: if the shell exited
+    // while the user was away, this is the respawn seam (no-op when a
+    // session is already open).
+    if (name === 'shell' && shellInitialized) openShellSessionIfPossible();
     syncTerminalPaneAccessibility();
     return;
   }
@@ -84988,6 +85339,7 @@ document.addEventListener('DOMContentLoaded', wireShellKeybar);
 document.addEventListener('DOMContentLoaded', () => {
   syncTerminalPaneAccessibility();
   refreshShellHostOptions();
+  document.getElementById('shell-restart-btn')?.addEventListener('click', restartShellSession);
 });
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('[data-shared-view-close]').forEach(btn => {
@@ -105575,6 +105927,67 @@ async function memoryProposeFromForm(button) {
     }
   }
 
+  // The successor-exec lane's live in-flight fact (payload-side, so it
+  // survives reloads and other tabs' clicks).
+  function successorExecBusy(body) {
+    const exec = body && body.successor_exec;
+    return Boolean(exec && exec.in_flight === true);
+  }
+
+  // The ruled unsupervised one-click (successor exec, 2026-07-31): ask
+  // THIS daemon to spawn the verified on-disk build as its successor,
+  // confirm readiness, then drain toward it. The click names the build
+  // it offers (expected_git_sha) — the daemon refuses if the artifact
+  // changed under the button or the swap would be build-neutral. One
+  // named emitter for every surface; the daemon's phase/verdict comes
+  // back through the payload's successor_exec block.
+  async function performSuccessorExec(body, disk) {
+    if (updateAction.inFlight || successorExecBusy(body)) return;
+    updateAction.inFlight = true;
+    updateAction.note = 'Starting the new daemon from the built binary — this daemon drains toward it once it is ready; in-flight sessions finish here.';
+    handoverUpdateRender(body);
+    try {
+      const resp = await authedFetch('/api/daemon/successor-exec', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          expected_git_sha: disk.git_sha,
+          requested_by: 'dashboard update chip',
+        }),
+      });
+      if (!resp.ok) {
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const err = await resp.json();
+          if (err && err.detail) detail = err.detail;
+        } catch (_) { /* non-JSON error body */ }
+        updateAction.note = `The spawn was refused: ${detail}`;
+      }
+    } catch (err) {
+      updateAction.note = `This surface could not reach the daemon: ${(err && err.message) || err}`;
+    } finally {
+      updateAction.inFlight = false;
+      if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
+    }
+  }
+
+  // Why no spawn button renders, said honestly for the arm we are in —
+  // the pre-ruling copy survives only where it is still true (no
+  // successor-exec lane on this daemon).
+  function successorExecReachCopy(body, disk) {
+    const exec = body && body.successor_exec;
+    if (!exec || exec.available !== true) {
+      return 'No other daemon is running to hand off to — this daemon cannot launch one itself. The macOS app (and a service-managed install) can do this in one click.';
+    }
+    if (!disk || !disk.git_sha) {
+      return 'The changed binary on disk has no readable provenance — it cannot be started as a successor until a verifiable build lands.';
+    }
+    if (body && body.held === false) {
+      return 'This daemon is not the scheduler-lease holder — hand-offs happen from the holder’s own dashboard (the handover status names it).';
+    }
+    return 'No successor lane is available right now.';
+  }
+
   // The unsupervised arm's hand-off, equally named for both surfaces:
   // ask THIS daemon to drain toward an already-running newer daemon.
   async function performTakeoverHandoff(successor, body) {
@@ -105635,6 +106048,7 @@ async function memoryProposeFromForm(button) {
       actions.appendChild(btn);
     } else {
       const successor = handoverSuccessorCandidate(body, disk);
+      const exec = body && body.successor_exec;
       if (successor) {
         const matches = disk && successor.version && successor.version.git_sha === disk.git_sha;
         const btn = document.createElement('button');
@@ -105642,10 +106056,21 @@ async function memoryProposeFromForm(button) {
         btn.disabled = updateAction.inFlight;
         btn.addEventListener('click', () => performTakeoverHandoff(successor, body));
         actions.appendChild(btn);
+      } else if (exec && exec.available === true && disk && disk.git_sha && body.held !== false) {
+        // The ruled spawn (successor exec): no successor is running yet
+        // — start one from the verified build, then drain toward it.
+        const busy = updateAction.inFlight || successorExecBusy(body);
+        const btn = document.createElement('button');
+        btn.textContent = busy
+          ? 'Starting the new daemon…'
+          : `Start the new daemon & hand off (${String(disk.git_sha).slice(0, 10)})`;
+        btn.disabled = busy;
+        btn.addEventListener('click', () => performSuccessorExec(body, disk));
+        actions.appendChild(btn);
       } else {
         const reach = document.createElement('div');
         reach.className = 'handover-update-reach';
-        reach.textContent = 'No other daemon is running to hand off to — this daemon cannot launch one itself. The macOS app (and a service-managed install) can do this in one click.';
+        reach.textContent = successorExecReachCopy(body, disk);
         actions.appendChild(reach);
       }
     }
@@ -105654,6 +106079,23 @@ async function memoryProposeFromForm(button) {
       note.className = 'handover-update-note';
       note.textContent = updateAction.note;
       actions.appendChild(note);
+    } else {
+      // The successor-exec flow's own story (another tab's click, a
+      // finished attempt): the payload block renders when no local
+      // click feedback outranks it. A drain in motion suppresses the
+      // whole chip, so the success arm shows only briefly.
+      const exec = body && body.successor_exec;
+      const execText = !exec || !exec.phase ? ''
+        : exec.in_flight ? `Successor exec: ${exec.phase}…`
+        : exec.ok === true ? (exec.detail || 'Successor exec completed.')
+        : exec.ok === false ? `Successor exec failed: ${exec.error || 'see the daemon log'}`
+        : '';
+      if (execText) {
+        const note = document.createElement('div');
+        note.className = 'handover-update-note';
+        note.textContent = execText;
+        actions.appendChild(note);
+      }
     }
     return actions;
   }
@@ -105899,11 +106341,26 @@ async function memoryProposeFromForm(button) {
     return `${others.length} predecessor daemons are draining${finishing}`;
   }
 
-  function handoverSuccessorPort(body) {
+  // The §5.1 live-holder resolution rule (update-abstraction intake) —
+  // the ONE place a successor doorway target may come from. The lease
+  // sidecar names the most recent acquirer OR the most recent drainer
+  // during the entry→acquisition window (6c), so the sidecar target
+  // counts only while its daemons entry is live and neither draining
+  // nor exited; otherwise the hand-off candidate rule is the fallback
+  // (live, non-draining, on-disk build preferred). Null means "nobody
+  // yet": render the pending line, never a doorway into a drain.
+  function resolveLiveHolder(body) {
+    const daemons = Array.isArray(body && body.daemons) ? body.daemons : [];
     const sidecar = body && body.sidecar;
-    if (!sidecar || !body.boot_id || sidecar.boot_id === body.boot_id) return null;
-    const port = Number(sidecar.port);
-    return Number.isFinite(port) && port > 0 ? port : null;
+    if (sidecar && body.boot_id && sidecar.boot_id !== body.boot_id) {
+      const entry = daemons.find((d) => d && d.boot_id === sidecar.boot_id);
+      if (entry && entry.live && entry.state !== 'draining' && entry.state !== 'exited') {
+        const port = Number(entry.port);
+        if (Number.isFinite(port) && port > 0) return entry;
+      }
+    }
+    const update = body && body.update;
+    return handoverSuccessorCandidate(body, update ? update.on_disk : null);
   }
 
   // Render at most this many holdout rows; the rest fold into an honest
@@ -106003,14 +106460,28 @@ async function memoryProposeFromForm(button) {
   }
 
   // A real doorway to a co-homed daemon — same-host port substitution,
-  // like the old inline link, but rendered as a prominent element.
+  // like the old inline link, but rendered as a prominent element. On
+  // the loopback posture a sibling refuses tokenless pages, so the
+  // click decorates the URL through the same-home token map
+  // (withSiblingLoopbackToken, the fleet-links lane) and lands authed
+  // instead of on the named 401; non-loopback surfaces pass through
+  // untouched. Modifier/middle clicks keep their native semantics on
+  // the bare href.
   function handoverDaemonLink(port, label) {
     const link = document.createElement('a');
     link.className = 'handover-successor-link';
-    link.href = `${location.protocol}//${location.hostname}:${port}/`;
+    const bare = `${location.protocol}//${location.hostname}:${port}/`;
+    link.href = bare;
     link.target = '_blank';
     link.rel = 'noopener';
     link.textContent = label;
+    link.addEventListener('click', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+      ev.preventDefault();
+      Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
+        window.open(url, '_blank', 'noopener');
+      });
+    });
     return link;
   }
 
@@ -106021,7 +106492,7 @@ async function memoryProposeFromForm(button) {
     }
     handoverUpdateRender(body);
     if (body.draining) {
-      const port = handoverSuccessorPort(body);
+      const holder = resolveLiveHolder(body);
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
@@ -106046,8 +106517,10 @@ async function memoryProposeFromForm(button) {
         : ' In-flight sessions finish here, then it exits.';
       head.appendChild(tail);
       el.appendChild(head);
-      if (port) {
-        el.appendChild(handoverDaemonLink(port, `Open the successor daemon (:${port}) →`));
+      if (holder) {
+        el.appendChild(
+          handoverDaemonLink(holder.port, `Open the successor daemon (:${holder.port}) →`)
+        );
       } else {
         const none = document.createElement('div');
         none.className = 'handover-banner-note';
@@ -107593,6 +108066,9 @@ function switchTab(tabId) {
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'shell') {
       if (!shellInitialized) initShell();
+      // Revisit seam: if the shell exited while the tab was hidden, this
+      // spawns a fresh one (no-op when a session is already open).
+      else openShellSessionIfPossible();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
     syncTerminalPaneAccessibility();
@@ -123137,6 +123613,7 @@ function ui2SettingsBuild() {
         { value: '', label: 'Auto', note: 'Pick a live-voice provider from available keys' },
         { value: 'gemini', label: 'Gemini Live' },
         { value: 'openai', label: 'OpenAI Realtime' },
+        { value: 'chatgpt', label: 'ChatGPT', note: 'Subscription voice via the daemon voice broker (no API key)' },
       ], 'Live voice provider');
       if (seg) {
         const segRow = ui2SettingsEl('div', 'ui2-seg-row');

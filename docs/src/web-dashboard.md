@@ -583,6 +583,16 @@ An embedded xterm.js terminal hosting an interactive **Shell** session on the
 daemon (or a selected peer). Session monitoring and control live in the
 Activity/Station tabs, not here.
 
+Entering the tab opens the PTY immediately — the shell's own startup runs
+while the lazily loaded xterm scripts fetch in parallel, with any output from
+that window buffered and replayed, so the first prompt is not serialized
+behind the script load. When the shell exits (Ctrl-D, `exit`, a crash) the
+pane says so with the exit status and offers the way back in: a **New shell**
+toolbar button, a press-Enter hint, and automatic re-open on the next visit
+to the tab. The daemon keeps the dead session's scrollback replayable until
+the next open replaces it with a fresh spawn (spawn rules apply — replacing
+requires `shell.spawn`, exactly like creating).
+
 ### Live display
 
 The Computer Use workspace combines a selected WebRTC stage with a live rail
@@ -2048,6 +2058,7 @@ response omits the header.
 | POST | `/api/daemon/update-swap` | Settings | own origin | ≤ 4 KiB | Ask the attached app supervisor for the one-click update swap (refused when no live supervisor is attached) |
 | POST | `/api/daemon/update-swap/claim` | Settings | own origin | ≤ 4 KiB | App supervisor poll: claim the pending one-click swap request (consuming; expired requests evaporate) |
 | POST | `/api/daemon/update-swap/result` | Settings | own origin | ≤ 4 KiB | App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane) |
+| POST | `/api/daemon/successor-exec` | Settings | own origin | ≤ 4 KiB | Successor exec: spawn the verified on-disk build as this daemon's successor and drain toward it (CLI-launched daemons; body requires {"expected_git_sha": …}) |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/refs/content` | AgendaRead | own origin | none | One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise) |

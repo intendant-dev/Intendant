@@ -5290,37 +5290,73 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         .to_string_lossy()
         .to_string();
 
-    // Two fixture declarations sharing a dirty path: the §2.7 pair
-    // overlap the radar flags. Written AFTER round 1, so round 1's
-    // request predates any coordination signal by construction.
-    for id in ["s-fake-a", "s-fake-b"] {
-        let doc = format!(
-            "---\nv: 1\nkind: session-declaration\nid: {id}\nbackend: native\ncreated_ms: 1\n---\n\
-             ## intent\noccupying the same space\n\n## dirty\n- shared/hot.rs\n"
-        );
-        std::fs::write(space_dir.join("sessions").join(format!("{id}.md")), doc)
-            .expect("write fixture declaration");
-    }
-    // The radar's deduplicated note write is the tick-completion proof:
-    // once an rn-* note exists, the same tick's snapshot publish (which
-    // follows the note writes) is microseconds behind — long past by
-    // the time the steer round-trips below.
-    poll_until(
+    // Give the real session and one fixture peer the same dirty path.
+    // Written AFTER round 1, so round 1's request predates any
+    // coordination signal by construction. Involving the real session
+    // also gives the test a post-publication rail event to await below.
+    let writer_id = format!("s-{session_id}");
+    let own_declaration = space_dir.join("sessions").join(format!("{writer_id}.md"));
+    let mut own_doc =
+        std::fs::read_to_string(&own_declaration).expect("read the session's declaration");
+    assert!(
+        !own_doc.contains("## dirty"),
+        "fixture expects a clean declaration"
+    );
+    own_doc.push_str("\n## dirty\n- shared/hot.rs\n");
+    std::fs::write(&own_declaration, own_doc).expect("add the session fixture path");
+    let peer_id = "s-fake-peer";
+    let peer_doc = format!(
+        "---\nv: 1\nkind: session-declaration\nid: {peer_id}\nbackend: native\ncreated_ms: 1\n---\n\
+         ## intent\noccupying the same space\n\n## dirty\n- shared/hot.rs\n"
+    );
+    std::fs::write(
+        space_dir.join("sessions").join(format!("{peer_id}.md")),
+        peer_doc,
+    )
+    .expect("write fixture peer declaration");
+    // The radar's deduplicated note is one acceptance surface of the
+    // overlap. The rail transition below separately proves that the
+    // same tick's snapshot has reached the in-process delivery seam.
+    let radar_note_id = poll_until(
         "a radar note for the fixture overlap",
         RUN_TIMEOUT,
         || {
             let notes_dir = space_dir.join("messages").join("daemon");
+            let writer_id = writer_id.clone();
             async move {
                 std::fs::read_dir(&notes_dir)
                     .ok()?
                     .flatten()
-                    .find(|e| e.file_name().to_string_lossy().starts_with("rn-"))
-                    .map(|_| ())
+                    .find_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if !name.starts_with("rn-") {
+                            return None;
+                        }
+                        let doc = std::fs::read_to_string(entry.path()).ok()?;
+                        doc.contains(&format!("\nto: {writer_id}\n"))
+                            .then(|| name.trim_end_matches(".md").to_string())
+                    })
             }
         },
         &daemon_log,
     )
     .await;
+
+    // Radar notes are written before the in-process snapshot publish.
+    // Await the real session's rail transition too: that event is emitted
+    // after publish, so round 2 cannot race the few instructions between
+    // the note rename and the state becoming visible to the agent loop.
+    let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("coordination_radar")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("state").and_then(|v| v.as_str()) == Some("raised")
+    })
+    .await
+    .unwrap_or_else(|| panic!("radar flag never raised:\n{}", daemon_log()));
+    assert_eq!(
+        raised.get("id").and_then(|v| v.as_str()),
+        Some(space_key.as_str())
+    );
 
     // Round 2 via the parked-steer fallback; the mock's own transcript
     // expectation gates on the injected block.
@@ -5394,16 +5430,26 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     let second_messages: Vec<serde_json::Value> =
         serde_json::from_str(second).expect("second request parses");
     assert!(second_messages.len() > first_messages.len());
-    let expected_block = format!(
+    let expected_core = format!(
         "[System] coordination v1 space={space_key}\n\
-         sessions: 2 active, 0 stale — s-fake-a(native), s-fake-b(native)"
+         sessions: 1 active, 0 stale — s-fake-p(native)\n\
+         ! overlap shared/hot.rs — with s-fake-p (declared)"
     );
+    // The tick scans before it writes its radar note, then publishes the
+    // scanned snapshot. A fast round 2 therefore sees the overlap but not
+    // the note until the next scan; a slower platform may see both. The
+    // note poll above proves the separate acceptance surface, while this
+    // byte proof admits exactly those two ruled renderings.
+    let expected_with_note =
+        format!("{expected_core}\nmessages: 1 unread — from daemon: {radar_note_id}");
     let tail_message = second_messages.last().expect("non-empty request");
     assert_eq!(tail_message["role"].as_str(), Some("user"));
-    assert_eq!(
-        tail_message["content"].as_str(),
-        Some(expected_block.as_str()),
-        "the §2.2 block is the NEW tail message"
+    let actual_block = tail_message["content"]
+        .as_str()
+        .expect("the new tail message has text content");
+    assert!(
+        actual_block == expected_core || actual_block == expected_with_note,
+        "the §2.2 block is the NEW tail message:\n{actual_block}"
     );
     assert!(
         !first_messages.iter().any(|m| m["content"]
@@ -5421,7 +5467,7 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         .join(&session_id);
     let rows = parsed_session_rows(&log_dir);
     let messages = canonical_message_rows(&rows);
-    let block_row = user_message_row(&messages, &expected_block);
+    let block_row = user_message_row(&messages, actual_block);
     assert_eq!(
         msg_field(block_row, "provenance").as_str(),
         Some("system_injection"),
@@ -7173,6 +7219,356 @@ async fn drainer_exits_at_last_session_end() {
     drop(daemon_b);
 }
 
+/// A mock script whose scheduled-session profile parks mid-turn on a
+/// long provider delay — the holdout that keeps each drainer in the
+/// three-daemon chain below alive (and draining) for the whole
+/// choreography. The 30s file-barrier bound is too tight for two
+/// takeovers plus a third boot on a slow runner, so the park is a
+/// plain delay; the sessions never complete inside the test and
+/// teardown kills the daemons.
+fn chain_park_script() -> serde_json::Value {
+    serde_json::json!({
+        "profiles": [
+            { "match": "handover rig follow-through",
+              "steps": [
+                { "content": "Working until the test ends.", "delay_ms": 600_000 },
+                { "content": "All work finished.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "handover fire complete" } }] }
+              ] },
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    })
+}
+
+/// The §5.1 live-holder resolution rule exactly as the dashboard's
+/// `resolveLiveHolder` applies it to a served handover payload: the
+/// sidecar target iff its daemons entry is live and neither draining
+/// nor exited; else the first live non-draining sibling; else none.
+/// (The SPA's on-disk-build preference needs no twin here — the rig
+/// runs one binary, so every candidate matches.)
+fn resolve_live_holder_port(body: &serde_json::Value) -> Option<u16> {
+    let daemons = body["daemons"].as_array().cloned().unwrap_or_default();
+    let self_boot = body["boot_id"].as_str().unwrap_or_default();
+    let eligible = |d: &serde_json::Value| {
+        d["live"] == true
+            && d["boot_id"].as_str().is_some_and(|boot| boot != self_boot)
+            && d["state"] != "draining"
+            && d["state"] != "exited"
+    };
+    let port_of = |d: &serde_json::Value| d["port"].as_u64().map(|p| p as u16);
+    if let Some(sidecar_boot) = body["sidecar"]["boot_id"].as_str() {
+        if sidecar_boot != self_boot {
+            if let Some(entry) = daemons.iter().find(|d| d["boot_id"] == sidecar_boot) {
+                if eligible(entry) {
+                    return port_of(entry);
+                }
+            }
+        }
+    }
+    daemons.iter().find(|d| eligible(d)).and_then(port_of)
+}
+
+/// Update-abstraction slice 1, acceptance (b): the three-daemon chain.
+/// A drains toward B, then B drains before any C exists — the 6c
+/// entry→acquisition window where the shared sidecar names a DRAINING
+/// daemon. A's served handover payload must let the §5.1 resolution
+/// rule refuse B during that window and reach C once C acquires; the
+/// drainer's `/api/local-daemons/tokens` must name the successor's own
+/// admission token, and that token must actually admit a doorway-shaped
+/// request (the tokened-doorway half). The drainers' refusal pointers
+/// (R-D1's server-side mirror) ride the same rule: "pending" during
+/// the window, `:C` after.
+#[tokio::test]
+async fn chained_drain_payload_resolves_only_live_non_draining_holder() {
+    let rig = TestRig::new();
+    let script = chain_park_script();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let boot_a = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // A fires a session that parks mid-turn: the holdout that keeps A
+    // alive (and draining, below) through the whole choreography.
+    let item_a = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "chain-park-a",
+    )
+    .await;
+    poll_until(
+        "A's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_a)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // B boots with --takeover: A drains, B acquires.
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &["--takeover"],
+    )
+    .await;
+    poll_until(
+        "the lease transferring to B",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] != boot_a.as_str() && sidecar["state"] == "active").then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+    let boot_b = lease_sidecar(&daemon_a.rig).expect("B sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // B — the holder now — fires its own parked session, so its drain
+    // below holds it alive too: a LIVE draining sibling (the intake's
+    // 6c shape), not a corpse.
+    let item_b = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_b.port,
+        now_epoch_ms() + 1_500,
+        "chain-park-b",
+    )
+    .await;
+    poll_until(
+        "B's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_b)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || format!("journal: {:?}", journal_rows(&daemon_a.rig)),
+    )
+    .await;
+
+    // Drain B with no successor running: the 6c window opens — the
+    // shared sidecar now names B, DRAINING, and nobody has acquired.
+    let takeover = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/daemon/takeover",
+            daemon_b.port
+        ))
+        .header(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&daemon_a.rig, daemon_b.port),
+        )
+        .json(&serde_json::json!({ "requested_by": "chain e2e" }))
+        .send()
+        .await
+        .expect("takeover request reaches B");
+    assert!(
+        takeover.status().is_success(),
+        "drain request on B refused: {}",
+        takeover.status()
+    );
+    poll_until(
+        "the sidecar naming B draining",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] == boot_b.as_str() && sidecar["state"] == "draining").then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // A's served payload during the window: the sidecar names a
+    // draining daemon, the daemons array carries B live+draining, and
+    // the resolution rule refuses it — no doorway into a drain.
+    let a_client = daemon_a.authed_client();
+    let handover_url = format!("http://127.0.0.1:{}/api/daemon/handover", daemon_a.port);
+    let payload = http_get_json(&a_client, &handover_url)
+        .await
+        .expect("A's handover payload");
+    assert_eq!(payload["draining"], true, "{payload}");
+    assert_eq!(payload["sidecar"]["boot_id"], boot_b.as_str(), "{payload}");
+    assert_eq!(payload["sidecar"]["state"], "draining", "{payload}");
+    let b_entry = payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == boot_b.as_str())
+                .cloned()
+        })
+        .expect("B's presence entry in A's payload");
+    assert_eq!(
+        b_entry["live"], true,
+        "the window is a LIVE draining sibling: {b_entry}"
+    );
+    assert_eq!(b_entry["state"], "draining", "{b_entry}");
+    assert_eq!(
+        resolve_live_holder_port(&payload),
+        None,
+        "the rule must refuse a draining sidecar target: {payload}"
+    );
+
+    // R-D1's server-side mirror, observed end to end: A's refusal
+    // pointer says "pending" during the window — never ":B".
+    let probe = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["--json", "agenda", "add", "chain-refusal-probe", "--task"],
+    )
+    .await;
+    assert!(probe.status.success(), "{}", text_of(&probe));
+    let probe_id = stdout_json(&probe)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+    let refused = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["agenda", "start", &probe_id[..10]],
+    )
+    .await;
+    let refused_text = text_of(&refused);
+    assert!(
+        !refused.status.success() && refused_text.contains("daemon_draining"),
+        "start_now must refuse on the drainer: {refused_text}"
+    );
+    assert!(
+        refused_text.contains("has not acquired"),
+        "the window's refusal says pending, never a draining port: {refused_text}"
+    );
+    assert!(
+        !refused_text.contains(&format!(":{}", daemon_b.port)),
+        "the refusal must not point into B's drain: {refused_text}"
+    );
+
+    // C boots plain — the lease is already free, so boot-time
+    // acquisition takes it.
+    let daemon_c = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-c.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &[],
+    )
+    .await;
+    poll_until(
+        "C acquiring the lease",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["state"] == "active"
+                && sidecar["boot_id"] != boot_a.as_str()
+                && sidecar["boot_id"] != boot_b.as_str())
+            .then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // A's payload now reaches C through the rule (the sidecar arm:
+    // live, non-draining) while B still shows live+draining beside it —
+    // the daemons array carries the multi-predecessor truth.
+    let payload = http_get_json(&a_client, &handover_url)
+        .await
+        .expect("A's handover payload after C acquired");
+    assert_eq!(
+        resolve_live_holder_port(&payload),
+        Some(daemon_c.port),
+        "the rule reaches C once C acquires: {payload}"
+    );
+    let b_entry = payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == boot_b.as_str())
+                .cloned()
+        })
+        .expect("B's presence entry beside C");
+    assert_eq!(b_entry["live"], true, "{b_entry}");
+    assert_eq!(b_entry["state"], "draining", "{b_entry}");
+
+    // …and A's refusal pointer follows the healed sidecar to C.
+    let redirected = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["agenda", "start", &probe_id[..10]],
+    )
+    .await;
+    let redirected_text = text_of(&redirected);
+    assert!(
+        !redirected.status.success() && redirected_text.contains(&format!("(:{})", daemon_c.port)),
+        "the refusal pointer names C once C acquires: {redirected_text}"
+    );
+
+    // The tokened doorway's map: the DRAINER serves the same-home
+    // instance map, it names the successor's own admission token, and
+    // that token admits a doorway-shaped request (the URL
+    // `withSiblingLoopbackToken` builds).
+    let tokens = http_get_json(
+        &a_client,
+        &format!(
+            "http://127.0.0.1:{}/api/local-daemons/tokens",
+            daemon_a.port
+        ),
+    )
+    .await
+    .expect("the drainer serves the token map");
+    let c_entry = tokens["instances"]
+        .as_array()
+        .and_then(|instances| {
+            instances
+                .iter()
+                .find(|inst| inst["port"].as_u64() == Some(u64::from(daemon_c.port)))
+                .cloned()
+        })
+        .expect("the successor appears in the drainer's token map");
+    let c_token = c_entry["token"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !c_token.is_empty(),
+        "the successor's entry carries its token: {tokens}"
+    );
+    assert_eq!(
+        c_token,
+        rig_loopback_token(&daemon_a.rig, daemon_c.port),
+        "the map's token IS the successor's own admission token"
+    );
+    let doorway = client
+        .get(format!(
+            "http://127.0.0.1:{}/?token={}",
+            daemon_c.port, c_token
+        ))
+        .send()
+        .await
+        .expect("doorway request reaches C");
+    assert!(
+        doorway.status().is_success(),
+        "the tokened doorway lands authed on C: {}",
+        doorway.status()
+    );
+
+    drop(daemon_c);
+    drop(daemon_b);
+}
+
 /// A probe-able fake "binary": a shell script printing exactly
 /// `build_info::version_line`'s shape with the given sha. Unix-only —
 /// the update watch execs it for `--version`.
@@ -7801,4 +8197,471 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
         "same daemon boot: {body}"
     );
     assert_eq!(body["draining"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Successor exec (the update-channels gate's ruled deferred question): the
+// CLI-launched daemon's own spawn → readiness → drain one-click, with the
+// exec target pinned by path AND hash.
+// ---------------------------------------------------------------------------
+
+/// The specimen refusals, over the wire on a REAL daemon: the click must
+/// name the offered build (400 without it); an offered sha the on-disk
+/// target does not match refuses without spawning (the artifact changed
+/// under the button); the on-disk target matching the RUNNING build
+/// refuses as build-neutral (the launch-before-replace specimen's exact
+/// silent failure, now a named refusal). The watched path is a tiny
+/// probe-able fake and the running sha rides the mock knob — this leg
+/// deliberately never execs the real (150 MB debug) binary, so it adds
+/// no load spike to the concurrently running suite. Unix-gated like the
+/// other shebang-fake legs.
+#[cfg(unix)]
+#[tokio::test]
+async fn successor_exec_refuses_mismatch_and_build_neutral() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+    // The watched "binary": a shebang fake whose --version reports a
+    // fixed sha, which the mock knob also declares as the RUNNING build
+    // — probing it is milliseconds, and offered == running is exactly
+    // the build-neutral shape under test.
+    let running_sha = "e2erunning0";
+    let watched = rig.home.path().join("watched-intendant");
+    write_fake_watched_binary(&watched, running_sha);
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_RUNNING_SHA", running_sha),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+
+    // The lane is wired and idle.
+    let body = http_get_json(&authed, &format!("{base}/api/daemon/handover"))
+        .await
+        .expect("handover status body");
+    assert_eq!(body["successor_exec"]["available"], true, "{body}");
+
+    // No offered sha: refused before anything runs.
+    let unnamed = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST successor-exec without sha");
+    assert_eq!(
+        unnamed.status(),
+        400,
+        "a click that names no build never runs"
+    );
+
+    // Offered sha ≠ on-disk target: the mismatch refusal, no spawn.
+    let mismatch = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({"expected_git_sha": "0000000000"}))
+        .send()
+        .await
+        .expect("POST successor-exec with stale sha");
+    assert_eq!(
+        mismatch.status(),
+        200,
+        "the flow starts, then refuses at the probe"
+    );
+    let refusal = poll_until(
+        "the mismatch refusal landing on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &format!("{base}/api/daemon/handover")).await?;
+            (body["successor_exec"]["ok"] == false).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let error = refusal["successor_exec"]["error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        error.contains("changed since the panel rendered") && error.contains("Nothing was spawned"),
+        "the mismatch refusal names the race: {refusal}"
+    );
+
+    // Offered sha == running build (the real binary IS the running
+    // build): the build-neutral refusal — the specimen's silent no-op,
+    // refused out loud. Also proves the probe really exec'd the target.
+    let neutral = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({"expected_git_sha": running_sha}))
+        .send()
+        .await
+        .expect("POST successor-exec with the running sha");
+    assert_eq!(neutral.status(), 200);
+    let refusal = poll_until(
+        "the build-neutral refusal landing on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &format!("{base}/api/daemon/handover")).await?;
+            let exec = &body["successor_exec"];
+            (exec["ok"] == false
+                && exec["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("would not change builds"))
+            .then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    // Nothing was ever spawned: this boot is the only registered daemon.
+    assert_eq!(
+        refusal["daemons"].as_array().map(Vec::len),
+        Some(1),
+        "no successor presence appeared: {refusal}"
+    );
+    assert_eq!(refusal["draining"], false, "never drained: {refusal}");
+}
+
+/// The ruled flow, end to end on REAL binaries: an "update" lands at the
+/// watched path (a fresh copy of the test daemon binary; the mock
+/// running-sha knob makes the running build read older), the chip block
+/// offers its sha, the click spawns THAT build as a plain secondary
+/// (`--web 0`, never `--takeover`), readiness is confirmed (presence +
+/// gateway), the incumbent drains, the successor acquires the lease
+/// inside the young-boot fast-poll window, and the post-takeover
+/// verification reports the offered build landed. The incumbent exits
+/// on its own (zero sessions); the spawned successor is drained via its
+/// own takeover route at cleanup.
+#[tokio::test]
+async fn successor_exec_spawns_verified_build_and_hands_off() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The watched path exists at boot (a tiny placeholder — just the
+    // boot stamp) and the real daemon binary LANDS there after boot —
+    // a new stamp, a probe, and the chip block, exactly the produce
+    // lane's ending. The landing is a hardlink where the tempdir shares
+    // the volume (zero bytes moved — the 150 MB debug binary must not
+    // become suite-wide disk pressure; the probe-timeout class this
+    // avoids was observed live), a copy across devices. The mock
+    // running-sha knob back-dates the RUNNING build so the real
+    // binary's sha reads as the update.
+    let watched = rig
+        .home
+        .path()
+        .join(format!("watched-intendant{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&watched, b"placeholder-not-yet-a-binary").expect("seed watched placeholder");
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_POLL_MS", "300"),
+            ("INTENDANT_UPDATE_LANE_RUNNING_SHA", "e2eoldsha00"),
+            ("INTENDANT_LEASE_POLL_MS", "500"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    let incumbent_boot = body["boot_id"].as_str().expect("boot id").to_string();
+    assert_eq!(body["held"], true, "the first boot holds the lease: {body}");
+
+    // Land the "update": the real binary replaces the placeholder (new
+    // stamp); the probe reads its provenance, which differs from the
+    // mocked running sha — the chip appears.
+    let staged = rig.home.path().join("staged-intendant");
+    if std::fs::hard_link(intendant_bin(), &staged).is_err() {
+        std::fs::copy(intendant_bin(), &staged).expect("stage new binary");
+    }
+    std::fs::rename(&staged, &watched).expect("land new binary at the watched path");
+    let body = poll_until(
+        "the update chip offering the on-disk build",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body["update"]["on_disk"]["git_sha"]
+                .as_str()
+                .is_some()
+                .then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let offered_sha = body["update"]["on_disk"]["git_sha"]
+        .as_str()
+        .expect("offered sha")
+        .to_string();
+    assert_ne!(offered_sha, "e2eoldsha00", "the offer IS the new build");
+
+    // The click, carrying the offered sha.
+    let started = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({
+            "expected_git_sha": offered_sha,
+            "requested_by": "e2e successor-exec leg",
+        }))
+        .send()
+        .await
+        .expect("POST successor-exec")
+        .error_for_status()
+        .expect("click accepted");
+    let started: serde_json::Value = started.json().await.expect("click body");
+    assert_eq!(started["started"], true, "{started}");
+
+    // Arm the leak guard the moment the child pid is knowable: the
+    // successor is a DETACHED grandchild — on a failed assertion below,
+    // nothing else would reap it and a mock daemon would idle on the
+    // runner forever. Disarmed after the clean drain at the end.
+    let child_pid = poll_until(
+        "the spawned successor's pid on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body["successor_exec"]["child_pid"].as_u64()
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await as u32;
+    let mut successor_guard = SuccessorKillGuard {
+        pid: Some(child_pid),
+    };
+
+    // The ruled sequence lands. The incumbent has ZERO sessions, so it
+    // exits within moments of its own drain entry — every assertion
+    // from here reads DISK truth (the lease sidecar, presence records,
+    // the successor's log), never the incumbent's racing status block.
+    // The sidecar naming the successor, active, with the offered build
+    // IS the post-takeover verification's ground truth.
+    let sidecar = poll_until(
+        "the lease sidecar naming an active successor",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&rig)?;
+            (sidecar["boot_id"] != incumbent_boot.as_str() && sidecar["state"] == "active")
+                .then_some(sidecar)
+        },
+        || {
+            let daemon_log = std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default();
+            let successor_log = std::fs::read_to_string(
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
+            )
+            .map(|log| tail(&log, 2000))
+            .unwrap_or_default();
+            format!("daemon.log:\n{daemon_log}\n\nsuccessor-exec.log:\n{successor_log}")
+        },
+    )
+    .await;
+    assert_eq!(
+        sidecar["version"]["git_sha"],
+        offered_sha.as_str(),
+        "the new holder runs the offered build: {sidecar}"
+    );
+    let successor_boot = sidecar["boot_id"]
+        .as_str()
+        .expect("successor boot")
+        .to_string();
+    let successor_port = sidecar["port"].as_u64().expect("successor port") as u16;
+    assert_ne!(
+        successor_port, daemon.port,
+        "the successor bound its own port"
+    );
+
+    // The successor-side acquisition verdict (the durable half of the
+    // post-takeover verification — the drainer may already be gone):
+    // its own log states the offered build landed.
+    poll_until(
+        "the successor's acquisition verdict in its log",
+        RUN_TIMEOUT,
+        || async {
+            let log = std::fs::read_to_string(
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
+            )
+            .ok()?;
+            log.contains("runs the offered build").then_some(())
+        },
+        || {
+            std::fs::read_to_string(
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
+            )
+            .map(|log| tail(&log, 2000))
+            .unwrap_or_default()
+        },
+    )
+    .await;
+
+    // The incumbent had zero sessions: it exits on its own.
+    poll_until(
+        "the drained incumbent exiting",
+        RUN_TIMEOUT,
+        || async { (!boot_lock_is_held(&rig, &incumbent_boot)).then_some(()) },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+
+    // Cleanup: drain the spawned successor through its own takeover
+    // route (zero sessions → it exits on its own), with a bounded wait
+    // on its per-boot lock freeing. It is a detached grandchild — the
+    // rig's kill_on_drop does not cover it.
+    let successor_authed = {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&rig, successor_port)
+                .parse()
+                .expect("successor token header"),
+        );
+        reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .expect("successor client")
+    };
+    successor_authed
+        .post(format!(
+            "http://127.0.0.1:{successor_port}/api/daemon/takeover"
+        ))
+        .json(&serde_json::json!({"requested_by": "e2e cleanup"}))
+        .send()
+        .await
+        .expect("POST successor takeover")
+        .error_for_status()
+        .expect("successor drains");
+    poll_until(
+        "the drained successor exiting",
+        RUN_TIMEOUT,
+        || async { (!boot_lock_is_held(&rig, &successor_boot)).then_some(()) },
+        || format!("successor :{successor_port} still live"),
+    )
+    .await;
+    successor_guard.pid = None; // clean exit confirmed — nothing to reap
+}
+
+/// Kills the detached successor by explicit pid on drop unless disarmed
+/// — the failure-path backstop keeping a panicked run from leaking a
+/// daemon onto the runner.
+struct SuccessorKillGuard {
+    pid: Option<u32>,
+}
+
+impl Drop for SuccessorKillGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid.take() else { return };
+        eprintln!("[e2e] reaping leaked successor pid {pid}");
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+/// Is a boot's per-boot presence lock still held (the daemon alive)?
+/// The e2e mirror of `handover::boot_id_is_live`: takeable or absent =
+/// dead. Errors read as live — the fail-safe direction for a wait that
+/// asserts death.
+fn boot_lock_is_held(rig: &TestRig, boot_id: &str) -> bool {
+    let path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{boot_id}.lock"));
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => true,
+    }
 }

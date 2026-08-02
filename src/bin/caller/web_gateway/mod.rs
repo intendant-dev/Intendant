@@ -1939,6 +1939,7 @@ pub(crate) mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -2596,6 +2597,7 @@ pub(crate) mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -2692,6 +2694,7 @@ pub(crate) mod tests {
             crate::peer::AuthRequirements::none(),
             tls_client_cert_required,
             Some(acceptor),
+            None,
             access_cert_dir,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
