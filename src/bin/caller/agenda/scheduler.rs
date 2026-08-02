@@ -358,6 +358,17 @@ pub(crate) fn spawn_reminder_scheduler(
             let sleep_for = next_wake_ms
                 .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
                 .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
+            // Op latency is EVENT-DRIVEN, not polled: every accepted
+            // agenda op nudges (`AgendaHandle::apply`) AND broadcasts
+            // `AgendaChanged` into `events`, whose subscription queues —
+            // an op landing while a pass runs still forces the next
+            // iteration instead of waiting out the sleep. An approve on
+            // an already-due manifest therefore dispatches in the same
+            // governed slot, never at the next safety tick (pinned by
+            // `approve_on_a_due_effect_fires_without_a_cadence_pass`;
+            // the 2026-08-01 "10-minute approve-to-fire" read was floors
+            // still in the future plus a drain/handover window, not a
+            // missing wake). The tick is the no-signal backstop only.
             tokio::select! {
                 _ = handle.reminder_nudged() => {}
                 _ = tokio::time::sleep(sleep_for) => {}
@@ -2173,7 +2184,9 @@ mod tests {
         log.write_all(lines.as_bytes()).unwrap();
     }
 
-    fn approved_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
+    /// Parks one item and proposes an UNAPPROVED manifest on it — the
+    /// approve-wake tests apply the approval themselves mid-flight.
+    fn proposed_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -2208,16 +2221,103 @@ mod tests {
             .unwrap();
         let digest = proposed.effects[0].digest.clone();
         let effect_id = proposed.effects[0].effect_id.clone();
+        (item.id, effect_id, digest)
+    }
+
+    fn approved_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
+        let (item_id, effect_id, digest) = proposed_effect_item(handle, fire_at_ms);
         handle
             .apply(
                 AgendaCommand::ApproveEffect {
-                    id: item.id.clone(),
+                    id: item_id.clone(),
+                    digest: digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+        (item_id, effect_id, digest)
+    }
+
+    /// The approve wake, nudge leg (approve-to-fire latency, live find
+    /// 2026-08-01): an accepted `approve_effect` completes a parked
+    /// `reminder_nudged()` waiter — the scheduler is TOLD about an
+    /// approval, it never has to poll one up.
+    #[tokio::test(start_paused = true)]
+    async fn approve_effect_nudges_a_parked_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), dir.path());
+        // Propose BEFORE parking: the propose op nudges too, and
+        // `notify_waiters` carries no permit — the waiter below must
+        // hear the approve itself, not a leftover.
+        let (item_id, _effect_id, digest) = proposed_effect_item(&handle, now_ms() - 60_000);
+        let waiter = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.reminder_nudged().await })
+        };
+        // Current-thread runtime: one yield polls the waiter to its
+        // `notified().await` registration.
+        tokio::task::yield_now().await;
+        handle
+            .apply(AgendaCommand::ApproveEffect { id: item_id, digest }, owner())
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
+            .await
+            .expect("approve_effect must nudge the scheduler waiter")
+            .unwrap();
+    }
+
+    /// The approve wake, loop leg (approve-to-fire latency, live find
+    /// 2026-08-01): the REAL scheduler loop, parked mid-sleep, converts
+    /// an `approve_effect` on an already-due manifest into a dispatch in
+    /// the same governed slot — never the next safety tick and never
+    /// some other op's pass. Paused-clock proof: virtual time advances
+    /// only while every task is idle, so a wake that waited for the
+    /// 300s tick would show as a ≥300s virtual jump; the working path
+    /// shows zero.
+    #[tokio::test(start_paused = true)]
+    async fn approve_on_a_due_effect_fires_without_a_cadence_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), project.path());
+        let mut rx = handle.bus().subscribe();
+        let scheduler = spawn_reminder_scheduler(handle.clone(), None);
+        // Quiesce: auto-advance fires this sleep only once no task is
+        // runnable — the boot pass has run and the loop is parked.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // The proposal lands while the loop sleeps; unapproved manifests
+        // plan nothing, so the loop parks again for the full tick.
+        let (item_id, _effect_id, digest) = proposed_effect_item(&handle, now_ms() - 60_000);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let approved_at = tokio::time::Instant::now();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item_id.clone(),
                     digest,
                 },
                 owner(),
             )
             .unwrap();
-        (item.id, effect_id, proposed.effects[0].digest.clone())
+        let task = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(600), rx.recv())
+                .await
+                .expect("the approve never produced a dispatch — the wake is missing")
+                .expect("bus closed");
+            if let AppEvent::ControlCommand(ControlMsg::StartTask { task, .. }) = event {
+                break task;
+            }
+        };
+        let waited = approved_at.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the dispatch waited {waited:?} — a cadence pass fired it, not the approve wake \
+             (safety tick {SAFETY_TICK:?})"
+        );
+        assert!(
+            task.contains(&item_id),
+            "the dispatched task names its item: {task}"
+        );
+        scheduler.abort();
     }
 
     /// Parks one item and proposes+approves a sealed manifest on it —

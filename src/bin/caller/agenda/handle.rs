@@ -175,6 +175,14 @@ impl AgendaHandle {
     }
 
     /// Await the next plan-moving change (op applied or policy edited).
+    /// `notify_waiters` carries no permit, so only a PARKED waiter hears
+    /// it — but item ops are also broadcast as `AgendaChanged` on the
+    /// bus the scheduler selects over, and that subscription queues, so
+    /// an op landing mid-pass still wakes the next iteration (this is
+    /// what makes approve-to-fire event-driven — see the scheduler's
+    /// select). Policy edits ride the nudge alone: one landing exactly
+    /// inside a pass waits for the safety tick — accepted, the stakes
+    /// are presentation cadence only.
     pub(crate) async fn reminder_nudged(&self) {
         self.reminder_nudge.notified().await;
     }
