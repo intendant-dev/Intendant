@@ -435,7 +435,12 @@ successor without kill-and-relaunch:
   durable `limit_park` marker with the reset instant), the drainer's
   presence record mirrors a capped row copy beside `session_count`, and
   the dashboard's drain banner lists WHO holds and until WHEN under a
-  prominent doorway to the successor. If the successor dies while the
+  prominent doorway to the successor. Both banner kinds (this daemon
+  draining; a predecessor draining) dock in a strip under the oversight
+  bar — never over the tab chrome — and collapse to a one-line pill
+  persisted per (kind, boot id): an unseen fact expands once, and no
+  dismiss exists while the fact is true, mirroring the update chip's
+  standing-fact pattern. If the successor dies while the
   drainer still drains, ONE loud notification says standing automations
   are paused until someone relaunches or takes over — the drainer never
   reclaims the lease.
