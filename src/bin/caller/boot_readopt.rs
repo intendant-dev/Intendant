@@ -1219,7 +1219,12 @@ mod tests {
             })
         };
         write_meta(home.path(), "sess-race-resident", "running", armed_park());
-        write_meta(home.path(), "sess-race-backstop", "interrupted", armed_park());
+        write_meta(
+            home.path(),
+            "sess-race-backstop",
+            "interrupted",
+            armed_park(),
+        );
         write_meta(home.path(), "sess-prefix-strand", "completed", armed_park());
 
         let candidates = scan_store_candidates(home.path(), u64::MAX, &HashSet::new());
