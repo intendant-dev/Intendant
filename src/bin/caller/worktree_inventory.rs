@@ -1935,6 +1935,218 @@ fn seconds_to_days(secs: i64) -> i64 {
     (secs / 86_400).max(0)
 }
 
+// ── Serve-time worktree git state ──────────────────────────────────────
+// The session envelope's stranded-work axis (dirty / unpushed / ahead),
+// probed from the daemon's own worktree knowledge on the session list's
+// serving path. A full `scan_worktrees` is subprocess-heavy and
+// on-demand only, so this seam keeps its own bounded memo: the
+// non-blocking read serves the last-known snapshot (or an honest
+// "unknown"), and a stale entry re-probes on a detached background
+// thread — never on the serving thread. Facts only; the closable fold
+// lives with the claim's other inputs (grid envelope + the SPA).
+
+/// How current a memoized worktree state may be before a serve kicks a
+/// background re-probe. Prompt-line cadence: ~2 status probes per minute
+/// per distinct live worktree, only while something serves the list.
+const WORKTREE_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// A refresh marked in-flight longer than this is presumed lost (a hung
+/// git, a killed thread) and may be re-spawned.
+const WORKTREE_STATE_REFRESH_STUCK: std::time::Duration = std::time::Duration::from_secs(120);
+/// Clear-on-full corruption backstop, comfortably above the distinct
+/// checkout paths a session list can name (`MAX_WORKTREES` per scan).
+const WORKTREE_STATE_MEMO_LIMIT: usize = 4_096;
+
+/// The honest four-way behind one checkout path: `Clean`/`Dirty` are
+/// probed facts, `Missing` means the path is gone, `Unknown` means no
+/// probe has answered (yet, or git failed there). Never guess clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreeStateKind {
+    Clean,
+    Dirty,
+    Missing,
+    Unknown,
+}
+
+impl WorktreeStateKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            WorktreeStateKind::Clean => "clean",
+            WorktreeStateKind::Dirty => "dirty",
+            WorktreeStateKind::Missing => "missing",
+            WorktreeStateKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// One worktree's git state as last probed. `dirty`/`unpushed`/`ahead`
+/// are meaningful only when `kind` is `Clean`/`Dirty` — consumers serve
+/// state-only for `Missing`/`Unknown`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WorktreeGitState {
+    pub(crate) kind: WorktreeStateKind,
+    /// Any uncommitted working-tree change: staged, unstaged, untracked,
+    /// or conflicted.
+    pub(crate) dirty: bool,
+    /// `HEAD` is reachable from NO remote ref — commits that exist only
+    /// in this checkout (subsumes ahead-of-upstream and never-pushed
+    /// branches alike; a remoteless repository reads unpushed, which is
+    /// the truth of it).
+    pub(crate) unpushed: bool,
+    /// Commits ahead of the configured upstream (0 without one).
+    pub(crate) ahead: i64,
+    pub(crate) branch: Option<String>,
+    /// Wall-clock instant of the probe that produced this snapshot.
+    pub(crate) checked_ms: u64,
+}
+
+impl WorktreeGitState {
+    fn factless(kind: WorktreeStateKind, checked_ms: u64) -> Self {
+        Self {
+            kind,
+            dirty: false,
+            unpushed: false,
+            ahead: 0,
+            branch: None,
+            checked_ms,
+        }
+    }
+}
+
+struct WorktreeStateMemoEntry {
+    snapshot: WorktreeGitState,
+    checked: std::time::Instant,
+    refreshing_since: Option<std::time::Instant>,
+}
+
+fn worktree_state_memo() -> &'static Mutex<HashMap<PathBuf, WorktreeStateMemoEntry>> {
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<PathBuf, WorktreeStateMemoEntry>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Probe one checkout now, on the calling thread: one `git status
+/// --porcelain=v2 --branch` plus one bounded `rev-list` for the
+/// unpushed bit. Failures degrade to `Unknown`, a gone path to
+/// `Missing` — never a guessed clean.
+fn probe_worktree_git_state(path: &Path) -> WorktreeGitState {
+    let checked_ms = wall_clock_ms();
+    if !path.is_dir() {
+        return WorktreeGitState::factless(WorktreeStateKind::Missing, checked_ms);
+    }
+    let Ok(info) = status_info(path) else {
+        return WorktreeGitState::factless(WorktreeStateKind::Unknown, checked_ms);
+    };
+    let dirty = info.staged + info.unstaged + info.untracked + info.conflicted > 0;
+    // Errors (unborn HEAD, exotic states) read as not-unpushed: `dirty`
+    // already carries the evidence for a tree with no commits yet.
+    let unpushed = git_string(path, &["rev-list", "-1", "HEAD", "--not", "--remotes"])
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false);
+    WorktreeGitState {
+        kind: if dirty {
+            WorktreeStateKind::Dirty
+        } else {
+            WorktreeStateKind::Clean
+        },
+        dirty,
+        unpushed,
+        ahead: info.ahead.max(0),
+        branch: info
+            .branch_head
+            .filter(|head| !head.is_empty() && head != "(detached)"),
+        checked_ms,
+    }
+}
+
+/// Blocking probe + memo fill: the deterministic lane for tests (the
+/// serving path never blocks — it goes through the cached read below).
+#[cfg(test)]
+pub(crate) fn probe_and_memoize_worktree_git_state(path: &Path) -> WorktreeGitState {
+    let snapshot = probe_worktree_git_state(path);
+    if let Ok(mut memo) = worktree_state_memo().lock() {
+        if memo.len() >= WORKTREE_STATE_MEMO_LIMIT && !memo.contains_key(path) {
+            memo.clear();
+        }
+        memo.insert(
+            path.to_path_buf(),
+            WorktreeStateMemoEntry {
+                snapshot: snapshot.clone(),
+                checked: std::time::Instant::now(),
+                refreshing_since: None,
+            },
+        );
+    }
+    snapshot
+}
+
+/// Non-blocking read for the serving path: returns the last-known
+/// snapshot immediately (stale included — `checked_ms` says how stale);
+/// a stale or absent entry kicks ONE background re-probe (single-flight
+/// per path) whose answer the next serve picks up. A gone path answers
+/// `Missing` synchronously — one stat, no subprocess. First sight of a
+/// live path answers an honest `Unknown` while the probe runs.
+pub(crate) fn cached_worktree_git_state(path: &Path) -> WorktreeGitState {
+    if !path.is_dir() {
+        return WorktreeGitState::factless(WorktreeStateKind::Missing, wall_clock_ms());
+    }
+    let mut snapshot = WorktreeGitState::factless(WorktreeStateKind::Unknown, wall_clock_ms());
+    let mut spawn = false;
+    if let Ok(mut memo) = worktree_state_memo().lock() {
+        match memo.get_mut(path) {
+            Some(entry) => {
+                let refresh_lost = entry
+                    .refreshing_since
+                    .is_some_and(|since| since.elapsed() >= WORKTREE_STATE_REFRESH_STUCK);
+                if (entry.refreshing_since.is_none() || refresh_lost)
+                    && entry.checked.elapsed() >= WORKTREE_STATE_TTL
+                {
+                    entry.refreshing_since = Some(std::time::Instant::now());
+                    spawn = true;
+                }
+                snapshot = entry.snapshot.clone();
+            }
+            None => {
+                if memo.len() >= WORKTREE_STATE_MEMO_LIMIT {
+                    memo.clear();
+                }
+                memo.insert(
+                    path.to_path_buf(),
+                    WorktreeStateMemoEntry {
+                        snapshot: snapshot.clone(),
+                        checked: std::time::Instant::now(),
+                        refreshing_since: Some(std::time::Instant::now()),
+                    },
+                );
+                spawn = true;
+            }
+        }
+    }
+    if spawn {
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let probed = probe_worktree_git_state(&path);
+            if let Ok(mut memo) = worktree_state_memo().lock() {
+                memo.insert(
+                    path,
+                    WorktreeStateMemoEntry {
+                        snapshot: probed,
+                        checked: std::time::Instant::now(),
+                        refreshing_since: None,
+                    },
+                );
+            }
+        });
+    }
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2307,6 +2519,112 @@ mod tests {
         assert_eq!(found.untracked, 1);
         assert!(!found.safe_to_remove);
         assert!(found.safety.contains("local changes") || found.safety.contains("untracked"));
+    }
+
+    /// The serve-time prober's fact matrix: an uncommitted file reads
+    /// dirty; committing it reads clean but still unpushed (the commit
+    /// exists in no remote); a detached-free branch name rides along.
+    #[test]
+    fn worktree_git_state_probe_reports_dirty_and_unpushed() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("state-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "state-probe", &wt_str, "main"],
+        );
+        std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
+
+        let dirty = probe_and_memoize_worktree_git_state(&wt);
+        assert_eq!(dirty.kind, WorktreeStateKind::Dirty);
+        assert!(dirty.dirty);
+        assert!(dirty.unpushed, "a remoteless checkout is unpushed truth");
+        assert_eq!(dirty.branch.as_deref(), Some("state-probe"));
+        assert!(dirty.checked_ms > 0);
+
+        git(&wt, &["config", "user.email", "test@example.com"]);
+        git(&wt, &["config", "user.name", "Test User"]);
+        git(&wt, &["add", "scratch.txt"]);
+        git(&wt, &["commit", "-m", "scratch"]);
+        let committed = probe_and_memoize_worktree_git_state(&wt);
+        assert_eq!(committed.kind, WorktreeStateKind::Clean);
+        assert!(!committed.dirty);
+        assert!(
+            committed.unpushed,
+            "the commit exists only in this checkout"
+        );
+    }
+
+    /// The unpushed bit's negative: once a remote ref reaches HEAD, the
+    /// checkout stops claiming stranded commits.
+    #[test]
+    fn worktree_git_state_unpushed_clears_when_remote_has_head() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let bare = tmp.path().join("origin.git");
+        git(tmp.path(), &["init", "--bare", &bare.to_string_lossy()]);
+        git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(&repo, &["push", "--quiet", "origin", "main"]);
+
+        let state = probe_and_memoize_worktree_git_state(&repo);
+        assert_eq!(state.kind, WorktreeStateKind::Clean);
+        assert!(!state.unpushed, "HEAD is on the remote — nothing stranded");
+        assert_eq!(state.ahead, 0);
+    }
+
+    /// Honest degradation: a gone path answers `Missing`, a plain
+    /// non-git dir answers `Unknown` — never a guessed clean, and no
+    /// fact fields claimed for either.
+    #[test]
+    fn worktree_git_state_degrades_missing_and_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("never-created");
+        let missing = probe_and_memoize_worktree_git_state(&gone);
+        assert_eq!(missing.kind, WorktreeStateKind::Missing);
+        assert!(!missing.dirty && !missing.unpushed);
+
+        let plain = tmp.path().join("plain-dir");
+        std::fs::create_dir(&plain).unwrap();
+        let unknown = probe_and_memoize_worktree_git_state(&plain);
+        assert_eq!(unknown.kind, WorktreeStateKind::Unknown);
+        assert!(!unknown.dirty && !unknown.unpushed);
+    }
+
+    /// The serving path's contract: a warmed memo answers synchronously
+    /// with the probed facts; a gone path answers `Missing` without a
+    /// subprocess; first sight of a live path answers an honest
+    /// `Unknown` while the background probe runs.
+    #[test]
+    fn cached_worktree_git_state_serves_memo_and_degrades() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("cached-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "cached-probe", &wt_str, "main"],
+        );
+        std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
+
+        probe_and_memoize_worktree_git_state(&wt);
+        let served = cached_worktree_git_state(&wt);
+        assert_eq!(served.kind, WorktreeStateKind::Dirty);
+        assert!(served.dirty);
+
+        let gone = tmp.path().join("gone");
+        assert_eq!(
+            cached_worktree_git_state(&gone).kind,
+            WorktreeStateKind::Missing
+        );
+
+        let fresh = tmp.path().join("first-sight");
+        std::fs::create_dir(&fresh).unwrap();
+        assert_eq!(
+            cached_worktree_git_state(&fresh).kind,
+            WorktreeStateKind::Unknown,
+            "first sight is honest ignorance, never a blocking probe"
+        );
     }
 
     #[test]
