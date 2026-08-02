@@ -353,6 +353,12 @@ pub(crate) fn spawn_mode_web_gateway(
     // (supervised children; fail-closed verify) that lands a newer
     // binary at the watched path for the chip/one-click swap above.
     crate::handover::spawn_update_lane(&handover);
+    // The successor-exec lane (ruled 2026-07-31): on a CLI-launched,
+    // UNSUPERVISED daemon the owner's explicit panel click may spawn
+    // the verified on-disk build as a successor secondary, confirm its
+    // readiness, then drain toward it. Standing daemon-shaping flags
+    // replay onto the successor; one-shot argv never does.
+    crate::handover::spawn_successor_exec_lane(&handover, flags.successor_replay_args());
     // --takeover (Track HS3): this boot is the intended successor — ask
     // the current holder to drain, then fast-poll the freed lease.
     // Detached; bounded; failure degrades to ordinary secondary polling.
