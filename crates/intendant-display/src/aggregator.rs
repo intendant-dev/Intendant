@@ -865,6 +865,87 @@ pub type OnDemandPauseProbe = Box<dyn Fn(&EncoderId) -> Option<bool> + Send + Sy
 /// Apply a pause (`true`) / resume (`false`) to one on-demand slot.
 pub type OnDemandPauseAction = Box<dyn Fn(&EncoderId, bool) + Send + Sync>;
 
+/// ── Federated H.264 link-aware ladder ─────────────────────────────
+///
+/// The federated slot spawns at the loss-safe Quarter rung
+/// ([`crate::encode::pool::FederatedRung`]); this policy steps it up
+/// only after the link has proven healthy for a sustained window, and
+/// back down the moment loss pressure appears. Health is read from the
+/// same per-peer aggregate-TWCC cascade the pause policies use:
+/// a fed-holder peer counts healthy only in
+/// [`AggregateLayerCapacity::AllUpperWanted`] — a missing TWCC entry
+/// (no feedback yet: video paused for tiles, or a fresh peer) counts
+/// UNhealthy, so the ladder can only climb while video actually flows
+/// and decays back toward Quarter across idle/tile stretches. With no
+/// fed holders at all the rung snaps back to Quarter so the next
+/// viewer starts safe.
+pub const FEDERATED_UPGRADE_HEALTHY: Duration = Duration::from_secs(10);
+/// Minimum spacing between rung changes (both directions) — an
+/// eviction/rebuild per change is cheap but not free, and flapping
+/// resolutions look worse than either shape.
+pub const FEDERATED_LADDER_DWELL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+pub struct FederatedLadderState {
+    pub rung: crate::encode::pool::FederatedRung,
+    healthy_since: Option<Instant>,
+    last_change: Option<Instant>,
+}
+
+impl Default for FederatedLadderState {
+    fn default() -> Self {
+        Self {
+            rung: crate::encode::pool::FederatedRung::Quarter,
+            healthy_since: None,
+            last_change: None,
+        }
+    }
+}
+
+/// Advance the ladder one tick. Returns `Some(rung)` when the caller
+/// should apply a re-spec (the state's rung has already moved).
+pub fn advance_federated_ladder(
+    state: &mut FederatedLadderState,
+    any_fed_holder: bool,
+    all_holders_healthy: bool,
+    now: Instant,
+) -> Option<crate::encode::pool::FederatedRung> {
+    use crate::encode::pool::FederatedRung;
+    let dwell_ok = state
+        .last_change
+        .is_none_or(|at| now.duration_since(at) >= FEDERATED_LADDER_DWELL);
+    if !any_fed_holder {
+        state.healthy_since = None;
+        if state.rung != FederatedRung::Quarter {
+            state.rung = FederatedRung::Quarter;
+            state.last_change = Some(now);
+            return Some(state.rung);
+        }
+        return None;
+    }
+    if all_holders_healthy {
+        let since = *state.healthy_since.get_or_insert(now);
+        if state.rung != FederatedRung::Full
+            && dwell_ok
+            && now.duration_since(since) >= FEDERATED_UPGRADE_HEALTHY
+        {
+            state.rung = state.rung.up();
+            state.last_change = Some(now);
+            state.healthy_since = Some(now);
+            return Some(state.rung);
+        }
+        None
+    } else {
+        state.healthy_since = None;
+        if state.rung != FederatedRung::Quarter && dwell_ok {
+            state.rung = state.rung.down();
+            state.last_change = Some(now);
+            return Some(state.rung);
+        }
+        None
+    }
+}
+
 /// Per-peer facts the standby reconcile needs, snapshotted while the
 /// coordinator holds the peers read guard (so the reconcile itself runs
 /// lock-free).
@@ -955,6 +1036,7 @@ pub fn spawn_layer_policy_coordinator(
     is_layer_paused: LayerPauseProbe,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
     on_demand: OnDemandStandbyHooks,
+    on_federated_respec: Box<dyn Fn(crate::encode::pool::FederatedRung) + Send + Sync>,
     demand_kick: Arc<Notify>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
@@ -967,6 +1049,9 @@ pub fn spawn_layer_policy_coordinator(
         // coordinator (not per-peer) because presence is a
         // display-level property.
         let mut presence_state = AggregatorState::Active;
+
+        // Federated H.264 link-aware ladder (see advance_federated_ladder).
+        let mut federated_ladder = FederatedLadderState::default();
 
         // Aggregate TWCC: one cascade state per peer.
         let mut twcc_state: HashMap<PeerId, AggregateLayerCapacity> = HashMap::new();
@@ -1039,19 +1124,24 @@ pub fn spawn_layer_policy_coordinator(
                 prev_measurement_count.retain(|(pid, _), _| current_peers.contains_key(pid));
             }
 
-            let peer_ids: Vec<PeerId> = current_peers.keys().cloned().collect();
             // Per-peer demand facts under the read guard: standby
             // flag + frozen codec/RID identity. Pinned, demanded,
-            // and the on-demand reconcile below all derive from
-            // this one walk.
-            let peer_demand: Vec<PeerDemandSnapshot> = current_peers
-                .values()
-                .map(|peer| PeerDemandSnapshot {
-                    video_standby: peer.video_standby(),
-                    active_codec: peer.active_codec(),
-                    active_rids: peer.active_rids().to_vec(),
+            // the on-demand reconcile, and the federated ladder all
+            // derive from this one walk — ids and snapshots come from
+            // the SAME iteration so zipping them stays sound.
+            let (peer_ids, peer_demand): (Vec<PeerId>, Vec<PeerDemandSnapshot>) = current_peers
+                .iter()
+                .map(|(id, peer)| {
+                    (
+                        *id,
+                        PeerDemandSnapshot {
+                            video_standby: peer.video_standby(),
+                            active_codec: peer.active_codec(),
+                            active_rids: peer.active_rids().to_vec(),
+                        },
+                    )
                 })
-                .collect();
+                .unzip();
             drop(current_peers);
             // #57: per-tick pinned-layer set. Each peer with
             // exactly one negotiated RID contributes that RID
@@ -1140,6 +1230,37 @@ pub fn spawn_layer_policy_coordinator(
                 }
                 aggregate_wanted_layers(per_peer)
             };
+
+            // ---- Federated H.264 ladder ----
+            // Health = the freshly-advanced aggregate-TWCC cascade:
+            // a fed holder counts healthy only at AllUpperWanted, and
+            // a missing entry (no feedback yet) counts unhealthy.
+            {
+                let fed_rid = SimulcastRid::federated();
+                let mut any_fed_holder = false;
+                let mut all_holders_healthy = true;
+                for (pid, demand) in peer_ids.iter().zip(peer_demand.iter()) {
+                    if demand.active_codec == crate::encode::pool::CodecKind::H264
+                        && demand.active_rids.contains(&fed_rid)
+                    {
+                        any_fed_holder = true;
+                        if !matches!(
+                            twcc_state.get(pid),
+                            Some(AggregateLayerCapacity::AllUpperWanted)
+                        ) {
+                            all_holders_healthy = false;
+                        }
+                    }
+                }
+                if let Some(rung) = advance_federated_ladder(
+                    &mut federated_ladder,
+                    any_fed_holder,
+                    all_holders_healthy,
+                    now,
+                ) {
+                    (on_federated_respec)(rung);
+                }
+            }
 
             // ---- Per-RID RR vote ----
             // Same shape: no peers → no restriction. Per-peer
@@ -2781,6 +2902,56 @@ mod tests {
         assert!(rec.actions.lock().unwrap().is_empty());
     }
 
+    // ----- federated H.264 ladder -----
+
+    #[test]
+    fn federated_ladder_climbs_on_health_drops_on_loss_resets_without_holders() {
+        use crate::encode::pool::FederatedRung;
+        let mut st = FederatedLadderState::default();
+        let t0 = Instant::now();
+
+        // Healthy but not sustained: no change.
+        assert_eq!(advance_federated_ladder(&mut st, true, true, t0), None);
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t0 + FEDERATED_UPGRADE_HEALTHY / 2),
+            None
+        );
+        // Sustained healthy: one rung up.
+        let t1 = t0 + FEDERATED_UPGRADE_HEALTHY;
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t1),
+            Some(FederatedRung::Half)
+        );
+        // Dwell blocks an immediate second step even when healthy long.
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t1 + Duration::from_secs(1)),
+            None
+        );
+        // Next sustained window: Full; then no further ups.
+        let t2 = t1 + FEDERATED_UPGRADE_HEALTHY;
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t2),
+            Some(FederatedRung::Full)
+        );
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t2 + FEDERATED_UPGRADE_HEALTHY),
+            None
+        );
+        // Loss: down one rung once dwell allows.
+        let t3 = t2 + FEDERATED_UPGRADE_HEALTHY + FEDERATED_LADDER_DWELL;
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, false, t3),
+            Some(FederatedRung::Half)
+        );
+        // No holders: snap back to Quarter (once dwell allows).
+        let t4 = t3 + FEDERATED_LADDER_DWELL;
+        assert_eq!(
+            advance_federated_ladder(&mut st, false, true, t4),
+            Some(FederatedRung::Quarter)
+        );
+        assert_eq!(advance_federated_ladder(&mut st, false, true, t4), None);
+    }
+
     // ----- tile-standby: coordinator demand mask -----
 
     /// End-to-end through the spawned coordinator: a tile-standby peer
@@ -2826,6 +2997,7 @@ mod tests {
             is_layer_paused,
             on_action,
             inert_on_demand_hooks(),
+            Box::new(|_| {}),
             Arc::clone(&kick),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
@@ -2931,6 +3103,7 @@ mod tests {
             is_layer_paused,
             on_action,
             inert_on_demand_hooks(),
+            Box::new(|_| {}),
             Arc::new(Notify::new()),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
@@ -3036,6 +3209,7 @@ mod tests {
             is_layer_paused,
             on_action,
             inert_on_demand_hooks(),
+            Box::new(|_| {}),
             Arc::new(Notify::new()),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
