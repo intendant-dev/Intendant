@@ -7173,6 +7173,357 @@ async fn drainer_exits_at_last_session_end() {
     drop(daemon_b);
 }
 
+/// A mock script whose scheduled-session profile parks mid-turn on a
+/// long provider delay — the holdout that keeps each drainer in the
+/// three-daemon chain below alive (and draining) for the whole
+/// choreography. The 30s file-barrier bound is too tight for two
+/// takeovers plus a third boot on a slow runner, so the park is a
+/// plain delay; the sessions never complete inside the test and
+/// teardown kills the daemons.
+fn chain_park_script() -> serde_json::Value {
+    serde_json::json!({
+        "profiles": [
+            { "match": "handover rig follow-through",
+              "steps": [
+                { "content": "Working until the test ends.", "delay_ms": 600_000 },
+                { "content": "All work finished.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "handover fire complete" } }] }
+              ] },
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    })
+}
+
+/// The §5.1 live-holder resolution rule exactly as the dashboard's
+/// `resolveLiveHolder` applies it to a served handover payload: the
+/// sidecar target iff its daemons entry is live and neither draining
+/// nor exited; else the first live non-draining sibling; else none.
+/// (The SPA's on-disk-build preference needs no twin here — the rig
+/// runs one binary, so every candidate matches.)
+fn resolve_live_holder_port(body: &serde_json::Value) -> Option<u16> {
+    let daemons = body["daemons"].as_array().cloned().unwrap_or_default();
+    let self_boot = body["boot_id"].as_str().unwrap_or_default();
+    let eligible = |d: &serde_json::Value| {
+        d["live"] == true
+            && d["boot_id"].as_str().is_some_and(|boot| boot != self_boot)
+            && d["state"] != "draining"
+            && d["state"] != "exited"
+    };
+    let port_of = |d: &serde_json::Value| d["port"].as_u64().map(|p| p as u16);
+    if let Some(sidecar_boot) = body["sidecar"]["boot_id"].as_str() {
+        if sidecar_boot != self_boot {
+            if let Some(entry) = daemons.iter().find(|d| d["boot_id"] == sidecar_boot) {
+                if eligible(entry) {
+                    return port_of(entry);
+                }
+            }
+        }
+    }
+    daemons.iter().find(|d| eligible(d)).and_then(port_of)
+}
+
+/// Update-abstraction slice 1, acceptance (b): the three-daemon chain.
+/// A drains toward B, then B drains before any C exists — the 6c
+/// entry→acquisition window where the shared sidecar names a DRAINING
+/// daemon. A's served handover payload must let the §5.1 resolution
+/// rule refuse B during that window and reach C once C acquires; the
+/// drainer's `/api/local-daemons/tokens` must name the successor's own
+/// admission token, and that token must actually admit a doorway-shaped
+/// request (the tokened-doorway half). The drainers' refusal pointers
+/// (R-D1's server-side mirror) ride the same rule: "pending" during
+/// the window, `:C` after.
+#[tokio::test]
+async fn chained_drain_payload_resolves_only_live_non_draining_holder() {
+    let rig = TestRig::new();
+    let script = chain_park_script();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let boot_a = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // A fires a session that parks mid-turn: the holdout that keeps A
+    // alive (and draining, below) through the whole choreography.
+    let item_a = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "chain-park-a",
+    )
+    .await;
+    poll_until(
+        "A's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_a)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // B boots with --takeover: A drains, B acquires.
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &["--takeover"],
+    )
+    .await;
+    poll_until(
+        "the lease transferring to B",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] != boot_a.as_str() && sidecar["state"] == "active").then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+    let boot_b = lease_sidecar(&daemon_a.rig).expect("B sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // B — the holder now — fires its own parked session, so its drain
+    // below holds it alive too: a LIVE draining sibling (the intake's
+    // 6c shape), not a corpse.
+    let item_b = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_b.port,
+        now_epoch_ms() + 1_500,
+        "chain-park-b",
+    )
+    .await;
+    poll_until(
+        "B's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_b)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || format!("journal: {:?}", journal_rows(&daemon_a.rig)),
+    )
+    .await;
+
+    // Drain B with no successor running: the 6c window opens — the
+    // shared sidecar now names B, DRAINING, and nobody has acquired.
+    let takeover = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/daemon/takeover",
+            daemon_b.port
+        ))
+        .header(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&daemon_a.rig, daemon_b.port),
+        )
+        .json(&serde_json::json!({ "requested_by": "chain e2e" }))
+        .send()
+        .await
+        .expect("takeover request reaches B");
+    assert!(
+        takeover.status().is_success(),
+        "drain request on B refused: {}",
+        takeover.status()
+    );
+    poll_until(
+        "the sidecar naming B draining",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] == boot_b.as_str() && sidecar["state"] == "draining").then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // A's served payload during the window: the sidecar names a
+    // draining daemon, the daemons array carries B live+draining, and
+    // the resolution rule refuses it — no doorway into a drain.
+    let a_client = daemon_a.authed_client();
+    let handover_url = format!("http://127.0.0.1:{}/api/daemon/handover", daemon_a.port);
+    let payload = http_get_json(&a_client, &handover_url)
+        .await
+        .expect("A's handover payload");
+    assert_eq!(payload["draining"], true, "{payload}");
+    assert_eq!(payload["sidecar"]["boot_id"], boot_b.as_str(), "{payload}");
+    assert_eq!(payload["sidecar"]["state"], "draining", "{payload}");
+    let b_entry = payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == boot_b.as_str())
+                .cloned()
+        })
+        .expect("B's presence entry in A's payload");
+    assert_eq!(
+        b_entry["live"], true,
+        "the window is a LIVE draining sibling: {b_entry}"
+    );
+    assert_eq!(b_entry["state"], "draining", "{b_entry}");
+    assert_eq!(
+        resolve_live_holder_port(&payload),
+        None,
+        "the rule must refuse a draining sidecar target: {payload}"
+    );
+
+    // R-D1's server-side mirror, observed end to end: A's refusal
+    // pointer says "pending" during the window — never ":B".
+    let probe = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["--json", "agenda", "add", "chain-refusal-probe", "--task"],
+    )
+    .await;
+    assert!(probe.status.success(), "{}", text_of(&probe));
+    let probe_id = stdout_json(&probe)["item"]["id"]
+        .as_str()
+        .expect("minted item id")
+        .to_string();
+    let refused = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["agenda", "start", &probe_id[..10]],
+    )
+    .await;
+    let refused_text = text_of(&refused);
+    assert!(
+        !refused.status.success() && refused_text.contains("daemon_draining"),
+        "start_now must refuse on the drainer: {refused_text}"
+    );
+    assert!(
+        refused_text.contains("has not acquired"),
+        "the window's refusal says pending, never a draining port: {refused_text}"
+    );
+    assert!(
+        !refused_text.contains(&format!(":{}", daemon_b.port)),
+        "the refusal must not point into B's drain: {refused_text}"
+    );
+
+    // C boots plain — the lease is already free, so boot-time
+    // acquisition takes it.
+    let daemon_c = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-c.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &[],
+    )
+    .await;
+    poll_until(
+        "C acquiring the lease",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["state"] == "active"
+                && sidecar["boot_id"] != boot_a.as_str()
+                && sidecar["boot_id"] != boot_b.as_str())
+            .then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // A's payload now reaches C through the rule (the sidecar arm:
+    // live, non-draining) while B still shows live+draining beside it —
+    // the daemons array carries the multi-predecessor truth.
+    let payload = http_get_json(&a_client, &handover_url)
+        .await
+        .expect("A's handover payload after C acquired");
+    assert_eq!(
+        resolve_live_holder_port(&payload),
+        Some(daemon_c.port),
+        "the rule reaches C once C acquires: {payload}"
+    );
+    let b_entry = payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == boot_b.as_str())
+                .cloned()
+        })
+        .expect("B's presence entry beside C");
+    assert_eq!(b_entry["live"], true, "{b_entry}");
+    assert_eq!(b_entry["state"], "draining", "{b_entry}");
+
+    // …and A's refusal pointer follows the healed sidecar to C.
+    let redirected = ctl_on_rig(
+        &daemon_a.rig,
+        daemon_a.port,
+        &["agenda", "start", &probe_id[..10]],
+    )
+    .await;
+    let redirected_text = text_of(&redirected);
+    assert!(
+        !redirected.status.success()
+            && redirected_text.contains(&format!("(:{})", daemon_c.port)),
+        "the refusal pointer names C once C acquires: {redirected_text}"
+    );
+
+    // The tokened doorway's map: the DRAINER serves the same-home
+    // instance map, it names the successor's own admission token, and
+    // that token admits a doorway-shaped request (the URL
+    // `withSiblingLoopbackToken` builds).
+    let tokens = http_get_json(
+        &a_client,
+        &format!(
+            "http://127.0.0.1:{}/api/local-daemons/tokens",
+            daemon_a.port
+        ),
+    )
+    .await
+    .expect("the drainer serves the token map");
+    let c_entry = tokens["instances"]
+        .as_array()
+        .and_then(|instances| {
+            instances
+                .iter()
+                .find(|inst| inst["port"].as_u64() == Some(u64::from(daemon_c.port)))
+                .cloned()
+        })
+        .expect("the successor appears in the drainer's token map");
+    let c_token = c_entry["token"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !c_token.is_empty(),
+        "the successor's entry carries its token: {tokens}"
+    );
+    assert_eq!(
+        c_token,
+        rig_loopback_token(&daemon_a.rig, daemon_c.port),
+        "the map's token IS the successor's own admission token"
+    );
+    let doorway = client
+        .get(format!(
+            "http://127.0.0.1:{}/?token={}",
+            daemon_c.port, c_token
+        ))
+        .send()
+        .await
+        .expect("doorway request reaches C");
+    assert!(
+        doorway.status().is_success(),
+        "the tokened doorway lands authed on C: {}",
+        doorway.status()
+    );
+
+    drop(daemon_c);
+    drop(daemon_b);
+}
+
 /// A probe-able fake "binary": a shell script printing exactly
 /// `build_info::version_line`'s shape with the given sha. Unix-only —
 /// the update watch execs it for `--version`.
