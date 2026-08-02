@@ -1648,16 +1648,32 @@ function loadDashboardLogHelperSandbox(appHtmlPath) {
   const helperSource = [
     constAssignmentSource(source, 'SESSION_TEXT_SIGNATURE_CHAR_LIMIT'),
     constAssignmentSource(source, 'SESSION_RENDERED_SIGNATURE_CHAR_LIMIT'),
+    // The signature span's content-alias path strips the supervision
+    // addendum, whose marker const lives in the identity fragment —
+    // extract the real value so the sandbox pins it, never a mirror.
+    constAssignmentSource(source, 'SESSION_SUPERVISION_ADDENDUM_MARKER'),
     sourceBetween(source, 'function compactSessionTextBounded', 'function utf8ByteLength'),
     sourceBetween(source, 'function sessionWindowTranscriptSignatureContent', 'function findSessionWindowHistoryIndexBySignatures'),
     sourceBetween(source, 'function sessionWindowHistoryNode', 'function isSessionWindowCommandOutputRecord'),
     sourceBetween(source, 'function isSessionWindowCommandOutputRecord', 'function commandOutputRecordOutputIds'),
     sourceBetween(source, 'function padTimestampPart', 'function formatLogTimestampTitle'),
+    // The lineage-pointer affordance plan (39-session-windows.js): the
+    // label/state/plan trio is pure by contract so both pointer shapes
+    // (same-window prose vs cross-window focusing link) pin here without
+    // a browser. shortSessionId is the label's one dependency;
+    // sessionWindowContinuationStateText reads the sandbox-provided
+    // sessionMetadataById map.
+    sourceBetween(source, 'function shortSessionId', 'function setDaemonSessionId'),
+    sourceBetween(source, 'function sessionWindowContinuationLabel', 'function sessionWindowContinuationTargetIsThisWindow'),
     `
 this.__helpers = {
   formatLogTimestampLabel,
   retargetSessionWindowHistoryItem,
   sessionWindowTranscriptSignaturesForRecord,
+  sessionWindowContinuationLabel,
+  sessionWindowContinuationStateText,
+  sessionWindowContinuationPlan,
+  sessionMetadataById,
 };
 `,
   ].join('\n');
@@ -1666,6 +1682,7 @@ this.__helpers = {
   const sandbox = {
     Element,
     Node,
+    sessionMetadataById: new Map(),
     document: {
       createElement() {
         throw new Error('dashboard log helper self-test does not render DOM content');
@@ -6106,6 +6123,11 @@ async function runSelfTest() {
     /unknown Station probe/,
   );
   assert.deepStrictEqual(parseArgs(['--station-probe', 'hidden-dock'], {}).stationProbes, ['dock-hidden']);
+  // Hermetic home for URL-building assertions: withLoopbackToken falls
+  // back to ~/.intendant/loopback-tokens/<port>.token, and a box that
+  // ever ran the harness holds tokens for these throwaway ports — the
+  // self-test must not read machine state it left behind itself.
+  const hermeticHomeEnv = { INTENDANT_HOME: path.join(os.tmpdir(), 'intendant-validate-self-test-void') };
   const launchParsed = parseArgs(
     [
       '--launch-dashboard',
@@ -6115,7 +6137,7 @@ async function runSelfTest() {
       '--no-presence',
       '--dashboard-timeout=5000',
     ],
-    {},
+    hermeticHomeEnv,
   );
   assert.strictEqual(launchParsed.launchDashboard, true);
   assert.strictEqual(dashboardLaunchPort(launchParsed), 8893);
@@ -6143,7 +6165,7 @@ async function runSelfTest() {
     '--no-tui',
     '--no-tls',
   ]);
-  const holdParsed = parseArgs(['--hold-dashboard', '--port', '8894', '--json'], {});
+  const holdParsed = parseArgs(['--hold-dashboard', '--port', '8894', '--json'], hermeticHomeEnv);
   assert.strictEqual(holdParsed.launchDashboard, true);
   assert.strictEqual(holdParsed.holdDashboard, true);
   assert.strictEqual(dashboardLaunchPort(holdParsed), 8894);
@@ -6302,6 +6324,56 @@ async function runSelfTest() {
       .some((signature) => liveSignatures.has(signature)),
     true,
   );
+  // Lineage-pointer affordance (agenda card 01KYRN634DYZEXN251N7JJXVY5):
+  // the same-window fold renders prose + scroll, a cross-window target a
+  // focusing link with a say-so hover, and no shape ever plans a dead
+  // link. Ids exercise the resume shape: same backend id, new wrapper.
+  const continuation = {
+    backendSessionId: 'b2b2b2b2-conversation',
+    sessionId: 'a1a1a1a1-wrapper-successor',
+    live: true,
+    source: 'claude-code',
+  };
+  const prosePlan = dashboardHelpers.sessionWindowContinuationPlan(
+    continuation,
+    true,
+    dashboardHelpers.sessionWindowContinuationStateText(continuation),
+  );
+  assert.strictEqual(prosePlan.kind, 'here');
+  assert.strictEqual(prosePlan.text, 'this window continues live below');
+  assert.strictEqual(prosePlan.text.includes('continued as'), false);
+  assert.ok(/scroll/i.test(prosePlan.title));
+  const linkPlan = dashboardHelpers.sessionWindowContinuationPlan(continuation, false, 'live');
+  assert.strictEqual(linkPlan.kind, 'link');
+  assert.strictEqual(linkPlan.text, 'continued as b2b2b2b2 (a1a1a1a1) — live');
+  assert.ok(/focus/i.test(linkPlan.title));
+  assert.strictEqual(dashboardHelpers.sessionWindowContinuationPlan(null, false, '').kind, 'none');
+  assert.strictEqual(dashboardHelpers.sessionWindowContinuationPlan({}, true, 'live').kind, 'none');
+  // A dead successor keeps the same-window prose honest…
+  const deadProse = dashboardHelpers.sessionWindowContinuationPlan(
+    { sessionId: 'a1a1a1a1-wrapper-successor', live: false },
+    true,
+    '',
+  );
+  assert.strictEqual(deadProse.kind, 'here');
+  assert.strictEqual(deadProse.text, 'this window continues below');
+  // …and the ended state joins from the successor's own card metadata.
+  dashboardHelpers.sessionMetadataById.set('a1a1a1a1-wrapper-successor', {
+    boot: { terminal: { outcome: 'completed', endedAt: '2026-07-30 00:24:32' } },
+  });
+  const endedState = dashboardHelpers.sessionWindowContinuationStateText({
+    sessionId: 'a1a1a1a1-wrapper-successor',
+    live: false,
+  });
+  assert.strictEqual(endedState, 'ended 2026-07-30 00:24:32 — completed');
+  const endedProse = dashboardHelpers.sessionWindowContinuationPlan(
+    { sessionId: 'a1a1a1a1-wrapper-successor', live: false },
+    true,
+    endedState,
+  );
+  assert.strictEqual(endedProse.kind, 'here');
+  assert.strictEqual(endedProse.text, `this window continues below — ${endedState}`);
+  dashboardHelpers.sessionMetadataById.delete('a1a1a1a1-wrapper-successor');
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(stationProbeExpression('rendered').includes('collectStationProbe'));
   assert.strictEqual(summarizeWaitValue(false), 'false');

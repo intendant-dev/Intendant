@@ -740,6 +740,63 @@ function sessionWindowContinuationStateText(continuedAs) {
   return '';
 }
 
+// The pointer affordance contract (agenda card 01KYRN634DYZEXN251N7JJXVY5,
+// owner specimen 2026-07-30): never a link with no effect. In the dominant
+// live shape a resume shares the backend id, so the pointer's target is
+// folded into THIS window — the chip already wears the successor and its
+// transcript streams right below the note — and a "continued as
+// <own-chip-id>" link goes nowhere the owner can see. That shape renders
+// prose (plus a courtesy scroll to the tail); only a target OUTSIDE this
+// window renders the link, whose click force-focuses that window. Pure
+// (DOM-free) so the QA harness self-test pins both shapes.
+function sessionWindowContinuationPlan(continuedAs, sameWindow, stateText) {
+  const label = sessionWindowContinuationLabel(continuedAs);
+  if (!label) return { kind: 'none', text: '', title: '' };
+  const state = String(stateText || '').trim();
+  if (sameWindow) {
+    return {
+      kind: 'here',
+      text: state === 'live'
+        ? 'this window continues live below'
+        : `this window continues below${state ? ` — ${state}` : ''}`,
+      title: 'The continuation is this window\'s own transcript — click to scroll to the latest output',
+    };
+  }
+  return {
+    kind: 'link',
+    text: `continued as ${label}${state ? ` — ${state}` : ''}`,
+    title: `Focus the continuation's window — ${label}`,
+  };
+}
+
+// Is the pointer's target folded into THIS window? True when a target id
+// is one of the window's own identities (map key, merged backend/wrapper
+// ids) or when the target's row alias-folds into the same card (the
+// resume bridge: a shared id in sessionAliasIds). Decided at render time
+// against the same alias closure the fold uses — never fold order.
+function sessionWindowContinuationTargetIsThisWindow(win, sid, continuedAs) {
+  const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  if (!targets.length) return false;
+  const own = new Set([String(sid || '').trim()].filter(Boolean));
+  const meta = sessionMetadataById.get(String(sid || '').trim()) || {};
+  for (const id of [meta.backendSessionId, meta.intendantSessionId]) {
+    const value = String(id || '').trim();
+    if (value) own.add(value);
+  }
+  for (const [id, w] of sessionWindows) {
+    if (w === win) own.add(id);
+  }
+  if (targets.some(id => own.has(id))) return true;
+  for (const session of Array.isArray(_cachedSessions) ? _cachedSessions : []) {
+    const aliases = sessionAliasIds(session);
+    if (!aliases.length || !targets.some(id => aliases.includes(id))) continue;
+    if (aliases.some(id => own.has(id))) return true;
+  }
+  return false;
+}
+
 function openSessionWindowForContinuation(continuedAs) {
   const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
     .map(id => String(id || '').trim())
@@ -756,8 +813,16 @@ function openSessionWindowForContinuation(continuedAs) {
     });
     Promise.resolve(hydrateSessionWindowIfEmpty(target)).catch(() => {});
   }
+  // An explicit pointer click must LAND: force past the composer-target
+  // focus veto (unforced, a foreign composer target silently swallows
+  // the click — the cross-window half of the dead-link card), then bring
+  // the window into the viewport.
   if (typeof focusSessionWindowFromLifecycle === 'function') {
-    focusSessionWindowFromLifecycle(target, {});
+    focusSessionWindowFromLifecycle(target, { force: true });
+  }
+  const targetWin = sessionWindows.get(target);
+  if (targetWin?.el?.scrollIntoView) {
+    targetWin.el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 }
 
@@ -786,8 +851,10 @@ function renderSessionWindowTerminalNote(win, sid) {
     }
     win.terminalNote = note;
   }
-  const continuationLabel = sessionWindowContinuationLabel(statement.continuedAs);
-  const signature = `${statement.text}${continuationLabel}${sessionWindowContinuationStateText(statement.continuedAs)}`;
+  const stateText = sessionWindowContinuationStateText(statement.continuedAs);
+  const sameWindow = sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+  const plan = sessionWindowContinuationPlan(statement.continuedAs, sameWindow, stateText);
+  const signature = [statement.text, plan.kind, plan.text, plan.title].join('');
   if (note.dataset.signature === signature) return;
   note.dataset.signature = signature;
   note.textContent = '';
@@ -795,18 +862,32 @@ function renderSessionWindowTerminalNote(win, sid) {
   fact.className = 'session-window-terminal-fact';
   fact.textContent = statement.text;
   note.appendChild(fact);
-  if (continuationLabel) {
+  if (plan.kind === 'link') {
     const link = document.createElement('a');
     link.href = '#';
     link.className = 'session-window-terminal-continued';
-    const stateText = sessionWindowContinuationStateText(statement.continuedAs);
-    link.textContent = `continued as ${continuationLabel}${stateText ? ` — ${stateText}` : ''}`;
+    link.textContent = plan.text;
+    link.title = plan.title;
     link.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       openSessionWindowForContinuation(statement.continuedAs);
     });
     note.appendChild(link);
+  } else if (plan.kind === 'here') {
+    // Prose, not a link: the continuation IS this window's transcript.
+    // The click is a courtesy scroll to the live tail (40's follow lane).
+    const here = document.createElement('span');
+    here.className = 'session-window-terminal-continued-here';
+    here.textContent = plan.text;
+    here.title = plan.title;
+    here.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (typeof scrollSessionWindowToBottom === 'function') {
+        scrollSessionWindowToBottom(win);
+      }
+    });
+    note.appendChild(here);
   }
 }
 
@@ -3888,6 +3969,26 @@ window.qa = Object.assign(window.qa || {}, {
         id, anchor, proj, icon, text, tone,
       }))),
     }));
+  },
+  // Terminal-note pointer readback: the affordance plan the note renders
+  // for a window — {kind:'here'} prose on the same-window fold,
+  // {kind:'link'} on a cross-window target, never a dead link.
+  terminalNotePlan: (sessionId) => {
+    const sid = String(sessionId || '').trim();
+    const statement = sessionWindowTerminalStatement(sid);
+    if (!statement) return null;
+    const win = sessionWindows.get(sid) || null;
+    const sameWindow = !!win
+      && sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+    return {
+      text: statement.text,
+      sameWindow,
+      pointer: sessionWindowContinuationPlan(
+        statement.continuedAs,
+        sameWindow,
+        sessionWindowContinuationStateText(statement.continuedAs),
+      ),
+    };
   },
 });
 

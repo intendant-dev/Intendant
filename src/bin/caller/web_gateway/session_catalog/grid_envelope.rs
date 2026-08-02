@@ -1073,10 +1073,17 @@ mod tests {
         );
         assert_eq!(relive["boot"]["continued_as"]["live"], true);
 
+        // The affordance split (card 01KYRN634DYZEXN251N7JJXVY5) must
+        // survive too: the cross-window pointer stays a link, the
+        // same-window fold renders prose — never a link with no effect.
         let fragment = include_str!("../../../../../static/app/39-session-windows.js");
         for needle in [
-            "continued as ${continuationLabel}",
+            "continued as ${label}",
             "session-window-terminal-continued",
+            "session-window-terminal-continued-here",
+            "this window continues",
+            "sessionWindowContinuationPlan(",
+            "sessionWindowContinuationTargetIsThisWindow(",
             "openSessionWindowForContinuation(",
         ] {
             assert!(
