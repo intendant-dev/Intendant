@@ -3391,6 +3391,11 @@ EOF
     fn bootstrap_scripts_do_not_persist_credentials() {
         assert!(!SETUP_SCRIPT.contains("AUTH_KEY"));
         assert!(!SETUP_SCRIPT.contains("ENROLL_TOKEN"));
+        assert!(SETUP_SCRIPT.contains("SCCACHE_VERSION=\"0.15.0\""));
+        assert!(SETUP_SCRIPT
+            .contains("782d2b5dd7ae0a55ebe368ab258114d0928d019ac2d949ab85d5d02f3926709e"));
+        assert!(SETUP_SCRIPT
+            .contains("3a6a3712b49da3d263bf2d30d702de4302793016019e800bfb81c0c69401d8f8"));
         assert!(!MAINTENANCE_SCRIPT.contains("AUTH_KEY"));
         assert!(!MAINTENANCE_SCRIPT.contains("ENROLL_TOKEN"));
         assert!(WORKER_SCRIPT.contains("mktemp -d"));
