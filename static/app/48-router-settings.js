@@ -274,6 +274,9 @@ function switchTab(tabId) {
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'shell') {
       if (!shellInitialized) initShell();
+      // Revisit seam: if the shell exited while the tab was hidden, this
+      // spawns a fresh one (no-op when a session is already open).
+      else openShellSessionIfPossible();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
     syncTerminalPaneAccessibility();
