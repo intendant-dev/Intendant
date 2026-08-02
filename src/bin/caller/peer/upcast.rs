@@ -597,7 +597,6 @@ impl AppEventUpcaster {
             | AppEvent::BackendCredentialAccount { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
-            | AppEvent::SharedView { .. }
             // Display requests are an owner-surface doorbell on THIS
             // daemon's dashboards; the peer rail deliberately does not
             // carry them (peers resolve nothing here).
@@ -1155,6 +1154,30 @@ impl AppEventUpcaster {
                 events.extend(self.displays.resize(*display_id, *width, *height));
                 events
             }
+
+            // Shared-view announcements pass through un-folded: the
+            // stream is low-volume, has no reconnect replay lane to
+            // dedupe (unlike display_ready), and the per-peer actor
+            // applies the last-event-wins fold for its snapshot. This
+            // is the deliberate cross-machine surfacing lane — a peer
+            // agent's "look here" reaches the primary's dashboards.
+            AppEvent::SharedView {
+                session_id,
+                action,
+                display_target,
+                display_id,
+                reason,
+                region,
+                note,
+            } => vec![PeerEvent::SharedView {
+                session_id: session_id.clone(),
+                action: action.clone(),
+                display_target: display_target.clone(),
+                display_id: *display_id,
+                reason: reason.clone(),
+                region: region.clone(),
+                note: note.clone(),
+            }],
 
             AppEvent::DisplayTaken { display_id } => vec![PeerEvent::CapabilityEngaged {
                 capability: Capability::Display,
@@ -2098,7 +2121,6 @@ impl WireEventUpcaster {
             | OutboundEvent::ConversationRolledBack { .. }
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::FollowUpStatus { .. }
-            | OutboundEvent::SharedView { .. }
             // A secondary's display-request doorbell rings on its own
             // dashboards; the peer rail does not mirror it (see the
             // AppEvent upcaster twin above).
@@ -2691,6 +2713,29 @@ impl WireEventUpcaster {
                 events.extend(self.displays.resize(*display_id, *width, *height));
                 events
             }
+
+            // Shared-view announcements pass through un-folded (see the
+            // AppEvent upcaster twin above): low-volume, no replay lane
+            // to dedupe, actor-side fold. Live-lane only — the replay
+            // upcaster deliberately suppresses historical shared_view
+            // frames so a stale "look here" never resurrects as live.
+            OutboundEvent::SharedView {
+                session_id,
+                action,
+                display_target,
+                display_id,
+                reason,
+                region,
+                note,
+            } => vec![PeerEvent::SharedView {
+                session_id: session_id.clone(),
+                action: action.clone(),
+                display_target: display_target.clone(),
+                display_id: *display_id,
+                reason: reason.clone(),
+                region: region.clone(),
+                note: note.clone(),
+            }],
 
             OutboundEvent::DisplayTaken { display_id } => vec![PeerEvent::CapabilityEngaged {
                 capability: Capability::Display,
@@ -4378,6 +4423,38 @@ mod tests {
             display_id: 1,
             reason: "backend_crashed".into(),
         });
+    }
+
+    #[test]
+    fn parity_shared_view() {
+        assert_parity(AppEvent::SharedView {
+            session_id: Some("sess-99".into()),
+            action: "show".into(),
+            display_target: Some(":99".into()),
+            display_id: Some(99),
+            reason: Some("watch the build finish".into()),
+            region: None,
+            note: None,
+        });
+    }
+
+    #[test]
+    fn shared_view_is_live_lane_only() {
+        let mut up = WireEventUpcaster::new();
+        let wire = OutboundEvent::SharedView {
+            session_id: None,
+            action: "show".into(),
+            display_target: Some(":99".into()),
+            display_id: Some(99),
+            reason: None,
+            region: None,
+            note: None,
+        };
+        assert_eq!(up.upcast(&wire).len(), 1, "live shared_view passes through");
+        assert!(
+            up.upcast_replayed(&wire).is_empty(),
+            "historical shared_view frames in log_replay must not resurrect a live banner"
+        );
     }
 
     // ---- Display-availability fold ----

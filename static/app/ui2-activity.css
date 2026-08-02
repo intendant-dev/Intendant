@@ -1410,6 +1410,17 @@ html.ui-v2 .shared-view-close {
 }
 html.ui-v2 .shared-view-close:hover { color: var(--text); }
 
+/* — federated peer shared-view banners (Activity log pane) — */
+html.ui-v2 .peer-shared-view-banners {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 12px 0;
+  flex-shrink: 0;
+}
+html.ui-v2 .peer-shared-view-banners.hidden { display: none; }
+html.ui-v2 .peer-shared-view-banner { padding: 6px 12px; }
+
 /* — empty state — */
 html.ui-v2 .log-empty-overlay { background: transparent; }
 html.ui-v2 #log-empty-state .ui-empty-title { font-size: 13px; font-weight: 650; color: var(--text-2); }

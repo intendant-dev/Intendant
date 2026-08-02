@@ -3803,6 +3803,46 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             ]
         }
 
+        // Shared-view (visual collaboration) announcements: narrated in
+        // the per-peer log only — the folded state itself rides the
+        // PeerStateChanged snapshot push (PeerSnapshot.shared_view), so
+        // the model/banner update needs no per-event command here.
+        "shared_view" => {
+            let action = payload["action"].as_str().unwrap_or("show");
+            let target = payload["display_target"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    payload["display_id"]
+                        .as_u64()
+                        .map(|id| format!("display_{id}"))
+                })
+                .unwrap_or_else(|| "a display".to_string());
+            let detail = payload["reason"]
+                .as_str()
+                .or_else(|| payload["note"].as_str())
+                .unwrap_or("");
+            let content = match action {
+                "hide" => "shared view hidden".to_string(),
+                "focus_clear" => "shared-view focus cleared".to_string(),
+                "focus" if !detail.is_empty() => format!("agent focusing {target}: {detail}"),
+                "focus" => format!("agent focusing {target}"),
+                "input_request" | "input" if !detail.is_empty() => {
+                    format!("agent requesting input on {target}: {detail}")
+                }
+                "input_request" | "input" => format!("agent requesting input on {target}"),
+                _ if !detail.is_empty() => format!("agent presenting {target}: {detail}"),
+                _ => format!("agent presenting {target}"),
+            };
+            vec![UiCommand::PeerLog {
+                host_id: host,
+                ts: now,
+                level: "info".to_string(),
+                source: "display".to_string(),
+                content,
+            }]
+        }
+
         "session_started" => {
             let session = &payload["session"];
             let label = session["label"].as_str().unwrap_or("");
@@ -6468,6 +6508,56 @@ mod tests {
                     if content.contains(":99") && content.contains("backend_crashed")
             )),
             "display_lost logs the id and reason"
+        );
+    }
+
+    /// `shared_view` peer events narrate in the per-peer log (the folded
+    /// state itself rides the PeerStateChanged snapshot push, so no
+    /// model-mutating command is expected here).
+    #[test]
+    fn peer_event_forwarded_shared_view_narrates_show_and_hide() {
+        let mut s = AppState::new();
+
+        let show = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "shared_view",
+                "action": "show",
+                "display_target": ":99",
+                "display_id": 99,
+                "reason": "watch the build finish",
+            },
+        });
+        let cmds = s.handle_message(&show);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                UiCommand::PeerLog { host_id, source, content, .. }
+                    if host_id == "intendant:alpha"
+                        && source == "display"
+                        && content.contains(":99")
+                        && content.contains("watch the build finish")
+            )),
+            "shared_view show logs the target and reason: {cmds:?}"
+        );
+
+        let hide = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "shared_view",
+                "action": "hide",
+            },
+        });
+        let cmds = s.handle_message(&hide);
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                UiCommand::PeerLog { content, .. }
+                    if content.contains("shared view hidden")
+            )),
+            "shared_view hide logs the retirement: {cmds:?}"
         );
     }
 

@@ -24,7 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerStatus, SessionInfo,
+    ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerSharedViewInfo,
+    PeerStatus, SessionInfo,
     TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
@@ -341,6 +342,10 @@ struct PeerHandleInner {
     /// Folded view of the peer's available displays (see the actor's
     /// `displays_tx` docs — connection-scoped, cleared on disconnect).
     displays: watch::Receiver<Arc<Vec<PeerDisplayInfo>>>,
+    /// Folded view of the peer's live shared-view state (see the
+    /// actor's `shared_view_tx` docs — connection-scoped, cleared on
+    /// disconnect).
+    shared_view: watch::Receiver<Option<PeerSharedViewInfo>>,
     /// The connected transport candidate (see [`PeerLinkInfo`]) —
     /// `Some` while connected, `None` otherwise.
     link: watch::Receiver<Option<PeerLinkInfo>>,
@@ -424,6 +429,15 @@ impl PeerHandle {
         self.inner.grant.clone()
     }
 
+    /// Watch the peer's folded shared-view state (see
+    /// [`PeerSnapshot::shared_view`]). The registry's state observer
+    /// selects on this so every change pushes a fresh `PeerStateChanged`
+    /// snapshot to the dashboards — shared-view actions are rare, so the
+    /// wholesale-snapshot lane is cheap and keeps the browser fold-free.
+    pub fn shared_view_updates(&self) -> watch::Receiver<Option<PeerSharedViewInfo>> {
+        self.inner.shared_view.clone()
+    }
+
     #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         matches!(*self.inner.connection.borrow(), ConnectionState::Connected)
@@ -466,6 +480,7 @@ impl PeerHandle {
             browser_tcp_via_url: self.inner.browser_tcp_via_url.clone(),
             sessions: self.inner.sessions.borrow().as_ref().clone(),
             displays: self.inner.displays.borrow().as_ref().clone(),
+            shared_view: self.inner.shared_view.borrow().clone(),
             link: self.inner.link.borrow().clone(),
             grant: self.inner.grant.borrow().clone(),
         }
@@ -999,6 +1014,15 @@ pub struct PeerSnapshot {
     /// `serde(default)` keeps older producers parseable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub displays: Vec<PeerDisplayInfo>,
+    /// The peer's live shared-view state as folded from its
+    /// `shared_view` events (see [`PeerSharedViewInfo`]):
+    /// its agent's current "look here" announcement, if any. Seeds the
+    /// dashboard's peer shared-view banner at load/refetch; live
+    /// `shared_view` events keep it fresh in between. Connection-
+    /// scoped like `displays`, with no reconnect replay — `None` after
+    /// a link drop until the peer agent's next shared-view action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_view: Option<PeerSharedViewInfo>,
     /// The connected transport candidate (URL + reachability class).
     /// `None` while disconnected. The dashboard derives
     /// media/datachannel availability from `link.transport_class` —
@@ -1087,6 +1111,7 @@ where
     let (card_tx, card_rx) = watch::channel(Arc::new(initial_card));
     let (sessions_tx, sessions_rx) = watch::channel(Arc::new(Vec::new()));
     let (displays_tx, displays_rx) = watch::channel(Arc::new(Vec::new()));
+    let (shared_view_tx, shared_view_rx) = watch::channel(None);
     let (receipts_tx, receipts_rx) = watch::channel(Arc::new(HashMap::new()));
     let (link_tx, link_rx) = watch::channel(None);
     let (grant_tx, grant_rx) = watch::channel(None);
@@ -1108,6 +1133,8 @@ where
         sessions: std::collections::BTreeMap::new(),
         displays_tx,
         displays: std::collections::BTreeMap::new(),
+        shared_view_tx,
+        shared_view: None,
         link_tx,
         grant_tx,
         receipts_tx,
@@ -1131,6 +1158,7 @@ where
             card: card_rx,
             sessions: sessions_rx,
             displays: displays_rx,
+            shared_view: shared_view_rx,
             link: link_rx,
             grant: grant_rx,
             receipts: receipts_rx,

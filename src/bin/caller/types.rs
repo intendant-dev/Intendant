@@ -159,7 +159,7 @@ pub use intendant_core::vitals::{
 /// Coordinates are fractions of the visible display frame, where `(0, 0)` is
 /// the top-left and `(1, 1)` is the bottom-right. The dashboard renders this as
 /// a focus box over the video stream.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedViewRegion {
     pub x: f64,
     pub y: f64,

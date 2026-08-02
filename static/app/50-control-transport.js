@@ -2661,6 +2661,12 @@ function snapshotToDaemonEntry(p) {
     // live peer_display_ready/removed events produced this list, so
     // wholesale row replacement never loses display state.
     displays: Array.isArray(p.displays) ? p.displays : [],
+    // The peer's live shared-view state (PeerSnapshot.shared_view):
+    // its agent's current "look here" announcement, folded daemon-side
+    // (hide retires it to null). Every change arrives as a fresh
+    // peer_state_changed snapshot — no per-event fold here. Drives the
+    // Activity peer shared-view banners (renderPeerSharedViewBanners).
+    shared_view: p.shared_view || null,
     // Reachability honesty (RC-C1): the connected transport candidate
     // ({url, transport_class: 'direct'|'relayed'}, null while
     // disconnected) and the grant the peer advertised for this

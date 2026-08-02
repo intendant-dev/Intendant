@@ -251,6 +251,14 @@
             <button class="pending-attachments-clear" id="pending-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
           </div>
 
+          <!-- Peer shared-view banners: one per federated peer whose agent
+               is presenting a display ("look here"). Data-derived from the
+               daemons snapshot (PeerSnapshot.shared_view) by
+               renderPeerSharedViewBanners in 45-displays-webrtc.js;
+               independent of the local display strip below so a peer
+               announcement surfaces even with zero local displays. -->
+          <div class="peer-shared-view-banners hidden" id="peer-shared-view-banners"></div>
+
           <!-- Display Strip (shown when displays are active) -->
           <div class="activity-display-strip hidden" id="activity-display-strip">
             <div class="activity-display-header">
