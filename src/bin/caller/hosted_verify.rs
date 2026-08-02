@@ -2793,9 +2793,75 @@ async fn run_release_cli(
 pub(crate) mod test_fixtures {
     use super::*;
 
+    // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
+    // exercised against real trees, mirroring the service's tests. ──
+
+    pub(crate) fn split_point(n: usize) -> usize {
+        let mut k = 1usize;
+        while k * 2 < n {
+            k *= 2;
+        }
+        k
+    }
+
+    pub(crate) fn tree_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        match leaves.len() {
+            0 => sha256(b""),
+            1 => leaves[0],
+            n => {
+                let k = split_point(n);
+                node_hash(&tree_root(&leaves[..k]), &tree_root(&leaves[k..]))
+            }
+        }
+    }
+
+    pub(crate) fn inclusion_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let n = leaves.len();
+        if n <= 1 {
+            return Vec::new();
+        }
+        let k = split_point(n);
+        if m < k {
+            let mut path = inclusion_proof(m, &leaves[..k]);
+            path.push(tree_root(&leaves[k..]));
+            path
+        } else {
+            let mut path = inclusion_proof(m - k, &leaves[k..]);
+            path.push(tree_root(&leaves[..k]));
+            path
+        }
+    }
+
+    pub(crate) fn consistency_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        fn subproof(m: usize, leaves: &[[u8; 32]], complete: bool) -> Vec<[u8; 32]> {
+            let n = leaves.len();
+            if m == n {
+                return if complete {
+                    Vec::new()
+                } else {
+                    vec![tree_root(leaves)]
+                };
+            }
+            let k = split_point(n);
+            if m <= k {
+                let mut proof = subproof(m, &leaves[..k], complete);
+                proof.push(tree_root(&leaves[k..]));
+                proof
+            } else {
+                let mut proof = subproof(m - k, &leaves[k..], false);
+                proof.push(tree_root(&leaves[..k]));
+                proof
+            }
+        }
+        if m == 0 || m > leaves.len() {
+            return Vec::new();
+        }
+        subproof(m, leaves, true)
+    }
+
     pub(crate) struct FixtureLog {
         pub(crate) leaves_json: Vec<String>,
-        keypair: ring::signature::EcdsaKeyPair,
+        pub(crate) keypair: ring::signature::EcdsaKeyPair,
         rng: ring::rand::SystemRandom,
     }
 
@@ -2820,14 +2886,14 @@ pub(crate) mod test_fixtures {
             }
         }
 
-        fn leaves(&self) -> Vec<[u8; 32]> {
+        pub(crate) fn leaves(&self) -> Vec<[u8; 32]> {
             self.leaves_json
                 .iter()
                 .map(|leaf| leaf_hash(leaf))
                 .collect()
         }
 
-        fn sth_json(&self) -> serde_json::Value {
+        pub(crate) fn sth_json(&self) -> serde_json::Value {
             use ring::signature::KeyPair as _;
             let leaves = self.leaves();
             let root_b64u = crate::daemon_identity::b64u(&tree_root(&leaves));
@@ -3265,72 +3331,6 @@ mod tests {
         assert!(parse_manifest_leaf(&leaf)
             .unwrap_err()
             .contains("string bounds"));
-    }
-
-    // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
-    // exercised against real trees, mirroring the service's tests. ──
-
-    fn split_point(n: usize) -> usize {
-        let mut k = 1usize;
-        while k * 2 < n {
-            k *= 2;
-        }
-        k
-    }
-
-    fn tree_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-        match leaves.len() {
-            0 => sha256(b""),
-            1 => leaves[0],
-            n => {
-                let k = split_point(n);
-                node_hash(&tree_root(&leaves[..k]), &tree_root(&leaves[k..]))
-            }
-        }
-    }
-
-    fn inclusion_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        let n = leaves.len();
-        if n <= 1 {
-            return Vec::new();
-        }
-        let k = split_point(n);
-        if m < k {
-            let mut path = inclusion_proof(m, &leaves[..k]);
-            path.push(tree_root(&leaves[k..]));
-            path
-        } else {
-            let mut path = inclusion_proof(m - k, &leaves[k..]);
-            path.push(tree_root(&leaves[..k]));
-            path
-        }
-    }
-
-    fn consistency_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        fn subproof(m: usize, leaves: &[[u8; 32]], complete: bool) -> Vec<[u8; 32]> {
-            let n = leaves.len();
-            if m == n {
-                return if complete {
-                    Vec::new()
-                } else {
-                    vec![tree_root(leaves)]
-                };
-            }
-            let k = split_point(n);
-            if m <= k {
-                let mut proof = subproof(m, &leaves[..k], complete);
-                proof.push(tree_root(&leaves[k..]));
-                proof
-            } else {
-                let mut proof = subproof(m - k, &leaves[k..], false);
-                proof.push(tree_root(&leaves[..k]));
-                proof
-            }
-        }
-        if m == 0 || m > leaves.len() {
-            return Vec::new();
-        }
-        subproof(m, leaves, true)
     }
 
     #[test]

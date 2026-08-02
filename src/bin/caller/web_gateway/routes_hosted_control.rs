@@ -546,8 +546,7 @@ pub(crate) async fn handle_hosted_control_anchor_decision(
         }
         Err(error) => Err(AnchorDecisionRefusal::Parse(error)),
     };
-    let response =
-        anchor_decision_response(result, runtime.configured(), runtime.enabled());
+    let response = anchor_decision_response(result, runtime.configured(), runtime.enabled());
     write_api_response(stream, response, cors, None).await;
 }
 

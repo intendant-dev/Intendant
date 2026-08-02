@@ -972,17 +972,20 @@ mod tests {
                     .hosted_control
                     .signed_app_anchors
                     .retain(|anchor| anchor.device_id != "device-1");
-                state.hosted_control.signed_app_anchors.push(SignedAppAnchor {
-                    device_id: "device-1".to_string(),
-                    label: "Test app".to_string(),
-                    public_key: public_key.clone(),
-                    key_fingerprint: "fp-test".to_string(),
-                    distribution_id: distribution_id.to_string(),
-                    active: true,
-                    enrolled_unix_ms: now_ms().max(0) as u64,
-                    revoked_unix_ms: None,
-                    evidence: None,
-                });
+                state
+                    .hosted_control
+                    .signed_app_anchors
+                    .push(SignedAppAnchor {
+                        device_id: "device-1".to_string(),
+                        label: "Test app".to_string(),
+                        public_key: public_key.clone(),
+                        key_fingerprint: "fp-test".to_string(),
+                        distribution_id: distribution_id.to_string(),
+                        active: true,
+                        enrolled_unix_ms: now_ms().max(0) as u64,
+                        revoked_unix_ms: None,
+                        evidence: None,
+                    });
                 Ok(((), true))
             })
             .unwrap();

@@ -8,8 +8,7 @@ pub const LEASE_PROTOCOL: &str = "intendant-hosted-control-lease-v1";
 pub const REQUEST_PROOF_PROTOCOL: &str = "intendant-hosted-control-request-v1";
 pub const POLL_PROOF_PROTOCOL: &str = "intendant-hosted-control-poll-v1";
 pub const ANCHOR_DECISION_PROTOCOL: &str = "intendant-hosted-control-anchor-decision-v1";
-pub const ANCHOR_ENROLLMENT_PROOF_PROTOCOL: &str =
-    "intendant-hosted-control-anchor-enrollment-v1";
+pub const ANCHOR_ENROLLMENT_PROOF_PROTOCOL: &str = "intendant-hosted-control-anchor-enrollment-v1";
 pub const SIGNED_APP_INSTALL_RECEIPT_PROTOCOL: &str = "intendant-signed-app-install-receipt-v1";
 pub const CERTIFICATE_LEDGER_PROTOCOL: &str = "intendant-fleet-certificate-ledger-v1";
 pub const CERTIFICATE_WITNESS_PROTOCOL: &str = "intendant-hosted-certificate-witness-v1";

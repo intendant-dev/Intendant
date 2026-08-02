@@ -43,10 +43,7 @@ pub const ANCHOR_DECISION_REFUSED_ERROR: &str =
     "signed application anchor decision is not accepted";
 
 fn ensure_eligible_distribution(distribution_id: &str) -> Result<(), String> {
-    if ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
-        .iter()
-        .any(|distribution| *distribution == distribution_id)
-    {
+    if ELIGIBLE_SIGNED_APP_DISTRIBUTIONS.contains(&distribution_id) {
         return Ok(());
     }
     Err(format!(
@@ -137,7 +134,10 @@ fn describe_verify_failure(failure: &crate::hosted_verify::VerifyFailure) -> Str
         crate::hosted_verify::VerifyFailure::Unavailable(detail) => {
             format!("verification unavailable: {detail}")
         }
-        crate::hosted_verify::VerifyFailure::Verification { summary, mismatches } => {
+        crate::hosted_verify::VerifyFailure::Verification {
+            summary,
+            mismatches,
+        } => {
             if mismatches.is_empty() {
                 summary.clone()
             } else {
@@ -1198,12 +1198,13 @@ impl HostedControlRuntime {
         let (public_key, key_fingerprint) = validate_browser_public_key(&input.public_key)
             .map_err(|_| {
                 AccessError(
-                    "anchor public key must be an uncompressed P-256 point (base64url)"
-                        .to_string(),
+                    "anchor public key must be an uncompressed P-256 point (base64url)".to_string(),
                 )
             })?;
         if !valid_id_component(&input.nonce) {
-            return Err(AccessError("anchor enrollment nonce is invalid".to_string()));
+            return Err(AccessError(
+                "anchor enrollment nonce is invalid".to_string(),
+            ));
         }
         verify_timestamp(input.timestamp_unix_ms).map_err(AccessError)?;
         validate_receipt_shape(&input.receipt).map_err(AccessError)?;
@@ -2621,7 +2622,7 @@ mod tests {
                 &request,
                 HostedPreset::Tasks,
                 3600,
-                &actor,
+                &actor.id,
                 identity,
                 "daemon-test",
             )
@@ -2639,7 +2640,7 @@ mod tests {
             &overflow,
             HostedPreset::Tasks,
             3600,
-            &actor,
+            &actor.id,
             identity,
             "daemon-test",
         )
@@ -2700,7 +2701,7 @@ mod tests {
                 &request,
                 HostedPreset::Tasks,
                 3600,
-                &actor,
+                &actor.id,
                 identity,
                 "daemon-test",
             )
@@ -3557,7 +3558,9 @@ mod tests {
         );
         let state = iam::load_state(&runtime.cert_dir).unwrap();
         assert_eq!(state.hosted_control.signed_app_anchors.len(), 1);
-        assert!(state.hosted_control.signed_app_anchors[0].evidence.is_some());
+        assert!(state.hosted_control.signed_app_anchors[0]
+            .evidence
+            .is_some());
         assert!(state
             .audit_events
             .iter()
@@ -3569,7 +3572,12 @@ mod tests {
         let replacement = runtime
             .enroll_signed_app_anchor_at(
                 &rig.endpoints,
-                enrollment_input(&rotated, "device-1", "macos-pgp-logged-v1", rig_receipt(&rig)),
+                enrollment_input(
+                    &rotated,
+                    "device-1",
+                    "macos-pgp-logged-v1",
+                    rig_receipt(&rig),
+                ),
                 &owner(),
             )
             .await
@@ -3762,17 +3770,20 @@ mod tests {
                 .hosted_control
                 .signed_app_anchors
                 .retain(|anchor| anchor.device_id != device_id);
-            state.hosted_control.signed_app_anchors.push(SignedAppAnchor {
-                device_id: device_id.to_string(),
-                label: "Injected test anchor".to_string(),
-                public_key: key.public_key.clone(),
-                key_fingerprint: "fp-test".to_string(),
-                distribution_id: distribution_id.to_string(),
-                active: true,
-                enrolled_unix_ms: now_ms().max(0) as u64,
-                revoked_unix_ms: None,
-                evidence: None,
-            });
+            state
+                .hosted_control
+                .signed_app_anchors
+                .push(SignedAppAnchor {
+                    device_id: device_id.to_string(),
+                    label: "Injected test anchor".to_string(),
+                    public_key: key.public_key.clone(),
+                    key_fingerprint: "fp-test".to_string(),
+                    distribution_id: distribution_id.to_string(),
+                    active: true,
+                    enrolled_unix_ms: now_ms().max(0) as u64,
+                    revoked_unix_ms: None,
+                    evidence: None,
+                });
             Ok(((), true))
         })
         .unwrap();
@@ -3919,7 +3930,12 @@ mod tests {
 
         // Revoked anchor.
         let revoked_key = browser_key();
-        inject_anchor(&runtime, &revoked_key, "device-revoked", "macos-pgp-logged-v1");
+        inject_anchor(
+            &runtime,
+            &revoked_key,
+            "device-revoked",
+            "macos-pgp-logged-v1",
+        );
         iam::transact_state(&runtime.cert_dir, |state, _| {
             let anchor = state
                 .hosted_control
@@ -3951,7 +3967,12 @@ mod tests {
         // Replay: a fresh nonce decides, the identical document replayed is
         // refused, and the request stays decided exactly once.
         let replay_key = browser_key();
-        inject_anchor(&runtime, &replay_key, "device-replay", "macos-pgp-logged-v1");
+        inject_anchor(
+            &runtime,
+            &replay_key,
+            "device-replay",
+            "macos-pgp-logged-v1",
+        );
         let document = decision_document(&replay_key, "device-replay", &request, false);
         let replayed = document.clone();
         runtime.apply_anchor_decision(document).unwrap();
