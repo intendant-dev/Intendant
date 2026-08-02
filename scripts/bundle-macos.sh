@@ -107,9 +107,22 @@ die() {
 # trusting the write, and name the remedy.
 require_keychain_in_search_list() {
     local keychain="$1"
-    if security list-keychains -d user | sed 's/^ *"//; s/"$//' | grep -qxF "$keychain"; then
-        return 0
-    fi
+    # The search list stores canonicalized paths — on macOS /var is a
+    # symlink to /private/var, so an entry written as
+    # ~/.intendant/signing.keychain-db lists back as
+    # /private/var/…/signing.keychain-db and a literal comparison against
+    # the $HOME spelling never matches (first fleet run of this preflight
+    # failed exactly there, 2026-08-02, on a correctly provisioned box).
+    # Compare resolved paths; when realpath is unavailable or fails, fall
+    # back to the raw spelling, which preserves the old exact-match check.
+    local resolved entry entry_resolved
+    resolved="$(realpath "$keychain" 2>/dev/null || echo "$keychain")"
+    while IFS= read -r entry; do
+        entry_resolved="$(realpath "$entry" 2>/dev/null || echo "$entry")"
+        if [ "$entry_resolved" = "$resolved" ] || [ "$entry" = "$keychain" ]; then
+            return 0
+        fi
+    done < <(security list-keychains -d user | sed 's/^ *"//; s/"$//')
     {
         echo "Error: signing keychain is not in the user keychain search list:"
         echo "  $keychain"
