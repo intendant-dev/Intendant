@@ -13,6 +13,7 @@ use super::{RemoteCommandAcquisitionStage, RemoteCommandAcquisitionView};
 const DEFAULT_ACQUIRE_TIMEOUT_S: u64 = 3600;
 const MAX_ACQUIRE_TIMEOUT_S: u64 = 7200;
 const ENROLLMENT_TOKEN_GRACE_S: u64 = 300;
+const PROVIDER_INITIAL_REFRESH_S: u64 = 15;
 const PROVIDER_REFRESH_INTERVAL_S: u64 = 60;
 const PROVIDER_REFRESH_TIMEOUT_S: u64 = 20;
 const DEFAULT_IDLE_TIMEOUT_S: u64 = 600;
@@ -377,7 +378,7 @@ async fn acquire_new_worker(
         None,
     ));
     let mut next_provider_refresh =
-        tokio::time::Instant::now() + Duration::from_secs(PROVIDER_REFRESH_INTERVAL_S);
+        tokio::time::Instant::now() + Duration::from_secs(PROVIDER_INITIAL_REFRESH_S);
     loop {
         if crate::codex_cloud_attach::attachment_channel(&task_id).is_some() {
             break;

@@ -84,7 +84,7 @@ install_prebuilt_sccache() {
   esac
 
   asset="sccache-v${SCCACHE_VERSION}-${target}.tar.gz"
-  sccache_tmp="$(mktemp -d)"
+  sccache_tmp="$(mktemp -d)" || return 1
   archive="$sccache_tmp/$asset"
   curl --fail --silent --show-error --location \
     --proto '=https' --tlsv1.2 \
