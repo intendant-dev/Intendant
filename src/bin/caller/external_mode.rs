@@ -185,10 +185,6 @@ async fn apply_backend_credentials_reload(
             "{noun} cancelled for the credential reload — parked messages deliver after the respawn",
         ));
     }
-    let resume_id = stats
-        .announced_native_session_id
-        .clone()
-        .or_else(|| drain_config.backend_thread_id.clone());
     // The restart kills the old process's background children before the
     // fresh process exists: flip any parked-on tasks to died-with-restart
     // NOW, with this class's name, so the park never outlives its wake.
@@ -204,27 +200,20 @@ async fn apply_backend_credentials_reload(
         backend
     ));
     progress(crate::event::CredentialReloadProgress::Respawning);
-    if let Err(e) = agent.shutdown().await {
-        slog(session_log, |l| {
-            l.warn(&format!("Backend shutdown before credential reload: {e}"))
-        });
-    }
-    match create_external_agent(
+    match respawn_external_backend_in_place(
         backend,
         project,
-        session_log,
         web_port,
-        resume_id,
-        intendant_session_id.clone(),
-        session_agent_config.codex_service_tier.clone(),
-        session_agent_config.codex_home.clone(),
+        intendant_session_id,
+        session_agent_config,
+        stats,
+        agent,
+        event_rx,
+        drain_config,
     )
     .await
     {
-        Ok((new_agent, new_thread, new_event_rx)) => {
-            *agent = new_agent;
-            *event_rx = new_event_rx;
-            drain_config.backend_thread_id = Some(new_thread.thread_id.clone());
+        Ok(()) => {
             announce(
                 "Credential reload complete — the backend restarted on the fresh credential store",
             );
@@ -244,6 +233,54 @@ async fn apply_backend_credentials_reload(
             None
         }
     }
+}
+
+/// In-place backend respawn shared by the credential-reload lane and the
+/// park-wake lane: shut the old process down (a no-op when it already
+/// exited), re-create the agent resume-attached to the same backend
+/// session id, and swap the loop's live handles (agent, event stream,
+/// thread id). The caller owns the surrounding announcements and any
+/// park/queue bookkeeping — and must re-open its event-channel gate,
+/// since the swapped-in receiver is live again. `Err` carries the create
+/// failure; the old process is already gone then, so callers exit their
+/// lane honestly.
+#[allow(clippy::too_many_arguments)]
+async fn respawn_external_backend_in_place(
+    backend: &external_agent::AgentBackend,
+    project: &Project,
+    web_port: Option<u16>,
+    intendant_session_id: &Option<String>,
+    session_agent_config: &session_config::SessionAgentConfig,
+    stats: &LoopStats,
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    drain_config: &mut DrainConfig<'_>,
+) -> Result<(), CallerError> {
+    let session_log = drain_config.session_log;
+    let resume_id = stats
+        .announced_native_session_id
+        .clone()
+        .or_else(|| drain_config.backend_thread_id.clone());
+    if let Err(e) = agent.shutdown().await {
+        slog(session_log, |l| {
+            l.warn(&format!("Backend shutdown before respawn: {e}"))
+        });
+    }
+    let (new_agent, new_thread, new_event_rx) = create_external_agent(
+        backend,
+        project,
+        session_log,
+        web_port,
+        resume_id,
+        intendant_session_id.clone(),
+        session_agent_config.codex_service_tier.clone(),
+        session_agent_config.codex_home.clone(),
+    )
+    .await?;
+    *agent = new_agent;
+    *event_rx = new_event_rx;
+    drain_config.backend_thread_id = Some(new_thread.thread_id.clone());
+    Ok(())
 }
 
 /// The named cause stamped on background tasks the credential-reload
@@ -622,6 +659,20 @@ pub(crate) async fn run_external_agent_mode(
     // the wire carries no reset time) and clears on any completed turn.
     let mut limit_park: Option<LimitParkState> = None;
     let mut limit_park_streak: u32 = 0;
+    // Whether the backend event channel still has a live sender. A park
+    // with owed work now holds through the backend's death (the
+    // park-then-die reconciliation), and a dead process's channel closes
+    // moments later — an ungated `recv()` on the closed channel would
+    // spin the idle select. Closed-while-parked flips this gate off; the
+    // respawn lanes (credential reload, park wake) flip it back on when
+    // they swap in a fresh receiver.
+    let mut event_channel_open = true;
+    // The event-bus-closed exit is the daemon tearing down, not this
+    // session's story ending: the exit backstop below must then leave the
+    // durable limit-park marker in place as the boot auto-readopt trace
+    // (exactly like a hard daemon death that never reaches the backstop),
+    // instead of cancelling the park like a deliberate session end.
+    let mut daemon_teardown_exit = false;
     // Consecutive transient-service-condition round deaths (the error
     // park's recovery-attempt counter): +1 each death, reset by a
     // completed turn or an explicit intervention (interrupt, reload) —
@@ -767,6 +818,7 @@ pub(crate) async fn run_external_agent_mode(
                     Some("credential reload could not respawn the backend".to_string());
                 break 'outer;
             };
+            event_channel_open = true;
             // When the reload's own interrupt cut the live turn, the
             // turn's driving message was consumed mid-delivery — nothing
             // re-drives it after the respawn, so the session would idle
@@ -912,6 +964,67 @@ pub(crate) async fn run_external_agent_mode(
                                     &pending,
                                 ) =>
                             {
+                                // A park can hold through the backend's own
+                                // death (the park-then-die reconciliation):
+                                // a wake that owes a delivery must respawn
+                                // a confirmed-dead backend resume-attached
+                                // FIRST, or the re-send would fail into the
+                                // dead process's stdin. The probe is
+                                // per-backend honest — only a confirmed
+                                // exit (or no process at all) answers true,
+                                // so a live backend is never replaced;
+                                // backends without the probe (everything
+                                // but Claude Code today) keep the direct
+                                // send, whose failure surfaces loudly
+                                // through the delivery lane.
+                                if agent.next_round_reads_fresh_credentials() {
+                                    match respawn_external_backend_in_place(
+                                        &backend,
+                                        &project,
+                                        web_port,
+                                        &intendant_session_id,
+                                        &session_agent_config,
+                                        &stats,
+                                        &mut agent,
+                                        &mut event_rx,
+                                        &mut drain_config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            event_channel_open = true;
+                                            let line = format!(
+                                                "{noun} elapsed with the backend gone — respawned {} resume-attached to deliver the parked message",
+                                                backend
+                                            );
+                                            slog(&session_log, |l| l.info(&line));
+                                            bus.send(AppEvent::LogEntry {
+                                                session_id: live_session_id.clone(),
+                                                level: "info".to_string(),
+                                                source: "Intendant".to_string(),
+                                                content: line,
+                                                turn: None,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let line = format!(
+                                                "{noun} elapsed, but the dead backend could not be respawned: {e}"
+                                            );
+                                            slog(&session_log, |l| l.error(&line));
+                                            emit_follow_up_status(
+                                                &bus,
+                                                live_session_id.as_deref(),
+                                                &pending.follow_up_id,
+                                                Some(&pending.text),
+                                                "failed",
+                                                Some("the backend could not be respawned at the park's wake"),
+                                            );
+                                            bus.send(AppEvent::LoopError(line.clone()));
+                                            stats.terminal_outcome = Some(line);
+                                            break 'outer;
+                                        }
+                                    }
+                                }
                                 let line = format!(
                                     "{noun} elapsed — re-sending the parked message"
                                 );
@@ -963,7 +1076,7 @@ pub(crate) async fn run_external_agent_mode(
                             );
                         }
                     }
-                    maybe_event = event_rx.recv() => {
+                    maybe_event = event_rx.recv(), if event_channel_open => {
                         match maybe_event {
                             Some(event) => {
                                 let (event_thread_id, event_turn_id, event) = event.into_scope();
@@ -1306,38 +1419,93 @@ pub(crate) async fn run_external_agent_mode(
                                                 reason,
                                                 turns_in_round,
                                             } => {
-                                                // A backend-started round
-                                                // observed from idle died on
-                                                // a fatal error before any
-                                                // turn ran: fail honestly,
-                                                // like the primary loop.
-                                                stats.rounds = round;
-                                                slog(&session_log, |l| {
-                                                    l.error(&format!(
-                                                        "External agent round failed before any turn completed while observed from idle: {reason}"
-                                                    ))
-                                                });
-                                                record_external_round_inline(
-                                                    &session_log,
-                                                    persist_model_responses_inline,
-                                                    round,
-                                                    turns_in_round,
-                                                );
-                                                bus.send(AppEvent::RoundComplete {
-                                                    session_id: live_session_id.clone(),
-                                                    round,
-                                                    turns_in_round,
-                                                    native_message_count: None,
-                                                    project_root: round_session_root.clone(),
-                                                });
-                                                bus.send(AppEvent::TaskComplete {
-                                                    session_id: live_session_id.clone(),
-                                                    reason: reason.clone(),
-                                                    summary: None,
-                                                    outcome: crate::event::TaskOutcome::Failed,
-                                                });
-                                                stats.terminal_outcome = Some(reason);
-                                                break 'outer;
+                                                if let Some(park) = limit_park
+                                                    .as_ref()
+                                                    .filter(|park| park.pending.is_some())
+                                                {
+                                                    // Park-then-die
+                                                    // reconciliation
+                                                    // (2026-08-01 specimen
+                                                    // e883a2db): this failed
+                                                    // spontaneous round is
+                                                    // usually the dying
+                                                    // backend's death rattle
+                                                    // from the very
+                                                    // rejection that armed
+                                                    // the park seconds
+                                                    // earlier — breaking
+                                                    // here destroyed the
+                                                    // in-memory wake while
+                                                    // the durable meta kept
+                                                    // advertising owed work.
+                                                    // The armed park with
+                                                    // pending outranks the
+                                                    // terminal: stay
+                                                    // resident, roll the
+                                                    // round back like the
+                                                    // limit arm, restore the
+                                                    // waiting status the
+                                                    // round's "running"
+                                                    // claim overwrote.
+                                                    let line =
+                                                        park_holds_through_terminal_line(
+                                                            park.kind,
+                                                            "the observed round failed before any turn completed",
+                                                            &reason,
+                                                        );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
+                                                    emit_external_turn_status(
+                                                        &bus,
+                                                        &autonomy,
+                                                        live_session_id.as_deref(),
+                                                        round,
+                                                        park.kind.waiting_turn_status(),
+                                                        park.kind
+                                                            .waiting_turn_detail(agent.name()),
+                                                    )
+                                                    .await;
+                                                    round = round.saturating_sub(1);
+                                                } else {
+                                                    // A backend-started round
+                                                    // observed from idle died on
+                                                    // a fatal error before any
+                                                    // turn ran: fail honestly,
+                                                    // like the primary loop.
+                                                    stats.rounds = round;
+                                                    slog(&session_log, |l| {
+                                                        l.error(&format!(
+                                                            "External agent round failed before any turn completed while observed from idle: {reason}"
+                                                        ))
+                                                    });
+                                                    record_external_round_inline(
+                                                        &session_log,
+                                                        persist_model_responses_inline,
+                                                        round,
+                                                        turns_in_round,
+                                                    );
+                                                    bus.send(AppEvent::RoundComplete {
+                                                        session_id: live_session_id.clone(),
+                                                        round,
+                                                        turns_in_round,
+                                                        native_message_count: None,
+                                                        project_root: round_session_root.clone(),
+                                                    });
+                                                    bus.send(AppEvent::TaskComplete {
+                                                        session_id: live_session_id.clone(),
+                                                        reason: reason.clone(),
+                                                        summary: None,
+                                                        outcome: crate::event::TaskOutcome::Failed,
+                                                    });
+                                                    stats.terminal_outcome = Some(reason);
+                                                    break 'outer;
+                                                }
                                             }
                                             DrainOutcome::TurnCompleted {
                                                 message,
@@ -1416,7 +1584,7 @@ pub(crate) async fn run_external_agent_mode(
                                                         RATE_LIMIT_RESTART_CAUSE,
                                                         turn_had_started,
                                                     );
-                                                let (mut park, park_line) =
+                                                let (mut park, mut park_line) =
                                                     backend_started_limit_park(
                                                         resets_at_epoch,
                                                         tokio::time::Instant::now(),
@@ -1425,6 +1593,25 @@ pub(crate) async fn run_external_agent_mode(
                                                         limit_park_jitter_secs(),
                                                         turn_had_started,
                                                     );
+                                                // A rejection landing while
+                                                // already parked (the death
+                                                // rattle held by the
+                                                // reconciliation above)
+                                                // re-arms with a fresh wake
+                                                // clock but must not
+                                                // clobber the owed pending
+                                                // — restate the line with
+                                                // the truthful pending-ness.
+                                                if inherit_owed_pending(
+                                                    limit_park.take(),
+                                                    &mut park,
+                                                ) {
+                                                    park_line = limit_park_log_line(
+                                                        resets_at_epoch,
+                                                        crate::session_activity::epoch_seconds(),
+                                                        true,
+                                                    );
+                                                }
                                                 if let (Some(pending), Some(addendum)) =
                                                     (park.pending.as_mut(), died_addendum)
                                                 {
@@ -1444,11 +1631,8 @@ pub(crate) async fn run_external_agent_mode(
                                                     &autonomy,
                                                     live_session_id.as_deref(),
                                                     round.saturating_add(1),
-                                                    "waiting-rate-limit",
-                                                    format!(
-                                                        "{} rate-limited; parked until the limit resets",
-                                                        agent.name()
-                                                    ),
+                                                    park.kind.waiting_turn_status(),
+                                                    park.kind.waiting_turn_detail(agent.name()),
                                                 )
                                                 .await;
                                                 limit_park = Some(park);
@@ -1611,15 +1795,38 @@ pub(crate) async fn run_external_agent_mode(
                                                         SERVICE_RECOVERY_RESTART_CAUSE,
                                                         turn_had_started,
                                                     );
-                                                let (mut park, park_line) =
+                                                let error_park_jitter =
+                                                    error_park_jitter_secs();
+                                                let (mut park, mut park_line) =
                                                     transient_round_death_error_park(
                                                         &reason,
                                                         tokio::time::Instant::now(),
                                                         error_park_streak,
-                                                        error_park_jitter_secs(),
+                                                        error_park_jitter,
                                                         turn_had_started,
                                                         None,
                                                     );
+                                                // A round death landing
+                                                // while already parked
+                                                // re-arms on the recovery
+                                                // schedule but must not
+                                                // clobber the owed pending
+                                                // — restate the line with
+                                                // the truthful pending-ness.
+                                                if inherit_owed_pending(
+                                                    limit_park.take(),
+                                                    &mut park,
+                                                ) {
+                                                    park_line = error_park_log_line(
+                                                        &reason,
+                                                        error_park_streak,
+                                                        error_park_delay(
+                                                            error_park_streak,
+                                                            error_park_jitter,
+                                                        ),
+                                                        true,
+                                                    );
+                                                }
                                                 if let (Some(pending), Some(addendum)) =
                                                     (park.pending.as_mut(), died_addendum)
                                                 {
@@ -1639,11 +1846,8 @@ pub(crate) async fn run_external_agent_mode(
                                                     &autonomy,
                                                     live_session_id.as_deref(),
                                                     round.saturating_add(1),
-                                                    "waiting-service-recovery",
-                                                    format!(
-                                                        "{} waiting out a temporary service condition; parked for recovery",
-                                                        agent.name()
-                                                    ),
+                                                    park.kind.waiting_turn_status(),
+                                                    park.kind.waiting_turn_detail(agent.name()),
                                                 )
                                                 .await;
                                                 limit_park = Some(park);
@@ -1746,33 +1950,109 @@ pub(crate) async fn run_external_agent_mode(
                                                 });
                                             }
                                             DrainOutcome::Terminated { reason, exit_code } => {
-                                                stats.rounds = round;
-                                                slog(&session_log, |l| {
-                                                    l.info(&format!(
-                                                        "External agent terminated while observed from idle: {} (exit code: {:?})",
-                                                        reason,
-                                                        exit_code
-                                                    ))
-                                                });
-                                                bus.send(AppEvent::TaskComplete {
-                                                    session_id: live_session_id.clone(),
-                                                    reason: reason.clone(),
-                                                    summary: stats.last_response.clone(),
-                                                    outcome: crate::event::TaskOutcome::Failed,
-                                                });
-                                                stats.terminal_outcome = Some(reason);
-                                                break 'outer;
+                                                if let Some(park) = limit_park
+                                                    .as_ref()
+                                                    .filter(|park| park.pending.is_some())
+                                                {
+                                                    // Park-then-die: the
+                                                    // process dying while a
+                                                    // park owes work is the
+                                                    // expected shape of a
+                                                    // limit that killed its
+                                                    // backend — the park
+                                                    // outranks the terminal
+                                                    // and the wake respawns
+                                                    // before delivering.
+                                                    let line =
+                                                        park_holds_through_terminal_line(
+                                                            park.kind,
+                                                            "the backend process terminated",
+                                                            &reason,
+                                                        );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
+                                                    emit_external_turn_status(
+                                                        &bus,
+                                                        &autonomy,
+                                                        live_session_id.as_deref(),
+                                                        round,
+                                                        park.kind.waiting_turn_status(),
+                                                        park.kind
+                                                            .waiting_turn_detail(agent.name()),
+                                                    )
+                                                    .await;
+                                                    round = round.saturating_sub(1);
+                                                } else {
+                                                    stats.rounds = round;
+                                                    slog(&session_log, |l| {
+                                                        l.info(&format!(
+                                                            "External agent terminated while observed from idle: {} (exit code: {:?})",
+                                                            reason,
+                                                            exit_code
+                                                        ))
+                                                    });
+                                                    bus.send(AppEvent::TaskComplete {
+                                                        session_id: live_session_id.clone(),
+                                                        reason: reason.clone(),
+                                                        summary: stats.last_response.clone(),
+                                                        outcome: crate::event::TaskOutcome::Failed,
+                                                    });
+                                                    stats.terminal_outcome = Some(reason);
+                                                    break 'outer;
+                                                }
                                             }
                                             DrainOutcome::ChannelClosed => {
-                                                slog(&session_log, |l| {
-                                                    l.info(
-                                                        "External agent event channel closed while observed from idle",
+                                                if let Some(park) = limit_park
+                                                    .as_ref()
+                                                    .filter(|park| park.pending.is_some())
+                                                {
+                                                    // Park-then-die: gate
+                                                    // the closed channel and
+                                                    // stay resident (see the
+                                                    // idle recv arm's twin).
+                                                    event_channel_open = false;
+                                                    let line =
+                                                        park_holds_through_terminal_line(
+                                                            park.kind,
+                                                            "the backend event channel closed",
+                                                            "",
+                                                        );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
+                                                    emit_external_turn_status(
+                                                        &bus,
+                                                        &autonomy,
+                                                        live_session_id.as_deref(),
+                                                        round,
+                                                        park.kind.waiting_turn_status(),
+                                                        park.kind
+                                                            .waiting_turn_detail(agent.name()),
                                                     )
-                                                });
-                                                stats.terminal_outcome = Some(
-                                                    "external agent event channel closed".to_string(),
-                                                );
-                                                break 'outer;
+                                                    .await;
+                                                    round = round.saturating_sub(1);
+                                                } else {
+                                                    slog(&session_log, |l| {
+                                                        l.info(
+                                                            "External agent event channel closed while observed from idle",
+                                                        )
+                                                    });
+                                                    stats.terminal_outcome = Some(
+                                                        "external agent event channel closed".to_string(),
+                                                    );
+                                                    break 'outer;
+                                                }
                                             }
                                         }
                                     }
@@ -1780,12 +2060,40 @@ pub(crate) async fn run_external_agent_mode(
                                 continue;
                             }
                             None => {
-                                slog(&session_log, |l| {
-                                    l.info("External agent event channel closed, exiting")
-                                });
-                                stats.terminal_outcome =
-                                    Some("external agent event channel closed".to_string());
-                                break 'outer;
+                                if let Some(park) =
+                                    limit_park.as_ref().filter(|park| park.pending.is_some())
+                                {
+                                    // Park-then-die reconciliation: the
+                                    // dead backend's channel closing is
+                                    // the death rattle's quiet sibling —
+                                    // the armed park with owed work
+                                    // outranks it. Gate the closed
+                                    // channel (an ungated recv() would
+                                    // spin this select) and stay
+                                    // resident; the wake respawns the
+                                    // backend before delivering.
+                                    event_channel_open = false;
+                                    let line = park_holds_through_terminal_line(
+                                        park.kind,
+                                        "the backend event channel closed",
+                                        "",
+                                    );
+                                    slog(&session_log, |l| l.warn(&line));
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "warn".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: line,
+                                        turn: None,
+                                    });
+                                } else {
+                                    slog(&session_log, |l| {
+                                        l.info("External agent event channel closed, exiting")
+                                    });
+                                    stats.terminal_outcome =
+                                        Some("external agent event channel closed".to_string());
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -2229,11 +2537,13 @@ pub(crate) async fn run_external_agent_mode(
                                     );
                                     break 'outer;
                                 }
+                                event_channel_open = true;
                             }
                             Ok(_) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 slog(&session_log, |l| l.info("Event bus closed, exiting"));
+                                daemon_teardown_exit = true;
                                 stats.terminal_outcome = Some("event bus closed".to_string());
                                 break 'outer;
                             }
@@ -4714,6 +5024,66 @@ pub(crate) async fn run_external_agent_mode(
                 stats.terminal_outcome = Some("external agent event channel closed".to_string());
                 break;
             }
+        }
+    }
+
+    // Park-then-die reconciliation, the exit side: the loop is ending
+    // while a park is still ARMED (a deliberate stop, session removal,
+    // safeguards terminal, recovery-required, …). Consume the park
+    // honestly — surface the owed message as undelivered and clear the
+    // durable marker so the boot sweep never resurrects a deliberately
+    // ended session — and say so in the terminal outcome, so the summary
+    // never reads clean over stranded work. The one exception is the
+    // daemon-teardown exit (event bus closed): the daemon is dying, not
+    // this session's story — the marker survives as the boot
+    // auto-readopt trace, exactly like a hard daemon death that never
+    // reaches this line at all.
+    if let Some(park) = limit_park.take() {
+        let noun = park.kind.noun();
+        let detail = stats
+            .terminal_outcome
+            .clone()
+            .unwrap_or_else(|| "the session ended".to_string());
+        let had_pending = park.pending.is_some();
+        if daemon_teardown_exit {
+            // The marker (and its owed pending) survives for the boot
+            // readopt pass; the meta write stays untouched and session_end
+            // refuses the clean completion over it.
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "{noun} still armed at the daemon-teardown exit — the durable marker \
+                     survives for the boot readopt pass"
+                ))
+            });
+            if had_pending {
+                stats.terminal_outcome = Some(format!(
+                    "{detail}; a {} with pending work was still armed — its durable \
+                     marker survives for the boot readopt pass",
+                    noun.to_lowercase()
+                ));
+            }
+        } else {
+            if let Some(pending) = park.pending {
+                emit_follow_up_status(
+                    &bus,
+                    live_session_id.as_deref(),
+                    &pending.follow_up_id,
+                    Some(&pending.text),
+                    "failed",
+                    Some(&format!(
+                        "{noun} was still armed when the session ended ({detail})"
+                    )),
+                );
+                stats.terminal_outcome = Some(format!(
+                    "{detail}; a {} with pending work was still armed at session end \
+                     (its owed message was surfaced as undelivered)",
+                    noun.to_lowercase()
+                ));
+            }
+            slog(&session_log, |l| l.set_limit_park(None));
+            slog(&session_log, |l| {
+                l.info(&format!("{noun} cancelled — {detail}"))
+            });
         }
     }
 

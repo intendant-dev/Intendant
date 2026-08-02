@@ -1509,8 +1509,18 @@ const LIMIT_PARK_MAX_SECS: u64 = 6 * 3600;
 
 /// Random park jitter in the fleet-safe band. Tests inject their own
 /// value into [`limit_park_delay`] instead of calling this.
+/// `INTENDANT_LIMIT_PARK_JITTER_SECS` overrides the draw (clamped to the
+/// band's max) — the e2e suite pins the park's wake-and-resume arc with
+/// it, and an operator can flatten the fleet-safety jitter deliberately;
+/// an unparsable value keeps the random draw.
 pub(crate) fn limit_park_jitter_secs() -> u64 {
     use rand::Rng;
+    if let Some(forced) = std::env::var("INTENDANT_LIMIT_PARK_JITTER_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+    {
+        return forced.min(LIMIT_PARK_JITTER_MAX_SECS);
+    }
     rand::thread_rng().gen_range(LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS)
 }
 
@@ -1584,6 +1594,79 @@ impl ParkKind {
                 "waiting out a service condition; delivers when the recovery pause elapses"
             }
         }
+    }
+
+    /// The turn-status name emitted while this park kind holds the lane
+    /// (the dashboard's waiting chip) — the arm sites and the
+    /// held-through-terminal re-emits share it, so a hold can restore
+    /// the exact status the observed round's "running" claim overwrote.
+    pub(crate) fn waiting_turn_status(&self) -> &'static str {
+        match self {
+            ParkKind::ProviderLimit => "waiting-rate-limit",
+            ParkKind::ServiceCondition => "waiting-service-recovery",
+        }
+    }
+
+    /// The turn-status detail line paired with
+    /// [`Self::waiting_turn_status`].
+    pub(crate) fn waiting_turn_detail(&self, agent_name: &str) -> String {
+        match self {
+            ParkKind::ProviderLimit => {
+                format!("{agent_name} rate-limited; parked until the limit resets")
+            }
+            ParkKind::ServiceCondition => format!(
+                "{agent_name} waiting out a temporary service condition; parked for recovery"
+            ),
+        }
+    }
+}
+
+/// The honest log row when a terminal classification lands while a park
+/// with owed work is armed and the park outranks it — the park-then-die
+/// reconciliation (2026-08-01 specimen e883a2db: a five_hour rejection
+/// armed the park at 22:34:30.897 and the dying backend's exit was
+/// classified a fatal round failure 1.5s later, whose `break` destroyed
+/// the in-memory wake while the durable meta kept advertising
+/// `has_pending: true` — a silent forever-strand). The classification is
+/// usually the same rejection's death rattle; holding residence keeps
+/// the armed wake, which respawns a confirmed-dead backend before
+/// delivering.
+pub(crate) fn park_holds_through_terminal_line(
+    kind: ParkKind,
+    classification: &str,
+    reason: &str,
+) -> String {
+    let reason = reason.trim();
+    let cause = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+    format!(
+        "{} holds through a backend terminal while parked — {classification}{cause}; \
+         the session stays resident and resumes at the park's wake",
+        kind.noun()
+    )
+}
+
+/// Re-arming a park over an already-armed one (a second rejection or
+/// round death while parked — the dying backend's death-rattle class)
+/// must not clobber the owed work: while parked nothing delivers user
+/// input, so the previous park's pending is still the owed re-send and
+/// strictly outranks a replacement arm's synthesized resume nudge. The
+/// fresh wake clock always wins; only the pending is preserved. Returns
+/// whether an owed pending carried over, so the caller can re-state the
+/// arm line with the truthful pending-ness.
+pub(crate) fn inherit_owed_pending(
+    previous: Option<LimitParkState>,
+    park: &mut LimitParkState,
+) -> bool {
+    match previous.and_then(|prev| prev.pending) {
+        Some(owed) => {
+            park.pending = Some(owed);
+            true
+        }
+        None => false,
     }
 }
 
@@ -2280,6 +2363,121 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The park-then-die hold line: honest, greppable, and truthful with
+    /// and without a carried reason.
+    #[test]
+    fn park_holds_through_terminal_line_is_honest() {
+        let line = park_holds_through_terminal_line(
+            ParkKind::ProviderLimit,
+            "the observed round failed before any turn completed",
+            "You've hit your session limit · resets 1:40am",
+        );
+        assert_eq!(
+            line,
+            "Rate-limit park holds through a backend terminal while parked — the observed \
+             round failed before any turn completed (You've hit your session limit · resets \
+             1:40am); the session stays resident and resumes at the park's wake"
+        );
+        let quiet = park_holds_through_terminal_line(
+            ParkKind::ServiceCondition,
+            "the backend event channel closed",
+            "",
+        );
+        assert_eq!(
+            quiet,
+            "Service-recovery pause holds through a backend terminal while parked — the \
+             backend event channel closed; the session stays resident and resumes at the \
+             park's wake"
+        );
+    }
+
+    /// Re-arming over an armed park inherits the owed pending: while
+    /// parked nothing delivers user input, so the earlier park's pending
+    /// is still the owed work and outranks a replacement arm's
+    /// synthesized nudge (or its absence).
+    #[test]
+    fn inherit_owed_pending_preserves_the_owed_message() {
+        let owed = FollowUpMessage::text("the owed re-send".to_string())
+            .with_follow_up_id(Some("f-owed".to_string()));
+        let previous = LimitParkState {
+            resume_at: tokio::time::Instant::now(),
+            pending: Some(owed),
+            kind: ParkKind::ProviderLimit,
+        };
+
+        // Replacement armed with only a synthesized nudge: the owed
+        // message wins.
+        let (mut park, _) = backend_started_limit_park(
+            Some(2_000_000_000),
+            tokio::time::Instant::now(),
+            1_999_999_000,
+            1,
+            0,
+            true,
+        );
+        assert!(park.pending.is_some(), "nudge-armed replacement");
+        assert!(inherit_owed_pending(Some(previous), &mut park));
+        let pending = park.pending.expect("owed pending inherited");
+        assert_eq!(pending.text, "the owed re-send");
+        assert_eq!(pending.follow_up_id.as_deref(), Some("f-owed"));
+
+        // No previous park: the replacement keeps its own pending.
+        let (mut park, _) = backend_started_limit_park(
+            Some(2_000_000_000),
+            tokio::time::Instant::now(),
+            1_999_999_000,
+            1,
+            0,
+            true,
+        );
+        assert!(!inherit_owed_pending(None, &mut park));
+        assert_eq!(
+            park.pending.map(|p| p.text),
+            Some(LIMIT_MIDTURN_CONTINUATION_TEXT.to_string())
+        );
+
+        // Previous park without pending: nothing carries over, the
+        // pending-less replacement stays pending-less.
+        let pending_less = LimitParkState {
+            resume_at: tokio::time::Instant::now(),
+            pending: None,
+            kind: ParkKind::ProviderLimit,
+        };
+        let (mut park, _) = backend_started_limit_park(
+            Some(2_000_000_000),
+            tokio::time::Instant::now(),
+            1_999_999_000,
+            1,
+            0,
+            false,
+        );
+        assert!(park.pending.is_none());
+        assert!(!inherit_owed_pending(Some(pending_less), &mut park));
+        assert!(park.pending.is_none());
+    }
+
+    /// The waiting-status vocabulary is shared by the arm sites and the
+    /// held-through-terminal re-emits — one source, no drift.
+    #[test]
+    fn waiting_turn_status_vocabulary_is_pinned() {
+        assert_eq!(
+            ParkKind::ProviderLimit.waiting_turn_status(),
+            "waiting-rate-limit"
+        );
+        assert_eq!(
+            ParkKind::ServiceCondition.waiting_turn_status(),
+            "waiting-service-recovery"
+        );
+        assert_eq!(
+            ParkKind::ProviderLimit.waiting_turn_detail("claude-code"),
+            "claude-code rate-limited; parked until the limit resets"
+        );
+        assert_eq!(
+            ParkKind::ServiceCondition.waiting_turn_detail("claude-code"),
+            "claude-code waiting out a temporary service condition; parked for recovery"
+        );
+    }
 
     /// THE no-auto-re-execution pin for the died-with-restart class: the
     /// marking seam flips registry records and publishes SURFACES only —
