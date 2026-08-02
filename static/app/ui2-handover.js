@@ -151,6 +151,12 @@
       honesty.textContent = update.honesty;
       mount.appendChild(honesty);
     }
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    const bounds = document.createElement('div');
+    bounds.className = 'update-lane-note';
+    bounds.textContent = 'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.';
+    mount.appendChild(bounds);
     mount.appendChild(handoverUpdateActions(body, disk));
   }
 
@@ -328,6 +334,12 @@
         `provenance unreadable${update.probe_error ? ` (${update.probe_error})` : ''}`
       ));
     }
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    const bounds = document.createElement('div');
+    bounds.className = 'handover-update-note';
+    bounds.textContent = 'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.';
+    el.appendChild(bounds);
     if (body.swap_result && body.swap_result.ok === false && !updateAction.note) {
       const failed = document.createElement('div');
       failed.className = 'handover-update-note';
