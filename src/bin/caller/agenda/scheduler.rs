@@ -2258,7 +2258,13 @@ mod tests {
         // `notified().await` registration.
         tokio::task::yield_now().await;
         handle
-            .apply(AgendaCommand::ApproveEffect { id: item_id, digest }, owner())
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item_id,
+                    digest,
+                },
+                owner(),
+            )
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(60), waiter)
             .await
