@@ -724,8 +724,9 @@ impl OutputHub {
 }
 
 /// A single live PTY-backed shell session. Callers share it via `Arc`;
-/// the blocking reader keeps only a `Weak` reference so it cannot pin a
-/// killed ConPTY whose output pipe remains open until the master drops.
+/// the blocking reader and child-exit waiter keep only `Weak` references so
+/// neither can pin a killed ConPTY whose output pipe remains open until the
+/// master drops.
 pub struct PtySession {
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
@@ -853,12 +854,33 @@ impl PtySession {
             shared: std::sync::atomic::AtomicBool::new(shared),
         });
 
-        // Reader: dedicated OS thread (portable_pty's reader is blocking).
-        // Copies bytes into scrollback and fans out to listeners.
-        let session_clone = Arc::downgrade(&session);
-        std::thread::spawn(move || {
-            Self::reader_loop(session_clone, reader, child);
-        });
+        // portable_pty's reader and child wait are both blocking. On Windows,
+        // ConPTY can retain the output pipe after an orderly shell exit while
+        // this session still owns the master handle, so waiting for EOF before
+        // waiting for the child loses the exit forever. Monitor the child on a
+        // separate thread there; both threads are weak owners, so Drop can
+        // still kill the child and release the master. Unix keeps the original
+        // drain-before-exit ordering, where PTY EOF is reliable and guarantees
+        // all final output precedes Exited.
+        #[cfg(windows)]
+        {
+            let reader_session = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::reader_loop(&reader_session, reader);
+            });
+            let exit_session = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::wait_for_child(exit_session, child);
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let session_clone = Arc::downgrade(&session);
+            std::thread::spawn(move || {
+                Self::reader_loop(&session_clone, reader);
+                Self::wait_for_child(session_clone, child);
+            });
+        }
 
         Ok(session)
     }
@@ -973,11 +995,7 @@ impl PtySession {
         }
     }
 
-    fn reader_loop(
-        session: Weak<Self>,
-        mut reader: Box<dyn Read + Send>,
-        mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    ) {
+    fn reader_loop(session: &Weak<Self>, mut reader: Box<dyn Read + Send>) {
         // 64 KiB reads: bulk shell output at 4 KiB paid 16× the syscalls,
         // and the per-read Vec was pure overhead — `fan_out` copies into
         // each listener's queue itself.
@@ -1012,9 +1030,11 @@ impl PtySession {
                 Err(_) => break,
             }
         }
+    }
 
-        // Shell exited. Capture exit status if available and notify
-        // listeners so the UI can mark the session as closed.
+    /// Wait for the shell process independently of ConPTY output EOF and
+    /// notify listeners exactly once when it exits.
+    fn wait_for_child(session: Weak<Self>, mut child: Box<dyn portable_pty::Child + Send + Sync>) {
         let status = match child.wait() {
             Ok(s) => s.exit_code() as i32,
             Err(_) => -1,
