@@ -429,16 +429,10 @@ pub(crate) async fn peers_add(
             let mut persisted = false;
             let mut config_path = None;
             if req.persist {
-                let Some(project_root) = project_root else {
-                    return (
-                        500,
-                        serde_json::json!({
-                            "error": "peer added for this run, but project root is unavailable for persistence"
-                        })
-                        .to_string(),
-                    );
-                };
-                match persist_manual_peer(project_root, &req, label_override) {
+                // Projectless daemons (the bundled app) persist into the
+                // settings-root config that boot hydration reads.
+                let persist_root = crate::project::daemon_config_root(project_root);
+                match persist_manual_peer(&persist_root, &req, label_override) {
                     Ok(path) => {
                         persisted = true;
                         config_path = Some(path.to_string_lossy().into_owned());
@@ -677,13 +671,10 @@ pub(crate) async fn peers_pairing_request_access_poll(
             );
         }
     };
-    let Some(project_root) = project_root else {
-        return (
-            503,
-            serde_json::json!({"error": "project root not available"}).to_string(),
-        );
-    };
-    let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
+    // Projectless daemons (the bundled app) write the daemon-scope
+    // config at the settings root — the same file boot hydration reads.
+    let config_root = crate::project::daemon_config_root(project_root);
+    let mut project = match crate::project::Project::from_root(config_root) {
         Ok(project) => project,
         Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
     };
@@ -918,12 +909,6 @@ pub(crate) async fn peers_pairing_join(
             serde_json::json!({"error": "invite is required"}).to_string(),
         );
     }
-    let Some(project_root) = project_root else {
-        return (
-            503,
-            serde_json::json!({"error": "project root not available"}).to_string(),
-        );
-    };
 
     let invite = match crate::peer::pairing::decode_invite(req.invite.trim()) {
         Ok(invite) => invite,
@@ -941,7 +926,10 @@ pub(crate) async fn peers_pairing_join(
         .map(|fp| vec![fp])
         .unwrap_or_default();
 
-    let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
+    // Projectless daemons (the bundled app) write the daemon-scope
+    // config at the settings root — the same file boot hydration reads.
+    let config_root = crate::project::daemon_config_root(project_root);
+    let mut project = match crate::project::Project::from_root(config_root) {
         Ok(project) => project,
         Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
     };
@@ -3023,6 +3011,42 @@ mod tests {
         assert_eq!(status, 400);
         assert!(response.contains("invalid peer invite encoding"));
         assert!(!response.contains("Config error"));
+    }
+
+    #[tokio::test]
+    async fn test_api_peers_pairing_join_projectless_daemon_reaches_invite_decode() {
+        // A projectless daemon (the bundled app's normal shape) must not
+        // refuse pairing with a "project root not available" 503: the
+        // daemon-scope config root fallback engages instead, so a bad
+        // invite fails as a bad invite. The write path itself is
+        // join_peer_invite's, covered with injected roots in peer::pairing.
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let body = serde_json::json!({"invite": "not an intendant invite"}).to_string();
+
+        let (status, response) = peers_pairing_join(&registry, None, &body).await;
+
+        assert_eq!(status, 400);
+        assert!(response.contains("invalid peer invite encoding"));
+        assert!(!response.contains("project root"));
+    }
+
+    #[tokio::test]
+    async fn test_api_peers_pairing_request_poll_projectless_daemon_resolves_settings_root() {
+        // Same policy on the doorbell-completion route: a missing project
+        // root resolves to the daemon settings root (hermetic under test —
+        // intendant_home's per-process test root), and the injected
+        // cert_dir holding no such request is the error the route must
+        // reach — not a 503.
+        let cert_dir = tempfile::TempDir::new().unwrap();
+        let body = serde_json::json!({"request_id": "req-zzzz"}).to_string();
+
+        let (status, response) =
+            peers_pairing_request_access_poll(None, None, cert_dir.path(), &body).await;
+
+        assert_eq!(status, 400);
+        assert!(response.contains("outgoing access request not found"));
+        assert!(!response.contains("project root"));
     }
 
     #[test]

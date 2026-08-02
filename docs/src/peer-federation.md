@@ -939,7 +939,11 @@ the connecting daemon:
 Joining from the dashboard writes or updates the local daemon's outbound
 `[[peer]]` entry in `intendant.toml`, stores the peer-issued client
 certificate/key in the local access cert store, and queues live registry
-registration so the daemon can connect without a restart.
+registration so the daemon can connect without a restart. On a projectless
+daemon (the bundled app's normal shape) the `[[peer]]` entry lands in the
+settings root's `intendant.toml` (`project::daemon_config_root`) — the
+same file boot hydration reads — so pairing is live *and* durable without
+the daemon ever having a project.
 
 The same flow is available from the CLI for headless peers or terminals:
 

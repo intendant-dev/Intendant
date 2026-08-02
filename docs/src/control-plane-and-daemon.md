@@ -348,6 +348,15 @@ shape for installed-app and service deployments, whose launch cwd (`$HOME`,
 `/Applications`, …) is an accident; CLI invocations keep cwd-as-project,
 which is correct for `intendant "task"` inside a repo.
 
+Daemon-scope state is exempt from that refusal. A projectless daemon loads
+its config from the settings root (`<state-root>/intendant.toml`), and the
+surfaces that *write* daemon-wide state resolve the same file through
+`project::daemon_config_root` — peer pairing (invite join, access-request
+completion) and manual peer persistence included — so pairing works and
+`[[peer]]` entries persist on the bundled app exactly as on a rooted
+daemon. Only project-scoped facilities (watcher, sandbox cwd scope,
+default session project) stay off.
+
 Ctrl+C in this mode is handled by the global signal handler installed in `main`
 (it marks the session interrupted and exits 130); the daemon loop deliberately
 does not also listen for it, to avoid racing two handlers.
