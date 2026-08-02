@@ -669,6 +669,38 @@ mod tests {
         assert_eq!(asset.body, VAULT_KERNEL_JS.as_bytes());
     }
 
+    /// The update-copy honesty pin: the update chip, the Daemon update
+    /// panel, and the swap confirm affordance each state the same plain
+    /// sentence — installs alongside, running sessions finish
+    /// uninterrupted, the old version may keep running while they do.
+    /// Pinned against the served bytes (and the docs chapter) so a
+    /// rewording that drops the honest bounds fails here instead of
+    /// shipping.
+    #[test]
+    fn update_copy_honesty_sentence_is_pinned() {
+        const SENTENCE: &str = "The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.";
+        let served = APP_HTML.matches(SENTENCE).count();
+        assert_eq!(
+            served, 3,
+            "the served dashboard must state the update-copy honesty sentence \
+             on exactly its three surfaces (update chip, Daemon update panel, \
+             swap confirm) — found {served}; edit the static/app/ fragments \
+             and regenerate with `cargo run -p app-html-assembler`"
+        );
+        let chapter_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/src/web-dashboard.md");
+        let chapter = std::fs::read_to_string(chapter_path)
+            .expect("docs/src/web-dashboard.md is part of the checkout");
+        // The chapter hard-wraps prose, so match against the
+        // whitespace-normalized text.
+        let chapter_flat = chapter.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            chapter_flat.matches(SENTENCE).count(),
+            1,
+            "docs/src/web-dashboard.md must state the same update-copy \
+             honesty sentence exactly once"
+        );
+    }
+
     #[test]
     fn vault_kernel_override_serves_disk_sibling() {
         let dir = tempfile::tempdir().unwrap();
@@ -2364,5 +2396,29 @@ mod tests {
             APP_HTML.contains("if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);")
         );
         assert!(APP_HTML.contains("win.el.classList.toggle('session-window-closable', closable)"));
+    }
+
+    /// The engaged lens states its direction ON-canvas (live specimen
+    /// 2026-07-31: a returning viewer read the dim as "closable" — the
+    /// exact inversion): the chip's own text flips to name the bright
+    /// side, the grid legend restates it keyed on the same html
+    /// attribute as the dim (it can never outlive the lens), navigating
+    /// away from the Timeline grid disengages the look, and the
+    /// agenda-settled × title is phase-guarded — on a non-quiet window
+    /// it leads with the live pill label instead of reading as an
+    /// all-clear, re-derived on every phase application because the
+    /// phase-only fast path skips the wide render.
+    #[test]
+    fn closable_lens_states_its_direction() {
+        assert!(APP_HTML.contains("safe to close · rest dimmed"));
+        assert!(APP_HTML.contains("id=\"ui2-closable-lens-legend\""));
+        assert!(APP_HTML.contains(
+            "html.ui-v2[data-ui2-closable-lens=\"on\"] .ui2-closable-lens-legend { display: flex; }"
+        ));
+        assert!(APP_HTML.contains(
+            "— stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)"
+        ));
+        assert!(APP_HTML.contains("function ui2DisengageClosableLensOffSurface()"));
+        assert!(APP_HTML.contains("updateSessionWindowCloseTitle(win, sid);"));
     }
 }
