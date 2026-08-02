@@ -1231,7 +1231,8 @@ mod tests {
             );
         }
         assert_eq!(
-            app.matches("async function withSiblingLoopbackToken").count(),
+            app.matches("async function withSiblingLoopbackToken")
+                .count(),
             1,
             "one shared sibling-token helper in the served bundle"
         );
@@ -1512,7 +1513,11 @@ mod tests {
         // still names A itself — the fallback names the live spare
         // rather than leaving callers with "pending".
         assert_eq!(a.request_drain(None), DrainRequest::Entered);
-        assert_eq!(a.successor_port(), Some(7002), "a live spare beats 'pending'");
+        assert_eq!(
+            a.successor_port(),
+            Some(7002),
+            "a live spare beats 'pending'"
+        );
 
         // B acquires: the sidecar arm names it.
         assert!(b.poll_acquire(0));
@@ -1534,7 +1539,11 @@ mod tests {
         // C crashes: the sidecar still names it, but a dead boot is not
         // a doorway either (B stays draining, so nothing is eligible).
         drop(c);
-        assert_eq!(a.successor_port(), None, "a crashed successor is not a doorway");
+        assert_eq!(
+            a.successor_port(),
+            None,
+            "a crashed successor is not a doorway"
+        );
     }
 
     /// The Q4 pin: a drainer that observes its successor gone — crashed

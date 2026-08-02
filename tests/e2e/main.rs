@@ -7469,8 +7469,7 @@ async fn chained_drain_payload_resolves_only_live_non_draining_holder() {
     .await;
     let redirected_text = text_of(&redirected);
     assert!(
-        !redirected.status.success()
-            && redirected_text.contains(&format!("(:{})", daemon_c.port)),
+        !redirected.status.success() && redirected_text.contains(&format!("(:{})", daemon_c.port)),
         "the refusal pointer names C once C acquires: {redirected_text}"
     );
 
