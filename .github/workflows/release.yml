@@ -544,15 +544,14 @@ jobs:
           command -v gh > /dev/null || { echo "::error::gh CLI not found on the runner"; exit 1; }
           tag="$GITHUB_REF_NAME"
           zip_file="$(ls dist/Intendant-*.zip)"
-          # A semver pre-release identifier in the tag (v0.2.0-alpha.1)
-          # publishes as a GitHub prerelease: badged on the release page
-          # and never surfaced as the repository's "latest" release. The
-          # transparency log and the update lane's release check carry
-          # prereleases like any other tag build.
-          prerelease_flag=""
-          case "$tag" in
-            *-*) prerelease_flag="--prerelease" ;;
-          esac
+          # Alpha marking rides the version string (v0.2.0-alpha.1) and
+          # the notes banner below — deliberately NOT GitHub's prerelease
+          # flag. While the whole line is alpha there is no stable release
+          # to protect, and a prerelease can never be "latest", which
+          # would strand every /releases/latest consumer (the README
+          # install one-liner, the app's UpdateChecker) on an older tag
+          # (owner-ratified 2026-08-02, after exactly that happened).
+          # Reintroduce a prerelease lane only when a stable line exists.
           # Belt and suspenders behind the signing gate. A half-Apple
           # artifact never publishes; with the Apple lane engaged, neither
           # does an unsigned one. With the Apple lane dormant (lane D),
@@ -591,10 +590,10 @@ jobs:
             signing_note="This alpha is deliberately not Apple-signed (no Developer ID): the app archive keeps its explicit \`-unsigned-dev\` suffix and Gatekeeper will warn on first open. Authenticity rides the detached PGP signatures and the public transparency log — verify before opening."
           fi
           {
-            if [ -n "$prerelease_flag" ]; then
+            case "$tag" in *-*)
               echo "> **Alpha prerelease.** Intendant is early software: interfaces, trust ceremonies, and defaults are still moving. Run it where rough edges are acceptable, and verify what you download."
               echo
-            fi
+            ;; esac
             echo "Native macOS app: the \`macos-app/\` WKWebView wrapper bundling the release \`intendant\` and \`intendant-runtime\` binaries (Apple Silicon)."
             echo
             echo "$signing_note"
@@ -631,15 +630,11 @@ jobs:
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            # $prerelease_flag is deliberately unquoted: empty for final
-            # releases, one flag for pre-release tags.
-            # shellcheck disable=SC2086
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --title "Intendant $tag" \
-              --notes-file "$RUNNER_TEMP/release-notes.md" \
-              $prerelease_flag
+              --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
 
       # Commit what was just published to the public transparency log:
