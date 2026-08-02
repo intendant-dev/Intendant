@@ -938,9 +938,7 @@ pub fn advance_federated_ladder(
     if all_holders_healthy {
         let since = *state.healthy_since.get_or_insert(now);
         if state.rung != FederatedRung::Full {
-            if state.never_downgraded
-                && now.duration_since(since) >= FEDERATED_FAST_START_HEALTHY
-            {
+            if state.never_downgraded && now.duration_since(since) >= FEDERATED_FAST_START_HEALTHY {
                 // Fast start: no loss ever observed — jump straight to
                 // Full (dwell inapplicable; this is the first change).
                 state.rung = FederatedRung::Full;
