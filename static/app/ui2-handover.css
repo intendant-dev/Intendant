@@ -132,11 +132,23 @@ html.ui-v2 .handover-predecessor + .handover-predecessor {
    of a newer on-disk build, its provenance, and (macOS unsigned builds)
    the keychain/TCC honesty line. Distinct from the drain banner: an
    update waits; a drain is in motion. ─────────────────────────────── */
-html.ui-v2 .handover-update-chip {
+/* Both standing-fact chips stack in one bottom-corner dock — "a newer
+   release is logged" and "a newer build sits on disk" are distinct
+   facts and may both stand. The dock is click-transparent; the chips
+   are the interactive surfaces. */
+html.ui-v2 #handover-chip-dock {
   position: fixed;
   right: 14px;
   bottom: 14px;
   z-index: 239;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+html.ui-v2 .handover-update-chip {
+  pointer-events: auto;
   max-width: min(420px, calc(100vw - 32px));
   padding: 8px 12px;
   border-radius: 8px;
@@ -164,6 +176,14 @@ html.ui-v2 .handover-update-chip.collapsed {
 }
 html.ui-v2 .handover-update-chip.collapsed:hover {
   background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+/* The release-availability chip shares the family look; its accent
+   names the different fact (a logged release, not a build on disk). */
+html.ui-v2 .handover-release-chip {
+  border-color: var(--green, #58c08c);
+}
+html.ui-v2 .handover-release-chip.collapsed {
+  color: var(--green, #58c08c);
 }
 html.ui-v2 .handover-update-head {
   display: flex;

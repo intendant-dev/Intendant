@@ -59,15 +59,61 @@ on:
 permissions:
   contents: read
 
-# Don't pile up redundant runs on a fast-moving branch: a newer push to the
-# same ref cancels the in-flight run.
-concurrency:
-  group: cross-platform-tests-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
+  # A merge-queue rebuild changes the synthetic ref's base-SHA suffix even
+  # when it is still validating the same PR. Derive the PR number before the
+  # matrix so each platform can cancel its obsolete predecessor instead of
+  # letting an invisible stale job consume a fleet seat. Keep this parser on
+  # a hosted runner: it executes no checkout or repository code.
+  concurrency-key:
+    name: derive concurrency key
+    runs-on: ubuntu-latest
+    outputs:
+      key: ${{ steps.derive.outputs.key }}
+    steps:
+      - name: Derive stable PR key
+        id: derive
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              if [[ "$PULL_REQUEST_NUMBER" =~ ^[0-9]+$ ]]; then
+                key="pr-$PULL_REQUEST_NUMBER"
+              else
+                echo "::error::pull_request event did not carry a numeric PR number"
+                exit 1
+              fi
+              ;;
+            merge_group)
+              if [[ "$MERGE_GROUP_HEAD_REF" =~ /pr-([0-9]+)- ]]; then
+                key="pr-${BASH_REMATCH[1]}"
+              else
+                echo "::error::merge_group head ref did not contain a PR number"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::unsupported event for concurrency-key derivation: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "concurrency key: $key"
+
   test:
     name: test (${{ matrix.os }})
+    needs: concurrency-key
+    # Fail closed inside the required platform contexts if key derivation ever
+    # stops matching GitHub's event shape. A unique fallback prevents that
+    # diagnostic run from canceling an unrelated PR's job.
+    if: ${{ always() }}
+    concurrency:
+      group: cross-platform-tests-${{ needs.concurrency-key.outputs.key || github.run_id }}-${{ matrix.os }}
+      cancel-in-progress: true
     # Trust-based routing: our own refs (pushes, merge-queue refs, same-repo
     # PRs — every agent landing) run on the self-hosted fleet for speed;
     # fork PRs run on GitHub-hosted runners so external code never executes
@@ -124,6 +170,30 @@ jobs:
             cargo_debug: "0"
 
     steps:
+      - name: Validate concurrency key (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CI_CONCURRENCY_KEY: ${{ needs.concurrency-key.outputs.key }}
+          KEY_JOB_RESULT: ${{ needs.concurrency-key.result }}
+        run: |
+          if [ "$KEY_JOB_RESULT" != success ] || [ -z "$CI_CONCURRENCY_KEY" ]; then
+            echo "::error::stable concurrency-key derivation failed"
+            exit 1
+          fi
+
+      - name: Validate concurrency key (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CI_CONCURRENCY_KEY: ${{ needs.concurrency-key.outputs.key }}
+          KEY_JOB_RESULT: ${{ needs.concurrency-key.result }}
+        run: |
+          if ($env:KEY_JOB_RESULT -ne 'success' -or [string]::IsNullOrEmpty($env:CI_CONCURRENCY_KEY)) {
+            Write-Host '::error::stable concurrency-key derivation failed'
+            exit 1
+          }
+
       # Fleet preflight: a self-hosted box with a nearly-full disk produces
       # resource-kill "could not compile" failures with zero rustc
       # diagnostics that read as toolchain corruption (a 2026-07-06 ENOSPC
@@ -344,16 +414,23 @@ jobs:
       # against a native target.
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
-      - name: cargo test
+      # Keep each native command in its own step. On Windows, pwsh does not
+      # terminate a script merely because a native command exits non-zero;
+      # a later successful cargo invocation would overwrite $LASTEXITCODE and
+      # falsely green the step. Separate steps make Actions consume each exit
+      # status directly on every platform.
+      - name: cargo test (package bins)
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
-        run: |
-          cargo test -p intendant --bins --locked --target ${{ matrix.target }}
-          # Lib crates get their own invocation: a global `--bins` filter
-          # silently no-ops packages that have no bin targets, which is
-          # how the core/display lib tests went dark after extraction.
-          # owner-plane-core/-reducer carry the vendored D0-A kernel and
-          # its §D corpus conformance gate (170 stamped vectors).
-          cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
+        run: cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+
+      # Lib crates get their own invocation: a global `--bins` filter
+      # silently no-ops packages that have no bin targets, which is
+      # how the core/display lib tests went dark after extraction.
+      # owner-plane-core/-reducer carry the vendored D0-A kernel and
+      # its §D corpus conformance gate (170 stamped vectors).
+      - name: cargo test (library crates)
+        if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
       # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
       # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only

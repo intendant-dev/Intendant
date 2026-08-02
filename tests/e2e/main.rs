@@ -8199,6 +8199,129 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     assert_eq!(body["draining"], false);
 }
 
+/// The release-availability surface (the slice-6 amendment card): a
+/// releases-channel check that verifies a NEWER release promotes the
+/// fact onto the handover payload as the DISTINCT `release_update`
+/// block — the docked chip's state — with one-click honesty derived
+/// from the install flavor. The check rides the mock-gated
+/// `INTENDANT_UPDATE_LANE_LATEST_RELEASE` knob (the network
+/// transparency-log ritual is not payable in CI; the operator-run
+/// consumer dry-run exercises it against a live release), and the
+/// fixture is a stray binary — an unmanaged install — so the
+/// one_click=false + reason arm is the deterministic cross-platform
+/// assertion. The on-disk `update` block stays absent throughout:
+/// distinct facts, never conflated.
+#[tokio::test]
+async fn release_availability_check_promotes_the_distinct_chip_block() {
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // A stray watched file far from any checkout or app bundle: the
+    // unmanaged flavor. Never probed (the image never changes), so a
+    // plain file works on every platform.
+    let watched = rig.home.path().join("bin").join("intendant");
+    std::fs::create_dir_all(watched.parent().expect("bin dir")).expect("bin dir");
+    std::fs::write(&watched, b"stray").expect("stray watched file");
+
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_LATEST_RELEASE", "v9.9.9"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    // No check yet, no availability fact.
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(body["update_lane"]["flavor"], "unmanaged", "{body}");
+    assert!(
+        body.get("release_update").is_none(),
+        "no check yet, no availability block: {body}"
+    );
+
+    // The releases check is honest data on every install shape — the
+    // click starts it; the mock knob answers for the network ritual.
+    let check: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-lane/check"))
+        .json(&serde_json::json!({"channel": "releases"}))
+        .send()
+        .await
+        .expect("POST releases check")
+        .error_for_status()
+        .expect("check accepted")
+        .json()
+        .await
+        .expect("check body");
+    assert_eq!(check["started"], true, "{check}");
+
+    let body = poll_until(
+        "the release-availability block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body.get("release_update").is_some().then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let release = &body["release_update"];
+    assert_eq!(release["latest_tag"], "v9.9.9", "{body}");
+    assert_eq!(release["latest_version"], "9.9.9", "{body}");
+    assert_eq!(
+        release["one_click"], false,
+        "an unmanaged install is honest about the click: {body}"
+    );
+    assert!(
+        release["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no update lane"),
+        "the no-click arm carries the produce refusal's own reason: {body}"
+    );
+    assert!(
+        body.get("update").is_none(),
+        "the availability fact never fabricates an on-disk chip: {body}"
+    );
+    // The panel's own releases slot tells the same story.
+    assert_eq!(
+        body["update_lane"]["checks"]["releases"]["latest_tag"], "v9.9.9",
+        "{body}"
+    );
+    assert_eq!(
+        body["update_lane"]["checks"]["releases"]["behind"], 1,
+        "{body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Successor exec (the update-channels gate's ruled deferred question): the
 // CLI-launched daemon's own spawn → readiness → drain one-click, with the

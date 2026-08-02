@@ -438,7 +438,7 @@ the name key, `runner` is the fleet placement):
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
 - **`codeql.yml`** — build-free Rust + Actions analysis on relevant `main` pushes and a weekly cron (Mondays 09:00 UTC). Advisory and GitHub-hosted; never a merge-queue requirement.
 - **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages on push to `main`.
-- **`release.yml`** — macOS app build/sign/notarize/publish plus transparency-log hash submission on `v*` tags or manual dispatch. Tag releases fail closed without signing credentials; a manual credential-less run emits an explicitly `-unsigned-dev` dry-run artifact. Not a merge-queue requirement.
+- **`release.yml`** — release lane on `v*` tags or manual dispatch: macOS app build/sign/notarize/publish, standalone Linux worker binaries (x86_64 + aarch64, the Codex Cloud `INTENDANT_CLOUD_BINARY_URL` fast path, built on hosted runners), and transparency-log hash submission covering every asset. Tag releases fail closed without signing credentials; a manual credential-less run emits an explicitly `-unsigned-dev` dry-run artifact. Not a merge-queue requirement.
 
 The `tests/skills/` scenarios that need real API calls or a display (the live
 haiku claude-code-e2e, browser/Station probes, the peer smoke's `--browser` leg)

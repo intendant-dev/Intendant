@@ -561,6 +561,16 @@ pub(crate) fn enroll_rate_ok(source: &str, now_ms: u64) -> bool {
     true
 }
 
+/// Version of the whole home↔worker attachment contract: the enroll body,
+/// the WebSocket hello/proof ceremony, and the closed frame vocabulary in
+/// both directions. Additive changes (new optional fingerprint fields, new
+/// reply kinds the other end drops) do NOT bump it; bump it on any change
+/// an older binary on the other end would misread. This is the number a
+/// release-asset worker pins: `redeem_enrollment`'s refusal string is the
+/// exact text such a worker surfaces as its enrollment failure, so keep it
+/// actionable (it must name the environment repin).
+pub const ATTACHMENT_PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollRequest {
@@ -606,9 +616,9 @@ pub fn redeem_enrollment(
     request: &EnrollRequest,
     now_ms: u64,
 ) -> Result<EnrollResponse, String> {
-    if request.version != 1 {
+    if request.version != ATTACHMENT_PROTOCOL_VERSION {
         return Err(format!(
-            "unsupported enrollment request version {}",
+            "unsupported enrollment request version {}: this daemon speaks {ATTACHMENT_PROTOCOL_VERSION} — repin INTENDANT_CLOUD_BINARY_URL/_SHA256 to a matching release, or rebuild the worker from source",
             request.version
         ));
     }
@@ -678,7 +688,7 @@ pub fn redeem_enrollment(
         record_worker_json(lease_store_path, &task_id, worker);
     }
     Ok(EnrollResponse {
-        version: 1,
+        version: ATTACHMENT_PROTOCOL_VERSION,
         task_id,
         profile: profile.to_string(),
         client_cert_pem: cert_pem,
@@ -1308,7 +1318,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
     let enrollment_payload = serde_json::to_vec(&serde_json::json!({
-        "version": 1,
+        "version": ATTACHMENT_PROTOCOL_VERSION,
         "token": &token,
         "public_key_pem": key_pair.public_key_pem(),
         "worker": &worker_fingerprint,
@@ -1768,6 +1778,9 @@ fn collect_worker_fingerprint(now_ms: u64) -> crate::codex_cloud::WorkerFingerpr
             })
             .filter(|revision| !revision.is_empty()),
         rustc: None,
+        intendant_version: Some(crate::build_info::pkg_version().to_string()),
+        intendant_git_sha: Some(crate::build_info::git_sha().to_string()),
+        intendant_target: Some(crate::build_info::target_triple().to_string()),
         cpus: std::thread::available_parallelism()
             .ok()
             .map(|count| count.get() as u64),
@@ -2514,6 +2527,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn enrollment_refuses_version_drift_with_repin_guidance() {
+        // The version gate fires before any filesystem or token work, so
+        // placeholder roots prove no side effect can precede the refusal.
+        let err = redeem_enrollment(
+            Path::new("unused-cert-dir"),
+            Path::new("unused-lease-store"),
+            &EnrollRequest {
+                version: ATTACHMENT_PROTOCOL_VERSION + 1,
+                token: "irrelevant".into(),
+                public_key_pem: String::new(),
+                worker: None,
+            },
+            5_000,
+        )
+        .unwrap_err();
+        // A pinned release-asset worker surfaces this string as its
+        // enrollment failure: it must name both versions and the repin.
+        let refused = format!(
+            "unsupported enrollment request version {}",
+            ATTACHMENT_PROTOCOL_VERSION + 1
+        );
+        assert!(err.contains(&refused), "{err}");
+        assert!(
+            err.contains(&format!("speaks {ATTACHMENT_PROTOCOL_VERSION}")),
+            "{err}"
+        );
+        assert!(err.contains("INTENDANT_CLOUD_BINARY_URL"), "{err}");
+    }
+
+    #[test]
+    fn collected_fingerprint_carries_binary_provenance() {
+        let fingerprint = collect_worker_fingerprint(1_234);
+        assert_eq!(
+            fingerprint.intendant_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(fingerprint.intendant_git_sha.is_some());
+        assert!(fingerprint.intendant_target.is_some());
+    }
+
+    #[test]
+    fn fingerprint_parse_tolerates_newer_worker_fields() {
+        // An older home receiving a newer worker's enrollment fingerprint
+        // must record what it knows and ignore the rest — the additive
+        // half of the ATTACHMENT_PROTOCOL_VERSION contract.
+        let fingerprint =
+            serde_json::from_value::<crate::codex_cloud::WorkerFingerprint>(serde_json::json!({
+                "hostname": "worker-a",
+                "intendant_version": "9.9.9",
+                "field_from_the_future": {"nested": true},
+            }))
+            .expect("unknown fingerprint fields must never fail the parse");
+        assert_eq!(fingerprint.hostname.as_deref(), Some("worker-a"));
+        assert_eq!(fingerprint.intendant_version.as_deref(), Some("9.9.9"));
     }
 
     #[test]

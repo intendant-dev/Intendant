@@ -1076,7 +1076,8 @@ impl UpdateLane {
             .git(repo_root, &["rev-parse", "--verify", "origin/main"])
             .await?;
         let running_sha = running_sha_for_compare();
-        let range = format!("{running_sha}..origin/main");
+        let base_sha = compare_base_sha(&running_sha).to_string();
+        let range = format!("{base_sha}..origin/main");
         let max_count = format!("--max-count={BEHIND_COUNT_CAP}");
         let count = self
             .git(
@@ -1087,7 +1088,7 @@ impl UpdateLane {
             .map_err(|err| {
                 format!(
                     "could not count commits behind origin/main (is the running build's commit \
-                     {running_sha} in this checkout's history?): {err}"
+                     {base_sha} in this checkout's history?): {err}"
                 )
             })?;
         // `--format=%h %s` sidesteps decoration/color config entirely —
@@ -1125,6 +1126,21 @@ impl UpdateLane {
     }
 
     async fn consumer_check(self: &Arc<Self>) -> Result<CheckOutcome, String> {
+        if let Some(tag) = mock_latest_release_override() {
+            // Rig lane (PROVIDER=mock only): the scripted tag stands in
+            // for the network transparency-log ritual the e2e legs
+            // cannot pay for; the real ritual runs below everywhere
+            // else, and the operator-run consumer dry-run exercises it
+            // against a live release.
+            let tag = tag.trim().to_string();
+            let version = tag.trim_start_matches('v').to_string();
+            let newer = release_version_newer(&tag, crate::build_info::pkg_version());
+            return Ok(CheckOutcome::Consumer {
+                tag,
+                version,
+                newer,
+            });
+        }
         let report = self.verified_release(None).await?;
         let newer = release_version_newer(&report.version, crate::build_info::pkg_version());
         Ok(CheckOutcome::Consumer {
@@ -1508,6 +1524,78 @@ fn check_state_block(check: &CheckState) -> serde_json::Value {
     block
 }
 
+/// The release-availability fact for the docked chip lane (the
+/// slice-6 amendment card): `Some` exactly when the last
+/// releases-channel check VERIFIED a release newer than the running
+/// package version. Everything else — never checked, in flight with no
+/// prior verdict, an equal or older release, an uncomparable version
+/// pair, or a failed/unverifiable check — is honest absence: no chip
+/// renders, and the panel keeps the error/compare story. `one_click`
+/// says whether this install can take the release through the consumer
+/// produce lane on a click; when it cannot, the block carries the
+/// produce refusal's own reason and the chip deep-links to the panel
+/// instead. A distinct fact from the on-disk `update` block — the two
+/// may render side by side, never conflated.
+fn release_update_block(
+    flavor: &InstallFlavor,
+    releases: &CheckState,
+    macos: bool,
+    running_version: &str,
+) -> Option<serde_json::Value> {
+    let checked_at_ms = releases.checked_at_ms?;
+    let Some(Ok(CheckOutcome::Consumer {
+        tag,
+        version,
+        newer,
+    })) = releases.outcome.as_ref()
+    else {
+        return None;
+    };
+    if *newer != Some(true) {
+        return None;
+    }
+    let produce = produce_refusal(flavor, UpdateChannel::Releases, macos);
+    let mut block = serde_json::json!({
+        "latest_tag": tag,
+        "latest_version": version,
+        "running_version": running_version,
+        "checked_at_ms": checked_at_ms,
+        "one_click": produce.is_none(),
+    });
+    if let Some(reason) = produce {
+        block
+            .as_object_mut()
+            .expect("literal object")
+            .insert("reason".into(), reason.into());
+    }
+    Some(block)
+}
+
+impl UpdateLane {
+    /// The `release_update` block for the handover status payload —
+    /// derived from the releases-check slot at read time, absent unless
+    /// a verified newer release stands (the transport wrapper of
+    /// [`release_update_block`]).
+    pub(crate) fn release_update_status(&self) -> Option<serde_json::Value> {
+        let slots = self.check.lock().ok()?;
+        release_update_block(
+            &self.flavor,
+            &slots.releases,
+            cfg!(target_os = "macos"),
+            crate::build_info::pkg_version(),
+        )
+    }
+
+    /// Seed the releases-check slot directly — the block fold and the
+    /// payload ride are pinned without a network check.
+    #[cfg(test)]
+    fn seed_releases_check_for_test(&self, state: CheckState) {
+        if let Ok(mut slots) = self.check.lock() {
+            slots.releases = state;
+        }
+    }
+}
+
 /// Delete the staging tree on drop — a failed job never leaves
 /// unverified bytes behind. Success paths drop it too: the artifact has
 /// been installed; the staging copy is done.
@@ -1583,6 +1671,15 @@ pub(super) fn running_sha_for_compare() -> String {
     mock_running_sha_override().unwrap_or_else(|| crate::build_info::git_sha().to_string())
 }
 
+/// The git revision the behind compare runs against: a dirty-tree build
+/// stamps `<sha>-dirty` (build.rs provenance), which is not a revision
+/// `git rev-list` can resolve — the compare uses the underlying commit,
+/// and the `-dirty` marker stays a display fact on the running
+/// provenance everywhere it renders.
+pub(crate) fn compare_base_sha(running_sha: &str) -> &str {
+    running_sha.strip_suffix("-dirty").unwrap_or(running_sha)
+}
+
 /// Rig knob (PROVIDER=mock only): the "running" commit for the compare.
 /// The e2e fixture repos cannot contain the test binary's compiled-in
 /// sha, so the rig injects one that is; production always compares the
@@ -1594,6 +1691,23 @@ fn mock_running_sha_override() -> Option<String> {
     }
     eprintln!(
         "[update-lane] INTENDANT_UPDATE_LANE_RUNNING_SHA ignored: PROVIDER=mock is not set \
+         (the override is a mock-rig knob, never a production redirect)"
+    );
+    None
+}
+
+/// Rig knob (PROVIDER=mock only): the latest logged release tag for
+/// the releases-channel check, standing in for the network
+/// transparency-log ritual the e2e legs cannot pay for. Mirrors its
+/// sibling knobs' fail-closed shape; the real ritual is exercised by
+/// the operator-run consumer dry-run against a live release.
+fn mock_latest_release_override() -> Option<String> {
+    let tag = std::env::var("INTENDANT_UPDATE_LANE_LATEST_RELEASE").ok()?;
+    if std::env::var("PROVIDER").as_deref() == Ok("mock") {
+        return Some(tag);
+    }
+    eprintln!(
+        "[update-lane] INTENDANT_UPDATE_LANE_LATEST_RELEASE ignored: PROVIDER=mock is not set \
          (the override is a mock-rig knob, never a production redirect)"
     );
     None
@@ -1624,6 +1738,35 @@ pub(crate) fn update_rendezvous_url() -> Result<url::Url, String> {
 const BOOT_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(180);
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
+/// Which channels the standing cadence checks unprompted for this
+/// install (the panel's check click always may): the install's NATIVE
+/// lane under its shipped gate — a source checkout fetches the owner's
+/// own origin; a releases check reaches the rendezvous + GitHub, so it
+/// follows the hosted-verify tripwire posture and runs unprompted only
+/// when the owner has Connect configured — plus, on a source install,
+/// the same Connect-gated releases check as the release-AVAILABILITY
+/// tripwire (the slice-6 card), so the docked chip can say a newer
+/// release exists without the owner asking. An unmanaged install keeps
+/// its ruled posture: nothing to check unprompted — the panel says why
+/// instead. A check that fails is honest absence on the chip lane and
+/// an error on the panel; nothing here blocks boot or retries hot.
+pub(crate) fn auto_check_channels(
+    flavor: &InstallFlavor,
+    connect_configured: bool,
+) -> Vec<UpdateChannel> {
+    match flavor {
+        InstallFlavor::Source { .. } => {
+            let mut channels = vec![UpdateChannel::Dev];
+            if connect_configured {
+                channels.push(UpdateChannel::Releases);
+            }
+            channels
+        }
+        InstallFlavor::ConsumerApp { .. } if connect_configured => vec![UpdateChannel::Releases],
+        InstallFlavor::ConsumerApp { .. } | InstallFlavor::Unmanaged { .. } => vec![],
+    }
+}
+
 /// Wire the lane onto the runtime and start the gentle check cadence.
 /// Spawned beside the update watch; shares its watched-path resolution
 /// (and therefore its mock-rig override).
@@ -1637,22 +1780,9 @@ pub(crate) fn spawn_update_lane(runtime: &Arc<super::HandoverRuntime>) {
     tokio::spawn(async move {
         tokio::time::sleep(BOOT_CHECK_DELAY).await;
         loop {
-            // The AUTOMATIC cadence checks the install's NATIVE channel,
-            // following the hosted-verify tripwire's posture: a releases
-            // check reaches the rendezvous + GitHub, so it only runs
-            // unprompted when the owner has Connect configured; a source
-            // install fetches the owner's own origin. An unmanaged
-            // install has nothing to check unprompted — the panel says
-            // why instead. The panel's check click always may.
-            let auto = match &lane.flavor {
-                InstallFlavor::Source { .. } => true,
-                InstallFlavor::ConsumerApp { .. } => {
-                    crate::connect_rendezvous::status_snapshot().configured
-                }
-                InstallFlavor::Unmanaged { .. } => false,
-            };
-            if auto {
-                let _ = lane.request_check(None);
+            let connect = crate::connect_rendezvous::status_snapshot().configured;
+            for channel in auto_check_channels(&lane.flavor, connect) {
+                let _ = lane.request_check(Some(channel));
             }
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
@@ -1698,6 +1828,18 @@ mod tests {
 
         assert!(fold_source_check("fatal: bad revision", "0", "", "").is_err());
         assert!(fold_source_check("abcdef012345", "many", "", "").is_err());
+    }
+
+    /// The dirty-build auto-check fix (release-availability card): a
+    /// `<sha>-dirty` provenance stamp folds to its underlying commit
+    /// for the rev-list range — `<sha>-dirty..origin/main` is not a git
+    /// revision, and it used to fail every auto compare on a
+    /// dirty-tree build.
+    #[test]
+    fn dirty_build_stamp_folds_to_a_real_revision_for_the_compare() {
+        assert_eq!(compare_base_sha("3e4c79f8-dirty"), "3e4c79f8");
+        assert_eq!(compare_base_sha("3e4c79f8"), "3e4c79f8");
+        assert_eq!(compare_base_sha("unknown"), "unknown");
     }
 
     /// The shortlog fold is bounded in count and width, and the width
@@ -2136,6 +2278,197 @@ mod tests {
         assert!(
             refusal.contains("no source checkout or app bundle"),
             "a dev check on an unmanaged install refuses with the flavor's reason: {refusal}"
+        );
+    }
+
+    // ── The release-availability block (the docked chip's state) ──
+
+    fn consumer_state(tag: &str, version: &str, newer: Option<bool>) -> CheckState {
+        CheckState {
+            in_flight: false,
+            checked_at_ms: Some(1_000),
+            outcome: Some(Ok(CheckOutcome::Consumer {
+                tag: tag.to_string(),
+                version: version.to_string(),
+                newer,
+            })),
+        }
+    }
+
+    /// Slice-6 pin (the availability state block): `release_update`
+    /// exists exactly when a VERIFIED newer release stands — an equal
+    /// or older release, an uncomparable version pair, a failed check,
+    /// and a never-run check are all honest absence. Quiet failure
+    /// never fabricates a chip, and an unverifiable release never
+    /// becomes one (the panel carries the error instead).
+    #[test]
+    fn release_update_block_appears_only_for_a_verified_newer_release() {
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/Applications/Intendant.app"),
+        };
+        let block = release_update_block(
+            &consumer,
+            &consumer_state("v0.2.0", "0.2.0", Some(true)),
+            true,
+            "0.1.0",
+        )
+        .expect("a newer release renders the block");
+        assert_eq!(block["latest_tag"], "v0.2.0");
+        assert_eq!(block["latest_version"], "0.2.0");
+        assert_eq!(block["running_version"], "0.1.0");
+        assert_eq!(block["checked_at_ms"], 1_000);
+        assert_eq!(
+            block["one_click"], true,
+            "a macOS consumer app takes the release on one click"
+        );
+        assert!(block.get("reason").is_none(), "{block}");
+
+        assert!(
+            release_update_block(
+                &consumer,
+                &consumer_state("v0.1.0", "0.1.0", Some(false)),
+                true,
+                "0.1.0",
+            )
+            .is_none(),
+            "an equal release is not availability"
+        );
+        assert!(
+            release_update_block(
+                &consumer,
+                &consumer_state("nightly", "nightly", None),
+                true,
+                "0.1.0",
+            )
+            .is_none(),
+            "an uncomparable release never becomes a chip"
+        );
+        let failed = CheckState {
+            in_flight: false,
+            checked_at_ms: Some(1_000),
+            outcome: Some(Err("release verification FAILED: tree head".to_string())),
+        };
+        assert!(
+            release_update_block(&consumer, &failed, true, "0.1.0").is_none(),
+            "an unverifiable release never becomes a chip"
+        );
+        assert!(
+            release_update_block(&consumer, &CheckState::default(), true, "0.1.0").is_none(),
+            "never checked = no block"
+        );
+    }
+
+    /// Slice-6 pin (one-click honesty): where the consumer produce lane
+    /// cannot honor a click — a source install, a non-macOS consumer,
+    /// an unmanaged binary — the block says so with the produce
+    /// refusal's own reason, and the chip's button becomes the panel
+    /// deep-link.
+    #[test]
+    fn release_update_block_is_honest_about_the_one_click() {
+        let state = consumer_state("v9.9.9", "9.9.9", Some(true));
+        let source = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: false,
+        };
+        let block = release_update_block(&source, &state, true, "0.1.0").expect("fact renders");
+        assert_eq!(block["one_click"], false);
+        assert!(
+            block["reason"].as_str().unwrap().contains("Dev channel"),
+            "{block}"
+        );
+
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/apps/Intendant.app"),
+        };
+        let off_macos =
+            release_update_block(&consumer, &state, false, "0.1.0").expect("fact renders");
+        assert_eq!(off_macos["one_click"], false);
+        assert!(
+            off_macos["reason"]
+                .as_str()
+                .unwrap()
+                .contains("only the macOS app"),
+            "{off_macos}"
+        );
+
+        let unmanaged = InstallFlavor::Unmanaged {
+            reason: "stray binary".to_string(),
+        };
+        let block = release_update_block(&unmanaged, &state, true, "0.1.0").expect("fact renders");
+        assert_eq!(block["one_click"], false);
+        assert!(
+            block["reason"].as_str().unwrap().contains("no update lane"),
+            "{block}"
+        );
+    }
+
+    /// Slice-6 pin (the Connect gate): the standing cadence checks the
+    /// native lane under its shipped gate, adds the release-availability
+    /// check on a source install ONLY when Connect is configured, and an
+    /// unmanaged install still checks nothing unprompted.
+    #[test]
+    fn auto_cadence_is_connect_gated_per_flavor() {
+        let source = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: false,
+        };
+        assert_eq!(
+            auto_check_channels(&source, false),
+            vec![UpdateChannel::Dev]
+        );
+        assert_eq!(
+            auto_check_channels(&source, true),
+            vec![UpdateChannel::Dev, UpdateChannel::Releases]
+        );
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/apps/Intendant.app"),
+        };
+        assert_eq!(auto_check_channels(&consumer, false), vec![]);
+        assert_eq!(
+            auto_check_channels(&consumer, true),
+            vec![UpdateChannel::Releases]
+        );
+        let unmanaged = InstallFlavor::Unmanaged {
+            reason: "stray".to_string(),
+        };
+        assert_eq!(auto_check_channels(&unmanaged, false), vec![]);
+        assert_eq!(auto_check_channels(&unmanaged, true), vec![]);
+    }
+
+    /// Slice-6 pin (the payload ride): the handover status payload
+    /// carries `release_update` beside `update_lane` exactly while the
+    /// lane holds a verified newer-release verdict — a distinct fact
+    /// block, never folded into the on-disk `update` chip's block.
+    #[tokio::test]
+    async fn handover_payload_rides_the_release_update_block() {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::handover::HandoverRuntime::initialize(
+            home.path(),
+            0,
+            0,
+        ));
+        let exe = home.path().join("bin").join("intendant");
+        touch(&exe);
+        let lane = Arc::new(UpdateLane::new(&runtime, exe));
+        runtime.set_update_lane(lane.clone());
+        let status = runtime.status_json();
+        assert!(
+            status.get("release_update").is_none(),
+            "no verdict, no block"
+        );
+        lane.seed_releases_check_for_test(consumer_state("v9.9.9", "9.9.9", Some(true)));
+        let status = runtime.status_json();
+        let release = status
+            .get("release_update")
+            .expect("the block rides the payload");
+        assert_eq!(release["latest_tag"], "v9.9.9");
+        assert_eq!(
+            release["one_click"], false,
+            "an unmanaged install is honest about the click"
+        );
+        assert!(
+            status.get("update").is_none(),
+            "the on-disk fact stays its own block"
         );
     }
 
