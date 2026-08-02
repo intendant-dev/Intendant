@@ -67,6 +67,7 @@ ui2-activity.js
 34-station-panes.js
 35-station-diff-viewer.js
 36-voice-wasm-init.js
+36b-voice-chatgpt-rtc.js
 37-uicommand-changes-control.js
 38-managed-context.js
 39-session-windows.js

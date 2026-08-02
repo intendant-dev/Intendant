@@ -340,6 +340,7 @@ function stopVideo() {
 function hasVoiceCredentials() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   if (provider === 'openai') return true; // server mints token from OPENAI_API_KEY
+  if (provider === 'chatgpt') return true; // subscription lane: daemon brokers signaling, no browser key
   return !!voiceApiKeyGet();
 }
 
@@ -428,6 +429,11 @@ async function connectVoice() {
       showVoiceStatus('Failed to get session token', true);
       return;
     }
+  } else if (provider === 'chatgpt') {
+    // Subscription lane: the daemon brokers signaling; media flows
+    // browser-to-provider over WebRTC. No token, no capture worklet, no
+    // playback queue - the RTC glue owns mic + audio element.
+    token = '';
   } else {
     // Gemini: vault entry when unlocked, else the per-origin localStorage key
     token = voiceApiKeyGet();
@@ -435,8 +441,10 @@ async function connectVoice() {
   }
 
   voiceConnecting = true;
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (provider !== 'chatgpt') {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
   showVoiceStatus('Connecting...');
   app.connect_voice(provider, token, model, inputRate);
   voiceConnecting = false;
@@ -1022,6 +1030,10 @@ async function main() {
     // A dead event stream can't retract pending-request items — drop the
     // attention badge; the reconnect bootstrap rebuilds what still stands.
     try { attentionOnServerState(connected); } catch (_) {}
+    // ChatGPT-lane calls treat signaling loss as call-terminal (the
+    // machine stops the mic now and closes the pc within its bounded
+    // grace - a dead daemon must never leave a live mic streaming).
+    if (!connected && app.voice_signaling_lost) app.voice_signaling_lost();
   });
 
   // ── Voice Callbacks ──
@@ -1040,7 +1052,11 @@ async function main() {
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus(isReconnect ? 'Reconnected' : 'Voice ready');
     setTimeout(hideVoiceStatus, 3000);
-    if (isReconnect) {
+    if (provider === 'chatgpt') {
+      // Context is daemon-seeded (checkpoint seeds initialItems); no
+      // browser-side grounding text exists on this lane.
+      sendDashboardVoiceDiagnostic('connected', 'chatgpt voice call active');
+    } else if (isReconnect) {
       // Reconnected after a disconnect — this is a fresh session with no prior
       // context. Send a strong grounding message to prevent the model from
       // confabulating a continuation of a conversation that no longer exists.
@@ -1061,6 +1077,14 @@ async function main() {
   });
 
   app.set_on_voice_audio((b64) => playAudioChunk(b64));
+
+  // ChatGPT lane: RTC verbs for the glue + voice card status.
+  app.set_on_voice_rtc((cmd) => {
+    if (window.voiceChatGptExec) voiceChatGptExec(cmd);
+  });
+  app.set_on_voice_status((statusJson) => {
+    if (window.voiceCardUpdate) voiceCardUpdate(statusJson);
+  });
 
   app.set_on_voice_text((text) => {
     sendDashboardVoiceLog(text, undefined);
@@ -1107,6 +1131,18 @@ async function main() {
 
   app.set_on_diagnostic((kind, detail) => {
     sendDashboardVoiceDiagnostic(kind, detail);
+    if (kind === 'voice_call_ended') {
+      // Terminal close on the chatgpt lane: run the same disconnect
+      // path the stop button uses (idempotent - the machine is already
+      // Closed) so presence bookkeeping and UI state reset.
+      disconnectDashboardVoice();
+      modelConnected = false;
+      micActive = false;
+      document.getElementById('micBtn').classList.remove('active');
+      document.getElementById('sb-voice').className = 'voice-dot err';
+      showVoiceStatus('Voice ended: ' + (detail || 'closed'));
+      setTimeout(hideVoiceStatus, 4000);
+    }
   });
 
   app.set_on_session_changed(() => {
@@ -1379,7 +1415,11 @@ async function main() {
     }
     micActive = !micActive;
     document.getElementById('micBtn').classList.toggle('active', micActive);
-    if (micActive) await startMic(); else stopMic();
+    const liveProvider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+    if (liveProvider === 'chatgpt') {
+      // The RTC glue owns the mic on this lane; un-toggling stops the call.
+      if (!micActive) disconnectDashboardVoice();
+    } else if (micActive) { await startMic(); } else { stopMic(); }
   });
 
   // ── Video Button ──

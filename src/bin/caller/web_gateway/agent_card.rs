@@ -451,9 +451,14 @@ pub(crate) fn build_config_inner(
     if let Some(provider) = live_provider {
         let model = live_model.unwrap_or(match provider {
             "openai" => "gpt-4o-realtime-preview",
+            // Pre-start display label only; the resolved backing model
+            // arrives on voice_status after every realtime start.
+            "chatgpt" => "chatgpt-subscription-voice",
             _ => "gemini-2.5-flash-native-audio-preview-12-2025",
         });
-        let (input_rate, output_rate) = if provider == "openai" {
+        // The chatgpt lane's media rides WebRTC (rates are the browser
+        // pipeline's concern only on the base64-PCM lanes).
+        let (input_rate, output_rate) = if provider == "openai" || provider == "chatgpt" {
             (24000, 24000)
         } else {
             (16000, 24000)

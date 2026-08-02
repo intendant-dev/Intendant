@@ -14555,6 +14555,30 @@ html.ui-v2 .ui2-vp-cam-slot .video-preview-info {
 html.ui-v2 .ui2-vp-cam-slot .video-preview-info .frame-id { color: var(--sky); }
 html.ui-v2 .ui2-vp-cam-slot #videoFps { display: none; } /* dead readout (never updated) — hidden under v2 */
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+
+/* ── ChatGPT-lane voice card ── */
+.vp-chatgpt-card {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface0, rgba(127, 127, 127, 0.12));
+  font-size: 11px;
+  line-height: 1.5;
+}
+.vp-chatgpt-card .vp-cg-row { opacity: 0.85; }
+.vp-chatgpt-card .vp-cg-usage { opacity: 0.6; }
+.vp-chatgpt-card .vp-cg-err { color: var(--red, #d20f39); }
+.vp-chatgpt-card .vp-cg-purge {
+  margin-top: 4px;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--surface2, rgba(127, 127, 127, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.vp-chatgpt-card .vp-cg-purge:hover { border-color: var(--red, #d20f39); }
 /* ── static/app/ui2-access.css ── */
 /* ── ui-v2 Access surface re-skin (design-overhaul P2) ─────────────────
    Everything here is scoped under `html.ui-v2` and restyles the EXISTING
@@ -35272,6 +35296,7 @@ html.ui-v2 .daemon-relay-note {
                   <option value="">Auto</option>
                   <option value="gemini">Gemini</option>
                   <option value="openai">OpenAI</option>
+                  <option value="chatgpt">ChatGPT (subscription)</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -38769,7 +38794,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '079013bd74302fb9';
+const INTENDANT_APP_BUILD = '8b47f4073a0162c3';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -55363,6 +55388,7 @@ function stopVideo() {
 function hasVoiceCredentials() {
   const provider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
   if (provider === 'openai') return true; // server mints token from OPENAI_API_KEY
+  if (provider === 'chatgpt') return true; // subscription lane: daemon brokers signaling, no browser key
   return !!voiceApiKeyGet();
 }
 
@@ -55451,6 +55477,11 @@ async function connectVoice() {
       showVoiceStatus('Failed to get session token', true);
       return;
     }
+  } else if (provider === 'chatgpt') {
+    // Subscription lane: the daemon brokers signaling; media flows
+    // browser-to-provider over WebRTC. No token, no capture worklet, no
+    // playback queue - the RTC glue owns mic + audio element.
+    token = '';
   } else {
     // Gemini: vault entry when unlocked, else the per-origin localStorage key
     token = voiceApiKeyGet();
@@ -55458,8 +55489,10 @@ async function connectVoice() {
   }
 
   voiceConnecting = true;
-  if (!audioCtx) audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (provider !== 'chatgpt') {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
   showVoiceStatus('Connecting...');
   app.connect_voice(provider, token, model, inputRate);
   voiceConnecting = false;
@@ -56045,6 +56078,10 @@ async function main() {
     // A dead event stream can't retract pending-request items — drop the
     // attention badge; the reconnect bootstrap rebuilds what still stands.
     try { attentionOnServerState(connected); } catch (_) {}
+    // ChatGPT-lane calls treat signaling loss as call-terminal (the
+    // machine stops the mic now and closes the pc within its bounded
+    // grace - a dead daemon must never leave a live mic streaming).
+    if (!connected && app.voice_signaling_lost) app.voice_signaling_lost();
   });
 
   // ── Voice Callbacks ──
@@ -56063,7 +56100,11 @@ async function main() {
     document.getElementById('sb-voice-label').textContent = provider.charAt(0).toUpperCase() + provider.slice(1);
     showVoiceStatus(isReconnect ? 'Reconnected' : 'Voice ready');
     setTimeout(hideVoiceStatus, 3000);
-    if (isReconnect) {
+    if (provider === 'chatgpt') {
+      // Context is daemon-seeded (checkpoint seeds initialItems); no
+      // browser-side grounding text exists on this lane.
+      sendDashboardVoiceDiagnostic('connected', 'chatgpt voice call active');
+    } else if (isReconnect) {
       // Reconnected after a disconnect — this is a fresh session with no prior
       // context. Send a strong grounding message to prevent the model from
       // confabulating a continuation of a conversation that no longer exists.
@@ -56084,6 +56125,14 @@ async function main() {
   });
 
   app.set_on_voice_audio((b64) => playAudioChunk(b64));
+
+  // ChatGPT lane: RTC verbs for the glue + voice card status.
+  app.set_on_voice_rtc((cmd) => {
+    if (window.voiceChatGptExec) voiceChatGptExec(cmd);
+  });
+  app.set_on_voice_status((statusJson) => {
+    if (window.voiceCardUpdate) voiceCardUpdate(statusJson);
+  });
 
   app.set_on_voice_text((text) => {
     sendDashboardVoiceLog(text, undefined);
@@ -56130,6 +56179,18 @@ async function main() {
 
   app.set_on_diagnostic((kind, detail) => {
     sendDashboardVoiceDiagnostic(kind, detail);
+    if (kind === 'voice_call_ended') {
+      // Terminal close on the chatgpt lane: run the same disconnect
+      // path the stop button uses (idempotent - the machine is already
+      // Closed) so presence bookkeeping and UI state reset.
+      disconnectDashboardVoice();
+      modelConnected = false;
+      micActive = false;
+      document.getElementById('micBtn').classList.remove('active');
+      document.getElementById('sb-voice').className = 'voice-dot err';
+      showVoiceStatus('Voice ended: ' + (detail || 'closed'));
+      setTimeout(hideVoiceStatus, 4000);
+    }
   });
 
   app.set_on_session_changed(() => {
@@ -56402,7 +56463,11 @@ async function main() {
     }
     micActive = !micActive;
     document.getElementById('micBtn').classList.toggle('active', micActive);
-    if (micActive) await startMic(); else stopMic();
+    const liveProvider = (gatewayConfig && gatewayConfig.provider) || 'gemini';
+    if (liveProvider === 'chatgpt') {
+      // The RTC glue owns the mic on this lane; un-toggling stops the call.
+      if (!micActive) disconnectDashboardVoice();
+    } else if (micActive) { await startMic(); } else { stopMic(); }
   });
 
   // ── Video Button ──
@@ -56489,6 +56554,174 @@ async function main() {
     if (modelConnected && app) disconnectDashboardVoice();
   });
 }
+/* ── static/app/36b-voice-chatgpt-rtc.js ── */
+// ── ChatGPT-lane voice: WebRTC glue + voice card ──
+//
+// Dumb executor for the WASM provider's RTC verbs (create_call /
+// apply_answer / stop_mic / close_pc). Every policy decision — when the
+// mic stops, when the peer connection closes, the drain grace for the
+// final usage flush, signaling-loss handling — lives in the natively
+// tested Rust call state machine; this file only performs browser API
+// calls and reports events back via app.chatgpt_rtc_event().
+//
+// Media flows browser⇄provider. The daemon relays SDP only and never
+// carries audio.
+
+(() => {
+  const st = { pc: null, mic: null, dc: null, audioEl: null, tick: null };
+
+  function evt(kind, payload) {
+    try {
+      if (window.app && app.chatgpt_rtc_event) app.chatgpt_rtc_event(kind, payload || '');
+    } catch (e) {
+      console.warn('[voice-chatgpt] event dispatch failed', kind, e);
+    }
+  }
+
+  function startTick() {
+    if (!st.tick) st.tick = setInterval(() => evt('tick'), 500);
+  }
+  function stopTick() {
+    if (st.tick) { clearInterval(st.tick); st.tick = null; }
+  }
+
+  async function createCall() {
+    startTick();
+    try {
+      st.mic = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+    } catch (e) {
+      evt('mic_error', String((e && e.message) || e));
+      return;
+    }
+    const pc = new RTCPeerConnection();
+    st.pc = pc;
+    for (const track of st.mic.getTracks()) pc.addTrack(track, st.mic);
+    const dc = pc.createDataChannel('oai-events');
+    st.dc = dc;
+    dc.onmessage = (e) => { if (typeof e.data === 'string') evt('dc_event', e.data); };
+    pc.ontrack = (e) => {
+      if (!st.audioEl) {
+        st.audioEl = document.createElement('audio');
+        st.audioEl.autoplay = true;
+        st.audioEl.style.display = 'none';
+        document.body.appendChild(st.audioEl);
+      }
+      st.audioEl.srcObject = (e.streams && e.streams[0]) || new MediaStream([e.track]);
+    };
+    pc.onconnectionstatechange = () => {
+      if (!st.pc || pc !== st.pc) return;
+      if (pc.connectionState === 'connected') evt('pc_connected');
+      else if (pc.connectionState === 'failed') evt('pc_terminated', 'failed');
+    };
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // The provider endpoint is ice-lite (candidates ride the SDP, no
+      // trickle) — wait for gathering, bounded.
+      if (pc.iceGatheringState !== 'complete') {
+        await new Promise((resolve) => {
+          const done = () => {
+            if (pc.iceGatheringState === 'complete') {
+              pc.removeEventListener('icegatheringstatechange', done);
+              resolve();
+            }
+          };
+          pc.addEventListener('icegatheringstatechange', done);
+          setTimeout(resolve, 3000);
+        });
+      }
+      evt('offer_ready', (pc.localDescription && pc.localDescription.sdp) || '');
+    } catch (e) {
+      evt('pc_terminated', 'offer: ' + String((e && e.message) || e));
+    }
+  }
+
+  function stopMicTracks() {
+    if (st.mic) {
+      for (const t of st.mic.getTracks()) t.stop();
+      st.mic = null;
+    }
+  }
+
+  function closePc() {
+    try { if (st.dc) st.dc.close(); } catch (_) {}
+    try { if (st.pc) st.pc.close(); } catch (_) {}
+    st.dc = null;
+    st.pc = null;
+    if (st.audioEl) st.audioEl.srcObject = null;
+    stopMicTracks();
+    stopTick();
+  }
+
+  window.voiceChatGptExec = function (cmdJson) {
+    let cmd;
+    try { cmd = JSON.parse(cmdJson); } catch (_) { return; }
+    switch (cmd.kind) {
+      case 'create_call':
+        createCall();
+        break;
+      case 'apply_answer':
+        if (st.pc) {
+          st.pc
+            .setRemoteDescription({ type: 'answer', sdp: cmd.sdp })
+            .catch((e) => evt('pc_terminated', 'answer: ' + String((e && e.message) || e)));
+        }
+        break;
+      case 'stop_mic':
+        stopMicTracks();
+        break;
+      case 'close_pc':
+        closePc();
+        break;
+      default:
+        break;
+    }
+  };
+
+  // ── Voice card (minimal): resolved pins + provider-reported usage +
+  // the owner's thread purge lever. Renders into the ui2 voice panel
+  // when present.
+  window.voiceCardUpdate = function (statusJson) {
+    let status;
+    try { status = JSON.parse(statusJson); } catch (_) { return; }
+    const host = document.getElementById('ui2-vp-note') || document.getElementById('voiceStatus');
+    if (!host) return;
+    let card = document.getElementById('vp-chatgpt-card');
+    if (!card) {
+      card = document.createElement('div');
+      card.id = 'vp-chatgpt-card';
+      card.className = 'vp-chatgpt-card';
+      host.parentNode.insertBefore(card, host.nextSibling);
+    }
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+    ));
+    const usage = status.last_usage && status.last_usage.tokens
+      ? `tokens ${esc(JSON.stringify(status.last_usage.tokens))} (provider-reported)`
+      : '';
+    card.innerHTML = [
+      `<div class="vp-cg-row">ChatGPT voice · ${status.active ? 'live' : 'idle'}${status.available ? '' : ' · not configured'}</div>`,
+      status.resolved_model
+        ? `<div class="vp-cg-row">backing ${esc(status.resolved_model)}${status.resolved_effort ? ' @ ' + esc(status.resolved_effort) : ''}</div>`
+        : '',
+      `<div class="vp-cg-row">${esc(status.realtime_version || 'v3')}${status.voice ? ' · voice ' + esc(status.voice) : ''}${status.thread_id ? ' · thread ' + esc(String(status.thread_id).slice(0, 8)) : ''}${status.thread_lineage_count ? ' · lineage ' + status.thread_lineage_count : ''}</div>`,
+      usage ? `<div class="vp-cg-row vp-cg-usage">${usage}</div>` : '',
+      status.last_error ? `<div class="vp-cg-row vp-cg-err">${esc(status.last_error)}</div>` : '',
+      `<div class="vp-cg-row"><button id="vp-cg-purge" class="vp-cg-purge" title="Delete the durable presence thread (provider-side) and reset its local identity">Purge presence thread</button></div>`,
+    ].join('');
+    const purge = card.querySelector('#vp-cg-purge');
+    if (purge) {
+      purge.addEventListener('click', () => {
+        if (!window.app || !app.voice_thread_purge) return;
+        if (window.confirm('Delete the durable voice presence thread? The next call starts fresh from the checkpoint.')) {
+          app.voice_thread_purge();
+        }
+      });
+    }
+  };
+})();
 /* ── static/app/37-uicommand-changes-control.js ── */
 // ── UiCommand Processor ──
 function processCommands(cmds) {
@@ -123376,6 +123609,7 @@ function ui2SettingsBuild() {
         { value: '', label: 'Auto', note: 'Pick a live-voice provider from available keys' },
         { value: 'gemini', label: 'Gemini Live' },
         { value: 'openai', label: 'OpenAI Realtime' },
+        { value: 'chatgpt', label: 'ChatGPT', note: 'Subscription voice via the daemon voice broker (no API key)' },
       ], 'Live voice provider');
       if (seg) {
         const segRow = ui2SettingsEl('div', 'ui2-seg-row');

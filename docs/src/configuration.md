@@ -252,12 +252,27 @@ agent (see [Presence Layer](./presence.md)).
 | `provider` | string | auto-detect | Provider for text-mode presence |
 | `model` | string | `gemini-3-flash-preview` | Text-mode presence model |
 | `context_window` | int | `1048576` | Context window for text-mode presence |
-| `live_provider` | string | auto-detect | Provider for browser-side live (voice) presence |
+| `live_provider` | string | auto-detect | Provider for browser-side live (voice) presence (`gemini`, `openai`, or `chatgpt`) |
 | `live_model` | string | provider default | Live presence model |
 | `live_context_window` | int | `32768` | Context window for live presence |
 
 > The compiled-in default text presence model is `gemini-3-flash-preview`. Text
 > presence auto-detection prefers Gemini when `GEMINI_API_KEY` is set.
+
+### `[presence.voice]`
+
+Pins for the ChatGPT-subscription voice lane (`live_provider = "chatgpt"` —
+see [Presence Layer](./presence.md#the-chatgpt-subscription-voice-lane)).
+Unset pins resolve to the account's own defaults; the resolved values are
+surfaced on the dashboard voice card after every start — never silently.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `backing_model` | string | account default | Backing (thread) model pin |
+| `backing_effort` | string | account default | Backing-model reasoning effort |
+| `voice` | string | provider default | Realtime voice, validated against the version's family (v3 uses the v1 family) |
+| `realtime_version` | string | `v3` | Realtime protocol version (`v1`/`v2`/`v3`) |
+| `app_server_command` | string | `[agent.codex] command` | Explicit App Server binary override |
 
 ### `[transcription]`
 

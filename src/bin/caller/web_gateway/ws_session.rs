@@ -689,6 +689,8 @@ pub(crate) struct WsInboundCtx {
     pub(crate) tcp_advertised_port: Option<u16>,
     pub(crate) tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     pub(crate) session_cancel: CancellationToken,
+    /// ChatGPT-lane voice broker (None when the daemon runs without one).
+    pub(crate) voice_broker: Option<Arc<crate::voice_broker::VoiceBroker>>,
 }
 
 /// Inbound half of a local `/ws` session: WebSocket -> EventBus frame
@@ -734,6 +736,7 @@ pub(crate) async fn ws_inbound_task(
         tcp_advertised_port,
         tcp_peer_registry,
         session_cancel,
+        voice_broker: voice_broker_inbound,
     } = ctx;
     // Input queue entries retain this shared grant handle. Keeping one Arc per
     // WebSocket avoids cloning the full IAM snapshot/audit history for every
@@ -986,62 +989,75 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("make_active") => {
                         // Request to become the active voice owner
-                        let mut slot = active_presence_inbound
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let previous_active =
-                            slot.as_ref().map(|active| active.connection_id.clone());
-                        if let Some(ref sl) = session_log_inbound {
-                            if let Ok(mut l) = sl.lock() {
-                                l.voice_diagnostic(
-                                    "make_active_received_gateway",
-                                    &format!(
-                                        "request from connection={} previous_active={}",
-                                        connection_id_inbound,
-                                        previous_active.as_deref().unwrap_or("none"),
-                                    ),
-                                );
-                            }
-                        }
-
-                        // Tell old active to disconnect voice
-                        if let Some(ref old) = *slot {
-                            if old.connection_id != connection_id_inbound {
-                                let force_msg = serde_json::json!({
-                                    "t": "force_disconnect_voice",
-                                    "reason": "handover",
-                                });
-                                let _ = old.direct_tx.send(force_msg.to_string());
-                                if let Some(ref sl) = session_log_inbound {
-                                    if let Ok(mut l) = sl.lock() {
-                                        l.voice_diagnostic(
-                                            "make_active_force_disconnect_gateway",
-                                            &format!(
-                                                "old_active={} new_active={}",
-                                                old.connection_id, connection_id_inbound,
-                                            ),
-                                        );
-                                    }
-                                }
-                            } else if let Some(ref sl) = session_log_inbound {
+                        let mut superseded_voice_conn: Option<String> = None;
+                        {
+                            let mut slot = active_presence_inbound
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let previous_active =
+                                slot.as_ref().map(|active| active.connection_id.clone());
+                            if let Some(ref sl) = session_log_inbound {
                                 if let Ok(mut l) = sl.lock() {
                                     l.voice_diagnostic(
-                                        "make_active_noop_gateway",
+                                        "make_active_received_gateway",
                                         &format!(
-                                            "request from already-active connection={}",
+                                            "request from connection={} previous_active={}",
                                             connection_id_inbound,
+                                            previous_active.as_deref().unwrap_or("none"),
                                         ),
                                     );
                                 }
                             }
+
+                            // Tell old active to disconnect voice
+                            if let Some(ref old) = *slot {
+                                if old.connection_id != connection_id_inbound {
+                                    superseded_voice_conn = Some(old.connection_id.clone());
+                                    let force_msg = serde_json::json!({
+                                        "t": "force_disconnect_voice",
+                                        "reason": "handover",
+                                    });
+                                    let _ = old.direct_tx.send(force_msg.to_string());
+                                    if let Some(ref sl) = session_log_inbound {
+                                        if let Ok(mut l) = sl.lock() {
+                                            l.voice_diagnostic(
+                                                "make_active_force_disconnect_gateway",
+                                                &format!(
+                                                    "old_active={} new_active={}",
+                                                    old.connection_id, connection_id_inbound,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else if let Some(ref sl) = session_log_inbound {
+                                    if let Ok(mut l) = sl.lock() {
+                                        l.voice_diagnostic(
+                                            "make_active_noop_gateway",
+                                            &format!(
+                                                "request from already-active connection={}",
+                                                connection_id_inbound,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Install this connection as new active
+                            *slot = Some(ActivePresence {
+                                connection_id: connection_id_inbound.clone(),
+                                direct_tx: direct_tx_inbound.clone(),
+                            });
                         }
 
-                        // Install this connection as new active
-                        *slot = Some(ActivePresence {
-                            connection_id: connection_id_inbound.clone(),
-                            direct_tx: direct_tx_inbound.clone(),
-                        });
-                        drop(slot);
+                        // Single-active: a handover stops the superseded
+                        // connection's ChatGPT-lane voice call outright
+                        // (the force_disconnect above covers the browser
+                        // side; this covers a browser that never reacts).
+                        if let (Some(broker), Some(old_id)) =
+                            (voice_broker_inbound.as_ref(), superseded_voice_conn.take())
+                        {
+                            broker.connection_superseded(&old_id).await;
+                        }
 
                         is_active = true;
                         is_presence_connected = true;
@@ -1199,6 +1215,72 @@ pub(crate) async fn ws_inbound_task(
                         }
                         bus_inbound.send(AppEvent::VoiceDiagnostic { kind, detail });
                     }
+                    Some("voice_start") => {
+                        // ChatGPT-lane voice call: SDP offer relay into the
+                        // voice broker. Media never touches the daemon —
+                        // this is signaling only; no daemon credential is
+                        // spent on this lane.
+                        match voice_broker_inbound.as_ref() {
+                            Some(broker) => {
+                                let sdp = json["sdp"].as_str().unwrap_or("").to_string();
+                                if sdp.is_empty() {
+                                    let _ = direct_tx_inbound.send(
+                                        serde_json::json!({
+                                            "t": "voice_error",
+                                            "message": "voice_start requires an sdp offer",
+                                        })
+                                        .to_string(),
+                                    );
+                                } else {
+                                    broker
+                                        .start_call(
+                                            &connection_id_inbound,
+                                            sdp,
+                                            direct_tx_inbound.clone(),
+                                        )
+                                        .await;
+                                }
+                            }
+                            None => {
+                                let _ = direct_tx_inbound.send(
+                                    serde_json::json!({
+                                        "t": "voice_error",
+                                        "message": "voice broker unavailable on this daemon",
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Some("voice_stop") => {
+                        if let Some(broker) = voice_broker_inbound.as_ref() {
+                            broker.stop_call(&connection_id_inbound).await;
+                        }
+                    }
+                    Some("voice_usage") => {
+                        // Provider-reported consumption forwarded from the
+                        // realtime data channel (decoration, never
+                        // authoritative window state).
+                        if let Some(broker) = voice_broker_inbound.as_ref() {
+                            if let Some(payload) = json.get("payload").cloned() {
+                                broker.ingest_usage(&connection_id_inbound, payload).await;
+                            }
+                        }
+                    }
+                    Some("voice_thread_purge") => match voice_broker_inbound.as_ref() {
+                        Some(broker) => {
+                            broker.purge_thread(direct_tx_inbound.clone()).await;
+                        }
+                        None => {
+                            let _ = direct_tx_inbound.send(
+                                serde_json::json!({
+                                    "t": "voice_error",
+                                    "message": "voice broker unavailable on this daemon",
+                                })
+                                .to_string(),
+                            );
+                        }
+                    },
                     Some("user_audio") => {
                         // Browser sends base64-encoded PCM16 audio for server-side transcription.
                         if let Some(ref transcriber) = transcriber_inbound {
@@ -2677,6 +2759,12 @@ pub(crate) async fn ws_inbound_task(
         {
             *slot = None;
         }
+    }
+    // A dead browser must not leave a ChatGPT-lane realtime session
+    // running: stop the voice call this connection owned (no-op for
+    // non-owners).
+    if let Some(broker) = voice_broker_inbound.as_ref() {
+        broker.connection_closed(&connection_id_inbound).await;
     }
     // Invalidate this transport's buffered raw-input frames before authority
     // returns to the permissive unclaimed state.
