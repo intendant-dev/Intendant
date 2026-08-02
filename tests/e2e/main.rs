@@ -5317,17 +5317,25 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     // The radar's deduplicated note is one acceptance surface of the
     // overlap. The rail transition below separately proves that the
     // same tick's snapshot has reached the in-process delivery seam.
-    poll_until(
+    let radar_note_id = poll_until(
         "a radar note for the fixture overlap",
         RUN_TIMEOUT,
         || {
             let notes_dir = space_dir.join("messages").join("daemon");
+            let writer_id = writer_id.clone();
             async move {
                 std::fs::read_dir(&notes_dir)
                     .ok()?
                     .flatten()
-                    .find(|e| e.file_name().to_string_lossy().starts_with("rn-"))
-                    .map(|_| ())
+                    .find_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if !name.starts_with("rn-") {
+                            return None;
+                        }
+                        let doc = std::fs::read_to_string(entry.path()).ok()?;
+                        doc.contains(&format!("\nto: {writer_id}\n"))
+                            .then(|| name.trim_end_matches(".md").to_string())
+                    })
             }
         },
         &daemon_log,
@@ -5424,7 +5432,9 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     assert!(second_messages.len() > first_messages.len());
     let expected_block = format!(
         "[System] coordination v1 space={space_key}\n\
-         sessions: 2 active, 0 stale — s-fake-a(native), s-fake-b(native)"
+         sessions: 1 active, 0 stale — s-fake-p(native)\n\
+         ! overlap shared/hot.rs — with s-fake-p (declared)\n\
+         messages: 1 unread — from daemon: {radar_note_id}"
     );
     let tail_message = second_messages.last().expect("non-empty request");
     assert_eq!(tail_message["role"].as_str(), Some("user"));

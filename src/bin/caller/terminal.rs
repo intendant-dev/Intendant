@@ -1459,8 +1459,8 @@ impl TerminalRegistry {
         }
         if let Some(SessionSlot::Live(session)) = guard.remove(key) {
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
-            // cleanly; if it ignores, the session is simply dropped and
-            // the reader thread hits read error → broadcasts Exited.
+            // cleanly; if it ignores, dropping the final owner invokes
+            // the forced-termination fallback and releases the master PTY.
             session.write_input(&[0x04]);
         }
         true
