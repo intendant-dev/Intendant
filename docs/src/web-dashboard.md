@@ -958,6 +958,11 @@ Unified administration for how dashboards and daemons reach each other:
   become Files/Terminal targets and expose no such actions.
   The pane also hosts the per-peer messaging/task/approval quick controls and
   capability routing, both in collapsed poweruser folds.
+  The **Daemon update** panel lives here too — the release/dev update checks,
+  producing a newer build, and the same one-click swap the bottom-corner
+  update chip offers. The update installs alongside the current version —
+  running sessions finish uninterrupted, and the old version may keep running
+  until they are done.
 - **People & Devices** owns the user/client domain. It shows your identity on
   this daemon, a guided grant flow (who → identity details → role → active or
   draft) with a role-card picker and advanced identity metadata folded away,

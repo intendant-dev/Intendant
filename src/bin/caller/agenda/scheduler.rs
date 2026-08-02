@@ -1686,7 +1686,7 @@ fn record_on_item(
     session_id: Option<String>,
     note: Option<String>,
 ) {
-    if let Err(err) = handle.record_occurrence(OccurrenceWriteBack {
+    match handle.record_occurrence(OccurrenceWriteBack {
         item_id: &spawn.item_id,
         effect_id: &spawn.effect_id,
         occurrence_id: &spawn.occurrence_id,
@@ -1694,11 +1694,74 @@ fn record_on_item(
         session_id,
         note,
     }) {
-        eprintln!(
-            "[agenda] occurrence write-back failed ({state} on {}): {err}",
-            spawn.item_id
-        );
+        Ok(item) => surface_suspension_trip(handle, spawn, state, &item),
+        Err(err) => {
+            eprintln!(
+                "[agenda] occurrence write-back failed ({state} on {}): {err}",
+                spawn.item_id
+            );
+        }
     }
+}
+
+/// Surface the exact healthy → suspended transition for a standing
+/// effect. The fold increments a failure streak by one per contributing
+/// terminal, so equality with the digest-bound threshold identifies the
+/// trip without another durable marker: values below it are still armed,
+/// values above it already surfaced, and re-approval resets the streak so
+/// a later trip can notify again.
+fn surface_suspension_trip(
+    handle: &AgendaHandle,
+    spawn: &SpawnOccurrence,
+    state: &str,
+    item: &super::types::AgendaItem,
+) {
+    let Some(effect) = item
+        .effects
+        .iter()
+        .find(|effect| effect.effect_id == spawn.effect_id)
+    else {
+        return;
+    };
+    let Some(recurrence) = effect.manifest.recurrence.as_ref() else {
+        return;
+    };
+    let Some(run) = effect
+        .last_run
+        .as_ref()
+        .filter(|run| run.occurrence_id == spawn.occurrence_id && run.state == state)
+    else {
+        return;
+    };
+    let contributes_failure = match state {
+        "failed" | "unknown" => true,
+        "completed" => matches!(
+            run.attestation
+                .as_ref()
+                .map(|attestation| attestation.outcome),
+            Some(
+                super::types::AttestationOutcome::Blocked
+                    | super::types::AttestationOutcome::Abandoned
+            )
+        ),
+        _ => false,
+    };
+    let threshold = recurrence.suspend_threshold();
+    if !contributes_failure || effect.consecutive_failures != threshold || !effect.suspended() {
+        return;
+    }
+    handle.bus().send(AppEvent::UserNotification {
+        session_id: None,
+        id: format!("agenda-session-suspended-{}", spawn.occurrence_id),
+        title: Some("Standing session suspended".to_string()),
+        text: format!(
+            "{} — suspended after {threshold} consecutive failures; re-approve the \
+             unchanged manifest to re-arm",
+            item.title
+        ),
+        urgency: crate::types::NotificationUrgency::Attention,
+        ts: now_ms(),
+    });
 }
 
 /// Journal `prepared` (fsync'd) → notify → journal `delivered`. Muted
@@ -4198,6 +4261,141 @@ mod tests {
             ),
             "the source line + batch ride the goal as a data prologue: {task}"
         );
+    }
+
+    /// The failure which reaches a standing manifest's reviewed threshold
+    /// surfaces one owner-facing suspension notice. Earlier failures are
+    /// silent, and later write-backs cannot repeat the transition notice.
+    #[test]
+    fn suspension_trip_notifies_once_at_exact_failure_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    refs: Vec::new(),
+                    kind: AgendaKind::Task,
+                    title: "standing triage".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                    source: None,
+                },
+                None,
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    binding_refs: Vec::new(),
+                    id: item.id.clone(),
+                    goal: "triage pass".into(),
+                    fire_at_ms: now_ms(),
+                    orchestrate: false,
+                    interactive: None,
+                    recurrence: Some(RecurrenceSpec {
+                        every_ms: super::super::types::RECURRENCE_MIN_EVERY_MS,
+                        until_ms: None,
+                        max_occurrences: None,
+                        suspend_after_failures: Some(3),
+                    }),
+                    agent_config: None,
+                    source: None,
+                    trigger: None,
+                    project_root: None,
+                },
+                None,
+            )
+            .unwrap();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest: proposed.effects[0].digest.clone(),
+                },
+                owner(),
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        let mut spawn = SpawnOccurrence {
+            binding_refs: Vec::new(),
+            occurrence_id: String::new(),
+            item_id: item.id.clone(),
+            effect_id,
+            goal: "standing triage".into(),
+            orchestrate: false,
+            fire_at_ms: 1_000,
+            approved_at_ms: 0,
+            recurring: true,
+            interactive: false,
+            project_root: None,
+            agent_config: None,
+            provenance_session_id: None,
+            matched_item_ids: Vec::new(),
+            session_name: None,
+            attempt: 0,
+        };
+
+        for failure in 1..=4 {
+            spawn.occurrence_id = format!("occ-trip-{failure}");
+            record_on_item(
+                &handle,
+                &spawn,
+                "failed",
+                None,
+                Some(format!("failure {failure}")),
+            );
+
+            let effect = handle
+                .snapshot()
+                .into_iter()
+                .find(|candidate| candidate.id == item.id)
+                .unwrap()
+                .effects
+                .into_iter()
+                .find(|effect| effect.effect_id == spawn.effect_id)
+                .unwrap();
+            assert_eq!(effect.consecutive_failures, failure);
+            assert_eq!(effect.suspended(), failure >= 3);
+
+            let mut notifications = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let AppEvent::UserNotification {
+                    session_id,
+                    id,
+                    title,
+                    text,
+                    urgency,
+                    ..
+                } = event
+                {
+                    notifications.push((session_id, id, title, text, urgency));
+                }
+            }
+            if failure == 3 {
+                assert_eq!(
+                    notifications,
+                    vec![(
+                        None,
+                        "agenda-session-suspended-occ-trip-3".to_string(),
+                        Some("Standing session suspended".to_string()),
+                        "standing triage — suspended after 3 consecutive failures; \
+                         re-approve the unchanged manifest to re-arm"
+                            .to_string(),
+                        crate::types::NotificationUrgency::Attention,
+                    )],
+                    "the threshold crossing surfaces exactly one suspension notice"
+                );
+            } else {
+                assert!(
+                    notifications.is_empty(),
+                    "failure {failure} must not surface the transition: {notifications:?}"
+                );
+            }
+        }
     }
 
     /// Track AU: a STANDING manifest with executor pins fires occurrences

@@ -278,6 +278,10 @@
       window.intendantHandoverUpdate.renderSwapSection(swap);
     }
 
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    line(card, 'update-lane-footer',
+      'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.');
     line(card, 'update-lane-footer',
       'Updates happen only on your click here — nothing installs or restarts automatically.');
     mount.appendChild(card);
