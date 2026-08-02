@@ -25,8 +25,7 @@
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
     ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerSharedViewInfo,
-    PeerStatus, SessionInfo,
-    TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
+    PeerStatus, SessionInfo, TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
 use crate::peer::log_writer::EnqueuedPeerEvent;

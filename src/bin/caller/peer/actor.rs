@@ -25,8 +25,7 @@
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
     MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerSharedViewInfo,
-    PeerStatus, SessionInfo,
-    TaggedPeerEvent, TaskId,
+    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
 };
 use crate::peer::handle::{ConnectionState, PeerCommand, PeerGrantInfo, PeerLinkInfo};
 use crate::peer::id::PeerId;

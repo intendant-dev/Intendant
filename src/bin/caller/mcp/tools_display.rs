@@ -161,12 +161,11 @@ impl IntendantServer {
                 .map(|d| d.id)
                 .collect();
         let mut rx = self.bus.subscribe();
-        self.bus.send(AppEvent::ControlCommand(
-            ControlMsg::CreateVirtualDisplay {
+        self.bus
+            .send(AppEvent::ControlCommand(ControlMsg::CreateVirtualDisplay {
                 width: params.width,
                 height: params.height,
-            },
-        ));
+            }));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
