@@ -279,9 +279,7 @@ pub(crate) fn spawn_mode_web_gateway(
     config.external_agent = initial_agent_backend
         .as_ref()
         .map(|backend| backend.as_short_str().to_string());
-    let settings_root = project_root
-        .clone()
-        .unwrap_or_else(crate::project::daemon_settings_config_root);
+    let settings_root = crate::project::daemon_config_root(project_root.as_deref());
     let codex_home = crate::session_config::effective_codex_home().map(PathBuf::from);
     let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
         daemon_session_id: session_log_id(session_log),
@@ -439,9 +437,7 @@ pub(crate) fn spawn_mode_web_gateway(
             // watch list exists; under the scheduler lease (Track HS2)
             // it runs on the holder only. Detaches on drop like its
             // siblings.
-            let scanner_settings_root = project_root
-                .clone()
-                .unwrap_or_else(crate::project::daemon_settings_config_root);
+            let scanner_settings_root = crate::project::daemon_config_root(project_root.as_deref());
             let _pr_scanner = crate::github_pr::scanner::spawn_scanner(
                 handle.clone(),
                 scanner_settings_root,

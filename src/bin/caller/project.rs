@@ -1340,6 +1340,20 @@ pub fn daemon_settings_config_root() -> PathBuf {
     crate::platform::intendant_home()
 }
 
+/// The root whose `intendant.toml` a daemon-scope write targets: the
+/// daemon's project root when it has one, else
+/// [`daemon_settings_config_root`] — the bundled app's normal projectless
+/// shape. Boot config substitution, the settings-save surface, and the
+/// Connect store already resolve this way; daemon-wide mutation surfaces
+/// (peer pairing, peer persistence) route through here so a projectless
+/// daemon never refuses a daemon-scope write with "project root not
+/// available".
+pub fn daemon_config_root(project_root: Option<&Path>) -> PathBuf {
+    project_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(daemon_settings_config_root)
+}
+
 /// Where a projectless daemon persists its Connect client config. Rooted
 /// daemons keep `[connect]` in the project's `intendant.toml`; a daemon
 /// with no project (the bundled app's normal shape) keeps Connect's
@@ -2187,6 +2201,15 @@ mod tests {
             "relay peer admission is owner-file opt-in only — no env override exists"
         );
         drop(guard);
+    }
+
+    #[test]
+    fn daemon_config_root_prefers_project_root_then_settings_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(daemon_config_root(Some(dir.path())), dir.path());
+        // intendant_home() is OnceLock-cached, so both sides observe the
+        // same resolution — no env coordination needed.
+        assert_eq!(daemon_config_root(None), daemon_settings_config_root());
     }
 
     #[test]
