@@ -130,19 +130,21 @@ impl VoiceBroker {
             "voice",
             &settings.app_server_command,
         );
-        let mut status = VoiceStatus::default();
-        status.available = settings.provider_selected;
-        status.realtime_version = Some(
-            settings
-                .voice
-                .realtime_version
-                .clone()
-                .unwrap_or_else(|| DEFAULT_REALTIME_VERSION.to_string()),
-        );
-        status.voice = settings.voice.voice.clone();
         let record = VoiceThreadRecord::load(&settings.state_root);
-        status.thread_id = record.thread_id.clone();
-        status.thread_lineage_count = record.lineage.len() as u32;
+        let status = VoiceStatus {
+            available: settings.provider_selected,
+            realtime_version: Some(
+                settings
+                    .voice
+                    .realtime_version
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_REALTIME_VERSION.to_string()),
+            ),
+            voice: settings.voice.voice.clone(),
+            thread_id: record.thread_id.clone(),
+            thread_lineage_count: record.lineage.len() as u32,
+            ..VoiceStatus::default()
+        };
         Arc::new(Self {
             settings,
             bus,
