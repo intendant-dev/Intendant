@@ -7814,8 +7814,12 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
 /// target does not match refuses without spawning (the artifact changed
 /// under the button); the on-disk target matching the RUNNING build
 /// refuses as build-neutral (the launch-before-replace specimen's exact
-/// silent failure, now a named refusal). The watched path is the real
-/// test binary — `--version` probes exec it for real.
+/// silent failure, now a named refusal). The watched path is a tiny
+/// probe-able fake and the running sha rides the mock knob — this leg
+/// deliberately never execs the real (150 MB debug) binary, so it adds
+/// no load spike to the concurrently running suite. Unix-gated like the
+/// other shebang-fake legs.
+#[cfg(unix)]
 #[tokio::test]
 async fn successor_exec_refuses_mismatch_and_build_neutral() {
     let client = reqwest::Client::builder()
@@ -7824,7 +7828,27 @@ async fn successor_exec_refuses_mismatch_and_build_neutral() {
         .expect("http client");
     let rig = TestRig::new();
     rig.write_script(&serde_json::json!({ "profiles": [] }));
-    let daemon = spawn_co_daemon(&client, &rig, "daemon.log", &[], &[]).await;
+    // The watched "binary": a shebang fake whose --version reports a
+    // fixed sha, which the mock knob also declares as the RUNNING build
+    // — probing it is milliseconds, and offered == running is exactly
+    // the build-neutral shape under test.
+    let running_sha = "e2erunning0";
+    let watched = rig.home.path().join("watched-intendant");
+    write_fake_watched_binary(&watched, running_sha);
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_RUNNING_SHA", running_sha),
+        ],
+        &[],
+    )
+    .await;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-intendant-loopback-token",
@@ -7839,15 +7863,11 @@ async fn successor_exec_refuses_mismatch_and_build_neutral() {
         .expect("build token-authed client");
     let base = format!("http://127.0.0.1:{}", daemon.port);
 
-    // The lane is wired and idle; the running provenance is the payload's.
+    // The lane is wired and idle.
     let body = http_get_json(&authed, &format!("{base}/api/daemon/handover"))
         .await
         .expect("handover status body");
     assert_eq!(body["successor_exec"]["available"], true, "{body}");
-    let running_sha = body["update_lane"]["running"]["git_sha"]
-        .as_str()
-        .expect("running sha")
-        .to_string();
 
     // No offered sha: refused before anything runs.
     let unnamed = authed
@@ -7946,16 +7966,20 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
     let rig = TestRig::new();
     rig.write_script(&serde_json::json!({ "profiles": [] }));
 
-    // The watched path exists at boot (the boot stamp) and is REPLACED
-    // after boot with a fresh copy of the real daemon binary — a new
-    // stamp, a probe, and the chip block, exactly the produce lane's
-    // ending. The mock running-sha knob back-dates the RUNNING build so
-    // the real binary's sha reads as the update.
+    // The watched path exists at boot (a tiny placeholder — just the
+    // boot stamp) and the real daemon binary LANDS there after boot —
+    // a new stamp, a probe, and the chip block, exactly the produce
+    // lane's ending. The landing is a hardlink where the tempdir shares
+    // the volume (zero bytes moved — the 150 MB debug binary must not
+    // become suite-wide disk pressure; the probe-timeout class this
+    // avoids was observed live), a copy across devices. The mock
+    // running-sha knob back-dates the RUNNING build so the real
+    // binary's sha reads as the update.
     let watched = rig.home.path().join(format!(
         "watched-intendant{}",
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::copy(intendant_bin(), &watched).expect("seed watched binary");
+    std::fs::write(&watched, b"placeholder-not-yet-a-binary").expect("seed watched placeholder");
     let daemon = spawn_co_daemon(
         &client,
         &rig,
@@ -7993,11 +8017,13 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
     let incumbent_boot = body["boot_id"].as_str().expect("boot id").to_string();
     assert_eq!(body["held"], true, "the first boot holds the lease: {body}");
 
-    // Land the "update": a fresh copy flips the stamp; the probe reads
-    // the real binary's provenance, which differs from the mocked
-    // running sha — the chip appears.
+    // Land the "update": the real binary replaces the placeholder (new
+    // stamp); the probe reads its provenance, which differs from the
+    // mocked running sha — the chip appears.
     let staged = rig.home.path().join("staged-intendant");
-    std::fs::copy(intendant_bin(), &staged).expect("stage new binary");
+    if std::fs::hard_link(intendant_bin(), &staged).is_err() {
+        std::fs::copy(intendant_bin(), &staged).expect("stage new binary");
+    }
     std::fs::rename(&staged, &watched).expect("land new binary at the watched path");
     let body = poll_until(
         "the update chip offering the on-disk build",
