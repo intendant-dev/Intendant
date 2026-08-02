@@ -1743,7 +1743,7 @@ mod tests {
     /// pin keeps the machinery and its load-bearing markers from being
     /// gutted silently). The app supervisor's one-click swap exists,
     /// follows the intake's spawn → readiness → swap → drain order, and
-    /// parks the predecessor in a draining slot the swap never
+    /// parks each predecessor in the draining array the swap never
     /// terminates; the app layer re-points the webview on
     /// `didSwapToPort` and the SPA marker gates the one-click button.
     #[test]
@@ -1752,6 +1752,15 @@ mod tests {
         for needle in [
             "func beginUpdateSwap",
             "drainingProcess",
+            // Update-abstraction slice 5 (intake 6a, multi-predecessor
+            // honesty): the draining slot is an ARRAY — a chained swap
+            // appends instead of displacing the elder from supervision,
+            // each termination handler removes exactly its own entry by
+            // identity, and the quit sweep tears down every drainer
+            // alongside the promoted successor.
+            "drainingProcesses: [Process]",
+            "drainingProcesses.removeAll { $0 === proc }",
+            "+ drainingProcesses)",
             // The intake's ordering marker (comment-wrapped in source).
             "spawn → readiness",
             "swap → drain",
