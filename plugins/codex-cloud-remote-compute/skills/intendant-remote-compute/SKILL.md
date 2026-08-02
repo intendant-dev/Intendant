@@ -1,7 +1,6 @@
 ---
 name: intendant-remote-compute
-description: Heavy platform-neutral development work — full compiles, broad test suites, workspace lint/clippy sweeps, benchmarks, code generation — MUST run through the remote_command tool instead of loading the local machine. Never silently fall back to heavy local work when the cloud lane fails; report the failure or pick a genuinely cheap alternative. Cheap commands and small platform-specific checks stay local.
-compatibility: Requires an Intendant-supervised session with the remote_command tool available (Remote Compute plugin enabled on the daemon; any backend — native, Codex, Claude Code, Kimi Code, Pi).
+description: In any Intendant-supervised native, Codex, Claude Code, Kimi Code, or Pi session where the remote_command tool is available, heavy platform-neutral development work — full compiles, broad test suites, workspace lint/clippy sweeps, benchmarks, code generation — MUST run through that tool instead of loading the local machine. Never silently fall back to heavy local work when the remote lane fails; report the failure or pick a genuinely cheap alternative. Cheap commands and small platform-specific checks stay local.
 ---
 
 > Applicability check first: if the `remote_command` tool is not available
@@ -36,8 +35,26 @@ compatibility: Requires an Intendant-supervised session with the remote_command 
 - Iterate with `source: "working_tree"` (an explicit content-addressed
   snapshot of your local changes); run final, authoritative validation
   with `source: "git_revision"` plus a pushed `expected_revision`.
-- Request `cache: "durable_sccache"` only when the daemon has configured
-  a durable cache relay.
+- When the daemon cannot infer the supervised worktree's provider branch,
+  pass the pushed branch explicitly as `branch`. The worker must still report
+  the requested `expected_revision`; a branch name never weakens that guard.
+- For Rust work that should reuse compile outputs after worker replacement,
+  request `cache: "durable_sccache"`. The default authenticated relay needs no
+  cloud credentials; the job fails early if sccache or the relay is unavailable.
+
+## Waiting for an acquired worker
+
+- `start` returns immediately. Keep its `job_id`, then use `status` or repeated
+  `wait` calls (at most 60 seconds each) until the same job is terminal.
+- A job in `acquiring` may still be creating a cold worker. Read
+  `job.acquisition`: it names the stage, pushed branch, provider task id and
+  URL, provider and attachment states, deadline, coalescing, and the latest
+  provider-refresh error. Do not submit a duplicate merely because setup is
+  slow. Matching environment/revision/branch requests already coalesce.
+- Automatic acquisition allows one hour by default because a small cold worker
+  can take tens of minutes to prepare. A terminal provider task fails early. An
+  acquisition timeout leaves the provider task running and reports its URL; do
+  not claim that it was cancelled.
 
 ## What to expect from caching (the honest version)
 
@@ -51,10 +68,15 @@ compatibility: Requires an Intendant-supervised session with the remote_command 
   contention and crash pressure from the local machine. It is NOT a promise
   that one cold command is faster; cold full builds can take tens of minutes
   on small workers.
+- Keep provider/cache warmth separate from connectivity. `warmth` estimates
+  cache or worker continuity; only `remote_compute_usable: true` proves this
+  daemon currently has a live command channel. A task can look warm while its
+  attachment is offline.
 
 ## Conduct on failure
 
 - If the lane errors (no worker available, environment missing, enrollment
-  broken), say so in your report and continue with cheap local steps only.
+  broken), report the acquisition stage, task URL, provider status, and last
+  provider error when present, then continue with cheap local steps only.
   Escalate the lane failure rather than quietly running the expensive thing
   locally.

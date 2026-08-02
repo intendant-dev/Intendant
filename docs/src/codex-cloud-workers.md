@@ -153,11 +153,13 @@ intendant codex-cloud prune --all
 
 `list` shows the provider's current window **plus** any tracked lease with a
 live attachment (`awaiting`/`connected`) that has fallen out of that window —
-liveness outlives the provider's list. Each row carries the derived warmth
-label (`warm`/`unknown`/`cold`; `--json` and the daemon lanes serialize it as
-`warmth`). When the provider returns a pagination cursor, `list` prints the
-ready-made `--cursor` invocation for the next page, and `--json` carries it
-as `cursor`.
+liveness outlives the provider's list. Its `REMOTE` column says whether this
+daemon has a usable live command channel; `--json` exposes that independent
+fact as `remote_compute_usable`. The separate `CACHE` column carries the
+derived warmth label (`warm`/`unknown`/`cold`; JSON field `warmth`). A lease can
+therefore be cache-warm but remote-compute-offline. When the provider returns a
+pagination cursor, `list` prints the ready-made `--cursor` invocation for the
+next page, and `--json` carries it as `cursor`.
 
 The lease store defaults to
 `$XDG_DATA_HOME/intendant/codex-cloud/leases.json` (or the platform data
@@ -427,6 +429,7 @@ operator can still select an already-connected lease with
 intendant ctl tools call remote_command --args '{
   "op": "start",
   "argv": ["cargo", "test", "-p", "intendant-core"],
+  "branch": "feature/example",
   "expected_revision": "0123456789abcdef",
   "require_clean": true,
   "timeout_s": 900
@@ -435,6 +438,16 @@ intendant ctl tools call remote_command --args '{
 intendant ctl tools call remote_command \
   --args '{"op":"wait","job_id":"remote-...","wait_s":30}'
 ```
+
+An automatically acquired job remains in `acquiring` while a cold provider
+task runs setup and attaches. Keep polling the returned job id rather than
+submitting another job. Its `job.acquisition` object reports `stage`
+(`checking_for_worker`, `submitting_task`, `waiting_for_worker`, `attached`,
+`provider_ended`, or `timed_out`), whether the request coalesced, the selected
+branch, task id and URL, provider status, attachment state, latest bounded
+provider-refresh error, timeout, and absolute deadline. Matching concurrent
+environment/revision/branch requests share one acquisition and followers see
+the leader's task and deadline.
 
 Uncommitted or not-yet-pushed source uses an explicit working-tree snapshot:
 
@@ -458,7 +471,10 @@ The contract is intentionally stricter than an interactive terminal:
   supply a different value in the explicit environment.
 - `source: "git_revision"` is the default and requires
   `expected_revision`. The worker refuses a different checkout; abbreviated
-  object ids are accepted from 7 hexadecimal characters.
+  object ids are accepted from 7 hexadecimal characters. An optional `branch`
+  names the pushed provider branch containing that revision; it takes
+  precedence over `INTENDANT_REMOTE_COMPUTE_BRANCH` and a branch derived from
+  the supervised project, but never weakens the revision check.
   `source: "working_tree"` captures a binary Git patch plus non-ignored
   untracked regular files relative to `expected_revision`, or
   `INTENDANT_REMOTE_COMPUTE_BASE_REF` (default `origin/main`) when omitted.
@@ -527,14 +543,20 @@ reachable `INTENDANT_CODEX_CLOUD_HOME_URL`; the environment bootstrap must
 install the matching Intendant binary and allow egress to home. Set
 `INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1` only for the explicitly trusted
 reverse-proxy mode described above. Optional
-`INTENDANT_REMOTE_COMPUTE_BRANCH` selects the provider checkout,
-`INTENDANT_REMOTE_COMPUTE_ACQUIRE_TIMEOUT_S` bounds attachment wait, and
-`INTENDANT_REMOTE_COMPUTE_IDLE_TIMEOUT_S` controls retirement. Concurrent
-requests for the same environment/revision/branch coalesce into one
-acquisition. Only workers created by this daemon process are auto-retired;
-manually attached workers are never retired behind their operator's back.
-Acquisition state is process-local, so a daemon restart may leave an acquired
-task until its expiring cloud-worker identity and provider turn end.
+`INTENDANT_REMOTE_COMPUTE_BRANCH` supplies a fallback provider checkout and
+`INTENDANT_REMOTE_COMPUTE_IDLE_TIMEOUT_S` controls retirement.
+`INTENDANT_REMOTE_COMPUTE_ACQUIRE_TIMEOUT_S` bounds the separate cold-worker
+wait: default 3600 seconds, clamped to 10–7200. The one-time enrollment remains
+valid for at least that wait plus five minutes; after redemption, the worker's
+zero-authority identity lasts one hour. Intendant refreshes provider state
+after 15 seconds and then once per minute (each probe is capped at 20 seconds),
+so a terminal provider task fails acquisition early with its real status and
+task URL. A timeout reports the last known provider/attachment state and does
+**not** cancel the provider task. Only workers created by this daemon process
+are auto-retired; manually attached workers are never retired behind their
+operator's back. Acquisition state is process-local, so a daemon restart may
+leave an acquired task until its expiring enrollment/identity and provider turn
+end.
 
 ## Attachment lifecycle
 
@@ -662,8 +684,8 @@ intendant codex-cloud bootstrap --output ./intendant-codex-cloud
 Paste `setup.sh` and `maintenance.sh` into the matching fields in the Codex
 Cloud environment settings. They are intentionally split by lifecycle:
 
-1. `setup.sh` installs Intendant and the task-time launcher. It either builds
-   the checked-out repository with Cargo or downloads a binary when both
+1. `setup.sh` installs Intendant, sccache, and the task-time launcher. It either
+   builds the checked-out repository with Cargo or downloads a binary when both
    `INTENDANT_CLOUD_BINARY_URL` and its mandatory
    `INTENDANT_CLOUD_BINARY_SHA256` are configured.
 2. `maintenance.sh` refreshes the installation after a cached container resumes,
@@ -672,6 +694,14 @@ Cloud environment settings. They are intentionally split by lifecycle:
    Intendant state roots under `$XDG_RUNTIME_DIR` (or a per-user `/tmp`
    directory), then `exec`s the supplied foreground command without shell
    re-parsing.
+
+For sccache, setup reuses any installed version 0.14 or newer. Otherwise it
+downloads the pinned 0.15.0 official Linux musl archive for x86_64 or aarch64,
+verifies its hard-coded SHA-256, and installs the single binary; compiling the
+same pinned release with Cargo is only a fallback for unsupported or failed
+downloads. Set `INTENDANT_CLOUD_SKIP_SCCACHE=1` when the environment
+deliberately must not install it. See the upstream
+[sccache v0.15.0 release](https://github.com/mozilla/sccache/releases/tag/v0.15.0).
 
 The scripts can also be printed for direct pasting:
 
