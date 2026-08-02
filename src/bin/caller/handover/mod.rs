@@ -492,14 +492,10 @@ impl HandoverRuntime {
     /// Polling a HELD flock never wins it, so a young secondary still
     /// cannot race a live incumbent (the binding-3 posture).
     pub(crate) fn secondary_poll_interval(&self) -> std::time::Duration {
-        const BOOT_CONVERGENCE_WINDOW_MS: u64 = 90_000;
-        const BOOT_CONVERGENCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
-        let interval = lease_poll_interval();
-        if now_ms().saturating_sub(self.booted_at_ms) < BOOT_CONVERGENCE_WINDOW_MS {
-            interval.min(BOOT_CONVERGENCE_POLL)
-        } else {
-            interval
-        }
+        secondary_poll_interval_for(
+            now_ms().saturating_sub(self.booted_at_ms),
+            lease_poll_interval(),
+        )
     }
 
     pub(crate) fn boot_id(&self) -> &str {
@@ -573,6 +569,42 @@ impl HandoverRuntime {
                 }
                 if let Ok(mut last) = self.lease_error.lock() {
                     *last = None;
+                }
+                // Successor-exec's durable post-takeover verification:
+                // when this boot was spawned as an update's successor,
+                // the first acquisition states whether the swap landed
+                // the offered build — the drainer's own report may have
+                // died with the drainer (prompt zero-session exit).
+                if let Some(offered) = successor_exec::take_acquisition_verdict() {
+                    let running = crate::build_info::git_sha();
+                    if running == offered {
+                        let text = format!(
+                            "this daemon (:{}) now holds the scheduler lease and runs the \
+                             offered build (commit {running})",
+                            self.port
+                        );
+                        eprintln!("[successor-exec] {text}");
+                        self.notify_user(
+                            "successor-exec-verified",
+                            Some("Update handed off"),
+                            &text,
+                            crate::types::NotificationUrgency::Info,
+                        );
+                    } else {
+                        let text = format!(
+                            "the swap did NOT land the offered build: this daemon (:{}) holds \
+                             the scheduler lease running commit {running}, offered was \
+                             {offered} — treat the update as not applied",
+                            self.port
+                        );
+                        eprintln!("[successor-exec] {text}");
+                        self.notify_user(
+                            "successor-exec-build-mismatch",
+                            Some("Update landed the wrong build"),
+                            &text,
+                            crate::types::NotificationUrgency::Attention,
+                        );
+                    }
                 }
                 true
             }
@@ -919,6 +951,27 @@ impl HandoverRuntime {
     }
 }
 
+/// The young-secondary convergence fold, pure: within the first ~90 s
+/// of a boot's life a secondary polls the lease at ~1 s instead of the
+/// full interval. Freshly
+/// spawned successors (the app supervisor's swap, the successor-exec
+/// lane) acquire the drained flock in about a second — inside the Q4
+/// successor watch's 30 s grace, where a full 60 s interval used to
+/// trip a false "successor gone" alarm. A rig interval shorter than
+/// the fast poll stays authoritative.
+fn secondary_poll_interval_for(
+    boot_age_ms: u64,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    const BOOT_CONVERGENCE_WINDOW_MS: u64 = 90_000;
+    const BOOT_CONVERGENCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    if boot_age_ms < BOOT_CONVERGENCE_WINDOW_MS {
+        interval.min(BOOT_CONVERGENCE_POLL)
+    } else {
+        interval
+    }
+}
+
 /// Secondary poll cadence for a freed lease (crash convergence: when the
 /// holder dies, the longest-standing daemon population converges on a new
 /// holder within one interval, no owner action). The scheduler bounds its
@@ -1128,12 +1181,15 @@ mod tests {
         }
         // Emission shapes, unweakened and unduplicated: the swap wires
         // live once each in the chip module (chip buttons and palette
-        // runs all route through the two named perform* functions), and
-        // every lane POST goes through the panel's one authedFetch.
+        // runs all route through the named perform* functions), and
+        // every lane POST goes through the panel's one authedFetch. The
+        // successor-exec POST (the ruled unsupervised one-click) is the
+        // third chip emitter — exactly one site, like its siblings.
         assert_eq!(chip.matches("/api/daemon/update-swap").count(), 1);
         assert_eq!(chip.matches("/api/daemon/takeover").count(), 1);
+        assert_eq!(chip.matches("/api/daemon/successor-exec").count(), 1);
         assert_eq!(chip.matches("messageHandlers.updateSwap").count(), 1);
-        assert_eq!(chip.matches("authedFetch(").count(), 2);
+        assert_eq!(chip.matches("authedFetch(").count(), 3);
         assert_eq!(lane.matches("authedFetch(").count(), 1);
         // Two call sites for the check path — the panel button and the
         // palette seam — one POST function between them.
@@ -1143,6 +1199,7 @@ mod tests {
         for banned in [
             "/api/daemon/update-swap",
             "/api/daemon/takeover",
+            "/api/daemon/successor-exec",
             "/api/daemon/update-lane",
             "messageHandlers.updateSwap",
             "authedFetch(",
@@ -1153,19 +1210,50 @@ mod tests {
                 "ui2-chrome must not carry the update wire shape {banned:?}"
             );
         }
-        // And the served bundle carries the whole wiring.
+        // And the served bundle carries the whole wiring — including
+        // the ruled successor-exec click (spawn button + emitter).
         let app = include_str!("../../../../static/app.html");
         for needle in [
             "label: 'Check for updates'",
             "window.qa.paletteUpdateActions",
             "paletteEntry: updatePaletteEntry",
             "window.intendantUpdateLane",
+            "performSuccessorExec",
+            "Start the new daemon & hand off",
         ] {
             assert!(
                 app.contains(needle),
                 "the dashboard bundle lost the palette update actions: {needle}"
             );
         }
+    }
+
+    /// The young-secondary convergence window: a fresh boot polls at
+    /// ~1 s (bounded by any shorter rig interval); past the window the
+    /// configured interval rules. Keeps a spawned successor's
+    /// acquisition inside the Q4 successor-gone 30 s grace.
+    #[test]
+    fn young_secondaries_poll_fast_then_settle() {
+        let minute = std::time::Duration::from_secs(60);
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(secondary_poll_interval_for(0, minute), second);
+        assert_eq!(secondary_poll_interval_for(89_999, minute), second);
+        assert_eq!(
+            secondary_poll_interval_for(90_000, minute),
+            minute,
+            "past the window the configured interval rules"
+        );
+        let rig = std::time::Duration::from_millis(500);
+        assert_eq!(
+            secondary_poll_interval_for(0, rig),
+            rig,
+            "a shorter rig interval stays authoritative"
+        );
+
+        // The runtime end: a just-initialized boot is inside the window.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HandoverRuntime::initialize(dir.path(), 8765, 0);
+        assert!(runtime.secondary_poll_interval() <= second);
     }
 
     #[test]

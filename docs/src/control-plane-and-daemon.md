@@ -468,8 +468,10 @@ The daemon watches its **own binary image on disk**: a boot-time identity
 stamp (length + mtime, plus dev/inode on Unix) beside the compiled-in
 build provenance, a 60 s stat poll, and — when the image changes — one
 bounded, environment-scrubbed `<binary> --version` probe that reads the
-NEW build's provenance. The daemon never execs a successor daemon;
-takeover stays an explicit gesture. What the watch produces:
+NEW build's provenance. Detection never execs anything beyond that
+probe; performing a swap is always a separate explicit gesture (the
+app supervisor's one-click, or the successor-exec click below). What
+the watch produces:
 
 - An `update` block on the handover status payload (`GET
   /api/daemon/handover`, its `api_daemon_handover` tunnel twin, and
@@ -484,10 +486,37 @@ takeover stays an explicit gesture. What the watch produces:
   the on-disk binary on a fresh port, waits for readiness, re-points the
   webview, and only then asks the predecessor to drain — the old child
   is never killed; it finishes its in-flight sessions and exits on its
-  own. On a CLI-launched daemon the chip is honest about its reach: it
-  can offer **Hand off to :PORT** when a live co-homed daemon is already
-  running (draining this daemon toward it), and when none is running it
-  says it cannot launch one itself.
+  own. On a CLI-launched daemon the chip offers **Hand off to :PORT**
+  when a live co-homed daemon is already running (draining this daemon
+  toward it), and — ruled 2026-07-31 — **Start the new daemon & hand
+  off** when none is: the successor-exec lane below.
+- **Successor exec** (`POST /api/daemon/successor-exec`; CLI-launched
+  daemons only): on the owner's explicit click — never automatically,
+  never as a side effect of producing a build — the lease-holding
+  daemon spawns the on-disk build as its own successor and drains
+  toward it. The exec target is pinned by **path and hash**: the click
+  carries the offered commit (`expected_git_sha`), the daemon re-probes
+  the watched binary at click time and refuses if the artifact changed
+  under the button or if the offered build IS the running one (a
+  build-neutral swap is refused out loud, never performed silently).
+  The successor boots as a plain secondary (never `--takeover` — it
+  cannot race the incumbent for the lease), inherits the incumbent's
+  explicitly passed daemon-shaping flags (bind/TLS posture, autonomy,
+  provider selection) but never its one-shot argv (the task,
+  `--continue`, the old port), registers presence, must answer its own
+  gateway, and only then does the incumbent drain. After the takeover
+  the new lease holder's recorded build is compared against the offered
+  build and the verdict is surfaced either way — an honest "the swap
+  did not land the offered build" beats a silent no-op. The route rides
+  the same owner-grade loopback trust class as the other update rows
+  and has deliberately **no tunnel twin**: remote surfaces observe
+  progress through the `successor_exec` block on the handover status
+  payload; they cannot click a spawn onto the box. While a supervisor
+  IS attached, the route refuses toward the app's own one-click. A
+  refused or failed spawn always leaves the running daemon untouched
+  (a successor that never became ready is terminated — it acquired
+  nothing); the spawned daemon's output appends to
+  `<state root>/successor-exec.log`.
 - On macOS, a non-Developer-ID on-disk build carries the keychain/TCC
   honesty line: item ACLs and TCC grants key on the signing identity, so
   the new build's first custody or capture access may re-prompt.
@@ -542,10 +571,11 @@ the watched binary path:
   verify failure deletes the staging bytes and reports the reason.
 
 Both lanes end the same way: a newer binary sits at the watched path,
-the update watch above announces it, and the **existing chip/one-click
-swap lane performs the actual handover** — produce and swap stay two
-honest phases, and the daemon never execs a build, a fetch ritual, or
-a successor into its own process. Progress and failure render live on
+the update watch above announces it, and the **swap is its own explicit
+click** (the app supervisor's one-click, or the successor-exec lane on
+CLI-launched daemons) — produce and swap stay two honest phases; the
+produce lane never execs a build or fetch into its own process and
+never spawns the successor itself. Progress and failure render live on
 the panel (phase, a bounded child-process log tail, and the outcome)
 served inside the `update_lane` block of `GET /api/daemon/handover`;
 the two actions (`POST /api/daemon/update-lane/{check,produce}`) are

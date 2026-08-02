@@ -398,13 +398,15 @@ impl CliFlags {
         valued("--mtls-ca", &self.mtls_ca);
         if self.autonomy_explicit {
             args.push("--autonomy".to_string());
-            args.push(self.autonomy.as_str().to_string());
+            // Display renders "Full"; from_str_loose reads it back
+            // case-insensitively — lowercase for the conventional argv.
+            args.push(self.autonomy.to_string().to_lowercase());
         }
         if let Some(bind) = self.web_bind {
             args.push("--bind".to_string());
             args.push(bind.to_string());
         }
-        if let Some(backend) = self.agent_backend {
+        if let Some(backend) = &self.agent_backend {
             args.push("--agent".to_string());
             args.push(backend.as_short_str().to_string());
         }
@@ -1885,6 +1887,65 @@ Also: {"source": "bare"}"#;
             no_web: false,
             advertise_urls: Vec::new(),
         }
+    }
+
+    /// Successor replay (the successor-exec lane): explicitly passed
+    /// STANDING daemon-shaping flags replay verbatim; one-shot argv —
+    /// the task, --takeover, --continue/--resume, the --web port — and
+    /// unpassed defaults never do (an unpassed --autonomy must not
+    /// override the successor's config resolution).
+    #[test]
+    fn successor_replay_carries_standing_flags_and_drops_one_shot_argv() {
+        let parsed = parse_cli_flags_from(cli(&[
+            "--web",
+            "8801",
+            "--bind",
+            "127.0.0.1",
+            "--no-tls",
+            "--autonomy",
+            "full",
+            "--agent",
+            "codex",
+            "--takeover",
+            "--continue",
+            "--verbose",
+            "--advertise-url",
+            "wss://example.test/ws",
+            "do the one-shot task",
+        ]))
+        .expect("flags parse");
+        let replay = parsed.successor_replay_args();
+        assert_eq!(
+            replay,
+            vec![
+                "--autonomy",
+                "full",
+                "--bind",
+                "127.0.0.1",
+                "--agent",
+                "codex",
+                "--verbose",
+                "--no-tls",
+                "--advertise-url",
+                "wss://example.test/ws",
+            ],
+            "standing flags replay; task/--takeover/--continue/--web never do"
+        );
+        let replayed = replay.join(" ");
+        for one_shot in ["8801", "--takeover", "--continue", "one-shot"] {
+            assert!(
+                !replayed.contains(one_shot),
+                "one-shot argv leaked into the successor replay: {one_shot}"
+            );
+        }
+
+        // Unpassed flags replay nothing at all — the successor
+        // re-resolves config/env defaults itself.
+        let bare = parse_cli_flags_from(cli(&["--web", "0"])).expect("bare flags parse");
+        assert!(
+            bare.successor_replay_args().is_empty(),
+            "an unflagged boot replays nothing"
+        );
     }
 
     #[test]

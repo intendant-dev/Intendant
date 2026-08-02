@@ -56,9 +56,11 @@ const LOG_TAIL_LINES: usize = 40;
 const LOG_LINE_CAP: usize = 400;
 
 /// Readiness budget: presence registration + gateway answer. The app
-/// supervisor's swap gives its successor ~15 s; a CLI box may be cold —
-/// give it 60 s before the spawn is declared failed and reaped.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// supervisor's swap gives its successor ~15 s, but a CLI box may boot
+/// a cold (or debug) binary under load — match the e2e harness's own
+/// 180 s daemon-boot ceiling before the spawn is declared failed and
+/// reaped. The panel shows the live phase the whole time.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const READY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Post-drain acquisition watch: the successor's young-boot fast poll
@@ -69,6 +71,32 @@ const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Grace for a SIGTERM'd failed successor before the hard kill.
 const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Env marker the lane sets on its spawned successor: the OFFERED build
+/// commit. The drainer's own verify-takeover poll races the drainer's
+/// exit (a zero-session drain exits within milliseconds of entry), so
+/// the successor carries the DURABLE half of the specimen's
+/// post-takeover verification: at its first lease acquisition it
+/// compares its compiled build against this and surfaces the verdict on
+/// its own notification lane — the surface the owner lands on next.
+pub(crate) const OFFERED_SHA_ENV: &str = "INTENDANT_SUCCESSOR_EXEC_OFFERED_SHA";
+
+/// The successor-side acquisition check: the offered sha this process
+/// was spawned to be, exactly once per process (a latch, not a
+/// `remove_var` — children inherit the var harmlessly; only a daemon's
+/// own first acquisition consumes it, and a further successor gets a
+/// FRESH value from its own spawn).
+pub(crate) fn take_acquisition_verdict() -> Option<String> {
+    static OFFERED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    let offered = OFFERED
+        .get_or_init(|| std::env::var(OFFERED_SHA_ENV).ok().filter(|sha| !sha.is_empty()));
+    if offered.is_some() && !TAKEN.swap(true, Ordering::AcqRel) {
+        offered.clone()
+    } else {
+        None
+    }
+}
 
 /// The pure offered-vs-target verdict (the specimen's pin): the exec
 /// target must be exactly the build the click offered, and an offered
@@ -387,7 +415,7 @@ impl SuccessorExecLane {
         // ── Spawn the successor as a plain secondary (binding 3) ──
         self.set_phase("spawn");
         let state_root = runtime.state_root().to_path_buf();
-        let mut child = self.spawn_successor(&state_root)?;
+        let mut child = self.spawn_successor(&state_root, expected_sha)?;
         let child_pid = child.id();
         if let Ok(mut state) = self.state.lock() {
             if let Some(state) = state.as_mut() {
@@ -423,7 +451,7 @@ impl SuccessorExecLane {
                 };
             }
             if tokio::time::Instant::now() >= deadline {
-                self.reap_failed_successor(&mut child);
+                self.reap_failed_successor(&mut child).await;
                 return Err(format!(
                     "the new daemon never registered its presence within {}s — terminated it; \
                      the running daemon is untouched (see {})",
@@ -449,7 +477,7 @@ impl SuccessorExecLane {
         // registered build is the successor's own compiled truth). ──
         self.set_phase("verify-successor");
         if successor.git_sha != probed.git_sha {
-            self.reap_failed_successor(&mut child);
+            self.reap_failed_successor(&mut child).await;
             return Err(format!(
                 "the spawned daemon reports commit {}, not the offered {} — refusing to hand \
                  over to a build the click did not approve; terminated it, the running daemon \
@@ -473,7 +501,7 @@ impl SuccessorExecLane {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                self.reap_failed_successor(&mut child);
+                self.reap_failed_successor(&mut child).await;
                 return Err(format!(
                     "the new daemon on :{} never answered its gateway within {}s — terminated \
                      it; the running daemon is untouched (see {})",
@@ -555,7 +583,11 @@ impl SuccessorExecLane {
     /// the successor log, detached into its own process group so the
     /// incumbent's terminal signals (Ctrl-C on a CLI daemon) never
     /// reach it.
-    fn spawn_successor(&self, state_root: &Path) -> Result<std::process::Child, String> {
+    fn spawn_successor(
+        &self,
+        state_root: &Path,
+        expected_sha: &str,
+    ) -> Result<std::process::Child, String> {
         let mut cmd = std::process::Command::new(&self.exe_path);
         cmd.arg("--web").arg("0");
         cmd.args(&self.replay_args);
@@ -564,6 +596,11 @@ impl SuccessorExecLane {
         // parent-pid check would reject it anyway — strip it at the
         // source instead of relying on that).
         cmd.env_remove("INTENDANT_APP_SUPERVISOR_PID");
+        // The successor-side half of the post-takeover verification: at
+        // its first lease acquisition the successor compares its build
+        // against this and says the verdict out loud (the drainer's own
+        // report can die with the drainer's prompt zero-session exit).
+        cmd.env(OFFERED_SHA_ENV, expected_sha);
         cmd.stdin(std::process::Stdio::null());
         let log_path = successor_log_path(state_root);
         match std::fs::OpenOptions::new()
@@ -615,16 +652,16 @@ impl SuccessorExecLane {
     /// where the platform has it, a bounded grace, then the hard kill.
     /// It acquired nothing and drained nothing — reaping it is clean
     /// recovery (the app supervisor's own failed-swap rule).
-    fn reap_failed_successor(&self, child: &mut std::process::Child) {
+    async fn reap_failed_successor(&self, child: &mut std::process::Child) {
         let pid = child.id();
         if crate::platform::request_graceful_terminate(pid) {
-            let deadline = std::time::Instant::now() + TERMINATE_GRACE;
-            while std::time::Instant::now() < deadline {
+            let deadline = tokio::time::Instant::now() + TERMINATE_GRACE;
+            while tokio::time::Instant::now() < deadline {
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     self.log(format!("failed successor (pid {pid}) exited on SIGTERM"));
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         let _ = child.kill();

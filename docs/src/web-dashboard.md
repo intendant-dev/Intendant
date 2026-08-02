@@ -2021,6 +2021,7 @@ response omits the header.
 | POST | `/api/daemon/update-swap` | Settings | own origin | ≤ 4 KiB | Ask the attached app supervisor for the one-click update swap (refused when no live supervisor is attached) |
 | POST | `/api/daemon/update-swap/claim` | Settings | own origin | ≤ 4 KiB | App supervisor poll: claim the pending one-click swap request (consuming; expired requests evaporate) |
 | POST | `/api/daemon/update-swap/result` | Settings | own origin | ≤ 4 KiB | App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane) |
+| POST | `/api/daemon/successor-exec` | Settings | own origin | ≤ 4 KiB | Successor exec: spawn the verified on-disk build as this daemon's successor and drain toward it (CLI-launched daemons; body requires {"expected_git_sha": …}) |
 | GET | `/api/agenda/blobs/{item_id}/{blob_id}/raw` | AgendaRead | own origin | none | Fetch one parked-ask preview blob's raw bytes (attachment; MIME sniffing disabled) |
 | GET | `/api/agenda/items/{item_id}/refs/drift` | AgendaRead | own origin | none | Re-hash one item's file refs and manifest binding refs against their recorded pins (expand-time drift check) |
 | GET | `/api/agenda/items/{item_id}/refs/content` | AgendaRead | own origin | none | One attached file ref's bytes (?locator=; sealed snapshot when pinned, live with drift verdict otherwise) |

@@ -7802,3 +7802,412 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     );
     assert_eq!(body["draining"], false);
 }
+
+// ---------------------------------------------------------------------------
+// Successor exec (the update-channels gate's ruled deferred question): the
+// CLI-launched daemon's own spawn → readiness → drain one-click, with the
+// exec target pinned by path AND hash.
+// ---------------------------------------------------------------------------
+
+/// The specimen refusals, over the wire on a REAL daemon: the click must
+/// name the offered build (400 without it); an offered sha the on-disk
+/// target does not match refuses without spawning (the artifact changed
+/// under the button); the on-disk target matching the RUNNING build
+/// refuses as build-neutral (the launch-before-replace specimen's exact
+/// silent failure, now a named refusal). The watched path is the real
+/// test binary — `--version` probes exec it for real.
+#[tokio::test]
+async fn successor_exec_refuses_mismatch_and_build_neutral() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+    let daemon = spawn_co_daemon(&client, &rig, "daemon.log", &[], &[]).await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+
+    // The lane is wired and idle; the running provenance is the payload's.
+    let body = http_get_json(&authed, &format!("{base}/api/daemon/handover"))
+        .await
+        .expect("handover status body");
+    assert_eq!(body["successor_exec"]["available"], true, "{body}");
+    let running_sha = body["update_lane"]["running"]["git_sha"]
+        .as_str()
+        .expect("running sha")
+        .to_string();
+
+    // No offered sha: refused before anything runs.
+    let unnamed = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST successor-exec without sha");
+    assert_eq!(unnamed.status(), 400, "a click that names no build never runs");
+
+    // Offered sha ≠ on-disk target: the mismatch refusal, no spawn.
+    let mismatch = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({"expected_git_sha": "0000000000"}))
+        .send()
+        .await
+        .expect("POST successor-exec with stale sha");
+    assert_eq!(mismatch.status(), 200, "the flow starts, then refuses at the probe");
+    let refusal = poll_until(
+        "the mismatch refusal landing on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &format!("{base}/api/daemon/handover")).await?;
+            (body["successor_exec"]["ok"] == false).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let error = refusal["successor_exec"]["error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        error.contains("changed since the panel rendered") && error.contains("Nothing was spawned"),
+        "the mismatch refusal names the race: {refusal}"
+    );
+
+    // Offered sha == running build (the real binary IS the running
+    // build): the build-neutral refusal — the specimen's silent no-op,
+    // refused out loud. Also proves the probe really exec'd the target.
+    let neutral = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({"expected_git_sha": running_sha}))
+        .send()
+        .await
+        .expect("POST successor-exec with the running sha");
+    assert_eq!(neutral.status(), 200);
+    let refusal = poll_until(
+        "the build-neutral refusal landing on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &format!("{base}/api/daemon/handover")).await?;
+            let exec = &body["successor_exec"];
+            (exec["ok"] == false
+                && exec["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("would not change builds"))
+            .then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    // Nothing was ever spawned: this boot is the only registered daemon.
+    assert_eq!(
+        refusal["daemons"].as_array().map(Vec::len),
+        Some(1),
+        "no successor presence appeared: {refusal}"
+    );
+    assert_eq!(refusal["draining"], false, "never drained: {refusal}");
+}
+
+/// The ruled flow, end to end on REAL binaries: an "update" lands at the
+/// watched path (a fresh copy of the test daemon binary; the mock
+/// running-sha knob makes the running build read older), the chip block
+/// offers its sha, the click spawns THAT build as a plain secondary
+/// (`--web 0`, never `--takeover`), readiness is confirmed (presence +
+/// gateway), the incumbent drains, the successor acquires the lease
+/// inside the young-boot fast-poll window, and the post-takeover
+/// verification reports the offered build landed. The incumbent exits
+/// on its own (zero sessions); the spawned successor is drained via its
+/// own takeover route at cleanup.
+#[tokio::test]
+async fn successor_exec_spawns_verified_build_and_hands_off() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The watched path exists at boot (the boot stamp) and is REPLACED
+    // after boot with a fresh copy of the real daemon binary — a new
+    // stamp, a probe, and the chip block, exactly the produce lane's
+    // ending. The mock running-sha knob back-dates the RUNNING build so
+    // the real binary's sha reads as the update.
+    let watched = rig.home.path().join(format!(
+        "watched-intendant{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::copy(intendant_bin(), &watched).expect("seed watched binary");
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_POLL_MS", "300"),
+            ("INTENDANT_UPDATE_LANE_RUNNING_SHA", "e2eoldsha00"),
+            ("INTENDANT_LEASE_POLL_MS", "500"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    let incumbent_boot = body["boot_id"].as_str().expect("boot id").to_string();
+    assert_eq!(body["held"], true, "the first boot holds the lease: {body}");
+
+    // Land the "update": a fresh copy flips the stamp; the probe reads
+    // the real binary's provenance, which differs from the mocked
+    // running sha — the chip appears.
+    let staged = rig.home.path().join("staged-intendant");
+    std::fs::copy(intendant_bin(), &staged).expect("stage new binary");
+    std::fs::rename(&staged, &watched).expect("land new binary at the watched path");
+    let body = poll_until(
+        "the update chip offering the on-disk build",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body["update"]["on_disk"]["git_sha"].as_str().is_some().then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let offered_sha = body["update"]["on_disk"]["git_sha"]
+        .as_str()
+        .expect("offered sha")
+        .to_string();
+    assert_ne!(offered_sha, "e2eoldsha00", "the offer IS the new build");
+
+    // The click, carrying the offered sha.
+    let started = authed
+        .post(format!("{base}/api/daemon/successor-exec"))
+        .json(&serde_json::json!({
+            "expected_git_sha": offered_sha,
+            "requested_by": "e2e successor-exec leg",
+        }))
+        .send()
+        .await
+        .expect("POST successor-exec")
+        .error_for_status()
+        .expect("click accepted");
+    let started: serde_json::Value = started.json().await.expect("click body");
+    assert_eq!(started["started"], true, "{started}");
+
+    // Arm the leak guard the moment the child pid is knowable: the
+    // successor is a DETACHED grandchild — on a failed assertion below,
+    // nothing else would reap it and a mock daemon would idle on the
+    // runner forever. Disarmed after the clean drain at the end.
+    let child_pid = poll_until(
+        "the spawned successor's pid on the status block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body["successor_exec"]["child_pid"].as_u64()
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await as u32;
+    let mut successor_guard = SuccessorKillGuard { pid: Some(child_pid) };
+
+    // The ruled sequence lands. The incumbent has ZERO sessions, so it
+    // exits within moments of its own drain entry — every assertion
+    // from here reads DISK truth (the lease sidecar, presence records,
+    // the successor's log), never the incumbent's racing status block.
+    // The sidecar naming the successor, active, with the offered build
+    // IS the post-takeover verification's ground truth.
+    let sidecar = poll_until(
+        "the lease sidecar naming an active successor",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&rig)?;
+            (sidecar["boot_id"] != incumbent_boot.as_str() && sidecar["state"] == "active")
+                .then_some(sidecar)
+        },
+        || {
+            let daemon_log = std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default();
+            let successor_log = std::fs::read_to_string(
+                rig.home.path().join(".intendant").join("successor-exec.log"),
+            )
+            .map(|log| tail(&log, 2000))
+            .unwrap_or_default();
+            format!("daemon.log:\n{daemon_log}\n\nsuccessor-exec.log:\n{successor_log}")
+        },
+    )
+    .await;
+    assert_eq!(
+        sidecar["version"]["git_sha"],
+        offered_sha.as_str(),
+        "the new holder runs the offered build: {sidecar}"
+    );
+    let successor_boot = sidecar["boot_id"].as_str().expect("successor boot").to_string();
+    let successor_port = sidecar["port"].as_u64().expect("successor port") as u16;
+    assert_ne!(successor_port, daemon.port, "the successor bound its own port");
+
+    // The successor-side acquisition verdict (the durable half of the
+    // post-takeover verification — the drainer may already be gone):
+    // its own log states the offered build landed.
+    poll_until(
+        "the successor's acquisition verdict in its log",
+        RUN_TIMEOUT,
+        || async {
+            let log = std::fs::read_to_string(
+                rig.home.path().join(".intendant").join("successor-exec.log"),
+            )
+            .ok()?;
+            log.contains("runs the offered build").then_some(())
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join(".intendant").join("successor-exec.log"))
+                .map(|log| tail(&log, 2000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+
+    // The incumbent had zero sessions: it exits on its own.
+    poll_until(
+        "the drained incumbent exiting",
+        RUN_TIMEOUT,
+        || async {
+            (!boot_lock_is_held(&rig, &incumbent_boot)).then_some(())
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+
+    // Cleanup: drain the spawned successor through its own takeover
+    // route (zero sessions → it exits on its own), with a bounded wait
+    // on its per-boot lock freeing. It is a detached grandchild — the
+    // rig's kill_on_drop does not cover it.
+    let successor_authed = {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&rig, successor_port)
+                .parse()
+                .expect("successor token header"),
+        );
+        reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .expect("successor client")
+    };
+    successor_authed
+        .post(format!(
+            "http://127.0.0.1:{successor_port}/api/daemon/takeover"
+        ))
+        .json(&serde_json::json!({"requested_by": "e2e cleanup"}))
+        .send()
+        .await
+        .expect("POST successor takeover")
+        .error_for_status()
+        .expect("successor drains");
+    poll_until(
+        "the drained successor exiting",
+        RUN_TIMEOUT,
+        || async { (!boot_lock_is_held(&rig, &successor_boot)).then_some(()) },
+        || format!("successor :{successor_port} still live"),
+    )
+    .await;
+    successor_guard.pid = None; // clean exit confirmed — nothing to reap
+}
+
+/// Kills the detached successor by explicit pid on drop unless disarmed
+/// — the failure-path backstop keeping a panicked run from leaking a
+/// daemon onto the runner.
+struct SuccessorKillGuard {
+    pid: Option<u32>,
+}
+
+impl Drop for SuccessorKillGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid.take() else { return };
+        eprintln!("[e2e] reaping leaked successor pid {pid}");
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
+    }
+}
+
+/// Is a boot's per-boot presence lock still held (the daemon alive)?
+/// The e2e mirror of `handover::boot_id_is_live`: takeable or absent =
+/// dead. Errors read as live — the fail-safe direction for a wait that
+/// asserts death.
+fn boot_lock_is_held(rig: &TestRig, boot_id: &str) -> bool {
+    let path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{boot_id}.lock"));
+    let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => true,
+    }
+}
