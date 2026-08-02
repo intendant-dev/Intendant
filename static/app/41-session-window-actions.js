@@ -589,6 +589,74 @@ function applySessionWindowPhase(win, sid, phase) {
   // application for the same reason the approval hook above does: the
   // active→done crossing arrives via the fast path AND the wide render.
   maybeAutoMinimizeSubagentWindow(sid);
+  // The × title reads the live phase (the settled and linkless-idle
+  // claims below are phase-guarded) — re-derive on EVERY phase
+  // application: the phase-only fast path never reaches the wide
+  // render's call site.
+  updateSessionWindowCloseTitle(win, sid);
+}
+
+// Track AO safe-to-stop: the × affordance claims exactly what the
+// machine knows — the served stop derivation for agenda-linked
+// sessions; for linkless sessions, "safe" only as the ruled conjunction
+// (idle ∧ no linkage), and a busy linkless session claims NOTHING (the
+// default title stands). Two-axis honesty for the settled claim:
+// "settled" is an agenda-axis fact, so on a window that is not quiet
+// (live phase, no hard-done evidence) the title leads with the live
+// state instead of reading as an all-clear — the pill and the tooltip
+// must never disagree about whether stopping interrupts anything.
+// Quiet mirrors sessionWindowClosableClaim's rule below (hard done, or
+// a present phase normalizing to idle); an absent phase claims nothing
+// in either direction, so it keeps the agenda-axis copy. Pure over an
+// explicit claim so the QA vectors can drive the whole matrix
+// (qa.closableLens.closeTitle / vectors in ui2-activity.js); `linked`
+// here is the ×'s own axis — a served occurrence — not the wider
+// meta.agenda linkage the lens claim reads.
+function sessionWindowCloseTitleClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  const linked = !!claim.linked || !!stop;
+  if (stop === 'kills_live_run') {
+    return 'Stopping kills a live agenda run — the occurrence records failed';
+  }
+  if (stop === 'owed_work') {
+    return 'Agenda work is still owed behind this session — stopping does not settle it';
+  }
+  if (stop === 'settled') {
+    const nonQuiet = !claim.hardDone
+      && !!claim.phase && normalizeSessionPhase(claim.phase) !== 'idle';
+    if (nonQuiet) {
+      const lead = claim.phaseLabel || sessionPhaseLabel(claim.phase);
+      return `${lead} — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)`;
+    }
+    return 'No agenda-owed work — the linked occurrence is settled';
+  }
+  if (!linked && !!claim.phase && normalizeSessionPhase(claim.phase) === 'idle') {
+    return 'Idle · no agenda-owed work — stopping loses only this session’s context';
+  }
+  return 'Hide or stop session';
+}
+
+// The sid boundary over the pure claim: called from the wide metadata
+// render AND from applySessionWindowPhase above, because the phase-only
+// fast path skips the wide render — a title that read the phase once
+// would otherwise go stale across running⇄idle flips (pre-guard, the
+// linkless Idle· title really did survive into running turns this way).
+// The lead label is the pill's own display label, so the two surfaces
+// can never disagree about the live state.
+function updateSessionWindowCloseTitle(win, sid) {
+  if (!win || !win.close) return;
+  const occ = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
+  const closeTitle = sessionWindowCloseTitleClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!occ,
+    phase: win.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+    phaseLabel: sessionWindowPhaseDisplayLabel(sid, win.phase || ''),
+  });
+  if (win.close.title !== closeTitle) {
+    win.close.title = closeTitle;
+    win.close.setAttribute('aria-label', closeTitle);
+  }
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -706,27 +774,10 @@ function updateSessionWindow(sessionId, meta = {}) {
   // a mid-execution look.
   renderSessionWindowTerminalNote(win, sid);
   // Track AO safe-to-stop: the × affordance claims exactly what the
-  // machine knows — the served stop derivation for agenda-linked
-  // sessions; for linkless sessions, "safe" only as the ruled
-  // conjunction (idle ∧ no linkage), and a busy linkless session claims
-  // NOTHING (the default title stands).
-  if (win.close) {
-    const agendaOcc = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
-    let closeTitle = 'Hide or stop session';
-    if (agendaOcc && agendaOcc.stop === 'kills_live_run') {
-      closeTitle = 'Stopping kills a live agenda run — the occurrence records failed';
-    } else if (agendaOcc && agendaOcc.stop === 'owed_work') {
-      closeTitle = 'Agenda work is still owed behind this session — stopping does not settle it';
-    } else if (agendaOcc && agendaOcc.stop === 'settled') {
-      closeTitle = 'No agenda-owed work — the linked occurrence is settled';
-    } else if (!agendaOcc && win.phase === 'idle') {
-      closeTitle = 'Idle · no agenda-owed work — stopping loses only this session’s context';
-    }
-    if (win.close.title !== closeTitle) {
-      win.close.title = closeTitle;
-      win.close.setAttribute('aria-label', closeTitle);
-    }
-  }
+  // machine knows (sessionWindowCloseTitleClaim above; re-derived on
+  // every phase application too — this call covers the agenda-envelope
+  // and ended-bit changes that arrive without a phase flip).
+  updateSessionWindowCloseTitle(win, sid);
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).

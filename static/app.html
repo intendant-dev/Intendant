@@ -4717,7 +4717,8 @@ body.context-focus-active {
    walk from the positive safe-to-stop claims): every card the machine
    does NOT rule safe recedes, the closable set keeps full presence with
    a quiet affirmative ring. Positive-only — the dim says "look here",
-   never "unsafe". */
+   never "unsafe" — and while engaged the direction is stated on-canvas
+   (the chip's flipped copy + the ui2-grid.css legend), never hover-only. */
 html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
   opacity: 0.35;
   filter: saturate(0.55);
@@ -27915,6 +27916,58 @@ html.ui-v2 .session-lane-legend .lane-legend-side i {
 }
 html.ui-v2 .session-lane-legend .lane-legend-count { margin-left: auto; }
 
+/* Closable-lens legend: the engaged lens's on-canvas direction statement
+   (markup beside the lane legend in 20-shell.html; ui2-activity.js wires
+   Show all to the same disengage the chip toggles). Display keys on the
+   html attribute the lens toggle stamps — the legend can never outlive
+   the lens — and inherits the lane legend's grid-only + maximized gates:
+   Focus hides the cards the statement is about, and navigating away
+   disengages the lens anyway. */
+html.ui-v2 .ui2-closable-lens-legend {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 0;
+  background: var(--bg);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+html.ui-v2[data-ui2-closable-lens="on"] .ui2-closable-lens-legend { display: flex; }
+html.ui-v2:not([data-ui2-layout="grid"]) .ui2-closable-lens-legend,
+html.ui-v2[data-ui2-layout="grid"]:has(#session-window-grid.maximized) .ui2-closable-lens-legend {
+  display: none;
+}
+/* The swatch echoes the closable cards' affirmative green ring — the
+   legend's "bright" and the grid's ring read as the same mark. */
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--green) 18%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 55%, transparent);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off {
+  margin-left: auto;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+
 /* — window card (design-system polish: no shadow at rest — shadows are
      reserved for overlays, primary buttons, and the approval hero) — */
 html.ui-v2 .session-window {
@@ -32377,11 +32430,16 @@ html.ui-v2 .daemon-relay-note {
                41-session-window-actions.js; the count and each card's
                class derive in ui2-activity.js's Arrange walk). Hidden at
                zero — never "0 closable" — and engaging it dims every
-               other card. -->
+               other card. While engaged the chip's own text states the
+               direction ("N safe to close · rest dimmed") and the legend
+               above the grid restates it on-canvas — hover is never the
+               only door to what the dim means — and navigating away from
+               the Timeline grid disengages the lens (wired in
+               ui2-activity.js). -->
           <button type="button" class="ui2-closable-lens-btn" id="ui2-closable-lens-btn" hidden
                   aria-pressed="false"
                   title="Session cards that are safe to close — click to dim the rest">
-            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span>closable</span>
+            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span id="ui2-closable-lens-word">closable</span>
           </button>
           <!-- One compact menu button consolidating the bulk window sweeps
                (it replaced five standalone pills: Minimize done, Hide done,
@@ -32498,6 +32556,20 @@ html.ui-v2 .daemon-relay-note {
             <span class="lane-legend-kind lane-legend-fork"><i></i>fork</span>
             <span class="lane-legend-kind lane-legend-side"><i></i>side conversation</span>
             <span class="lane-legend-count" id="session-lane-legend-count"></span>
+          </div>
+          <!-- Closable-lens legend: the engaged lens's on-canvas direction
+               statement, next to the cards it dims (the toolbar chip flips
+               its copy too, but a returning viewer reads the grid first —
+               the live specimen behind this read dim as "closable", the
+               exact inversion). Display keys on the same html attribute
+               the lens toggle stamps (styles with the lane legend in
+               ui2-grid.css), so the legend can never outlive the lens;
+               Show all disengages (wired in ui2-activity.js). -->
+          <div class="ui2-closable-lens-legend" id="ui2-closable-lens-legend">
+            <i class="ui2-closable-lens-legend-swatch" aria-hidden="true"></i>
+            <span id="ui2-closable-lens-legend-text">Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).</span>
+            <button type="button" class="ui2-closable-lens-legend-off" id="ui2-closable-lens-legend-off"
+                    title="Turn the lens off — show every card at full strength">Show all</button>
           </div>
           <div class="session-window-grid hidden" id="session-window-grid"></div>
           <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
@@ -37459,6 +37531,10 @@ function ui2ApplyLayout(mode) {
   // whole Arrange surface) — fully close the menu so its stamped anchor
   // and aria-expanded never go stale (no-op while closed).
   ui2CloseArrangeMenu();
+  // Leaving Grid takes the dimmed cards and the lens chip out of view —
+  // the look drops with them (no-op while off; boot's layout restore
+  // runs before any engagement, so this never fights a fresh load).
+  if (!grid) ui2DisengageClosableLensOffSurface();
   const fBtn = document.getElementById('ui2-layout-focus-btn');
   const gBtn = document.getElementById('ui2-layout-grid-btn');
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
@@ -37702,8 +37778,45 @@ function ui2RunArrangeAction(action, row) {
 // an empty count would strand a fully-dimmed grid behind a hidden
 // toggle, the refresh disengages it the moment the count empties.
 // Transient by design: the lens is a look, not a mode — it never
-// persists across reloads.
+// persists across reloads, and navigating away from the Timeline grid
+// (main tab, sub-tab, or layout) disengages it rather than greeting a
+// returning viewer with an unexplained dimmed grid (the live specimen
+// behind this: a forgotten lens read on re-entry as "dim = closable",
+// the exact inversion). While engaged the direction is stated ON-canvas,
+// never hover-only: the chip's own text flips to "N safe to close ·
+// rest dimmed" and the grid legend (20-shell.html / ui2-grid.css, keyed
+// on the same html attribute) restates which side is which.
 let ui2ClosableLensOn = false;
+
+// Copy for the chip's two states, pure so the QA vectors can pin the
+// matrix: the count renders separately (the tabular-nums span), the
+// trailing word and the tooltip derive here.
+function ui2ClosableLensChipCopy(count, engaged) {
+  const n = Number(count) || 0;
+  if (engaged) {
+    return {
+      word: 'safe to close · rest dimmed',
+      title: 'Lens on — bright cards are safe to close; dimmed cards are not ruled safe '
+        + '(still working, waiting, or owed). Click to show every card at full strength.',
+    };
+  }
+  return {
+    word: 'closable',
+    title: n === 1
+      ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
+      : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`,
+  };
+}
+
+function ui2ApplyClosableLensChipCopy() {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  const countEl = document.getElementById('ui2-closable-lens-count');
+  const copy = ui2ClosableLensChipCopy(Number(countEl?.textContent || '0'), ui2ClosableLensOn);
+  const wordEl = document.getElementById('ui2-closable-lens-word');
+  if (wordEl && wordEl.textContent !== copy.word) wordEl.textContent = copy.word;
+  if (btn.title !== copy.title) btn.title = copy.title;
+}
 
 function ui2SetClosableLens(on) {
   ui2ClosableLensOn = !!on;
@@ -37712,6 +37825,8 @@ function ui2SetClosableLens(on) {
   else html.removeAttribute('data-ui2-closable-lens');
   const btn = document.getElementById('ui2-closable-lens-btn');
   if (btn) btn.setAttribute('aria-pressed', ui2ClosableLensOn ? 'true' : 'false');
+  // Engaged⇄disengaged flips the chip's stated direction with it.
+  ui2ApplyClosableLensChipCopy();
 }
 
 function ui2RefreshClosableLensChip(count) {
@@ -37722,9 +37837,15 @@ function ui2RefreshClosableLensChip(count) {
   if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);
   const countEl = document.getElementById('ui2-closable-lens-count');
   if (countEl) countEl.textContent = String(n);
-  btn.title = n === 1
-    ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
-    : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`;
+  ui2ApplyClosableLensChipCopy();
+}
+
+// The lens is a look at THIS grid: any navigation that takes the grid
+// away — leaving the Timeline sub-tab, leaving the Activity tab, or
+// flipping to Focus layout — disengages it (no-op while off), so a
+// return hours later never inherits an unexplained dim.
+function ui2DisengageClosableLensOffSurface() {
+  if (ui2ClosableLensOn) ui2SetClosableLens(false);
 }
 
 function ui2WireClosableLens() {
@@ -37734,29 +37855,101 @@ function ui2WireClosableLens() {
     ui2SetClosableLens(!ui2ClosableLensOn);
     ui2RefreshArrangeMenu();
   });
+  const legendOff = document.getElementById('ui2-closable-lens-legend-off');
+  if (legendOff) {
+    legendOff.addEventListener('click', () => {
+      ui2SetClosableLens(false);
+      ui2RefreshArrangeMenu();
+    });
+  }
+  // Same observations the Arrange popover's off-log guard uses: the
+  // router stamps the log sub-tab button's class, and the Activity
+  // pane's class carries main-tab presence (the layout leg lives in
+  // ui2ApplyLayout, which already retires grid-scoped chrome on flips).
+  const logBtn = document.querySelector('#activity-subtabs .subtab-btn[data-activity-tab="log"]');
+  if (logBtn) {
+    new MutationObserver(() => {
+      if (!logBtn.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(logBtn, { attributes: true, attributeFilter: ['class'] });
+  }
+  const activityPane = document.getElementById('tab-activity');
+  if (activityPane) {
+    new MutationObserver(() => {
+      if (!activityPane.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(activityPane, { attributes: true, attributeFilter: ['class'] });
+  }
 }
 
 // QA facade (window.qa convention): claim() drives the pure classifier
 // with an explicit matrix (the conjunction is otherwise untestable
-// without a live daemon), set()/state() drive and snapshot the chip +
-// lens surface after a fresh single-pass walk.
+// without a live daemon), closeTitle()/chipCopy() drive the legibility
+// copy the same way, vectors() is the pinned copy matrix (deliberate
+// double-entry — a copy edit that forgets the vector fails its row),
+// set()/state() drive and snapshot the chip + lens surface after a
+// fresh single-pass walk.
 window.qa = Object.assign(window.qa || {}, {
   closableLens: {
     claim: (c) => (typeof sessionWindowClosableClaim === 'function'
       ? sessionWindowClosableClaim(c || {}) : null),
     isClosable: (sid) => (typeof sessionWindowIsClosableAtAGlance === 'function'
       ? sessionWindowIsClosableAtAGlance(sid) : null),
+    closeTitle: (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+      ? sessionWindowCloseTitleClaim(c || {}) : null),
+    chipCopy: (n, on) => ui2ClosableLensChipCopy(n, !!on),
+    vectors: () => {
+      const t = (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+        ? sessionWindowCloseTitleClaim(c) : null);
+      const settled = (extra) => ({ stop: 'settled', linked: true, ...extra });
+      const rows = [
+        ['close/kills-live-run', t({ stop: 'kills_live_run', linked: true, phase: 'running' }),
+          'Stopping kills a live agenda run — the occurrence records failed'],
+        ['close/owed-work', t({ stop: 'owed_work', linked: true, phase: 'running' }),
+          'Agenda work is still owed behind this session — stopping does not settle it'],
+        ['close/settled-idle', t(settled({ phase: 'idle' })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-hard-done', t(settled({ phase: 'running', hardDone: true })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-running', t(settled({ phase: 'running', phaseLabel: 'Running Agent' })),
+          'Running Agent — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-waiting', t(settled({ phase: 'waiting_approval' })),
+          'Waiting for Approval — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-phaseless', t(settled({})),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/linked-unclaimed', t({ linked: true, phase: 'idle' }),
+          'Hide or stop session'],
+        ['close/linkless-idle', t({ phase: 'idle' }),
+          'Idle · no agenda-owed work — stopping loses only this session’s context'],
+        ['close/linkless-busy', t({ phase: 'running' }), 'Hide or stop session'],
+        ['close/linkless-phaseless', t({}), 'Hide or stop session'],
+        ['lens/chip-off-word', ui2ClosableLensChipCopy(3, false).word, 'closable'],
+        ['lens/chip-off-title-plural', ui2ClosableLensChipCopy(3, false).title,
+          '3 session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-off-title-one', ui2ClosableLensChipCopy(1, false).title,
+          'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-on-word', ui2ClosableLensChipCopy(3, true).word, 'safe to close · rest dimmed'],
+        ['lens/chip-on-title', ui2ClosableLensChipCopy(3, true).title,
+          'Lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed). Click to show every card at full strength.'],
+        ['lens/legend-copy',
+          (document.getElementById('ui2-closable-lens-legend-text')?.textContent || '').trim(),
+          'Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).'],
+      ];
+      return rows.map(([name, got, expect]) => ({ name, got, expect, pass: got === expect }));
+    },
     set: (on) => { ui2SetClosableLens(!!on); ui2RefreshArrangeMenu(); return ui2ClosableLensOn; },
     state: () => {
       ui2RefreshArrangeMenu();
       const btn = document.getElementById('ui2-closable-lens-btn');
       const ids = typeof sessionWindows === 'undefined' ? [] : [...sessionWindows.keys()];
       const canClassify = typeof sessionWindowIsClosableAtAGlance === 'function';
+      const legendEl = document.getElementById('ui2-closable-lens-legend');
       return {
         on: ui2ClosableLensOn,
         lensAttr: document.documentElement.getAttribute('data-ui2-closable-lens') || '',
         count: Number(document.getElementById('ui2-closable-lens-count')?.textContent || '0'),
         chipHidden: !btn || !!btn.hidden,
+        chipWord: document.getElementById('ui2-closable-lens-word')?.textContent || '',
+        chipTitle: btn?.title || '',
+        legendShown: !!legendEl && getComputedStyle(legendEl).display !== 'none',
         closable: canClassify ? ids.filter((sid) => sessionWindowIsClosableAtAGlance(sid)) : [],
         closableClassed: ids.filter(
           (sid) => !!sessionWindows.get(sid)?.el?.classList?.contains('session-window-closable')
@@ -38416,7 +38609,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '25b978807f04d3e9';
+const INTENDANT_APP_BUILD = '7a0cd00fa79bf0da';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -72012,6 +72205,74 @@ function applySessionWindowPhase(win, sid, phase) {
   // application for the same reason the approval hook above does: the
   // active→done crossing arrives via the fast path AND the wide render.
   maybeAutoMinimizeSubagentWindow(sid);
+  // The × title reads the live phase (the settled and linkless-idle
+  // claims below are phase-guarded) — re-derive on EVERY phase
+  // application: the phase-only fast path never reaches the wide
+  // render's call site.
+  updateSessionWindowCloseTitle(win, sid);
+}
+
+// Track AO safe-to-stop: the × affordance claims exactly what the
+// machine knows — the served stop derivation for agenda-linked
+// sessions; for linkless sessions, "safe" only as the ruled conjunction
+// (idle ∧ no linkage), and a busy linkless session claims NOTHING (the
+// default title stands). Two-axis honesty for the settled claim:
+// "settled" is an agenda-axis fact, so on a window that is not quiet
+// (live phase, no hard-done evidence) the title leads with the live
+// state instead of reading as an all-clear — the pill and the tooltip
+// must never disagree about whether stopping interrupts anything.
+// Quiet mirrors sessionWindowClosableClaim's rule below (hard done, or
+// a present phase normalizing to idle); an absent phase claims nothing
+// in either direction, so it keeps the agenda-axis copy. Pure over an
+// explicit claim so the QA vectors can drive the whole matrix
+// (qa.closableLens.closeTitle / vectors in ui2-activity.js); `linked`
+// here is the ×'s own axis — a served occurrence — not the wider
+// meta.agenda linkage the lens claim reads.
+function sessionWindowCloseTitleClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  const linked = !!claim.linked || !!stop;
+  if (stop === 'kills_live_run') {
+    return 'Stopping kills a live agenda run — the occurrence records failed';
+  }
+  if (stop === 'owed_work') {
+    return 'Agenda work is still owed behind this session — stopping does not settle it';
+  }
+  if (stop === 'settled') {
+    const nonQuiet = !claim.hardDone
+      && !!claim.phase && normalizeSessionPhase(claim.phase) !== 'idle';
+    if (nonQuiet) {
+      const lead = claim.phaseLabel || sessionPhaseLabel(claim.phase);
+      return `${lead} — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)`;
+    }
+    return 'No agenda-owed work — the linked occurrence is settled';
+  }
+  if (!linked && !!claim.phase && normalizeSessionPhase(claim.phase) === 'idle') {
+    return 'Idle · no agenda-owed work — stopping loses only this session’s context';
+  }
+  return 'Hide or stop session';
+}
+
+// The sid boundary over the pure claim: called from the wide metadata
+// render AND from applySessionWindowPhase above, because the phase-only
+// fast path skips the wide render — a title that read the phase once
+// would otherwise go stale across running⇄idle flips (pre-guard, the
+// linkless Idle· title really did survive into running turns this way).
+// The lead label is the pill's own display label, so the two surfaces
+// can never disagree about the live state.
+function updateSessionWindowCloseTitle(win, sid) {
+  if (!win || !win.close) return;
+  const occ = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
+  const closeTitle = sessionWindowCloseTitleClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!occ,
+    phase: win.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+    phaseLabel: sessionWindowPhaseDisplayLabel(sid, win.phase || ''),
+  });
+  if (win.close.title !== closeTitle) {
+    win.close.title = closeTitle;
+    win.close.setAttribute('aria-label', closeTitle);
+  }
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -72129,27 +72390,10 @@ function updateSessionWindow(sessionId, meta = {}) {
   // a mid-execution look.
   renderSessionWindowTerminalNote(win, sid);
   // Track AO safe-to-stop: the × affordance claims exactly what the
-  // machine knows — the served stop derivation for agenda-linked
-  // sessions; for linkless sessions, "safe" only as the ruled
-  // conjunction (idle ∧ no linkage), and a busy linkless session claims
-  // NOTHING (the default title stands).
-  if (win.close) {
-    const agendaOcc = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
-    let closeTitle = 'Hide or stop session';
-    if (agendaOcc && agendaOcc.stop === 'kills_live_run') {
-      closeTitle = 'Stopping kills a live agenda run — the occurrence records failed';
-    } else if (agendaOcc && agendaOcc.stop === 'owed_work') {
-      closeTitle = 'Agenda work is still owed behind this session — stopping does not settle it';
-    } else if (agendaOcc && agendaOcc.stop === 'settled') {
-      closeTitle = 'No agenda-owed work — the linked occurrence is settled';
-    } else if (!agendaOcc && win.phase === 'idle') {
-      closeTitle = 'Idle · no agenda-owed work — stopping loses only this session’s context';
-    }
-    if (win.close.title !== closeTitle) {
-      win.close.title = closeTitle;
-      win.close.setAttribute('aria-label', closeTitle);
-    }
-  }
+  // machine knows (sessionWindowCloseTitleClaim above; re-derived on
+  // every phase application too — this call covers the agenda-envelope
+  // and ended-bit changes that arrive without a phase flip).
+  updateSessionWindowCloseTitle(win, sid);
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).

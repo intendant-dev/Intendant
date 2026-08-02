@@ -2365,4 +2365,28 @@ mod tests {
         );
         assert!(APP_HTML.contains("win.el.classList.toggle('session-window-closable', closable)"));
     }
+
+    /// The engaged lens states its direction ON-canvas (live specimen
+    /// 2026-07-31: a returning viewer read the dim as "closable" — the
+    /// exact inversion): the chip's own text flips to name the bright
+    /// side, the grid legend restates it keyed on the same html
+    /// attribute as the dim (it can never outlive the lens), navigating
+    /// away from the Timeline grid disengages the look, and the
+    /// agenda-settled × title is phase-guarded — on a non-quiet window
+    /// it leads with the live pill label instead of reading as an
+    /// all-clear, re-derived on every phase application because the
+    /// phase-only fast path skips the wide render.
+    #[test]
+    fn closable_lens_states_its_direction() {
+        assert!(APP_HTML.contains("safe to close · rest dimmed"));
+        assert!(APP_HTML.contains("id=\"ui2-closable-lens-legend\""));
+        assert!(APP_HTML.contains(
+            "html.ui-v2[data-ui2-closable-lens=\"on\"] .ui2-closable-lens-legend { display: flex; }"
+        ));
+        assert!(APP_HTML.contains(
+            "— stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)"
+        ));
+        assert!(APP_HTML.contains("function ui2DisengageClosableLensOffSurface()"));
+        assert!(APP_HTML.contains("updateSessionWindowCloseTitle(win, sid);"));
+    }
 }
