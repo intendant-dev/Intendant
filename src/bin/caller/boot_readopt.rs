@@ -269,8 +269,9 @@ pub(crate) fn midwork_class(meta: &SessionMeta) -> Option<MidWorkClass> {
     None
 }
 
-/// The durable meta of a session dir, when one is readable.
-fn session_meta_for(home: &Path, session_id: &str) -> Option<SessionMeta> {
+/// The durable meta of a session dir, when one is readable. Shared with
+/// the commission sweep's interrupted-mid-arc consult.
+pub(crate) fn session_meta_for(home: &Path, session_id: &str) -> Option<SessionMeta> {
     let dir = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)?;
     let raw = std::fs::read_to_string(dir.join("session_meta.json")).ok()?;
     serde_json::from_str::<SessionMeta>(&raw).ok()
@@ -2249,7 +2250,13 @@ pub(crate) async fn run_boot_readopt_pass(
             let mut history: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             for standing in &standings {
-                if let crate::commission_sweep::CommissionStanding::Wake(cref) = standing {
+                // Wake candidates AND completed-unattested consults both
+                // need the lineage closure — the latter so a live or
+                // already-resumed successor settles them silently.
+                if let crate::commission_sweep::CommissionStanding::Wake(cref)
+                | crate::commission_sweep::CommissionStanding::CompletedUnattested(cref) =
+                    standing
+                {
                     if let Some(sessions) = handle.occurrence_started_history(&cref.occurrence_id) {
                         history.insert(cref.occurrence_id.clone(), sessions);
                     }

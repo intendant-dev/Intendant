@@ -102,3 +102,41 @@ not the lens. For a visual look, re-run with the removal step deleted
 and `--keep-browser`, then inspect the held page (two full-presence
 cards with the green ring, two dimmed at 0.35 opacity, chip pressed
 with count 2).
+
+## Legibility leg (the lens-direction copy, 2026-08-01)
+
+The lens-legibility landing added on-canvas direction statements and the
+phase-guarded × title (the 2026-07-31 specimen: a returning viewer read
+the dim as "closable" — the exact inversion). New behaviors, all
+display-only over the same claims:
+
+- engaged, the chip's own text flips to `N safe to close · rest dimmed`
+  and the grid legend (`#ui2-closable-lens-legend`, keyed on the same
+  html attribute as the dim) states the direction with a `Show all`
+  disengage; `state()` now also reports `chipWord` / `chipTitle` /
+  `legendShown`;
+- the lens auto-disengages on navigation away from the Timeline grid
+  (main tab, sub-tab, or Focus-layout flip) — a stale engaged lens can
+  no longer greet a re-entry unexplained;
+- the agenda-settled × title is phase-guarded: on a non-quiet window it
+  leads with the live pill label ("Running Agent — stopping interrupts
+  it; no agenda-owed work remains (the linked occurrence is settled)"),
+  and it re-derives on every phase application (the phase-only fast path
+  skips the wide render).
+
+One self-checking probe covers the whole copy matrix —
+`qa.closableLens.vectors()` pins tooltip rows (the × title claim matrix:
+veto/settled×quiet/settled×live/linkless) and the chip + legend copy;
+add it to the invocation above as a third `--probe-json`:
+
+```bash
+  --probe-json "copy=(() => { const v = window.qa.closableLens.vectors();
+    return { rows: v.length, pass: v.every(r => r.pass),
+             failed: v.filter(r => !r.pass).map(r => r.name) }; })()"
+```
+
+Pass bar: `pass: true`, `failed: []` (any named row = the copy and its
+pinned vector drifted apart — fix whichever side is wrong). The engaged
+lens leg above additionally reports `chipWord: "safe to close · rest
+dimmed"` and `legendShown: true` inside `lens.engaged`, and
+`legendShown: false` once disengaged.

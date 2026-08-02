@@ -740,6 +740,63 @@ function sessionWindowContinuationStateText(continuedAs) {
   return '';
 }
 
+// The pointer affordance contract (agenda card 01KYRN634DYZEXN251N7JJXVY5,
+// owner specimen 2026-07-30): never a link with no effect. In the dominant
+// live shape a resume shares the backend id, so the pointer's target is
+// folded into THIS window — the chip already wears the successor and its
+// transcript streams right below the note — and a "continued as
+// <own-chip-id>" link goes nowhere the owner can see. That shape renders
+// prose (plus a courtesy scroll to the tail); only a target OUTSIDE this
+// window renders the link, whose click force-focuses that window. Pure
+// (DOM-free) so the QA harness self-test pins both shapes.
+function sessionWindowContinuationPlan(continuedAs, sameWindow, stateText) {
+  const label = sessionWindowContinuationLabel(continuedAs);
+  if (!label) return { kind: 'none', text: '', title: '' };
+  const state = String(stateText || '').trim();
+  if (sameWindow) {
+    return {
+      kind: 'here',
+      text: state === 'live'
+        ? 'this window continues live below'
+        : `this window continues below${state ? ` — ${state}` : ''}`,
+      title: 'The continuation is this window\'s own transcript — click to scroll to the latest output',
+    };
+  }
+  return {
+    kind: 'link',
+    text: `continued as ${label}${state ? ` — ${state}` : ''}`,
+    title: `Focus the continuation's window — ${label}`,
+  };
+}
+
+// Is the pointer's target folded into THIS window? True when a target id
+// is one of the window's own identities (map key, merged backend/wrapper
+// ids) or when the target's row alias-folds into the same card (the
+// resume bridge: a shared id in sessionAliasIds). Decided at render time
+// against the same alias closure the fold uses — never fold order.
+function sessionWindowContinuationTargetIsThisWindow(win, sid, continuedAs) {
+  const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  if (!targets.length) return false;
+  const own = new Set([String(sid || '').trim()].filter(Boolean));
+  const meta = sessionMetadataById.get(String(sid || '').trim()) || {};
+  for (const id of [meta.backendSessionId, meta.intendantSessionId]) {
+    const value = String(id || '').trim();
+    if (value) own.add(value);
+  }
+  for (const [id, w] of sessionWindows) {
+    if (w === win) own.add(id);
+  }
+  if (targets.some(id => own.has(id))) return true;
+  for (const session of Array.isArray(_cachedSessions) ? _cachedSessions : []) {
+    const aliases = sessionAliasIds(session);
+    if (!aliases.length || !targets.some(id => aliases.includes(id))) continue;
+    if (aliases.some(id => own.has(id))) return true;
+  }
+  return false;
+}
+
 function openSessionWindowForContinuation(continuedAs) {
   const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
     .map(id => String(id || '').trim())
@@ -756,8 +813,16 @@ function openSessionWindowForContinuation(continuedAs) {
     });
     Promise.resolve(hydrateSessionWindowIfEmpty(target)).catch(() => {});
   }
+  // An explicit pointer click must LAND: force past the composer-target
+  // focus veto (unforced, a foreign composer target silently swallows
+  // the click — the cross-window half of the dead-link card), then bring
+  // the window into the viewport.
   if (typeof focusSessionWindowFromLifecycle === 'function') {
-    focusSessionWindowFromLifecycle(target, {});
+    focusSessionWindowFromLifecycle(target, { force: true });
+  }
+  const targetWin = sessionWindows.get(target);
+  if (targetWin?.el?.scrollIntoView) {
+    targetWin.el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 }
 
@@ -786,8 +851,10 @@ function renderSessionWindowTerminalNote(win, sid) {
     }
     win.terminalNote = note;
   }
-  const continuationLabel = sessionWindowContinuationLabel(statement.continuedAs);
-  const signature = `${statement.text}${continuationLabel}${sessionWindowContinuationStateText(statement.continuedAs)}`;
+  const stateText = sessionWindowContinuationStateText(statement.continuedAs);
+  const sameWindow = sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+  const plan = sessionWindowContinuationPlan(statement.continuedAs, sameWindow, stateText);
+  const signature = [statement.text, plan.kind, plan.text, plan.title].join('');
   if (note.dataset.signature === signature) return;
   note.dataset.signature = signature;
   note.textContent = '';
@@ -795,18 +862,32 @@ function renderSessionWindowTerminalNote(win, sid) {
   fact.className = 'session-window-terminal-fact';
   fact.textContent = statement.text;
   note.appendChild(fact);
-  if (continuationLabel) {
+  if (plan.kind === 'link') {
     const link = document.createElement('a');
     link.href = '#';
     link.className = 'session-window-terminal-continued';
-    const stateText = sessionWindowContinuationStateText(statement.continuedAs);
-    link.textContent = `continued as ${continuationLabel}${stateText ? ` — ${stateText}` : ''}`;
+    link.textContent = plan.text;
+    link.title = plan.title;
     link.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       openSessionWindowForContinuation(statement.continuedAs);
     });
     note.appendChild(link);
+  } else if (plan.kind === 'here') {
+    // Prose, not a link: the continuation IS this window's transcript.
+    // The click is a courtesy scroll to the live tail (40's follow lane).
+    const here = document.createElement('span');
+    here.className = 'session-window-terminal-continued-here';
+    here.textContent = plan.text;
+    here.title = plan.title;
+    here.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (typeof scrollSessionWindowToBottom === 'function') {
+        scrollSessionWindowToBottom(win);
+      }
+    });
+    note.appendChild(here);
   }
 }
 
@@ -830,6 +911,8 @@ function normalizeSessionWindowMeta(meta = {}) {
   // form may feed the cwd fallback below.
   const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
   if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeState = normalizeSessionWorktreeState(meta.worktree_state || meta.worktreeState);
+  if (worktreeState) out.worktreeState = worktreeState;
   const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
   const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
@@ -906,6 +989,30 @@ function normalizeSessionWorktreeInfo(raw) {
   return info;
 }
 
+// Served worktree git state (grid envelope `worktree_state`,
+// worktree_inventory.rs's serve-time probe): the stranded-work axis —
+// dirty / unpushed / ahead — probed daemon-side so it outlives the
+// session's own vitals stream. `state` is the honest four-way
+// (clean/dirty/missing/unknown); the fact fields ride only when the
+// probe answered. The SPA consumes, never re-derives.
+function normalizeSessionWorktreeState(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const state = String(raw.state || '').toLowerCase();
+  if (!['clean', 'dirty', 'missing', 'unknown'].includes(state)) return null;
+  const out = { state };
+  if (state === 'clean' || state === 'dirty') {
+    out.dirty = raw.dirty === true;
+    out.unpushed = raw.unpushed === true;
+    const ahead = Number(raw.ahead);
+    if (Number.isFinite(ahead) && ahead > 0) out.ahead = ahead;
+  }
+  const branch = compactSessionText(raw.branch);
+  if (branch) out.branch = branch;
+  const checkedMs = Number(raw.checked_ms ?? raw.checkedMs);
+  if (Number.isFinite(checkedMs) && checkedMs > 0) out.checkedMs = checkedMs;
+  return out;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -915,6 +1022,11 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.cwd || '',
     meta.cwdLabel || '',
     meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
+    // Facts only — checkedMs deliberately excluded so an unchanged tree
+    // re-probed every TTL never churns the signature into full renders.
+    meta.worktreeState
+      ? [meta.worktreeState.state, meta.worktreeState.dirty ? '1' : '0', meta.worktreeState.unpushed ? '1' : '0', meta.worktreeState.ahead || 0, meta.worktreeState.branch || ''].join('|')
+      : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -1912,6 +2024,20 @@ const VITALS_SYMBOLS = {
     },
     action: (v) => (v.path ? { label: 'Copy folder path', run: () => vitalsCopyText(v.path) } : null),
   },
+  // The daemon-probed stranded-work chip (grid envelope
+  // `worktree_state`): unlike the vitals-fed `dirty`/`unpushed` chips it
+  // outlives the session, so an interrupted or dead card still states
+  // that its checkout holds work that exists nowhere else. Shown only
+  // when something IS stranded (or the checkout is gone) — clean stays
+  // quiet, unknown claims nothing.
+  'worktree-state': {
+    label: 'Worktree state',
+    priority: 58,
+    icon: 'pencil',
+    chip: (v) => v.text,
+    factText: (v) => v.text,
+    explain: (v) => v.lines,
+  },
   branch: {
     label: 'Branch',
     priority: 30,
@@ -2246,7 +2372,7 @@ const VITALS_SYMBOLS = {
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
   'health', 'activity', 'model', 'permissions', 'agenda-source',
-  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
+  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'worktree-state', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -2508,6 +2634,39 @@ function vitalsChipModels(vitals, meta, sessionId) {
     }, {
       severity: bootMeta.ghost ? 'warn' : '',
     });
+  }
+  const worktreeState = meta?.worktreeState && typeof meta.worktreeState === 'object'
+    ? meta.worktreeState
+    : null;
+  if (worktreeState) {
+    const stranded = [];
+    if (worktreeState.dirty) stranded.push('dirty');
+    if (worktreeState.unpushed) stranded.push('unpushed');
+    const gone = worktreeState.state === 'missing';
+    if (stranded.length || gone) {
+      const lines = [];
+      if (gone) {
+        lines.push('The checkout this session worked in is gone (removed or reclaimed).');
+      }
+      if (worktreeState.dirty) {
+        lines.push('Uncommitted changes are sitting in the worktree — work that exists nowhere else until committed.');
+      }
+      if (worktreeState.unpushed) {
+        lines.push(`Commits on ${worktreeState.branch ? `“${worktreeState.branch}”` : 'the worktree branch'} exist only on this machine — not pushed anywhere${Number(worktreeState.ahead) > 0 ? ` (${worktreeState.ahead} ahead of upstream)` : ''}.`);
+      }
+      lines.push('Probed by the daemon from the checkout itself, so it stays honest after the session ends.');
+      push('worktree-state', 'worktree-state', {
+        text: gone
+          ? '⧉ worktree gone'
+          : (stranded.length === 1 && worktreeState.dirty ? '⧉ dirty worktree'
+            : (stranded.length === 1 ? '⧉ unpushed worktree' : '⧉ dirty+unpushed')),
+        lines,
+      }, {
+        // Stranded work IS attention: elevate like the ghost chip. A
+        // gone checkout is a neutral fact — nothing left to strand.
+        severity: stranded.length ? 'warn' : '',
+      });
+    }
   }
 
   const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
@@ -3893,6 +4052,26 @@ window.qa = Object.assign(window.qa || {}, {
       }))),
     }));
   },
+  // Terminal-note pointer readback: the affordance plan the note renders
+  // for a window — {kind:'here'} prose on the same-window fold,
+  // {kind:'link'} on a cross-window target, never a dead link.
+  terminalNotePlan: (sessionId) => {
+    const sid = String(sessionId || '').trim();
+    const statement = sessionWindowTerminalStatement(sid);
+    if (!statement) return null;
+    const win = sessionWindows.get(sid) || null;
+    const sameWindow = !!win
+      && sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+    return {
+      text: statement.text,
+      sameWindow,
+      pointer: sessionWindowContinuationPlan(
+        statement.continuedAs,
+        sameWindow,
+        sessionWindowContinuationStateText(statement.continuedAs),
+      ),
+    };
+  },
 });
 
 // The vitals conflict chip opens the same worktree finish/merge card the
@@ -4320,6 +4499,7 @@ function sessionWindowMetaFromSession(session) {
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
     worktree: session.worktree,
+    worktree_state: session.worktree_state,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,

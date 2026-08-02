@@ -243,6 +243,58 @@ html.ui-v2 .session-lane-legend .lane-legend-side i {
 }
 html.ui-v2 .session-lane-legend .lane-legend-count { margin-left: auto; }
 
+/* Closable-lens legend: the engaged lens's on-canvas direction statement
+   (markup beside the lane legend in 20-shell.html; ui2-activity.js wires
+   Show all to the same disengage the chip toggles). Display keys on the
+   html attribute the lens toggle stamps — the legend can never outlive
+   the lens — and inherits the lane legend's grid-only + maximized gates:
+   Focus hides the cards the statement is about, and navigating away
+   disengages the lens anyway. */
+html.ui-v2 .ui2-closable-lens-legend {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 0;
+  background: var(--bg);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+html.ui-v2[data-ui2-closable-lens="on"] .ui2-closable-lens-legend { display: flex; }
+html.ui-v2:not([data-ui2-layout="grid"]) .ui2-closable-lens-legend,
+html.ui-v2[data-ui2-layout="grid"]:has(#session-window-grid.maximized) .ui2-closable-lens-legend {
+  display: none;
+}
+/* The swatch echoes the closable cards' affirmative green ring — the
+   legend's "bright" and the grid's ring read as the same mark. */
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--green) 18%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 55%, transparent);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off {
+  margin-left: auto;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+
 /* — window card (design-system polish: no shadow at rest — shadows are
      reserved for overlays, primary buttons, and the approval hero) — */
 html.ui-v2 .session-window {
