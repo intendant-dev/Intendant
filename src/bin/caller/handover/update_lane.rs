@@ -1076,7 +1076,8 @@ impl UpdateLane {
             .git(repo_root, &["rev-parse", "--verify", "origin/main"])
             .await?;
         let running_sha = running_sha_for_compare();
-        let range = format!("{running_sha}..origin/main");
+        let base_sha = compare_base_sha(&running_sha).to_string();
+        let range = format!("{base_sha}..origin/main");
         let max_count = format!("--max-count={BEHIND_COUNT_CAP}");
         let count = self
             .git(
@@ -1087,7 +1088,7 @@ impl UpdateLane {
             .map_err(|err| {
                 format!(
                     "could not count commits behind origin/main (is the running build's commit \
-                     {running_sha} in this checkout's history?): {err}"
+                     {base_sha} in this checkout's history?): {err}"
                 )
             })?;
         // `--format=%h %s` sidesteps decoration/color config entirely —
@@ -1583,6 +1584,15 @@ pub(super) fn running_sha_for_compare() -> String {
     mock_running_sha_override().unwrap_or_else(|| crate::build_info::git_sha().to_string())
 }
 
+/// The git revision the behind compare runs against: a dirty-tree build
+/// stamps `<sha>-dirty` (build.rs provenance), which is not a revision
+/// `git rev-list` can resolve — the compare uses the underlying commit,
+/// and the `-dirty` marker stays a display fact on the running
+/// provenance everywhere it renders.
+pub(crate) fn compare_base_sha(running_sha: &str) -> &str {
+    running_sha.strip_suffix("-dirty").unwrap_or(running_sha)
+}
+
 /// Rig knob (PROVIDER=mock only): the "running" commit for the compare.
 /// The e2e fixture repos cannot contain the test binary's compiled-in
 /// sha, so the rig injects one that is; production always compares the
@@ -1698,6 +1708,18 @@ mod tests {
 
         assert!(fold_source_check("fatal: bad revision", "0", "", "").is_err());
         assert!(fold_source_check("abcdef012345", "many", "", "").is_err());
+    }
+
+    /// The dirty-build auto-check fix (release-availability card): a
+    /// `<sha>-dirty` provenance stamp folds to its underlying commit
+    /// for the rev-list range — `<sha>-dirty..origin/main` is not a git
+    /// revision, and it used to fail every auto compare on a
+    /// dirty-tree build.
+    #[test]
+    fn dirty_build_stamp_folds_to_a_real_revision_for_the_compare() {
+        assert_eq!(compare_base_sha("3e4c79f8-dirty"), "3e4c79f8");
+        assert_eq!(compare_base_sha("3e4c79f8"), "3e4c79f8");
+        assert_eq!(compare_base_sha("unknown"), "unknown");
     }
 
     /// The shortlog fold is bounded in count and width, and the width
