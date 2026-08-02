@@ -85,6 +85,10 @@ function ui2ApplyLayout(mode) {
   // whole Arrange surface) — fully close the menu so its stamped anchor
   // and aria-expanded never go stale (no-op while closed).
   ui2CloseArrangeMenu();
+  // Leaving Grid takes the dimmed cards and the lens chip out of view —
+  // the look drops with them (no-op while off; boot's layout restore
+  // runs before any engagement, so this never fights a fresh load).
+  if (!grid) ui2DisengageClosableLensOffSurface();
   const fBtn = document.getElementById('ui2-layout-focus-btn');
   const gBtn = document.getElementById('ui2-layout-grid-btn');
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
@@ -328,8 +332,45 @@ function ui2RunArrangeAction(action, row) {
 // an empty count would strand a fully-dimmed grid behind a hidden
 // toggle, the refresh disengages it the moment the count empties.
 // Transient by design: the lens is a look, not a mode — it never
-// persists across reloads.
+// persists across reloads, and navigating away from the Timeline grid
+// (main tab, sub-tab, or layout) disengages it rather than greeting a
+// returning viewer with an unexplained dimmed grid (the live specimen
+// behind this: a forgotten lens read on re-entry as "dim = closable",
+// the exact inversion). While engaged the direction is stated ON-canvas,
+// never hover-only: the chip's own text flips to "N safe to close ·
+// rest dimmed" and the grid legend (20-shell.html / ui2-grid.css, keyed
+// on the same html attribute) restates which side is which.
 let ui2ClosableLensOn = false;
+
+// Copy for the chip's two states, pure so the QA vectors can pin the
+// matrix: the count renders separately (the tabular-nums span), the
+// trailing word and the tooltip derive here.
+function ui2ClosableLensChipCopy(count, engaged) {
+  const n = Number(count) || 0;
+  if (engaged) {
+    return {
+      word: 'safe to close · rest dimmed',
+      title: 'Lens on — bright cards are safe to close; dimmed cards are not ruled safe '
+        + '(still working, waiting, or owed). Click to show every card at full strength.',
+    };
+  }
+  return {
+    word: 'closable',
+    title: n === 1
+      ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
+      : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`,
+  };
+}
+
+function ui2ApplyClosableLensChipCopy() {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  const countEl = document.getElementById('ui2-closable-lens-count');
+  const copy = ui2ClosableLensChipCopy(Number(countEl?.textContent || '0'), ui2ClosableLensOn);
+  const wordEl = document.getElementById('ui2-closable-lens-word');
+  if (wordEl && wordEl.textContent !== copy.word) wordEl.textContent = copy.word;
+  if (btn.title !== copy.title) btn.title = copy.title;
+}
 
 function ui2SetClosableLens(on) {
   ui2ClosableLensOn = !!on;
@@ -338,6 +379,8 @@ function ui2SetClosableLens(on) {
   else html.removeAttribute('data-ui2-closable-lens');
   const btn = document.getElementById('ui2-closable-lens-btn');
   if (btn) btn.setAttribute('aria-pressed', ui2ClosableLensOn ? 'true' : 'false');
+  // Engaged⇄disengaged flips the chip's stated direction with it.
+  ui2ApplyClosableLensChipCopy();
 }
 
 function ui2RefreshClosableLensChip(count) {
@@ -348,9 +391,15 @@ function ui2RefreshClosableLensChip(count) {
   if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);
   const countEl = document.getElementById('ui2-closable-lens-count');
   if (countEl) countEl.textContent = String(n);
-  btn.title = n === 1
-    ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
-    : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`;
+  ui2ApplyClosableLensChipCopy();
+}
+
+// The lens is a look at THIS grid: any navigation that takes the grid
+// away — leaving the Timeline sub-tab, leaving the Activity tab, or
+// flipping to Focus layout — disengages it (no-op while off), so a
+// return hours later never inherits an unexplained dim.
+function ui2DisengageClosableLensOffSurface() {
+  if (ui2ClosableLensOn) ui2SetClosableLens(false);
 }
 
 function ui2WireClosableLens() {
@@ -360,29 +409,101 @@ function ui2WireClosableLens() {
     ui2SetClosableLens(!ui2ClosableLensOn);
     ui2RefreshArrangeMenu();
   });
+  const legendOff = document.getElementById('ui2-closable-lens-legend-off');
+  if (legendOff) {
+    legendOff.addEventListener('click', () => {
+      ui2SetClosableLens(false);
+      ui2RefreshArrangeMenu();
+    });
+  }
+  // Same observations the Arrange popover's off-log guard uses: the
+  // router stamps the log sub-tab button's class, and the Activity
+  // pane's class carries main-tab presence (the layout leg lives in
+  // ui2ApplyLayout, which already retires grid-scoped chrome on flips).
+  const logBtn = document.querySelector('#activity-subtabs .subtab-btn[data-activity-tab="log"]');
+  if (logBtn) {
+    new MutationObserver(() => {
+      if (!logBtn.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(logBtn, { attributes: true, attributeFilter: ['class'] });
+  }
+  const activityPane = document.getElementById('tab-activity');
+  if (activityPane) {
+    new MutationObserver(() => {
+      if (!activityPane.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(activityPane, { attributes: true, attributeFilter: ['class'] });
+  }
 }
 
 // QA facade (window.qa convention): claim() drives the pure classifier
 // with an explicit matrix (the conjunction is otherwise untestable
-// without a live daemon), set()/state() drive and snapshot the chip +
-// lens surface after a fresh single-pass walk.
+// without a live daemon), closeTitle()/chipCopy() drive the legibility
+// copy the same way, vectors() is the pinned copy matrix (deliberate
+// double-entry — a copy edit that forgets the vector fails its row),
+// set()/state() drive and snapshot the chip + lens surface after a
+// fresh single-pass walk.
 window.qa = Object.assign(window.qa || {}, {
   closableLens: {
     claim: (c) => (typeof sessionWindowClosableClaim === 'function'
       ? sessionWindowClosableClaim(c || {}) : null),
     isClosable: (sid) => (typeof sessionWindowIsClosableAtAGlance === 'function'
       ? sessionWindowIsClosableAtAGlance(sid) : null),
+    closeTitle: (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+      ? sessionWindowCloseTitleClaim(c || {}) : null),
+    chipCopy: (n, on) => ui2ClosableLensChipCopy(n, !!on),
+    vectors: () => {
+      const t = (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+        ? sessionWindowCloseTitleClaim(c) : null);
+      const settled = (extra) => ({ stop: 'settled', linked: true, ...extra });
+      const rows = [
+        ['close/kills-live-run', t({ stop: 'kills_live_run', linked: true, phase: 'running' }),
+          'Stopping kills a live agenda run — the occurrence records failed'],
+        ['close/owed-work', t({ stop: 'owed_work', linked: true, phase: 'running' }),
+          'Agenda work is still owed behind this session — stopping does not settle it'],
+        ['close/settled-idle', t(settled({ phase: 'idle' })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-hard-done', t(settled({ phase: 'running', hardDone: true })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-running', t(settled({ phase: 'running', phaseLabel: 'Running Agent' })),
+          'Running Agent — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-waiting', t(settled({ phase: 'waiting_approval' })),
+          'Waiting for Approval — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-phaseless', t(settled({})),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/linked-unclaimed', t({ linked: true, phase: 'idle' }),
+          'Hide or stop session'],
+        ['close/linkless-idle', t({ phase: 'idle' }),
+          'Idle · no agenda-owed work — stopping loses only this session’s context'],
+        ['close/linkless-busy', t({ phase: 'running' }), 'Hide or stop session'],
+        ['close/linkless-phaseless', t({}), 'Hide or stop session'],
+        ['lens/chip-off-word', ui2ClosableLensChipCopy(3, false).word, 'closable'],
+        ['lens/chip-off-title-plural', ui2ClosableLensChipCopy(3, false).title,
+          '3 session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-off-title-one', ui2ClosableLensChipCopy(1, false).title,
+          'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-on-word', ui2ClosableLensChipCopy(3, true).word, 'safe to close · rest dimmed'],
+        ['lens/chip-on-title', ui2ClosableLensChipCopy(3, true).title,
+          'Lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed). Click to show every card at full strength.'],
+        ['lens/legend-copy',
+          (document.getElementById('ui2-closable-lens-legend-text')?.textContent || '').trim(),
+          'Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).'],
+      ];
+      return rows.map(([name, got, expect]) => ({ name, got, expect, pass: got === expect }));
+    },
     set: (on) => { ui2SetClosableLens(!!on); ui2RefreshArrangeMenu(); return ui2ClosableLensOn; },
     state: () => {
       ui2RefreshArrangeMenu();
       const btn = document.getElementById('ui2-closable-lens-btn');
       const ids = typeof sessionWindows === 'undefined' ? [] : [...sessionWindows.keys()];
       const canClassify = typeof sessionWindowIsClosableAtAGlance === 'function';
+      const legendEl = document.getElementById('ui2-closable-lens-legend');
       return {
         on: ui2ClosableLensOn,
         lensAttr: document.documentElement.getAttribute('data-ui2-closable-lens') || '',
         count: Number(document.getElementById('ui2-closable-lens-count')?.textContent || '0'),
         chipHidden: !btn || !!btn.hidden,
+        chipWord: document.getElementById('ui2-closable-lens-word')?.textContent || '',
+        chipTitle: btn?.title || '',
+        legendShown: !!legendEl && getComputedStyle(legendEl).display !== 'none',
         closable: canClassify ? ids.filter((sid) => sessionWindowIsClosableAtAGlance(sid)) : [],
         closableClassed: ids.filter(
           (sid) => !!sessionWindows.get(sid)?.el?.classList?.contains('session-window-closable')

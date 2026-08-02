@@ -151,11 +151,16 @@
                41-session-window-actions.js; the count and each card's
                class derive in ui2-activity.js's Arrange walk). Hidden at
                zero — never "0 closable" — and engaging it dims every
-               other card. -->
+               other card. While engaged the chip's own text states the
+               direction ("N safe to close · rest dimmed") and the legend
+               above the grid restates it on-canvas — hover is never the
+               only door to what the dim means — and navigating away from
+               the Timeline grid disengages the lens (wired in
+               ui2-activity.js). -->
           <button type="button" class="ui2-closable-lens-btn" id="ui2-closable-lens-btn" hidden
                   aria-pressed="false"
                   title="Session cards that are safe to close — click to dim the rest">
-            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span>closable</span>
+            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span id="ui2-closable-lens-word">closable</span>
           </button>
           <!-- One compact menu button consolidating the bulk window sweeps
                (it replaced five standalone pills: Minimize done, Hide done,
@@ -272,6 +277,20 @@
             <span class="lane-legend-kind lane-legend-fork"><i></i>fork</span>
             <span class="lane-legend-kind lane-legend-side"><i></i>side conversation</span>
             <span class="lane-legend-count" id="session-lane-legend-count"></span>
+          </div>
+          <!-- Closable-lens legend: the engaged lens's on-canvas direction
+               statement, next to the cards it dims (the toolbar chip flips
+               its copy too, but a returning viewer reads the grid first —
+               the live specimen behind this read dim as "closable", the
+               exact inversion). Display keys on the same html attribute
+               the lens toggle stamps (styles with the lane legend in
+               ui2-grid.css), so the legend can never outlive the lens;
+               Show all disengages (wired in ui2-activity.js). -->
+          <div class="ui2-closable-lens-legend" id="ui2-closable-lens-legend">
+            <i class="ui2-closable-lens-legend-swatch" aria-hidden="true"></i>
+            <span id="ui2-closable-lens-legend-text">Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).</span>
+            <button type="button" class="ui2-closable-lens-legend-off" id="ui2-closable-lens-legend-off"
+                    title="Turn the lens off — show every card at full strength">Show all</button>
           </div>
           <div class="session-window-grid hidden" id="session-window-grid"></div>
           <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
