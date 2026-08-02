@@ -532,6 +532,14 @@ function sessionWindowPhaseDisplayLabel(sessionId, phase) {
       || null;
     return ghostTerminal?.outcome ? 'Ended' : 'Died';
   }
+  // The interrupted-arc card copy (display only): while the arc looks
+  // unconcluded the pill states the whole truth — interrupted MID-WORK,
+  // and resumable — instead of a bare "Interrupted". Ghost corpses
+  // above keep their death statement.
+  if (p === 'interrupted') {
+    const arc = sessionWindowInterruptedArcState(ghostSid);
+    if (arc && !arc.concluded) return 'Interrupted mid-work — resumable';
+  }
   const canDerive = typeof deriveSessionActivity === 'function'
     && typeof sessionWireActivity === 'function';
   if (canDerive && (p === 'idle' || p === 'done')
@@ -621,6 +629,21 @@ function sessionWindowCloseTitleClaim(claim = {}) {
   if (stop === 'owed_work') {
     return 'Agenda work is still owed behind this session — stopping does not settle it';
   }
+  // Interrupted-arc amendment row (see sessionWindowClosableClaim):
+  // above the settled rows because "settled" names only the agenda-debt
+  // axis and no longer implies an interrupted card is benign — the
+  // title states the mid-work truth with the unconcluded-arc evidence.
+  if (claim.interrupted && (claim.attested !== 'achieved' || claim.worktreeStranded)) {
+    const evidence = [];
+    if (claim.attested !== 'achieved') {
+      evidence.push(claim.attested
+        ? `attested “${claim.attested}”, not achieved`
+        : 'no achieved attestation');
+    }
+    if (claim.worktreeStranded) evidence.push('worktree holds uncommitted or unpushed work');
+    const settledNote = stop === 'settled' ? 'agenda debt settled, but ' : '';
+    return `Interrupted mid-work — resumable. Closing hides the last handle on it (${settledNote}${evidence.join('; ')})`;
+  }
   if (stop === 'settled') {
     const nonQuiet = !claim.hardDone
       && !!claim.phase && normalizeSessionPhase(claim.phase) !== 'idle';
@@ -643,16 +666,24 @@ function sessionWindowCloseTitleClaim(claim = {}) {
 // linkless Idle· title really did survive into running turns this way).
 // The lead label is the pill's own display label, so the two surfaces
 // can never disagree about the live state.
-function updateSessionWindowCloseTitle(win, sid) {
-  if (!win || !win.close) return;
+function sessionWindowCloseTitleForSession(sid, win) {
   const occ = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
-  const closeTitle = sessionWindowCloseTitleClaim({
+  const arc = sessionWindowInterruptedArcState(sid);
+  return sessionWindowCloseTitleClaim({
     stop: (occ && occ.stop) || '',
     linked: !!occ,
     phase: win.phase || '',
     hardDone: sessionWindowHasHardDoneEvidence(sid),
     phaseLabel: sessionWindowPhaseDisplayLabel(sid, win.phase || ''),
+    interrupted: !!arc,
+    attested: arc ? arc.attested : '',
+    worktreeStranded: !!(arc && arc.worktreeStranded),
   });
+}
+
+function updateSessionWindowCloseTitle(win, sid) {
+  if (!win || !win.close) return;
+  const closeTitle = sessionWindowCloseTitleForSession(sid, win);
   if (win.close.title !== closeTitle) {
     win.close.title = closeTitle;
     win.close.setAttribute('aria-label', closeTitle);
@@ -1200,9 +1231,23 @@ function hideDoneSessionWindows() {
 //     rule.
 // A linked occurrence with no served stop claim, and any unrecognized
 // claim, stay not-closable: positive-only, absence claims nothing.
+//
+// INTERRUPTED-ARC AMENDMENT (2026-08-01, lex posterior over the ruled
+// conjunction's CLOSABLE application — stop-safety semantics unchanged):
+// "interrupted" stays quiet for STOP-safety (nothing live to kill) but
+// is no longer unconditional quiet-POSITIVE for the closable claim.
+// Close hides the card, and for an interrupted mid-arc session the card
+// is the last visible handle on stranded work — so an interrupted
+// window claims closable only on affirmative conclusion evidence: its
+// occurrence attested `achieved` AND no stranded-tree evidence (dirty /
+// unpushed worktree). Linkless sessions have no attestation lane, so an
+// interrupted linkless window never reads closable.
 function sessionWindowClosableClaim(claim = {}) {
   const stop = typeof claim.stop === 'string' ? claim.stop : '';
   if (stop === 'kills_live_run' || stop === 'owed_work') return false;
+  if (claim.interrupted) {
+    if (claim.attested !== 'achieved' || claim.worktreeStranded) return false;
+  }
   // An ABSENT phase is no claim (normalizeSessionPhase defaults '' to
   // 'idle', which would read wider than the ×'s raw win.phase === 'idle'
   // check — positive-only forbids that): a phase-less window is quiet
@@ -1212,6 +1257,37 @@ function sessionWindowClosableClaim(claim = {}) {
   if (stop === 'settled') return quiet;
   if (stop || claim.linked) return false;
   return quiet;
+}
+
+// The interrupted-arc state behind one session id: null unless the
+// window's phase (or the catalog row's durable status) says
+// interrupted; else the conclusion evidence the amendment weighs — the
+// occurrence's attestation outcome and the served worktree
+// strandedness. Every input is an already-served fact
+// (sessionMetadataById); nothing here re-derives.
+function sessionWindowInterruptedArcState(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const win = sessionWindows.get(sid);
+  const meta = sessionMetadataById.get(sid) || {};
+  const rawPhase = (win && win.phase) || meta.phase || '';
+  const interrupted = (!!rawPhase && normalizeSessionPhase(rawPhase) === 'interrupted')
+    || String(meta.status || '') === 'interrupted';
+  if (!interrupted) return null;
+  const attested = String(meta.agenda?.occurrence?.attestation?.outcome || '');
+  const ws = meta.worktreeState && typeof meta.worktreeState === 'object'
+    ? meta.worktreeState
+    : null;
+  const worktreeStranded = !!(ws && (ws.dirty || ws.unpushed));
+  return {
+    attested,
+    worktreeStranded,
+    // For copy surfaces: '' = no worktree known, else the served
+    // four-way (missing/unknown degrade honestly — they veto nothing,
+    // the attestation arm alone decides).
+    worktreeState: ws ? (ws.state || '') : '',
+    concluded: attested === 'achieved' && !worktreeStranded,
+  };
 }
 
 // The sid boundary over the pure claim above: every input is a fact some
@@ -1224,11 +1300,15 @@ function sessionWindowIsClosableAtAGlance(sessionId) {
   if (!win) return false;
   const meta = sessionMetadataById.get(sid) || {};
   const occ = (meta.agenda || {}).occurrence;
+  const arc = sessionWindowInterruptedArcState(sid);
   return sessionWindowClosableClaim({
     stop: (occ && occ.stop) || '',
     linked: !!meta.agenda,
     phase: win.phase || meta.phase || '',
     hardDone: sessionWindowHasHardDoneEvidence(sid),
+    interrupted: !!arc,
+    attested: arc ? arc.attested : '',
+    worktreeStranded: !!(arc && arc.worktreeStranded),
   });
 }
 
@@ -1243,7 +1323,39 @@ function sessionWindowIsClosableAtAGlance(sessionId) {
 // use; the readbacks are serializable snapshots (windowState's
 // followOutput/logAtBottom expose the jump-button state machine — QA-only
 // layout read, never on a hot path).
+// The closable-claim matrix frozen as executable vectors — the
+// interrupted-arc amendment's new states beside the ruled Track AO
+// rows. window.qa.closableClaim.vectors() runs them all; any
+// pass:false is a regression in the claim function itself.
+const CLOSABLE_CLAIM_QA_VECTORS = [
+  { name: 'settled + hard done stays closable', claim: { stop: 'settled', hardDone: true }, expect: true },
+  { name: 'settled while running stays suppressed', claim: { stop: 'settled', phase: 'running' }, expect: false },
+  { name: 'live agenda run vetoes', claim: { stop: 'kills_live_run', hardDone: true }, expect: false },
+  { name: 'owed work vetoes', claim: { stop: 'owed_work', hardDone: true }, expect: false },
+  { name: 'linked without a stop claim stays not-closable', claim: { linked: true, hardDone: true }, expect: false },
+  { name: 'linkless idle stays closable', claim: { phase: 'idle' }, expect: true },
+  { name: 'interrupted linkless never reads closable', claim: { hardDone: true, interrupted: true, attested: '' }, expect: false },
+  { name: 'interrupted settled without attestation is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: '' }, expect: false },
+  { name: 'interrupted attested short of achieved is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'partial' }, expect: false },
+  { name: 'interrupted achieved with a clean tree is closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: false }, expect: true },
+  { name: 'interrupted achieved with a stranded tree is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: true }, expect: false },
+];
+
 window.qa = Object.assign(window.qa || {}, {
+  closableClaim: {
+    evaluate: (claim) => sessionWindowClosableClaim(claim || {}),
+    atAGlance: (sessionId) => sessionWindowIsClosableAtAGlance(sessionId),
+    interruptedArc: (sessionId) => sessionWindowInterruptedArcState(sessionId),
+    closeTitle: (sessionId) => {
+      const sid = String(sessionId || '').trim();
+      const win = sid ? sessionWindows.get(sid) : null;
+      return win ? sessionWindowCloseTitleForSession(sid, win) : '';
+    },
+    vectors: () => CLOSABLE_CLAIM_QA_VECTORS.map((vector) => {
+      const got = sessionWindowClosableClaim(vector.claim);
+      return { name: vector.name, expect: vector.expect, got, pass: got === vector.expect };
+    }),
+  },
   sessionWindowSweeps: {
     build: (sessionId, meta) => !!ensureSessionWindow(sessionId, meta || {}),
     setMinimized: (sessionId, minimized) => setSessionWindowMinimized(sessionId, !!minimized),
