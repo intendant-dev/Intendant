@@ -1195,6 +1195,53 @@ owner — instead of waiting unattended; the persistent daemon lane reports the
 outage on the error/presence surfaces and stops parking until the next user
 message re-drives it.
 
+## Parked-task Respawn Honesty (died-with-restart)
+
+A session whose turn ends with armed background commands **parks on them**
+(`parked-on-tasks` activity; the wake is the backend's own
+`task_notification`). Those commands are OS children of the backend process,
+so they die with **every** respawn class — credential reload,
+service-recovery restart, rate-limit restart, daemon restart — while the
+parked claim is session-state and survives. Untreated, that is a
+forever-park waiting on a dead wake (and an accidental drain holdout). The
+honesty machinery:
+
+- **The registry never silently forgets running tasks.** At every seam
+  where the old process objectively dies, its running records flip to a
+  retained `died-with-restart` status with a named cause
+  (`background_tasks::mark_running_died_with_restart`): the
+  credential-reload respawn pre-marks with its own name, the park arms mark
+  when the backend's confirmed-exit probe says the process is gone (an
+  API-500 against a live process marks nothing — the park stays honest),
+  the adapter's shutdown/Drop/re-adoption seams are generic backstops, and
+  the boot + released-predecessor passes stamp `the daemon restart` on
+  dead-boot live parks. Kimi is deliberately exempt: its tasks are
+  server-side and survive a client respawn.
+- **The park flips to an honest attention state.** The marking seam
+  publishes a corrected activity snapshot — state `idle` (the wire truth)
+  with `diedBackgroundTasks`/`diedTasksCause` — sticky in the vitals hub
+  until the session demonstrably works again; the durable
+  `SessionMeta.bg_park` marker shadows the claim across daemon restarts
+  (live form stamped while parked, died form with the cause, cleared on
+  any turn-state publish). The dashboard derives a `died-tasks` display
+  state from it: attention chip, per-task detail, the killing restart
+  named on the inspector rows, and a status pill that says "task died
+  with restart" instead of "Parked"/"Idle".
+- **Re-running is an owner decision — never automatic** (commands are not
+  known idempotent; pinned by
+  `died_with_restart_marking_never_arms_delivery`). The re-run OFFER rides
+  only continuation nudges a lane already sends (the reload continuation,
+  the parks' delivery-aware resume nudges, readopt continuations —
+  `died_tasks_nudge_addendum`, appended only to the synthesized nudge,
+  never to a verbatim re-send of the owner's message, and never minted on
+  its own); the session card's activity chip carries a one-tap "ask the
+  session to re-run it" that sends a normal follow-up through the
+  existing lane.
+- **Drain interplay:** an idle session whose only hold is a died park is
+  releasable (`session_holds_drain` — its wait is on nobody, and the
+  durable marker survives to the successor), while a LIVE bg-park holdout
+  names its tasks on the drain wait set's rows.
+
 ## Dashboard and Station parity
 
 The per-session dashboard features (Activity → Timeline agent windows and the

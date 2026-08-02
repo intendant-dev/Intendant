@@ -49,6 +49,13 @@ pub(crate) struct DrainHoldout {
     pub(crate) phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) limit_park: Option<crate::session_log::SessionLimitParkMeta>,
+    /// The session's durable background-task-park marker, when set: a
+    /// live one names the tasks an idle holdout is honestly waiting on;
+    /// a died one never appears here (died-park idle sessions are
+    /// releasable and leave the wait set). Additive: rows written before
+    /// 2026-08 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bg_park: Option<crate::session_log::SessionBgParkMeta>,
 }
 
 /// Presence-record cap on mirrored holdout rows: the record is a small
@@ -342,6 +349,7 @@ mod tests {
                 resets_at_epoch: Some(1_754_000_000),
                 has_pending: true,
             }),
+            bg_park: None,
         };
         presence.update_state("draining").unwrap();
         presence
@@ -394,6 +402,7 @@ mod tests {
                 name: None,
                 phase: "running".to_string(),
                 limit_park: None,
+                bg_park: None,
             })
             .collect();
         presence

@@ -35,6 +35,13 @@ pub(crate) enum BackgroundTaskStatus {
     Failed,
     /// Killed / cancelled / interrupted (e.g. a TaskStop).
     Stopped,
+    /// The backend process that supervised the task went away (respawn,
+    /// shutdown, restart) while the task was still running — the task was
+    /// its OS child, so it died with it and no notification will ever
+    /// arrive. `BackgroundTaskRecord::died_cause` names the restart.
+    /// Terminal, and never entered from wire words: only the supervision
+    /// seams that observed the process die mark it.
+    DiedWithRestart,
 }
 
 impl BackgroundTaskStatus {
@@ -44,6 +51,7 @@ impl BackgroundTaskStatus {
             BackgroundTaskStatus::Completed => "completed",
             BackgroundTaskStatus::Failed => "failed",
             BackgroundTaskStatus::Stopped => "stopped",
+            BackgroundTaskStatus::DiedWithRestart => "died-with-restart",
         }
     }
 
@@ -85,6 +93,10 @@ pub(crate) struct BackgroundTaskRecord {
     pub(crate) inline_output: Option<Vec<u8>>,
     /// Authoritative total byte count when the backend reports one.
     pub(crate) output_size_bytes: Option<u64>,
+    /// The named restart that killed the task, present exactly when
+    /// `status` is [`BackgroundTaskStatus::DiedWithRestart`] (e.g. "the
+    /// credential-reload restart", "the daemon restart").
+    pub(crate) died_cause: Option<String>,
 }
 
 /// Hard ceiling for one retained inline output preview. It matches the
@@ -217,6 +229,7 @@ impl Registry {
             output_file: None,
             inline_output: None,
             output_size_bytes: None,
+            died_cause: None,
         });
         self.evict_stale_sessions();
     }
@@ -298,9 +311,13 @@ impl Registry {
                 record.output_file = Some(path);
             }
         }
-        // Retention: keep every running record; drop the oldest finished
-        // ones (finishes land in wire order, so list order is age order)
-        // past the bound.
+        Self::trim_finished(entry);
+    }
+
+    /// Retention: keep every running record; drop the oldest finished
+    /// ones (finishes land in wire order, so list order is age order)
+    /// past the bound.
+    fn trim_finished(entry: &mut SessionTasks) {
         let finished = entry
             .records
             .iter()
@@ -317,6 +334,44 @@ impl Registry {
                 }
             });
         }
+    }
+
+    /// A backend restart killed the session's still-running background
+    /// tasks (they were children of the replaced process): flip every
+    /// running record to [`BackgroundTaskStatus::DiedWithRestart`] with
+    /// the named cause and return the flipped records, newest state
+    /// first-hand — the supervision seam that observed the process die
+    /// calls this, then surfaces the honest attention state from the
+    /// returned rows. Records are RETAINED (bounded like any finished
+    /// record): a died task is history the owner can still inspect and
+    /// choose to re-run, unlike a running claim nobody can confirm.
+    /// Sessions with nothing running return empty and stay untouched, so
+    /// pre-marked respawn seams compose with the generic shutdown
+    /// backstop without double-marking.
+    pub(crate) fn mark_running_died_with_restart(
+        &mut self,
+        session_id: &str,
+        cause: &str,
+        died_at_epoch: u64,
+    ) -> Vec<BackgroundTaskRecord> {
+        let Some(entry) = self.sessions.get_mut(session_id.trim()) else {
+            return Vec::new();
+        };
+        let mut died = Vec::new();
+        for record in entry
+            .records
+            .iter_mut()
+            .filter(|record| record.status == BackgroundTaskStatus::Running)
+        {
+            record.status = BackgroundTaskStatus::DiedWithRestart;
+            record.ended_at_epoch = Some(died_at_epoch);
+            record.died_cause = Some(cause.to_string());
+            died.push(record.clone());
+        }
+        if !died.is_empty() {
+            Self::trim_finished(entry);
+        }
+        died
     }
 
     /// Forget a session's records — the wrapper shut down, or a fresh
@@ -444,6 +499,14 @@ pub(crate) fn record_finished(
 
 pub(crate) fn clear_session(session_id: &str) {
     global().clear_session(session_id);
+}
+
+pub(crate) fn mark_running_died_with_restart(
+    session_id: &str,
+    cause: &str,
+    died_at_epoch: u64,
+) -> Vec<BackgroundTaskRecord> {
+    global().mark_running_died_with_restart(session_id, cause, died_at_epoch)
 }
 
 pub(crate) fn tasks_for_session(session_id: &str) -> Vec<BackgroundTaskRecord> {
@@ -658,6 +721,56 @@ mod tests {
                 .is_none(),
             "a newline before any path text means no path on the marker line"
         );
+    }
+
+    #[test]
+    fn died_with_restart_flips_running_only_names_the_cause_and_retains() {
+        let mut reg = Registry::new();
+        let sid = "session-respawn";
+        reg.record_started(sid, "task-live", "toolu_live", "cargo test battery", 100);
+        reg.record_started(sid, "task-done", "toolu_done", "quick job", 101);
+        reg.record_finished(
+            sid,
+            "toolu_done",
+            BackgroundTaskStatus::Completed,
+            None,
+            102,
+        );
+
+        let died = reg.mark_running_died_with_restart(sid, "the credential-reload restart", 160);
+        assert_eq!(died.len(), 1, "only running records flip");
+        assert_eq!(died[0].task_id, "task-live");
+        assert_eq!(died[0].status, BackgroundTaskStatus::DiedWithRestart);
+        assert_eq!(
+            died[0].died_cause.as_deref(),
+            Some("the credential-reload restart")
+        );
+        assert_eq!(died[0].ended_at_epoch, Some(160));
+
+        // The record is RETAINED for the inspector/re-run affordance —
+        // that retention is the whole point of marking over clearing.
+        let kept = reg.find_task(sid, "task-live").expect("died row retained");
+        assert_eq!(kept.status, BackgroundTaskStatus::DiedWithRestart);
+        // Finished records never flip or gain a cause.
+        let done = reg.find_task(sid, "task-done").expect("finished retained");
+        assert_eq!(done.status, BackgroundTaskStatus::Completed);
+        assert!(done.died_cause.is_none());
+
+        // Idempotent: a second (generic backstop) mark finds nothing
+        // running and returns empty without churning the named cause.
+        assert!(reg
+            .mark_running_died_with_restart(sid, "the backend shutdown", 170)
+            .is_empty());
+        let kept = reg.find_task(sid, "task-live").expect("still retained");
+        assert_eq!(
+            kept.died_cause.as_deref(),
+            Some("the credential-reload restart"),
+            "the first, most specific cause stands"
+        );
+        // Unknown sessions mark nothing.
+        assert!(reg
+            .mark_running_died_with_restart("session-unknown", "x", 1)
+            .is_empty());
     }
 
     #[test]

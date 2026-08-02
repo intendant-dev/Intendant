@@ -548,8 +548,16 @@ function sessionWindowPhaseDisplayLabel(sessionId, phase) {
       ? sessionWindows.get(String(sessionId || '').trim())
       : null;
     if (!win?.ended) {
-      const parked = sessionParkedPillLabel(deriveSessionActivity(sessionWireActivity(sessionId)));
+      const act = deriveSessionActivity(sessionWireActivity(sessionId));
+      const parked = sessionParkedPillLabel(act);
       if (parked) return parked;
+      // The wait's honest ending: tasks the park rode died with a
+      // backend restart — say so instead of a bare "Idle" (the re-run
+      // decision is the owner's, one tap away on the activity chip).
+      if (typeof sessionDiedTasksPillLabel === 'function') {
+        const died = sessionDiedTasksPillLabel(act);
+        if (died) return died;
+      }
     }
   }
   if (isAgentActivePhase(p) && canDerive) {
