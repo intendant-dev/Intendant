@@ -787,8 +787,12 @@ async fn run_pass(
         } else {
             // Secondary: standing automations off — plan nothing, fire
             // nothing, deliver nothing. Wake at the poll cadence so a
-            // freed lease converges without owner action.
-            return Some(now_ms() + crate::handover::lease_poll_interval().as_millis() as u64);
+            // freed lease converges without owner action — fast while
+            // this boot is young: a freshly spawned successor (the app
+            // supervisor's swap, the successor-exec lane) must acquire
+            // the drainer's released flock well inside the Q4 watch's
+            // 30 s successor-gone grace, not a full poll interval later.
+            return Some(now_ms() + runtime.secondary_poll_interval().as_millis() as u64);
         }
     }
     let items = handle.snapshot();

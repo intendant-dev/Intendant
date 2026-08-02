@@ -289,6 +289,11 @@ struct CliFlags {
     no_tui: bool,
     mcp: bool,
     autonomy: AutonomyLevel,
+    /// Whether `--autonomy` was passed explicitly (vs the parser
+    /// default). Only [`CliFlags::successor_replay_args`] reads this:
+    /// an unpassed default must not be replayed onto a successor, where
+    /// it would override the config file's choice.
+    autonomy_explicit: bool,
     log_file: Option<String>,
     /// --continue / -c: resume the most recent session for this project.
     continue_last: bool,
@@ -360,6 +365,76 @@ struct CliFlags {
     /// replaces both the `[server.advertise]` config value and the
     /// auto-detected single URL — operator at the CLI wins.
     advertise_urls: Vec<String>,
+}
+
+impl CliFlags {
+    /// The argv a spawned successor daemon boots with (the ruled
+    /// successor-exec lane): every STANDING daemon-shaping flag the
+    /// owner passed explicitly — bind/TLS posture, autonomy, provider
+    /// selection, the external-agent default — replayed verbatim, so
+    /// the successor's exposure and behavior do not silently reset to
+    /// defaults. ONE-SHOT argv never replays: the task and --task-file
+    /// (would re-run work), --continue/--resume (would hijack a session
+    /// the drainer still serves), --takeover (the successor must never
+    /// race the incumbent at boot — ruling binding 3), and the --web
+    /// port (the successor binds its own via `--web 0`). Flags absent
+    /// here re-resolve from config/env on the successor, which is the
+    /// point: only explicit CLI choices pin. A NEW daemon-shaping flag
+    /// must be added here to survive a successor hand-off.
+    pub(crate) fn successor_replay_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = Vec::new();
+        let mut valued = |flag: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                args.push(flag.to_string());
+                args.push(value.clone());
+            }
+        };
+        valued("--provider", &self.provider);
+        valued("--openai-auth", &self.openai_auth);
+        valued("--model", &self.model);
+        valued("--log-file", &self.log_file);
+        valued("--tls-cert", &self.tls_cert);
+        valued("--tls-key", &self.tls_key);
+        valued("--mtls-ca", &self.mtls_ca);
+        if self.autonomy_explicit {
+            args.push("--autonomy".to_string());
+            args.push(self.autonomy.as_str().to_string());
+        }
+        if let Some(bind) = self.web_bind {
+            args.push("--bind".to_string());
+            args.push(bind.to_string());
+        }
+        if let Some(backend) = self.agent_backend {
+            args.push("--agent".to_string());
+            args.push(backend.as_short_str().to_string());
+        }
+        for flag in [
+            ("--verbose", self.verbose),
+            ("--control-socket", self.control_socket),
+            ("--sandbox", self.sandbox),
+            ("--no-sandbox", self.no_sandbox),
+            ("--no-presence", self.no_presence),
+            ("--no-tls", self.no_tls),
+            ("--allow-public-plaintext", self.allow_public_plaintext),
+            ("--tls", self.tls),
+            ("--mtls", self.mtls),
+            ("--transcription", self.transcription),
+        ]
+        .into_iter()
+        .filter_map(|(flag, set)| set.then_some(flag))
+        {
+            args.push(flag.to_string());
+        }
+        for url in &self.advertise_urls {
+            args.push("--advertise-url".to_string());
+            args.push(url.clone());
+        }
+        for id in &self.record_displays {
+            args.push("--record-display".to_string());
+            args.push(id.to_string());
+        }
+        args
+    }
 }
 
 fn print_help() {
@@ -494,6 +569,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
         no_tui: false,
         mcp: false,
         autonomy: AutonomyLevel::Medium,
+        autonomy_explicit: false,
         log_file: None,
         continue_last: false,
         resume_id: None,
@@ -587,6 +663,7 @@ fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerE
             "--autonomy" => {
                 if i + 1 < args.len() {
                     flags.autonomy = AutonomyLevel::from_str_loose(&args[i + 1]);
+                    flags.autonomy_explicit = true;
                     i += 2;
                 } else {
                     return Err(CallerError::Config(
@@ -1781,6 +1858,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -2037,6 +2115,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -2095,6 +2174,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,
@@ -2140,6 +2220,7 @@ Also: {"source": "bare"}"#;
             no_tui: false,
             mcp: false,
             autonomy: AutonomyLevel::Medium,
+            autonomy_explicit: false,
             log_file: None,
             continue_last: false,
             resume_id: None,

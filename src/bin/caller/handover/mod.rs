@@ -24,11 +24,13 @@
 
 mod lease;
 mod presence;
+mod successor_exec;
 mod update_lane;
 mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
 pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence, DrainHoldout};
+pub(crate) use successor_exec::spawn_successor_exec_lane;
 pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane};
 pub(crate) use update_watch::spawn_update_watch;
 
@@ -103,6 +105,15 @@ pub(crate) struct HandoverRuntime {
     /// check/produce actions through it; `status_json` serves its
     /// `update_lane` block. Unset in bare test constructions.
     update_lane: std::sync::OnceLock<std::sync::Arc<update_lane::UpdateLane>>,
+    /// The successor-exec lane (the ruled unsupervised one-click:
+    /// spawn-secondary → readiness → drain on the owner's explicit
+    /// panel click), installed at wiring beside the update lane.
+    /// `status_json` serves its `successor_exec` block. Unset in bare
+    /// test constructions.
+    successor_exec: std::sync::OnceLock<std::sync::Arc<successor_exec::SuccessorExecLane>>,
+    /// This boot's registration instant, for the young-secondary
+    /// convergence window ([`Self::secondary_poll_interval`]).
+    booted_at_ms: u64,
     /// The pid the spawning app supervisor claimed at boot
     /// (`INTENDANT_APP_SUPERVISOR_PID`). The claim alone proves nothing —
     /// [`Self::app_supervised`] re-checks it against the LIVE parent pid,
@@ -159,8 +170,10 @@ impl SwapRefusal {
     pub(crate) fn detail(self) -> &'static str {
         match self {
             SwapRefusal::NoSupervisor => {
-                "no app supervisor is attached to this daemon — nothing can \
-                 spawn the new daemon on this machine's behalf"
+                "no app supervisor is attached to this daemon — the relay has \
+                 nobody to hand the swap to; on a CLI-launched daemon the \
+                 successor-exec lane (the panel's hand-off click) performs the \
+                 update instead"
             }
             SwapRefusal::Draining => {
                 "this daemon is already draining — the update is already in motion"
@@ -310,6 +323,8 @@ impl HandoverRuntime {
             bus: std::sync::OnceLock::new(),
             update_status: std::sync::Mutex::new(None),
             update_lane: std::sync::OnceLock::new(),
+            successor_exec: std::sync::OnceLock::new(),
+            booted_at_ms: now_ms(),
             app_supervisor_pid: claimed_app_supervisor_pid(),
             swap_request: std::sync::Mutex::new(None),
             swap_result: std::sync::Mutex::new(None),
@@ -449,6 +464,42 @@ impl HandoverRuntime {
     /// entry point for the check/produce actions).
     pub(crate) fn update_lane(&self) -> Option<std::sync::Arc<update_lane::UpdateLane>> {
         self.update_lane.get().cloned()
+    }
+
+    /// Install the successor-exec lane (wiring, once). First lane wins.
+    pub(crate) fn set_successor_exec(
+        &self,
+        lane: std::sync::Arc<successor_exec::SuccessorExecLane>,
+    ) {
+        let _ = self.successor_exec.set(lane);
+    }
+
+    /// The successor-exec lane, when this boot wired one (the route
+    /// handler's entry point for the ruled unsupervised one-click).
+    pub(crate) fn successor_exec_lane(
+        &self,
+    ) -> Option<std::sync::Arc<successor_exec::SuccessorExecLane>> {
+        self.successor_exec.get().cloned()
+    }
+
+    /// The scheduler's secondary-idle wake bound. Normally the lease
+    /// poll interval; while this boot is YOUNG it is ~1 s, so a freshly
+    /// spawned successor (the app supervisor's swap, the successor-exec
+    /// lane) converges on the drainer's released flock in about a
+    /// second instead of a full poll interval — which also keeps the Q4
+    /// successor watch's 30 s grace honest (a fresh spawn that idled a
+    /// full 60 s interval would trip a false "successor gone" alarm).
+    /// Polling a HELD flock never wins it, so a young secondary still
+    /// cannot race a live incumbent (the binding-3 posture).
+    pub(crate) fn secondary_poll_interval(&self) -> std::time::Duration {
+        const BOOT_CONVERGENCE_WINDOW_MS: u64 = 90_000;
+        const BOOT_CONVERGENCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+        let interval = lease_poll_interval();
+        if now_ms().saturating_sub(self.booted_at_ms) < BOOT_CONVERGENCE_WINDOW_MS {
+            interval.min(BOOT_CONVERGENCE_POLL)
+        } else {
+            interval
+        }
     }
 
     pub(crate) fn boot_id(&self) -> &str {
@@ -835,6 +886,9 @@ impl HandoverRuntime {
         }
         if let Some(lane) = self.update_lane.get() {
             obj.insert("update_lane".into(), lane.status_block());
+        }
+        if let Some(lane) = self.successor_exec.get() {
+            obj.insert("successor_exec".into(), lane.status_block());
         }
         // The supervisor fact + relay state ride TOP-LEVEL, never inside
         // `update`: the watch task replaces that block wholesale every
