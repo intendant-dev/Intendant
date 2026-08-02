@@ -1215,7 +1215,10 @@ mod tests {
         );
         for needle in [
             "function sessionWindowInterruptedArcState(",
-            "function sessionWindowCloseTitle(",
+            // The interrupted-arc row lives INSIDE the one pure title
+            // matrix (#740's extraction), above its settled rows.
+            "function sessionWindowCloseTitleForSession(",
+            "if (claim.interrupted && (claim.attested !== 'achieved' || claim.worktreeStranded)) {",
             "Interrupted mid-work — resumable",
             "CLOSABLE_CLAIM_QA_VECTORS",
             "closableClaim: {",

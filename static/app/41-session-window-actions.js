@@ -597,6 +597,97 @@ function applySessionWindowPhase(win, sid, phase) {
   // application for the same reason the approval hook above does: the
   // active→done crossing arrives via the fast path AND the wide render.
   maybeAutoMinimizeSubagentWindow(sid);
+  // The × title reads the live phase (the settled and linkless-idle
+  // claims below are phase-guarded) — re-derive on EVERY phase
+  // application: the phase-only fast path never reaches the wide
+  // render's call site.
+  updateSessionWindowCloseTitle(win, sid);
+}
+
+// Track AO safe-to-stop: the × affordance claims exactly what the
+// machine knows — the served stop derivation for agenda-linked
+// sessions; for linkless sessions, "safe" only as the ruled conjunction
+// (idle ∧ no linkage), and a busy linkless session claims NOTHING (the
+// default title stands). Two-axis honesty for the settled claim:
+// "settled" is an agenda-axis fact, so on a window that is not quiet
+// (live phase, no hard-done evidence) the title leads with the live
+// state instead of reading as an all-clear — the pill and the tooltip
+// must never disagree about whether stopping interrupts anything.
+// Quiet mirrors sessionWindowClosableClaim's rule below (hard done, or
+// a present phase normalizing to idle); an absent phase claims nothing
+// in either direction, so it keeps the agenda-axis copy. Pure over an
+// explicit claim so the QA vectors can drive the whole matrix
+// (qa.closableLens.closeTitle / vectors in ui2-activity.js); `linked`
+// here is the ×'s own axis — a served occurrence — not the wider
+// meta.agenda linkage the lens claim reads.
+function sessionWindowCloseTitleClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  const linked = !!claim.linked || !!stop;
+  if (stop === 'kills_live_run') {
+    return 'Stopping kills a live agenda run — the occurrence records failed';
+  }
+  if (stop === 'owed_work') {
+    return 'Agenda work is still owed behind this session — stopping does not settle it';
+  }
+  // Interrupted-arc amendment row (see sessionWindowClosableClaim):
+  // above the settled rows because "settled" names only the agenda-debt
+  // axis and no longer implies an interrupted card is benign — the
+  // title states the mid-work truth with the unconcluded-arc evidence.
+  if (claim.interrupted && (claim.attested !== 'achieved' || claim.worktreeStranded)) {
+    const evidence = [];
+    if (claim.attested !== 'achieved') {
+      evidence.push(claim.attested
+        ? `attested “${claim.attested}”, not achieved`
+        : 'no achieved attestation');
+    }
+    if (claim.worktreeStranded) evidence.push('worktree holds uncommitted or unpushed work');
+    const settledNote = stop === 'settled' ? 'agenda debt settled, but ' : '';
+    return `Interrupted mid-work — resumable. Closing hides the last handle on it (${settledNote}${evidence.join('; ')})`;
+  }
+  if (stop === 'settled') {
+    const nonQuiet = !claim.hardDone
+      && !!claim.phase && normalizeSessionPhase(claim.phase) !== 'idle';
+    if (nonQuiet) {
+      const lead = claim.phaseLabel || sessionPhaseLabel(claim.phase);
+      return `${lead} — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)`;
+    }
+    return 'No agenda-owed work — the linked occurrence is settled';
+  }
+  if (!linked && !!claim.phase && normalizeSessionPhase(claim.phase) === 'idle') {
+    return 'Idle · no agenda-owed work — stopping loses only this session’s context';
+  }
+  return 'Hide or stop session';
+}
+
+// The sid boundary over the pure claim: called from the wide metadata
+// render AND from applySessionWindowPhase above, because the phase-only
+// fast path skips the wide render — a title that read the phase once
+// would otherwise go stale across running⇄idle flips (pre-guard, the
+// linkless Idle· title really did survive into running turns this way).
+// The lead label is the pill's own display label, so the two surfaces
+// can never disagree about the live state.
+function sessionWindowCloseTitleForSession(sid, win) {
+  const occ = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
+  const arc = sessionWindowInterruptedArcState(sid);
+  return sessionWindowCloseTitleClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!occ,
+    phase: win.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+    phaseLabel: sessionWindowPhaseDisplayLabel(sid, win.phase || ''),
+    interrupted: !!arc,
+    attested: arc ? arc.attested : '',
+    worktreeStranded: !!(arc && arc.worktreeStranded),
+  });
+}
+
+function updateSessionWindowCloseTitle(win, sid) {
+  if (!win || !win.close) return;
+  const closeTitle = sessionWindowCloseTitleForSession(sid, win);
+  if (win.close.title !== closeTitle) {
+    win.close.title = closeTitle;
+    win.close.setAttribute('aria-label', closeTitle);
+  }
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -713,17 +804,11 @@ function updateSessionWindow(sessionId, meta = {}) {
   // how it ended (and where its lineage continued) instead of freezing on
   // a mid-execution look.
   renderSessionWindowTerminalNote(win, sid);
-  // Track AO safe-to-stop + the interrupted-arc amendment: the ×
-  // affordance claims exactly what the machine knows. The matrix lives
-  // in sessionWindowCloseTitle (one testable surface, exposed through
-  // window.qa.closableClaim).
-  if (win.close) {
-    const closeTitle = sessionWindowCloseTitle(sid, win);
-    if (win.close.title !== closeTitle) {
-      win.close.title = closeTitle;
-      win.close.setAttribute('aria-label', closeTitle);
-    }
-  }
+  // Track AO safe-to-stop: the × affordance claims exactly what the
+  // machine knows (sessionWindowCloseTitleClaim above; re-derived on
+  // every phase application too — this call covers the agenda-envelope
+  // and ended-bit changes that arrive without a phase flip).
+  updateSessionWindowCloseTitle(win, sid);
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
@@ -1205,43 +1290,6 @@ function sessionWindowInterruptedArcState(sessionId) {
   };
 }
 
-// The × affordance's tooltip matrix, one testable surface (Track AO +
-// the interrupted-arc amendment): live agenda debt outranks everything;
-// the interrupted-arc statement whenever the arc looks unconcluded —
-// deliberately ABOVE the settled row, because "settled" names only the
-// agenda-debt axis and no longer implies an interrupted card is benign;
-// then the ruled settled and linkless-idle rows; a busy linkless
-// session claims NOTHING (the default title stands).
-function sessionWindowCloseTitle(sessionId, win) {
-  const sid = String(sessionId || '').trim();
-  const agendaOcc = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
-  const arc = sessionWindowInterruptedArcState(sid);
-  if (agendaOcc && agendaOcc.stop === 'kills_live_run') {
-    return 'Stopping kills a live agenda run — the occurrence records failed';
-  }
-  if (agendaOcc && agendaOcc.stop === 'owed_work') {
-    return 'Agenda work is still owed behind this session — stopping does not settle it';
-  }
-  if (arc && !arc.concluded) {
-    const evidence = [];
-    if (arc.attested !== 'achieved') {
-      evidence.push(arc.attested
-        ? `attested “${arc.attested}”, not achieved`
-        : 'no achieved attestation');
-    }
-    if (arc.worktreeStranded) evidence.push('worktree holds uncommitted or unpushed work');
-    const settledNote = agendaOcc && agendaOcc.stop === 'settled' ? 'agenda debt settled, but ' : '';
-    return `Interrupted mid-work — resumable. Closing hides the last handle on it (${settledNote}${evidence.join('; ')})`;
-  }
-  if (agendaOcc && agendaOcc.stop === 'settled') {
-    return 'No agenda-owed work — the linked occurrence is settled';
-  }
-  if (!agendaOcc && win && win.phase === 'idle') {
-    return 'Idle · no agenda-owed work — stopping loses only this session’s context';
-  }
-  return 'Hide or stop session';
-}
-
 // The sid boundary over the pure claim above: every input is a fact some
 // shipped surface already trusts — the served envelope in
 // sessionMetadataById, the ×'s win.phase, the sweeps' hard-done
@@ -1301,7 +1349,7 @@ window.qa = Object.assign(window.qa || {}, {
     closeTitle: (sessionId) => {
       const sid = String(sessionId || '').trim();
       const win = sid ? sessionWindows.get(sid) : null;
-      return win ? sessionWindowCloseTitle(sid, win) : '';
+      return win ? sessionWindowCloseTitleForSession(sid, win) : '';
     },
     vectors: () => CLOSABLE_CLAIM_QA_VECTORS.map((vector) => {
       const got = sessionWindowClosableClaim(vector.claim);

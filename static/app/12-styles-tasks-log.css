@@ -990,7 +990,8 @@ body.context-focus-active {
    walk from the positive safe-to-stop claims): every card the machine
    does NOT rule safe recedes, the closable set keeps full presence with
    a quiet affirmative ring. Positive-only — the dim says "look here",
-   never "unsafe". */
+   never "unsafe" — and while engaged the direction is stated on-canvas
+   (the chip's flipped copy + the ui2-grid.css legend), never hover-only. */
 html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
   opacity: 0.35;
   filter: saturate(0.55);
