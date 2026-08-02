@@ -205,6 +205,21 @@ impl GridEnvelopeJoins {
             row["agenda"] = block;
         }
 
+        // Worktree state — the stranded-work axis (dirty / unpushed /
+        // ahead), probed from the daemon's worktree knowledge
+        // (worktree_inventory's serve-time memo). Attached post
+        // row-cache like the other blocks: tree state moves without
+        // touching the session dir. The path comes from the row's own
+        // recorded linkage; without linkage, a cwd or project root
+        // under a `.worktrees` directory (the external-seat convention)
+        // qualifies — never a main checkout, whose dirtiness says
+        // nothing about THIS session's arc. Missing/unknown serve
+        // state-only: honest ignorance, never a guessed clean.
+        if let Some(path) = row_worktree_path(row) {
+            let state = crate::worktree_inventory::cached_worktree_git_state(&path);
+            row["worktree_state"] = worktree_state_json(&state);
+        }
+
         let (Some(boot), Some(live)) = (self.boot.as_ref(), self.live_wrappers.as_ref()) else {
             return;
         };
@@ -261,6 +276,53 @@ impl GridEnvelopeJoins {
         }
         row["boot"] = boot_block;
     }
+}
+
+/// The checkout path whose git state speaks for this row's arc:
+/// recorded worktree linkage first (session_meta.json, native worktree
+/// launches), else a cwd/project-root under a `.worktrees` directory —
+/// the convention external seats create their own checkouts under. A
+/// main checkout never qualifies: its dirtiness is the merge target's,
+/// not this session's.
+fn row_worktree_path(row: &serde_json::Value) -> Option<PathBuf> {
+    if let Some(path) = row["worktree"]["path"].as_str().filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    for key in ["cwd", "project_root"] {
+        if let Some(path) = row[key].as_str().filter(|s| !s.is_empty()) {
+            let path = Path::new(path);
+            if path
+                .components()
+                .any(|component| component.as_os_str() == ".worktrees")
+            {
+                return Some(path.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// The `worktree_state` wire block: `state` always; the probed facts
+/// (`dirty`/`unpushed`/`ahead`, `branch`) only when the probe answered
+/// (`clean`/`dirty`) — `missing`/`unknown` carry no fact fields.
+fn worktree_state_json(state: &crate::worktree_inventory::WorktreeGitState) -> serde_json::Value {
+    use crate::worktree_inventory::WorktreeStateKind;
+    let mut block = serde_json::json!({
+        "state": state.kind.as_str(),
+        "checked_ms": state.checked_ms,
+    });
+    if matches!(
+        state.kind,
+        WorktreeStateKind::Clean | WorktreeStateKind::Dirty
+    ) {
+        block["dirty"] = serde_json::Value::Bool(state.dirty);
+        block["unpushed"] = serde_json::Value::Bool(state.unpushed);
+        block["ahead"] = serde_json::json!(state.ahead);
+        if let Some(branch) = state.branch.as_ref() {
+            block["branch"] = serde_json::Value::String(branch.clone());
+        }
+    }
+    block
 }
 
 /// Where a dead row's lineage stands: no recorded wrapper history (native
@@ -677,6 +739,11 @@ mod tests {
             "lineage_tip",
             "continued_as",
             "raw.terminal",
+            // The stranded-work axis: served worktree state consumed by
+            // the normalize + chip surfaces.
+            "worktree_state",
+            "normalizeSessionWorktreeState(",
+            "'worktree-state'",
         ] {
             assert!(
                 fragment.contains(needle),
@@ -1006,10 +1073,17 @@ mod tests {
         );
         assert_eq!(relive["boot"]["continued_as"]["live"], true);
 
+        // The affordance split (card 01KYRN634DYZEXN251N7JJXVY5) must
+        // survive too: the cross-window pointer stays a link, the
+        // same-window fold renders prose — never a link with no effect.
         let fragment = include_str!("../../../../../static/app/39-session-windows.js");
         for needle in [
-            "continued as ${continuationLabel}",
+            "continued as ${label}",
             "session-window-terminal-continued",
+            "session-window-terminal-continued-here",
+            "this window continues",
+            "sessionWindowContinuationPlan(",
+            "sessionWindowContinuationTargetIsThisWindow(",
             "openSessionWindowForContinuation(",
         ] {
             assert!(
@@ -1115,6 +1189,132 @@ mod tests {
         assert!(
             fragment.contains("${meta.boot.sourceSessionId || ''}"),
             "the metadata signature lost the boot writer segment — same-bit writer handoffs would never land in the store"
+        );
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The interrupted-arc closability amendment (2026-08-01, lex
+    /// posterior over the ruled conjunction's CLOSABLE application —
+    /// stop-safety untouched), byte-pinned where it bites: the claim
+    /// function's interrupted guard, the arc-evidence helper, the
+    /// mid-work card copy, the extracted tooltip matrix, and the QA
+    /// vector facade. A behavior change must move these pins and the
+    /// fragment together.
+    #[test]
+    fn interrupted_arc_closable_amendment_pinned() {
+        let actions = include_str!("../../../../../static/app/41-session-window-actions.js");
+        let guard = "  if (claim.interrupted) {\n    if (claim.attested !== 'achieved' || claim.worktreeStranded) return false;\n  }";
+        assert!(
+            actions.contains(guard),
+            "the closable claim's interrupted guard drifted from the amendment"
+        );
+        for needle in [
+            "function sessionWindowInterruptedArcState(",
+            // The interrupted-arc row lives INSIDE the one pure title
+            // matrix (#740's extraction), above its settled rows.
+            "function sessionWindowCloseTitleForSession(",
+            "if (claim.interrupted && (claim.attested !== 'achieved' || claim.worktreeStranded)) {",
+            "Interrupted mid-work — resumable",
+            "CLOSABLE_CLAIM_QA_VECTORS",
+            "closableClaim: {",
+            "const worktreeStranded = !!(ws && (ws.dirty || ws.unpushed));",
+        ] {
+            assert!(
+                actions.contains(needle),
+                "the actions fragment lost the interrupted-arc amendment surface: {needle}"
+            );
+        }
+        // Stop-safety semantics unchanged: interrupted remains HARD done
+        // evidence for the sweeps and the stop flow.
+        assert!(
+            actions.contains(
+                "return !!(win.ended || meta.ended) || phase === 'done' || phase === 'interrupted';"
+            ),
+            "hard done evidence must keep interrupted — only the CLOSABLE application was amended"
+        );
+    }
+
+    /// The stranded-work axis rides the row: a dirty, never-pushed
+    /// checkout named by the row's recorded worktree linkage serves the
+    /// probed facts — independent of the boot/agenda joins.
+    #[test]
+    fn worktree_state_rides_the_row() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, &["init"]);
+        git(&checkout, &["checkout", "-b", "seat-branch"]);
+        git(&checkout, &["config", "user.email", "t@example.com"]);
+        git(&checkout, &["config", "user.name", "T"]);
+        std::fs::write(checkout.join("README.md"), "hi\n").unwrap();
+        git(&checkout, &["add", "README.md"]);
+        git(&checkout, &["commit", "-m", "initial"]);
+        std::fs::write(checkout.join("scratch.txt"), "local\n").unwrap();
+        crate::worktree_inventory::probe_and_memoize_worktree_git_state(&checkout);
+
+        let dir = session_dir_with_transcript(root.path(), "s1");
+        let mut row = serde_json::json!({
+            "worktree": {"branch": "seat-branch", "path": checkout.to_string_lossy()},
+        });
+        joins(None, None, None).attach(&mut row, "s1", &dir);
+        assert_eq!(row["worktree_state"]["state"], "dirty");
+        assert_eq!(row["worktree_state"]["dirty"], true);
+        assert_eq!(
+            row["worktree_state"]["unpushed"], true,
+            "a remoteless checkout's commits exist nowhere else"
+        );
+        assert_eq!(row["worktree_state"]["branch"], "seat-branch");
+        assert!(row["worktree_state"]["checked_ms"].as_u64().unwrap() > 0);
+    }
+
+    /// Honest degradation + scope: a gone linkage path serves state-only
+    /// `missing`; a linkage-less cwd qualifies only under a `.worktrees`
+    /// directory (honest `unknown` for a non-git dir); a main-checkout
+    /// cwd serves NO block — its dirtiness is the merge target's, not
+    /// this session's.
+    #[test]
+    fn worktree_state_degrades_and_scopes_honestly() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = session_dir_with_transcript(root.path(), "s1");
+
+        let mut row = serde_json::json!({
+            "worktree": {"branch": "b", "path": root.path().join("reclaimed").to_string_lossy()},
+        });
+        joins(None, None, None).attach(&mut row, "s1", &dir);
+        assert_eq!(row["worktree_state"]["state"], "missing");
+        assert!(
+            row["worktree_state"].get("dirty").is_none(),
+            "missing serves no fact fields"
+        );
+
+        let seat = root.path().join(".worktrees").join("seat");
+        std::fs::create_dir_all(&seat).unwrap();
+        let mut row = serde_json::json!({ "cwd": seat.to_string_lossy() });
+        joins(None, None, None).attach(&mut row, "s2", &dir);
+        assert_eq!(
+            row["worktree_state"]["state"], "unknown",
+            "first sight of a non-git seat dir is honest ignorance"
+        );
+
+        let repo_root = root.path().join("repo-root");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let mut row = serde_json::json!({ "cwd": repo_root.to_string_lossy() });
+        joins(None, None, None).attach(&mut row, "s3", &dir);
+        assert!(
+            row.get("worktree_state").is_none(),
+            "a main checkout never speaks for a session's arc"
         );
     }
 }

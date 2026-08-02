@@ -1713,6 +1713,135 @@ mod tests {
         );
     }
 
+    /// The presentation half of card 01KYZSPQ6Q… (second strike of the
+    /// banner-wall class): BOTH handover banner kinds — draining and
+    /// predecessor — collapse to a pill persisted per (kind, boot id),
+    /// with the update chip's standing-fact semantics: an unseen fact
+    /// announces itself expanded once, a collapse survives renders and
+    /// reloads, and no dismiss lane exists. The stored-state writes
+    /// stay singular (one collapse emitter, one expand emitter), both
+    /// kinds route through the one collapse gate, and the #729 wait
+    /// set + successor doorway live in the expanded form only.
+    #[test]
+    fn handover_banners_collapse_to_pills_and_persist() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            // The per-(kind, boot) storage key and the round-trip:
+            // read at render, written on both transitions, stale keys
+            // pruned on write.
+            "handover-banner:",
+            "bannerStateKey('draining', body.boot_id)",
+            "bannerStateKey('predecessor'",
+            "bannerStoredState(key) === 'collapsed'",
+            "bannerStoreState(key, 'collapsed')",
+            "bannerStoreState(key, 'expanded')",
+            "indexOf('handover-banner:') === 0",
+            // The collapse affordance, the pill's expand affordance,
+            // and the QA driver's round-trip hook.
+            "handover-banner-collapse",
+            "handover-banner-open",
+            "stateKey: bannerStateKey",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the handover banners lost their collapse machinery: {needle}"
+            );
+        }
+        // Emission shapes stay singular: one stored-state write per
+        // transition (definition + two call sites), one class toggle
+        // shared by both kinds (the chip keeps its own).
+        assert_eq!(fragment.matches("bannerStoreState(").count(), 3);
+        assert_eq!(
+            fragment
+                .matches("bannerStoreState(key, 'collapsed')")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fragment
+                .matches("bannerStoreState(key, 'expanded')")
+                .count(),
+            1
+        );
+        assert_eq!(fragment.matches("classList.toggle('collapsed'").count(), 2);
+        // Both collapse buttons stop their click from bubbling into
+        // the expand handler the collapsed re-render installs on the
+        // container — without this the collapse self-reverts on the
+        // same click (probe-caught live on the banner AND the chip).
+        assert_eq!(fragment.matches("ev.stopPropagation()").count(), 2);
+        // Both kinds still emit their identity for the styling split.
+        assert!(fragment.contains("el.dataset.kind = 'draining';"));
+        assert!(fragment.contains("el.dataset.kind = 'predecessor';"));
+        // The expanded form keeps the #729 honesty rows (the pill pins
+        // above assert the collapsed arm returns before building them).
+        assert!(fragment.contains("handoverHoldoutList"));
+        assert!(fragment.contains("Open the successor daemon"));
+        let styles = include_str!("../../../../static/app/ui2-handover.css");
+        assert!(
+            styles.contains(".handover-banner.collapsed"),
+            "the collapsed banner pill lost its styles"
+        );
+        assert!(
+            styles.contains(".handover-banner-collapse"),
+            "the banner collapse affordance lost its styles"
+        );
+    }
+
+    /// The placement half of card 01KYZSPQ6Q…: the banner docks UNDER
+    /// the oversight bar and reserves its measured height through
+    /// --ui2-handover-h (the --ui2-composer-h pattern), and every
+    /// fixed element hanging off the bar consumes the reservation —
+    /// so neither banner form can overlap interactive chrome. The
+    /// per-file pins keep a future geometry edit from silently
+    /// dropping one consumer.
+    #[test]
+    fn handover_banner_docks_and_reserves_its_height() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        assert!(
+            fragment.contains("--ui2-handover-h"),
+            "the banner no longer maintains its height reservation"
+        );
+        let banner = include_str!("../../../../static/app/ui2-handover.css");
+        assert!(
+            banner.contains("top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t))"),
+            "the banner strip no longer docks under the oversight bar"
+        );
+        let chrome = include_str!("../../../../static/app/ui2-chrome.css");
+        assert!(
+            chrome.contains("--ui2-handover-h: 0px"),
+            "the shell lost the reservation variable's declaration"
+        );
+        // #app's top padding and the attention popover both offset.
+        assert_eq!(
+            chrome.matches("var(--ui2-handover-h)").count(),
+            2,
+            "a chrome consumer of the handover reservation went missing"
+        );
+        let voice = include_str!("../../../../static/app/ui2-voice.css");
+        assert!(
+            voice.contains("var(--ui2-handover-h)"),
+            "the voice panel no longer offsets under the banner strip"
+        );
+        let inspector = include_str!("../../../../static/app/ui2-agenda-inspector.css");
+        assert!(
+            inspector.contains("var(--ui2-handover-h"),
+            "the narrow-viewport agenda inspector no longer offsets under the banner strip"
+        );
+        // And the served bundle carries the whole wiring.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "bannerStateKey('predecessor'",
+            "handover-banner-collapse",
+            "--ui2-handover-h: 0px",
+            "stateKey: bannerStateKey",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the banner pill wiring: {needle}"
+            );
+        }
+    }
+
     /// Commission pin `cli_daemon_button_is_honest_about_its_reach`: on
     /// a CLI-launched daemon the chip can drain THIS daemon toward an
     /// already-running newer one (the takeover lane), and when none is

@@ -10,6 +10,14 @@
 //   - other co-homed daemons draining (all of them, not just the
 //     first): a predecessor section each, with its remaining count, its
 //     named holdout rows off the presence record, and a doorway to it.
+//     Both banner kinds render in a strip DOCKED under the oversight
+//     bar — its measured height rides --ui2-handover-h (the
+//     --ui2-composer-h reservation pattern), so neither form ever
+//     covers the tab chrome — and each collapses to a one-line pill
+//     under the update chip's standing-fact pattern, persisted per
+//     (kind, boot id): an unseen fact announces itself expanded once,
+//     a collapse then holds across renders and reloads, and there is
+//     deliberately no dismiss while the fact is true.
 //   - a newer/changed binary on disk (the daemon's update watch): the
 //     bottom-corner update chip with both builds' provenance and the
 //     keychain/TCC honesty line where it applies. Collapsible to a
@@ -400,7 +408,10 @@
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', 'Collapse the update chip to a pill');
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // Same bubble hazard as the banner's collapse: the collapsed
+      // re-render puts the expand handler on this click's path.
+      ev.stopPropagation();
       updateAction.note = '';
       updateChipStoreState(sha, 'collapsed');
       handoverUpdateRender(lastHandoverBody);
@@ -454,18 +465,142 @@
     }
   }
 
+  let bannerResize = null;
+
   function handoverBanner() {
     if (!bannerEl) {
       bannerEl = document.createElement('div');
       bannerEl.id = 'handover-banner';
       bannerEl.className = 'handover-banner';
       document.body.appendChild(bannerEl);
+      if (typeof ResizeObserver === 'function') {
+        bannerResize = new ResizeObserver(handoverBannerReserve);
+        bannerResize.observe(bannerEl);
+      } else {
+        window.addEventListener('resize', handoverBannerReserve);
+      }
     }
     return bannerEl;
   }
 
   function handoverClear() {
-    if (bannerEl) { bannerEl.remove(); bannerEl = null; }
+    if (bannerEl) {
+      if (bannerResize) { bannerResize.disconnect(); bannerResize = null; }
+      window.removeEventListener('resize', handoverBannerReserve);
+      bannerEl.remove();
+      bannerEl = null;
+    }
+    handoverBannerReserve();
+  }
+
+  // The strip reserves its own real height: #app's top padding and the
+  // fixed panels hanging off the oversight bar all offset by
+  // --ui2-handover-h (the --ui2-composer-h pattern), so the banner —
+  // expanded or collapsed — displaces content instead of covering it.
+  function handoverBannerReserve() {
+    const h = bannerEl ? Math.ceil(bannerEl.getBoundingClientRect().height) : 0;
+    document.documentElement.style.setProperty('--ui2-handover-h', (h > 0 ? h : 0) + 'px');
+  }
+
+  // Collapsed-state persistence for the banners, PER (kind, boot id) —
+  // the update chip's per-sha pattern verbatim: a never-seen fact (this
+  // daemon's drain, a given set of draining predecessors) renders the
+  // full banner once; the owner's collapse then persists for that fact
+  // — across polls and reloads — as a one-line pill that keeps it
+  // discoverable without walling anything. There is deliberately NO
+  // dismiss: some rendering of the fact always stands while it is true
+  // (a drain in motion must not be forgettable), only its size is the
+  // owner's choice. A new boot, or a changed predecessor set, starts
+  // fresh.
+  function bannerStateKey(kind, bootId) {
+    return 'handover-banner:' + kind + ':' + (bootId || 'unknown');
+  }
+  function bannerStoredState(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  }
+  function bannerStoreState(key, state) {
+    try {
+      // One live banner fact at a time — stale keys go as we write.
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('handover-banner:') === 0 && k !== key) {
+          localStorage.removeItem(k);
+        }
+      }
+      localStorage.setItem(key, state);
+    } catch (_) { /* storage unavailable — the choice lives for this page only */ }
+  }
+
+  // Applies the stored choice to the element and strips pill-only
+  // attributes when expanded; both kinds route through here.
+  function bannerCollapsedNow(el, key) {
+    const collapsed = bannerStoredState(key) === 'collapsed';
+    el.classList.toggle('collapsed', collapsed);
+    if (!collapsed) {
+      el.onclick = null;
+      el.onkeydown = null;
+      el.removeAttribute('role');
+      el.removeAttribute('tabindex');
+      el.removeAttribute('title');
+    }
+    return collapsed;
+  }
+
+  // The one-line pill: the whole strip is the expand affordance
+  // (click or Enter/Space), and the trailing "(open)" names it.
+  function bannerFillPill(el, key, label) {
+    el.title = 'Click to expand.';
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    const expand = () => {
+      bannerStoreState(key, 'expanded');
+      handoverRender(lastHandoverBody);
+    };
+    el.onclick = expand;
+    el.onkeydown = (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); expand(); }
+    };
+    el.appendChild(document.createTextNode(label + ' '));
+    const open = document.createElement('span');
+    open.className = 'handover-banner-open';
+    open.textContent = '(open)';
+    el.appendChild(open);
+  }
+
+  function bannerCollapseButton(key, ariaLabel) {
+    const collapse = document.createElement('button');
+    collapse.type = 'button';
+    collapse.className = 'handover-banner-collapse';
+    collapse.textContent = '–';
+    collapse.title = 'Collapse to a pill — the fact stays visible';
+    collapse.setAttribute('aria-label', ariaLabel);
+    collapse.addEventListener('click', (ev) => {
+      // The container is the pill's expand affordance: the re-render
+      // installs its handler on the still-bubbling click's path, so an
+      // unstopped collapse click would expand right back (probe-caught
+      // live on both this banner and the update chip).
+      ev.stopPropagation();
+      bannerStoreState(key, 'collapsed');
+      handoverRender(lastHandoverBody);
+    });
+    return collapse;
+  }
+
+  // The predecessor pill's one line, honest about what is known: the
+  // port when there is one predecessor, the summed still-finishing
+  // count only when every predecessor reports one.
+  function bannerPredecessorPill(others) {
+    const counts = others.map((d) => Number(d && d.session_count));
+    const total = counts.every((n) => Number.isFinite(n) && n >= 0)
+      ? counts.reduce((a, b) => a + b, 0)
+      : null;
+    const finishing = total === null ? '' : ` — ${total} session${total === 1 ? '' : 's'} finishing`;
+    if (others.length === 1) {
+      const port = Number(others[0] && others[0].port);
+      const where = Number.isFinite(port) && port > 0 ? ` on :${port}` : '';
+      return `A predecessor daemon is draining${where}${finishing}`;
+    }
+    return `${others.length} predecessor daemons are draining${finishing}`;
   }
 
   function handoverSuccessorPort(body) {
@@ -584,12 +719,21 @@
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
+      const key = bannerStateKey('draining', body.boot_id);
+      const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
+      if (bannerCollapsedNow(el, key)) {
+        bannerFillPill(el, key, rows.length
+          ? `This daemon is draining — waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}`
+          : 'This daemon is draining — in-flight sessions are finishing');
+        handoverBannerReserve();
+        return;
+      }
+      el.appendChild(bannerCollapseButton(key, 'Collapse the drain banner to a pill'));
       const head = document.createElement('div');
       head.className = 'handover-banner-head';
       const lead = document.createElement('strong');
       lead.textContent = 'This daemon is draining.';
       head.appendChild(lead);
-      const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
       const tail = document.createElement('span');
       tail.textContent = rows.length
         ? ` Waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}, then it exits.`
@@ -605,6 +749,7 @@
         el.appendChild(none);
       }
       if (rows.length) el.appendChild(handoverHoldoutList(rows, rows.length));
+      handoverBannerReserve();
       return;
     }
     const others = Array.isArray(body.daemons)
@@ -614,6 +759,17 @@
       const el = handoverBanner();
       el.dataset.kind = 'predecessor';
       el.textContent = '';
+      // The fact identity is the SET of draining predecessor boots: a
+      // predecessor appearing (or the set changing) announces expanded
+      // once; the same set stays as the owner left it.
+      const key = bannerStateKey('predecessor',
+        others.map((d) => String((d && d.boot_id) || 'unknown')).sort().join('+'));
+      if (bannerCollapsedNow(el, key)) {
+        bannerFillPill(el, key, bannerPredecessorPill(others));
+        handoverBannerReserve();
+        return;
+      }
+      el.appendChild(bannerCollapseButton(key, 'Collapse the predecessor banner to a pill'));
       others.forEach((d) => {
         const port = Number(d.port);
         const count = Number(d.session_count);
@@ -638,6 +794,7 @@
         section.appendChild(note);
         el.appendChild(section);
       });
+      handoverBannerReserve();
       return;
     }
     handoverClear();
@@ -662,9 +819,11 @@
   };
   // Same tokenless-QA posture for the drain banner: probes feed a
   // synthetic handover body and assert the named wait set + the
-  // successor doorway render.
+  // successor doorway render; `stateKey` lets them seed and read the
+  // per-(kind, boot) collapse choice to walk the pill round-trip.
   window.qa.handoverBanner = {
     render: (body) => handoverRender(body),
+    stateKey: bannerStateKey,
   };
 
   // The palette's dynamic entry, as data (ui2-chrome reads this by name

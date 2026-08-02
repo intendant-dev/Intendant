@@ -4717,7 +4717,8 @@ body.context-focus-active {
    walk from the positive safe-to-stop claims): every card the machine
    does NOT rule safe recedes, the closable set keeps full presence with
    a quiet affirmative ring. Positive-only — the dim says "look here",
-   never "unsafe". */
+   never "unsafe" — and while engaged the direction is stated on-canvas
+   (the chip's flipped copy + the ui2-grid.css legend), never hover-only. */
 html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
   opacity: 0.35;
   filter: saturate(0.55);
@@ -4751,6 +4752,20 @@ html[data-ui2-closable-lens="on"] .session-window.session-window-closable {
 }
 .session-window .session-window-terminal-continued:hover {
   text-decoration-style: solid;
+}
+/* Same-window fold (the resume shape): the pointer's target IS this
+   window — the successor's transcript streams below the note — so the
+   affordance is prose plus a courtesy scroll-to-tail, never a link that
+   goes nowhere. */
+.session-window .session-window-terminal-continued-here {
+  cursor: pointer;
+}
+.session-window .session-window-terminal-continued-here::after {
+  content: ' \2193';
+  opacity: 0.7;
+}
+.session-window .session-window-terminal-continued-here:hover {
+  text-decoration: underline dotted;
 }
 .session-window.minimized {
   min-height: 36px;
@@ -13642,11 +13657,16 @@ html.ui-v2 {
   --ui2-composer-off: 16px;
   --ui2-composer-h: 62px;
   --ui2-kb-inset: 0px;
+  /* Handover strip reservation: ui2-handover.js keeps this at the
+     drain/predecessor banner's REAL rendered height (0 when absent), so
+     the strip docks under the oversight bar and displaces #app and the
+     bar-adjacent popovers instead of covering chrome. */
+  --ui2-handover-h: 0px;
 }
 
 html.ui-v2 #app {
   padding-left: var(--ui2-nav-edge);
-  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + var(--ui2-handover-h));
   padding-right: var(--ui2-sa-r);
 }
 
@@ -14025,7 +14045,7 @@ html.ui-v2 .ui2-attention-count {
 
 html.ui-v2 #ui2-attention-pop {
   position: fixed; z-index: 230;
-  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + 6px);
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + var(--ui2-handover-h) + 6px);
   right: calc(12px + var(--ui2-sa-r));
   width: 390px; max-width: calc(100vw - 24px);
   max-height: min(68vh, 560px);
@@ -14412,7 +14432,7 @@ html.ui-v2 .ui2-micbtn[data-state="error"] .ui2-micbtn-dot { background: var(--r
 
 html.ui-v2 #ui2-voice-panel {
   position: fixed;
-  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + 8px);
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + var(--ui2-handover-h) + 8px);
   right: calc(18px + var(--ui2-sa-r)); /* shares the oversight bar's content edge */
   width: min(320px, calc(100vw - 36px));
   z-index: 90;                     /* above content + composer (70), below ⌘K (100) */
@@ -25731,7 +25751,7 @@ html.ui-v2 .ag2-inspector-backdrop { display: none; }
 @media (max-width: 1179px) {
   html.ui-v2 .ag2-inspector {
     position: fixed;
-    top: var(--ui2-ovs-h, 48px);
+    top: calc(var(--ui2-ovs-h, 48px) + var(--ui2-handover-h, 0px));
     right: 0;
     bottom: 0;
     width: 0;
@@ -27349,27 +27369,74 @@ html.ui-v2 .memory-judge-strip select {
   max-width: 340px;
 }
 /* ── static/app/ui2-handover.css ── */
-/* ── ui2-handover — drain banner + predecessor chip (Track HS5) ────── */
+/* ── ui2-handover — drain banner + predecessor chip (Track HS5) ──────
+   Placement/z audit (the owner-hit wall class): both banner kinds dock
+   as a strip UNDER the oversight bar, never over the tab chrome. The
+   strip's real height rides --ui2-handover-h (JS-measured, the
+   --ui2-composer-h reservation pattern), and every fixed element
+   hanging off the bar — #app's top padding, the attention popover, the
+   voice panel, the narrow-viewport agenda inspector — offsets by it,
+   so expanded or collapsed the banner displaces content instead of
+   covering it. z sits above pane chrome (agenda inspector 57) and
+   below user-invoked overlays (voice 90, ⌘K 100, attention 230), which
+   the reservation displaces out of contest anyway. ─────────────────── */
 html.ui-v2 .handover-banner {
   position: fixed;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 240;
-  max-width: min(720px, calc(100vw - 32px));
-  padding: 8px 14px;
-  border-radius: 8px;
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  left: var(--ui2-nav-edge);
+  right: var(--ui2-sa-r);
+  z-index: 88;
+  padding: 8px 18px;
   font-size: 13px;
   line-height: 1.4;
   color: var(--text, #e6e6e6);
   background: var(--surface1, rgba(40, 40, 48, 0.96));
-  border: 1px solid var(--warning, #e5a50a);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+  border-bottom: 1px solid var(--warning, #e5a50a);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
+}
+html.ui-v2 .handover-banner:not(.collapsed) {
+  padding-right: 44px; /* clear the corner collapse button */
 }
 html.ui-v2 .handover-banner[data-kind='predecessor'] {
-  border-color: var(--accent, #62a0ea);
+  border-bottom-color: var(--accent, #62a0ea);
   font-size: 12px;
-  padding: 6px 12px;
+}
+/* The collapsed pill: the same standing fact on one line — click (or
+   Enter/Space) expands; there is deliberately no dismissed state while
+   the drain is true. */
+html.ui-v2 .handover-banner.collapsed {
+  padding: 3px 18px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
+}
+html.ui-v2 .handover-banner.collapsed:hover {
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+html.ui-v2 .handover-banner-open {
+  color: var(--accent, #62a0ea);
+  font-weight: 600;
+}
+html.ui-v2 .handover-banner-collapse {
+  position: absolute;
+  top: 4px;
+  right: 10px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted, #7e8896);
+  font-size: 14px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+html.ui-v2 .handover-banner-collapse:hover {
+  color: var(--accent, #62a0ea);
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
 }
 html.ui-v2 .handover-banner a {
   color: var(--accent, #62a0ea);
@@ -27914,6 +27981,58 @@ html.ui-v2 .session-lane-legend .lane-legend-side i {
   background: repeating-linear-gradient(90deg, rgba(var(--violet-rgb), .8) 0 4px, transparent 4px 7px);
 }
 html.ui-v2 .session-lane-legend .lane-legend-count { margin-left: auto; }
+
+/* Closable-lens legend: the engaged lens's on-canvas direction statement
+   (markup beside the lane legend in 20-shell.html; ui2-activity.js wires
+   Show all to the same disengage the chip toggles). Display keys on the
+   html attribute the lens toggle stamps — the legend can never outlive
+   the lens — and inherits the lane legend's grid-only + maximized gates:
+   Focus hides the cards the statement is about, and navigating away
+   disengages the lens anyway. */
+html.ui-v2 .ui2-closable-lens-legend {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 0;
+  background: var(--bg);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+html.ui-v2[data-ui2-closable-lens="on"] .ui2-closable-lens-legend { display: flex; }
+html.ui-v2:not([data-ui2-layout="grid"]) .ui2-closable-lens-legend,
+html.ui-v2[data-ui2-layout="grid"]:has(#session-window-grid.maximized) .ui2-closable-lens-legend {
+  display: none;
+}
+/* The swatch echoes the closable cards' affirmative green ring — the
+   legend's "bright" and the grid's ring read as the same mark. */
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-swatch {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--green) 18%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 55%, transparent);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off {
+  margin-left: auto;
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color var(--t-fast), background var(--t-fast);
+}
+html.ui-v2 .ui2-closable-lens-legend .ui2-closable-lens-legend-off:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
 
 /* — window card (design-system polish: no shadow at rest — shadows are
      reserved for overlays, primary buttons, and the approval hero) — */
@@ -32377,11 +32496,16 @@ html.ui-v2 .daemon-relay-note {
                41-session-window-actions.js; the count and each card's
                class derive in ui2-activity.js's Arrange walk). Hidden at
                zero — never "0 closable" — and engaging it dims every
-               other card. -->
+               other card. While engaged the chip's own text states the
+               direction ("N safe to close · rest dimmed") and the legend
+               above the grid restates it on-canvas — hover is never the
+               only door to what the dim means — and navigating away from
+               the Timeline grid disengages the lens (wired in
+               ui2-activity.js). -->
           <button type="button" class="ui2-closable-lens-btn" id="ui2-closable-lens-btn" hidden
                   aria-pressed="false"
                   title="Session cards that are safe to close — click to dim the rest">
-            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span>closable</span>
+            <span class="ui2-closable-lens-count" id="ui2-closable-lens-count">0</span><span id="ui2-closable-lens-word">closable</span>
           </button>
           <!-- One compact menu button consolidating the bulk window sweeps
                (it replaced five standalone pills: Minimize done, Hide done,
@@ -32498,6 +32622,20 @@ html.ui-v2 .daemon-relay-note {
             <span class="lane-legend-kind lane-legend-fork"><i></i>fork</span>
             <span class="lane-legend-kind lane-legend-side"><i></i>side conversation</span>
             <span class="lane-legend-count" id="session-lane-legend-count"></span>
+          </div>
+          <!-- Closable-lens legend: the engaged lens's on-canvas direction
+               statement, next to the cards it dims (the toolbar chip flips
+               its copy too, but a returning viewer reads the grid first —
+               the live specimen behind this read dim as "closable", the
+               exact inversion). Display keys on the same html attribute
+               the lens toggle stamps (styles with the lane legend in
+               ui2-grid.css), so the legend can never outlive the lens;
+               Show all disengages (wired in ui2-activity.js). -->
+          <div class="ui2-closable-lens-legend" id="ui2-closable-lens-legend">
+            <i class="ui2-closable-lens-legend-swatch" aria-hidden="true"></i>
+            <span id="ui2-closable-lens-legend-text">Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).</span>
+            <button type="button" class="ui2-closable-lens-legend-off" id="ui2-closable-lens-legend-off"
+                    title="Turn the lens off — show every card at full strength">Show all</button>
           </div>
           <div class="session-window-grid hidden" id="session-window-grid"></div>
           <div class="session-window-grid-resize-handle hidden" id="session-window-grid-resize-handle" title="Drag to resize session windows and concurrent view"></div>
@@ -37459,6 +37597,10 @@ function ui2ApplyLayout(mode) {
   // whole Arrange surface) — fully close the menu so its stamped anchor
   // and aria-expanded never go stale (no-op while closed).
   ui2CloseArrangeMenu();
+  // Leaving Grid takes the dimmed cards and the lens chip out of view —
+  // the look drops with them (no-op while off; boot's layout restore
+  // runs before any engagement, so this never fights a fresh load).
+  if (!grid) ui2DisengageClosableLensOffSurface();
   const fBtn = document.getElementById('ui2-layout-focus-btn');
   const gBtn = document.getElementById('ui2-layout-grid-btn');
   if (fBtn) fBtn.setAttribute('aria-pressed', String(!grid));
@@ -37702,8 +37844,45 @@ function ui2RunArrangeAction(action, row) {
 // an empty count would strand a fully-dimmed grid behind a hidden
 // toggle, the refresh disengages it the moment the count empties.
 // Transient by design: the lens is a look, not a mode — it never
-// persists across reloads.
+// persists across reloads, and navigating away from the Timeline grid
+// (main tab, sub-tab, or layout) disengages it rather than greeting a
+// returning viewer with an unexplained dimmed grid (the live specimen
+// behind this: a forgotten lens read on re-entry as "dim = closable",
+// the exact inversion). While engaged the direction is stated ON-canvas,
+// never hover-only: the chip's own text flips to "N safe to close ·
+// rest dimmed" and the grid legend (20-shell.html / ui2-grid.css, keyed
+// on the same html attribute) restates which side is which.
 let ui2ClosableLensOn = false;
+
+// Copy for the chip's two states, pure so the QA vectors can pin the
+// matrix: the count renders separately (the tabular-nums span), the
+// trailing word and the tooltip derive here.
+function ui2ClosableLensChipCopy(count, engaged) {
+  const n = Number(count) || 0;
+  if (engaged) {
+    return {
+      word: 'safe to close · rest dimmed',
+      title: 'Lens on — bright cards are safe to close; dimmed cards are not ruled safe '
+        + '(still working, waiting, or owed). Click to show every card at full strength.',
+    };
+  }
+  return {
+    word: 'closable',
+    title: n === 1
+      ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
+      : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`,
+  };
+}
+
+function ui2ApplyClosableLensChipCopy() {
+  const btn = document.getElementById('ui2-closable-lens-btn');
+  if (!btn) return;
+  const countEl = document.getElementById('ui2-closable-lens-count');
+  const copy = ui2ClosableLensChipCopy(Number(countEl?.textContent || '0'), ui2ClosableLensOn);
+  const wordEl = document.getElementById('ui2-closable-lens-word');
+  if (wordEl && wordEl.textContent !== copy.word) wordEl.textContent = copy.word;
+  if (btn.title !== copy.title) btn.title = copy.title;
+}
 
 function ui2SetClosableLens(on) {
   ui2ClosableLensOn = !!on;
@@ -37712,6 +37891,8 @@ function ui2SetClosableLens(on) {
   else html.removeAttribute('data-ui2-closable-lens');
   const btn = document.getElementById('ui2-closable-lens-btn');
   if (btn) btn.setAttribute('aria-pressed', ui2ClosableLensOn ? 'true' : 'false');
+  // Engaged⇄disengaged flips the chip's stated direction with it.
+  ui2ApplyClosableLensChipCopy();
 }
 
 function ui2RefreshClosableLensChip(count) {
@@ -37722,9 +37903,15 @@ function ui2RefreshClosableLensChip(count) {
   if (btn.hidden && ui2ClosableLensOn) ui2SetClosableLens(false);
   const countEl = document.getElementById('ui2-closable-lens-count');
   if (countEl) countEl.textContent = String(n);
-  btn.title = n === 1
-    ? 'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'
-    : `${n} session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest`;
+  ui2ApplyClosableLensChipCopy();
+}
+
+// The lens is a look at THIS grid: any navigation that takes the grid
+// away — leaving the Timeline sub-tab, leaving the Activity tab, or
+// flipping to Focus layout — disengages it (no-op while off), so a
+// return hours later never inherits an unexplained dim.
+function ui2DisengageClosableLensOffSurface() {
+  if (ui2ClosableLensOn) ui2SetClosableLens(false);
 }
 
 function ui2WireClosableLens() {
@@ -37734,29 +37921,115 @@ function ui2WireClosableLens() {
     ui2SetClosableLens(!ui2ClosableLensOn);
     ui2RefreshArrangeMenu();
   });
+  const legendOff = document.getElementById('ui2-closable-lens-legend-off');
+  if (legendOff) {
+    legendOff.addEventListener('click', () => {
+      ui2SetClosableLens(false);
+      ui2RefreshArrangeMenu();
+    });
+  }
+  // Same observations the Arrange popover's off-log guard uses: the
+  // router stamps the log sub-tab button's class, and the Activity
+  // pane's class carries main-tab presence (the layout leg lives in
+  // ui2ApplyLayout, which already retires grid-scoped chrome on flips).
+  const logBtn = document.querySelector('#activity-subtabs .subtab-btn[data-activity-tab="log"]');
+  if (logBtn) {
+    new MutationObserver(() => {
+      if (!logBtn.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(logBtn, { attributes: true, attributeFilter: ['class'] });
+  }
+  const activityPane = document.getElementById('tab-activity');
+  if (activityPane) {
+    new MutationObserver(() => {
+      if (!activityPane.classList.contains('active')) ui2DisengageClosableLensOffSurface();
+    }).observe(activityPane, { attributes: true, attributeFilter: ['class'] });
+  }
 }
 
 // QA facade (window.qa convention): claim() drives the pure classifier
 // with an explicit matrix (the conjunction is otherwise untestable
-// without a live daemon), set()/state() drive and snapshot the chip +
-// lens surface after a fresh single-pass walk.
+// without a live daemon), closeTitle()/chipCopy() drive the legibility
+// copy the same way, vectors() is the pinned copy matrix (deliberate
+// double-entry — a copy edit that forgets the vector fails its row),
+// set()/state() drive and snapshot the chip + lens surface after a
+// fresh single-pass walk.
 window.qa = Object.assign(window.qa || {}, {
   closableLens: {
     claim: (c) => (typeof sessionWindowClosableClaim === 'function'
       ? sessionWindowClosableClaim(c || {}) : null),
     isClosable: (sid) => (typeof sessionWindowIsClosableAtAGlance === 'function'
       ? sessionWindowIsClosableAtAGlance(sid) : null),
+    closeTitle: (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+      ? sessionWindowCloseTitleClaim(c || {}) : null),
+    chipCopy: (n, on) => ui2ClosableLensChipCopy(n, !!on),
+    vectors: () => {
+      const t = (c) => (typeof sessionWindowCloseTitleClaim === 'function'
+        ? sessionWindowCloseTitleClaim(c) : null);
+      const settled = (extra) => ({ stop: 'settled', linked: true, ...extra });
+      const rows = [
+        ['close/kills-live-run', t({ stop: 'kills_live_run', linked: true, phase: 'running' }),
+          'Stopping kills a live agenda run — the occurrence records failed'],
+        ['close/owed-work', t({ stop: 'owed_work', linked: true, phase: 'running' }),
+          'Agenda work is still owed behind this session — stopping does not settle it'],
+        ['close/settled-idle', t(settled({ phase: 'idle' })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-hard-done', t(settled({ phase: 'running', hardDone: true })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/settled-running', t(settled({ phase: 'running', phaseLabel: 'Running Agent' })),
+          'Running Agent — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-waiting', t(settled({ phase: 'waiting_approval' })),
+          'Waiting for Approval — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)'],
+        ['close/settled-phaseless', t(settled({})),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['close/linked-unclaimed', t({ linked: true, phase: 'idle' }),
+          'Hide or stop session'],
+        ['close/linkless-idle', t({ phase: 'idle' }),
+          'Idle · no agenda-owed work — stopping loses only this session’s context'],
+        ['close/linkless-busy', t({ phase: 'running' }), 'Hide or stop session'],
+        ['close/linkless-phaseless', t({}), 'Hide or stop session'],
+        // Interrupted-arc amendment rows: unconcluded-arc evidence beats
+        // the settled all-clear; a concluded arc falls through to it.
+        ['close/interrupted-settled-unattested',
+          t(settled({ phase: 'interrupted', hardDone: true, interrupted: true, attested: '' })),
+          'Interrupted mid-work — resumable. Closing hides the last handle on it (agenda debt settled, but no achieved attestation)'],
+        ['close/interrupted-stranded-tree',
+          t(settled({ phase: 'interrupted', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: true })),
+          'Interrupted mid-work — resumable. Closing hides the last handle on it (agenda debt settled, but worktree holds uncommitted or unpushed work)'],
+        ['close/interrupted-linkless',
+          t({ phase: 'interrupted', hardDone: true, interrupted: true, attested: '' }),
+          'Interrupted mid-work — resumable. Closing hides the last handle on it (no achieved attestation)'],
+        ['close/interrupted-concluded-settled',
+          t(settled({ phase: 'interrupted', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: false })),
+          'No agenda-owed work — the linked occurrence is settled'],
+        ['lens/chip-off-word', ui2ClosableLensChipCopy(3, false).word, 'closable'],
+        ['lens/chip-off-title-plural', ui2ClosableLensChipCopy(3, false).title,
+          '3 session cards are safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-off-title-one', ui2ClosableLensChipCopy(1, false).title,
+          'One session card is safe to close (settled agenda debt, idle with no agenda linkage, or finished) — click to dim the rest'],
+        ['lens/chip-on-word', ui2ClosableLensChipCopy(3, true).word, 'safe to close · rest dimmed'],
+        ['lens/chip-on-title', ui2ClosableLensChipCopy(3, true).title,
+          'Lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed). Click to show every card at full strength.'],
+        ['lens/legend-copy',
+          (document.getElementById('ui2-closable-lens-legend-text')?.textContent || '').trim(),
+          'Closable lens on — bright cards are safe to close; dimmed cards are not ruled safe (still working, waiting, or owed).'],
+      ];
+      return rows.map(([name, got, expect]) => ({ name, got, expect, pass: got === expect }));
+    },
     set: (on) => { ui2SetClosableLens(!!on); ui2RefreshArrangeMenu(); return ui2ClosableLensOn; },
     state: () => {
       ui2RefreshArrangeMenu();
       const btn = document.getElementById('ui2-closable-lens-btn');
       const ids = typeof sessionWindows === 'undefined' ? [] : [...sessionWindows.keys()];
       const canClassify = typeof sessionWindowIsClosableAtAGlance === 'function';
+      const legendEl = document.getElementById('ui2-closable-lens-legend');
       return {
         on: ui2ClosableLensOn,
         lensAttr: document.documentElement.getAttribute('data-ui2-closable-lens') || '',
         count: Number(document.getElementById('ui2-closable-lens-count')?.textContent || '0'),
         chipHidden: !btn || !!btn.hidden,
+        chipWord: document.getElementById('ui2-closable-lens-word')?.textContent || '',
+        chipTitle: btn?.title || '',
+        legendShown: !!legendEl && getComputedStyle(legendEl).display !== 'none',
         closable: canClassify ? ids.filter((sid) => sessionWindowIsClosableAtAGlance(sid)) : [],
         closableClassed: ids.filter(
           (sid) => !!sessionWindows.get(sid)?.el?.classList?.contains('session-window-closable')
@@ -38416,7 +38689,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'e8ff30dcab02ebff';
+const INTENDANT_APP_BUILD = 'f29414ca4015a369';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -62285,6 +62558,63 @@ function sessionWindowContinuationStateText(continuedAs) {
   return '';
 }
 
+// The pointer affordance contract (agenda card 01KYRN634DYZEXN251N7JJXVY5,
+// owner specimen 2026-07-30): never a link with no effect. In the dominant
+// live shape a resume shares the backend id, so the pointer's target is
+// folded into THIS window — the chip already wears the successor and its
+// transcript streams right below the note — and a "continued as
+// <own-chip-id>" link goes nowhere the owner can see. That shape renders
+// prose (plus a courtesy scroll to the tail); only a target OUTSIDE this
+// window renders the link, whose click force-focuses that window. Pure
+// (DOM-free) so the QA harness self-test pins both shapes.
+function sessionWindowContinuationPlan(continuedAs, sameWindow, stateText) {
+  const label = sessionWindowContinuationLabel(continuedAs);
+  if (!label) return { kind: 'none', text: '', title: '' };
+  const state = String(stateText || '').trim();
+  if (sameWindow) {
+    return {
+      kind: 'here',
+      text: state === 'live'
+        ? 'this window continues live below'
+        : `this window continues below${state ? ` — ${state}` : ''}`,
+      title: 'The continuation is this window\'s own transcript — click to scroll to the latest output',
+    };
+  }
+  return {
+    kind: 'link',
+    text: `continued as ${label}${state ? ` — ${state}` : ''}`,
+    title: `Focus the continuation's window — ${label}`,
+  };
+}
+
+// Is the pointer's target folded into THIS window? True when a target id
+// is one of the window's own identities (map key, merged backend/wrapper
+// ids) or when the target's row alias-folds into the same card (the
+// resume bridge: a shared id in sessionAliasIds). Decided at render time
+// against the same alias closure the fold uses — never fold order.
+function sessionWindowContinuationTargetIsThisWindow(win, sid, continuedAs) {
+  const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  if (!targets.length) return false;
+  const own = new Set([String(sid || '').trim()].filter(Boolean));
+  const meta = sessionMetadataById.get(String(sid || '').trim()) || {};
+  for (const id of [meta.backendSessionId, meta.intendantSessionId]) {
+    const value = String(id || '').trim();
+    if (value) own.add(value);
+  }
+  for (const [id, w] of sessionWindows) {
+    if (w === win) own.add(id);
+  }
+  if (targets.some(id => own.has(id))) return true;
+  for (const session of Array.isArray(_cachedSessions) ? _cachedSessions : []) {
+    const aliases = sessionAliasIds(session);
+    if (!aliases.length || !targets.some(id => aliases.includes(id))) continue;
+    if (aliases.some(id => own.has(id))) return true;
+  }
+  return false;
+}
+
 function openSessionWindowForContinuation(continuedAs) {
   const targets = [continuedAs?.backendSessionId, continuedAs?.sessionId]
     .map(id => String(id || '').trim())
@@ -62301,8 +62631,16 @@ function openSessionWindowForContinuation(continuedAs) {
     });
     Promise.resolve(hydrateSessionWindowIfEmpty(target)).catch(() => {});
   }
+  // An explicit pointer click must LAND: force past the composer-target
+  // focus veto (unforced, a foreign composer target silently swallows
+  // the click — the cross-window half of the dead-link card), then bring
+  // the window into the viewport.
   if (typeof focusSessionWindowFromLifecycle === 'function') {
-    focusSessionWindowFromLifecycle(target, {});
+    focusSessionWindowFromLifecycle(target, { force: true });
+  }
+  const targetWin = sessionWindows.get(target);
+  if (targetWin?.el?.scrollIntoView) {
+    targetWin.el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 }
 
@@ -62331,8 +62669,10 @@ function renderSessionWindowTerminalNote(win, sid) {
     }
     win.terminalNote = note;
   }
-  const continuationLabel = sessionWindowContinuationLabel(statement.continuedAs);
-  const signature = `${statement.text}${continuationLabel}${sessionWindowContinuationStateText(statement.continuedAs)}`;
+  const stateText = sessionWindowContinuationStateText(statement.continuedAs);
+  const sameWindow = sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+  const plan = sessionWindowContinuationPlan(statement.continuedAs, sameWindow, stateText);
+  const signature = [statement.text, plan.kind, plan.text, plan.title].join('');
   if (note.dataset.signature === signature) return;
   note.dataset.signature = signature;
   note.textContent = '';
@@ -62340,18 +62680,32 @@ function renderSessionWindowTerminalNote(win, sid) {
   fact.className = 'session-window-terminal-fact';
   fact.textContent = statement.text;
   note.appendChild(fact);
-  if (continuationLabel) {
+  if (plan.kind === 'link') {
     const link = document.createElement('a');
     link.href = '#';
     link.className = 'session-window-terminal-continued';
-    const stateText = sessionWindowContinuationStateText(statement.continuedAs);
-    link.textContent = `continued as ${continuationLabel}${stateText ? ` — ${stateText}` : ''}`;
+    link.textContent = plan.text;
+    link.title = plan.title;
     link.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
       openSessionWindowForContinuation(statement.continuedAs);
     });
     note.appendChild(link);
+  } else if (plan.kind === 'here') {
+    // Prose, not a link: the continuation IS this window's transcript.
+    // The click is a courtesy scroll to the live tail (40's follow lane).
+    const here = document.createElement('span');
+    here.className = 'session-window-terminal-continued-here';
+    here.textContent = plan.text;
+    here.title = plan.title;
+    here.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (typeof scrollSessionWindowToBottom === 'function') {
+        scrollSessionWindowToBottom(win);
+      }
+    });
+    note.appendChild(here);
   }
 }
 
@@ -62375,6 +62729,8 @@ function normalizeSessionWindowMeta(meta = {}) {
   // form may feed the cwd fallback below.
   const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
   if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeState = normalizeSessionWorktreeState(meta.worktree_state || meta.worktreeState);
+  if (worktreeState) out.worktreeState = worktreeState;
   const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
   const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
@@ -62451,6 +62807,30 @@ function normalizeSessionWorktreeInfo(raw) {
   return info;
 }
 
+// Served worktree git state (grid envelope `worktree_state`,
+// worktree_inventory.rs's serve-time probe): the stranded-work axis —
+// dirty / unpushed / ahead — probed daemon-side so it outlives the
+// session's own vitals stream. `state` is the honest four-way
+// (clean/dirty/missing/unknown); the fact fields ride only when the
+// probe answered. The SPA consumes, never re-derives.
+function normalizeSessionWorktreeState(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const state = String(raw.state || '').toLowerCase();
+  if (!['clean', 'dirty', 'missing', 'unknown'].includes(state)) return null;
+  const out = { state };
+  if (state === 'clean' || state === 'dirty') {
+    out.dirty = raw.dirty === true;
+    out.unpushed = raw.unpushed === true;
+    const ahead = Number(raw.ahead);
+    if (Number.isFinite(ahead) && ahead > 0) out.ahead = ahead;
+  }
+  const branch = compactSessionText(raw.branch);
+  if (branch) out.branch = branch;
+  const checkedMs = Number(raw.checked_ms ?? raw.checkedMs);
+  if (Number.isFinite(checkedMs) && checkedMs > 0) out.checkedMs = checkedMs;
+  return out;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -62460,6 +62840,11 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.cwd || '',
     meta.cwdLabel || '',
     meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
+    // Facts only — checkedMs deliberately excluded so an unchanged tree
+    // re-probed every TTL never churns the signature into full renders.
+    meta.worktreeState
+      ? [meta.worktreeState.state, meta.worktreeState.dirty ? '1' : '0', meta.worktreeState.unpushed ? '1' : '0', meta.worktreeState.ahead || 0, meta.worktreeState.branch || ''].join('|')
+      : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -63384,6 +63769,20 @@ const VITALS_SYMBOLS = {
     },
     action: (v) => (v.path ? { label: 'Copy folder path', run: () => vitalsCopyText(v.path) } : null),
   },
+  // The daemon-probed stranded-work chip (grid envelope
+  // `worktree_state`): unlike the vitals-fed `dirty`/`unpushed` chips it
+  // outlives the session, so an interrupted or dead card still states
+  // that its checkout holds work that exists nowhere else. Shown only
+  // when something IS stranded (or the checkout is gone) — clean stays
+  // quiet, unknown claims nothing.
+  'worktree-state': {
+    label: 'Worktree state',
+    priority: 58,
+    icon: 'pencil',
+    chip: (v) => v.text,
+    factText: (v) => v.text,
+    explain: (v) => v.lines,
+  },
   branch: {
     label: 'Branch',
     priority: 30,
@@ -63718,7 +64117,7 @@ const VITALS_SYMBOLS = {
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
   'health', 'activity', 'model', 'permissions', 'agenda-source',
-  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
+  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'worktree-state', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -63976,6 +64375,39 @@ function vitalsChipModels(vitals, meta, sessionId) {
     }, {
       severity: bootMeta.ghost ? 'warn' : '',
     });
+  }
+  const worktreeState = meta?.worktreeState && typeof meta.worktreeState === 'object'
+    ? meta.worktreeState
+    : null;
+  if (worktreeState) {
+    const stranded = [];
+    if (worktreeState.dirty) stranded.push('dirty');
+    if (worktreeState.unpushed) stranded.push('unpushed');
+    const gone = worktreeState.state === 'missing';
+    if (stranded.length || gone) {
+      const lines = [];
+      if (gone) {
+        lines.push('The checkout this session worked in is gone (removed or reclaimed).');
+      }
+      if (worktreeState.dirty) {
+        lines.push('Uncommitted changes are sitting in the worktree — work that exists nowhere else until committed.');
+      }
+      if (worktreeState.unpushed) {
+        lines.push(`Commits on ${worktreeState.branch ? `“${worktreeState.branch}”` : 'the worktree branch'} exist only on this machine — not pushed anywhere${Number(worktreeState.ahead) > 0 ? ` (${worktreeState.ahead} ahead of upstream)` : ''}.`);
+      }
+      lines.push('Probed by the daemon from the checkout itself, so it stays honest after the session ends.');
+      push('worktree-state', 'worktree-state', {
+        text: gone
+          ? '⧉ worktree gone'
+          : (stranded.length === 1 && worktreeState.dirty ? '⧉ dirty worktree'
+            : (stranded.length === 1 ? '⧉ unpushed worktree' : '⧉ dirty+unpushed')),
+        lines,
+      }, {
+        // Stranded work IS attention: elevate like the ghost chip. A
+        // gone checkout is a neutral fact — nothing left to strand.
+        severity: stranded.length ? 'warn' : '',
+      });
+    }
   }
 
   const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
@@ -65356,6 +65788,26 @@ window.qa = Object.assign(window.qa || {}, {
       }))),
     }));
   },
+  // Terminal-note pointer readback: the affordance plan the note renders
+  // for a window — {kind:'here'} prose on the same-window fold,
+  // {kind:'link'} on a cross-window target, never a dead link.
+  terminalNotePlan: (sessionId) => {
+    const sid = String(sessionId || '').trim();
+    const statement = sessionWindowTerminalStatement(sid);
+    if (!statement) return null;
+    const win = sessionWindows.get(sid) || null;
+    const sameWindow = !!win
+      && sessionWindowContinuationTargetIsThisWindow(win, sid, statement.continuedAs);
+    return {
+      text: statement.text,
+      sameWindow,
+      pointer: sessionWindowContinuationPlan(
+        statement.continuedAs,
+        sameWindow,
+        sessionWindowContinuationStateText(statement.continuedAs),
+      ),
+    };
+  },
 });
 
 // The vitals conflict chip opens the same worktree finish/merge card the
@@ -65783,6 +66235,7 @@ function sessionWindowMetaFromSession(session) {
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
     worktree: session.worktree,
+    worktree_state: session.worktree_state,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,
@@ -71955,6 +72408,14 @@ function sessionWindowPhaseDisplayLabel(sessionId, phase) {
       || null;
     return ghostTerminal?.outcome ? 'Ended' : 'Died';
   }
+  // The interrupted-arc card copy (display only): while the arc looks
+  // unconcluded the pill states the whole truth — interrupted MID-WORK,
+  // and resumable — instead of a bare "Interrupted". Ghost corpses
+  // above keep their death statement.
+  if (p === 'interrupted') {
+    const arc = sessionWindowInterruptedArcState(ghostSid);
+    if (arc && !arc.concluded) return 'Interrupted mid-work — resumable';
+  }
   const canDerive = typeof deriveSessionActivity === 'function'
     && typeof sessionWireActivity === 'function';
   if (canDerive && (p === 'idle' || p === 'done')
@@ -72012,6 +72473,97 @@ function applySessionWindowPhase(win, sid, phase) {
   // application for the same reason the approval hook above does: the
   // active→done crossing arrives via the fast path AND the wide render.
   maybeAutoMinimizeSubagentWindow(sid);
+  // The × title reads the live phase (the settled and linkless-idle
+  // claims below are phase-guarded) — re-derive on EVERY phase
+  // application: the phase-only fast path never reaches the wide
+  // render's call site.
+  updateSessionWindowCloseTitle(win, sid);
+}
+
+// Track AO safe-to-stop: the × affordance claims exactly what the
+// machine knows — the served stop derivation for agenda-linked
+// sessions; for linkless sessions, "safe" only as the ruled conjunction
+// (idle ∧ no linkage), and a busy linkless session claims NOTHING (the
+// default title stands). Two-axis honesty for the settled claim:
+// "settled" is an agenda-axis fact, so on a window that is not quiet
+// (live phase, no hard-done evidence) the title leads with the live
+// state instead of reading as an all-clear — the pill and the tooltip
+// must never disagree about whether stopping interrupts anything.
+// Quiet mirrors sessionWindowClosableClaim's rule below (hard done, or
+// a present phase normalizing to idle); an absent phase claims nothing
+// in either direction, so it keeps the agenda-axis copy. Pure over an
+// explicit claim so the QA vectors can drive the whole matrix
+// (qa.closableLens.closeTitle / vectors in ui2-activity.js); `linked`
+// here is the ×'s own axis — a served occurrence — not the wider
+// meta.agenda linkage the lens claim reads.
+function sessionWindowCloseTitleClaim(claim = {}) {
+  const stop = typeof claim.stop === 'string' ? claim.stop : '';
+  const linked = !!claim.linked || !!stop;
+  if (stop === 'kills_live_run') {
+    return 'Stopping kills a live agenda run — the occurrence records failed';
+  }
+  if (stop === 'owed_work') {
+    return 'Agenda work is still owed behind this session — stopping does not settle it';
+  }
+  // Interrupted-arc amendment row (see sessionWindowClosableClaim):
+  // above the settled rows because "settled" names only the agenda-debt
+  // axis and no longer implies an interrupted card is benign — the
+  // title states the mid-work truth with the unconcluded-arc evidence.
+  if (claim.interrupted && (claim.attested !== 'achieved' || claim.worktreeStranded)) {
+    const evidence = [];
+    if (claim.attested !== 'achieved') {
+      evidence.push(claim.attested
+        ? `attested “${claim.attested}”, not achieved`
+        : 'no achieved attestation');
+    }
+    if (claim.worktreeStranded) evidence.push('worktree holds uncommitted or unpushed work');
+    const settledNote = stop === 'settled' ? 'agenda debt settled, but ' : '';
+    return `Interrupted mid-work — resumable. Closing hides the last handle on it (${settledNote}${evidence.join('; ')})`;
+  }
+  if (stop === 'settled') {
+    const nonQuiet = !claim.hardDone
+      && !!claim.phase && normalizeSessionPhase(claim.phase) !== 'idle';
+    if (nonQuiet) {
+      const lead = claim.phaseLabel || sessionPhaseLabel(claim.phase);
+      return `${lead} — stopping interrupts it; no agenda-owed work remains (the linked occurrence is settled)`;
+    }
+    return 'No agenda-owed work — the linked occurrence is settled';
+  }
+  if (!linked && !!claim.phase && normalizeSessionPhase(claim.phase) === 'idle') {
+    return 'Idle · no agenda-owed work — stopping loses only this session’s context';
+  }
+  return 'Hide or stop session';
+}
+
+// The sid boundary over the pure claim: called from the wide metadata
+// render AND from applySessionWindowPhase above, because the phase-only
+// fast path skips the wide render — a title that read the phase once
+// would otherwise go stale across running⇄idle flips (pre-guard, the
+// linkless Idle· title really did survive into running turns this way).
+// The lead label is the pill's own display label, so the two surfaces
+// can never disagree about the live state.
+function sessionWindowCloseTitleForSession(sid, win) {
+  const occ = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
+  const arc = sessionWindowInterruptedArcState(sid);
+  return sessionWindowCloseTitleClaim({
+    stop: (occ && occ.stop) || '',
+    linked: !!occ,
+    phase: win.phase || '',
+    hardDone: sessionWindowHasHardDoneEvidence(sid),
+    phaseLabel: sessionWindowPhaseDisplayLabel(sid, win.phase || ''),
+    interrupted: !!arc,
+    attested: arc ? arc.attested : '',
+    worktreeStranded: !!(arc && arc.worktreeStranded),
+  });
+}
+
+function updateSessionWindowCloseTitle(win, sid) {
+  if (!win || !win.close) return;
+  const closeTitle = sessionWindowCloseTitleForSession(sid, win);
+  if (win.close.title !== closeTitle) {
+    win.close.title = closeTitle;
+    win.close.setAttribute('aria-label', closeTitle);
+  }
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -72129,27 +72681,10 @@ function updateSessionWindow(sessionId, meta = {}) {
   // a mid-execution look.
   renderSessionWindowTerminalNote(win, sid);
   // Track AO safe-to-stop: the × affordance claims exactly what the
-  // machine knows — the served stop derivation for agenda-linked
-  // sessions; for linkless sessions, "safe" only as the ruled
-  // conjunction (idle ∧ no linkage), and a busy linkless session claims
-  // NOTHING (the default title stands).
-  if (win.close) {
-    const agendaOcc = ((sessionMetadataById.get(sid) || {}).agenda || {}).occurrence;
-    let closeTitle = 'Hide or stop session';
-    if (agendaOcc && agendaOcc.stop === 'kills_live_run') {
-      closeTitle = 'Stopping kills a live agenda run — the occurrence records failed';
-    } else if (agendaOcc && agendaOcc.stop === 'owed_work') {
-      closeTitle = 'Agenda work is still owed behind this session — stopping does not settle it';
-    } else if (agendaOcc && agendaOcc.stop === 'settled') {
-      closeTitle = 'No agenda-owed work — the linked occurrence is settled';
-    } else if (!agendaOcc && win.phase === 'idle') {
-      closeTitle = 'Idle · no agenda-owed work — stopping loses only this session’s context';
-    }
-    if (win.close.title !== closeTitle) {
-      win.close.title = closeTitle;
-      win.close.setAttribute('aria-label', closeTitle);
-    }
-  }
+  // machine knows (sessionWindowCloseTitleClaim above; re-derived on
+  // every phase application too — this call covers the agenda-envelope
+  // and ended-bit changes that arrive without a phase flip).
+  updateSessionWindowCloseTitle(win, sid);
   // Arm-only: this window's goal was just rendered; the 1 s ticker owns
   // elapsed-time repaints for the rest (re-rendering EVERY window's goal
   // per metadata update was the waste).
@@ -72572,9 +73107,23 @@ function hideDoneSessionWindows() {
 //     rule.
 // A linked occurrence with no served stop claim, and any unrecognized
 // claim, stay not-closable: positive-only, absence claims nothing.
+//
+// INTERRUPTED-ARC AMENDMENT (2026-08-01, lex posterior over the ruled
+// conjunction's CLOSABLE application — stop-safety semantics unchanged):
+// "interrupted" stays quiet for STOP-safety (nothing live to kill) but
+// is no longer unconditional quiet-POSITIVE for the closable claim.
+// Close hides the card, and for an interrupted mid-arc session the card
+// is the last visible handle on stranded work — so an interrupted
+// window claims closable only on affirmative conclusion evidence: its
+// occurrence attested `achieved` AND no stranded-tree evidence (dirty /
+// unpushed worktree). Linkless sessions have no attestation lane, so an
+// interrupted linkless window never reads closable.
 function sessionWindowClosableClaim(claim = {}) {
   const stop = typeof claim.stop === 'string' ? claim.stop : '';
   if (stop === 'kills_live_run' || stop === 'owed_work') return false;
+  if (claim.interrupted) {
+    if (claim.attested !== 'achieved' || claim.worktreeStranded) return false;
+  }
   // An ABSENT phase is no claim (normalizeSessionPhase defaults '' to
   // 'idle', which would read wider than the ×'s raw win.phase === 'idle'
   // check — positive-only forbids that): a phase-less window is quiet
@@ -72584,6 +73133,37 @@ function sessionWindowClosableClaim(claim = {}) {
   if (stop === 'settled') return quiet;
   if (stop || claim.linked) return false;
   return quiet;
+}
+
+// The interrupted-arc state behind one session id: null unless the
+// window's phase (or the catalog row's durable status) says
+// interrupted; else the conclusion evidence the amendment weighs — the
+// occurrence's attestation outcome and the served worktree
+// strandedness. Every input is an already-served fact
+// (sessionMetadataById); nothing here re-derives.
+function sessionWindowInterruptedArcState(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const win = sessionWindows.get(sid);
+  const meta = sessionMetadataById.get(sid) || {};
+  const rawPhase = (win && win.phase) || meta.phase || '';
+  const interrupted = (!!rawPhase && normalizeSessionPhase(rawPhase) === 'interrupted')
+    || String(meta.status || '') === 'interrupted';
+  if (!interrupted) return null;
+  const attested = String(meta.agenda?.occurrence?.attestation?.outcome || '');
+  const ws = meta.worktreeState && typeof meta.worktreeState === 'object'
+    ? meta.worktreeState
+    : null;
+  const worktreeStranded = !!(ws && (ws.dirty || ws.unpushed));
+  return {
+    attested,
+    worktreeStranded,
+    // For copy surfaces: '' = no worktree known, else the served
+    // four-way (missing/unknown degrade honestly — they veto nothing,
+    // the attestation arm alone decides).
+    worktreeState: ws ? (ws.state || '') : '',
+    concluded: attested === 'achieved' && !worktreeStranded,
+  };
 }
 
 // The sid boundary over the pure claim above: every input is a fact some
@@ -72596,11 +73176,15 @@ function sessionWindowIsClosableAtAGlance(sessionId) {
   if (!win) return false;
   const meta = sessionMetadataById.get(sid) || {};
   const occ = (meta.agenda || {}).occurrence;
+  const arc = sessionWindowInterruptedArcState(sid);
   return sessionWindowClosableClaim({
     stop: (occ && occ.stop) || '',
     linked: !!meta.agenda,
     phase: win.phase || meta.phase || '',
     hardDone: sessionWindowHasHardDoneEvidence(sid),
+    interrupted: !!arc,
+    attested: arc ? arc.attested : '',
+    worktreeStranded: !!(arc && arc.worktreeStranded),
   });
 }
 
@@ -72615,7 +73199,39 @@ function sessionWindowIsClosableAtAGlance(sessionId) {
 // use; the readbacks are serializable snapshots (windowState's
 // followOutput/logAtBottom expose the jump-button state machine — QA-only
 // layout read, never on a hot path).
+// The closable-claim matrix frozen as executable vectors — the
+// interrupted-arc amendment's new states beside the ruled Track AO
+// rows. window.qa.closableClaim.vectors() runs them all; any
+// pass:false is a regression in the claim function itself.
+const CLOSABLE_CLAIM_QA_VECTORS = [
+  { name: 'settled + hard done stays closable', claim: { stop: 'settled', hardDone: true }, expect: true },
+  { name: 'settled while running stays suppressed', claim: { stop: 'settled', phase: 'running' }, expect: false },
+  { name: 'live agenda run vetoes', claim: { stop: 'kills_live_run', hardDone: true }, expect: false },
+  { name: 'owed work vetoes', claim: { stop: 'owed_work', hardDone: true }, expect: false },
+  { name: 'linked without a stop claim stays not-closable', claim: { linked: true, hardDone: true }, expect: false },
+  { name: 'linkless idle stays closable', claim: { phase: 'idle' }, expect: true },
+  { name: 'interrupted linkless never reads closable', claim: { hardDone: true, interrupted: true, attested: '' }, expect: false },
+  { name: 'interrupted settled without attestation is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: '' }, expect: false },
+  { name: 'interrupted attested short of achieved is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'partial' }, expect: false },
+  { name: 'interrupted achieved with a clean tree is closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: false }, expect: true },
+  { name: 'interrupted achieved with a stranded tree is not closable', claim: { stop: 'settled', hardDone: true, interrupted: true, attested: 'achieved', worktreeStranded: true }, expect: false },
+];
+
 window.qa = Object.assign(window.qa || {}, {
+  closableClaim: {
+    evaluate: (claim) => sessionWindowClosableClaim(claim || {}),
+    atAGlance: (sessionId) => sessionWindowIsClosableAtAGlance(sessionId),
+    interruptedArc: (sessionId) => sessionWindowInterruptedArcState(sessionId),
+    closeTitle: (sessionId) => {
+      const sid = String(sessionId || '').trim();
+      const win = sid ? sessionWindows.get(sid) : null;
+      return win ? sessionWindowCloseTitleForSession(sid, win) : '';
+    },
+    vectors: () => CLOSABLE_CLAIM_QA_VECTORS.map((vector) => {
+      const got = sessionWindowClosableClaim(vector.claim);
+      return { name: vector.name, expect: vector.expect, got, pass: got === vector.expect };
+    }),
+  },
   sessionWindowSweeps: {
     build: (sessionId, meta) => !!ensureSessionWindow(sessionId, meta || {}),
     setMinimized: (sessionId, minimized) => setSessionWindowMinimized(sessionId, !!minimized),
@@ -104620,6 +105236,14 @@ async function memoryProposeFromForm(button) {
 //   - other co-homed daemons draining (all of them, not just the
 //     first): a predecessor section each, with its remaining count, its
 //     named holdout rows off the presence record, and a doorway to it.
+//     Both banner kinds render in a strip DOCKED under the oversight
+//     bar — its measured height rides --ui2-handover-h (the
+//     --ui2-composer-h reservation pattern), so neither form ever
+//     covers the tab chrome — and each collapses to a one-line pill
+//     under the update chip's standing-fact pattern, persisted per
+//     (kind, boot id): an unseen fact announces itself expanded once,
+//     a collapse then holds across renders and reloads, and there is
+//     deliberately no dismiss while the fact is true.
 //   - a newer/changed binary on disk (the daemon's update watch): the
 //     bottom-corner update chip with both builds' provenance and the
 //     keychain/TCC honesty line where it applies. Collapsible to a
@@ -105010,7 +105634,10 @@ async function memoryProposeFromForm(button) {
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', 'Collapse the update chip to a pill');
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // Same bubble hazard as the banner's collapse: the collapsed
+      // re-render puts the expand handler on this click's path.
+      ev.stopPropagation();
       updateAction.note = '';
       updateChipStoreState(sha, 'collapsed');
       handoverUpdateRender(lastHandoverBody);
@@ -105064,18 +105691,142 @@ async function memoryProposeFromForm(button) {
     }
   }
 
+  let bannerResize = null;
+
   function handoverBanner() {
     if (!bannerEl) {
       bannerEl = document.createElement('div');
       bannerEl.id = 'handover-banner';
       bannerEl.className = 'handover-banner';
       document.body.appendChild(bannerEl);
+      if (typeof ResizeObserver === 'function') {
+        bannerResize = new ResizeObserver(handoverBannerReserve);
+        bannerResize.observe(bannerEl);
+      } else {
+        window.addEventListener('resize', handoverBannerReserve);
+      }
     }
     return bannerEl;
   }
 
   function handoverClear() {
-    if (bannerEl) { bannerEl.remove(); bannerEl = null; }
+    if (bannerEl) {
+      if (bannerResize) { bannerResize.disconnect(); bannerResize = null; }
+      window.removeEventListener('resize', handoverBannerReserve);
+      bannerEl.remove();
+      bannerEl = null;
+    }
+    handoverBannerReserve();
+  }
+
+  // The strip reserves its own real height: #app's top padding and the
+  // fixed panels hanging off the oversight bar all offset by
+  // --ui2-handover-h (the --ui2-composer-h pattern), so the banner —
+  // expanded or collapsed — displaces content instead of covering it.
+  function handoverBannerReserve() {
+    const h = bannerEl ? Math.ceil(bannerEl.getBoundingClientRect().height) : 0;
+    document.documentElement.style.setProperty('--ui2-handover-h', (h > 0 ? h : 0) + 'px');
+  }
+
+  // Collapsed-state persistence for the banners, PER (kind, boot id) —
+  // the update chip's per-sha pattern verbatim: a never-seen fact (this
+  // daemon's drain, a given set of draining predecessors) renders the
+  // full banner once; the owner's collapse then persists for that fact
+  // — across polls and reloads — as a one-line pill that keeps it
+  // discoverable without walling anything. There is deliberately NO
+  // dismiss: some rendering of the fact always stands while it is true
+  // (a drain in motion must not be forgettable), only its size is the
+  // owner's choice. A new boot, or a changed predecessor set, starts
+  // fresh.
+  function bannerStateKey(kind, bootId) {
+    return 'handover-banner:' + kind + ':' + (bootId || 'unknown');
+  }
+  function bannerStoredState(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  }
+  function bannerStoreState(key, state) {
+    try {
+      // One live banner fact at a time — stale keys go as we write.
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('handover-banner:') === 0 && k !== key) {
+          localStorage.removeItem(k);
+        }
+      }
+      localStorage.setItem(key, state);
+    } catch (_) { /* storage unavailable — the choice lives for this page only */ }
+  }
+
+  // Applies the stored choice to the element and strips pill-only
+  // attributes when expanded; both kinds route through here.
+  function bannerCollapsedNow(el, key) {
+    const collapsed = bannerStoredState(key) === 'collapsed';
+    el.classList.toggle('collapsed', collapsed);
+    if (!collapsed) {
+      el.onclick = null;
+      el.onkeydown = null;
+      el.removeAttribute('role');
+      el.removeAttribute('tabindex');
+      el.removeAttribute('title');
+    }
+    return collapsed;
+  }
+
+  // The one-line pill: the whole strip is the expand affordance
+  // (click or Enter/Space), and the trailing "(open)" names it.
+  function bannerFillPill(el, key, label) {
+    el.title = 'Click to expand.';
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    const expand = () => {
+      bannerStoreState(key, 'expanded');
+      handoverRender(lastHandoverBody);
+    };
+    el.onclick = expand;
+    el.onkeydown = (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); expand(); }
+    };
+    el.appendChild(document.createTextNode(label + ' '));
+    const open = document.createElement('span');
+    open.className = 'handover-banner-open';
+    open.textContent = '(open)';
+    el.appendChild(open);
+  }
+
+  function bannerCollapseButton(key, ariaLabel) {
+    const collapse = document.createElement('button');
+    collapse.type = 'button';
+    collapse.className = 'handover-banner-collapse';
+    collapse.textContent = '–';
+    collapse.title = 'Collapse to a pill — the fact stays visible';
+    collapse.setAttribute('aria-label', ariaLabel);
+    collapse.addEventListener('click', (ev) => {
+      // The container is the pill's expand affordance: the re-render
+      // installs its handler on the still-bubbling click's path, so an
+      // unstopped collapse click would expand right back (probe-caught
+      // live on both this banner and the update chip).
+      ev.stopPropagation();
+      bannerStoreState(key, 'collapsed');
+      handoverRender(lastHandoverBody);
+    });
+    return collapse;
+  }
+
+  // The predecessor pill's one line, honest about what is known: the
+  // port when there is one predecessor, the summed still-finishing
+  // count only when every predecessor reports one.
+  function bannerPredecessorPill(others) {
+    const counts = others.map((d) => Number(d && d.session_count));
+    const total = counts.every((n) => Number.isFinite(n) && n >= 0)
+      ? counts.reduce((a, b) => a + b, 0)
+      : null;
+    const finishing = total === null ? '' : ` — ${total} session${total === 1 ? '' : 's'} finishing`;
+    if (others.length === 1) {
+      const port = Number(others[0] && others[0].port);
+      const where = Number.isFinite(port) && port > 0 ? ` on :${port}` : '';
+      return `A predecessor daemon is draining${where}${finishing}`;
+    }
+    return `${others.length} predecessor daemons are draining${finishing}`;
   }
 
   function handoverSuccessorPort(body) {
@@ -105194,12 +105945,21 @@ async function memoryProposeFromForm(button) {
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
+      const key = bannerStateKey('draining', body.boot_id);
+      const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
+      if (bannerCollapsedNow(el, key)) {
+        bannerFillPill(el, key, rows.length
+          ? `This daemon is draining — waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}`
+          : 'This daemon is draining — in-flight sessions are finishing');
+        handoverBannerReserve();
+        return;
+      }
+      el.appendChild(bannerCollapseButton(key, 'Collapse the drain banner to a pill'));
       const head = document.createElement('div');
       head.className = 'handover-banner-head';
       const lead = document.createElement('strong');
       lead.textContent = 'This daemon is draining.';
       head.appendChild(lead);
-      const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
       const tail = document.createElement('span');
       tail.textContent = rows.length
         ? ` Waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}, then it exits.`
@@ -105215,6 +105975,7 @@ async function memoryProposeFromForm(button) {
         el.appendChild(none);
       }
       if (rows.length) el.appendChild(handoverHoldoutList(rows, rows.length));
+      handoverBannerReserve();
       return;
     }
     const others = Array.isArray(body.daemons)
@@ -105224,6 +105985,17 @@ async function memoryProposeFromForm(button) {
       const el = handoverBanner();
       el.dataset.kind = 'predecessor';
       el.textContent = '';
+      // The fact identity is the SET of draining predecessor boots: a
+      // predecessor appearing (or the set changing) announces expanded
+      // once; the same set stays as the owner left it.
+      const key = bannerStateKey('predecessor',
+        others.map((d) => String((d && d.boot_id) || 'unknown')).sort().join('+'));
+      if (bannerCollapsedNow(el, key)) {
+        bannerFillPill(el, key, bannerPredecessorPill(others));
+        handoverBannerReserve();
+        return;
+      }
+      el.appendChild(bannerCollapseButton(key, 'Collapse the predecessor banner to a pill'));
       others.forEach((d) => {
         const port = Number(d.port);
         const count = Number(d.session_count);
@@ -105248,6 +106020,7 @@ async function memoryProposeFromForm(button) {
         section.appendChild(note);
         el.appendChild(section);
       });
+      handoverBannerReserve();
       return;
     }
     handoverClear();
@@ -105272,9 +106045,11 @@ async function memoryProposeFromForm(button) {
   };
   // Same tokenless-QA posture for the drain banner: probes feed a
   // synthetic handover body and assert the named wait set + the
-  // successor doorway render.
+  // successor doorway render; `stateKey` lets them seed and read the
+  // per-(kind, boot) collapse choice to walk the pill round-trip.
   window.qa.handoverBanner = {
     render: (body) => handoverRender(body),
+    stateKey: bannerStateKey,
   };
 
   // The palette's dynamic entry, as data (ui2-chrome reads this by name

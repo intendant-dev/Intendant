@@ -990,7 +990,8 @@ body.context-focus-active {
    walk from the positive safe-to-stop claims): every card the machine
    does NOT rule safe recedes, the closable set keeps full presence with
    a quiet affirmative ring. Positive-only — the dim says "look here",
-   never "unsafe". */
+   never "unsafe" — and while engaged the direction is stated on-canvas
+   (the chip's flipped copy + the ui2-grid.css legend), never hover-only. */
 html[data-ui2-closable-lens="on"] .session-window:not(.session-window-closable) {
   opacity: 0.35;
   filter: saturate(0.55);
@@ -1024,6 +1025,20 @@ html[data-ui2-closable-lens="on"] .session-window.session-window-closable {
 }
 .session-window .session-window-terminal-continued:hover {
   text-decoration-style: solid;
+}
+/* Same-window fold (the resume shape): the pointer's target IS this
+   window — the successor's transcript streams below the note — so the
+   affordance is prose plus a courtesy scroll-to-tail, never a link that
+   goes nowhere. */
+.session-window .session-window-terminal-continued-here {
+  cursor: pointer;
+}
+.session-window .session-window-terminal-continued-here::after {
+  content: ' \2193';
+  opacity: 0.7;
+}
+.session-window .session-window-terminal-continued-here:hover {
+  text-decoration: underline dotted;
 }
 .session-window.minimized {
   min-height: 36px;

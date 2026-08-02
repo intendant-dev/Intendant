@@ -32,11 +32,16 @@ html.ui-v2 {
   --ui2-composer-off: 16px;
   --ui2-composer-h: 62px;
   --ui2-kb-inset: 0px;
+  /* Handover strip reservation: ui2-handover.js keeps this at the
+     drain/predecessor banner's REAL rendered height (0 when absent), so
+     the strip docks under the oversight bar and displaces #app and the
+     bar-adjacent popovers instead of covering chrome. */
+  --ui2-handover-h: 0px;
 }
 
 html.ui-v2 #app {
   padding-left: var(--ui2-nav-edge);
-  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + var(--ui2-handover-h));
   padding-right: var(--ui2-sa-r);
 }
 
@@ -415,7 +420,7 @@ html.ui-v2 .ui2-attention-count {
 
 html.ui-v2 #ui2-attention-pop {
   position: fixed; z-index: 230;
-  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + 6px);
+  top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t) + var(--ui2-handover-h) + 6px);
   right: calc(12px + var(--ui2-sa-r));
   width: 390px; max-width: calc(100vw - 24px);
   max-height: min(68vh, 560px);
