@@ -816,7 +816,18 @@ impl EncoderPool {
         {
             let always_on = self.inner.always_on.read().unwrap();
             for handle in always_on.iter() {
-                if prefs.supports(handle.id.codec) {
+                // A federated H.264 peer never rides the always-on H.264
+                // bank: its contract is the dedicated quarter-resolution /
+                // capped-bitrate `fed` slot (see the on-demand pass below
+                // and `select_single_rid_for_federated_offer`'s docs). On
+                // Windows H.264 IS the always-on baseline, and handing the
+                // federated peer this full-res `f` subscription produced a
+                // layer no federated viewer ever demands — the encoder
+                // stayed paused and the peer streamed nothing (observed
+                // live against a Windows 11 peer, 2026-08-02).
+                let federated_h264_bank =
+                    prefs.federated && handle.id.codec == CodecKind::H264;
+                if prefs.supports(handle.id.codec) && !federated_h264_bank {
                     subs.push(EncoderSubscription {
                         id: handle.id.clone(),
                         layer: handle.layer.clone(),
@@ -850,7 +861,14 @@ impl EncoderPool {
         {
             let mut on_demand = self.inner.on_demand.lock().unwrap();
             for &codec in &prefs.supported {
-                if always_on_codecs.contains(&codec) {
+                // Federated H.264 spawns its dedicated `fed` slot even
+                // when H.264 is the always-on baseline (Windows) — the
+                // always-on pass above deliberately withheld that bank
+                // from federated peers, so without this carve-out a
+                // Windows federated viewer would end the subscribe with
+                // no encoder at all.
+                let federated_h264 = prefs.federated && codec == CodecKind::H264;
+                if always_on_codecs.contains(&codec) && !federated_h264 {
                     continue;
                 }
                 if !Self::on_demand_spawnable(codec) {
@@ -859,12 +877,12 @@ impl EncoderPool {
                 // A federated H.264 peer gets the loss-resilient
                 // quarter-resolution / capped-bitrate layer on a DISTINCT
                 // RID (`RID_FEDERATED`), so its slot never aliases a local
-                // full-resolution H.264 slot (`RID_FULL`). Every other
+                // full-resolution H.264 slot (`RID_FULL`) — including the
+                // always-on baseline slot on Windows. Every other
                 // on-demand codec/peer keeps the full-resolution single
                 // layer on `RID_FULL`. The slot key (`EncoderId`) and the
                 // constructed layer must agree on the RID — they're
-                // derived together here.
-                let federated_h264 = prefs.federated && codec == CodecKind::H264;
+                // derived together (`federated_h264` from the loop head).
                 let rid = if federated_h264 {
                     SimulcastRid::federated()
                 } else {
@@ -3203,6 +3221,75 @@ mod tests {
             Some(2),
             "refcount must be exactly 2 — both subscribers counted \
              (never 1 from a missed install, never 3+ from a double-install)"
+        );
+    }
+
+    /// A federated H.264 subscription lands on the dedicated `fed`
+    /// quarter-layer slot — never a full-resolution H.264 slot. This is
+    /// the contract `select_single_rid_for_federated_offer` documents
+    /// and the demand policy relies on (a federated viewer only ever
+    /// demands its own layer).
+    #[tokio::test]
+    async fn federated_h264_subscribes_the_fed_slot_not_full() {
+        let pool = EncoderPool::new(640, 360, 30, |_, _| vec![], None);
+        let prefs = PeerCodecPreferences::new_federated(vec![CodecKind::H264]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("subscribe");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].id.codec, CodecKind::H264);
+        assert_eq!(
+            subs[0].id.rid,
+            SimulcastRid::federated(),
+            "federated H.264 must ride the fed quarter layer"
+        );
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::federated()),
+            Some(1),
+        );
+    }
+
+    /// Windows twin of the fed-slot contract: H.264 is the always-on
+    /// BASELINE_CODEC there, and the always-on short-circuit used to
+    /// capture federated H.264 peers — they were handed the full-res
+    /// `f` bank subscription (a layer no federated viewer demands, so
+    /// its encoder never emitted: peers=1, encode=0.0fps observed live
+    /// against a Windows 11 peer, 2026-08-02) and the `fed` spawn never
+    /// happened. A federated subscribe against an always-on H.264 bank
+    /// must yield exactly the on-demand `fed` slot; a non-federated one
+    /// keeps riding the always-on bank with no on-demand spawn.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_federated_h264_bypasses_the_always_on_bank() {
+        // Production Windows shape: single full-resolution always-on
+        // H.264 layer (see the DisplaySession::start layer_factory).
+        let pool = EncoderPool::new(
+            640,
+            360,
+            30,
+            |w, h| vec![LayerSpec::single(CodecKind::H264, w, h, 30)],
+            None,
+        );
+
+        let federated = PeerCodecPreferences::new_federated(vec![CodecKind::H264]);
+        let (subs, _lease) = pool.subscribe(&federated).expect("federated subscribe");
+        assert_eq!(subs.len(), 1, "exactly the fed slot — not the bank too");
+        assert_eq!(subs[0].id.rid, SimulcastRid::federated());
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::federated()),
+            Some(1),
+        );
+
+        let local = PeerCodecPreferences::new(vec![CodecKind::H264]);
+        let (subs, _lease2) = pool.subscribe(&local).expect("local subscribe");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            subs[0].id.rid,
+            SimulcastRid::full(),
+            "non-federated viewers keep the always-on bank"
+        );
+        assert_eq!(
+            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full()),
+            None,
+            "no on-demand full-res spawn beside the always-on bank"
         );
     }
 
