@@ -24,11 +24,13 @@
 
 mod lease;
 mod presence;
+mod successor_exec;
 mod update_lane;
 mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
 pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence, DrainHoldout};
+pub(crate) use successor_exec::spawn_successor_exec_lane;
 pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane};
 pub(crate) use update_watch::spawn_update_watch;
 
@@ -103,6 +105,15 @@ pub(crate) struct HandoverRuntime {
     /// check/produce actions through it; `status_json` serves its
     /// `update_lane` block. Unset in bare test constructions.
     update_lane: std::sync::OnceLock<std::sync::Arc<update_lane::UpdateLane>>,
+    /// The successor-exec lane (the ruled unsupervised one-click:
+    /// spawn-secondary → readiness → drain on the owner's explicit
+    /// panel click), installed at wiring beside the update lane.
+    /// `status_json` serves its `successor_exec` block. Unset in bare
+    /// test constructions.
+    successor_exec: std::sync::OnceLock<std::sync::Arc<successor_exec::SuccessorExecLane>>,
+    /// This boot's registration instant, for the young-secondary
+    /// convergence window ([`Self::secondary_poll_interval`]).
+    booted_at_ms: u64,
     /// The pid the spawning app supervisor claimed at boot
     /// (`INTENDANT_APP_SUPERVISOR_PID`). The claim alone proves nothing —
     /// [`Self::app_supervised`] re-checks it against the LIVE parent pid,
@@ -159,8 +170,10 @@ impl SwapRefusal {
     pub(crate) fn detail(self) -> &'static str {
         match self {
             SwapRefusal::NoSupervisor => {
-                "no app supervisor is attached to this daemon — nothing can \
-                 spawn the new daemon on this machine's behalf"
+                "no app supervisor is attached to this daemon — the relay has \
+                 nobody to hand the swap to; on a CLI-launched daemon the \
+                 successor-exec lane (the panel's hand-off click) performs the \
+                 update instead"
             }
             SwapRefusal::Draining => {
                 "this daemon is already draining — the update is already in motion"
@@ -310,6 +323,8 @@ impl HandoverRuntime {
             bus: std::sync::OnceLock::new(),
             update_status: std::sync::Mutex::new(None),
             update_lane: std::sync::OnceLock::new(),
+            successor_exec: std::sync::OnceLock::new(),
+            booted_at_ms: now_ms(),
             app_supervisor_pid: claimed_app_supervisor_pid(),
             swap_request: std::sync::Mutex::new(None),
             swap_result: std::sync::Mutex::new(None),
@@ -451,6 +466,38 @@ impl HandoverRuntime {
         self.update_lane.get().cloned()
     }
 
+    /// Install the successor-exec lane (wiring, once). First lane wins.
+    pub(crate) fn set_successor_exec(
+        &self,
+        lane: std::sync::Arc<successor_exec::SuccessorExecLane>,
+    ) {
+        let _ = self.successor_exec.set(lane);
+    }
+
+    /// The successor-exec lane, when this boot wired one (the route
+    /// handler's entry point for the ruled unsupervised one-click).
+    pub(crate) fn successor_exec_lane(
+        &self,
+    ) -> Option<std::sync::Arc<successor_exec::SuccessorExecLane>> {
+        self.successor_exec.get().cloned()
+    }
+
+    /// The scheduler's secondary-idle wake bound. Normally the lease
+    /// poll interval; while this boot is YOUNG it is ~1 s, so a freshly
+    /// spawned successor (the app supervisor's swap, the successor-exec
+    /// lane) converges on the drainer's released flock in about a
+    /// second instead of a full poll interval — which also keeps the Q4
+    /// successor watch's 30 s grace honest (a fresh spawn that idled a
+    /// full 60 s interval would trip a false "successor gone" alarm).
+    /// Polling a HELD flock never wins it, so a young secondary still
+    /// cannot race a live incumbent (the binding-3 posture).
+    pub(crate) fn secondary_poll_interval(&self) -> std::time::Duration {
+        secondary_poll_interval_for(
+            now_ms().saturating_sub(self.booted_at_ms),
+            lease_poll_interval(),
+        )
+    }
+
     pub(crate) fn boot_id(&self) -> &str {
         &self.boot_id
     }
@@ -522,6 +569,42 @@ impl HandoverRuntime {
                 }
                 if let Ok(mut last) = self.lease_error.lock() {
                     *last = None;
+                }
+                // Successor-exec's durable post-takeover verification:
+                // when this boot was spawned as an update's successor,
+                // the first acquisition states whether the swap landed
+                // the offered build — the drainer's own report may have
+                // died with the drainer (prompt zero-session exit).
+                if let Some(offered) = successor_exec::take_acquisition_verdict() {
+                    let running = crate::build_info::git_sha();
+                    if running == offered {
+                        let text = format!(
+                            "this daemon (:{}) now holds the scheduler lease and runs the \
+                             offered build (commit {running})",
+                            self.port
+                        );
+                        eprintln!("[successor-exec] {text}");
+                        self.notify_user(
+                            "successor-exec-verified",
+                            Some("Update handed off"),
+                            &text,
+                            crate::types::NotificationUrgency::Info,
+                        );
+                    } else {
+                        let text = format!(
+                            "the swap did NOT land the offered build: this daemon (:{}) holds \
+                             the scheduler lease running commit {running}, offered was \
+                             {offered} — treat the update as not applied",
+                            self.port
+                        );
+                        eprintln!("[successor-exec] {text}");
+                        self.notify_user(
+                            "successor-exec-build-mismatch",
+                            Some("Update landed the wrong build"),
+                            &text,
+                            crate::types::NotificationUrgency::Attention,
+                        );
+                    }
                 }
                 true
             }
@@ -862,6 +945,9 @@ impl HandoverRuntime {
         if let Some(lane) = self.update_lane.get() {
             obj.insert("update_lane".into(), lane.status_block());
         }
+        if let Some(lane) = self.successor_exec.get() {
+            obj.insert("successor_exec".into(), lane.status_block());
+        }
         // The supervisor fact + relay state ride TOP-LEVEL, never inside
         // `update`: the watch task replaces that block wholesale every
         // tick and would clobber them.
@@ -888,6 +974,27 @@ impl HandoverRuntime {
             }
         }
         block
+    }
+}
+
+/// The young-secondary convergence fold, pure: within the first ~90 s
+/// of a boot's life a secondary polls the lease at ~1 s instead of the
+/// full interval. Freshly
+/// spawned successors (the app supervisor's swap, the successor-exec
+/// lane) acquire the drained flock in about a second — inside the Q4
+/// successor watch's 30 s grace, where a full 60 s interval used to
+/// trip a false "successor gone" alarm. A rig interval shorter than
+/// the fast poll stays authoritative.
+fn secondary_poll_interval_for(
+    boot_age_ms: u64,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    const BOOT_CONVERGENCE_WINDOW_MS: u64 = 90_000;
+    const BOOT_CONVERGENCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+    if boot_age_ms < BOOT_CONVERGENCE_WINDOW_MS {
+        interval.min(BOOT_CONVERGENCE_POLL)
+    } else {
+        interval
     }
 }
 
@@ -1167,12 +1274,15 @@ mod tests {
         }
         // Emission shapes, unweakened and unduplicated: the swap wires
         // live once each in the chip module (chip buttons and palette
-        // runs all route through the two named perform* functions), and
-        // every lane POST goes through the panel's one authedFetch.
+        // runs all route through the named perform* functions), and
+        // every lane POST goes through the panel's one authedFetch. The
+        // successor-exec POST (the ruled unsupervised one-click) is the
+        // third chip emitter — exactly one site, like its siblings.
         assert_eq!(chip.matches("/api/daemon/update-swap").count(), 1);
         assert_eq!(chip.matches("/api/daemon/takeover").count(), 1);
+        assert_eq!(chip.matches("/api/daemon/successor-exec").count(), 1);
         assert_eq!(chip.matches("messageHandlers.updateSwap").count(), 1);
-        assert_eq!(chip.matches("authedFetch(").count(), 2);
+        assert_eq!(chip.matches("authedFetch(").count(), 3);
         assert_eq!(lane.matches("authedFetch(").count(), 1);
         // Two call sites for the check path — the panel button and the
         // palette seam — one POST function between them.
@@ -1182,6 +1292,7 @@ mod tests {
         for banned in [
             "/api/daemon/update-swap",
             "/api/daemon/takeover",
+            "/api/daemon/successor-exec",
             "/api/daemon/update-lane",
             "messageHandlers.updateSwap",
             "authedFetch(",
@@ -1192,19 +1303,50 @@ mod tests {
                 "ui2-chrome must not carry the update wire shape {banned:?}"
             );
         }
-        // And the served bundle carries the whole wiring.
+        // And the served bundle carries the whole wiring — including
+        // the ruled successor-exec click (spawn button + emitter).
         let app = include_str!("../../../../static/app.html");
         for needle in [
             "label: 'Check for updates'",
             "window.qa.paletteUpdateActions",
             "paletteEntry: updatePaletteEntry",
             "window.intendantUpdateLane",
+            "performSuccessorExec",
+            "Start the new daemon & hand off",
         ] {
             assert!(
                 app.contains(needle),
                 "the dashboard bundle lost the palette update actions: {needle}"
             );
         }
+    }
+
+    /// The young-secondary convergence window: a fresh boot polls at
+    /// ~1 s (bounded by any shorter rig interval); past the window the
+    /// configured interval rules. Keeps a spawned successor's
+    /// acquisition inside the Q4 successor-gone 30 s grace.
+    #[test]
+    fn young_secondaries_poll_fast_then_settle() {
+        let minute = std::time::Duration::from_secs(60);
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(secondary_poll_interval_for(0, minute), second);
+        assert_eq!(secondary_poll_interval_for(89_999, minute), second);
+        assert_eq!(
+            secondary_poll_interval_for(90_000, minute),
+            minute,
+            "past the window the configured interval rules"
+        );
+        let rig = std::time::Duration::from_millis(500);
+        assert_eq!(
+            secondary_poll_interval_for(0, rig),
+            rig,
+            "a shorter rig interval stays authoritative"
+        );
+
+        // The runtime end: a just-initialized boot is inside the window.
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HandoverRuntime::initialize(dir.path(), 8765, 0);
+        assert!(runtime.secondary_poll_interval() <= second);
     }
 
     #[test]

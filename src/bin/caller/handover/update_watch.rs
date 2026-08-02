@@ -10,9 +10,12 @@
 //! new to the new boot). On macOS an unsigned / non-Developer-ID image
 //! carries the keychain/TCC honesty line: its first custody or
 //! capture access after a takeover may re-prompt (item ACLs and TCC
-//! grants key on the signing identity). The old daemon never execs a
-//! successor daemon (Q8) — detection and the `--version` probe only;
-//! takeover stays an explicit gesture on the surfaces that carry one.
+//! grants key on the signing identity). Detection never execs a
+//! successor daemon — the stat and the `--version` probe only; the swap
+//! stays an explicit gesture on the surfaces that carry one (the app
+//! supervisor's one-click, or the ruled [`super::successor_exec`] click
+//! on CLI-launched daemons — the 2026-07-31 amendment to the original
+//! Q8 never-exec posture).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -159,7 +162,10 @@ impl UpdateWatch {
             exe_path,
             boot_stamp,
             running_version: crate::build_info::pkg_version().to_string(),
-            running_sha: crate::build_info::git_sha().to_string(),
+            // The shared running-commit answer (mock-rig override under
+            // PROVIDER=mock only): the chip's same-build suppression
+            // must agree with the update/successor-exec lanes' compares.
+            running_sha: super::update_lane::running_sha_for_compare(),
             running_built_at: crate::build_info::build_timestamp().to_string(),
             booted_at_ms,
             probed_stamp: None,

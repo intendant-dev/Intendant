@@ -538,6 +538,59 @@ mod tests {
         }
     }
 
+    /// The dev-only `skills-internal/` tier must stay disjoint from every
+    /// shipped skill name: `scripts/install-dev-skills.sh` symlinks those
+    /// into the same global roots, and the daemon installer skips
+    /// user-owned entries — so a name collision would silently block the
+    /// shipped copy's install on every dev machine. Also pins hygiene:
+    /// each internal SKILL.md parses and its frontmatter name equals the
+    /// directory.
+    #[test]
+    fn internal_skills_stay_disjoint_from_shipped_names_and_parse() {
+        let internal_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills-internal");
+        let mut shipped = BTreeSet::new();
+        for builtin in crate::builtin_skills::BUILTIN_SKILLS {
+            shipped.insert(builtin.name);
+        }
+        for plugin in BUNDLED_PLUGINS {
+            for skill in plugin.skills {
+                shipped.insert(skill.name);
+            }
+        }
+        let mut seen_any = false;
+        for entry in std::fs::read_dir(&internal_root)
+            .expect("skills-internal/ readable")
+            .flatten()
+        {
+            let skill_md = entry.path().join("SKILL.md");
+            if !skill_md.is_file() {
+                continue;
+            }
+            seen_any = true;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !shipped.contains(name.as_str()),
+                "skills-internal/{name} collides with a shipped skill — the \
+                 dev symlink would block the daemon install of the shipped copy"
+            );
+            let body = std::fs::read_to_string(&skill_md).expect("internal SKILL.md readable");
+            let (config, _) =
+                intendant_core::skills::parse_skill_md(&body, Path::new(name.as_str()))
+                    .unwrap_or_else(|error| {
+                        panic!("skills-internal/{name}/SKILL.md does not parse: {error}")
+                    });
+            assert_eq!(
+                config.name, name,
+                "frontmatter name must match the directory"
+            );
+            assert!(
+                !config.description.trim().is_empty(),
+                "internal skill description must carry its trigger"
+            );
+        }
+        assert!(seen_any, "skills-internal/ holds at least one skill");
+    }
+
     #[test]
     fn enable_state_round_trips_and_preserves_foreign_ids() {
         let tmp = tempfile::tempdir().unwrap();
