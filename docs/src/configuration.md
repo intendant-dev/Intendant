@@ -996,7 +996,7 @@ Schema version 3 contains:
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
 | `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (implemented; see [Trust Architecture](./trust-architecture.md)) |
 | `tier` | Optional owner-selected daemon trust tier (`integrated` or `disposable`). It informs doctrine and UI warnings but grants or denies nothing by itself |
-| `hosted_control` | Daemon-local hosted policy, pending doorbells, active/recent lease records, and qualifying signed-app anchors. Defaults to a Tasks ceiling and empty request/lease/anchor sets |
+| `hosted_control` | Daemon-local hosted policy, pending doorbells, active/recent lease records, and qualifying signed-app anchors (each enrolled anchor carries its evidence snapshot; a store holding evidence-bearing anchors refuses to load on older binaries that predate those fields — revoke anchors before downgrading). Defaults to a Tasks ceiling and empty request/lease/anchor sets |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard

@@ -71,7 +71,9 @@ Practical rules:
   `--tls` with a trusted certificate for public/authority-free bytes. The
   packaged macOS app's local bridge also supplies a secure context for local
   development, but no Developer ID-signed/notarized release exists for this
-  alpha, so its current artifact is not a distribution anchor. A generic Caddy/nginx HTTPS reverse proxy supplies
+  alpha and no published artifact can complete the compiled publisher-PGP
+  qualifying lane's verified install ceremony yet, so its current artifact is
+  not a distribution anchor. A generic Caddy/nginx HTTPS reverse proxy supplies
   encryption and a secure context, not client authentication. If it forwards
   to daemon loopback, the proxy is itself a root trust boundary and must enforce
   approved client identity while protecting its upstream from other callers.

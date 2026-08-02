@@ -99,10 +99,71 @@ confirmation surface, but is not required. Product copy recommends confirming
 on a device other than the requesting browser when convenient.
 
 Application-anchor enrollment is itself a local or direct-mTLS owner ceremony.
-An unsigned development artifact does not qualify. Until a qualifying signed
-distribution is published, the compiled eligible-distribution set is empty
-and the app-anchor set remains empty; local and direct-mTLS approval continue
-to work.
+An unsigned development artifact does not qualify. Two provenance lanes can
+qualify a distribution: an Apple Developer ID-signed/notarized release (that
+lane is dormant — no such release has been published), and the shipped
+publisher-PGP lane — detached signatures by the compile-pinned release key
+over every artifact, committed to the public transparency log, installed
+through the fail-closed verified install/update ceremony, and re-signed under
+the machine-local stable identity. The compiled eligible-distribution set
+names that second lane as its first entry, `macos-pgp-logged-v1`. The id
+names a lane (platform + provenance + revision), never a repo, key, or
+filename — those parameters live once each in the compiled pins. Future
+lanes and platforms are new ids with their own evidence semantics.
+
+Qualification is evidence-based and per instance, never parsed from an
+artifact name. Enrollment presents the install receipt the verified ceremony
+wrote (`{tag, log index, manifest hash, artifact sha256, re-sign identity,
+time}`) plus a fresh challenge signed by the platform-keystore anchor key
+over a domain-separated versioned transcript. The daemon independently
+re-verifies the receipt's release against its own compiled pins — inclusion
+proof, signed tree head, append-only pin, signing-key identity — online and
+fail-closed at enrollment, checks the receipt's artifact digest against that
+release's logged manifest, and persists the anchor with an evidence snapshot
+(receipt digest, verified tag and log index, signing-key fingerprint at
+enrollment) so later readers can audit what qualified it. Nothing published
+so far can complete that chain: `-unsigned-dev` artifacts, including
+v0.1.0's, are permanently outside the set (no retroactivity — the first
+qualifying release is the first whose artifacts complete the verified
+install ceremony), so enrollment remains an honest refusal today while local
+and direct-mTLS approval continue to work.
+
+What the chain proves is bounded, and this page says so deliberately: the
+install receipt is same-uid local state, so a local process could fabricate
+one. The chain therefore hardens the owner ceremony against supply-chain
+drift and honest mistake (enrolling a stale, tampered, or unlogged build)
+and hardens remote surfaces absolutely (a browser or served-code attacker
+cannot mint keystore keys or receipts) — but it does not defend against an
+already-compromised local machine, the same trust class as local presence
+itself. And the chain has a first instant it cannot cover: a drag-installed
+bootstrap **executes before any verification has happened**. The user-side
+ritual — `gpg --verify` plus `intendant hosted-verify --releases --download`
+against the downloaded archive before first launch — remains the independent
+check, and release notes keep recommending it.
+
+An enrolled anchor confirms through content-signed documents, not through a
+widened management surface: the public `anchor-decisions` doorbell verifies
+a decision signed by the enrolled keystore key — set membership re-checked
+at use, freshness and replay bounds enforced, and the decision bound to the
+exact daemon-signed request digest, with a changed digest refused the same
+way witness evidence is. Its authority is exactly deciding pending lease
+requests; policy, revocation, session eligibility, anchor enrollment, and
+witness confirm/override remain exclusively on the trusted confirmation
+surface. Because the document authenticates its content, the transport is
+irrelevant — the availability-only relay can carry it unchanged. How an
+application fetches pending requests remotely is staged follow-on work.
+
+Anchor records are closed-shape state: once an evidence-bearing anchor
+exists, an older daemon binary that predates the evidence fields refuses to
+load IAM state — loudly; authority errors and nothing is wiped or silently
+dropped. That downgrade posture is deliberate and fail-closed: revoke
+enrolled anchors before downgrading the daemon across this feature, or
+restore the pre-enrollment store backup. Release signing-key rotation
+composes the same way the compiled pin does: subkey rotation moves no pins
+and touches no anchors, while primary replacement is deliberately loud —
+anchors whose evidence names a retired fingerprint render as stale for the
+owner to re-enroll, are never auto-revoked, and keep witnessing under their
+active enrollment until the owner acts.
 
 On borrowed hardware, account authentication uses cross-device WebAuthn so the
 credential remains on the owner's phone. The resulting browser tab is still a
@@ -227,8 +288,10 @@ Configured peer daemons periodically fetch that record through their existing
 authenticated peer-route candidates, never from the fleet origin being
 observed, dial the fleet name from their own network path with ordinary WebPKI
 verification, and compare the presented leaf serial with the ledger. An
-observer does not need to enable its own hosted lane. A qualifying signed
-application may perform the same observation using its own network path.
+observer does not need to enable its own hosted lane. An enrolled application
+anchor of a compiled qualifying distribution may perform the same observation
+using its own network path; its reports are accepted only under an active
+enrollment — byte-equal keystore key and set membership re-checked at use.
 Unsigned development artifacts are not application witnesses.
 
 Reports carry an explicit vantage label. A private or link-local destination is
