@@ -22,7 +22,11 @@ off-by-default fleet-name lane can borrow a short-lived daemon-local lease
 bounded to a compiled non-root preset after confirmation on one of those
 surfaces. The packaged macOS app contains a local mTLS bridge, but no Developer
 ID-signed/notarized release has been published for this alpha. An
-`-unsigned-dev` app artifact is not a distribution trust anchor.
+`-unsigned-dev` app artifact is not a distribution trust anchor; what is one
+is the publisher-PGP + transparency-log lane — the compiled qualifying set's
+first entry, `macos-pgp-logged-v1` — verified per instance at enrollment
+through the fail-closed install ceremony, which no published artifact can
+complete yet.
 
 ## The residual trust problem is code provenance
 
@@ -870,8 +874,10 @@ authentication from staged identity vocabulary:
 1. **Trusted anchors are shipped** — local presence and direct mTLS are the
    root-capable daemon-control and lease-confirmation entry points. The packaged macOS app has a
    loopback mTLS bridge in source, but no Developer ID-signed/notarized release
-   has been published for this alpha. The release pipeline labels builds
-   `-unsigned-dev` until signing credentials are provisioned; those artifacts
+   has been published for this alpha. Releases are publisher-PGP-signed and
+   transparency-logged, and that lane is the compiled qualifying set's first
+   entry (`macos-pgp-logged-v1`); artifacts keep the `-unsigned-dev` label
+   until the app-side verified-install ceremony ships, and labelled artifacts
    are not distribution anchors.
 2. **Ambient hosted refusal, migration, and bounded leases are shipped** — raw
    hosted provenance is fixed at `role:none`; retired Connect signaling is
@@ -890,7 +896,11 @@ authentication from staged identity vocabulary:
    authorization decision.
 5. **General browser-key login remains future work** — it cannot reactivate the
    retired Connect path or broaden the dedicated hosted-lease principal. The
-   signed-application witness/anchor protocol is implemented, but the current
+   signed-application witness, enrollment, and decision verifiers are
+   implemented daemon-side against the compiled qualifying set (first entry:
+   `macos-pgp-logged-v1`, the publisher-PGP + transparency-log lane; an Apple
+   signed/notarized lane would be its own entry), but the current
    `-unsigned-dev` artifact is deliberately ineligible; operational
-   signed-application confirmation still requires a qualifying
-   signed/notarized distribution and platform-keystore enrollment.
+   signed-application confirmation still requires an instance of a qualifying
+   distribution completing the verified install ceremony and
+   platform-keystore enrollment, which nothing published can do yet.

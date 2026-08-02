@@ -1584,7 +1584,7 @@ fn mock_running_sha_override() -> Option<String> {
 /// The rendezvous the consumer lane verifies against: the live Connect
 /// configuration when one is set, else the env override, else the
 /// hosted default — the same ladder as `intendant hosted-verify`.
-fn update_rendezvous_url() -> Result<url::Url, String> {
+pub(crate) fn update_rendezvous_url() -> Result<url::Url, String> {
     let configured = crate::connect_rendezvous::status_snapshot()
         .rendezvous_url
         .map(|url| url.trim().to_string())

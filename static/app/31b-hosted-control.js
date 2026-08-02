@@ -805,7 +805,11 @@ function hostedControlRenderManagementCard() {
       <div class="acc-section-title">Hosted control</div>
       <div class="acc-section-sub">Daemon-minted, browser-key-bound leases. Feature:
       ${state.enabled ? 'enabled' : state.configured ? 'initialization error' : 'dark'}.
-      Signed-app confirmation and witnessing are unavailable until a qualifying signed distribution ships.</div>
+      ${state.qualifying_signed_app_distribution_available
+        ? `Qualifying signed distributions in this build: ${
+            (state.eligible_signed_app_distributions || []).map(hostedControlEscape).join(', ')
+          } — anchor enrollment requires verified install evidence from a transparency-logged release.`
+        : 'Signed-app confirmation and witnessing are unavailable until a qualifying signed distribution ships.'}</div>
     </div>
     <div class="hosted-control-mgmt">
       ${customSection}

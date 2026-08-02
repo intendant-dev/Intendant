@@ -132,6 +132,10 @@ impl HostedControlRuntime {
         if report.observer_kind != HostedWitnessKind::SignedApp {
             return Err("signed-application endpoint accepts only app witness reports".to_string());
         }
+        // The emptiness door stays fail-closed ahead of shape validation and
+        // curve verification: the set is a compiled constant, and forks or
+        // future builds may compile it empty again.
+        #[allow(clippy::const_is_empty)]
         if ELIGIBLE_SIGNED_APP_DISTRIBUTIONS.is_empty() {
             return Err(
                 "no qualifying signed application distribution is enabled in this build"
@@ -255,7 +259,7 @@ impl HostedControlRuntime {
         .map_err(|error| error.to_string())
     }
 
-    fn record_witness_rate(&self, observer_binding: &str) -> Result<(), String> {
+    pub(super) fn record_witness_rate(&self, observer_binding: &str) -> Result<(), String> {
         let now = now_ms();
         let cutoff = now.saturating_sub(HOSTED_WITNESS_RATE_WINDOW_MS);
         let mut rate = self
@@ -400,24 +404,13 @@ fn verify_signed_app_witness_anchor(
     device_id: &str,
     report: &HostedCertificateWitnessReport,
 ) -> AccessResult<()> {
-    let anchor = state
-        .hosted_control
-        .signed_app_anchors
-        .iter()
-        .find(|anchor| {
-            anchor.device_id == device_id && anchor.active && anchor.revoked_unix_ms.is_none()
-        })
-        .ok_or_else(|| AccessError("signed application witness is not accepted".to_string()))?;
-    if anchor.public_key != report.observer_public_key
-        || !ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
-            .iter()
-            .any(|distribution| *distribution == anchor.distribution_id)
-    {
-        return Err(AccessError(
-            "signed application witness is not accepted".to_string(),
-        ));
-    }
-    Ok(())
+    super::runtime::find_accepted_signed_app_anchor(
+        state,
+        device_id,
+        &report.observer_public_key,
+        "signed application witness is not accepted",
+    )
+    .map(|_| ())
 }
 
 fn witness_update_is_noop(
@@ -891,35 +884,125 @@ mod tests {
     }
 
     #[test]
-    fn build_without_an_eligible_distribution_accepts_no_app_witness() {
-        assert!(ELIGIBLE_SIGNED_APP_DISTRIBUTIONS.is_empty());
+    fn app_witness_requires_an_enrolled_qualifying_anchor() {
+        // The semantic flip of the empty-set pin: the compiled set now
+        // holds exactly the first qualifying lane, so app-witness
+        // reachability is gated on enrollment and set membership, not on
+        // build-wide emptiness.
+        assert_eq!(ELIGIBLE_SIGNED_APP_DISTRIBUTIONS, &["macos-pgp-logged-v1"]);
+
         let temp = tempfile::tempdir().unwrap();
+        let cert_dir = temp.path().join("access");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::write(
+            cert_dir.join("fleet-origin-provenance.json"),
+            r#"{
+                "schema_version": 1,
+                "zone": "example.test",
+                "name": "target.example.test",
+                "known_names": ["target.example.test"],
+                "provenance_incomplete": false
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cert_dir.join("fleet-cert-serials.json"),
+            r#"[{
+                "serial_hex": "abc",
+                "name": "target.example.test",
+                "directory": "test",
+                "issued_unix_ms": 1
+            }]"#,
+        )
+        .unwrap();
         let runtime = HostedControlRuntime::new(
             true,
-            temp.path().join("access"),
+            cert_dir,
             Some(&temp.path().join("identity.pk8")),
             Some("target"),
             "Target".to_string(),
             false,
         );
-        let witness = HostedCertificateWitnessReport {
+        let ledger = runtime.certificate_ledger().unwrap();
+
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        let public_key = b64u(pair.public_key().as_ref());
+        let mut report = HostedCertificateWitnessReport {
             protocol: CERTIFICATE_WITNESS_PROTOCOL.to_string(),
             report_id: "report-1".to_string(),
             observer_kind: HostedWitnessKind::SignedApp,
             observer_id: "device-1".to_string(),
-            observer_public_key: "not-used".to_string(),
+            observer_public_key: public_key.clone(),
             target_daemon_id: "target".to_string(),
-            fleet_origin: "https://target.example.test".to_string(),
-            ledger_sha256: "not-used".to_string(),
-            observed_serial_hex: "abc".to_string(),
+            fleet_origin: ledger.fleet_origin.clone(),
+            ledger_sha256: ledger.document_sha256(),
+            observed_serial_hex: "def".to_string(),
             vantage: HostedWitnessVantage::Cellular,
             observed_unix_ms: now_ms().max(0) as u64,
-            signature: "not-used".to_string(),
+            signature: String::new(),
         };
+        report.signature = b64u(
+            pair.sign(&rng, report.unsigned_payload().as_bytes())
+                .unwrap()
+                .as_ref(),
+        );
+
+        // Well-shaped and correctly signed, but the device is not enrolled.
         assert!(runtime
-            .receive_signed_app_witness(witness)
+            .receive_signed_app_witness(report.clone())
             .unwrap_err()
-            .contains("no qualifying signed application distribution"));
+            .contains("not accepted"));
+
+        // An enrolled record outside the qualifying set is still refused.
+        let inject = |distribution_id: &str| {
+            iam::transact_state(&runtime.cert_dir, |state, _| {
+                state
+                    .hosted_control
+                    .signed_app_anchors
+                    .retain(|anchor| anchor.device_id != "device-1");
+                state.hosted_control.signed_app_anchors.push(SignedAppAnchor {
+                    device_id: "device-1".to_string(),
+                    label: "Test app".to_string(),
+                    public_key: public_key.clone(),
+                    key_fingerprint: "fp-test".to_string(),
+                    distribution_id: distribution_id.to_string(),
+                    active: true,
+                    enrolled_unix_ms: now_ms().max(0) as u64,
+                    revoked_unix_ms: None,
+                    evidence: None,
+                });
+                Ok(((), true))
+            })
+            .unwrap();
+        };
+        inject("macos-unsigned-dev");
+        assert!(runtime
+            .receive_signed_app_witness(report.clone())
+            .unwrap_err()
+            .contains("not accepted"));
+
+        // An enrolled qualifying anchor makes the report land.
+        inject("macos-pgp-logged-v1");
+        let guard = runtime.receive_signed_app_witness(report).unwrap();
+        assert_eq!(guard.status, HostedLaneGuardStatus::Alert);
+        let state = iam::load_state(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.witnesses.reports.len(), 1);
+        assert_eq!(
+            state.hosted_control.witnesses.reports[0].observer_binding,
+            "app:device-1"
+        );
     }
 
     #[test]

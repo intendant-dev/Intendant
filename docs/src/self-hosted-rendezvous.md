@@ -227,7 +227,9 @@ with a separate fleet-origin request and trusted confirmation, then mints an
 exact expiring `hosted_lease`. Use a trusted local or independently reached
 daemon-served direct/mTLS surface for root access and lease confirmation. The
 packaged macOS app is not an alternative distribution anchor in this alpha:
-no Developer ID-signed/notarized release has been published.
+no Developer ID-signed/notarized release has been published, and the compiled
+publisher-PGP qualifying lane (`macos-pgp-logged-v1`) has no published
+instance that can complete its verified install ceremony yet.
 
 Root bootstrap is deliberately outside this flow. Use `intendant access
 setup` from the machine's console/SSH session or a direct mTLS root session.

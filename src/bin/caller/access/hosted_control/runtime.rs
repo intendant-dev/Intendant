@@ -14,7 +14,138 @@ use crate::daemon_identity::{b64u, verify_b64u, DaemonIdentity};
 
 use super::*;
 
-pub(super) const ELIGIBLE_SIGNED_APP_DISTRIBUTIONS: &[&str] = &[];
+/// The compiled qualifying set of signed application distributions — the
+/// only ids `enroll_signed_app_anchor` will enroll and the witness/decision
+/// lanes will accept. Each id names a **lane** (platform + provenance +
+/// revision), never a repo, key, or filename: those parameters live once in
+/// the compiled pins the enrollment verifier already consults —
+/// `crate::hosted_verify::DEFAULT_RELEASE_REPO`,
+/// `crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT` (and the committed
+/// key bytes beside it), and the per-host append-only transparency-log pin
+/// under the state root (`hosted-verify/<host>.json`). Qualification is
+/// evidence-based, verified per instance at enrollment (receipt
+/// re-verification against the pinned log plus a keystore-key challenge) —
+/// never parsed from an artifact name, and never retroactive: releases
+/// published before the verified install ceremony existed stay outside.
+/// `-unsigned-dev`-suffixed artifacts, source builds, and browser tabs are
+/// permanently outside the set. Future lanes (an Apple-notarized lane,
+/// other platforms) are new ids with their own evidence semantics.
+pub(super) const ELIGIBLE_SIGNED_APP_DISTRIBUTIONS: &[&str] = &["macos-pgp-logged-v1"];
+
+/// Mirror of the witness lane's changed-evidence posture: a decision is
+/// bound to the exact daemon-signed request digest the anchor saw, and a
+/// digest that no longer matches is refused rather than silently rebound.
+pub const ANCHOR_DECISION_REQUEST_CHANGED_ERROR: &str =
+    "lease request changed; fetch the current daemon-signed request before deciding";
+/// Uniform refusal for unknown, revoked, key-mismatched, or set-nonmember
+/// anchors — deliberately non-enumerating, like the witness lane's.
+pub const ANCHOR_DECISION_REFUSED_ERROR: &str =
+    "signed application anchor decision is not accepted";
+
+fn ensure_eligible_distribution(distribution_id: &str) -> Result<(), String> {
+    if ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
+        .iter()
+        .any(|distribution| *distribution == distribution_id)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "signed application distribution {distribution_id:?} is not in this build's qualifying set"
+    ))
+}
+
+/// The one acceptance predicate for enrolled signed-application anchors:
+/// an active, unrevoked record for the device, byte-equal presented key,
+/// and compiled-set membership re-checked at use time. The witness and
+/// decision lanes both resolve through here.
+pub(super) fn find_accepted_signed_app_anchor<'a>(
+    state: &'a LocalIamState,
+    device_id: &str,
+    presented_public_key: &str,
+    refusal: &str,
+) -> AccessResult<&'a SignedAppAnchor> {
+    let anchor = state
+        .hosted_control
+        .signed_app_anchors
+        .iter()
+        .find(|anchor| {
+            anchor.device_id == device_id && anchor.active && anchor.revoked_unix_ms.is_none()
+        })
+        .ok_or_else(|| AccessError(refusal.to_string()))?;
+    if anchor.public_key != presented_public_key
+        || ensure_eligible_distribution(&anchor.distribution_id).is_err()
+    {
+        return Err(AccessError(refusal.to_string()));
+    }
+    Ok(anchor)
+}
+
+/// Where enrollment re-verifies a receipt's release: the same rendezvous
+/// ladder, GitHub API base, compiled repo, and per-host append-only pin
+/// store the consumer update lane uses — one log, one pin per host.
+pub(crate) struct ReleaseEvidenceEndpoints {
+    pub(crate) log_base: url::Url,
+    pub(crate) github_api: url::Url,
+    pub(crate) repo: String,
+    pub(crate) state_root: PathBuf,
+}
+
+impl ReleaseEvidenceEndpoints {
+    fn resolve() -> Result<Self, String> {
+        Ok(Self {
+            log_base: crate::handover::update_rendezvous_url()?,
+            github_api: url::Url::parse(crate::hosted_verify::GITHUB_API_BASE)
+                .map_err(|error| format!("GitHub API base: {error}"))?,
+            repo: crate::hosted_verify::DEFAULT_RELEASE_REPO.to_string(),
+            state_root: crate::platform::intendant_home(),
+        })
+    }
+}
+
+fn validate_receipt_shape(receipt: &SignedAppInstallReceipt) -> Result<(), String> {
+    let hex64 =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if receipt.tag.is_empty()
+        || receipt.tag.len() > 64
+        || !receipt
+            .tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err("install receipt tag is invalid".to_string());
+    }
+    if !hex64(&receipt.manifest_hash) {
+        return Err("install receipt manifest hash is invalid".to_string());
+    }
+    if !hex64(&receipt.artifact_sha256) {
+        return Err("install receipt artifact digest is invalid".to_string());
+    }
+    // The re-sign identity fields are machine-local evidence (empty when the
+    // owner declined the stable identity); bound their shape, not presence.
+    let bounded = |value: &str| value.len() <= 192 && !value.chars().any(char::is_control);
+    if !bounded(&receipt.resign_cert_fingerprint) || !bounded(&receipt.post_resign_cdhash) {
+        return Err("install receipt re-sign identity fields are invalid".to_string());
+    }
+    if receipt.written_unix_ms == 0 {
+        return Err("install receipt timestamp is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn describe_verify_failure(failure: &crate::hosted_verify::VerifyFailure) -> String {
+    match failure {
+        crate::hosted_verify::VerifyFailure::Unavailable(detail) => {
+            format!("verification unavailable: {detail}")
+        }
+        crate::hosted_verify::VerifyFailure::Verification { summary, mismatches } => {
+            if mismatches.is_empty() {
+                summary.clone()
+            } else {
+                format!("{summary} — {}", mismatches.join("; "))
+            }
+        }
+    }
+}
 
 pub fn mark_session_created_by_hosted_lease(
     cert_dir: &Path,
@@ -495,6 +626,19 @@ impl HostedControlRuntime {
         input: HostedLeaseDecisionInput,
         actor: &AccessPrincipal,
     ) -> Result<Option<HostedLeaseDocument>, String> {
+        self.decide_request_as(input, &actor.id)
+    }
+
+    /// The one lease-decision core. Trusted-surface callers arrive through
+    /// [`Self::decide_request`]; the anchor decision lane arrives through
+    /// [`Self::apply_anchor_decision`] after content-signature verification,
+    /// with the enrolled anchor as the audited actor. Nothing else decides
+    /// pending lease requests.
+    fn decide_request_as(
+        &self,
+        input: HostedLeaseDecisionInput,
+        actor_id: &str,
+    ) -> Result<Option<HostedLeaseDocument>, String> {
         self.ensure_enabled()?;
         let identity = self.identity()?;
         iam::transact_state(&self.cert_dir, |state, _| {
@@ -545,7 +689,7 @@ impl HostedControlRuntime {
                     HostedLeaseRequestStatus::Denied;
                 push_audit(
                     state,
-                    &actor.id,
+                    actor_id,
                     "hosted_lease_deny",
                     &request.request_id,
                     "Denied hosted lease request".to_string(),
@@ -575,7 +719,7 @@ impl HostedControlRuntime {
                 &request,
                 preset,
                 ttl,
-                actor,
+                actor_id,
                 identity,
                 &self.daemon_id,
             )?;
@@ -676,7 +820,7 @@ impl HostedControlRuntime {
                 &request,
                 request.requested_preset,
                 request.requested_ttl_secs,
-                actor,
+                &actor.id,
                 identity,
                 &self.daemon_id,
             )?;
@@ -808,14 +952,22 @@ impl HostedControlRuntime {
         let state = iam::load_state_cached_arc(&self.cert_dir)?;
         let now = now_ms() as u64;
         let lane_guard = compute_current_lane_guard(&state);
+        // Derived from the compiled constant; forks and future builds may
+        // compile the set empty again, so the emptiness read stays.
+        #[allow(clippy::const_is_empty)]
+        let qualifying_signed_app_distribution_available =
+            !ELIGIBLE_SIGNED_APP_DISTRIBUTIONS.is_empty();
         Ok(HostedControlManagementSnapshot {
             configured: self.configured(),
             enabled: self.enabled(),
             initialization_error: self.initialization_error().map(ToOwned::to_owned),
             display_media_relay_configured: self.display_media_relay_configured,
             anchor_decision_protocol: ANCHOR_DECISION_PROTOCOL.to_string(),
-            qualifying_signed_app_distribution_available: !ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
-                .is_empty(),
+            qualifying_signed_app_distribution_available,
+            eligible_signed_app_distributions: ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             policy: state.hosted_control.policy.clone(),
             pending_requests: state
                 .hosted_control
@@ -1003,16 +1155,249 @@ impl HostedControlRuntime {
         })
     }
 
-    pub fn enroll_signed_app_anchor(
+    /// Enroll a signed-application anchor at the unchanged local or
+    /// direct-mTLS owner ceremony. The evidence chain hardens that ceremony
+    /// against supply-chain drift and honest mistake; it never substitutes
+    /// for it, and an enrolled anchor holds no IAM role. Verification is
+    /// fail-closed and online: the daemon independently re-verifies the
+    /// receipt's release against its own compiled pins through
+    /// [`crate::hosted_verify::verify_hosted_release`] — no cached-evidence
+    /// acceptance. The optional macOS live-codesign strength probe stages
+    /// with the app-side ceremony (only the running app knows its live
+    /// bundle path); the receipt's re-sign identity fields are covered by
+    /// the receipt digest so that probe can compare later.
+    pub async fn enroll_signed_app_anchor(
         &self,
-        _anchor: SignedAppAnchor,
-        _actor: &AccessPrincipal,
-    ) -> AccessResult<()> {
+        input: SignedAppAnchorEnrollmentInput,
+        actor: &AccessPrincipal,
+    ) -> AccessResult<SignedAppAnchor> {
+        let endpoints = ReleaseEvidenceEndpoints::resolve().map_err(AccessError)?;
+        self.enroll_signed_app_anchor_at(&endpoints, input, actor)
+            .await
+    }
+
+    pub(crate) async fn enroll_signed_app_anchor_at(
+        &self,
+        endpoints: &ReleaseEvidenceEndpoints,
+        mut input: SignedAppAnchorEnrollmentInput,
+        actor: &AccessPrincipal,
+    ) -> AccessResult<SignedAppAnchor> {
         self.ensure_enabled().map_err(AccessError)?;
-        let _ = ELIGIBLE_SIGNED_APP_DISTRIBUTIONS;
-        Err(AccessError(
-            "no qualifying signed application distribution is enabled in this build".to_string(),
-        ))
+        // Set membership refuses before any cryptography or network reach,
+        // and is re-checked inside the durable transaction below.
+        ensure_eligible_distribution(&input.distribution_id).map_err(AccessError)?;
+        if !valid_id_component(&input.device_id) {
+            return Err(AccessError("anchor device id is invalid".to_string()));
+        }
+        let label = input.label.trim().to_string();
+        if label.is_empty() || label.len() > 96 || label.chars().any(char::is_control) {
+            return Err(AccessError(
+                "anchor label must contain 1 to 96 printable characters".to_string(),
+            ));
+        }
+        let (public_key, key_fingerprint) = validate_browser_public_key(&input.public_key)
+            .map_err(|_| {
+                AccessError(
+                    "anchor public key must be an uncompressed P-256 point (base64url)"
+                        .to_string(),
+                )
+            })?;
+        if !valid_id_component(&input.nonce) {
+            return Err(AccessError("anchor enrollment nonce is invalid".to_string()));
+        }
+        verify_timestamp(input.timestamp_unix_ms).map_err(AccessError)?;
+        validate_receipt_shape(&input.receipt).map_err(AccessError)?;
+        // The keystore-key challenge: a domain-separated versioned transcript
+        // binding daemon, device, key, distribution, and the exact receipt.
+        input.public_key = public_key.clone();
+        input.label = label.clone();
+        verify_p256_signature(
+            &public_key,
+            input.challenge_payload(&self.daemon_id).as_bytes(),
+            &input.signature,
+        )
+        .map_err(AccessError)?;
+        self.record_nonce(
+            &format!("anchor-enroll:{key_fingerprint}"),
+            &input.nonce,
+            input.timestamp_unix_ms,
+        )
+        .map_err(AccessError)?;
+        // Fail closed online: any transparency-log, pin, signature-coverage,
+        // or GitHub divergence — including plain unavailability — refuses
+        // enrollment. Enrollment is rare and owner-driven; there is no
+        // cached-evidence path.
+        let report = crate::hosted_verify::verify_hosted_release(
+            &endpoints.log_base,
+            &endpoints.github_api,
+            &endpoints.repo,
+            Some(&input.receipt.tag),
+            false,
+            &endpoints.state_root,
+        )
+        .await
+        .map_err(|failure| {
+            AccessError(format!(
+                "enrollment evidence verification failed: {}",
+                describe_verify_failure(&failure)
+            ))
+        })?;
+        if report.manifest_index != input.receipt.log_index {
+            return Err(AccessError(
+                "install receipt names a different transparency-log index than the verified release"
+                    .to_string(),
+            ));
+        }
+        if report.manifest_hash != input.receipt.manifest_hash {
+            return Err(AccessError(
+                "install receipt manifest hash does not match the verified release".to_string(),
+            ));
+        }
+        if !report
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.sha256 == input.receipt.artifact_sha256)
+        {
+            return Err(AccessError(
+                "install receipt artifact digest is not in the verified release's logged manifest"
+                    .to_string(),
+            ));
+        }
+        let now = now_ms().max(0) as u64;
+        let anchor = SignedAppAnchor {
+            device_id: input.device_id.clone(),
+            label,
+            public_key,
+            key_fingerprint,
+            distribution_id: input.distribution_id.clone(),
+            active: true,
+            enrolled_unix_ms: now,
+            revoked_unix_ms: None,
+            evidence: Some(SignedAppAnchorEvidence {
+                receipt_sha256: input.receipt.document_sha256(),
+                verified_tag: report.tag.clone(),
+                log_index: report.manifest_index,
+                artifact_sha256: input.receipt.artifact_sha256.clone(),
+                pgp_fingerprint_at_enrollment: report.pgp_fingerprint.clone(),
+                verified_unix_ms: now,
+            }),
+        };
+        iam::transact_state(&self.cert_dir, |state, _| {
+            ensure_eligible_distribution(&anchor.distribution_id).map_err(AccessError)?;
+            // Re-enrollment under the same device id is the owner's
+            // key-rotation and staleness remedy: the fresh record replaces
+            // the prior one, so the old key stops witnessing immediately.
+            let replaced = state
+                .hosted_control
+                .signed_app_anchors
+                .iter()
+                .any(|existing| existing.device_id == anchor.device_id);
+            state
+                .hosted_control
+                .signed_app_anchors
+                .retain(|existing| existing.device_id != anchor.device_id);
+            state.hosted_control.signed_app_anchors.push(anchor.clone());
+            state.hosted_control.normalize();
+            push_audit(
+                state,
+                &actor.id,
+                "hosted_anchor_enroll",
+                &anchor.device_id,
+                format!(
+                    "Enrolled signed-app anchor under {} with verified release {}{}",
+                    anchor.distribution_id,
+                    report.tag,
+                    if replaced {
+                        ", replacing the prior enrollment"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            Ok(((), true))
+        })?;
+        Ok(anchor)
+    }
+
+    /// Verify and apply a content-signed lease decision from an enrolled
+    /// signed-application anchor. The document's authority is exactly one
+    /// pending lease decision — approve or deny, bound to the exact
+    /// daemon-signed request digest — never a management operation: policy,
+    /// revocation, eligibility, anchor CRUD, and witness confirm/override
+    /// remain exclusively on the trusted confirmation surface.
+    pub fn apply_anchor_decision(
+        &self,
+        document: HostedAnchorDecisionDocument,
+    ) -> Result<HostedLeaseRequestStatus, String> {
+        self.ensure_enabled()?;
+        if document.protocol != ANCHOR_DECISION_PROTOCOL {
+            return Err("unsupported anchor decision protocol".to_string());
+        }
+        if document.daemon_id != self.daemon_id {
+            return Err("anchor decision names a different target daemon".to_string());
+        }
+        if !valid_id_component(&document.device_id)
+            || !valid_id_component(&document.request_id)
+            || !valid_id_component(&document.nonce)
+        {
+            return Err("anchor decision identifier is invalid".to_string());
+        }
+        verify_timestamp(document.timestamp_unix_ms)?;
+        let state = iam::load_state_cached_arc(&self.cert_dir)
+            .map_err(|error| format!("load signed-app anchor state: {error}"))?;
+        let anchor = find_accepted_signed_app_anchor(
+            &state,
+            &document.device_id,
+            &document.anchor_public_key,
+            ANCHOR_DECISION_REFUSED_ERROR,
+        )
+        .map_err(|error| error.to_string())?;
+        let anchor_public_key = anchor.public_key.clone();
+        // Account the attempt before the curve verification, but only after
+        // the anchor lookup: garbage from unenrolled devices must not drain
+        // the shared observation window.
+        self.record_witness_rate(&format!("decision:{}", document.device_id))
+            .map_err(|_| "anchor decision rate limit exceeded".to_string())?;
+        verify_p256_signature(
+            &anchor_public_key,
+            document.signing_payload().as_bytes(),
+            &document.signature,
+        )?;
+        self.record_nonce(
+            &format!("anchor-decision:{}", document.device_id),
+            &document.nonce,
+            document.timestamp_unix_ms,
+        )?;
+        // Bind to the exact daemon-signed request. The digest covers only
+        // the request's immutable creation-time fields, so a mismatch means
+        // the anchor decided a different request than this daemon holds.
+        let request = state
+            .hosted_control
+            .requests
+            .iter()
+            .find(|request| request.request_id == document.request_id)
+            .cloned()
+            .ok_or_else(|| "hosted lease request was not found".to_string())?;
+        self.verify_doorbell(&request)?;
+        if request.document_sha256() != document.request_document_sha256 {
+            return Err(ANCHOR_DECISION_REQUEST_CHANGED_ERROR.to_string());
+        }
+        let decided = self.decide_request_as(
+            HostedLeaseDecisionInput {
+                request_id: document.request_id.clone(),
+                approve: document.approve,
+                approved_preset: None,
+                approved_ttl_secs: None,
+            },
+            &format!("principal:signed-app-anchor:{}", document.device_id),
+        )?;
+        // The lease document itself rides the requesting browser's poll
+        // channel; the anchor learns only the decision outcome.
+        Ok(if decided.is_some() {
+            HostedLeaseRequestStatus::Approved
+        } else {
+            HostedLeaseRequestStatus::Denied
+        })
     }
 
     fn materialize_expirations(&self, actor: &str) -> AccessResult<()> {
@@ -1286,12 +1671,12 @@ fn issue_lease_record(
     request: &HostedLeaseRequest,
     preset: HostedPreset,
     ttl_secs: u64,
-    actor: &AccessPrincipal,
+    actor_id: &str,
     identity: &DaemonIdentity,
     daemon_id: &str,
 ) -> AccessResult<HostedLeaseDocument> {
     let now = now_ms().max(0) as u64;
-    materialize_hosted_lease_expirations(state, now, &actor.id);
+    materialize_hosted_lease_expirations(state, now, actor_id);
     iam::normalize_hosted_lease_bindings(state);
     let active_leases = state
         .hosted_control
@@ -1376,7 +1761,7 @@ fn issue_lease_record(
     iam::normalize_hosted_lease_bindings(state);
     push_audit(
         state,
-        &actor.id,
+        actor_id,
         "hosted_lease_issue",
         &lease_id,
         format!("Issued {} lease for {} seconds", preset.as_str(), ttl_secs),
@@ -3035,24 +3420,621 @@ mod tests {
     }
 
     #[test]
-    fn unsigned_development_artifacts_cannot_enroll_as_anchors() {
+    fn qualifying_set_holds_exactly_the_macos_pgp_logged_lane() {
+        assert_eq!(ELIGIBLE_SIGNED_APP_DISTRIBUTIONS, &["macos-pgp-logged-v1"]);
+    }
+
+    /// Hermetic enrollment-evidence rig: the hosted_verify fixture log with
+    /// one qualifying release, plus injected endpoints so the enrollment
+    /// verifier's fail-closed online re-verification runs against loopback.
+    struct EvidenceRig {
+        endpoints: ReleaseEvidenceEndpoints,
+        tag: String,
+        artifact_sha256: String,
+        manifest_hash: String,
+        log_index: u64,
+        _server: tokio::task::JoinHandle<()>,
+        _state_root: tempfile::TempDir,
+    }
+
+    async fn evidence_rig(tag: &str) -> EvidenceRig {
+        use crate::hosted_verify::test_fixtures::{
+            release_leaf_fixture, signed_release_artifacts, spawn_fixture_server, Fixture,
+            FixtureLog,
+        };
+        let bytes = b"qualifying app bytes".to_vec();
+        let artifact = crate::hosted_verify::ReleaseArtifact {
+            name: format!("Intendant-{}-macos-arm64.zip", tag.trim_start_matches('v')),
+            sha256: crate::hosted_verify::sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        };
+        let artifacts = signed_release_artifacts(&artifact, b"detached signature bytes");
+        let leaf = release_leaf_fixture(tag, &artifacts);
+        let manifest_hash = serde_json::from_str::<serde_json::Value>(&leaf).unwrap()
+            ["manifest_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let leaves = vec![
+            serde_json::json!({ "kind": "daemon_claimed", "daemon_id": "d1" }).to_string(),
+            leaf,
+        ];
+        let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
+            log: FixtureLog::new(leaves),
+            manifest_index: 1,
+            release_status: 200,
+            release_body: serde_json::Value::Null,
+            downloads: std::collections::HashMap::new(),
+        }));
+        let (base, server) = spawn_fixture_server(std::sync::Arc::clone(&fixture)).await;
+        fixture.lock().unwrap().release_body = serde_json::json!({
+            "tag_name": tag,
+            "assets": artifacts
+                .iter()
+                .map(|artifact| serde_json::json!({
+                    "name": artifact.name,
+                    "size": artifact.size,
+                    "digest": format!("sha256:{}", artifact.sha256),
+                    "browser_download_url": format!("{base}dl/{}", artifact.name),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let state_root = tempfile::tempdir().unwrap();
+        EvidenceRig {
+            endpoints: ReleaseEvidenceEndpoints {
+                log_base: base.clone(),
+                github_api: base,
+                repo: "test/repo".to_string(),
+                state_root: state_root.path().to_path_buf(),
+            },
+            tag: tag.to_string(),
+            artifact_sha256: artifact.sha256,
+            manifest_hash,
+            log_index: 1,
+            _server: server,
+            _state_root: state_root,
+        }
+    }
+
+    fn rig_receipt(rig: &EvidenceRig) -> SignedAppInstallReceipt {
+        SignedAppInstallReceipt {
+            tag: rig.tag.clone(),
+            log_index: rig.log_index,
+            manifest_hash: rig.manifest_hash.clone(),
+            artifact_sha256: rig.artifact_sha256.clone(),
+            resign_cert_fingerprint: "intendant-dev-test-dr".to_string(),
+            post_resign_cdhash: "cdhash-test".to_string(),
+            written_unix_ms: now_ms().max(0) as u64,
+        }
+    }
+
+    fn enrollment_input(
+        key: &BrowserKey,
+        device_id: &str,
+        distribution_id: &str,
+        receipt: SignedAppInstallReceipt,
+    ) -> SignedAppAnchorEnrollmentInput {
+        let mut input = SignedAppAnchorEnrollmentInput {
+            device_id: device_id.to_string(),
+            label: "Test signed app".to_string(),
+            public_key: key.public_key.clone(),
+            distribution_id: distribution_id.to_string(),
+            receipt,
+            nonce: format!("nonce-{}", uuid::Uuid::new_v4().simple()),
+            timestamp_unix_ms: now_ms(),
+            signature: String::new(),
+        };
+        input.signature = sign(key, &input.challenge_payload("daemon-test"));
+        input
+    }
+
+    #[tokio::test]
+    async fn enrollment_verifies_evidence_online_and_persists_the_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(&temp);
-        let anchor = SignedAppAnchor {
-            device_id: "device-test".to_string(),
-            label: "Unsigned development app".to_string(),
-            public_key: "not-used".to_string(),
-            key_fingerprint: "not-used".to_string(),
-            distribution_id: "macos-unsigned-dev".to_string(),
-            active: true,
-            enrolled_unix_ms: now_ms() as u64,
-            revoked_unix_ms: None,
+        let rig = evidence_rig("v1.2.3").await;
+        let key = browser_key();
+        let receipt = rig_receipt(&rig);
+        let receipt_sha256 = receipt.document_sha256();
+        let anchor = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&key, "device-1", "macos-pgp-logged-v1", receipt),
+                &owner(),
+            )
+            .await
+            .expect("qualifying enrollment passes");
+        assert!(anchor.active);
+        assert_eq!(anchor.distribution_id, "macos-pgp-logged-v1");
+        let evidence = anchor.evidence.expect("evidence snapshot persisted");
+        assert_eq!(evidence.verified_tag, "v1.2.3");
+        assert_eq!(evidence.log_index, 1);
+        assert_eq!(evidence.receipt_sha256, receipt_sha256);
+        assert_eq!(evidence.artifact_sha256, rig.artifact_sha256);
+        assert_eq!(
+            evidence.pgp_fingerprint_at_enrollment,
+            crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT
+        );
+        let state = iam::load_state(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.signed_app_anchors.len(), 1);
+        assert!(state.hosted_control.signed_app_anchors[0].evidence.is_some());
+        assert!(state
+            .audit_events
+            .iter()
+            .any(|event| event.action == "hosted_anchor_enroll"));
+
+        // Re-enrollment under the same device id replaces the record —
+        // the owner's key-rotation remedy; the old key stops witnessing.
+        let rotated = browser_key();
+        let replacement = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&rotated, "device-1", "macos-pgp-logged-v1", rig_receipt(&rig)),
+                &owner(),
+            )
+            .await
+            .unwrap();
+        let state = iam::load_state(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.signed_app_anchors.len(), 1);
+        assert_eq!(
+            state.hosted_control.signed_app_anchors[0].public_key,
+            replacement.public_key
+        );
+        assert_ne!(replacement.public_key, anchor.public_key);
+    }
+
+    #[tokio::test]
+    async fn enrollment_refuses_unlisted_and_development_distribution_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        // Membership refuses before any network reach: these endpoints are
+        // never dialed.
+        let endpoints = ReleaseEvidenceEndpoints {
+            log_base: url::Url::parse("http://127.0.0.1:1/").unwrap(),
+            github_api: url::Url::parse("http://127.0.0.1:1/").unwrap(),
+            repo: "test/repo".to_string(),
+            state_root: temp.path().to_path_buf(),
         };
+        let key = browser_key();
+        for ineligible in ["macos-unsigned-dev", "some-other-lane", ""] {
+            let receipt = SignedAppInstallReceipt {
+                tag: "v1.2.3".to_string(),
+                log_index: 1,
+                manifest_hash: "0".repeat(64),
+                artifact_sha256: "0".repeat(64),
+                resign_cert_fingerprint: String::new(),
+                post_resign_cdhash: String::new(),
+                written_unix_ms: 1,
+            };
+            let error = runtime
+                .enroll_signed_app_anchor_at(
+                    &endpoints,
+                    enrollment_input(&key, "device-1", ineligible, receipt),
+                    &owner(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not in this build's qualifying set"),
+                "{ineligible:?} was not refused by membership: {error}"
+            );
+        }
+        assert!(iam::load_state(&runtime.cert_dir)
+            .unwrap()
+            .hosted_control
+            .signed_app_anchors
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrollment_refuses_forged_receipts_daemon_side() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+
+        // An unlogged tag: the log has no such release committed.
+        let rig = evidence_rig("v1.2.3").await;
+        let mut receipt = rig_receipt(&rig);
+        receipt.tag = "v9.9.9".to_string();
+        let error = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&key, "device-1", "macos-pgp-logged-v1", receipt),
+                &owner(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("enrollment evidence verification failed"),
+            "unlogged tag must fail the online re-verification: {error}"
+        );
+
+        // An artifact digest absent from the release's logged manifest.
+        let rig = evidence_rig("v1.2.3").await;
+        let mut receipt = rig_receipt(&rig);
+        receipt.artifact_sha256 = crate::hosted_verify::sha256_hex(b"a swapped artifact");
+        let error = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&key, "device-1", "macos-pgp-logged-v1", receipt),
+                &owner(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not in the verified release's logged manifest"),
+            "mismatched artifact digest must be refused: {error}"
+        );
+
+        // A receipt naming a different log position or manifest hash than
+        // the verified release.
+        let rig = evidence_rig("v1.2.3").await;
+        let mut receipt = rig_receipt(&rig);
+        receipt.log_index = 7;
+        let error = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&key, "device-1", "macos-pgp-logged-v1", receipt),
+                &owner(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transparency-log index"), "{error}");
+        let rig = evidence_rig("v1.2.3").await;
+        let mut receipt = rig_receipt(&rig);
+        receipt.manifest_hash = crate::hosted_verify::sha256_hex(b"other manifest");
+        let error = runtime
+            .enroll_signed_app_anchor_at(
+                &rig.endpoints,
+                enrollment_input(&key, "device-1", "macos-pgp-logged-v1", receipt),
+                &owner(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("manifest hash"), "{error}");
+        assert!(iam::load_state(&runtime.cert_dir)
+            .unwrap()
+            .hosted_control
+            .signed_app_anchors
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn enrollment_challenge_is_fresh_keyed_and_replay_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let rig = evidence_rig("v1.2.3").await;
+        let key = browser_key();
+
+        // A challenge signed by a different key than the presented one.
+        let mut input =
+            enrollment_input(&key, "device-1", "macos-pgp-logged-v1", rig_receipt(&rig));
+        input.signature = sign(&browser_key(), &input.challenge_payload("daemon-test"));
         assert!(runtime
-            .enroll_signed_app_anchor(anchor, &owner())
+            .enroll_signed_app_anchor_at(&rig.endpoints, input, &owner())
+            .await
             .unwrap_err()
             .to_string()
-            .contains("no qualifying signed application distribution"));
+            .contains("signature verification failed"));
+
+        // A stale challenge timestamp.
+        let mut input =
+            enrollment_input(&key, "device-1", "macos-pgp-logged-v1", rig_receipt(&rig));
+        input.timestamp_unix_ms = now_ms() - REQUEST_PROOF_MAX_SKEW_MS - 1_000;
+        input.signature = sign(&key, &input.challenge_payload("daemon-test"));
+        assert!(runtime
+            .enroll_signed_app_anchor_at(&rig.endpoints, input, &owner())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("timestamp"));
+
+        // A replayed nonce after a successful enrollment.
+        let input = enrollment_input(&key, "device-1", "macos-pgp-logged-v1", rig_receipt(&rig));
+        let replay = input.clone();
+        runtime
+            .enroll_signed_app_anchor_at(&rig.endpoints, input, &owner())
+            .await
+            .unwrap();
+        assert!(runtime
+            .enroll_signed_app_anchor_at(&rig.endpoints, replay, &owner())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already used"));
+    }
+
+    /// Unit-level anchor injection for the decision-lane tests; enrollment
+    /// evidence has its own coverage above.
+    fn inject_anchor(
+        runtime: &HostedControlRuntime,
+        key: &BrowserKey,
+        device_id: &str,
+        distribution_id: &str,
+    ) {
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state
+                .hosted_control
+                .signed_app_anchors
+                .retain(|anchor| anchor.device_id != device_id);
+            state.hosted_control.signed_app_anchors.push(SignedAppAnchor {
+                device_id: device_id.to_string(),
+                label: "Injected test anchor".to_string(),
+                public_key: key.public_key.clone(),
+                key_fingerprint: "fp-test".to_string(),
+                distribution_id: distribution_id.to_string(),
+                active: true,
+                enrolled_unix_ms: now_ms().max(0) as u64,
+                revoked_unix_ms: None,
+                evidence: None,
+            });
+            Ok(((), true))
+        })
+        .unwrap();
+    }
+
+    fn decision_document(
+        key: &BrowserKey,
+        device_id: &str,
+        request: &HostedLeaseRequest,
+        approve: bool,
+    ) -> HostedAnchorDecisionDocument {
+        let mut document = HostedAnchorDecisionDocument {
+            protocol: ANCHOR_DECISION_PROTOCOL.to_string(),
+            device_id: device_id.to_string(),
+            anchor_public_key: key.public_key.clone(),
+            daemon_id: "daemon-test".to_string(),
+            request_id: request.request_id.clone(),
+            request_document_sha256: request.document_sha256(),
+            approve,
+            nonce: format!("nonce-{}", uuid::Uuid::new_v4().simple()),
+            timestamp_unix_ms: now_ms(),
+            signature: String::new(),
+        };
+        document.signature = sign(key, &document.signing_payload());
+        document
+    }
+
+    #[test]
+    fn anchor_decision_approves_and_denies_bound_pending_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let anchor_key = browser_key();
+        inject_anchor(&runtime, &anchor_key, "device-1", "macos-pgp-logged-v1");
+
+        let browser = browser_key();
+        let request = runtime
+            .create_request(
+                doorbell_input(&browser, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let status = runtime
+            .apply_anchor_decision(decision_document(&anchor_key, "device-1", &request, true))
+            .unwrap();
+        assert_eq!(status, HostedLeaseRequestStatus::Approved);
+        let state = iam::load_state(&runtime.cert_dir).unwrap();
+        let stored = state
+            .hosted_control
+            .requests
+            .iter()
+            .find(|stored| stored.request_id == request.request_id)
+            .unwrap();
+        assert_eq!(stored.status, HostedLeaseRequestStatus::Approved);
+        let lease_id = stored.approved_lease_id.clone().unwrap();
+        assert!(runtime
+            .load_verified_lease(&lease_id, "https://laptop.example.test", "relay")
+            .is_ok());
+        assert!(state.audit_events.iter().any(|event| {
+            event.action == "hosted_lease_issue"
+                && event.actor_principal_id == "principal:signed-app-anchor:device-1"
+        }));
+
+        let second = runtime
+            .create_request(
+                doorbell_input(&browser_key(), HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let status = runtime
+            .apply_anchor_decision(decision_document(&anchor_key, "device-1", &second, false))
+            .unwrap();
+        assert_eq!(status, HostedLeaseRequestStatus::Denied);
+    }
+
+    #[test]
+    fn anchor_decision_negative_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let anchor_key = browser_key();
+        inject_anchor(&runtime, &anchor_key, "device-1", "macos-pgp-logged-v1");
+        let browser = browser_key();
+        let request = runtime
+            .create_request(
+                doorbell_input(&browser, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+
+        // Wrong-key decision: signed by a key other than the enrolled one.
+        let mut document = decision_document(&anchor_key, "device-1", &request, true);
+        document.signature = sign(&browser_key(), &document.signing_payload());
+        assert!(runtime
+            .apply_anchor_decision(document)
+            .unwrap_err()
+            .contains("signature verification failed"));
+
+        // A decision presenting a key that is not the enrolled record's.
+        let foreign = browser_key();
+        let document = decision_document(&foreign, "device-1", &request, true);
+        assert_eq!(
+            runtime.apply_anchor_decision(document).unwrap_err(),
+            ANCHOR_DECISION_REFUSED_ERROR
+        );
+
+        // Stale decision: outside the freshness window.
+        let mut document = decision_document(&anchor_key, "device-1", &request, true);
+        document.timestamp_unix_ms = now_ms() - REQUEST_PROOF_MAX_SKEW_MS - 1_000;
+        document.signature = sign(&anchor_key, &document.signing_payload());
+        assert!(runtime
+            .apply_anchor_decision(document)
+            .unwrap_err()
+            .contains("timestamp"));
+
+        // Unknown device.
+        let document = decision_document(&anchor_key, "device-unknown", &request, true);
+        assert_eq!(
+            runtime.apply_anchor_decision(document).unwrap_err(),
+            ANCHOR_DECISION_REFUSED_ERROR
+        );
+
+        // A different target daemon.
+        let mut document = decision_document(&anchor_key, "device-1", &request, true);
+        document.daemon_id = "daemon-other".to_string();
+        document.signature = sign(&anchor_key, &document.signing_payload());
+        assert!(runtime
+            .apply_anchor_decision(document)
+            .unwrap_err()
+            .contains("different target daemon"));
+
+        // Changed digest: the decision names a different request document
+        // than the one this daemon holds under that id.
+        let mut document = decision_document(&anchor_key, "device-1", &request, true);
+        let mut other = request.clone();
+        other.requested_ttl_secs = 900;
+        document.request_document_sha256 = other.document_sha256();
+        document.signature = sign(&anchor_key, &document.signing_payload());
+        assert_eq!(
+            runtime.apply_anchor_decision(document).unwrap_err(),
+            ANCHOR_DECISION_REQUEST_CHANGED_ERROR
+        );
+
+        // Revoked anchor.
+        let revoked_key = browser_key();
+        inject_anchor(&runtime, &revoked_key, "device-revoked", "macos-pgp-logged-v1");
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            let anchor = state
+                .hosted_control
+                .signed_app_anchors
+                .iter_mut()
+                .find(|anchor| anchor.device_id == "device-revoked")
+                .unwrap();
+            anchor.active = false;
+            anchor.revoked_unix_ms = Some(now_ms().max(0) as u64);
+            Ok(((), true))
+        })
+        .unwrap();
+        let document = decision_document(&revoked_key, "device-revoked", &request, true);
+        assert_eq!(
+            runtime.apply_anchor_decision(document).unwrap_err(),
+            ANCHOR_DECISION_REFUSED_ERROR
+        );
+
+        // Set-nonmember anchor: enrolled record whose distribution id is
+        // outside the compiled qualifying set.
+        let nonmember_key = browser_key();
+        inject_anchor(&runtime, &nonmember_key, "device-dev", "macos-unsigned-dev");
+        let document = decision_document(&nonmember_key, "device-dev", &request, true);
+        assert_eq!(
+            runtime.apply_anchor_decision(document).unwrap_err(),
+            ANCHOR_DECISION_REFUSED_ERROR
+        );
+
+        // Replay: a fresh nonce decides, the identical document replayed is
+        // refused, and the request stays decided exactly once.
+        let replay_key = browser_key();
+        inject_anchor(&runtime, &replay_key, "device-replay", "macos-pgp-logged-v1");
+        let document = decision_document(&replay_key, "device-replay", &request, false);
+        let replayed = document.clone();
+        runtime.apply_anchor_decision(document).unwrap();
+        assert!(runtime
+            .apply_anchor_decision(replayed)
+            .unwrap_err()
+            .contains("already used"));
+
+        // The request was denied above and is no longer pending.
+        let document = decision_document(&replay_key, "device-replay", &request, true);
+        assert!(runtime
+            .apply_anchor_decision(document)
+            .unwrap_err()
+            .contains("no longer pending"));
+    }
+
+    #[test]
+    fn anchor_decision_scope_is_lease_decisions_only() {
+        // The document shape is closed: anything beyond the decision fields
+        // is refused at parse time, so the lane cannot grow management
+        // operations by riding extra fields.
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let anchor_key = browser_key();
+        inject_anchor(&runtime, &anchor_key, "device-1", "macos-pgp-logged-v1");
+        let request = runtime
+            .create_request(
+                doorbell_input(&browser_key(), HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let document = decision_document(&anchor_key, "device-1", &request, true);
+        let mut widened = serde_json::to_value(&document).unwrap();
+        widened
+            .as_object_mut()
+            .unwrap()
+            .insert("op".to_string(), serde_json::json!("set_policy"));
+        assert!(
+            serde_json::from_value::<HostedAnchorDecisionDocument>(widened).is_err(),
+            "unknown fields must refuse at parse time"
+        );
+
+        // A valid decision changes lease-request state only: policy,
+        // anchors, witnesses, and session eligibility stay byte-identical.
+        let before = iam::load_state(&runtime.cert_dir).unwrap();
+        runtime.apply_anchor_decision(document).unwrap();
+        let after = iam::load_state(&runtime.cert_dir).unwrap();
+        assert_eq!(before.hosted_control.policy, after.hosted_control.policy);
+        assert_eq!(
+            before.hosted_control.signed_app_anchors,
+            after.hosted_control.signed_app_anchors
+        );
+        assert_eq!(
+            before.hosted_control.witnesses,
+            after.hosted_control.witnesses
+        );
+        let decided = after
+            .hosted_control
+            .requests
+            .iter()
+            .find(|stored| stored.request_id == request.request_id)
+            .unwrap();
+        assert_eq!(decided.status, HostedLeaseRequestStatus::Approved);
+    }
+
+    #[test]
+    fn public_bootstrap_never_carries_the_qualifying_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let bootstrap = runtime.bootstrap("https://laptop.example.test").unwrap();
+        let value = serde_json::to_value(&bootstrap).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("qualifying_signed_app_distribution_available"));
+        assert!(!object.contains_key("eligible_signed_app_distributions"));
+
+        // The trusted management surface does say what the set holds.
+        let snapshot = runtime.management_snapshot().unwrap();
+        assert!(snapshot.qualifying_signed_app_distribution_available);
+        assert_eq!(
+            snapshot.eligible_signed_app_distributions,
+            vec!["macos-pgp-logged-v1".to_string()]
+        );
     }
 
     #[test]

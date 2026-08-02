@@ -2111,8 +2111,13 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::HostedControlAnchorDecision => {
-                return handle_hosted_control_anchor_decision(stream, hosted_control, route.cors)
-                    .await;
+                return handle_hosted_control_anchor_decision(
+                    stream,
+                    route_body,
+                    hosted_control,
+                    route.cors,
+                )
+                .await;
             }
             RouteHandlerId::HostedControlCertificateLedger => {
                 return handle_hosted_control_certificate_ledger(

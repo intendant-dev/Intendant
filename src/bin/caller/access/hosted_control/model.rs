@@ -8,6 +8,9 @@ pub const LEASE_PROTOCOL: &str = "intendant-hosted-control-lease-v1";
 pub const REQUEST_PROOF_PROTOCOL: &str = "intendant-hosted-control-request-v1";
 pub const POLL_PROOF_PROTOCOL: &str = "intendant-hosted-control-poll-v1";
 pub const ANCHOR_DECISION_PROTOCOL: &str = "intendant-hosted-control-anchor-decision-v1";
+pub const ANCHOR_ENROLLMENT_PROOF_PROTOCOL: &str =
+    "intendant-hosted-control-anchor-enrollment-v1";
+pub const SIGNED_APP_INSTALL_RECEIPT_PROTOCOL: &str = "intendant-signed-app-install-receipt-v1";
 pub const CERTIFICATE_LEDGER_PROTOCOL: &str = "intendant-fleet-certificate-ledger-v1";
 pub const CERTIFICATE_WITNESS_PROTOCOL: &str = "intendant-hosted-certificate-witness-v1";
 
@@ -241,6 +244,62 @@ pub struct HostedLeaseRecord {
     pub revoked_by: Option<String>,
 }
 
+/// The install receipt a qualifying application instance presents at
+/// enrollment: written by the verified install/update ceremony at the one
+/// moment the transparency log, the artifact bytes, and the machine-local
+/// re-sign identity are simultaneously verifiable. The daemon never trusts
+/// these fields as claimed — enrollment independently re-verifies the named
+/// release against its own compiled pins and refuses on any divergence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAppInstallReceipt {
+    pub tag: String,
+    pub log_index: u64,
+    pub manifest_hash: String,
+    pub artifact_sha256: String,
+    pub resign_cert_fingerprint: String,
+    pub post_resign_cdhash: String,
+    pub written_unix_ms: u64,
+}
+
+impl SignedAppInstallReceipt {
+    pub fn canonical_payload(&self) -> String {
+        format!(
+            "{SIGNED_APP_INSTALL_RECEIPT_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.tag,
+            self.log_index,
+            self.manifest_hash,
+            self.artifact_sha256,
+            self.resign_cert_fingerprint,
+            self.post_resign_cdhash,
+            self.written_unix_ms,
+        )
+    }
+
+    pub fn document_sha256(&self) -> String {
+        b64u(
+            ring::digest::digest(&ring::digest::SHA256, self.canonical_payload().as_bytes())
+                .as_ref(),
+        )
+    }
+}
+
+/// What qualified an anchor, snapshotted at enrollment so later readers can
+/// audit the evidence chain: the receipt digest, the release the daemon
+/// re-verified against its own compiled pins, and the signing-key identity
+/// pinned at that moment (primary-key replacement renders a staleness flag,
+/// never an automatic revocation).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAppAnchorEvidence {
+    pub receipt_sha256: String,
+    pub verified_tag: String,
+    pub log_index: u64,
+    pub artifact_sha256: String,
+    pub pgp_fingerprint_at_enrollment: String,
+    pub verified_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedAppAnchor {
@@ -254,6 +313,85 @@ pub struct SignedAppAnchor {
     pub enrolled_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_unix_ms: Option<u64>,
+    /// Enrollment evidence snapshot. Downgrade posture (deliberate,
+    /// fail-closed): `SignedAppAnchor` is `deny_unknown_fields`, so once an
+    /// evidence-bearing anchor exists in the store, an older binary that
+    /// predates this field refuses to load the IAM state (authority errors
+    /// loudly; nothing is wiped or silently dropped). Enrollment is a rare
+    /// owner ceremony on a current binary; revoke enrolled anchors before
+    /// downgrading the daemon across this feature, or restore the
+    /// pre-enrollment store backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<SignedAppAnchorEvidence>,
+}
+
+/// Enrollment input presented at the unchanged local/direct-mTLS owner
+/// ceremony: the anchor identity, the install receipt (hop 1-2 evidence),
+/// and a fresh challenge signature by the platform-keystore anchor key over
+/// a domain-separated versioned transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedAppAnchorEnrollmentInput {
+    pub device_id: String,
+    pub label: String,
+    pub public_key: String,
+    pub distribution_id: String,
+    pub receipt: SignedAppInstallReceipt,
+    pub nonce: String,
+    pub timestamp_unix_ms: i64,
+    pub signature: String,
+}
+
+impl SignedAppAnchorEnrollmentInput {
+    pub fn challenge_payload(&self, daemon_id: &str) -> String {
+        format!(
+            "{ANCHOR_ENROLLMENT_PROOF_PROTOCOL}\n{daemon_id}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.device_id,
+            self.public_key,
+            self.distribution_id,
+            self.receipt.document_sha256(),
+            self.nonce,
+            self.timestamp_unix_ms,
+        )
+    }
+}
+
+/// A content-signed lease decision presented by an enrolled application
+/// anchor. Content authentication makes the transport irrelevant: the
+/// availability-only relay carries this document as-is, and the daemon
+/// verifies it against its own enrolled-anchor state. Its authority is
+/// exactly deciding one pending lease request — approve or deny, bound to
+/// the exact daemon-signed request digest — never a management operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedAnchorDecisionDocument {
+    pub protocol: String,
+    pub device_id: String,
+    pub anchor_public_key: String,
+    pub daemon_id: String,
+    pub request_id: String,
+    pub request_document_sha256: String,
+    pub approve: bool,
+    pub nonce: String,
+    pub timestamp_unix_ms: i64,
+    pub signature: String,
+}
+
+impl HostedAnchorDecisionDocument {
+    pub fn signing_payload(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.protocol,
+            self.device_id,
+            self.anchor_public_key,
+            self.daemon_id,
+            self.request_id,
+            self.request_document_sha256,
+            if self.approve { "approve" } else { "deny" },
+            self.nonce,
+            self.timestamp_unix_ms,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,6 +694,10 @@ pub struct HostedControlManagementSnapshot {
     pub display_media_relay_configured: bool,
     pub anchor_decision_protocol: String,
     pub qualifying_signed_app_distribution_available: bool,
+    /// The compiled qualifying set, verbatim, so trusted surfaces can say
+    /// what this build holds. Deliberately absent from the public
+    /// `HostedControlBootstrap`: an anonymous fleet tab cannot learn it.
+    pub eligible_signed_app_distributions: Vec<String>,
     pub policy: HostedControlPolicy,
     pub pending_requests: Vec<HostedLeaseRequest>,
     pub active_leases: Vec<HostedLeaseRecord>,
