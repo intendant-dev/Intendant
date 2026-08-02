@@ -695,6 +695,46 @@ Cloud environment settings. They are intentionally split by lifecycle:
    directory), then `exec`s the supplied foreground command without shell
    re-parsing.
 
+### Pinned binary fast path (recommended)
+
+Building the release binary from source is the slow half of a cold worker:
+on an observed two-vCPU lease it consumed most of the first turn (14m41s to
+provider-ready, 2026-08-02), while a checksum-pinned download attaches well
+inside it. Every tagged release publishes standalone Linux binaries as
+PGP-signed, transparency-logged assets — `intendant-linux-x86_64` and
+`intendant-linux-aarch64` — and the release notes carry the ready-made pin
+block (v0.1.0 predates these assets; pin a newer release):
+
+```
+INTENDANT_CLOUD_BINARY_URL=https://github.com/intendant-dev/Intendant/releases/download/<tag>/intendant-linux-x86_64
+INTENDANT_CLOUD_BINARY_SHA256=<from the release notes or the .sha256 asset>
+```
+
+Set both in the Codex Cloud environment (setup-time configuration, not
+secrets). Take the SHA-256 from a release you have verified — `gpg
+--verify` against the committed `RELEASE-SIGNING-KEY.asc` and `intendant
+hosted-verify --releases <tag>` check every asset against its detached
+signature and the public transparency log (see
+[Verifying a release](./getting-started.md#verifying-a-release)); the hash
+pin is what the container itself enforces. `setup.sh` refuses a mismatched
+download, and a binary that cannot start fails the bootstrap loudly (the
+trailing `codex-cloud --help` probe) instead of silently rebuilding.
+
+Two honest bounds. The assets are built on `ubuntu-24.04` and need that
+image's library baseline at runtime — glibc 2.39+, libvpx, libpipewire,
+libxcb; the Codex universal image satisfies it, and an older container
+keeps the source-build path by leaving the pin unset. And the pin is a
+*compatibility* choice, not only a speed one: a source-built worker runs
+whatever revision the task checked out, so its attachment agent floats
+with the branch under test, while a pinned asset keeps the attachment
+agent deterministic per environment and tracking the home daemon's
+release. A worker whose attachment protocol has drifted fails enrollment
+with the remedy in the error text (`unsupported enrollment request
+version N: this daemon speaks M — repin INTENDANT_CLOUD_BINARY_URL/_SHA256
+to a matching release, or rebuild the worker from source`), and the
+enrollment fingerprint records the worker binary's version, commit, and
+target, so `status` shows what actually attached (`worker binary:` line).
+
 For sccache, setup reuses any installed version 0.14 or newer. Otherwise it
 downloads the pinned 0.15.0 official Linux musl archive for x86_64 or aarch64,
 verifies its hard-coded SHA-256, and installs the single binary; compiling the

@@ -133,6 +133,17 @@ pub struct WorkerFingerprint {
     pub git_rev: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustc: Option<String>,
+    /// Provenance of the worker's own Intendant binary, filled by the
+    /// running worker agent at enrollment. Probe-script fingerprints
+    /// measure the environment, not the binary, and leave these absent.
+    /// Distinct from `git_rev` (the checkout's HEAD): a release-asset
+    /// worker binary runs source at a different revision than its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intendant_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intendant_git_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intendant_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -973,6 +984,9 @@ pub(crate) fn parse_probe_fingerprint(diff_text: &str) -> Option<WorkerFingerpri
             unix_ms: num("unix_ms"),
             git_rev: text("git_rev"),
             rustc: text("rustc"),
+            intendant_version: text("intendant_version"),
+            intendant_git_sha: text("intendant_git_sha"),
+            intendant_target: text("intendant_target"),
             cpus: num("cpus"),
             mem_kb: num("mem_kb"),
             collected_at_unix_ms: now_unix_ms(),
@@ -2624,6 +2638,13 @@ fn print_lease(lease: &WorkerLease) {
             "  worker: {}{boot}",
             worker.hostname.as_deref().unwrap_or("unknown-host")
         );
+        if let Some(version) = worker.intendant_version.as_deref() {
+            println!(
+                "  worker binary: {version} (commit {}, {})",
+                worker.intendant_git_sha.as_deref().unwrap_or("unknown"),
+                worker.intendant_target.as_deref().unwrap_or("unknown"),
+            );
+        }
     }
     if lease.cold_replacements_observed > 0 {
         println!(
@@ -3900,6 +3921,9 @@ index 0000000..ce01362\n\
             unix_ms: None,
             git_rev: None,
             rustc: None,
+            intendant_version: None,
+            intendant_git_sha: None,
+            intendant_target: None,
             cpus: None,
             mem_kb: None,
             collected_at_unix_ms: 1,
@@ -3917,6 +3941,9 @@ index 0000000..ce01362\n\
             unix_ms: None,
             git_rev: None,
             rustc: None,
+            intendant_version: None,
+            intendant_git_sha: None,
+            intendant_target: None,
             cpus: None,
             mem_kb: None,
             collected_at_unix_ms: 1,

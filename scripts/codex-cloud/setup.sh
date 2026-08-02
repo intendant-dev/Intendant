@@ -39,6 +39,17 @@ install_downloaded_binary() {
     return 2
   fi
 
+  # Cached resumes re-run setup through maintenance.sh: when the installed
+  # binary already hashes to the pin, the download is pure waste.
+  if [[ -x "$bin_dir/intendant" ]]; then
+    local existing
+    existing="$(file_sha256 "$bin_dir/intendant")" || existing=""
+    if [[ "$existing" == "$INTENDANT_CLOUD_BINARY_SHA256" ]]; then
+      echo "pinned Intendant binary already installed (sha256 match)"
+      return 0
+    fi
+  fi
+
   local actual
   downloaded="$(mktemp)"
   curl --fail --silent --show-error --location \
@@ -169,5 +180,8 @@ if [[ ! -f "$script_root/run-worker.sh" ]]; then
 fi
 install -m 0755 "$script_root/run-worker.sh" "$libexec_dir/run-worker.sh"
 
-"$bin_dir/intendant" codex-cloud --help >/dev/null
+if ! "$bin_dir/intendant" codex-cloud --help >/dev/null; then
+  echo "installed Intendant binary failed to run. If it came from INTENDANT_CLOUD_BINARY_URL, this container is likely older than the asset's ubuntu-24.04 library baseline (glibc 2.39+, libvpx, libpipewire, libxcb) — unset the pin to build from source instead." >&2
+  exit 2
+fi
 echo "Intendant Codex Cloud bootstrap installed at $bin_dir/intendant"
