@@ -150,10 +150,14 @@ async fn apply_backend_credentials_reload(
     drain_config: &mut DrainConfig<'_>,
 ) -> Option<Vec<String>> {
     let session_log = drain_config.session_log;
+    // Hoisted out of `drain_config` so the closures below don't hold a
+    // borrow across the in-place respawn, which needs `&mut drain_config`.
+    let bus = drain_config.bus;
+    let reload_session_id = drain_config.session_id.clone();
     let announce = |line: &str| {
         slog(session_log, |l| l.info(line));
-        drain_config.bus.send(AppEvent::LogEntry {
-            session_id: drain_config.session_id.clone(),
+        bus.send(AppEvent::LogEntry {
+            session_id: reload_session_id.clone(),
             level: "info".to_string(),
             source: "Intendant".to_string(),
             content: line.to_string(),
@@ -164,12 +168,10 @@ async fn apply_backend_credentials_reload(
     // per-session reload lifecycle from these, so the Vault card's chips
     // track the daemon's actual progress instead of client-side memory.
     let progress = |progress: crate::event::CredentialReloadProgress| {
-        drain_config
-            .bus
-            .send(AppEvent::BackendCredentialsReloadProgress {
-                session_id: drain_config.session_id.clone(),
-                progress,
-            });
+        bus.send(AppEvent::BackendCredentialsReloadProgress {
+            session_id: reload_session_id.clone(),
+            progress,
+        });
     };
     if let Some(park) = limit_park.take() {
         *limit_park_streak = 0;
@@ -1166,16 +1168,46 @@ pub(crate) async fn run_external_agent_mode(
                                         );
                                     }
                                     external_agent::AgentEvent::Terminated { reason, exit_code } => {
-                                        let message = format!(
-                                            "{} terminated while idle: {} (exit code: {:?})",
-                                            agent.name(),
-                                            reason,
-                                            exit_code
-                                        );
-                                        slog(&session_log, |l| l.warn(&message));
-                                        bus.send(AppEvent::LoopError(message));
-                                        stats.terminal_outcome = Some(reason);
-                                        break 'outer;
+                                        if let Some(park) = limit_park
+                                            .as_ref()
+                                            .filter(|park| park.pending.is_some())
+                                        {
+                                            // Park-then-die reconciliation:
+                                            // the backend announcing its own
+                                            // death right after a rejection
+                                            // armed the park (the specimen's
+                                            // process-exit shape) must not
+                                            // end the session that promised
+                                            // to resume the owed work — the
+                                            // park stands; the wake respawns
+                                            // before delivering. The
+                                            // channel's subsequent close is
+                                            // held by the gated recv arm.
+                                            let line = park_holds_through_terminal_line(
+                                                park.kind,
+                                                "the backend process terminated while idle",
+                                                &reason,
+                                            );
+                                            slog(&session_log, |l| l.warn(&line));
+                                            bus.send(AppEvent::LogEntry {
+                                                session_id: drain_config.session_id.clone(),
+                                                level: "warn".to_string(),
+                                                source: "Intendant".to_string(),
+                                                content: line,
+                                                turn: None,
+                                            });
+                                        } else {
+                                            let message = format!(
+                                                "{} terminated while idle: {} (exit code: {:?})",
+                                                agent.name(),
+                                                reason,
+                                                exit_code
+                                            );
+                                            slog(&session_log, |l| l.warn(&message));
+                                            bus.send(AppEvent::LoopError(message));
+                                            stats.terminal_outcome = Some(reason);
+                                            break 'outer;
+                                        }
                                     }
                                     // Ambient diagnostics are not evidence of a
                                     // backend-initiated turn. Recording them inline and

@@ -8399,7 +8399,7 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
         RUN_TIMEOUT,
         || async {
             let logs = rig.session_logs();
-            (logs.contains("respawned claude-code resume-attached to deliver the parked message")
+            (logs.contains("resume-attached to deliver the parked message")
                 && logs.contains("elapsed — re-sending the parked message")
                 && logs.contains("resumed after the park wake"))
             .then_some(())
