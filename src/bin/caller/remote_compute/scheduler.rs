@@ -380,8 +380,13 @@ async fn acquire_new_worker(
     let mut next_provider_refresh =
         tokio::time::Instant::now() + Duration::from_secs(PROVIDER_INITIAL_REFRESH_S);
     loop {
-        if crate::codex_cloud_attach::attachment_channel(&task_id).is_some() {
-            break;
+        let attachment_live = crate::codex_cloud_attach::attachment_channel(&task_id).is_some();
+        if attachment_live {
+            let current_lease = cached_task_lease(&lease_store, &task_id);
+            if attached_worker_revision(attachment_live, current_lease.as_ref()).is_some() {
+                last_lease = current_lease;
+                break;
+            }
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -531,6 +536,24 @@ fn cached_task_lease(
         .ok()?
         .into_iter()
         .find(|lease| lease.task_id == task_id)
+}
+
+/// A live socket alone is not acquisition readiness. The attachment registry
+/// becomes visible just before its reader handles the worker's authenticated
+/// hello; alpha.2 moved checkout provenance onto that hello to keep enrollment
+/// headers inside managed-proxy limits. Wait for both facts so the scheduler
+/// cannot reject a correct cold worker as revision `unknown` in that gap.
+fn attached_worker_revision(
+    attachment_live: bool,
+    lease: Option<&crate::codex_cloud::WorkerLease>,
+) -> Option<&str> {
+    attachment_live
+        .then_some(lease?)?
+        .worker
+        .as_ref()?
+        .git_rev
+        .as_deref()
+        .filter(|revision| !revision.trim().is_empty())
 }
 
 async fn refresh_acquiring_task(
@@ -857,6 +880,39 @@ mod tests {
                 + crate::codex_cloud_attach::DEFAULT_IDENTITY_TTL_S
                 + 60
         );
+    }
+
+    #[test]
+    fn connected_socket_waits_for_authenticated_hello_revision() {
+        let lease = |revision: Option<&str>| {
+            serde_json::from_value::<crate::codex_cloud::WorkerLease>(serde_json::json!({
+                "task_id": "task_e_hello_race",
+                "task_url": null,
+                "title": "cold worker",
+                "environment_id": "env-a",
+                "environment_label": null,
+                "provider_status": "pending",
+                "provider_state": "queued",
+                "attachment_state": "connected",
+                "worker": revision.map(|revision| serde_json::json!({
+                    "git_rev": revision,
+                    "collected_at_unix_ms": 1234,
+                })),
+                "provider_updated_at": null,
+                "last_observed_unix_ms": 1234,
+            }))
+            .unwrap()
+        };
+
+        let before_hello = lease(None);
+        assert_eq!(attached_worker_revision(true, Some(&before_hello)), None);
+
+        let after_hello = lease(Some("147a6908962e40e7"));
+        assert_eq!(
+            attached_worker_revision(true, Some(&after_hello)),
+            Some("147a6908962e40e7")
+        );
+        assert_eq!(attached_worker_revision(false, Some(&after_hello)), None);
     }
 
     #[test]
