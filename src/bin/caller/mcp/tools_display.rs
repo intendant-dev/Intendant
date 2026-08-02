@@ -142,6 +142,74 @@ impl IntendantServer {
         }
     }
 
+    #[tool(
+        description = "Create an agent-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer. Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry."
+    )]
+    pub(crate) async fn create_virtual_display(
+        &self,
+        Parameters(params): Parameters<CreateVirtualDisplayParams>,
+    ) -> String {
+        // Outcome events carry only a display id, so the fresh display is
+        // recognized by not having existed before the request (the
+        // unsupported-platform failure uses a sentinel id, which is
+        // likewise never a live id).
+        let session_registry = self.state.read().await.session_registry.clone();
+        let known: std::collections::HashSet<u32> =
+            crate::display::enumerate_displays_with_sessions(&session_registry)
+                .await
+                .into_iter()
+                .map(|d| d.id)
+                .collect();
+        let mut rx = self.bus.subscribe();
+        self.bus.send(AppEvent::ControlCommand(
+            ControlMsg::CreateVirtualDisplay {
+                width: params.width,
+                height: params.height,
+            },
+        ));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return "virtual display creation requested, but no display_ready arrived \
+                        within 20s — check the daemon log (is Xvfb installed on the host?)"
+                    .to_string();
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady {
+                    display_id,
+                    width,
+                    height,
+                    ..
+                })) if !known.contains(&display_id) => {
+                    return format!(
+                        "virtual display created: display_id {display_id} ({width}x{height}). \
+                         Target it as display_target \"display_{display_id}\" for screenshots \
+                         and CU actions; it is streaming to dashboards and announced to \
+                         federated peers now."
+                    );
+                }
+                Ok(Ok(AppEvent::DisplayCaptureLost { display_id, reason }))
+                    if !known.contains(&display_id) =>
+                {
+                    return format!("virtual display create failed: {reason}");
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    return "virtual display create: the event bus closed before an outcome \
+                            arrived"
+                        .to_string();
+                }
+                Err(_elapsed) => {
+                    return "virtual display creation requested, but no display_ready arrived \
+                            within 20s — check the daemon log (is Xvfb installed on the host?)"
+                        .to_string();
+                }
+            }
+        }
+    }
+
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
     pub(crate) async fn list_displays(&self) -> String {
         let session_registry = self.state.read().await.session_registry.clone();

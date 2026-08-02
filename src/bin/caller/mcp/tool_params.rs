@@ -602,6 +602,17 @@ pub struct GrantUserDisplayParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateVirtualDisplayParams {
+    /// Optional width in pixels (default 1920; clamped to sane bounds and
+    /// rounded down to even).
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Optional height in pixels (default 1080; same clamping).
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RevokeUserDisplayParams {
     /// User session display ID to revoke. Omit for the primary display (0).
     #[serde(default)]

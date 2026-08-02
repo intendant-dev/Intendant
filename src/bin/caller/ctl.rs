@@ -779,6 +779,15 @@ async fn run_display(
                 call_tool(client, config, "list_displays", Value::Object(Map::new())).await?;
             print_tool_response(response, config, None)?;
         }
+        "create" => {
+            let args = parse_command_args(&raw[1..], &["--width", "--height"], &[])?;
+            let mut map = Map::new();
+            insert_u32(&mut map, "width", args.one("--width"))?;
+            insert_u32(&mut map, "height", args.one("--height"))?;
+            let response =
+                call_tool(client, config, "create_virtual_display", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "frames" => {
             let args = parse_command_args(&raw[1..], &["--stream", "--count"], &[])?;
             let mut map = Map::new();
@@ -5534,6 +5543,7 @@ fn help_display() {
     println!(
         "Usage:\n\
   intendant ctl display list\n\
+  intendant ctl display create [--width N] [--height N]\n\
   intendant ctl display status [--target TARGET]\n\
   intendant ctl display frames [--stream NAME] [--count N]\n\
   intendant ctl display read-frame [latest|ID] [--stream NAME]\n\
