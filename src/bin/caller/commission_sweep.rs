@@ -636,7 +636,7 @@ mod tests {
             .iter()
             .filter_map(|standing| match standing {
                 CommissionStanding::Wake(cref) => Some(cref.occurrence_id.clone()),
-                CommissionStanding::List(..) => None,
+                CommissionStanding::List(..) | CommissionStanding::CompletedUnattested(_) => None,
             })
             .collect()
     }
@@ -657,9 +657,7 @@ mod tests {
         standings
             .iter()
             .filter_map(|standing| match standing {
-                CommissionStanding::CompletedUnattested(cref) => {
-                    Some(cref.occurrence_id.clone())
-                }
+                CommissionStanding::CompletedUnattested(cref) => Some(cref.occurrence_id.clone()),
                 _ => None,
             })
             .collect()
@@ -1084,7 +1082,10 @@ mod tests {
         };
         let plan = plan_sweep(
             home.path(),
-            vec![standing("occ-i", "sess-i"), standing("occ-done", "sess-done")],
+            vec![
+                standing("occ-i", "sess-i"),
+                standing("occ-done", "sess-done"),
+            ],
             &HashMap::new(),
             crate::session_activity::epoch_seconds(),
             &HashSet::new(),

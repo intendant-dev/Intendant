@@ -1963,7 +1963,8 @@ pub(crate) async fn run_boot_readopt_pass(
                 // need the lineage closure — the latter so a live or
                 // already-resumed successor settles them silently.
                 if let crate::commission_sweep::CommissionStanding::Wake(cref)
-                | crate::commission_sweep::CommissionStanding::CompletedUnattested(cref) = standing
+                | crate::commission_sweep::CommissionStanding::CompletedUnattested(cref) =
+                    standing
                 {
                     if let Some(sessions) = handle.occurrence_started_history(&cref.occurrence_id) {
                         history.insert(cref.occurrence_id.clone(), sessions);

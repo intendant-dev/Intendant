@@ -2065,8 +2065,9 @@ fn probe_worktree_git_state(path: &Path) -> WorktreeGitState {
     }
 }
 
-/// Blocking probe + memo fill: the deterministic lane (tests, eager
-/// warms). The serving path never calls this.
+/// Blocking probe + memo fill: the deterministic lane for tests (the
+/// serving path never blocks — it goes through the cached read below).
+#[cfg(test)]
 pub(crate) fn probe_and_memoize_worktree_git_state(path: &Path) -> WorktreeGitState {
     let snapshot = probe_worktree_git_state(path);
     if let Ok(mut memo) = worktree_state_memo().lock() {
@@ -2529,7 +2530,10 @@ mod tests {
         let repo = repo_path(&tmp);
         let wt = tmp.path().join("state-worktree");
         let wt_str = wt.to_string_lossy().to_string();
-        git(&repo, &["worktree", "add", "-b", "state-probe", &wt_str, "main"]);
+        git(
+            &repo,
+            &["worktree", "add", "-b", "state-probe", &wt_str, "main"],
+        );
         std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
 
         let dirty = probe_and_memoize_worktree_git_state(&wt);
@@ -2597,7 +2601,10 @@ mod tests {
         let repo = repo_path(&tmp);
         let wt = tmp.path().join("cached-worktree");
         let wt_str = wt.to_string_lossy().to_string();
-        git(&repo, &["worktree", "add", "-b", "cached-probe", &wt_str, "main"]);
+        git(
+            &repo,
+            &["worktree", "add", "-b", "cached-probe", &wt_str, "main"],
+        );
         std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
 
         probe_and_memoize_worktree_git_state(&wt);

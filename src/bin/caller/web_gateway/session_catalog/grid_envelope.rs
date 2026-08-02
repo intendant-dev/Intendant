@@ -311,7 +311,10 @@ fn worktree_state_json(state: &crate::worktree_inventory::WorktreeGitState) -> s
         "state": state.kind.as_str(),
         "checked_ms": state.checked_ms,
     });
-    if matches!(state.kind, WorktreeStateKind::Clean | WorktreeStateKind::Dirty) {
+    if matches!(
+        state.kind,
+        WorktreeStateKind::Clean | WorktreeStateKind::Dirty
+    ) {
         block["dirty"] = serde_json::Value::Bool(state.dirty);
         block["unpushed"] = serde_json::Value::Bool(state.unpushed);
         block["ahead"] = serde_json::json!(state.ahead);
@@ -1216,7 +1219,7 @@ mod tests {
             "Interrupted mid-work — resumable",
             "CLOSABLE_CLAIM_QA_VECTORS",
             "closableClaim: {",
-            "worktreeStranded: !!(ws && (ws.dirty || ws.unpushed))",
+            "const worktreeStranded = !!(ws && (ws.dirty || ws.unpushed));",
         ] {
             assert!(
                 actions.contains(needle),
