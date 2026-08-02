@@ -324,7 +324,7 @@ pub(crate) fn spawn_reminder_scheduler(
             handover.attach_scheduler();
         }
         let mut state = SchedulerState::default();
-        let mut events = handle.bus().subscribe();
+        let events = handle.bus().subscribe();
         // Boot recovery, scoped (Track HS2): a live co-homed daemon's
         // in-flight rows are spared; legacy rows and provably dead
         // writers fail-close exactly as before. The classification
@@ -339,67 +339,83 @@ pub(crate) fn spawn_reminder_scheduler(
         };
         state.readopt_watch = classification.watches;
         crate::boot_readopt::publish_agenda_readopt_seeds(classification.seeds);
-        loop {
-            let next_wake_ms =
-                run_pass(&handle, &mut journal, &mut state, handover.as_deref()).await;
-            let now = now_ms();
-            let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
-            let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
-            let readopt_wake_ms = sweep_readopt_watch(&handle, &mut journal, &mut state, now);
-            let next_wake_ms = [
-                next_wake_ms,
-                retry_wake_ms,
-                lineage_wake_ms,
-                readopt_wake_ms,
-            ]
-            .into_iter()
-            .flatten()
-            .min();
-            let sleep_for = next_wake_ms
-                .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
-                .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
-            // Op latency is EVENT-DRIVEN, not polled: every accepted
-            // agenda op nudges (`AgendaHandle::apply`) AND broadcasts
-            // `AgendaChanged` into `events`, whose subscription queues —
-            // an op landing while a pass runs still forces the next
-            // iteration instead of waiting out the sleep. An approve on
-            // an already-due manifest therefore dispatches in the same
-            // governed slot, never at the next safety tick (pinned by
-            // `approve_on_a_due_effect_fires_without_a_cadence_pass`;
-            // the 2026-08-01 "10-minute approve-to-fire" read was floors
-            // still in the future plus a drain/handover window, not a
-            // missing wake). The tick is the no-signal backstop only.
-            tokio::select! {
-                _ = handle.reminder_nudged() => {}
-                _ = tokio::time::sleep(sleep_for) => {}
-                // Drain/takeover wake (Track HS3): entry must not wait
-                // out a sleep — the requester's flock acquire is gated on
-                // it. Pends forever without a runtime.
-                _ = async {
-                    match &handover {
-                        Some(runtime) => runtime.drain_wake().await,
-                        None => std::future::pending().await,
-                    }
-                } => {}
-                event = events.recv() => match event {
-                    Ok(event) => observe_event(&handle, &mut journal, &mut state, &event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        // Receipts and terminal events cannot be reconstructed
-                        // from the broadcast stream. Apply the same fail-closed
-                        // terminal state as restart recovery so an occurrence
-                        // cannot remain excluded from planning indefinitely.
-                        let resolved =
-                            resolve_lagged_occurrences(&handle, &mut journal, &mut state);
-                        eprintln!(
-                            "[agenda] scheduler lagged on the event bus \
-                             (skipped {skipped}, resolved {resolved} in-flight occurrences)"
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                },
-            }
-        }
+        scheduler_loop(handle, handover, journal, state, events).await;
     })
+}
+
+/// The post-boot select loop, whole. Split from
+/// [`spawn_reminder_scheduler`] so the loop-leg wake test drives the
+/// REAL loop without the boot side of the task: boot recovery and the
+/// readopt-seed publish write a process-global slot, and a test driving
+/// them cross-talks the boot_readopt suite's own seed waits
+/// (hermeticity law — found live when the wake test skewed
+/// `dispatch_stagger_spaces_but_never_drops`).
+async fn scheduler_loop(
+    handle: Arc<AgendaHandle>,
+    handover: Option<Arc<crate::handover::HandoverRuntime>>,
+    mut journal: OccurrenceJournal,
+    mut state: SchedulerState,
+    mut events: tokio::sync::broadcast::Receiver<AppEvent>,
+) {
+    loop {
+        let next_wake_ms = run_pass(&handle, &mut journal, &mut state, handover.as_deref()).await;
+        let now = now_ms();
+        let retry_wake_ms = sweep_pending_dispatches(&handle, &mut journal, &mut state, now);
+        let lineage_wake_ms = sweep_lineage_pending(&handle, &mut journal, &mut state, now);
+        let readopt_wake_ms = sweep_readopt_watch(&handle, &mut journal, &mut state, now);
+        let next_wake_ms = [
+            next_wake_ms,
+            retry_wake_ms,
+            lineage_wake_ms,
+            readopt_wake_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let sleep_for = next_wake_ms
+            .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
+            .map_or(SAFETY_TICK, |until| until.min(SAFETY_TICK));
+        // Op latency is EVENT-DRIVEN, not polled: every accepted
+        // agenda op nudges (`AgendaHandle::apply`) AND broadcasts
+        // `AgendaChanged` into `events`, whose subscription queues —
+        // an op landing while a pass runs still forces the next
+        // iteration instead of waiting out the sleep. An approve on
+        // an already-due manifest therefore dispatches in the same
+        // governed slot, never at the next safety tick (pinned by
+        // `approve_on_a_due_effect_fires_without_a_cadence_pass`;
+        // the 2026-08-01 "10-minute approve-to-fire" read was floors
+        // still in the future plus a drain/handover window, not a
+        // missing wake). The tick is the no-signal backstop only.
+        tokio::select! {
+            _ = handle.reminder_nudged() => {}
+            _ = tokio::time::sleep(sleep_for) => {}
+            // Drain/takeover wake (Track HS3): entry must not wait
+            // out a sleep — the requester's flock acquire is gated on
+            // it. Pends forever without a runtime.
+            _ = async {
+                match &handover {
+                    Some(runtime) => runtime.drain_wake().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
+            event = events.recv() => match event {
+                Ok(event) => observe_event(&handle, &mut journal, &mut state, &event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Receipts and terminal events cannot be reconstructed
+                    // from the broadcast stream. Apply the same fail-closed
+                    // terminal state as restart recovery so an occurrence
+                    // cannot remain excluded from planning indefinitely.
+                    let resolved =
+                        resolve_lagged_occurrences(&handle, &mut journal, &mut state);
+                    eprintln!(
+                        "[agenda] scheduler lagged on the event bus \
+                         (skipped {skipped}, resolved {resolved} in-flight occurrences)"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+        }
+    }
 }
 
 /// Which unresolved journal rows this daemon may fail-close (Track HS2,
@@ -2286,9 +2302,20 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let handle = handle_with_default_project(dir.path(), project.path());
         let mut rx = handle.bus().subscribe();
-        let scheduler = spawn_reminder_scheduler(handle.clone(), None);
+        // Drive the REAL post-boot loop directly: `scheduler_loop` is
+        // everything `spawn_reminder_scheduler` runs after boot recovery
+        // — the boot side publishes a process-global readopt-seed slot,
+        // which a test must not touch (it cross-talks the boot_readopt
+        // suite's seed waits).
+        let scheduler = tokio::spawn(scheduler_loop(
+            handle.clone(),
+            None,
+            OccurrenceJournal::open(handle.dir()).unwrap(),
+            SchedulerState::default(),
+            handle.bus().subscribe(),
+        ));
         // Quiesce: auto-advance fires this sleep only once no task is
-        // runnable — the boot pass has run and the loop is parked.
+        // runnable — the first pass has run and the loop is parked.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         // The proposal lands while the loop sleeps; unapproved manifests
         // plan nothing, so the loop parks again for the full tick.
