@@ -303,11 +303,13 @@ INTENDANT_CODEX_CLOUD_TLS_TERMINATED_PROXY=1
 In that mode the worker validates the public endpoint with normal WebPKI
 instead of pinning Intendant's inner TLS certificate. It still generates the
 same task-local P-256 key and receives the same zero-authority client
-certificate. The enrollment request carries the same bounded JSON in its
-normal POST body and in a base64url header because some managed egress proxies
-have been observed to preserve request headers while dropping POST bodies.
-Home accepts the header only as a body fallback and requires the two byte
-copies to agree when both arrive; the single-use token never enters the URL.
+certificate. The security-critical enrollment request carries the same bounded
+JSON in its normal POST body and in a base64url header because some managed
+egress proxies have been observed to preserve request headers while dropping
+POST bodies. Informational worker fingerprint data follows on the authenticated
+attachment hello so neither duplicate exceeds managed custom-header ceilings.
+Home accepts the header only as a body fallback and requires the two byte copies
+to agree when both arrive; the single-use token never enters the URL.
 Every WebSocket attempt signs a transcript containing the exact
 attachment path, certificate fingerprint, task id, random nonce, and current
 timestamp. Home verifies it against the public key stored at enrollment and
@@ -732,8 +734,8 @@ release. A worker whose attachment protocol has drifted fails enrollment
 with the remedy in the error text (`unsupported enrollment request
 version N: this daemon speaks M — repin INTENDANT_CLOUD_BINARY_URL/_SHA256
 to a matching release, or rebuild the worker from source`), and the
-enrollment fingerprint records the worker binary's version, commit, and
-target, so `status` shows what actually attached (`worker binary:` line).
+authenticated attachment hello records the worker binary's version, commit,
+and target, so `status` shows what actually attached (`worker binary:` line).
 
 For sccache, setup reuses any installed version 0.14 or newer. Otherwise it
 downloads the pinned 0.15.0 official Linux musl archive for x86_64 or aarch64,
