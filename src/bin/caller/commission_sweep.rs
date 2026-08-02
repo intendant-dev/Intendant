@@ -109,6 +109,15 @@ pub(crate) enum CommissionStanding {
     /// Owner lane: listed in the needs-you task with the reason —
     /// never woken, never re-fired.
     List(CommissionRef, String),
+    /// A `completed` transport terminal with NO attestation: the
+    /// write-back records the transport ending, not arc completion (the
+    /// 19:00 limit-wave class), so it may dress an interrupted mid-arc
+    /// seat as done. Whether the arc concluded needs the session's own
+    /// durable status — `plan_sweep` consults it and LISTS the
+    /// interrupted ones (never a wake: by sweep time the stranding
+    /// predates this boot, the stale-stranding law's lane); every other
+    /// completed run stays settled.
+    CompletedUnattested(CommissionRef),
 }
 
 /// The open-commission conjunction (the AO safe-to-stop rule read at
@@ -141,12 +150,6 @@ pub(crate) fn classify_commissions(
                 // not a silent stranding — idle-done stays down.
                 continue;
             }
-            if !matches!(run.state.as_str(), "failed" | "unknown") {
-                // `started` = a live (or co-homed) run owns it;
-                // `completed`/`missed` = settled terminals with their
-                // own lanes.
-                continue;
-            }
             if effect.next_fire_ms.is_some() {
                 // The planner will fire this effect again (armed
                 // standing series, trigger regeneration): machinery
@@ -161,6 +164,19 @@ pub(crate) fn classify_commissions(
                 run_state: run.state.clone(),
                 session_id: run.session_id.clone(),
             };
+            if run.state == "completed" {
+                // The interrupted-mid-arc blindness (2026-08-01 owner
+                // specimen): "completed" is a TRANSPORT ending, and
+                // unattested it proves nothing about the arc — the
+                // session's own status decides in plan_sweep.
+                standings.push(CommissionStanding::CompletedUnattested(cref));
+                continue;
+            }
+            if !matches!(run.state.as_str(), "failed" | "unknown") {
+                // `started` = a live (or co-homed) run owns it;
+                // `missed` = a settled terminal with its own lane.
+                continue;
+            }
             if run.state == "failed" {
                 standings.push(CommissionStanding::List(
                     cref,
@@ -221,13 +237,13 @@ pub(crate) fn plan_sweep(
 ) -> SweepPlan {
     let mut plan = SweepPlan::default();
     for standing in standings {
-        let (cref, session) = match standing {
+        let (cref, session, wake) = match standing {
             CommissionStanding::List(cref, reason) => {
                 plan.listed.push((cref, reason));
                 continue;
             }
             CommissionStanding::Wake(cref) => match cref.session_id.clone() {
-                Some(session) => (cref, session),
+                Some(session) => (cref, session, true),
                 // Unreachable by classification; fail toward the owner
                 // lane rather than dropping it.
                 None => {
@@ -238,6 +254,19 @@ pub(crate) fn plan_sweep(
                     continue;
                 }
             },
+            CommissionStanding::CompletedUnattested(cref) => {
+                let Some(session) = cref.session_id.clone() else {
+                    continue; // no session ever ran — nothing mid-arc
+                };
+                if !session_ended_interrupted(home, &session) {
+                    // The transport ending stands unchallenged: the
+                    // session's own durable status shows no
+                    // interrupted-mid-arc evidence — settled, today's
+                    // behavior.
+                    continue;
+                }
+                (cref, session, false)
+            }
         };
         let mut seeds: Vec<String> = lineage_history
             .get(&cref.occurrence_id)
@@ -265,6 +294,19 @@ pub(crate) fn plan_sweep(
             // The mid-work pass already dispatched this lineage's
             // resume; the commission rides that seat and the readopt
             // summary reports its outcome.
+            continue;
+        }
+        if !wake {
+            // The interrupted-mid-arc lane: a "completed"-dressed run
+            // whose seat's durable status says interrupted, with no
+            // live or already-resumed lineage — LISTED, never woken
+            // (prior-boot by construction; the stale-stranding law).
+            plan.listed.push((
+                cref,
+                "ended interrupted mid-task without attesting — the arc looks unconcluded; \
+                 resume the session by hand or re-approve the manifest"
+                    .to_string(),
+            ));
             continue;
         }
         let mut candidate = ReadoptCandidate {
@@ -484,6 +526,15 @@ pub(crate) fn report_sweep(
     }
 }
 
+/// Whether the session's own durable status says it ended interrupted —
+/// the arc evidence a "completed" transport terminal cannot see. Read
+/// through the shared meta reader; an unreadable meta claims nothing.
+fn session_ended_interrupted(home: &Path, session_id: &str) -> bool {
+    crate::boot_readopt::session_meta_for(home, session_id)
+        .and_then(|meta| meta.status)
+        .is_some_and(|status| status == "interrupted")
+}
+
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -597,7 +648,19 @@ mod tests {
                 CommissionStanding::List(cref, reason) => {
                     Some((cref.occurrence_id.clone(), reason.clone()))
                 }
-                CommissionStanding::Wake(_) => None,
+                CommissionStanding::Wake(_) | CommissionStanding::CompletedUnattested(_) => None,
+            })
+            .collect()
+    }
+
+    fn completed_unattested_occurrences(standings: &[CommissionStanding]) -> Vec<String> {
+        standings
+            .iter()
+            .filter_map(|standing| match standing {
+                CommissionStanding::CompletedUnattested(cref) => {
+                    Some(cref.occurrence_id.clone())
+                }
+                _ => None,
             })
             .collect()
     }
@@ -706,6 +769,37 @@ mod tests {
             listed[0].0 == "occ-spawnless" && listed[0].1.contains("before its session"),
             "the spawnless fail-close goes to the owner lane: {listed:?}"
         );
+        assert_eq!(
+            completed_unattested_occurrences(&standings),
+            vec!["occ-completed".to_string()],
+            "an unattested completed run on an OPEN item is never ignorable — \
+             plan_sweep consults the seat's own status"
+        );
+    }
+
+    /// The next-fire guard bounds the interrupted-mid-arc consult
+    /// exactly as it bounds the wake lane: an armed standing series'
+    /// completed occurrence stays silent — the planner carries the
+    /// continuity.
+    #[test]
+    fn armed_series_completed_run_stays_settled() {
+        let fresh = HashSet::new();
+        let items = vec![item(
+            "i-armed-completed",
+            "open",
+            effect(
+                "occ-armed-completed",
+                "completed",
+                Some("sess-1"),
+                json!({}),
+                json!({"next_fire_ms": 12345u64}),
+            ),
+        )];
+        let standings = classify_commissions(&items, &fresh);
+        assert!(
+            standings.is_empty(),
+            "an armed series' completed run is settled: {standings:?}"
+        );
     }
 
     /// The idle-done exclusion by name: an attested run — ANY outcome,
@@ -713,7 +807,10 @@ mod tests {
     /// not a silent stranding, and the seat stays down.
     #[test]
     fn idle_done_seats_stay_down() {
-        let fresh: HashSet<String> = ["occ-a", "occ-b"].into_iter().map(String::from).collect();
+        let fresh: HashSet<String> = ["occ-a", "occ-b", "occ-c"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let items = vec![
             item(
                 "i-achieved",
@@ -734,6 +831,19 @@ mod tests {
                     "failed",
                     Some("sess-2"),
                     json!({"attestation": {"outcome": "blocked", "at_ms": 2}}),
+                    json!({}),
+                ),
+            ),
+            // An attested completed run never reaches the
+            // interrupted-mid-arc consult: the self-report settles it.
+            item(
+                "i-attested-completed",
+                "open",
+                effect(
+                    "occ-c",
+                    "completed",
+                    Some("sess-3"),
+                    json!({"attestation": {"outcome": "achieved", "at_ms": 2}}),
                     json!({}),
                 ),
             ),
@@ -949,6 +1059,56 @@ mod tests {
             crate::session_activity::epoch_seconds(),
             &HashSet::new(),
             &dispatched,
+        );
+        assert!(plan.wakes.is_empty() && plan.listed.is_empty());
+    }
+
+    /// The interrupted-mid-arc lane end to end: a "completed"-dressed
+    /// unattested run whose seat's durable status says interrupted is
+    /// LISTED with the arc-unconcluded reason — never woken; a seat
+    /// whose status shows a clean end stays settled (today's behavior);
+    /// a live lineage settles it silently (the running seat owns it).
+    #[test]
+    fn completed_unattested_interrupted_seat_is_listed() {
+        let home = tempfile::tempdir().unwrap();
+        write_status(home.path(), "sess-i", "interrupted");
+        write_status(home.path(), "sess-done", "completed");
+        let standing = |occ: &str, session: &str| {
+            CommissionStanding::CompletedUnattested(CommissionRef {
+                occurrence_id: occ.to_string(),
+                item_id: "i-1".to_string(),
+                item_title: format!("commission {occ}"),
+                run_state: "completed".to_string(),
+                session_id: Some(session.to_string()),
+            })
+        };
+        let plan = plan_sweep(
+            home.path(),
+            vec![standing("occ-i", "sess-i"), standing("occ-done", "sess-done")],
+            &HashMap::new(),
+            crate::session_activity::epoch_seconds(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert!(plan.wakes.is_empty(), "the lane never wakes");
+        assert_eq!(plan.listed.len(), 1, "only the interrupted seat lists");
+        assert_eq!(plan.listed[0].0.occurrence_id, "occ-i");
+        assert!(
+            plan.listed[0].1.contains("interrupted mid-task")
+                && plan.listed[0].1.contains("arc looks unconcluded"),
+            "the reason names the class: {}",
+            plan.listed[0].1
+        );
+
+        // A live wrapper in the lineage settles the consult silently.
+        let live: HashSet<String> = ["sess-i".to_string()].into_iter().collect();
+        let plan = plan_sweep(
+            home.path(),
+            vec![standing("occ-i", "sess-i")],
+            &HashMap::new(),
+            crate::session_activity::epoch_seconds(),
+            &live,
+            &HashSet::new(),
         );
         assert!(plan.wakes.is_empty() && plan.listed.is_empty());
     }

@@ -830,6 +830,8 @@ function normalizeSessionWindowMeta(meta = {}) {
   // form may feed the cwd fallback below.
   const worktreeInfo = normalizeSessionWorktreeInfo(meta.worktree);
   if (worktreeInfo) out.worktree = worktreeInfo;
+  const worktreeState = normalizeSessionWorktreeState(meta.worktree_state || meta.worktreeState);
+  if (worktreeState) out.worktreeState = worktreeState;
   const worktreeCwdAlias = typeof meta.worktree === 'string' ? meta.worktree : '';
   const cwd = compactSessionText(meta.cwd || meta.workdir || meta.workDir || worktreeCwdAlias || project);
   if (cwd) {
@@ -906,6 +908,30 @@ function normalizeSessionWorktreeInfo(raw) {
   return info;
 }
 
+// Served worktree git state (grid envelope `worktree_state`,
+// worktree_inventory.rs's serve-time probe): the stranded-work axis —
+// dirty / unpushed / ahead — probed daemon-side so it outlives the
+// session's own vitals stream. `state` is the honest four-way
+// (clean/dirty/missing/unknown); the fact fields ride only when the
+// probe answered. The SPA consumes, never re-derives.
+function normalizeSessionWorktreeState(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const state = String(raw.state || '').toLowerCase();
+  if (!['clean', 'dirty', 'missing', 'unknown'].includes(state)) return null;
+  const out = { state };
+  if (state === 'clean' || state === 'dirty') {
+    out.dirty = raw.dirty === true;
+    out.unpushed = raw.unpushed === true;
+    const ahead = Number(raw.ahead);
+    if (Number.isFinite(ahead) && ahead > 0) out.ahead = ahead;
+  }
+  const branch = compactSessionText(raw.branch);
+  if (branch) out.branch = branch;
+  const checkedMs = Number(raw.checked_ms ?? raw.checkedMs);
+  if (Number.isFinite(checkedMs) && checkedMs > 0) out.checkedMs = checkedMs;
+  return out;
+}
+
 function sessionWindowMetadataSignature(meta = {}) {
   return [
     meta.name || '',
@@ -915,6 +941,11 @@ function sessionWindowMetadataSignature(meta = {}) {
     meta.cwd || '',
     meta.cwdLabel || '',
     meta.worktree ? `${meta.worktree.branch}${meta.worktree.path}${meta.worktree.baseBranch || ''}` : '',
+    // Facts only — checkedMs deliberately excluded so an unchanged tree
+    // re-probed every TTL never churns the signature into full renders.
+    meta.worktreeState
+      ? [meta.worktreeState.state, meta.worktreeState.dirty ? '1' : '0', meta.worktreeState.unpushed ? '1' : '0', meta.worktreeState.ahead || 0, meta.worktreeState.branch || ''].join('|')
+      : '',
     meta.source || '',
     meta.sourceLabel || '',
     meta.backendSource || '',
@@ -1839,6 +1870,20 @@ const VITALS_SYMBOLS = {
     },
     action: (v) => (v.path ? { label: 'Copy folder path', run: () => vitalsCopyText(v.path) } : null),
   },
+  // The daemon-probed stranded-work chip (grid envelope
+  // `worktree_state`): unlike the vitals-fed `dirty`/`unpushed` chips it
+  // outlives the session, so an interrupted or dead card still states
+  // that its checkout holds work that exists nowhere else. Shown only
+  // when something IS stranded (or the checkout is gone) — clean stays
+  // quiet, unknown claims nothing.
+  'worktree-state': {
+    label: 'Worktree state',
+    priority: 58,
+    icon: 'pencil',
+    chip: (v) => v.text,
+    factText: (v) => v.text,
+    explain: (v) => v.lines,
+  },
   branch: {
     label: 'Branch',
     priority: 30,
@@ -2173,7 +2218,7 @@ const VITALS_SYMBOLS = {
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
   'health', 'activity', 'model', 'permissions', 'agenda-source',
-  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'branch', 'dirty',
+  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'worktree-state', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -2431,6 +2476,39 @@ function vitalsChipModels(vitals, meta, sessionId) {
     }, {
       severity: bootMeta.ghost ? 'warn' : '',
     });
+  }
+  const worktreeState = meta?.worktreeState && typeof meta.worktreeState === 'object'
+    ? meta.worktreeState
+    : null;
+  if (worktreeState) {
+    const stranded = [];
+    if (worktreeState.dirty) stranded.push('dirty');
+    if (worktreeState.unpushed) stranded.push('unpushed');
+    const gone = worktreeState.state === 'missing';
+    if (stranded.length || gone) {
+      const lines = [];
+      if (gone) {
+        lines.push('The checkout this session worked in is gone (removed or reclaimed).');
+      }
+      if (worktreeState.dirty) {
+        lines.push('Uncommitted changes are sitting in the worktree — work that exists nowhere else until committed.');
+      }
+      if (worktreeState.unpushed) {
+        lines.push(`Commits on ${worktreeState.branch ? `“${worktreeState.branch}”` : 'the worktree branch'} exist only on this machine — not pushed anywhere${Number(worktreeState.ahead) > 0 ? ` (${worktreeState.ahead} ahead of upstream)` : ''}.`);
+      }
+      lines.push('Probed by the daemon from the checkout itself, so it stays honest after the session ends.');
+      push('worktree-state', 'worktree-state', {
+        text: gone
+          ? '⧉ worktree gone'
+          : (stranded.length === 1 && worktreeState.dirty ? '⧉ dirty worktree'
+            : (stranded.length === 1 ? '⧉ unpushed worktree' : '⧉ dirty+unpushed')),
+        lines,
+      }, {
+        // Stranded work IS attention: elevate like the ghost chip. A
+        // gone checkout is a neutral fact — nothing left to strand.
+        severity: stranded.length ? 'warn' : '',
+      });
+    }
   }
 
   const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
@@ -4238,6 +4316,7 @@ function sessionWindowMetaFromSession(session) {
     cwd: session.cwd || session.workdir || session.workDir,
     project_root: session.project_root,
     worktree: session.worktree,
+    worktree_state: session.worktree_state,
     source: session.source,
     source_label: session.backend_source_label || session.source_label || prettyAgentName(session.backend_source || session.source || '') || session.backend_source || session.source,
     backend_source: session.backend_source,
