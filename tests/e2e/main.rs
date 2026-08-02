@@ -8269,3 +8269,151 @@ fn boot_lock_is_held(rig: &TestRig, boot_id: &str) -> bool {
         Err(std::fs::TryLockError::Error(_)) => true,
     }
 }
+
+/// The first session meta under the rig's store carrying a limit-park
+/// marker (parsed as raw JSON — the e2e asserts on-disk bytes, not
+/// internal types).
+#[cfg(unix)]
+fn park_meta_of(rig: &TestRig) -> Option<serde_json::Value> {
+    let logs_dir = rig.home.path().join(".intendant").join("logs");
+    for entry in std::fs::read_dir(logs_dir).ok()?.flatten() {
+        if let Ok(raw) = std::fs::read_to_string(entry.path().join("session_meta.json")) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if meta.get("limit_park").is_some_and(|park| !park.is_null()) {
+                    return Some(meta);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The park-then-die race end to end (card 01KZ07Q0PX, specimen e883a2db
+/// 2026-08-01): a fake claude binary rejects the first turn on a rate
+/// limit and DIES with the rejection. The armed park must hold the
+/// session resident through the backend terminal, leave the
+/// daemon-restart-survivable meta on disk while parked (the exact
+/// predicate the boot sweep's `midwork_class` candidates on), and at the
+/// reset respawn the backend resume-attached and deliver the parked
+/// re-send to completion. Unix-only for the /bin/sh fake; the underlying
+/// seams carry platform-neutral unit pins.
+#[cfg(unix)]
+#[tokio::test]
+async fn limit_park_survives_backend_death_and_resumes_at_reset() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The fake claude: run 1 waits for the first user message, announces
+    // a rejected five_hour window resetting ~15s out, ends the turn with
+    // the limit-text error result, and exits — the death rattle. Run 2
+    // (the wake's resume-attached respawn; the marker file
+    // discriminates) answers the parked re-send with a clean result and
+    // stays alive reading stdin. The reset clock starts only after the
+    // wrapper is fully up and delivering, so the 15s window prices in a
+    // loaded CI box: only the wrapper's own line-drain sits between the
+    // fake's emit and the park arming.
+    let fake = rig.home.path().join("fake-claude.sh");
+    std::fs::write(
+        &fake,
+        concat!(
+            "#!/bin/sh\n",
+            "SID=\"11111111-2222-4333-8444-555555555555\"\n",
+            "MARKER=\"$(dirname \"$0\")/fake-claude-ran-once\"\n",
+            "if [ ! -f \"$MARKER\" ]; then\n",
+            "  : > \"$MARKER\"\n",
+            "  read -r _line || exit 1\n",
+            "  printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
+            "  RESET=$(( $(/bin/date +%s) + 15 ))\n",
+            "  printf '{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":%d},\"session_id\":\"%s\"}\\n' \"$RESET\" \"$SID\"\n",
+            "  printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You have hit your session limit\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
+            "  exit 1\n",
+            "fi\n",
+            "read -r _line || exit 1\n",
+            "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
+            "printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"resumed after the park wake\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
+            "while read -r _line; do :; done\n",
+        ),
+    )
+    .expect("write fake claude");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+
+    std::fs::write(
+        rig.project.path().join("intendant.toml"),
+        format!("[agent.claude_code]\ncommand = \"{}\"\n", fake.display()),
+    )
+    .expect("write project config");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_LIMIT_PARK_JITTER_SECS", "0")
+        .stdin(Stdio::piped())
+        .args([
+            "--no-web",
+            "--json",
+            "--agent",
+            "claude-code",
+            "park race task",
+        ]);
+    let mut child = cmd.spawn().expect("spawn intendant");
+    // Hold stdin open for the whole run: the --json stdin reader owns a
+    // follow-up sender, so the parked idle wait survives instead of
+    // ending on a closed follow-up channel.
+    let _stdin = child.stdin.take().expect("piped stdin");
+
+    // Phase 1: the park arms and then HOLDS through the backend's death
+    // (the terminal classification differs by which death signal lands —
+    // Terminated event or channel close — and the shared hold line
+    // covers both).
+    let logs = poll_until(
+        "the armed park holding through the backend terminal",
+        RUN_TIMEOUT,
+        || async {
+            let logs = rig.session_logs();
+            (logs.contains("Rate-limited — parked")
+                && logs.contains("holds through a backend terminal while parked"))
+            .then_some(logs)
+        },
+        || tail(&rig.session_logs(), 4000),
+    )
+    .await;
+    assert!(
+        !logs.contains("session_end"),
+        "the session must stay resident while parked:\n{}",
+        tail(&logs, 4000)
+    );
+
+    // The daemon-restart-survival shape, read mid-park exactly as a boot
+    // sweep would: the durable meta advertises the pending park under a
+    // non-completed status (`midwork_class`'s candidate predicate, pinned
+    // in boot_readopt's unit tests against these same bytes).
+    let meta = park_meta_of(&rig).expect("a session meta with a limit park");
+    assert_eq!(meta["limit_park"]["has_pending"], true, "meta: {meta}");
+    assert_ne!(meta["status"], "completed", "meta: {meta}");
+
+    // Phase 2: the wake respawns the dead backend resume-attached and
+    // the parked re-send completes on the fresh process.
+    poll_until(
+        "the wake respawn and the delivered parked message",
+        RUN_TIMEOUT,
+        || async {
+            let logs = rig.session_logs();
+            (logs.contains(
+                "respawned claude-code resume-attached to deliver the parked message",
+            ) && logs.contains("elapsed — re-sending the parked message")
+                && logs.contains("resumed after the park wake"))
+            .then_some(())
+        },
+        || tail(&rig.session_logs(), 4000),
+    )
+    .await;
+    // The delivered wake released the park: the durable marker is gone.
+    let meta = park_meta_of(&rig);
+    assert!(
+        meta.is_none(),
+        "the delivered wake clears the durable park marker: {meta:?}"
+    );
+
+    child.kill().await.ok();
+}

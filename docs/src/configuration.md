@@ -170,6 +170,12 @@ startup.
 | `INTENDANT_LOG_MESSAGES_JSON` | unset (off) | Write the per-turn full-conversation dump `turns/turn_NNN_messages.json`. Off by default — the context snapshot already archives the exact provider request. The dump is still written automatically, gate or no gate, when a provider cannot produce a request snapshot (mock/custom providers), so every turn keeps at least one exact input record |
 | `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL` | unset (rotate) | Keep every per-turn context-snapshot sidecar instead of rotating to the latest one per (source, session id) stream. Debugging aid — latest-only rotation is what keeps per-session context disk O(1) instead of O(turns × context) |
 
+### Rate-limit park tuning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_LIMIT_PARK_JITTER_SECS` | unset (random 30–90) | Fixed jitter added to a rate-limit park's wake time, clamped to the 90s band maximum, replacing the random fleet-anti-stampede draw. An unparsable value keeps the random draw. The e2e suite pins the park wake-and-resume arc with `0`; setting it fleet-wide deliberately flattens the stampede protection |
+
 ### Process-plumbing variables
 
 Sub-agents no longer travel through the environment — they are supervised
