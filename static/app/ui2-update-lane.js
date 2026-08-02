@@ -334,6 +334,11 @@
       const channel = nativeCheckChannel();
       if (channel) updateLanePost('/api/daemon/update-lane/check', channel);
     },
+    // The release chip's one-click rides this SAME consent POST — the
+    // emission-shape law: every lane POST goes through the one
+    // updateLanePost above, so the chip adds no second produce path
+    // and inherits the in-flight latch, notes, and poll cadence.
+    produce: (channel) => updateLanePost('/api/daemon/update-lane/produce', channel),
   };
 
   function start() {

@@ -27593,11 +27593,23 @@ html.ui-v2 .handover-predecessor + .handover-predecessor {
    of a newer on-disk build, its provenance, and (macOS unsigned builds)
    the keychain/TCC honesty line. Distinct from the drain banner: an
    update waits; a drain is in motion. ─────────────────────────────── */
-html.ui-v2 .handover-update-chip {
+/* Both standing-fact chips stack in one bottom-corner dock — "a newer
+   release is logged" and "a newer build sits on disk" are distinct
+   facts and may both stand. The dock is click-transparent; the chips
+   are the interactive surfaces. */
+html.ui-v2 #handover-chip-dock {
   position: fixed;
   right: 14px;
   bottom: 14px;
   z-index: 239;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+html.ui-v2 .handover-update-chip {
+  pointer-events: auto;
   max-width: min(420px, calc(100vw - 32px));
   padding: 8px 12px;
   border-radius: 8px;
@@ -27625,6 +27637,14 @@ html.ui-v2 .handover-update-chip.collapsed {
 }
 html.ui-v2 .handover-update-chip.collapsed:hover {
   background: var(--surface2, rgba(58, 58, 70, 0.96));
+}
+/* The release-availability chip shares the family look; its accent
+   names the different fact (a logged release, not a build on disk). */
+html.ui-v2 .handover-release-chip {
+  border-color: var(--green, #58c08c);
+}
+html.ui-v2 .handover-release-chip.collapsed {
+  color: var(--green, #58c08c);
 }
 html.ui-v2 .handover-update-head {
   display: flex;
@@ -38794,7 +38814,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '8b47f4073a0162c3';
+const INTENDANT_APP_BUILD = 'a865644f0be367ea';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -105768,19 +105788,56 @@ async function memoryProposeFromForm(button) {
   const HANDOVER_POLL_MS = 30000;
   let bannerEl = null;
   let updateEl = null;
+  let releaseEl = null;
+
+  // Both standing-fact chips share one bottom-corner dock — a fixed
+  // flex column — so "a newer release is logged" and "a newer build
+  // sits on disk" stack instead of covering each other: distinct facts,
+  // both may stand, never conflated. The dock is click-transparent;
+  // the chips are the interactive surfaces.
+  let chipDockEl = null;
+  function chipDock() {
+    if (!chipDockEl) {
+      chipDockEl = document.createElement('div');
+      chipDockEl.id = 'handover-chip-dock';
+      document.body.appendChild(chipDockEl);
+    }
+    return chipDockEl;
+  }
+  function chipDockPrune() {
+    if (chipDockEl && !updateEl && !releaseEl) { chipDockEl.remove(); chipDockEl = null; }
+  }
 
   function updateChip() {
     if (!updateEl) {
       updateEl = document.createElement('div');
       updateEl.id = 'handover-update-chip';
       updateEl.className = 'handover-update-chip';
-      document.body.appendChild(updateEl);
+      chipDock().appendChild(updateEl);
     }
     return updateEl;
   }
 
   function updateChipClear() {
     if (updateEl) { updateEl.remove(); updateEl = null; }
+    chipDockPrune();
+  }
+
+  // The release-availability chip sits ABOVE the on-disk chip: the
+  // logged fact leads, the produced artifact follows.
+  function releaseChip() {
+    if (!releaseEl) {
+      releaseEl = document.createElement('div');
+      releaseEl.id = 'handover-release-chip';
+      releaseEl.className = 'handover-update-chip handover-release-chip';
+      chipDock().insertBefore(releaseEl, chipDockEl.firstChild);
+    }
+    return releaseEl;
+  }
+
+  function releaseChipClear() {
+    if (releaseEl) { releaseEl.remove(); releaseEl = null; }
+    chipDockPrune();
   }
 
   // Collapsed-state persistence, PER SHA: a never-seen on-disk build
@@ -105810,12 +105867,54 @@ async function memoryProposeFromForm(button) {
     } catch (_) { /* storage unavailable — the choice lives for this page only */ }
   }
 
+  // Collapsed-state persistence for the release chip, PER TAG — the
+  // update chip's per-sha pattern verbatim: a never-seen release
+  // announces itself expanded once; the owner's collapse then persists
+  // for that tag — across polls and reloads — as a pill that keeps the
+  // fact discoverable without covering content. There is deliberately
+  // NO dismiss: a standing fact only changes size. A new tag starts
+  // fresh.
+  function releaseChipStateKey(tag) {
+    return 'handover-release-chip:' + (tag || 'unknown');
+  }
+  function releaseChipStoredState(tag) {
+    try { return localStorage.getItem(releaseChipStateKey(tag)); } catch (_) { return null; }
+  }
+  function releaseChipStoreState(tag, state) {
+    try {
+      // One live tag at a time — stale per-tag keys go as we write.
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (key && key.indexOf('handover-release-chip:') === 0 && key !== releaseChipStateKey(tag)) {
+          localStorage.removeItem(key);
+        }
+      }
+      localStorage.setItem(releaseChipStateKey(tag), state);
+    } catch (_) { /* storage unavailable — the choice lives for this page only */ }
+  }
+
   // The one action's client state (the button must never double-fire and
   // its feedback must survive the 30s poll cadence). `relayRequestedMs`
   // bridges the gap between a relay click and the next poll's payload
   // (which carries `swap_pending_ms` server-side, surviving reloads).
   const updateAction = { inFlight: false, note: '', relayRequestedMs: 0 };
   let lastHandoverBody = null;
+
+  // The release chip's click feedback — the produce job's live truth
+  // arrives on the payload; the note only bridges the gap after a
+  // click, and the payload's job block supersedes it.
+  const releaseAction = { note: '' };
+
+  // While a consumer produce job runs, chase the payload faster than
+  // the 30s cadence — bounded: re-armed only while the job is live.
+  let quickPollTimer = null;
+  function armQuickHandoverPoll() {
+    if (quickPollTimer) return;
+    quickPollTimer = setTimeout(async () => {
+      quickPollTimer = null;
+      await handoverPoll();
+    }, 3000);
+  }
 
   // A one-click swap is in motion: parked on the daemon awaiting the
   // app supervisor's claim (payload fact), or just clicked here.
@@ -106199,6 +106298,148 @@ async function memoryProposeFromForm(button) {
     }
   }
 
+  // The consumer produce job as the release chip tells it (the job
+  // slot is shared with dev builds; only the consumer lane is this
+  // chip's story).
+  function releaseJobState(body) {
+    const job = body && body.update_lane && body.update_lane.job;
+    if (!job || job.lane !== 'consumer') return null;
+    return job;
+  }
+
+  // The release chip's action row: the one-click rides the update
+  // panel's ONE produce emitter (the emission-shape law — this module
+  // adds no lane wire of its own), and an install that cannot take the
+  // release gets the honest reason and the panel doorway instead of a
+  // button that cannot mean what it says.
+  function releaseChipActions(release, tag, job) {
+    const actions = document.createElement('div');
+    actions.className = 'handover-update-actions';
+    if (job && !('ok' in job)) {
+      const note = document.createElement('div');
+      note.className = 'handover-update-note';
+      note.textContent = `Downloading release — ${job.phase}…`;
+      actions.appendChild(note);
+    } else if (job && job.ok) {
+      const note = document.createElement('div');
+      note.className = 'handover-update-note';
+      note.textContent = job.detail || 'Release installed — the update chip offers the swap.';
+      actions.appendChild(note);
+    } else {
+      if (job && job.ok === false) {
+        const failed = document.createElement('div');
+        failed.className = 'handover-update-note';
+        failed.textContent = `Update failed: ${job.error || 'see the daemon log'}. The running daemon is untouched.`;
+        actions.appendChild(failed);
+      }
+      if (release.one_click === true) {
+        const btn = document.createElement('button');
+        btn.textContent = `Update to ${tag}`;
+        btn.addEventListener('click', () => {
+          if (window.intendantUpdateLane
+              && typeof window.intendantUpdateLane.produce === 'function') {
+            releaseAction.note = 'Starting the verified download — progress lands here.';
+            window.intendantUpdateLane.produce('releases');
+            handoverReleaseRender(lastHandoverBody);
+            armQuickHandoverPoll();
+          }
+        });
+        actions.appendChild(btn);
+      } else if (release.reason) {
+        const reach = document.createElement('div');
+        reach.className = 'handover-update-reach';
+        reach.textContent = release.reason;
+        actions.appendChild(reach);
+      }
+      if (releaseAction.note) {
+        const note = document.createElement('div');
+        note.className = 'handover-update-note';
+        note.textContent = releaseAction.note;
+        actions.appendChild(note);
+      }
+    }
+    // The chip stays small: version detail, channels, and the job log
+    // live on the update panel.
+    if (typeof routeTo === 'function') {
+      const panelLink = document.createElement('button');
+      panelLink.type = 'button';
+      panelLink.className = 'handover-update-panel-link';
+      panelLink.textContent = 'Open the update panel';
+      panelLink.addEventListener('click', () => routeTo('access', 'daemons'));
+      actions.appendChild(panelLink);
+    }
+    return actions;
+  }
+
+  // The release-availability chip: a releases-channel check found a
+  // VERIFIED release newer than the running version (the payload's
+  // `release_update` block — server-derived, absent on quiet failure),
+  // promoted into the same docked chip/pill lane as the on-disk chip.
+  // A DISTINCT fact: "new release available" here, "new build on disk"
+  // there — both may render. textContent construction throughout —
+  // release tags and versions are observed strings, never markup.
+  function handoverReleaseRender(body) {
+    const release = body && body.release_update;
+    if (!release || body.draining) { releaseChipClear(); return; }
+    const tag = String(release.latest_tag || 'unknown');
+    const running = String(release.running_version || '?');
+    const job = releaseJobState(body);
+    if (job) {
+      // The payload's job truth supersedes the local click bridge.
+      releaseAction.note = '';
+      if (!('ok' in job)) armQuickHandoverPoll();
+    }
+    const el = releaseChip();
+    el.textContent = '';
+    const feedbackOpen = Boolean(releaseAction.note) || Boolean(job && !('ok' in job));
+    const collapsed = releaseChipStoredState(tag) === 'collapsed' && !feedbackOpen;
+    el.classList.toggle('collapsed', collapsed);
+    if (collapsed) {
+      el.textContent = `Release · ${tag}`;
+      el.title = `New release ${tag} — running v${running}. Click to expand.`;
+      el.setAttribute('role', 'button');
+      el.onclick = () => {
+        releaseChipStoreState(tag, 'expanded');
+        handoverReleaseRender(lastHandoverBody);
+      };
+      return;
+    }
+    el.onclick = null;
+    el.removeAttribute('role');
+    el.removeAttribute('title');
+    const head = document.createElement('div');
+    head.className = 'handover-update-head';
+    const strong = document.createElement('strong');
+    strong.textContent = 'New release available';
+    head.appendChild(strong);
+    const collapse = document.createElement('button');
+    collapse.type = 'button';
+    collapse.className = 'handover-update-collapse';
+    collapse.textContent = '–';
+    collapse.title = 'Collapse to a pill — the fact stays visible';
+    collapse.setAttribute('aria-label', 'Collapse the release chip to a pill');
+    collapse.addEventListener('click', (ev) => {
+      // Same bubble hazard as its siblings: the collapsed re-render
+      // installs the expand handler on this click's path.
+      ev.stopPropagation();
+      releaseAction.note = '';
+      releaseChipStoreState(tag, 'collapsed');
+      handoverReleaseRender(lastHandoverBody);
+    });
+    head.appendChild(collapse);
+    el.appendChild(head);
+    el.appendChild(document.createTextNode(
+      `${tag} (v${String(release.latest_version || '?')}) — running v${running}`
+    ));
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    const bounds = document.createElement('div');
+    bounds.className = 'handover-update-note';
+    bounds.textContent = 'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.';
+    el.appendChild(bounds);
+    el.appendChild(releaseChipActions(release, tag, job));
+  }
+
   let bannerResize = null;
 
   function handoverBanner() {
@@ -106482,11 +106723,17 @@ async function memoryProposeFromForm(button) {
   }
 
   function handoverRender(body) {
-    if (!body || body.available === false) { handoverClear(); updateChipClear(); return; }
+    if (!body || body.available === false) {
+      handoverClear();
+      updateChipClear();
+      releaseChipClear();
+      return;
+    }
     if (body.boot_id && typeof maybeNudgeDaemonBoot === 'function') {
       maybeNudgeDaemonBoot(body.boot_id);
     }
     handoverUpdateRender(body);
+    handoverReleaseRender(body);
     if (body.draining) {
       const holder = resolveLiveHolder(body);
       const el = handoverBanner();
@@ -106599,6 +106846,14 @@ async function memoryProposeFromForm(button) {
   window.qa.handoverBanner = {
     render: (body) => handoverRender(body),
     stateKey: bannerStateKey,
+  };
+  // And for the release chip: probes feed a synthetic body carrying
+  // `release_update` and walk the pill round-trip plus the dock
+  // stacking beside the on-disk chip. Setting lastHandoverBody keeps
+  // the chip's own re-render clicks on the synthetic fact.
+  window.qa.handoverReleaseChip = {
+    render: (body) => { lastHandoverBody = body; handoverReleaseRender(body); },
+    stateKey: releaseChipStateKey,
   };
 
   // The palette's dynamic entry, as data (ui2-chrome reads this by name
@@ -106993,6 +107248,11 @@ async function memoryProposeFromForm(button) {
       const channel = nativeCheckChannel();
       if (channel) updateLanePost('/api/daemon/update-lane/check', channel);
     },
+    // The release chip's one-click rides this SAME consent POST — the
+    // emission-shape law: every lane POST goes through the one
+    // updateLanePost above, so the chip adds no second produce path
+    // and inherits the in-flight latch, notes, and poll cadence.
+    produce: (channel) => updateLanePost('/api/daemon/update-lane/produce', channel),
   };
 
   function start() {

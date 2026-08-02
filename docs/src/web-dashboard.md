@@ -988,9 +988,16 @@ Unified administration for how dashboards and daemons reach each other:
   capability routing, both in collapsed poweruser folds.
   The **Daemon update** panel lives here too — the release/dev update checks,
   producing a newer build, and the same one-click swap the bottom-corner
-  update chip offers. The update installs alongside the current version —
-  running sessions finish uninterrupted, and the old version may keep running
-  until they are done.
+  update chip offers. When a releases check verifies a release newer than the
+  running version, a bottom-corner release chip states it — a distinct fact
+  beside the on-disk update chip (both may stack in the shared dock), with
+  the same expand-once, collapse-to-pill, never-dismiss behavior — and its
+  button starts the verified download on installs that can take a release
+  (the panel doorway, with the honest reason, elsewhere). The unprompted
+  availability check runs only with Connect configured; a failed check is
+  honest absence, never a chip. The update installs alongside the current
+  version — running sessions finish uninterrupted, and the old version may
+  keep running until they are done.
 - **People & Devices** owns the user/client domain. It shows your identity on
   this daemon, a guided grant flow (who → identity details → role → active or
   draft) with a role-card picker and advanced identity metadata folded away,
