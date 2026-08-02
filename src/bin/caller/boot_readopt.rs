@@ -413,6 +413,86 @@ fn scan_midwork_candidates(
     candidates
 }
 
+/// Daemon-restart honesty for parked background tasks (the fourth
+/// respawn class): background tasks are OS children of the dead boot's
+/// backend processes, so every task a dead session was parked on died
+/// with that daemon — while the durable bg-park marker
+/// (`SessionMeta::bg_park`) survived, still claiming a live wait.
+/// Flip each live marker to its died form under the named cause and
+/// publish the attention snapshot into THIS boot's vitals hub, so no
+/// surface (grid chip, drain banner, session card) keeps waiting on a
+/// task that no longer exists. Same walk discipline as
+/// [`scan_midwork_candidates`]: one era predicate parameter, live
+/// wrappers own their own state, unreadable metas skip. Nothing here
+/// re-runs a command — re-running is an owner decision (the session
+/// card's one-tap re-run; readopted candidates additionally get the
+/// offer on the continuation nudge they already receive).
+fn mark_dead_bg_parks(
+    home: &Path,
+    live_wrapper_ids: &HashSet<String>,
+    era_keeps: impl Fn(u64) -> bool,
+    bus: &EventBus,
+) -> usize {
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
+    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
+        return 0;
+    };
+    let mut marked = 0usize;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(dir.join("session_meta.json")) else {
+            continue;
+        };
+        let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&raw) else {
+            continue;
+        };
+        let session_id = meta.session_id.trim().to_string();
+        if session_id.is_empty() || live_wrapper_ids.contains(&session_id) {
+            continue;
+        }
+        if !era_keeps(activity_mtime_secs(&dir)) {
+            continue;
+        }
+        let Some(park) = meta.bg_park.as_mut() else {
+            continue;
+        };
+        if park.died_cause.is_some() {
+            // Already stamped (an earlier boot's pass, or the wrapper's
+            // own respawn seam) — the first, most specific cause stands.
+            continue;
+        }
+        let now_epoch = crate::session_activity::epoch_seconds();
+        park.died_cause = Some(crate::external_supervision::DAEMON_RESTART_CAUSE.to_string());
+        park.died_at_epoch = Some(now_epoch);
+        let tasks = park.tasks.clone();
+        let Ok(json) = serde_json::to_string_pretty(&meta) else {
+            continue;
+        };
+        if crate::session_log::write_session_meta_atomic(&dir, &json).is_err() {
+            continue;
+        }
+        eprintln!(
+            "[readopt] {}: {} background task(s) the session was parked on died with the daemon \
+             restart — marked died-with-restart; nothing is re-run automatically",
+            short_id(&session_id),
+            tasks.len(),
+        );
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some(session_id),
+            activity: crate::external_supervision::died_tasks_attention_activity(
+                tasks,
+                crate::external_supervision::DAEMON_RESTART_CAUSE,
+                now_epoch,
+            ),
+        });
+        marked += 1;
+    }
+    marked
+}
+
 /// Merge the agenda seeds into the store scan, deduplicating by session
 /// id (a scheduled session that was also mid-turn or parked is ONE
 /// candidate; the agenda class wins the label and carries suspension).
@@ -632,7 +712,11 @@ pub(crate) fn decide_candidate_with_lens(
         session_id: resume_conversation,
         resume_id: None,
         project_root: project_root.map(|root| root.to_string_lossy().to_string()),
-        task: Some(lens.continuation_text().to_string()),
+        task: Some(readopt_continuation_with_died_tasks(
+            home,
+            &candidate.session_id,
+            lens,
+        )),
         direct: None,
         attachments: Vec::new(),
         fork: false,
@@ -644,6 +728,30 @@ pub(crate) fn decide_candidate_with_lens(
         codex_managed_context: None,
         codex_context_archive: None,
     }))
+}
+
+/// The lens's continuation nudge, extended with the died-task re-run
+/// OFFER when the restart killed background tasks the candidate was
+/// parked on ([`mark_dead_bg_parks`] stamped the durable marker before
+/// dispatch). The #644 composition law: the offer only ever rides a
+/// nudge the lane already sends — never a minted message — and nothing
+/// here re-executes a command.
+fn readopt_continuation_with_died_tasks(
+    home: &Path,
+    candidate_id: &str,
+    lens: ResumeLens,
+) -> String {
+    let mut text = lens.continuation_text().to_string();
+    if let Some(park) = session_meta_for(home, candidate_id).and_then(|meta| meta.bg_park) {
+        if let Some(cause) = park.died_cause.as_deref() {
+            if let Some(addendum) =
+                crate::external_supervision::died_tasks_nudge_addendum(&park.tasks, cause)
+            {
+                text.push_str(&addendum);
+            }
+        }
+    }
+    text
 }
 
 fn short_id(id: &str) -> &str {
@@ -1841,6 +1949,16 @@ pub(crate) async fn run_boot_readopt_pass(
     let live: HashSet<String> = crate::session_supervisor::published_live_session_registry()
         .and_then(|registry| registry.live_wrapper_ids())
         .unwrap_or_default();
+    // Honesty precedes recovery: dead sessions parked on background
+    // tasks get their died-with-restart marking whether or not they
+    // become candidates below (a parked-only session never does — its
+    // meta reads idle — and exactly that shape was the forever-park).
+    mark_dead_bg_parks(
+        &home,
+        &live,
+        |activity_secs| activity_secs < watershed,
+        &bus,
+    );
     let store = scan_store_candidates(&home, watershed, &live);
     let mut candidates = merge_candidates(&seeds, store);
     // Merged agenda-only seeds carry no activity line yet — resolve it
@@ -2299,6 +2417,16 @@ async fn run_released_readopt_pass(
     released_before_secs: u64,
     live: &HashSet<String>,
 ) {
+    // Honesty precedes recovery, same as the boot pass: the exited
+    // predecessor's backend processes took their background children
+    // with them, and a released parked-only session never becomes a
+    // candidate below.
+    mark_dead_bg_parks(
+        home,
+        live,
+        |activity_secs| activity_secs <= released_before_secs,
+        bus,
+    );
     let candidates = scan_released_candidates(home, released_before_secs, live);
     if candidates.is_empty() {
         eprintln!(

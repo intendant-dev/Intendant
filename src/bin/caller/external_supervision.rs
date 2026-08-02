@@ -1671,6 +1671,206 @@ pub(crate) fn delivery_aware_park_pending(
     }
 }
 
+/// A backend respawn class killed this session's still-running background
+/// tasks (they were OS children of the replaced backend process, and the
+/// replacement does not inherit them). Flip their registry records to
+/// died-with-restart under the named cause, stamp the durable bg-park
+/// marker's died form, log the honest line, and publish the attention
+/// activity snapshot that replaces the stale `parked-on-tasks` claim —
+/// the park marker is session-state and survives every respawn class
+/// (credential reload, service-recovery restart, rate-limit restart,
+/// daemon restart) while the tasks never do, and until this seam nothing
+/// reconciled the two: a forever-park waiting on a dead wake.
+///
+/// Returns the died tasks' descriptions so a respawn lane that ALREADY
+/// sends a delivery-aware continuation can carry the re-run offer on it
+/// ([`died_tasks_nudge_addendum`]). NOTHING here re-executes a command or
+/// re-arms delivery: commands are not known idempotent, so re-running is
+/// an owner decision — the session card's one-tap re-run, or the model
+/// deciding after an owner-visible nudge.
+pub(crate) fn mark_parked_tasks_died_with_restart(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    live_session_id: &Option<String>,
+    backend_session_id: Option<&str>,
+    cause: &str,
+) -> Vec<String> {
+    let Some(backend_session_id) = backend_session_id.map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+    let now_epoch = crate::session_activity::epoch_seconds();
+    let died = crate::background_tasks::mark_running_died_with_restart(
+        backend_session_id,
+        cause,
+        now_epoch,
+    );
+    if died.is_empty() {
+        return Vec::new();
+    }
+    let descs: Vec<String> = died
+        .iter()
+        .map(|record| record.description.clone())
+        .collect();
+    let line = format!(
+        "⚠ {} background task{} died with {cause} — nothing is re-run automatically: {}",
+        descs.len(),
+        if descs.len() == 1 { "" } else { "s" },
+        descs.join("; "),
+    );
+    slog(session_log, |l| l.warn(&line));
+    bus.send(AppEvent::LogEntry {
+        session_id: live_session_id.clone(),
+        level: "warn".to_string(),
+        source: "Intendant".to_string(),
+        content: line,
+        turn: None,
+    });
+    // Durable half: the boot pass and the drain wait set read this
+    // marker, so a died park stays adjudicable after the daemon itself
+    // restarts. Cleared when the session works again (the live-park
+    // stamping seam observes any non-parked activity).
+    slog(session_log, |l| {
+        l.set_bg_park(Some(session_log::SessionBgParkMeta {
+            tasks: descs.clone(),
+            died_cause: Some(cause.to_string()),
+            died_at_epoch: Some(now_epoch),
+        }))
+    });
+    // Live half: replace the stale parked claim on every surface that
+    // mirrors the vitals hub. The next publish from a live activity
+    // machine (a resumed turn) clears the attention state.
+    bus.send(AppEvent::SessionActivity {
+        session_id: live_session_id.clone(),
+        activity: died_tasks_attention_activity(descs.clone(), cause, now_epoch),
+    });
+    descs
+}
+
+/// The honest between-turn snapshot after a respawn killed the parked
+/// tasks: no turn running, no live tasks — died ones, with the named
+/// cause. `Idle` is the truthful state (nothing is happening); the died
+/// fields are what make it an attention state on the dashboard.
+pub(crate) fn died_tasks_attention_activity(
+    died_background_tasks: Vec<String>,
+    cause: &str,
+    now_epoch: u64,
+) -> crate::types::SessionActivityVitals {
+    crate::types::SessionActivityVitals {
+        state: crate::types::SessionActivityState::Idle,
+        since_epoch: now_epoch,
+        last_stream_byte_epoch: now_epoch,
+        stalled_after_seconds: None,
+        resets_at_epoch: None,
+        background_tasks: Vec::new(),
+        died_background_tasks,
+        died_tasks_cause: Some(cause.to_string()),
+    }
+}
+
+/// The re-run OFFER a respawn lane appends to a continuation nudge it
+/// ALREADY sends (#644's delivery-aware machinery — never a second lane):
+/// `None` when no tasks died, and never a message of its own — a respawn
+/// that owes the model no continuation keeps owing none (the attention
+/// state and the session card's one-tap re-run are the surfaces then),
+/// and a verbatim re-send of the owner's message is never mutated. Text
+/// only; the daemon never re-executes the command itself.
+pub(crate) fn died_tasks_nudge_addendum(descs: &[String], cause: &str) -> Option<String> {
+    match descs {
+        [] => None,
+        [desc] => Some(format!(
+            " Note: the background task you were waiting on (\"{desc}\") died with {cause} and \
+             was NOT re-run automatically (commands are not known idempotent) — re-run it \
+             yourself if the work still needs it."
+        )),
+        many => Some(format!(
+            " Note: {} background tasks you were waiting on died with {cause} and were NOT \
+             re-run automatically (commands are not known idempotent): {}. Re-run them yourself \
+             if the work still needs them.",
+            many.len(),
+            many.join("; "),
+        )),
+    }
+}
+
+/// Keep the durable bg-park marker (`SessionMeta::bg_park`) mirroring
+/// the backend's own activity claims — the write side of the marker the
+/// boot pass and the drain wait set adjudicate from. A parked-on-tasks
+/// claim stamps the live form; any turn state clears the marker (the
+/// session demonstrably works again — this is also what resolves a
+/// died-with-restart attention state); a quiet idle clears only a LIVE
+/// marker, never a died one (a respawned backend settling through an
+/// empty round must not erase the statement that its predecessor's
+/// tasks died).
+pub(crate) fn stamp_bg_park_marker_from_activity(
+    session_log: &SharedSessionLog,
+    activity: &crate::types::SessionActivityVitals,
+) {
+    use crate::types::SessionActivityState as S;
+    match activity.state {
+        S::ParkedOnTasks => slog(session_log, |l| {
+            l.set_bg_park(Some(session_log::SessionBgParkMeta {
+                tasks: activity.background_tasks.clone(),
+                died_cause: None,
+                died_at_epoch: None,
+            }))
+        }),
+        S::Idle | S::Stalled => slog(session_log, |l| l.clear_bg_park_if_live()),
+        S::AwaitingApi | S::Reasoning | S::Responding | S::ToolRunning | S::RateLimited => {
+            slog(session_log, |l| l.set_bg_park(None))
+        }
+    }
+}
+
+/// The named cause stamped on background tasks a service-condition
+/// round death took with the backend process (the error park's respawn
+/// class — the replacement process spawns at the park's wake).
+pub(crate) const SERVICE_RECOVERY_RESTART_CAUSE: &str = "the service-recovery restart";
+
+/// The named cause stamped on background tasks that died with a
+/// limit-killed backend process (the rate-limit park's respawn class).
+pub(crate) const RATE_LIMIT_RESTART_CAUSE: &str = "the rate-limit restart";
+
+/// The named cause stamped on background tasks that died with the whole
+/// daemon (the boot pass's respawn class — every backend process was a
+/// child of the dead boot).
+pub(crate) const DAEMON_RESTART_CAUSE: &str = "the daemon restart";
+
+/// Park-arm composition of [`mark_parked_tasks_died_with_restart`]: a
+/// round death may or may not have taken the backend process with it —
+/// an API-500 against a live process leaves its background children
+/// running and the park honest, so marking is gated on the backend's own
+/// confirmed-exit probe (`next_round_reads_fresh_credentials`: true
+/// exactly when no live backend process remains; backends without the
+/// probe never mark here). Returns the re-run addendum for the park's
+/// pending exactly when that pending is the synthesized resume nudge
+/// (`turn_had_started`) — a verbatim re-send of the owner's own message
+/// is never mutated, and no nudge is ever minted for this.
+pub(crate) fn mark_died_tasks_at_park_arm(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    live_session_id: &Option<String>,
+    backend_session_id: Option<&str>,
+    cause: &str,
+    turn_had_started: bool,
+) -> Option<String> {
+    if !agent.next_round_reads_fresh_credentials() {
+        return None;
+    }
+    let descs = mark_parked_tasks_died_with_restart(
+        bus,
+        session_log,
+        live_session_id,
+        backend_session_id,
+        cause,
+    );
+    if !turn_had_started {
+        return None;
+    }
+    died_tasks_nudge_addendum(&descs, cause)
+}
+
 /// The session-log/activity row announcing a park. One place so the two
 /// lanes (persistent daemon lane and the supervised external-mode lane)
 /// cannot drift. `has_pending` says whether a rejected message will be

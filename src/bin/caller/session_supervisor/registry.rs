@@ -51,6 +51,18 @@ impl SessionSupervisor {
             } => {
                 self.update_session_phase(Some(session_id), phase).await;
             }
+            AppEvent::SessionActivity {
+                session_id: Some(session_id),
+                activity,
+            } => {
+                // The died-with-restart attention state, derived from the
+                // one carrier every surface reads: non-empty died fields
+                // mark the session's park as dead (releasable for the
+                // drain while idle); any publish without them means the
+                // session works again and clears the mark.
+                self.update_session_died_park(session_id, !activity.died_background_tasks.is_empty())
+                    .await;
+            }
             AppEvent::BackendCredentialsReloadProgress {
                 session_id,
                 progress,
@@ -104,6 +116,25 @@ impl SessionSupervisor {
         state.related_sessions.remove(session_id);
         state.known_external_sessions.remove(session_id);
         state.advertised_thread_actions.remove(session_id);
+    }
+
+    /// Track died-park membership (see `SupervisorState::died_park_sessions`).
+    /// Explicit targets only, resolved through aliases like phase updates;
+    /// entries are added only for sessions this supervisor manages (a
+    /// foreign session's vitals must not grow the set), and removal is
+    /// unconditional (a resumed session clears its mark even mid-rename).
+    pub(crate) async fn update_session_died_park(&self, session_id: &str, died_park: bool) {
+        let mut state = self.state.lock().await;
+        let Some(target_id) = state.resolve_session_id(session_id) else {
+            return;
+        };
+        if died_park {
+            if state.sessions.contains_key(&target_id) {
+                state.died_park_sessions.insert(target_id);
+            }
+        } else {
+            state.died_park_sessions.remove(&target_id);
+        }
     }
 
     pub(crate) async fn update_session_phase(&self, session_id: Option<&str>, phase: &str) {

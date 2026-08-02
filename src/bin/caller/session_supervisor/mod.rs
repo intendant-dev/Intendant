@@ -198,6 +198,15 @@ pub(crate) struct SupervisorState {
     /// The fallback responder defers to the advertising loop for exactly
     /// these ops instead of false-rejecting non-external sessions.
     advertised_thread_actions: HashMap<String, std::collections::HashSet<String>>,
+    /// Sessions whose background-task park DIED with a backend restart
+    /// (`SessionActivity` publishes with non-empty died fields) — the
+    /// honest attention state. An idle member no longer holds the drain:
+    /// its wait is on nobody (the tasks are dead, re-running is an owner
+    /// decision the successor daemon serves just as well), so counting it
+    /// as held work would strand the drain behind a wait that can never
+    /// end. Membership clears when the session demonstrably works again
+    /// (any activity publish without died fields).
+    died_park_sessions: std::collections::HashSet<String>,
     /// Peer-delegation dedup ledger: delegation id → the session the
     /// task was dispatched as. A `StartTask` re-sent with an
     /// already-recorded `delegation_id` (the delegating daemon's
@@ -611,6 +620,7 @@ impl SupervisorState {
     fn remove_session(&mut self, session_id: &str) -> Option<(String, ManagedSession)> {
         let canonical = self.resolve_session_id(session_id)?;
         let removed = self.sessions.remove(&canonical)?;
+        self.died_park_sessions.remove(&canonical);
         self.session_aliases
             .retain(|alias, target| alias != &canonical && target != &canonical);
         self.related_sessions
@@ -927,23 +937,34 @@ impl SessionSupervisor {
         if !runtime.is_draining() {
             return false;
         }
-        let holding: Vec<(String, String, Option<String>, String, PathBuf)> = self
-            .state
-            .lock()
-            .await
-            .sessions
-            .values()
-            .filter(|session| session.phase != "done")
-            .map(|session| {
-                (
-                    session.session_id.clone(),
-                    session.source.clone(),
-                    session.name.clone(),
-                    session.phase.clone(),
-                    session.session_dir.clone(),
-                )
-            })
-            .collect();
+        let holding: Vec<(String, String, Option<String>, String, PathBuf)> = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .values()
+                .filter(|session| {
+                    // A session whose ONLY hold is a died-with-restart
+                    // park is releasable: its wait is on tasks that no
+                    // longer exist, and re-running them is an owner
+                    // decision the successor daemon serves just as well
+                    // (the durable bg_park marker survives the exit).
+                    // Any other phase — an approval, a live turn, an
+                    // interrupt — still holds like before.
+                    session.phase != "done"
+                        && !(session.phase == "idle"
+                            && state.died_park_sessions.contains(&session.session_id))
+                })
+                .map(|session| {
+                    (
+                        session.session_id.clone(),
+                        session.source.clone(),
+                        session.name.clone(),
+                        session.phase.clone(),
+                        session.session_dir.clone(),
+                    )
+                })
+                .collect()
+        };
         // Rebuild + report the named rows only when the set moved or the
         // refresh beat elapsed: this check runs per bus event, and the
         // marker resolution reads each holding session's durable meta.
@@ -1055,16 +1076,19 @@ fn drain_holdout_rows(
     let mut rows: Vec<crate::handover::DrainHoldout> = holding
         .iter()
         .map(|(session_id, source, name, phase, session_dir)| {
-            let limit_park = std::fs::read_to_string(session_dir.join("session_meta.json"))
+            let meta = std::fs::read_to_string(session_dir.join("session_meta.json"))
                 .ok()
-                .and_then(|raw| serde_json::from_str::<session_log::SessionMeta>(&raw).ok())
-                .and_then(|meta| meta.limit_park);
+                .and_then(|raw| serde_json::from_str::<session_log::SessionMeta>(&raw).ok());
+            let (limit_park, bg_park) = meta
+                .map(|meta| (meta.limit_park, meta.bg_park))
+                .unwrap_or((None, None));
             crate::handover::DrainHoldout {
                 session_id: session_id.clone(),
                 source: source.clone(),
                 name: name.clone(),
                 phase: normalize_supervisor_phase(phase),
                 limit_park,
+                bg_park,
             }
         })
         .collect();

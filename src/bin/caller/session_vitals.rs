@@ -1376,7 +1376,17 @@ pub(crate) fn spawn_cache_vitals_listener(
                     session_id: Some(session_id),
                     activity,
                 }) => {
-                    hub.apply(&session_id, |vitals| vitals.activity = Some(activity));
+                    hub.apply(&session_id, |vitals| {
+                        // Sticky died-with-restart attention: a respawned
+                        // backend's fresh machine settling to idle knows
+                        // nothing of its predecessor's task deaths; only
+                        // demonstrable work clears the attention fields
+                        // (see `session_activity::fold_died_tasks_attention`).
+                        vitals.activity = Some(crate::session_activity::fold_died_tasks_attention(
+                            vitals.activity.as_ref(),
+                            activity,
+                        ));
+                    });
                 }
                 Ok(AppEvent::SessionConfigFacts {
                     session_id: Some(session_id),
@@ -3190,6 +3200,7 @@ mod tests {
             }),
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         let meta_path = dir.join("session_meta.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();

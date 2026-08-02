@@ -1556,7 +1556,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // Wire-fact activity snapshot → the vitals hub (keyed like
                 // usage; the hub's identity aliasing folds it into the
                 // session's one entry). Pure bookkeeping — never opens or
-                // completes a turn.
+                // completes a turn. The durable bg-park marker shadows the
+                // claim (parked stamps it, working clears it) so a dead
+                // boot can still tell a live wait from a dead one.
+                stamp_bg_park_marker_from_activity(config.session_log, &activity);
                 config.bus.send(AppEvent::SessionActivity {
                     session_id: config.session_id.clone(),
                     activity,

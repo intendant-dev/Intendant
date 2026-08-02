@@ -2377,7 +2377,20 @@ pub(crate) async fn run_with_presence(
                                     // it at reset.
                                     persistent_limit_park_streak =
                                         persistent_limit_park_streak.saturating_add(1);
-                                    let (park, park_line) = backend_started_limit_park(
+                                    // Confirmed-exit gated: a limit that
+                                    // killed the process killed its
+                                    // background children; the resume
+                                    // nudge then carries the re-run offer.
+                                    let died_addendum = mark_died_tasks_at_park_arm(
+                                        agent,
+                                        &bus,
+                                        &session_log,
+                                        &session_log_id(&session_log),
+                                        persistent_thread.as_ref().map(|t| t.thread_id.as_str()),
+                                        RATE_LIMIT_RESTART_CAUSE,
+                                        turn_had_started,
+                                    );
+                                    let (mut park, park_line) = backend_started_limit_park(
                                         resets_at_epoch,
                                         tokio::time::Instant::now(),
                                         crate::session_activity::epoch_seconds(),
@@ -2385,6 +2398,11 @@ pub(crate) async fn run_with_presence(
                                         limit_park_jitter_secs(),
                                         turn_had_started,
                                     );
+                                    if let (Some(pending), Some(addendum)) =
+                                        (park.pending.as_mut(), died_addendum)
+                                    {
+                                        pending.text.push_str(&addendum);
+                                    }
                                     slog(&session_log, |l| l.warn(&park_line));
                                     bus.send(AppEvent::LogEntry {
                                         session_id: session_log_id(&session_log),
@@ -2494,7 +2512,23 @@ pub(crate) async fn run_with_presence(
                                             turn: None,
                                         });
                                     } else {
-                                        let (park, park_line) = transient_round_death_error_park(
+                                        // Confirmed-exit gated: a round
+                                        // death that took the process
+                                        // took its background children;
+                                        // the resume nudge then carries
+                                        // the re-run offer.
+                                        let died_addendum = mark_died_tasks_at_park_arm(
+                                            agent,
+                                            &bus,
+                                            &session_log,
+                                            &session_log_id(&session_log),
+                                            persistent_thread
+                                                .as_ref()
+                                                .map(|t| t.thread_id.as_str()),
+                                            SERVICE_RECOVERY_RESTART_CAUSE,
+                                            turn_had_started,
+                                        );
+                                        let (mut park, park_line) = transient_round_death_error_park(
                                             &reason,
                                             tokio::time::Instant::now(),
                                             persistent_error_park_streak,
@@ -2502,6 +2536,11 @@ pub(crate) async fn run_with_presence(
                                             turn_had_started,
                                             None,
                                         );
+                                        if let (Some(pending), Some(addendum)) =
+                                            (park.pending.as_mut(), died_addendum)
+                                        {
+                                            pending.text.push_str(&addendum);
+                                        }
                                         slog(&session_log, |l| l.warn(&park_line));
                                         bus.send(AppEvent::LogEntry {
                                             session_id: session_log_id(&session_log),

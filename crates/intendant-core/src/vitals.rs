@@ -219,6 +219,20 @@ pub struct SessionActivityVitals {
     /// on backends without background primitives is simply always.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
+    /// Short descriptions of background tasks that DIED with a backend
+    /// restart while the session was parked on them (they were children
+    /// of the replaced backend process). Non-empty is an attention
+    /// state: the wait is over, nothing was re-run automatically
+    /// (commands are not known idempotent), and re-running is an owner
+    /// decision. Cleared by the next activity publish once the session
+    /// works again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub died_background_tasks: Vec<String>,
+    /// The named restart that killed `died_background_tasks` (e.g.
+    /// "the credential-reload restart", "the daemon restart"). Present
+    /// exactly when that list is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_tasks_cause: Option<String>,
 }
 
 /// Session configuration facts — model, reasoning effort, permission
