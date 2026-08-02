@@ -1,0 +1,9 @@
+{
+  "name": "codex-cloud-remote-compute",
+  "version": "0.1.0",
+  "displayName": "Codex Cloud Remote Compute",
+  "description": "Offload heavy platform-neutral development work (builds, broad tests, lint, benchmarks, codegen) to Codex Cloud workers through Intendant's provider-neutral remote_command lane. Enabling activates a shared agent skill for every Intendant-supervised backend.",
+  "skills": [
+    "skills/intendant-remote-compute"
+  ]
+}
