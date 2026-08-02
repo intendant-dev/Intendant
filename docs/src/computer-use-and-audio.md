@@ -210,10 +210,14 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
 - **`Virtual { id }`** — an Xvfb-managed virtual display (`:99`, `:100`, …).
   `display_env_string()` → `":<id>"`. Virtual displays come into being three
   ways: the agent loop's Xvfb auto-launch, the agent starting one itself
-  (`Xvfb :99 … &`), or the dashboard's keyless **New virtual display** action
-  (`create_virtual_display`) — the path that gives an authorized headless box a
-  display with no API key configured. Dashboard-created displays register a
-  capture session immediately (streaming tile, CU-routable), are daemon-owned,
+  (`Xvfb :99 … &`), or `create_virtual_display` — the dashboard's keyless
+  **New virtual display** action and a first-class MCP tool
+  (`intendant ctl display create [--width N] [--height N]`, federated via
+  `ctl --peer`; it awaits the ready/failed outcome and returns the new
+  display's id) — the path that gives an authorized headless box a
+  display with no API key configured. Created displays register a
+  capture session immediately (streaming tile, CU-routable, announced to
+  dashboards and federated peers), are daemon-owned,
   and are destroyed when their tile is closed (a hard daemon kill leaves the
   usual orphan for the next allocation to reclaim). Xvfb is Linux-only; other
   platforms answer the action with a clear error.

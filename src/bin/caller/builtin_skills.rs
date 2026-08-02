@@ -58,6 +58,11 @@ pub(crate) const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         support_files: &[],
     },
     BuiltinSkill {
+        name: "peer-displays",
+        skill_md: include_str!("../../../skills/peer-displays/SKILL.md"),
+        support_files: &[],
+    },
+    BuiltinSkill {
         name: "phone-call",
         skill_md: include_str!("../../../skills/phone-call/SKILL.md"),
         support_files: &[],

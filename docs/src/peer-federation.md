@@ -379,6 +379,28 @@ id and geometry (`display :99 ready (1920x1080)`). An agent that brings up a
 display on a peer is therefore *discoverable* the moment the peer announces
 it — no display id needs to be guessed or typed.
 
+### Federated shared views — surfacing a peer display to the owner
+
+The shared-view announcement travels the same lane. A peer agent's
+`show_shared_view` (and every other shared-view action) rides its `/ws` as
+`shared_view` wire events; both upcasters pass them through as
+`PeerEvent::SharedView` — live-lane only (`log_replay` deliberately does not
+fold them: a stale "look here" must not resurrect as live) and un-folded
+(low volume, and no on-connect replay exists to dedupe). The per-peer actor
+applies the dashboards' last-event-wins fold (`hide` retires it,
+`focus_clear` strips the annotation) into a watch-published view;
+`PeerSnapshot` carries it as `shared_view`, and — because shared-view
+changes are rare — the registry's state observer pushes a full
+`PeerStateChanged` snapshot per change instead of minting a dedicated
+per-event command. On the dashboard, each connected peer with an active
+shared view gets a banner on the Activity log pane (peer label, action,
+display, reason) with an Open click-through to the Live display peer pane,
+and the per-peer Timeline narrates the announcement. The state is
+connection-scoped with no reconnect replay: after a link drop the banner
+clears and resurfaces on the peer agent's next shared-view action. The
+agent-facing loop this completes — create a display on a peer, work on it,
+announce it — is taught by the `peer-displays` skill.
+
 ## Agent-Facing Peer Control (ctl + MCP)
 
 Federation is not a dashboard-only surface. An agent-facing control surface
