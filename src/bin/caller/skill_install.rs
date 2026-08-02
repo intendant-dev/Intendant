@@ -80,9 +80,7 @@ impl GlobalInstallReport {
                     SkillRootInstallOutcome::SkippedUserOwnedRoot => {
                         ("root_user_owned", serde_json::Value::Null)
                     }
-                    SkillRootInstallOutcome::Failed(error) => {
-                        ("failed", serde_json::json!(error))
-                    }
+                    SkillRootInstallOutcome::Failed(error) => ("failed", serde_json::json!(error)),
                 };
                 serde_json::json!({
                     "root": root.display_path,
@@ -158,7 +156,10 @@ fn install_skills_in_root(
         // Collisions are forbidden by the registry parity tests; if one
         // ever slips through, the builtin wins and the plugin copy is
         // skipped rather than the two fighting over one directory.
-        if desired.iter().any(|(existing, _)| existing.name == skill.name) {
+        if desired
+            .iter()
+            .any(|(existing, _)| existing.name == skill.name)
+        {
             continue;
         }
         desired.push((
@@ -582,7 +583,10 @@ mod tests {
         }
         assert_eq!(
             skill_install_status_in(home, &PLUGIN_SKILL),
-            vec![("~/.agents/skills", "absent"), ("~/.claude/skills", "absent")]
+            vec![
+                ("~/.agents/skills", "absent"),
+                ("~/.claude/skills", "absent")
+            ]
         );
 
         // An unmarked user-owned copy is never replaced on activation and

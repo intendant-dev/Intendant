@@ -27363,6 +27363,57 @@ html.ui-v2 .memory-judge-strip input[type="text"] {
 html.ui-v2 .memory-judge-strip select {
   max-width: 340px;
 }
+/* ── static/app/ui2-plugins.css ── */
+/* Plugins tab (System → Plugins): the bundled-plugin catalog. Cards are
+   host-owned; every state/readiness/install fact derives from the daemon
+   body. Styles reuse the shared ui-* components (.ui-card, .ui-btn,
+   .ui-chip, .ui-empty, .ui-explainer) and the v2 token palette. */
+
+html.ui-v2 #tab-plugins { overflow-y: auto; }
+
+html.ui-v2 .plugins-wrap {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+html.ui-v2 .plugins-intro { color: var(--text-2); font-size: 13px; line-height: 1.5; }
+
+html.ui-v2 .plugins-status { min-height: 18px; font-size: 12.5px; color: var(--text-2); }
+html.ui-v2 .plugins-status-error { color: var(--rose); }
+
+html.ui-v2 .plugin-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+html.ui-v2 .plugin-card-head { display: flex; align-items: center; gap: 10px; }
+html.ui-v2 .plugin-card-title { font-weight: 600; font-size: 15px; margin-right: auto; }
+html.ui-v2 .plugin-card-summary { color: var(--text-2); font-size: 13px; line-height: 1.45; }
+html.ui-v2 .plugin-summary-line { font-size: 12.5px; color: var(--text-3); }
+
+html.ui-v2 .plugin-readiness,
+html.ui-v2 .plugin-skills {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid rgba(var(--iris-rgb), 0.12);
+  padding-top: 10px;
+}
+
+html.ui-v2 .plugin-layer-head { display: flex; align-items: center; gap: 8px; }
+html.ui-v2 .plugin-layer-name { font-family: monospace; font-size: 12px; color: var(--text-2); }
+html.ui-v2 .plugin-layer-detail { font-size: 12.5px; color: var(--text-3); }
+html.ui-v2 .plugin-layer-fix { font-size: 12.5px; color: var(--amber); }
+
+html.ui-v2 .plugin-skill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+html.ui-v2 .plugin-install-note { font-size: 12.5px; color: var(--text-3); }
 /* ── static/app/ui2-handover.css ── */
 /* ── ui2-handover — drain banner + predecessor chip (Track HS5) ────── */
 html.ui-v2 .handover-banner {
@@ -32375,6 +32426,15 @@ html.ui-v2 .daemon-relay-note {
        carry the .tab-btn class the router binds. -->
   <div class="tab-content">
 
+    <!-- Plugins Tab -->
+    <div id="tab-plugins" class="tab-pane">
+      <div class="plugins-wrap">
+        <div class="plugins-intro">Optional bundled capabilities. Enabling a plugin activates its agent skill for every backend on this machine; nothing here installs or runs third-party code.</div>
+        <div id="plugins-status" class="plugins-status"></div>
+        <div id="plugins-list"></div>
+      </div>
+    </div>
+
     <!-- Station Tab -->
     <div id="tab-station" class="tab-pane">
       <div id="station-peer-chips" class="station-peer-chips hidden" role="group" aria-label="Peer display shortcuts"></div>
@@ -36065,6 +36125,9 @@ const UI2_ICON_PATHS = {
   //   safe wheel; settings/debug kept) —
   activity: '<circle cx="5" cy="6.2" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="17.8" r="1.3" fill="currentColor" stroke="none"/><path d="M9 6.2h7.5"/><path d="M9 12h11"/><path d="M9 17.8h5.5"/>',
   sessions: '<circle cx="12" cy="5.4" r="2.1"/><path d="M10.9 7.2 6.6 14.6"/><path d="M12 7.5v7.9"/><path d="M13.1 7.2l4.3 7.4"/><circle cx="5.8" cy="16.9" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="17.6" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.2" cy="16.9" r="1.5" fill="currentColor" stroke="none"/>',
+  // plugins: a power plug — prongs, body, cord (optional capability that
+  // plugs into the daemon).
+  plugins: '<path d="M9 3.5v3.5"/><path d="M15 3.5v3.5"/><path d="M7 7h10v3.8a5 5 0 0 1-5 5 5 5 0 0 1-5-5z"/><path d="M12 15.8v4.7"/>',
   live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><circle cx="12" cy="10.5" r="1.4" fill="currentColor" stroke="none"/><path d="M9.2 13.3a4.4 4.4 0 0 1 0-5.6"/><path d="M14.8 7.7a4.4 4.4 0 0 1 0 5.6"/>',
   station: '<circle cx="12" cy="12" r="8.4"/><path d="M12 12l5.4-6.2"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="14.9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.2" r="1.3" fill="currentColor" stroke="none"/>',
   terminal: '<path d="M4.5 6.5 10 12l-5.5 5.5"/><rect x="13" y="15.7" width="6.5" height="2.6" rx="1.1" fill="currentColor" stroke="none"/>',
@@ -36205,6 +36268,7 @@ const UI2_NAV_GROUPS = [
   ] },
   { label: 'System', items: [
     { tab: 'settings', label: 'Settings', icon: 'settings' },
+    { tab: 'plugins', label: 'Plugins', icon: 'plugins' },
     { tab: 'debug', label: 'Debug', icon: 'debug' },
   ] },
 ];
@@ -38623,7 +38687,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '04fa5651aecaa2a0';
+const INTENDANT_APP_BUILD = 'ecd75a835b5c7739';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -41373,6 +41437,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_agenda_ref_content: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/content', query: ['locator'] },
   api_agenda_reminder_policy: { verb: 'POST', path: '/api/agenda/reminders/policy' },
   api_daemon_handover: { verb: 'GET', path: '/api/daemon/handover' },
+  api_plugins_list: { verb: 'GET', path: '/api/plugins' },
+  api_plugin_set_enabled: { verb: 'POST', path: '/api/plugins/{plugin_id}' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
   api_agenda_occurrences: { verb: 'GET', path: '/api/agenda/occurrences', query: ['since', 'item', 'limit'] },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },
@@ -106525,6 +106591,211 @@ window.cloudWorkersOnShown = cloudWorkersOnShown;
 window.openCloudWorkerDisplay = openCloudWorkerDisplay;
 window.closeCloudWorkerDisplay = closeCloudWorkerDisplay;
 window.submitCloudTask = submitCloudTask;
+/* ── static/app/ui2-plugins.js ── */
+// ── Plugins (System → Plugins) ─────────────────────────────────────────
+//
+// The bundled-plugin catalog: host-owned cards over GET /api/plugins
+// (tunnel twin api_plugins_list) and POST /api/plugins/{plugin_id}
+// (api_plugin_set_enabled). Everything on a card derives from the daemon
+// body — lifecycle state, readiness layers, per-skill install facts —
+// and the toggle's response carries the refreshed entry plus the
+// installer's per-root report, so there is no second fetch and no
+// pretending: the card says what the installer actually did. Plugins
+// here are declarative bundles (skills + readiness); they ship no code,
+// hooks, or frames, so this surface renders daemon data only.
+//
+// Deep-link TDZ rule: evaluates BEFORE the router (48) because a
+// #plugins deep link makes the router's eval-time boot call
+// pluginsOnTabShown(), which reads this fragment's module-level lets.
+// Top level declares only lets/consts/functions.
+
+let pluginsRows = [];
+let pluginsError = '';
+let pluginsLoaded = false;
+let pluginsFetchInFlight = null;
+let pluginsBusy = {};        // plugin id -> true while a toggle runs
+let pluginsLastInstall = {}; // plugin id -> install report from the last toggle
+
+function pluginsOnTabShown() {
+  if (pluginsLoaded) renderPlugins();
+  else loadPlugins();
+}
+
+async function loadPlugins() {
+  if (pluginsFetchInFlight) return pluginsFetchInFlight;
+  pluginsFetchInFlight = (async () => {
+    const avail = daemonApi.availability('api_plugins_list');
+    if (!avail.ok) {
+      pluginsError = avail.reason === 'denied'
+        ? "This session's role can't read the plugin catalog."
+        : avail.reason === 'unsupported'
+          ? 'This daemon predates the plugin catalog — upgrade it to manage plugins from here.'
+          : 'Daemon connection not ready yet.';
+      pluginsFetchInFlight = null;
+      renderPlugins();
+      return;
+    }
+    try {
+      const resp = await daemonApi.request('api_plugins_list', {});
+      if (resp.ok && resp.body && Array.isArray(resp.body.plugins)) {
+        pluginsRows = resp.body.plugins;
+        pluginsError = '';
+        pluginsLoaded = true;
+      } else {
+        pluginsError = (resp.body && resp.body.error) || `plugin catalog unavailable (${resp.status})`;
+      }
+    } catch (e) {
+      pluginsError = String((e && e.message) || e);
+    } finally {
+      pluginsFetchInFlight = null;
+    }
+    renderPlugins();
+  })();
+  return pluginsFetchInFlight;
+}
+
+// The daemon's snake_case lifecycle vocabulary as chip label + tone.
+// Unknown values pass through verbatim — the daemon is the source of
+// truth ("derive, don't mirror").
+const PLUGIN_STATE_CHIPS = {
+  available: { label: 'Available', cls: '' },
+  needs_setup: { label: 'Needs setup', cls: 'warn' },
+  enabled: { label: 'Enabled', cls: 'ok' },
+  setup_failed: { label: 'Setup failed', cls: 'warn' },
+};
+
+async function pluginSetEnabled(pluginId, enabled) {
+  if (pluginsBusy[pluginId]) return;
+  const avail = daemonApi.availability('api_plugin_set_enabled');
+  if (!avail.ok) {
+    pluginsError = avail.reason === 'denied'
+      ? "This session's role can't manage plugins."
+      : 'Plugin management is unavailable on this daemon.';
+    renderPlugins();
+    return;
+  }
+  pluginsBusy[pluginId] = true;
+  renderPlugins();
+  try {
+    const resp = await daemonApi.request('api_plugin_set_enabled', {
+      plugin_id: pluginId,
+      enabled,
+    });
+    if (resp.ok && resp.body && resp.body.plugin) {
+      pluginsRows = pluginsRows.map(p => (p && p.id === pluginId) ? resp.body.plugin : p);
+      pluginsLastInstall[pluginId] = resp.body.install || null;
+      pluginsError = '';
+    } else {
+      pluginsError = (resp.body && resp.body.error) || `plugin toggle failed (${resp.status})`;
+    }
+  } catch (e) {
+    pluginsError = String((e && e.message) || e);
+  } finally {
+    delete pluginsBusy[pluginId];
+  }
+  renderPlugins();
+}
+
+function pluginReadinessHtml(readiness) {
+  if (!readiness || !Array.isArray(readiness.layers) || !readiness.layers.length) return '';
+  const rows = readiness.layers.map(layer => {
+    const ok = layer && layer.status === 'ready';
+    const chip = ok
+      ? '<span class="ui-chip ok">ready</span>'
+      : `<span class="ui-chip warn">${escapeHtml((layer && layer.status) || 'unknown')}</span>`;
+    const fix = !ok && layer && layer.fix
+      ? `<div class="plugin-layer-fix">${escapeHtml(layer.fix)}</div>`
+      : '';
+    return `<div class="plugin-layer">
+      <div class="plugin-layer-head">${chip}<span class="plugin-layer-name">${escapeHtml((layer && layer.layer) || '')}</span></div>
+      <div class="plugin-layer-detail">${escapeHtml((layer && layer.detail) || '')}</div>${fix}
+    </div>`;
+  }).join('');
+  return `<div class="plugin-readiness">${rows}</div>`;
+}
+
+function pluginSkillsHtml(skills) {
+  if (!Array.isArray(skills) || !skills.length) return '';
+  const rows = skills.map(s => {
+    const roots = s && s.roots && typeof s.roots === 'object'
+      ? Object.entries(s.roots).map(([root, st]) => {
+          const cls = st === 'installed' ? 'ok' : (st === 'absent' ? '' : 'warn');
+          return `<span class="ui-chip ${cls}">${escapeHtml(root)}: ${escapeHtml(String(st))}</span>`;
+        }).join(' ')
+      : '';
+    return `<div class="plugin-skill-row"><code>${escapeHtml((s && s.name) || '')}</code>${roots}</div>`;
+  }).join('');
+  return `<div class="plugin-skills">${rows}</div>`;
+}
+
+// One line summarizing what the installer did on the last toggle —
+// straight from the response's per-root report, never invented.
+function pluginInstallNoteHtml(install) {
+  if (!Array.isArray(install)) return '';
+  const parts = install.map(r => {
+    if (!r || !r.root) return '';
+    if (r.outcome === 'applied' && r.detail) {
+      const d = r.detail;
+      const bits = [];
+      if (Array.isArray(d.installed) && d.installed.length) bits.push(`installed ${d.installed.length}`);
+      if (Array.isArray(d.removed_stale) && d.removed_stale.length) bits.push(`removed ${d.removed_stale.length}`);
+      if (Array.isArray(d.skipped_user_owned) && d.skipped_user_owned.length) bits.push(`kept ${d.skipped_user_owned.length} user-owned`);
+      if (!bits.length) bits.push('no changes');
+      return `${r.root}: ${bits.join(', ')}`;
+    }
+    if (r.outcome === 'failed') return `${r.root}: failed — ${r.detail || 'unknown error'}`;
+    if (r.outcome === 'root_user_owned') return `${r.root}: user-owned, untouched`;
+    return '';
+  }).filter(Boolean);
+  if (!parts.length) return '';
+  return `<div class="plugin-install-note">Last change — ${escapeHtml(parts.join(' · '))}</div>`;
+}
+
+function pluginCardHtml(p) {
+  if (!p || !p.id) return '';
+  const chip = PLUGIN_STATE_CHIPS[p.state] || { label: p.state || 'unknown', cls: '' };
+  const busy = Boolean(pluginsBusy[p.id]);
+  const toggleLabel = busy ? 'Working…' : (p.enabled ? 'Disable' : 'Enable');
+  const btnCls = p.enabled ? 'ui-btn' : 'ui-btn primary';
+  const summaryLine = p.readiness && p.readiness.summary
+    ? `<div class="plugin-summary-line">${escapeHtml(p.readiness.summary)}</div>`
+    : '';
+  const installNote = pluginInstallNoteHtml(pluginsLastInstall[p.id]);
+  return `<div class="ui-card plugin-card" data-plugin-id="${escapeHtml(p.id)}">
+    <div class="plugin-card-head">
+      <div class="plugin-card-title">${escapeHtml(p.display_name || p.id)}</div>
+      <span class="ui-chip ${chip.cls}">${escapeHtml(chip.label)}</span>
+      <button type="button" class="${btnCls}" data-plugin-toggle="${escapeHtml(p.id)}" data-enable="${p.enabled ? '0' : '1'}"${busy ? ' disabled' : ''}>${toggleLabel}</button>
+    </div>
+    <div class="plugin-card-summary">${escapeHtml(p.summary || '')}</div>
+    ${summaryLine}
+    ${pluginReadinessHtml(p.readiness)}
+    ${pluginSkillsHtml(p.skills)}
+    ${installNote}
+  </div>`;
+}
+
+function renderPlugins() {
+  const status = document.getElementById('plugins-status');
+  if (status) {
+    status.textContent = pluginsError ? `Error: ${pluginsError}` : '';
+    status.classList.toggle('plugins-status-error', Boolean(pluginsError));
+  }
+  const list = document.getElementById('plugins-list');
+  if (!list) return;
+  if (!pluginsLoaded && !pluginsError) {
+    list.innerHTML = '<div class="ui-explainer">Loading plugin catalog…</div>';
+    return;
+  }
+  if (!pluginsRows.length) {
+    list.innerHTML = '<div class="ui-empty"><div class="ui-empty-title">No bundled plugins</div><div class="ui-empty-hint">This build ships no optional plugins.</div></div>';
+    return;
+  }
+  list.innerHTML = pluginsRows.map(pluginCardHtml).join('');
+  list.querySelectorAll('button[data-plugin-toggle]').forEach(btn => {
+    btn.onclick = () => pluginSetEnabled(btn.dataset.pluginToggle, btn.dataset.enable === '1');
+  });
+}
 /* ── static/app/48-router-settings.js ── */
 // ── Tab Switching ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -106587,7 +106858,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings', 'agenda', 'memory'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings', 'agenda', 'memory', 'plugins'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'security', 'providers', 'presence', 'advanced', 'appearance'];
@@ -106818,6 +107089,9 @@ function switchTab(tabId) {
   }
   if (tabId === 'memory') {
     memoryOnTabShown();
+  }
+  if (tabId === 'plugins') {
+    pluginsOnTabShown();
   }
   if (tabId === 'stats') {
     // The explicit refresh below supersedes any render deferred while

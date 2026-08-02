@@ -487,7 +487,10 @@ mod tests {
 
             for skill in plugin.skills {
                 let disk = std::fs::read_to_string(
-                    package_root.join("skills").join(skill.name).join("SKILL.md"),
+                    package_root
+                        .join("skills")
+                        .join(skill.name)
+                        .join("SKILL.md"),
                 )
                 .expect("plugin skill SKILL.md readable");
                 assert_eq!(
@@ -495,13 +498,14 @@ mod tests {
                     "embedded bytes for {}/{} are stale",
                     plugin.id, skill.name
                 );
-                let (config, _) = intendant_core::skills::parse_skill_md(
-                    skill.skill_md,
-                    Path::new(skill.name),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("plugin skill {}/SKILL.md does not parse: {error}", skill.name)
-                });
+                let (config, _) =
+                    intendant_core::skills::parse_skill_md(skill.skill_md, Path::new(skill.name))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "plugin skill {}/SKILL.md does not parse: {error}",
+                                skill.name
+                            )
+                        });
                 assert_eq!(
                     config.name, skill.name,
                     "frontmatter name must match the skill directory"
@@ -538,7 +542,10 @@ mod tests {
     fn enable_state_round_trips_and_preserves_foreign_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        assert!(enabled_plugins_in(root).is_empty(), "shipped default is off");
+        assert!(
+            enabled_plugins_in(root).is_empty(),
+            "shipped default is off"
+        );
 
         set_plugin_enabled_in(root, REMOTE_COMPUTE_PLUGIN_ID, true).unwrap();
         assert!(enabled_plugins_in(root).contains(REMOTE_COMPUTE_PLUGIN_ID));
@@ -574,8 +581,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not json").unwrap();
         assert!(enabled_plugins_in(root).is_empty());
-        std::fs::write(&path, br#"{"version":99,"enabled":["codex-cloud-remote-compute"]}"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            br#"{"version":99,"enabled":["codex-cloud-remote-compute"]}"#,
+        )
+        .unwrap();
         assert!(enabled_plugins_in(root).is_empty());
     }
 
@@ -616,8 +626,10 @@ mod tests {
             missing_env
                 .layers
                 .iter()
-                .all(|layer| layer.status == LayerStatus::Blocked && layer.fix.is_some()
-                    || layer.status == LayerStatus::Ready),
+                .all(
+                    |layer| layer.status == LayerStatus::Blocked && layer.fix.is_some()
+                        || layer.status == LayerStatus::Ready
+                ),
             "blocked layers must carry a fix"
         );
     }

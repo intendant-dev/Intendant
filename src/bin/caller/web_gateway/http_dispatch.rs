@@ -1289,8 +1289,7 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::PluginsList => {
-                return handle_plugins_list(stream, route.cors, fleet_cors_origin.as_deref())
-                    .await;
+                return handle_plugins_list(stream, route.cors, fleet_cors_origin.as_deref()).await;
             }
             RouteHandlerId::PluginSetEnabled => {
                 // The row's `{plugin_id}` capture.

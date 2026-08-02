@@ -34,7 +34,11 @@ one in Intendant gives you:
   Heavy platform-neutral builds and tests therefore move off the supervisor
   without changing which backend does the reasoning. Platform-specific CI
   remains authoritative, and the backend never silently falls back to a
-  heavy local build when acquisition fails.
+  heavy local build when acquisition fails. The workflow *teaching* lives in
+  the shared `intendant-remote-compute` agent skill, materialized for every
+  backend only while the **Codex Cloud Remote Compute** plugin (dashboard →
+  Plugins; default off) is enabled and ready — the tool itself stays
+  available and self-describing either way.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents
