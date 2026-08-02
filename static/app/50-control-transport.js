@@ -3021,6 +3021,13 @@ function renderDaemonsListTail() {
   // (replaceChildren over a handful of peers) and display lists aren't
   // fully encoded in the row HTML, so this stays unconditional.
   stationRenderPeerChips();
+  // The Live display rail derives its peer rows from the same data;
+  // nudge its render loop on every peer add/remove/state event (the
+  // chip-row observer alone can't — that DOM only exists once Station
+  // initializes).
+  if (typeof window.refreshLiveDisplayPeerRows === 'function') {
+    window.refreshLiveDisplayPeerRows();
+  }
 
   // Toggle host-badge visibility in the Activity tab. Single-host
   // setups stay visually clean; multi-host setups see the badges.

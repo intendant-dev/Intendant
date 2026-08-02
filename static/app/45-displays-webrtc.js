@@ -3347,14 +3347,6 @@ function applyDisplayStripState() {
     }
   }
 
-  function peerKey(chip, index) {
-    const host = chip.dataset.hostId || '';
-    const display = chip.dataset.displayId || '';
-    return host || display
-      ? host + ':' + display
-      : (chip.getAttribute('aria-label') || chip.textContent || String(index));
-  }
-
   // ── Inline peer stage ────────────────────────────────────────────────
   // Selecting a peer display hosts the federated pane inside the Live
   // display stage instead of routing to Station. The stage provides the
@@ -3403,10 +3395,10 @@ function applyDisplayStripState() {
   }
 
   function selectPeerDisplay(key) {
-    const chip = peerSources.get(key);
-    if (!chip || chip.disabled) return;
-    const hostId = chip.dataset.hostId || '';
-    const displayId = Number(chip.dataset.displayId || 0);
+    const source = peerSources.get(key);
+    if (!source || source.disabled) return;
+    const hostId = source.hostId;
+    const displayId = source.displayId;
     if (!hostId || typeof openPeerDisplay !== 'function') return;
     const current = selectedSlot();
     if (slotHasBlockingSurfaceWork(current)) {
@@ -3452,29 +3444,59 @@ function applyDisplayStripState() {
   }
 
   function syncPeerRows() {
-    const chips = Array.from(document.querySelectorAll('#station-peer-chips .station-peer-chip'));
+    // Derive rows from the peers DATA (the same `daemons` snapshot the
+    // Station chips render from), not from Station's chip DOM — the chip
+    // row only exists once Station's surface initializes, and the Live
+    // rail must list peers without the user ever visiting Station.
+    const peers = (typeof daemons !== 'undefined' && Array.isArray(daemons)
+      && typeof peerCanShareDisplay === 'function')
+      ? daemons.filter(d => peerCanShareDisplay(d))
+      : [];
     peerSources.clear();
     const liveKeys = new Set();
     const ordered = [];
-    chips.forEach((chip, index) => {
-      const key = peerKey(chip, index);
-      liveKeys.add(key);
-      peerSources.set(key, chip);
-      let record = peerRows.get(key);
-      if (!record) {
-        record = createPeerRow(key);
-        peerRows.set(key, record);
+    for (const d of peers) {
+      const hostId = String(d.host_id || '');
+      if (!hostId) continue;
+      const name = (typeof compactSessionText === 'function'
+        ? compactSessionText(d.label || hostId)
+        : (d.label || hostId)) || hostId;
+      // Mirror the chip renderer: one row per advertised display, and a
+      // single default-target row for peers that don't advertise any.
+      const displays = Array.isArray(d.displays) && d.displays.length
+        ? d.displays
+        : [{ display_id: (typeof stationPeerDisplayIdForHost === 'function'
+            ? stationPeerDisplayIdForHost(hostId) : 0) }];
+      for (const disp of displays) {
+        const displayId = Number.parseInt(String(disp.display_id ?? 0), 10) || 0;
+        const key = hostId + ':' + displayId;
+        const size = disp.width && disp.height ? ` (${disp.width}x${disp.height})` : '';
+        const source = {
+          hostId,
+          displayId,
+          disabled: !d.connected,
+          label: `${name} · :${displayId}`,
+          title: d.connected ? 'View this peer display live' : `${name} is disconnected`,
+          aria: d.connected
+            ? `View display ${displayId}${size} on ${name}`
+            : `${name} (disconnected)`,
+        };
+        liveKeys.add(key);
+        peerSources.set(key, source);
+        let record = peerRows.get(key);
+        if (!record) {
+          record = createPeerRow(key);
+          peerRows.set(key, record);
+        }
+        record.row.disabled = source.disabled;
+        record.row.classList.toggle('ok', !source.disabled);
+        record.row.classList.toggle('selected', selectedPeerKey === key);
+        record.row.title = source.title;
+        record.row.setAttribute('aria-label', source.aria);
+        record.title.textContent = source.label;
+        ordered.push(record);
       }
-      record.row.disabled = chip.disabled;
-      record.row.classList.toggle('ok', !chip.disabled);
-      record.row.classList.toggle('selected', selectedPeerKey === key);
-      record.row.title = chip.disabled
-        ? (chip.title || 'Peer unavailable')
-        : 'View this peer display live';
-      record.row.setAttribute('aria-label', chip.getAttribute('aria-label') || chip.textContent || 'Peer display');
-      record.title.textContent = chip.textContent || 'Peer display';
-      ordered.push(record);
-    });
+    }
     for (const [key, record] of peerRows) {
       if (liveKeys.has(key)) continue;
       record.row.remove();
@@ -3504,8 +3526,8 @@ function applyDisplayStripState() {
     const slot = selectedSlot();
     if (!slot) {
       if (selectedPeerKey !== null) {
-        const chip = peerSources.get(selectedPeerKey);
-        mobileSummary.textContent = (chip && chip.textContent) || 'Peer display';
+        const source = peerSources.get(selectedPeerKey);
+        mobileSummary.textContent = (source && source.label) || 'Peer display';
         return;
       }
       mobileSummary.textContent = 'No display selected';
@@ -3644,6 +3666,10 @@ function applyDisplayStripState() {
     if (railRaf) return;
     railRaf = requestAnimationFrame(renderWorkspace);
   }
+  // Peer add/remove/state events land here from renderDaemonsListTail —
+  // the peer rows derive from the `daemons` data, so data changes must
+  // nudge the render loop directly (no chip DOM to observe pre-Station).
+  window.refreshLiveDisplayPeerRows = scheduleWorkspace;
 
   // Self-feed filter: the 3 s getStats sampler writes the metrics chip and
   // the 1 Hz presence-stream tick writes the frame-id chip — both INSIDE

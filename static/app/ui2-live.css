@@ -180,6 +180,11 @@ html.ui-v2 .displays-container > .ui2-live-peer-stage {
   min-height: 0;
   width: 100%;
 }
+/* A selected peer display owns the stage: the local no-displays hero
+   would otherwise sit above the peer pane. */
+html.ui-v2 .displays-container.ui2-live-peer-mode > .displays-placeholder {
+  display: none;
+}
 html.ui-v2 .ui2-live-peer-stage .peer-display-pane {
   display: flex;
   flex-direction: column;
