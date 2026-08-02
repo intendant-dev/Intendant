@@ -126,8 +126,13 @@ pub(crate) fn idle_external_pr_published_event(
 /// resume-attached to the same backend session id so the new process
 /// reads the fresh credential store. Queued `parked_follow_ups` stay in
 /// the loop untouched and flush through the normal preamble after the
-/// respawn. Returns `false` when the respawn failed — the old process is
-/// already gone, so the caller exits the loop honestly.
+/// respawn. Returns `None` when the respawn failed — the old process is
+/// already gone, so the caller exits the loop honestly; on success,
+/// returns the descriptions of parked background tasks the restart
+/// killed (they were the old process's children —
+/// [`mark_parked_tasks_died_with_restart`] flipped their records and
+/// published the attention state before the shutdown), so the caller's
+/// continuation can carry the re-run offer.
 #[allow(clippy::too_many_arguments)]
 async fn apply_backend_credentials_reload(
     backend: &external_agent::AgentBackend,
@@ -143,7 +148,7 @@ async fn apply_backend_credentials_reload(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
     drain_config: &mut DrainConfig<'_>,
-) -> bool {
+) -> Option<Vec<String>> {
     let session_log = drain_config.session_log;
     let announce = |line: &str| {
         slog(session_log, |l| l.info(line));
@@ -184,6 +189,16 @@ async fn apply_backend_credentials_reload(
         .announced_native_session_id
         .clone()
         .or_else(|| drain_config.backend_thread_id.clone());
+    // The restart kills the old process's background children before the
+    // fresh process exists: flip any parked-on tasks to died-with-restart
+    // NOW, with this class's name, so the park never outlives its wake.
+    let died_task_descs = mark_parked_tasks_died_with_restart(
+        drain_config.bus,
+        session_log,
+        &drain_config.session_id,
+        stats.announced_native_session_id.as_deref(),
+        CREDENTIAL_RELOAD_RESTART_CAUSE,
+    );
     announce(&format!(
         "Reloading credentials: restarting {} resume-attached to its backend session",
         backend
@@ -214,7 +229,7 @@ async fn apply_backend_credentials_reload(
                 "Credential reload complete — the backend restarted on the fresh credential store",
             );
             progress(crate::event::CredentialReloadProgress::Done);
-            true
+            Some(died_task_descs)
         }
         Err(e) => {
             let line = format!(
@@ -226,10 +241,14 @@ async fn apply_backend_credentials_reload(
                 error: format!("could not respawn {backend}: {e}"),
             });
             drain_config.bus.send(AppEvent::LoopError(line));
-            false
+            None
         }
     }
 }
+
+/// The named cause stamped on background tasks the credential-reload
+/// respawn kills (see [`mark_parked_tasks_died_with_restart`]).
+pub(crate) const CREDENTIAL_RELOAD_RESTART_CAUSE: &str = "the credential-reload restart";
 
 /// The follow-up text synthesized when a credential reload's own
 /// interrupt cut a live turn. Resume-attach keeps the conversation
@@ -727,7 +746,7 @@ pub(crate) async fn run_external_agent_mode(
         // backend and returned; the respawn precedes any queued turn so
         // the next delivery runs on the fresh credential store.
         if backend_credentials_reload.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            if !apply_backend_credentials_reload(
+            let Some(reload_died_task_descs) = apply_backend_credentials_reload(
                 &backend,
                 &project,
                 web_port,
@@ -743,21 +762,32 @@ pub(crate) async fn run_external_agent_mode(
                 &mut drain_config,
             )
             .await
-            {
+            else {
                 stats.terminal_outcome =
                     Some("credential reload could not respawn the backend".to_string());
                 break 'outer;
-            }
+            };
             // When the reload's own interrupt cut the live turn, the
             // turn's driving message was consumed mid-delivery — nothing
             // re-drives it after the respawn, so the session would idle
             // on the fresh account with the work half-done. Mirror the
             // rate-limit park's pending preservation: front-queue a
             // synthesized continuation so the flush below re-drives the
-            // interrupted work ahead of anything queued behind it.
-            if let Some(continuation) =
+            // interrupted work ahead of anything queued behind it. When
+            // the restart also killed parked background tasks, the
+            // continuation carries the re-run OFFER (and only an already
+            // owed continuation does — a between-rounds park mints no
+            // nudge; its surfaces are the attention state and the session
+            // card's one-tap re-run).
+            if let Some(mut continuation) =
                 synthesized_reload_continuation(std::mem::take(&mut reload_interrupted_turn))
             {
+                if let Some(addendum) = died_tasks_nudge_addendum(
+                    &reload_died_task_descs,
+                    CREDENTIAL_RELOAD_RESTART_CAUSE,
+                ) {
+                    continuation.text.push_str(&addendum);
+                }
                 parked_follow_ups.push_front(continuation);
                 let line = "Credential reload interrupted the previous turn — queued a continuation so the work resumes on the fresh account";
                 slog(&session_log, |l| l.info(line));
@@ -1081,6 +1111,10 @@ pub(crate) async fn run_external_agent_mode(
                                     // snapshot implies no turn and must not
                                     // open a spontaneous round).
                                     external_agent::AgentEvent::ActivityUpdate { activity } => {
+                                        stamp_bg_park_marker_from_activity(
+                                            &session_log,
+                                            &activity,
+                                        );
                                         bus.send(AppEvent::SessionActivity {
                                             session_id: drain_config.session_id.clone(),
                                             activity,
@@ -1363,7 +1397,26 @@ pub(crate) async fn run_external_agent_mode(
                                                 round = round.saturating_sub(1);
                                                 limit_park_streak =
                                                     limit_park_streak.saturating_add(1);
-                                                let (park, park_line) =
+                                                // Confirmed-exit gated:
+                                                // a limit that killed
+                                                // the process killed its
+                                                // background children;
+                                                // the resume nudge then
+                                                // carries the re-run
+                                                // offer.
+                                                let died_addendum =
+                                                    mark_died_tasks_at_park_arm(
+                                                        &mut agent,
+                                                        &bus,
+                                                        &session_log,
+                                                        &live_session_id,
+                                                        stats
+                                                            .announced_native_session_id
+                                                            .as_deref(),
+                                                        RATE_LIMIT_RESTART_CAUSE,
+                                                        turn_had_started,
+                                                    );
+                                                let (mut park, park_line) =
                                                     backend_started_limit_park(
                                                         resets_at_epoch,
                                                         tokio::time::Instant::now(),
@@ -1372,6 +1425,11 @@ pub(crate) async fn run_external_agent_mode(
                                                         limit_park_jitter_secs(),
                                                         turn_had_started,
                                                     );
+                                                if let (Some(pending), Some(addendum)) =
+                                                    (park.pending.as_mut(), died_addendum)
+                                                {
+                                                    pending.text.push_str(&addendum);
+                                                }
                                                 let has_pending = park.pending.is_some();
                                                 slog(&session_log, |l| l.warn(&park_line));
                                                 bus.send(AppEvent::LogEntry {
@@ -1533,7 +1591,27 @@ pub(crate) async fn run_external_agent_mode(
                                                     break 'outer;
                                                 }
                                                 round = round.saturating_sub(1);
-                                                let (park, park_line) =
+                                                // A spontaneous round's
+                                                // death that took the
+                                                // process took its
+                                                // background children
+                                                // too (confirmed-exit
+                                                // gated); the resume
+                                                // nudge carries the
+                                                // re-run offer.
+                                                let died_addendum =
+                                                    mark_died_tasks_at_park_arm(
+                                                        &mut agent,
+                                                        &bus,
+                                                        &session_log,
+                                                        &live_session_id,
+                                                        stats
+                                                            .announced_native_session_id
+                                                            .as_deref(),
+                                                        SERVICE_RECOVERY_RESTART_CAUSE,
+                                                        turn_had_started,
+                                                    );
+                                                let (mut park, park_line) =
                                                     transient_round_death_error_park(
                                                         &reason,
                                                         tokio::time::Instant::now(),
@@ -1542,6 +1620,11 @@ pub(crate) async fn run_external_agent_mode(
                                                         turn_had_started,
                                                         None,
                                                     );
+                                                if let (Some(pending), Some(addendum)) =
+                                                    (park.pending.as_mut(), died_addendum)
+                                                {
+                                                    pending.text.push_str(&addendum);
+                                                }
                                                 let has_pending = park.pending.is_some();
                                                 slog(&session_log, |l| l.warn(&park_line));
                                                 bus.send(AppEvent::LogEntry {
@@ -2116,9 +2199,13 @@ pub(crate) async fn run_external_agent_mode(
                                 // right away (the park cancel inside
                                 // preserves the pending re-send; queued
                                 // messages flush through the preamble).
+                                // No continuation is owed from idle, so
+                                // tasks the restart killed surface through
+                                // the attention state the respawn already
+                                // published — never a minted nudge.
                                 backend_credentials_reload
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                                if !apply_backend_credentials_reload(
+                                if apply_backend_credentials_reload(
                                     &backend,
                                     &project,
                                     web_port,
@@ -2134,6 +2221,7 @@ pub(crate) async fn run_external_agent_mode(
                                     &mut drain_config,
                                 )
                                 .await
+                                .is_none()
                                 {
                                     stats.terminal_outcome = Some(
                                         "credential reload could not respawn the backend"
@@ -3935,11 +4023,28 @@ pub(crate) async fn run_external_agent_mode(
                         turn: None,
                     });
                 }
+                // A limit-killed backend process took its background
+                // children with it (confirmed-exit gated: a mere
+                // rejection against a live process marks nothing) — the
+                // resume nudge then carries the re-run offer.
+                let died_addendum = mark_died_tasks_at_park_arm(
+                    &mut agent,
+                    &bus,
+                    &session_log,
+                    &live_session_id,
+                    stats.announced_native_session_id.as_deref(),
+                    RATE_LIMIT_RESTART_CAUSE,
+                    turn_had_started,
+                );
                 let mut pending = active_followup_for_rewind_replay.clone();
                 pending.text = merged.clone();
+                let mut parked_pending = limit_park_pending(pending, turn_had_started);
+                if let Some(addendum) = died_addendum {
+                    parked_pending.text.push_str(&addendum);
+                }
                 limit_park = Some(LimitParkState {
                     resume_at: tokio::time::Instant::now() + delay,
-                    pending: Some(limit_park_pending(pending, turn_had_started)),
+                    pending: Some(parked_pending),
                     kind: ParkKind::ProviderLimit,
                 });
                 // Durable park marker: the in-memory park dies with the
@@ -3997,9 +4102,22 @@ pub(crate) async fn run_external_agent_mode(
                     break;
                 }
                 round = round.saturating_sub(1);
+                // A round death that took the backend process also took
+                // its background children (confirmed-exit gated — an
+                // API-500 against a live process marks nothing); the
+                // resume nudge then carries the re-run offer.
+                let died_addendum = mark_died_tasks_at_park_arm(
+                    &mut agent,
+                    &bus,
+                    &session_log,
+                    &live_session_id,
+                    stats.announced_native_session_id.as_deref(),
+                    SERVICE_RECOVERY_RESTART_CAUSE,
+                    turn_had_started,
+                );
                 let mut pending = active_followup_for_rewind_replay.clone();
                 pending.text = merged.clone();
-                let (park, park_line) = transient_round_death_error_park(
+                let (mut park, park_line) = transient_round_death_error_park(
                     &reason,
                     tokio::time::Instant::now(),
                     error_park_streak,
@@ -4007,6 +4125,9 @@ pub(crate) async fn run_external_agent_mode(
                     turn_had_started,
                     Some(pending),
                 );
+                if let (Some(pending), Some(addendum)) = (park.pending.as_mut(), died_addendum) {
+                    pending.text.push_str(&addendum);
+                }
                 let has_pending = park.pending.is_some();
                 slog(&session_log, |l| l.warn(&park_line));
                 bus.send(AppEvent::LogEntry {

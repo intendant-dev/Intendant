@@ -593,6 +593,43 @@ lags. Environment suggestions derive from the tracked leases (there is no
 provider env-list verb); the last environment submitted from that browser
 is remembered locally.
 
+## Remote Compute plugin
+
+The dashboard's **Plugins** destination carries **Codex Cloud Remote
+Compute** — a bundled, default-off plugin wrapping this chapter's lane in a
+product surface. It is a declarative bundle, not an extension system:
+enabling it does two bounded things.
+
+1. **Readiness.** A cheap, mutation-free probe of the three prerequisites
+   automatic acquisition needs — `INTENDANT_CODEX_CLOUD_ENVIRONMENT`, a
+   valid `INTENDANT_CODEX_CLOUD_HOME_URL`, and the daemon gateway TLS
+   identity (or explicit TLS-terminating-proxy mode). Blocked layers name
+   their fix on the card; the probe never mints enrollments, spawns the
+   provider CLI, or submits tasks. Cached-lease and live-attachment counts
+   render as information, not gates — acquiring workers on demand is the
+   lane's own job.
+2. **Skill materialization.** While enabled AND ready, the shared
+   `intendant-remote-compute` agent skill — the workflow teaching that used
+   to live in system prompts: prefer `remote_command` for heavy
+   platform-neutral work, never silently fall back to heavy local work,
+   `working_tree` snapshots for iteration vs pushed `git_revision` for
+   authoritative validation, honest cache expectations — is installed into
+   `~/.agents/skills/` and `~/.claude/skills/` with plugin provenance
+   markers, so native, Codex, Claude Code, Kimi Code, and Pi sessions all
+   see it. Disabling (or losing readiness) sweeps exactly the
+   Intendant-managed copies; a user's same-named skill directory is never
+   touched. Enable state lives under the daemon state root, survives
+   restarts, and reconciles at every boot.
+
+`GET /api/plugins` (tunnel `api_plugins_list`) serves the catalog — enabled
+flag, derived lifecycle state (`available` / `needs_setup` / `enabled` /
+`setup_failed`), readiness layers, per-skill install facts — and
+`POST /api/plugins/{plugin_id}` (tunnel `api_plugin_set_enabled`,
+Settings-classed) toggles a plugin, reporting the installer's per-root
+outcome in the same response. The `remote_command` tool itself remains
+available and provider-neutral regardless of the plugin: the plugin governs
+the teaching, not the capability.
+
 ## MCP tools
 
 The daemon's full MCP tool profile exposes the provider operations

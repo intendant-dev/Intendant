@@ -261,6 +261,13 @@ impl ActivityMachine {
             stalled_after_seconds: stall_armed.then_some(STALL_AFTER_SECS),
             resets_at_epoch: self.resets_at_epoch,
             background_tasks: self.background_tasks.clone(),
+            // The machine only ever claims live wire facts; the
+            // died-with-restart attention snapshot is published by the
+            // supervision seam that observed the process die
+            // (`external_supervision::mark_parked_tasks_died_with_restart`),
+            // and any later publish from a live machine clears it.
+            died_background_tasks: Vec::new(),
+            died_tasks_cause: None,
         }
     }
 
@@ -275,7 +282,39 @@ impl ActivityMachine {
     pub(crate) fn effective_state(&self, now_epoch: u64) -> SessionActivityState {
         effective_activity_state(&self.snapshot(), now_epoch)
     }
+}
 
+/// Hub-side sticky fold for the died-with-restart attention fields
+/// (`died_background_tasks` / `died_tasks_cause`): the attention snapshot
+/// is published machine-externally by the supervision seam that observed
+/// the backend die, while every LATER publish comes from the respawned
+/// backend's fresh machine, which knows nothing of the deaths. A fresh
+/// machine settling quietly to idle (the respawned CLI's empty round)
+/// must not erase the attention state — only demonstrable work does: any
+/// turn-state publish, or a new parked/tasks claim (arming tasks takes a
+/// turn). Mirrors `SessionLog::clear_bg_park_if_live` on the durable
+/// side; the two carriers resolve on the same evidence.
+pub(crate) fn fold_died_tasks_attention(
+    prev: Option<&SessionActivityVitals>,
+    mut next: SessionActivityVitals,
+) -> SessionActivityVitals {
+    if next.died_background_tasks.is_empty()
+        && matches!(
+            next.state,
+            SessionActivityState::Idle | SessionActivityState::Stalled
+        )
+    {
+        if let Some(prev) = prev {
+            if !prev.died_background_tasks.is_empty() {
+                next.died_background_tasks = prev.died_background_tasks.clone();
+                next.died_tasks_cause = prev.died_tasks_cause.clone();
+            }
+        }
+    }
+    next
+}
+
+impl ActivityMachine {
     fn maybe_publish(&mut self) -> Option<SessionActivityVitals> {
         let next = self.snapshot();
         let changed = match self.published.as_ref() {
@@ -684,6 +723,58 @@ mod tests {
         assert!(m.observe(Obs::TurnDispatched, 70).is_some());
     }
 
+    /// The hub-side sticky fold: died-with-restart attention fields
+    /// survive a fresh machine's quiet idle publishes (the respawned
+    /// backend knows nothing of its predecessor's deaths) and clear on
+    /// demonstrable work — any turn state, or a new tasks claim.
+    #[test]
+    fn died_attention_folds_sticky_across_idle_and_clears_on_work() {
+        let died = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            since_epoch: 100,
+            died_background_tasks: vec!["cargo test".into()],
+            died_tasks_cause: Some("the credential-reload restart".into()),
+            ..Default::default()
+        };
+        // A later quiet idle keeps the attention fields.
+        let idle = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            since_epoch: 200,
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), idle);
+        assert_eq!(folded.died_background_tasks, vec!["cargo test".to_string()]);
+        assert_eq!(
+            folded.died_tasks_cause.as_deref(),
+            Some("the credential-reload restart")
+        );
+        assert_eq!(folded.since_epoch, 200, "only the died fields stick");
+
+        // A turn state clears them — the session works again.
+        let working = SessionActivityVitals {
+            state: SessionActivityState::AwaitingApi,
+            since_epoch: 300,
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), working);
+        assert!(folded.died_background_tasks.is_empty());
+        assert!(folded.died_tasks_cause.is_none());
+
+        // A fresh parked claim (new tasks armed — a turn ran) clears too.
+        let parked = SessionActivityVitals {
+            state: SessionActivityState::ParkedOnTasks,
+            background_tasks: vec!["new job".into()],
+            ..Default::default()
+        };
+        let folded = fold_died_tasks_attention(Some(&died), parked);
+        assert!(folded.died_background_tasks.is_empty());
+
+        // No previous attention → pass-through.
+        let idle2 = SessionActivityVitals::default();
+        let folded = fold_died_tasks_attention(None, idle2.clone());
+        assert_eq!(folded, idle2);
+    }
+
     #[test]
     fn wire_shape_serializes_kebab_states_and_camel_fields() {
         // The dashboard consumes these exact strings; pin them.
@@ -694,6 +785,8 @@ mod tests {
             stalled_after_seconds: Some(20),
             resets_at_epoch: None,
             background_tasks: vec!["cargo test".into()],
+            died_background_tasks: Vec::new(),
+            died_tasks_cause: None,
         };
         let json = serde_json::to_string(&activity).expect("serializes");
         assert!(json.contains("\"state\":\"tool-running\""), "{json}");
@@ -704,9 +797,27 @@ mod tests {
             json.contains("\"backgroundTasks\":[\"cargo test\"]"),
             "{json}"
         );
-        // An empty task list stays off the wire entirely.
+        // An empty task list stays off the wire entirely — died fields too.
         let quiet = serde_json::to_string(&SessionActivityVitals::default()).expect("serializes");
         assert!(!quiet.contains("backgroundTasks"), "{quiet}");
+        assert!(!quiet.contains("diedBackgroundTasks"), "{quiet}");
+        assert!(!quiet.contains("diedTasksCause"), "{quiet}");
+        // The died-with-restart attention snapshot's wire spelling is
+        // what the dashboard keys the attention state on; pin it.
+        let died = serde_json::to_string(&SessionActivityVitals {
+            died_background_tasks: vec!["cargo test".into()],
+            died_tasks_cause: Some("the credential-reload restart".into()),
+            ..SessionActivityVitals::default()
+        })
+        .expect("serializes");
+        assert!(
+            died.contains("\"diedBackgroundTasks\":[\"cargo test\"]"),
+            "{died}"
+        );
+        assert!(
+            died.contains("\"diedTasksCause\":\"the credential-reload restart\""),
+            "{died}"
+        );
         for state in [
             SessionActivityState::Reasoning,
             SessionActivityState::Responding,

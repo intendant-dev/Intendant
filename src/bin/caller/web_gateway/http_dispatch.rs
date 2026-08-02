@@ -1288,6 +1288,24 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::PluginsList => {
+                return handle_plugins_list(stream, route.cors, fleet_cors_origin.as_deref()).await;
+            }
+            RouteHandlerId::PluginSetEnabled => {
+                // The row's `{plugin_id}` capture.
+                let plugin_id = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return handle_plugin_set_enabled(
+                    stream,
+                    plugin_id,
+                    route_body,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::DaemonUpdateSwapRequest => {
                 return handle_daemon_update_swap(
                     stream,

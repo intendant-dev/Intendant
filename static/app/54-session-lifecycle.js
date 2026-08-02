@@ -794,6 +794,35 @@ function dispatchPeerTaskText(peerTarget, text) {
   return true;
 }
 
+// One-tap re-run for background tasks that died with a backend restart
+// (the activity chip's died-tasks action): an OWNER action that asks the
+// session to re-run them — a normal follow-up through the existing
+// start_task lane with full status tracking, never a daemon-side
+// re-execution (commands are not known idempotent, so nothing re-runs
+// without exactly this tap).
+function sendDiedTaskRerun(sessionId, tasks, cause) {
+  const sid = String(sessionId || '').trim();
+  const list = (Array.isArray(tasks) ? tasks : [])
+    .map((t) => String(t || '').trim())
+    .filter(Boolean);
+  if (!sid || !list.length) return false;
+  const why = String(cause || '').trim() || 'a backend restart';
+  const what = list.length === 1
+    ? `the background task that died with ${why}: “${list[0]}”`
+    : `these ${list.length} background tasks that died with ${why}: ${list.map((t) => `“${t}”`).join('; ')}`;
+  const text = `Please re-run ${what}. ${list.length === 1 ? 'It was' : 'They were'} not re-run automatically. Skip anything already covered by later work.`;
+  const id = nextFollowUpId();
+  const msg = { action: 'start_task', task: text, session_id: sid, follow_up_id: id };
+  rememberPendingFollowUp(id, { sessionId: sid, text, direct: false, attachments: [] });
+  onSteerStatusUpdate(id, text, 'pending', null, { sessionId: sid });
+  if (!dispatchSessionControlMsg(msg)) return false;
+  markSessionWindowPendingActive(sid);
+  if (typeof showControlToast === 'function') {
+    showControlToast('info', `Asked session ${shortSessionId(sid)} to re-run ${list.length === 1 ? 'the died task' : `${list.length} died tasks`}.`);
+  }
+  return true;
+}
+
 function dispatchTaskText(text, options = {}) {
   if (!app) return false;
   text = String(text || '').trim();

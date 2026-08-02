@@ -1376,7 +1376,17 @@ pub(crate) fn spawn_cache_vitals_listener(
                     session_id: Some(session_id),
                     activity,
                 }) => {
-                    hub.apply(&session_id, |vitals| vitals.activity = Some(activity));
+                    hub.apply(&session_id, |vitals| {
+                        // Sticky died-with-restart attention: a respawned
+                        // backend's fresh machine settling to idle knows
+                        // nothing of its predecessor's task deaths; only
+                        // demonstrable work clears the attention fields
+                        // (see `session_activity::fold_died_tasks_attention`).
+                        vitals.activity = Some(crate::session_activity::fold_died_tasks_attention(
+                            vitals.activity.as_ref(),
+                            activity,
+                        ));
+                    });
                 }
                 Ok(AppEvent::SessionConfigFacts {
                     session_id: Some(session_id),
@@ -3190,6 +3200,7 @@ mod tests {
             }),
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         let meta_path = dir.join("session_meta.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
@@ -4637,6 +4648,77 @@ mod tests {
         assert!(
             vitals.git.is_some(),
             "activity writes must not blank other sections"
+        );
+
+        // The died-with-restart attention is sticky across a fresh
+        // machine's quiet idle publish (the respawned backend knows
+        // nothing of its predecessor's task deaths) and clears on a
+        // turn-state publish — the hub twin of the durable marker's
+        // lifecycle.
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: crate::types::SessionActivityVitals {
+                state: crate::types::SessionActivityState::Idle,
+                since_epoch: 150,
+                died_background_tasks: vec!["cargo test battery".into()],
+                died_tasks_cause: Some("the credential-reload restart".into()),
+                ..Default::default()
+            },
+        });
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: crate::types::SessionActivityVitals {
+                state: crate::types::SessionActivityState::Idle,
+                since_epoch: 160,
+                ..Default::default()
+            },
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9"
+                        && vitals.activity.as_ref().map(|a| a.since_epoch) == Some(160)
+                    {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the quiet idle");
+        let act = vitals.activity.as_ref().expect("activity present");
+        assert_eq!(
+            act.died_background_tasks,
+            vec!["cargo test battery".to_string()],
+            "quiet idle keeps the attention fields"
+        );
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: crate::types::SessionActivityVitals {
+                state: crate::types::SessionActivityState::AwaitingApi,
+                since_epoch: 170,
+                ..Default::default()
+            },
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9"
+                        && vitals.activity.as_ref().map(|a| a.since_epoch) == Some(170)
+                    {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the turn state");
+        assert!(
+            vitals
+                .activity
+                .as_ref()
+                .is_some_and(|a| a.died_background_tasks.is_empty()),
+            "demonstrable work clears the attention fields"
         );
 
         // Id-less snapshots (a native loop without a session id) are
