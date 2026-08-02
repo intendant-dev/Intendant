@@ -3,6 +3,7 @@ pub mod format;
 pub mod prompt;
 pub mod tools;
 pub mod types;
+pub mod voice;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -13,3 +14,4 @@ pub use format::{format_agent_output, format_event, truncate, FormattedOutput};
 pub use prompt::DEFAULT_PRESENCE_PROMPT;
 pub use tools::{presence_tools, ToolDefinition};
 pub use types::*;
+pub use voice::PresenceVoiceConfig;
