@@ -2533,6 +2533,8 @@ function applyDisplayStripState() {
   const activityRows = new Map();
   const drawerMedia = window.matchMedia('(max-width: 1279px)');
   let selectedDisplayId = null;
+  let selectedPeerKey = null;
+  let peerStageHost = null;
   let railOpen = false;
   let railRaf = 0;
   let activitySeq = 0;
@@ -2593,7 +2595,9 @@ function applyDisplayStripState() {
   function setSelectedProjection() {
     const slots = Array.from(displaySlots.values());
     const selectedExists = selectedDisplayId !== null && displaySlots.has(selectedDisplayId);
-    container.classList.toggle('ui2-live-single-stage', slots.length > 0);
+    const peerActive = selectedPeerKey !== null;
+    container.classList.toggle('ui2-live-single-stage', slots.length > 0 || peerActive);
+    container.classList.toggle('ui2-live-peer-mode', peerActive);
     container.dataset.activeDisplayId = selectedExists ? String(selectedDisplayId) : '';
     for (const slot of slots) {
       const active = selectedExists && Number(slot.displayId) === selectedDisplayId;
@@ -2629,7 +2633,10 @@ function applyDisplayStripState() {
     const id = Number(displayId);
     const next = Number.isFinite(id) ? displaySlots.get(id) : null;
     if (!next) return false;
-    if (selectedDisplayId !== id) {
+    // An advisory auto-selection must not steal the stage from a peer
+    // display the user explicitly opened.
+    if (opts.advisory && selectedPeerKey !== null) return false;
+    if (selectedDisplayId !== id || selectedPeerKey !== null) {
       const current = selectedSlot();
       if (opts.advisory && slotHasActiveUserWork(current)) return false;
       if (slotHasBlockingSurfaceWork(current)) {
@@ -2637,6 +2644,7 @@ function applyDisplayStripState() {
         return false;
       }
       teardownSelectedSurface(current);
+      clearPeerSelection({ close: true });
       selectedDisplayId = id;
     }
     setSelectedProjection();
@@ -2685,6 +2693,12 @@ function applyDisplayStripState() {
   };
 
   function reconcileSelectedDisplay(slots) {
+    // A selected peer display owns the stage; never auto-reselect a
+    // local slot underneath it.
+    if (selectedPeerKey !== null) {
+      setSelectedProjection();
+      return;
+    }
     if (selectedDisplayId !== null && displaySlots.has(selectedDisplayId)) {
       setSelectedProjection();
       return;
@@ -3341,6 +3355,82 @@ function applyDisplayStripState() {
       : (chip.getAttribute('aria-label') || chip.textContent || String(index));
   }
 
+  // ── Inline peer stage ────────────────────────────────────────────────
+  // Selecting a peer display hosts the federated pane inside the Live
+  // display stage instead of routing to Station. The stage provides the
+  // generic `peer-display-<hostId>` container that
+  // PeerDisplayConnection._resolveContainer prefers whenever the Station
+  // tab is not active; the pane itself (video, take-control, annotate,
+  // attach, callout, close) is 52-peer-display.js machinery unchanged.
+  function ensurePeerStage(hostId) {
+    if (peerStageHost === hostId) {
+      const existing = document.getElementById('peer-display-' + hostId);
+      if (existing) return existing;
+    }
+    removePeerStage();
+    const wrap = document.createElement('div');
+    wrap.id = 'peer-display-' + hostId;
+    wrap.className = 'ui2-live-peer-stage';
+    // The pane's own Close button (closePeerDisplaysForHost) empties and
+    // hides the container; fold the workspace selection state with it.
+    wrap.addEventListener('click', (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest('.peer-display-close')) {
+        clearPeerSelection();
+        setSelectedProjection();
+        scheduleWorkspace();
+      }
+    });
+    container.appendChild(wrap);
+    peerStageHost = hostId;
+    return wrap;
+  }
+
+  function removePeerStage() {
+    if (peerStageHost === null) return;
+    const wrap = document.getElementById('peer-display-' + peerStageHost);
+    if (wrap && wrap.parentElement === container) wrap.remove();
+    peerStageHost = null;
+  }
+
+  function clearPeerSelection(opts) {
+    if (selectedPeerKey === null && peerStageHost === null) return;
+    const host = peerStageHost;
+    selectedPeerKey = null;
+    removePeerStage();
+    if (opts && opts.close && host && typeof closePeerDisplaysForHost === 'function') {
+      closePeerDisplaysForHost(host).catch(() => {});
+    }
+  }
+
+  function selectPeerDisplay(key) {
+    const chip = peerSources.get(key);
+    if (!chip || chip.disabled) return;
+    const hostId = chip.dataset.hostId || '';
+    const displayId = Number(chip.dataset.displayId || 0);
+    if (!hostId || typeof openPeerDisplay !== 'function') return;
+    const current = selectedSlot();
+    if (slotHasBlockingSurfaceWork(current)) {
+      announceBlockedSurfaceSwitch();
+      return;
+    }
+    teardownSelectedSurface(current);
+    const prevHost = peerStageHost;
+    selectedDisplayId = null;
+    selectedPeerKey = key;
+    if (prevHost && prevHost !== hostId && typeof closePeerDisplaysForHost === 'function') {
+      // Switching hosts: the old host's connection would otherwise keep
+      // streaming into a removed container (openPeerDisplay only closes
+      // per-host for the NEW host).
+      closePeerDisplaysForHost(prevHost).catch(() => {});
+    }
+    ensurePeerStage(hostId);
+    openPeerDisplay(hostId, displayId).catch((err) => {
+      console.error('live peer display open failed:', err);
+    });
+    setSelectedProjection();
+    scheduleWorkspace();
+  }
+
   function createPeerRow(key) {
     const row = document.createElement('button');
     row.type = 'button';
@@ -3349,21 +3439,11 @@ function applyDisplayStripState() {
       '<span class="ui2-live-row-dot" aria-hidden="true"></span>' +
       '<span class="ui2-live-row-main">' +
         '<span class="ui2-live-row-title"></span>' +
-        '<span class="ui2-live-row-meta">peer · opens in Station</span>' +
-      '</span>' +
-      '<span class="ui2-live-row-chev" aria-hidden="true">›</span>';
+        '<span class="ui2-live-row-meta">peer · live</span>' +
+      '</span>';
     row.addEventListener('click', () => {
-      const chip = peerSources.get(key);
-      if (!chip || chip.disabled) return;
-      const hostId = chip.dataset.hostId || '';
-      const displayId = Number(chip.dataset.displayId || 0);
-      if (typeof routeTo === 'function' && routeTo('station') === false) return;
+      selectPeerDisplay(key);
       if (drawerMedia.matches) setRailOpen(false, false);
-      if (hostId && typeof stationOpenDisplay === 'function') {
-        stationOpenDisplay(hostId, displayId);
-      } else {
-        chip.click();
-      }
     });
     return {
       row,
@@ -3387,9 +3467,10 @@ function applyDisplayStripState() {
       }
       record.row.disabled = chip.disabled;
       record.row.classList.toggle('ok', !chip.disabled);
+      record.row.classList.toggle('selected', selectedPeerKey === key);
       record.row.title = chip.disabled
         ? (chip.title || 'Peer unavailable')
-        : (chip.title || 'Open this peer display in Station');
+        : 'View this peer display live';
       record.row.setAttribute('aria-label', chip.getAttribute('aria-label') || chip.textContent || 'Peer display');
       record.title.textContent = chip.textContent || 'Peer display';
       ordered.push(record);
@@ -3399,11 +3480,17 @@ function applyDisplayStripState() {
       record.row.remove();
       peerRows.delete(key);
     }
+    // The selected peer vanished (peer disconnected / display retired):
+    // release the stage so the local fallback selection can return.
+    if (selectedPeerKey !== null && !liveKeys.has(selectedPeerKey)) {
+      clearPeerSelection({ close: true });
+      setSelectedProjection();
+    }
 
     let empty = peerList.querySelector('.ui2-live-rail-empty');
     if (!ordered.length) {
       if (!empty) {
-        empty = emptyHint('No peer displays advertised. Connected peers open in the Station workspace.');
+        empty = emptyHint('No peer displays advertised.');
         peerList.appendChild(empty);
       }
       return;
@@ -3416,6 +3503,11 @@ function applyDisplayStripState() {
     if (!mobileSummary) return;
     const slot = selectedSlot();
     if (!slot) {
+      if (selectedPeerKey !== null) {
+        const chip = peerSources.get(selectedPeerKey);
+        mobileSummary.textContent = (chip && chip.textContent) || 'Peer display';
+        return;
+      }
       mobileSummary.textContent = 'No display selected';
       return;
     }
