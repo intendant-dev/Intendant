@@ -2412,7 +2412,10 @@ mod tests {
             repo_root: PathBuf::from("/checkout"),
             app_bundle: false,
         };
-        assert_eq!(auto_check_channels(&source, false), vec![UpdateChannel::Dev]);
+        assert_eq!(
+            auto_check_channels(&source, false),
+            vec![UpdateChannel::Dev]
+        );
         assert_eq!(
             auto_check_channels(&source, true),
             vec![UpdateChannel::Dev, UpdateChannel::Releases]
