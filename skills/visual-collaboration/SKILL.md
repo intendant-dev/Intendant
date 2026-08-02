@@ -23,6 +23,7 @@ Use this skill when work benefits from the user having live visibility into an *
 
 ## Core Tools
 
+- `create_virtual_display`: creates an agent-owned virtual display (Xvfb; Linux hosts today — other platforms return a clear error) already activated for capture and streaming; the result names the new `display_id`. Use it when no agent-owned display exists yet — never commandeer the user's session for agent work. CLI: `intendant ctl display create [--width N] [--height N]`.
 - `show_shared_view`: opens the shared display surface and marks the relevant display as the shared view, requesting display-stream activation so the dashboard shows it live.
 - `focus_shared_view`: highlights a normalized region `{x, y, width, height}` on the shared display. Coordinates are fractions from 0.0 to 1.0.
 - `clear_shared_view_focus`: removes the focus highlight and its note while keeping the shared view open. Idempotent — safe when nothing is highlighted.
@@ -41,6 +42,10 @@ Proactively open the shared view when the human should visually stay in the loop
 Use `focus_shared_view` whenever you reference a specific UI area, keep notes short and concrete, and `hide_shared_view` when the shared visual moment is over.
 
 A focus annotation is content-bound guidance: the moment the thing it points at is gone (tab closed, page navigated, dialog dismissed), replace it with a new focus or remove it with `clear_shared_view_focus` — stale guidance on a live view is worse than none. Annotations also auto-clear when the shared view hides, when the display's user grant is revoked, and when the session that drew them ends; the explicit clear is for every earlier moment the content changes under the highlight.
+
+## Federated Peers
+
+Every tool here works on a federated peer too (`"$INTENDANT" ctl --peer <id> …`): a `shared show` on a peer raises that peer's banner on the primary owner's Activity pane with a click-through to the live pane. The whole open-a-screen-on-a-peer loop — create a virtual display there, arrange work on it, announce it — is the **peer-displays** skill.
 
 ## Display Targets
 

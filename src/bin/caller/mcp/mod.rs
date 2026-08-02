@@ -880,6 +880,12 @@ impl IntendantServer {
                 ))
             }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
+            "create_virtual_display" => {
+                let Parameters(params) = parse_params::<CreateVirtualDisplayParams>(args)?;
+                Ok(text_tool_result(
+                    self.create_virtual_display(Parameters(params)).await,
+                ))
+            }
             "take_display" => {
                 let params = parse_params::<TakeDisplayParams>(args)?;
                 Ok(text_tool_result(self.take_display(params).await))

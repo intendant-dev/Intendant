@@ -146,6 +146,7 @@ pub(crate) fn tool_allowed_for_profile(
                     // which only travel well as MCP content blocks. The broad
                     // control surface stays behind `intendant ctl`.
                     | "list_displays"
+                    | "create_virtual_display"
                     | "grant_user_display"
                     // The doorbell for the user's own display — exists
                     // precisely for these scoped supervised callers.
@@ -178,6 +179,7 @@ pub(crate) fn tool_allowed_for_profile(
                     | "close_browser_workspace"
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
+                    | "create_virtual_display"
                     | "grant_user_display"
                     | "request_user_display"
                     | "revoke_user_display"
@@ -309,6 +311,7 @@ pub(crate) fn mcp_tool_operation(name: &str) -> crate::peer::access_policy::Peer
         // agent access to the user's real session.
         "take_display"
         | "release_display"
+        | "create_virtual_display"
         | "grant_user_display"
         | "revoke_user_display"
         | "request_shared_view_input"
@@ -629,6 +632,14 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
             "list_displays",
             "Enumerate available displays with their IDs, names, and resolutions.",
             EmptyToolParams
+        ),
+    );
+    push(
+        "create_virtual_display",
+        manual_http_tool_definition!(
+            "create_virtual_display",
+            "Create an agent-owned virtual display (Xvfb) on this daemon's host and activate it for capture and streaming — it announces as display_ready to every dashboard and federated peer. Linux hosts only today; other platforms report a clear error. Waits for the ready/failed outcome and returns the new display's id and geometry.",
+            CreateVirtualDisplayParams
         ),
     );
     push(

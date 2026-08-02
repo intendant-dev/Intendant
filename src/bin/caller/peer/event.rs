@@ -184,6 +184,33 @@ pub enum PeerEvent {
         reason: Option<String>,
     },
 
+    /// The peer's agent-requested visual-collaboration state changed:
+    /// its agent showed, focused, or hid a shared view on one of its
+    /// displays (`show_shared_view` and friends). Passed through from
+    /// the peer's `shared_view` wire events so a peer agent's "look
+    /// here" surfaces on the primary owner's dashboards — the
+    /// cross-machine half of the loop that `display_ready` starts.
+    /// Presentation-level like the local `AppEvent::SharedView` twin:
+    /// grants no input authority and mutates no display session.
+    /// `action: "hide"` / `"focus_clear"` retire state; every other
+    /// action replaces it (the last-event-wins fold the dashboards
+    /// apply).
+    SharedView {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<crate::types::SharedViewRegion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+
     // ---- Resource accounting ----
     Usage {
         snapshot: UsageSnapshot,
@@ -617,6 +644,33 @@ pub struct PeerDisplayInfo {
     pub display_id: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// The peer's live shared-view state, folded from its `shared_view`
+/// wire events by the per-peer actor (last-event-wins; `hide` retires
+/// it — the same fold the peer's own dashboards apply). Connection-
+/// scoped like the display fold, but with no reconnect replay lane:
+/// after a link drop the state resurfaces on the peer agent's next
+/// shared-view action, matching the local dashboard's refresh
+/// semantics.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PeerSharedViewInfo {
+    /// The folded action (`show`, `focus`, `capture`, `input_request`,
+    /// …) — never `hide`/`focus_clear`, those clear the fold instead.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Peer-side session that raised the view, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<crate::types::SharedViewRegion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -2100,6 +2100,87 @@ function updateSharedViewBanner() {
   });
 }
 
+// ── Peer shared-view banners ────────────────────────────────────────────
+// One banner per federated peer whose agent currently presents a shared
+// view ("look here"), derived from the daemons snapshot
+// (PeerSnapshot.shared_view — folded daemon-side, hide retires it to
+// null, every change arrives as a peer_state_changed push). Rendered
+// into #peer-shared-view-banners on the Activity log pane by
+// renderWorkspace, which every peer push schedules; a peer's FIRST
+// announcement also routes to Activity like the local shared-view
+// handler does.
+const peerSharedViewLastSig = new Map();
+
+function peerSharedViewSignature(view) {
+  return [view.action || '', view.display_id ?? '', view.display_target || '',
+    view.reason || '', view.note || ''].join('|');
+}
+
+function renderPeerSharedViewBanners() {
+  const container = document.getElementById('peer-shared-view-banners');
+  if (!container) return;
+  const rows = (typeof daemons !== 'undefined' && Array.isArray(daemons))
+    ? daemons.filter(d => d && d.host_id && d.shared_view && d.connected)
+    : [];
+  let newArrival = false;
+  const liveHosts = new Set(rows.map(d => d.host_id));
+  for (const host of Array.from(peerSharedViewLastSig.keys())) {
+    if (!liveHosts.has(host)) peerSharedViewLastSig.delete(host);
+  }
+  const frag = document.createDocumentFragment();
+  for (const d of rows) {
+    const view = d.shared_view;
+    if (!peerSharedViewLastSig.has(d.host_id)) newArrival = true;
+    peerSharedViewLastSig.set(d.host_id, peerSharedViewSignature(view));
+    const name = (typeof compactSessionText === 'function'
+      ? compactSessionText(d.label || d.host_id)
+      : (d.label || d.host_id)) || d.host_id;
+    const target = sharedViewDisplayLabel(
+      view.display_id ?? null, String(view.display_target || ''));
+    const rawAction = String(view.action || 'show');
+    const action = rawAction === 'input' ? 'input_request' : rawAction;
+    const verb = action === 'input_request' ? 'Input requested'
+      : action === 'focus' ? 'Focus'
+        : action === 'capture' ? 'Captured'
+          : 'Viewing';
+    const detail = view.reason || view.note || '';
+    const banner = document.createElement('div');
+    banner.className = 'shared-view-banner peer-shared-view-banner';
+    banner.setAttribute('role', 'status');
+    const kicker = document.createElement('span');
+    kicker.className = 'shared-view-kicker';
+    kicker.textContent = `Peer · ${name}`;
+    const message = document.createElement('span');
+    message.className = 'shared-view-message';
+    message.textContent = detail ? `${verb} ${target}: ${detail}` : `${verb} ${target}`;
+    const actions = document.createElement('span');
+    actions.className = 'shared-view-actions';
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'shared-view-action';
+    open.textContent = 'Open';
+    open.title = `Watch this display live on ${name}`;
+    open.addEventListener('click', () => {
+      if (typeof routeTo === 'function') routeTo('displays');
+      if (typeof window.selectLivePeerDisplay === 'function') {
+        window.selectLivePeerDisplay(d.host_id, view.display_id ?? null);
+      }
+    });
+    actions.appendChild(open);
+    banner.appendChild(kicker);
+    banner.appendChild(message);
+    banner.appendChild(actions);
+    frag.appendChild(banner);
+  }
+  container.replaceChildren(frag);
+  container.classList.toggle('hidden', rows.length === 0);
+  if (newArrival
+      && activeTab !== 'displays'
+      && (activeTab !== 'activity' || activeActivitySubtab !== 'log')) {
+    routeTo('activity', 'log');
+  }
+}
+
 function applySharedViewToSlot(slot) {
   if (!sharedViewState.visible || !slot) return;
   // Current daemons resolve auto-detect to a concrete target. A legacy null
@@ -3658,6 +3739,7 @@ function applyDisplayStripState() {
     syncAuthorityCard();
     syncActivityList();
     syncPeerRows();
+    renderPeerSharedViewBanners();
     syncYourScreen();
     syncMobileSummary();
   }
@@ -3670,6 +3752,30 @@ function applyDisplayStripState() {
   // the peer rows derive from the `daemons` data, so data changes must
   // nudge the render loop directly (no chip DOM to observe pre-Station).
   window.refreshLiveDisplayPeerRows = scheduleWorkspace;
+
+  // Open a specific federated peer display on the Live stage — the peer
+  // shared-view banner's click-through (module scope can't reach this
+  // IIFE's selectPeerDisplay directly). Falls back to the host's first
+  // listed display when the requested id isn't advertised, so a banner
+  // for a not-yet-announced display still lands the user on that peer.
+  window.selectLivePeerDisplay = function (hostId, displayId) {
+    syncPeerRows();
+    const host = String(hostId || '');
+    if (!host) return false;
+    let key = null;
+    if (displayId !== null && displayId !== undefined) {
+      const id = Number.parseInt(String(displayId), 10);
+      if (Number.isFinite(id) && peerSources.has(host + ':' + id)) key = host + ':' + id;
+    }
+    if (!key) {
+      for (const k of peerSources.keys()) {
+        if (k.startsWith(host + ':')) { key = k; break; }
+      }
+    }
+    if (!key) return false;
+    selectPeerDisplay(key);
+    return selectedPeerKey === key;
+  };
 
   // Self-feed filter: the 3 s getStats sampler writes the metrics chip and
   // the 1 Hz presence-stream tick writes the frame-id chip — both INSIDE

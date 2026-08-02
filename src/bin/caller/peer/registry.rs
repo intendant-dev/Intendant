@@ -626,10 +626,11 @@ impl PeerRegistry {
 }
 
 /// Spawn the per-peer observer task that watches a handle's
-/// connection-state, status, and card watch channels and emits
-/// [`RegistryEvent::PeerStateChanged`] whenever any of them change.
+/// connection-state, status, card, link, grant, and shared-view watch
+/// channels and emits [`RegistryEvent::PeerStateChanged`] whenever any
+/// of them change.
 ///
-/// The task exits cleanly when all three watch sender sides close —
+/// The task exits cleanly when the watch sender sides close —
 /// which happens automatically when the per-peer actor task terminates
 /// (via explicit disconnect or transport-level shutdown). No cancellation
 /// token is needed; the lifetime is tied to the handle's lifetime via
@@ -641,6 +642,13 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let mut card_rx = handle.card_updates();
         let mut link_rx = handle.link_updates();
         let mut grant_rx = handle.grant_updates();
+        // Shared-view changes ride the same wholesale-snapshot lane:
+        // they are rare (a handful per collaboration session), so a
+        // full PeerStateChanged per change is cheap and saves the
+        // browser from re-implementing the fold. Sessions/displays
+        // stay on their dedicated per-event upserts — they are far
+        // too chatty for this lane.
+        let mut shared_view_rx = handle.shared_view_updates();
 
         // Mark current values as observed so we only react to *changes*
         // from this point forward — the initial values are already
@@ -650,6 +658,7 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
         let _ = card_rx.borrow_and_update();
         let _ = link_rx.borrow_and_update();
         let _ = grant_rx.borrow_and_update();
+        let _ = shared_view_rx.borrow_and_update();
 
         loop {
             let changed = tokio::select! {
@@ -658,6 +667,7 @@ fn spawn_state_observer(handle: PeerHandle, events: broadcast::Sender<RegistryEv
                 r = card_rx.changed() => r,
                 r = link_rx.changed() => r,
                 r = grant_rx.changed() => r,
+                r = shared_view_rx.changed() => r,
             };
             if changed.is_err() {
                 // One of the watch senders dropped — peer actor has

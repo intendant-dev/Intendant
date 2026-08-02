@@ -24,8 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo,
-    TaggedPeerEvent, TaskId,
+    MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerSharedViewInfo,
+    PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
 };
 use crate::peer::handle::{ConnectionState, PeerCommand, PeerGrantInfo, PeerLinkInfo};
 use crate::peer::id::PeerId;
@@ -193,6 +193,16 @@ pub(crate) struct PeerActor {
     pub displays_tx: watch::Sender<Arc<Vec<PeerDisplayInfo>>>,
     /// Fold backing `displays_tx`, keyed by display id.
     pub displays: BTreeMap<u32, PeerDisplayInfo>,
+    /// Published view of the peer's live shared-view state, folded
+    /// from the `SharedView` stream with the same last-event-wins
+    /// semantics the peer's own dashboards apply (`hide` retires,
+    /// `focus_clear` strips the annotation). Connection-scoped like
+    /// `displays_tx` — cleared on disconnect; there is no reconnect
+    /// replay for shared views, so the state resurfaces on the peer
+    /// agent's next shared-view action.
+    pub shared_view_tx: watch::Sender<Option<PeerSharedViewInfo>>,
+    /// Fold backing `shared_view_tx`.
+    pub shared_view: Option<PeerSharedViewInfo>,
     /// Published view of the connected transport candidate (URL +
     /// reachability class), recorded after every successful connect
     /// and cleared while disconnected. `MultiTransport` re-walks
@@ -530,6 +540,50 @@ impl PeerActor {
                     self.publish_displays();
                 }
             }
+            PeerEvent::SharedView {
+                session_id,
+                action,
+                display_target,
+                display_id,
+                reason,
+                region,
+                note,
+            } => match action.as_str() {
+                "hide" => {
+                    if self.shared_view.take().is_some() {
+                        self.publish_shared_view();
+                    }
+                }
+                "focus_clear" => {
+                    // Mirror the dashboard: the annotation clears but the
+                    // view stays shown; a focus-only action demotes to
+                    // plain "show" so the label stays honest.
+                    let mut changed = false;
+                    if let Some(view) = self.shared_view.as_mut() {
+                        view.region = None;
+                        view.note = None;
+                        if view.action == "focus" {
+                            view.action = "show".to_string();
+                        }
+                        changed = true;
+                    }
+                    if changed {
+                        self.publish_shared_view();
+                    }
+                }
+                _ => {
+                    self.shared_view = Some(PeerSharedViewInfo {
+                        action: action.clone(),
+                        display_id: *display_id,
+                        display_target: display_target.clone(),
+                        reason: reason.clone(),
+                        note: note.clone(),
+                        session_id: session_id.clone(),
+                        region: region.clone(),
+                    });
+                    self.publish_shared_view();
+                }
+            },
             PeerEvent::TaskReceipt {
                 delegation_id,
                 task,
@@ -585,6 +639,9 @@ impl PeerActor {
                 if !self.displays.is_empty() {
                     self.displays.clear();
                     self.publish_displays();
+                }
+                if self.shared_view.take().is_some() {
+                    self.publish_shared_view();
                 }
                 // Link + grant are connection-scoped like the folds
                 // above: the next connect re-records the winning
@@ -737,6 +794,11 @@ impl PeerActor {
     fn publish_displays(&mut self) {
         let displays: Vec<PeerDisplayInfo> = self.displays.values().cloned().collect();
         let _ = self.displays_tx.send(Arc::new(displays));
+    }
+
+    /// Publish the current shared-view fold.
+    fn publish_shared_view(&mut self) {
+        let _ = self.shared_view_tx.send(self.shared_view.clone());
     }
 
     /// Durable-first fan-out: await on the log sink (must not drop),
@@ -978,6 +1040,7 @@ mod tests {
         let (card_tx, _card_rx) = watch::channel(Arc::new(card));
         let (sessions_tx, _sessions_rx) = watch::channel(Arc::new(Vec::new()));
         let (displays_tx, _displays_rx) = watch::channel(Arc::new(Vec::new()));
+        let (shared_view_tx, _shared_view_rx) = watch::channel(None);
         let (receipts_tx, _receipts_rx) = watch::channel(Arc::new(HashMap::new()));
         let (link_tx, _link_rx) = watch::channel(None);
         let (grant_tx, _grant_rx) = watch::channel(None);
@@ -1000,6 +1063,8 @@ mod tests {
             sessions: BTreeMap::new(),
             displays_tx,
             displays: BTreeMap::new(),
+            shared_view_tx,
+            shared_view: None,
             link_tx,
             grant_tx,
             receipts_tx,
@@ -1067,6 +1132,83 @@ mod tests {
         assert!(
             link_rx.borrow().is_none(),
             "link is connection-scoped and must clear on disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_view_folds_last_event_wins_and_clears_on_hide_and_disconnect() {
+        let (log_tx, _log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        let shared_view_rx = actor.shared_view_tx.subscribe();
+
+        let show = |action: &str, note: Option<&str>| PeerEvent::SharedView {
+            session_id: Some("sess-1".into()),
+            action: action.into(),
+            display_target: Some(":99".into()),
+            display_id: Some(99),
+            reason: Some("watch this".into()),
+            region: None,
+            note: note.map(str::to_string),
+        };
+
+        actor.handle_event(show("show", None)).await;
+        {
+            let view = shared_view_rx.borrow();
+            let view = view.as_ref().expect("shared view folded");
+            assert_eq!(view.action, "show");
+            assert_eq!(view.display_id, Some(99));
+            assert_eq!(view.reason.as_deref(), Some("watch this"));
+        }
+
+        // focus replaces wholesale; focus_clear strips the annotation
+        // but keeps the view shown, demoting the action to "show".
+        actor.handle_event(show("focus", Some("look here"))).await;
+        assert_eq!(
+            shared_view_rx.borrow().as_ref().map(|v| v.action.clone()),
+            Some("focus".to_string())
+        );
+        actor
+            .handle_event(PeerEvent::SharedView {
+                session_id: None,
+                action: "focus_clear".into(),
+                display_target: None,
+                display_id: None,
+                reason: None,
+                region: None,
+                note: None,
+            })
+            .await;
+        {
+            let view = shared_view_rx.borrow();
+            let view = view.as_ref().expect("focus_clear keeps the view shown");
+            assert_eq!(view.action, "show");
+            assert!(view.note.is_none() && view.region.is_none());
+        }
+
+        actor
+            .handle_event(PeerEvent::SharedView {
+                session_id: None,
+                action: "hide".into(),
+                display_target: None,
+                display_id: None,
+                reason: None,
+                region: None,
+                note: None,
+            })
+            .await;
+        assert!(shared_view_rx.borrow().is_none(), "hide retires the fold");
+
+        // Connection-scoped: a fold live at disconnect clears.
+        actor.handle_event(show("show", None)).await;
+        assert!(shared_view_rx.borrow().is_some());
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+        assert!(
+            shared_view_rx.borrow().is_none(),
+            "shared view is connection-scoped and must clear on disconnect"
         );
     }
 
