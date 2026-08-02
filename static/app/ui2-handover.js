@@ -312,7 +312,10 @@
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', 'Collapse the update chip to a pill');
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // Same bubble hazard as the banner's collapse: the collapsed
+      // re-render puts the expand handler on this click's path.
+      ev.stopPropagation();
       updateAction.note = '';
       updateChipStoreState(sha, 'collapsed');
       handoverUpdateRender(lastHandoverBody);
@@ -469,7 +472,12 @@
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', ariaLabel);
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // The container is the pill's expand affordance: the re-render
+      // installs its handler on the still-bubbling click's path, so an
+      // unstopped collapse click would expand right back (probe-caught
+      // live on both this banner and the update chip).
+      ev.stopPropagation();
       bannerStoreState(key, 'collapsed');
       handoverRender(lastHandoverBody);
     });

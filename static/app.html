@@ -38468,7 +38468,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c32deab5fa9ad47a';
+const INTENDANT_APP_BUILD = 'c3275c19e39fe3b0';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -104974,7 +104974,10 @@ async function memoryProposeFromForm(button) {
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', 'Collapse the update chip to a pill');
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // Same bubble hazard as the banner's collapse: the collapsed
+      // re-render puts the expand handler on this click's path.
+      ev.stopPropagation();
       updateAction.note = '';
       updateChipStoreState(sha, 'collapsed');
       handoverUpdateRender(lastHandoverBody);
@@ -105131,7 +105134,12 @@ async function memoryProposeFromForm(button) {
     collapse.textContent = '–';
     collapse.title = 'Collapse to a pill — the fact stays visible';
     collapse.setAttribute('aria-label', ariaLabel);
-    collapse.addEventListener('click', () => {
+    collapse.addEventListener('click', (ev) => {
+      // The container is the pill's expand affordance: the re-render
+      // installs its handler on the still-bubbling click's path, so an
+      // unstopped collapse click would expand right back (probe-caught
+      // live on both this banner and the update chip).
+      ev.stopPropagation();
       bannerStoreState(key, 'collapsed');
       handoverRender(lastHandoverBody);
     });
