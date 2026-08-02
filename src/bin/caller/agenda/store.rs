@@ -7519,9 +7519,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
         let effect = &item.effects[0];
         assert_eq!(effect.manifest.binding_refs[0].sha256, outcome.sha256);
-        assert!(effect.manifest.binding_refs[0]
+        let locator_path = effect.manifest.binding_refs[0]
             .locator
-            .ends_with(".house/triage/SKILL.md"));
+            .strip_prefix(super::super::types::BINDING_REF_FILE_SCHEME)
+            .expect("file binding-ref scheme");
+        assert!(
+            Path::new(locator_path).ends_with(Path::new(".house").join("triage").join("SKILL.md"))
+        );
         // The cadence prefill rode the manifest through the ordinary
         // intake: weekly, suspend after 3.
         let recurrence = effect.manifest.recurrence.expect("cadenced action");
@@ -7714,12 +7718,13 @@ mod tests {
                 .contains("recurrence cadence floors at 15 minutes"),
             "{err}"
         );
-        let (_root, mut store) = stamp_rig();
+        let (root, mut store) = stamp_rig();
+        let missing_project = root.path().join("definitely-not-a-dir");
         let err = store
             .apply_stamp_command(
                 AgendaCommand::Stamp {
                     definition: "triage".into(),
-                    project_root: Some("/definitely/not/a/dir".into()),
+                    project_root: Some(missing_project.display().to_string()),
                     fire_at_ms: None,
                     every_ms: None,
                     suspend_after: None,
@@ -7738,11 +7743,12 @@ mod tests {
         // append-only history, nothing rolls back silently.
         let (_root3, store3) = {
             let (r, mut s) = stamp_rig();
+            let missing_project = r.path().join("definitely-not-a-dir");
             let _ = s
                 .apply_stamp_command(
                     AgendaCommand::Stamp {
                         definition: "triage".into(),
-                        project_root: Some("/definitely/not/a/dir".into()),
+                        project_root: Some(missing_project.display().to_string()),
                         fire_at_ms: None,
                         every_ms: None,
                         suspend_after: None,

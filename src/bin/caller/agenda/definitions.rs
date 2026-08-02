@@ -1656,7 +1656,9 @@ mod tests {
         let err = resolve_definition(root.path(), "no-such").unwrap_err();
         assert!(err.contains("no definition named"), "{err}");
         // Explicit paths must be .../SKILL.md.
-        let err = resolve_definition(root.path(), "file:/tmp/definition.md").unwrap_err();
+        let wrong_name = root.path().join("definition.md");
+        let selector = format!("file:{}", wrong_name.display());
+        let err = resolve_definition(root.path(), &selector).unwrap_err();
         assert!(err.contains("SKILL.md"), "{err}");
     }
 
@@ -1666,7 +1668,10 @@ mod tests {
     /// parsed house definitions.
     #[test]
     fn docs_walkthrough_blocks_byte_match_the_house_files() {
-        let docs = include_str!("../../../../docs/src/agenda-and-memory.md");
+        // Actions checkout may materialize tracked text as CRLF on
+        // Windows. The prose comparison is line-oriented, so normalize
+        // the checkout representation before locating Markdown fences.
+        let docs = include_str!("../../../../docs/src/agenda-and-memory.md").replace("\r\n", "\n");
         let block_after = |header: &str| -> &str {
             let at = docs.find(header).expect("docs section header present");
             let open = docs[at..].find("```text\n").expect("fenced block") + at + 8;
