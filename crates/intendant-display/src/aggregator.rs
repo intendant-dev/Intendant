@@ -880,6 +880,12 @@ pub type OnDemandPauseAction = Box<dyn Fn(&EncoderId, bool) + Send + Sync>;
 /// fed holders at all the rung snaps back to Quarter so the next
 /// viewer starts safe.
 pub const FEDERATED_UPGRADE_HEALTHY: Duration = Duration::from_secs(10);
+/// Fast-start window: while the link has NEVER forced a downgrade,
+/// the first sustained-healthy window is this short and jumps straight
+/// to Full — an instant quarter-res first paint that sharpens within
+/// ~2s on clean links. The slow 10s single-step climb applies only
+/// after loss has actually been observed, where caution is earned.
+pub const FEDERATED_FAST_START_HEALTHY: Duration = Duration::from_millis(1500);
 /// Minimum spacing between rung changes (both directions) — an
 /// eviction/rebuild per change is cheap but not free, and flapping
 /// resolutions look worse than either shape.
@@ -890,6 +896,10 @@ pub struct FederatedLadderState {
     pub rung: crate::encode::pool::FederatedRung,
     healthy_since: Option<Instant>,
     last_change: Option<Instant>,
+    /// True until a loss signal forces the first downgrade; governs the
+    /// fast-start jump. Reset when the last fed holder leaves — a fresh
+    /// viewer session starts optimistic.
+    never_downgraded: bool,
 }
 
 impl Default for FederatedLadderState {
@@ -898,6 +908,7 @@ impl Default for FederatedLadderState {
             rung: crate::encode::pool::FederatedRung::Quarter,
             healthy_since: None,
             last_change: None,
+            never_downgraded: true,
         }
     }
 }
@@ -916,6 +927,7 @@ pub fn advance_federated_ladder(
         .is_none_or(|at| now.duration_since(at) >= FEDERATED_LADDER_DWELL);
     if !any_fed_holder {
         state.healthy_since = None;
+        state.never_downgraded = true;
         if state.rung != FederatedRung::Quarter {
             state.rung = FederatedRung::Quarter;
             state.last_change = Some(now);
@@ -925,14 +937,24 @@ pub fn advance_federated_ladder(
     }
     if all_holders_healthy {
         let since = *state.healthy_since.get_or_insert(now);
-        if state.rung != FederatedRung::Full
-            && dwell_ok
-            && now.duration_since(since) >= FEDERATED_UPGRADE_HEALTHY
-        {
-            state.rung = state.rung.up();
-            state.last_change = Some(now);
-            state.healthy_since = Some(now);
-            return Some(state.rung);
+        if state.rung != FederatedRung::Full {
+            if state.never_downgraded && now.duration_since(since) >= FEDERATED_FAST_START_HEALTHY {
+                // Fast start: no loss ever observed — jump straight to
+                // Full (dwell inapplicable; this is the first change).
+                state.rung = FederatedRung::Full;
+                state.last_change = Some(now);
+                state.healthy_since = Some(now);
+                return Some(state.rung);
+            }
+            if !state.never_downgraded
+                && dwell_ok
+                && now.duration_since(since) >= FEDERATED_UPGRADE_HEALTHY
+            {
+                state.rung = state.rung.up();
+                state.last_change = Some(now);
+                state.healthy_since = Some(now);
+                return Some(state.rung);
+            }
         }
         None
     } else {
@@ -940,6 +962,7 @@ pub fn advance_federated_ladder(
         if state.rung != FederatedRung::Quarter && dwell_ok {
             state.rung = state.rung.down();
             state.last_change = Some(now);
+            state.never_downgraded = false;
             return Some(state.rung);
         }
         None
@@ -2905,51 +2928,47 @@ mod tests {
     // ----- federated H.264 ladder -----
 
     #[test]
-    fn federated_ladder_climbs_on_health_drops_on_loss_resets_without_holders() {
+    fn federated_ladder_fast_starts_then_earns_caution_after_loss() {
         use crate::encode::pool::FederatedRung;
         let mut st = FederatedLadderState::default();
         let t0 = Instant::now();
 
-        // Healthy but not sustained: no change.
+        // Healthy but not yet sustained for the fast-start window.
         assert_eq!(advance_federated_ladder(&mut st, true, true, t0), None);
-        assert_eq!(
-            advance_federated_ladder(&mut st, true, true, t0 + FEDERATED_UPGRADE_HEALTHY / 2),
-            None
-        );
-        // Sustained healthy: one rung up.
-        let t1 = t0 + FEDERATED_UPGRADE_HEALTHY;
+        // Fast start: never downgraded, ~1.5s clean — straight to Full.
+        let t1 = t0 + FEDERATED_FAST_START_HEALTHY;
         assert_eq!(
             advance_federated_ladder(&mut st, true, true, t1),
-            Some(FederatedRung::Half)
-        );
-        // Dwell blocks an immediate second step even when healthy long.
-        assert_eq!(
-            advance_federated_ladder(&mut st, true, true, t1 + Duration::from_secs(1)),
-            None
-        );
-        // Next sustained window: Full; then no further ups.
-        let t2 = t1 + FEDERATED_UPGRADE_HEALTHY;
-        assert_eq!(
-            advance_federated_ladder(&mut st, true, true, t2),
             Some(FederatedRung::Full)
         );
+        // Loss: step down once dwell allows; caution is now earned.
+        let t2 = t1 + FEDERATED_LADDER_DWELL;
         assert_eq!(
-            advance_federated_ladder(&mut st, true, true, t2 + FEDERATED_UPGRADE_HEALTHY),
-            None
-        );
-        // Loss: down one rung once dwell allows.
-        let t3 = t2 + FEDERATED_UPGRADE_HEALTHY + FEDERATED_LADDER_DWELL;
-        assert_eq!(
-            advance_federated_ladder(&mut st, true, false, t3),
+            advance_federated_ladder(&mut st, true, false, t2),
             Some(FederatedRung::Half)
         );
-        // No holders: snap back to Quarter (once dwell allows).
-        let t4 = t3 + FEDERATED_LADDER_DWELL;
+        // Post-loss, the fast-start window no longer applies...
+        let t3 = t2 + FEDERATED_LADDER_DWELL + FEDERATED_FAST_START_HEALTHY;
+        assert_eq!(advance_federated_ladder(&mut st, true, true, t3), None);
+        // ...but the slow sustained window climbs one rung at a time.
+        let t4 = t3 + FEDERATED_UPGRADE_HEALTHY;
         assert_eq!(
-            advance_federated_ladder(&mut st, false, true, t4),
+            advance_federated_ladder(&mut st, true, true, t4),
+            Some(FederatedRung::Full)
+        );
+        // No holders: snap back to Quarter and restore optimism.
+        let t5 = t4 + FEDERATED_LADDER_DWELL;
+        assert_eq!(
+            advance_federated_ladder(&mut st, false, true, t5),
             Some(FederatedRung::Quarter)
         );
-        assert_eq!(advance_federated_ladder(&mut st, false, true, t4), None);
+        // Fresh viewer fast-starts again.
+        assert_eq!(advance_federated_ladder(&mut st, true, true, t5), None);
+        let t6 = t5 + FEDERATED_FAST_START_HEALTHY;
+        assert_eq!(
+            advance_federated_ladder(&mut st, true, true, t6),
+            Some(FederatedRung::Full)
+        );
     }
 
     // ----- tile-standby: coordinator demand mask -----
