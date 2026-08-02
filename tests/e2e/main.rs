@@ -5290,21 +5290,33 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         .to_string_lossy()
         .to_string();
 
-    // Two fixture declarations sharing a dirty path: the §2.7 pair
-    // overlap the radar flags. Written AFTER round 1, so round 1's
-    // request predates any coordination signal by construction.
-    for id in ["s-fake-a", "s-fake-b"] {
-        let doc = format!(
-            "---\nv: 1\nkind: session-declaration\nid: {id}\nbackend: native\ncreated_ms: 1\n---\n\
-             ## intent\noccupying the same space\n\n## dirty\n- shared/hot.rs\n"
-        );
-        std::fs::write(space_dir.join("sessions").join(format!("{id}.md")), doc)
-            .expect("write fixture declaration");
-    }
-    // The radar's deduplicated note write is the tick-completion proof:
-    // once an rn-* note exists, the same tick's snapshot publish (which
-    // follows the note writes) is microseconds behind — long past by
-    // the time the steer round-trips below.
+    // Give the real session and one fixture peer the same dirty path.
+    // Written AFTER round 1, so round 1's request predates any
+    // coordination signal by construction. Involving the real session
+    // also gives the test a post-publication rail event to await below.
+    let writer_id = format!("s-{session_id}");
+    let own_declaration = space_dir.join("sessions").join(format!("{writer_id}.md"));
+    let mut own_doc =
+        std::fs::read_to_string(&own_declaration).expect("read the session's declaration");
+    assert!(
+        !own_doc.contains("## dirty"),
+        "fixture expects a clean declaration"
+    );
+    own_doc.push_str("\n## dirty\n- shared/hot.rs\n");
+    std::fs::write(&own_declaration, own_doc).expect("add the session fixture path");
+    let peer_id = "s-fake-peer";
+    let peer_doc = format!(
+        "---\nv: 1\nkind: session-declaration\nid: {peer_id}\nbackend: native\ncreated_ms: 1\n---\n\
+         ## intent\noccupying the same space\n\n## dirty\n- shared/hot.rs\n"
+    );
+    std::fs::write(
+        space_dir.join("sessions").join(format!("{peer_id}.md")),
+        peer_doc,
+    )
+    .expect("write fixture peer declaration");
+    // The radar's deduplicated note is one acceptance surface of the
+    // overlap. The rail transition below separately proves that the
+    // same tick's snapshot has reached the in-process delivery seam.
     poll_until(
         "a radar note for the fixture overlap",
         RUN_TIMEOUT,
@@ -5321,6 +5333,22 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         &daemon_log,
     )
     .await;
+
+    // Radar notes are written before the in-process snapshot publish.
+    // Await the real session's rail transition too: that event is emitted
+    // after publish, so round 2 cannot race the few instructions between
+    // the note rename and the state becoming visible to the agent loop.
+    let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("coordination_radar")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("state").and_then(|v| v.as_str()) == Some("raised")
+    })
+    .await
+    .unwrap_or_else(|| panic!("radar flag never raised:\n{}", daemon_log()));
+    assert_eq!(
+        raised.get("id").and_then(|v| v.as_str()),
+        Some(space_key.as_str())
+    );
 
     // Round 2 via the parked-steer fallback; the mock's own transcript
     // expectation gates on the injected block.

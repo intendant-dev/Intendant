@@ -2126,7 +2126,9 @@ mod tests {
         assert_eq!(
             index[0]["sessionDir"],
             child
-                .join("sessions/wd/session_parent")
+                .join("sessions")
+                .join("wd")
+                .join("session_parent")
                 .to_string_lossy()
                 .as_ref()
         );
@@ -2506,7 +2508,9 @@ mod tests {
         assert_eq!(
             index[0]["sessionDir"],
             primary
-                .join("sessions/workspace/session")
+                .join("sessions")
+                .join("workspace")
+                .join("session")
                 .to_string_lossy()
                 .as_ref()
         );

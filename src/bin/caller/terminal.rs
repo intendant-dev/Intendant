@@ -22,7 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, MasterPty, PtySize};
@@ -723,9 +723,9 @@ impl OutputHub {
     }
 }
 
-/// A single live PTY-backed shell session. Internally shared via `Arc` so
-/// the reader task and any number of attached listeners can hold a
-/// reference without lifetime gymnastics.
+/// A single live PTY-backed shell session. Callers share it via `Arc`;
+/// the blocking reader keeps only a `Weak` reference so it cannot pin a
+/// killed ConPTY whose output pipe remains open until the master drops.
 pub struct PtySession {
     master: StdMutex<Box<dyn MasterPty + Send>>,
     writer: StdMutex<Box<dyn Write + Send>>,
@@ -855,7 +855,7 @@ impl PtySession {
 
         // Reader: dedicated OS thread (portable_pty's reader is blocking).
         // Copies bytes into scrollback and fans out to listeners.
-        let session_clone = session.clone();
+        let session_clone = Arc::downgrade(&session);
         std::thread::spawn(move || {
             Self::reader_loop(session_clone, reader, child);
         });
@@ -974,7 +974,7 @@ impl PtySession {
     }
 
     fn reader_loop(
-        session: Arc<Self>,
+        session: Weak<Self>,
         mut reader: Box<dyn Read + Send>,
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
     ) {
@@ -986,6 +986,9 @@ impl PtySession {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let Some(session) = session.upgrade() else {
+                        break;
+                    };
                     let chunk = &buf[..n];
                     // Answer ConPTY's startup cursor-position query so the shell
                     // doesn't block waiting for it (Windows only; no-op on Unix
@@ -1016,11 +1019,9 @@ impl PtySession {
             Ok(s) => s.exit_code() as i32,
             Err(_) => -1,
         };
-        if let Ok(mut alive) = session.alive.lock() {
-            *alive = false;
+        if let Some(session) = session.upgrade() {
+            session.mark_exited(status);
         }
-        let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
-        hub.fan_out_exit(status);
     }
 
     /// Write bytes to the PTY stdin. Silently drops if the writer has
@@ -1063,6 +1064,26 @@ impl PtySession {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let _ = killer.kill();
+        drop(killer);
+        // ConPTY may retain its output pipe until the master handle is
+        // dropped, so its reader is not a reliable exit notifier after a
+        // forced kill. Publish the forced exit here; the reader's later
+        // observation is deduplicated by `mark_exited`.
+        self.mark_exited(-1);
+    }
+
+    fn mark_exited(&self, status: i32) {
+        let transitioned = if let Ok(mut alive) = self.alive.lock() {
+            let transitioned = *alive;
+            *alive = false;
+            transitioned
+        } else {
+            false
+        };
+        if transitioned {
+            let mut hub = self.output.lock().unwrap_or_else(|e| e.into_inner());
+            hub.fan_out_exit(status);
+        }
     }
 
     pub fn shared(&self) -> bool {
@@ -1101,10 +1122,13 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        // The session (registry entry + reader thread) is gone: wake every
-        // parked listener so `recv` drains what's queued and returns
-        // `None` — the same end-of-stream the old dropped-sender channels
-        // signalled.
+        // The reader is deliberately weak: the last registry/listener
+        // owner dropping must stop the child and close the master PTY,
+        // which in turn releases a blocked ConPTY read.
+        self.terminate();
+        // Wake every parked listener so `recv` drains what's queued and
+        // returns `None` — the same end-of-stream the old dropped-sender
+        // channels signalled.
         if let Ok(hub) = self.output.lock() {
             hub.detach_all();
         }
