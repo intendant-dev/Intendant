@@ -4180,6 +4180,16 @@ let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
+// Whether the toolbar's "New shell" re-entry affordance is showing (the
+// shell exited or the open errored; a sent open clears it).
+let shellRestartOffered = false;
+// Shell events (output/exit) that arrived before xterm.js finished
+// loading: the open frame is sent the moment the Terminal tab is entered
+// so the PTY's startup overlaps the script fetch, and nothing from that
+// window may be dropped. Bounded; oldest output falls off first.
+let shellPreInitEvents = [];
+let shellPreInitEventBytes = 0;
+const SHELL_PRE_INIT_MAX_BYTES = 512 * 1024;
 let activeTermSubtab = 'shell';
 
 // Files editor state. Declared here, far above the editor's functions,

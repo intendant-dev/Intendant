@@ -1578,6 +1578,70 @@ mod tests {
         expect_output(&mut rx2, Some("scroll_token_abc"), "scrollback replay").await;
     }
 
+    /// Drain `rx` until the shell's `Exited` event arrives, returning its
+    /// status. Panics loudly on deadline or channel close.
+    async fn expect_exited(rx: &mut TerminalListener, phase: &str) -> i32 {
+        let deadline = tokio::time::Instant::now() + OUTPUT_BUDGET;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(TerminalEvent::Output(_))) => {}
+                Ok(Some(TerminalEvent::Exited { status })) => return status,
+                Ok(None) => panic!("{phase}: event channel closed before Exited"),
+                Err(_) => panic!("{phase}: no Exited within {OUTPUT_BUDGET:?}"),
+            }
+        }
+    }
+
+    /// The Ctrl-D / `exit` lifecycle the dashboard depends on: a session
+    /// whose shell exited stays visible (scrollback replayable) but is
+    /// REPLACED by the next open of the same key with a fresh, working
+    /// shell — the way back into a terminal after the old one dies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exited_session_is_replaced_by_next_open() {
+        let registry = TerminalRegistry::new(std::env::temp_dir());
+        let key = TerminalKey::local("respawn-after-exit");
+        let (first, created) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, spawn_all())
+            .await
+            .unwrap();
+        assert!(created);
+        let mut rx = first.attach();
+        // Wait for the shell to paint before typing (startup can flush
+        // pending input — see open_attach_write_and_receive_output).
+        expect_output(&mut rx, None, "first shell startup").await;
+        first.write_input(b"exit\r");
+        expect_exited(&mut rx, "first shell exit").await;
+        assert!(!first.is_alive());
+
+        // Dead but still visible: the scrollback stays replayable until
+        // something replaces the session.
+        assert!(registry
+            .get_visible(&key, &TerminalActor::Root)
+            .await
+            .is_some());
+
+        // The next open of the same key replaces the dead session with a
+        // fresh spawn (replacement follows spawn rules, so `created`).
+        let (second, respawned) = registry
+            .open_or_attach(key.clone(), 80, 24, &TerminalActor::Root, spawn_all())
+            .await
+            .unwrap();
+        assert!(respawned, "a dead session must be replaced, not attached");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the replacement is a new session"
+        );
+        assert!(second.is_alive());
+        assert_eq!(registry.len().await, 1);
+
+        // And the replacement is a working shell, not a husk.
+        let mut rx2 = second.attach();
+        expect_output(&mut rx2, None, "respawned shell startup").await;
+        second.write_input(b"echo respawn_ok_5173\r");
+        expect_output(&mut rx2, Some("respawn_ok_5173"), "respawned echo").await;
+        registry.close_visible(&key, &TerminalActor::Root).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn open_or_attach_reuses_live_session() {
         let registry = TerminalRegistry::new(std::env::temp_dir());
