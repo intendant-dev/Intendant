@@ -440,7 +440,20 @@ pub(crate) fn spawn_mode_web_gateway(
             let scanner_settings_root = crate::project::daemon_config_root(project_root.as_deref());
             let _pr_scanner = crate::github_pr::scanner::spawn_scanner(
                 handle.clone(),
+                scanner_settings_root.clone(),
+                Some(handover.clone()),
+            );
+            // The landing shepherd: closed-loop watch over the fleet's
+            // open PRs — armed-DIRTY conflicts, queue ejections,
+            // auto-merge disarms, and armed-but-never-queued stalls wake
+            // the owning session through the task lane or park a
+            // needs-you agenda item when the seat is gone. Observe-and-
+            // wake only; `gh`-based with silent degrade; holder-gated
+            // like its scanner sibling. Detaches on drop.
+            let _landing_shepherd = crate::landing_shepherd::spawn_landing_shepherd(
+                handle.clone(),
                 scanner_settings_root,
+                project_root.clone(),
                 Some(handover.clone()),
             );
             Some(handle)

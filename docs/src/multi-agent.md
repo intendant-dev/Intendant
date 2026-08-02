@@ -250,6 +250,36 @@ with the three explicit outcomes:
 An explicitly stopped worktree session keeps its dashboard window until the
 card is dismissed — the merge/remove/keep decision outlives the stop.
 
+### The Landing Shepherd
+
+A branch pushed as a PR with auto-merge armed can wedge **after** its
+session ends (seats end at queued+report): a conflict against a moving
+main parks an armed PR forever, a flaked merge-queue check silently
+ejects it, and a check run stuck at `failure` while its workflow shows
+success leaves auto-merge waiting on a green PR indefinitely. The
+**landing shepherd** (`landing_shepherd.rs`, spawned beside the PR
+scanner in every gateway-shaped daemon) is the fleet-wide backstop: a
+bounded `gh` poll (default 60 s; ≤3 `gh` + ≤3 `git` calls per repo per
+tick, silent degrade when `gh` is absent) over every open PR whose head
+branch exists in a supervised checkout's repository. Ownership derives
+from session records + `gh` — supervised checkouts joined to branches
+through `git worktree list` plus each live session's
+`SessionMeta.worktree.branch` — never a second bookkeeping. Four
+conditions alert: DIRTY/CONFLICTING on an armed or ready PR (terminal
+at first sight), a merge-queue ejection, an auto-merge disarm outside
+the queue, and armed-with-settled-checks-but-never-queued past a grace
+(default 5 min, the stuck-check-run class). A live owner is woken
+through the existing task lane (`StartTask { session_id }` routes the
+reconcile ritual — merge never rebase; app.html conflicts resolve in
+the `static/app/` fragments then regenerate — as a follow-up turn); a
+gone owner parks ONE open `needs-you`-tagged agenda item per PR,
+deduplicated against the agenda fold so restarts re-park nothing. The
+shepherd is **observe-and-wake only** — it never merges, resolves, or
+re-arms; GitHub's queue stays the sole authority. One shepherd per
+daemon, holder-gated under the scheduler lease, `[landing_shepherd]`
+in `intendant.toml` (`enabled`, `poll_secs`, `stall_secs`;
+`INTENDANT_LANDING_SHEPHERD=0` kills it, `…_POLL_MS` speeds rigs).
+
 ## Knowledge Routing Between Agents
 
 Agents share durable, machine-wide findings through the daemon's
