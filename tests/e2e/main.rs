@@ -5430,18 +5430,26 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
     let second_messages: Vec<serde_json::Value> =
         serde_json::from_str(second).expect("second request parses");
     assert!(second_messages.len() > first_messages.len());
-    let expected_block = format!(
+    let expected_core = format!(
         "[System] coordination v1 space={space_key}\n\
          sessions: 1 active, 0 stale — s-fake-p(native)\n\
-         ! overlap shared/hot.rs — with s-fake-p (declared)\n\
-         messages: 1 unread — from daemon: {radar_note_id}"
+         ! overlap shared/hot.rs — with s-fake-p (declared)"
     );
+    // The tick scans before it writes its radar note, then publishes the
+    // scanned snapshot. A fast round 2 therefore sees the overlap but not
+    // the note until the next scan; a slower platform may see both. The
+    // note poll above proves the separate acceptance surface, while this
+    // byte proof admits exactly those two ruled renderings.
+    let expected_with_note =
+        format!("{expected_core}\nmessages: 1 unread — from daemon: {radar_note_id}");
     let tail_message = second_messages.last().expect("non-empty request");
     assert_eq!(tail_message["role"].as_str(), Some("user"));
-    assert_eq!(
-        tail_message["content"].as_str(),
-        Some(expected_block.as_str()),
-        "the §2.2 block is the NEW tail message"
+    let actual_block = tail_message["content"]
+        .as_str()
+        .expect("the new tail message has text content");
+    assert!(
+        actual_block == expected_core || actual_block == expected_with_note,
+        "the §2.2 block is the NEW tail message:\n{actual_block}"
     );
     assert!(
         !first_messages.iter().any(|m| m["content"]
@@ -5459,7 +5467,7 @@ async fn coordination_radar_block_injects_as_a_pure_tail_append() {
         .join(&session_id);
     let rows = parsed_session_rows(&log_dir);
     let messages = canonical_message_rows(&rows);
-    let block_row = user_message_row(&messages, &expected_block);
+    let block_row = user_message_row(&messages, actual_block);
     assert_eq!(
         msg_field(block_row, "provenance").as_str(),
         Some("system_injection"),
