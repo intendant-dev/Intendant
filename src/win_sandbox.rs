@@ -1100,11 +1100,11 @@ mod tests {
         }
     }
 
-    fn run_under(restriction: TokenRestriction, script: &str) -> (i32, String) {
+    fn run_under(restriction: TokenRestriction, capture_dir: &Path, script: &str) -> (i32, String) {
         let token = create_restricted_token(restriction).expect("token");
         let cmd = std::env::var("ComSpec")
             .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
-        let out = std::env::temp_dir().join(format!("win-sbx-out-{}.txt", std::process::id()));
+        let out = capture_dir.join(format!("win-sbx-out-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&out);
         // cmd.exe writes the script's combined output to a file we read
         // back — the restricted child shares our console, so capturing via
@@ -1130,20 +1130,23 @@ mod tests {
     fn write_restricted_token_confines_writes_to_granted_paths() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         assert_privileges_stripped(TokenRestriction::WriteOnly);
-        let root = std::env::temp_dir().join(format!("win-sbx-wr-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("mkdir");
-        // Grant the whole temp dir: the capture file needs it, and the
-        // outside probe uses the profile dir.
-        let guard = AceGuard::stamp(&[], &[std::env::temp_dir()]).expect("stamp");
+        let root = tempfile::Builder::new()
+            .prefix("win-sbx-wr-")
+            .tempdir()
+            .expect("mkdir");
+        // Keep the inheritable test grant on this tiny fixture tree. Stamping
+        // the shared temp root propagates the ACE through every existing CI
+        // temp descendant and makes this test take minutes on Windows.
+        let guard = AceGuard::stamp(&[], &[root.path().to_path_buf()]).expect("stamp");
 
         let profile = std::env::var("USERPROFILE").expect("USERPROFILE");
         let script = format!(
             "echo probe > \"{root}\\in.txt\" && echo WRITE_IN_OK & \
              echo probe > \"{profile}\\win-sbx-deny.txt\" 2>nul && echo WRITE_OUT_OK || echo WRITE_OUT_DENIED & \
              type \"%SystemRoot%\\win.ini\" >nul 2>&1 && echo READ_OK || echo READ_DENIED",
-            root = root.display(),
+            root = root.path().display(),
         );
-        let (_code, text) = run_under(TokenRestriction::WriteOnly, &script);
+        let (_code, text) = run_under(TokenRestriction::WriteOnly, root.path(), &script);
         drop(guard);
         assert!(text.contains("WRITE_IN_OK"), "{text}");
         assert!(text.contains("WRITE_OUT_DENIED"), "{text}");
@@ -1152,7 +1155,6 @@ mod tests {
             !Path::new(&profile).join("win-sbx-deny.txt").exists(),
             "outside write leaked through"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Fully-restricted token: system dirs readable (Users restricting
@@ -1170,10 +1172,17 @@ mod tests {
         let scope = Path::new(&profile).join(format!("win-sbx-full-{}", std::process::id()));
         std::fs::create_dir_all(&scope).expect("mkdir");
         std::fs::write(scope.join("inside.txt"), "inside_ok_9282").expect("write");
+        let capture = tempfile::Builder::new()
+            .prefix("win-sbx-capture-")
+            .tempdir()
+            .expect("capture dir");
 
         // Overlapping guards: the grant must survive the first drop.
-        let g1 = AceGuard::stamp(&[scope.clone()], &[std::env::temp_dir()]).expect("stamp1");
-        let g2 = AceGuard::stamp(&[scope.clone()], &[std::env::temp_dir()]).expect("stamp2");
+        let capture_root = capture.path().to_path_buf();
+        let g1 =
+            AceGuard::stamp(&[scope.clone()], std::slice::from_ref(&capture_root)).expect("stamp1");
+        let g2 =
+            AceGuard::stamp(&[scope.clone()], std::slice::from_ref(&capture_root)).expect("stamp2");
         drop(g1);
 
         let script = format!(
@@ -1182,22 +1191,23 @@ mod tests {
              type \"%SystemRoot%\\win.ini\" >nul 2>&1 && echo SYSTEM_READ_OK || echo SYSTEM_READ_DENIED",
             scope = scope.display(),
         );
-        let (_code, text) = run_under(TokenRestriction::Full, &script);
+        let (_code, text) = run_under(TokenRestriction::Full, capture.path(), &script);
         assert!(text.contains("inside_ok_9282"), "{text}");
         assert!(text.contains("SCOPE_READ_OK"), "{text}");
         assert!(text.contains("PROFILE_DENIED"), "{text}");
         assert!(text.contains("SYSTEM_READ_OK"), "{text}");
 
         // Refcount reached zero: the scope root is denied again. (Keep a
-        // temp grant so the capture file stays writable.)
+        // capture grant so the output file stays writable.)
         drop(g2);
-        let temp_guard = AceGuard::stamp(&[], &[std::env::temp_dir()]).expect("stamp3");
+        let capture_guard =
+            AceGuard::stamp(&[], std::slice::from_ref(&capture_root)).expect("stamp3");
         let script = format!(
             "type \"{scope}\\inside.txt\" >nul 2>&1 && echo SCOPE_STILL_OPEN || echo SCOPE_CLOSED",
             scope = scope.display(),
         );
-        let (_code, text) = run_under(TokenRestriction::Full, &script);
-        drop(temp_guard);
+        let (_code, text) = run_under(TokenRestriction::Full, capture.path(), &script);
+        drop(capture_guard);
         assert!(text.contains("SCOPE_CLOSED"), "{text}");
         let _ = std::fs::remove_dir_all(&scope);
     }
