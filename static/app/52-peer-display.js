@@ -59,7 +59,9 @@ const PEER_DISPLAY_POLICY = {
     return pcConfig;
   },
 
-  // **#67 (federated VP8 A/B)**: pin codec preference to VP8 only.
+  // **#67 (federated VP8 A/B)**: prefer VP8 (H.264 trails as the
+  // only-codec fallback for peers that cannot encode VP8 at all — see
+  // the default arm below).
   // Distinct from the local DisplaySlot path (#58) which deliberately
   // lets WKWebView default H.264 first to get the hardware-accelerated
   // VideoToolbox encoder on the macOS Mac viewing its own display.
@@ -132,18 +134,30 @@ const PEER_DISPLAY_POLICY = {
           'leaving codec order at browser default');
       }
     } else if (videoTransceiver && typeof videoTransceiver.setCodecPreferences === 'function') {
+      // Default order: VP8 first (the #67 loss-resilience preference —
+      // any peer that CAN encode VP8 answers VP8, exactly as the old
+      // VP8-only pin produced), then H.264 as a trailing fallback.
+      // The fallback exists for peers whose encoder pool has no VP8
+      // at all — every Windows peer (Media Foundation is H.264-only)
+      // — which the VP8-only pin hard-failed with NoCompatibleCodec:
+      // the peer never answered and the viewer surfaced the misleading
+      // no-track watchdog ("may need a capture grant"). Observed live
+      // against a Windows 11 peer, 2026-08-02.
       const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
         ? RTCRtpReceiver.getCapabilities('video')
         : null;
-      const vp8 = caps && caps.codecs
-        ? caps.codecs.filter(c => c.mimeType && c.mimeType.toLowerCase() === 'video/vp8')
-        : [];
+      const allCodecs = caps && caps.codecs ? caps.codecs : [];
+      const mime = (c) => (c && c.mimeType ? c.mimeType.toLowerCase() : '');
+      const vp8 = allCodecs.filter(c => mime(c) === 'video/vp8');
+      const h264 = allCodecs.filter(c => mime(c) === 'video/h264');
       if (vp8.length > 0) {
         try {
-          videoTransceiver.setCodecPreferences(vp8);
-          log('info', `codec preference pinned to VP8 (${vp8.length} variant(s))`);
+          videoTransceiver.setCodecPreferences(vp8.concat(h264));
+          log('info',
+            `codec preference pinned to VP8 (${vp8.length} variant(s)) ` +
+            `with H.264 fallback (${h264.length} variant(s))`);
         } catch (e) {
-          log('warn', `setCodecPreferences(VP8) failed: ${e.message} — falling back to browser default`);
+          log('warn', `setCodecPreferences(VP8+H264) failed: ${e.message} — falling back to browser default`);
         }
       } else {
         log('warn', 'no VP8 in RTCRtpReceiver capabilities — leaving codec order at browser default');
