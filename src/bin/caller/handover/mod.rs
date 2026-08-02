@@ -747,7 +747,7 @@ impl HandoverRuntime {
                 && records
                     .iter()
                     .find(|record| record.boot_id == sidecar.boot_id)
-                    .is_some_and(|record| eligible(record))
+                    .is_some_and(&eligible)
             {
                 return Some(sidecar.port);
             }
