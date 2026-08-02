@@ -170,6 +170,35 @@ html.ui-v2 .displays-container.ui2-live-single-stage > .display-slot.ui2-live-in
 html.ui-v2 .displays-container.ui2-live-single-stage > .display-slot.ui2-live-selected {
   display: flex;
 }
+/* Inline peer stage: the Live workspace hosts the federated peer pane
+   (52-peer-display.js) in the same stage area local slots use. The wrap
+   only exists while a peer display is selected, and attachToDom /
+   closePeerDisplaysForHost own its inline display (block/none) — these
+   rules only size it as a flex item of the displays-container column. */
+html.ui-v2 .displays-container > .ui2-live-peer-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+/* A selected peer display owns the stage: the local no-displays hero
+   would otherwise sit above the peer pane. */
+html.ui-v2 .displays-container.ui2-live-peer-mode > .displays-placeholder {
+  display: none;
+}
+html.ui-v2 .ui2-live-peer-stage .peer-display-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+}
+html.ui-v2 .ui2-live-peer-stage .peer-display-video {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+  background: #000;
+}
 html.ui-v2 #tab-displays .ui-empty-glyph {
   width: 40px;
   height: 40px;
