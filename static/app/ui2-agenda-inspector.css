@@ -21,7 +21,7 @@ html.ui-v2 .ag2-inspector-backdrop { display: none; }
 @media (max-width: 1179px) {
   html.ui-v2 .ag2-inspector {
     position: fixed;
-    top: var(--ui2-ovs-h, 48px);
+    top: calc(var(--ui2-ovs-h, 48px) + var(--ui2-handover-h, 0px));
     right: 0;
     bottom: 0;
     width: 0;
