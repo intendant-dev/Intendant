@@ -252,7 +252,12 @@ pub(crate) struct ReadoptDispatch {
 /// drift): `running` (the daemon died with the turn in flight) and
 /// `interrupted` (a signal shutdown marked it on the way down) are
 /// mid-turn; a pending limit park is parked work; everything else is
-/// idle-in-idle-out.
+/// idle-in-idle-out. The `completed` exclusion on the park class is
+/// backed by session_end's park-then-die backstop: a session can no
+/// longer END as "completed" while its park marker owes pending work
+/// (session_end stamps "interrupted" over a stranded marker instead),
+/// so "completed" genuinely means no owed park — the exclusion guards
+/// against pre-backstop metas, not live strands.
 pub(crate) fn midwork_class(meta: &SessionMeta) -> Option<MidWorkClass> {
     let status = meta.status.as_deref().unwrap_or("");
     if matches!(status, "running" | "interrupted") {
@@ -1185,6 +1190,59 @@ mod tests {
         assert!(
             candidates.is_empty(),
             "idle/done sessions stay down: {candidates:?}"
+        );
+    }
+
+    /// Daemon-restart survival for the park-then-die race (card
+    /// 01KZ07Q0PX, specimen e883a2db): every durable shape the race can
+    /// leave behind is a boot readopt candidate.
+    ///
+    /// - The RESIDENT hold (the fix's primary lane): the session stays
+    ///   alive with the park armed, meta still carrying the last turn's
+    ///   "running" status plus the pending park — a daemon death
+    ///   mid-hold must enumerate it.
+    /// - The session_end backstop: a loop that nonetheless ends over a
+    ///   stranded pending park is stamped "interrupted", never
+    ///   "completed" — that shape must enumerate too.
+    /// - The pre-fix strand ("completed" + pending park, the literal
+    ///   b366d359 on-disk shape) stays EXCLUDED: session_end can no
+    ///   longer mint it, and historical strands were resolved by hand —
+    ///   resurrecting every old contradiction on each boot would be the
+    ///   new bug.
+    #[test]
+    fn park_then_die_race_metas_are_boot_candidates() {
+        let home = tempfile::tempdir().unwrap();
+        let armed_park = || {
+            Some(SessionLimitParkMeta {
+                resets_at_epoch: Some(now_secs() + 3600),
+                has_pending: true,
+            })
+        };
+        write_meta(home.path(), "sess-race-resident", "running", armed_park());
+        write_meta(
+            home.path(),
+            "sess-race-backstop",
+            "interrupted",
+            armed_park(),
+        );
+        write_meta(home.path(), "sess-prefix-strand", "completed", armed_park());
+
+        let candidates = scan_store_candidates(home.path(), u64::MAX, &HashSet::new());
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"sess-race-resident"),
+            "a daemon death mid-hold leaves a readoptable meta: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"sess-race-backstop"),
+            "the session_end backstop's interrupted stamp is readoptable: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"sess-prefix-strand"),
+            "pre-backstop completed strands stay excluded: {ids:?}"
         );
     }
 

@@ -2043,12 +2043,31 @@ impl SessionLog {
         // teardown the kill itself triggers reaches this write, and that
         // marker is what the next boot's readopt scan reads — a kill must
         // never be rewritten as a clean completion (a real new turn
-        // re-stamps "running" via write_meta first).
+        // re-stamps "running" via write_meta first). An armed limit park
+        // with pending work equally refuses the clean completion: the
+        // wrapper's exit paths cancel any park they consume (clearing the
+        // marker before this write), so a still-pending park here means
+        // the session died with owed work the park promised to resume —
+        // stamping "completed" would hide it from the boot readopt scan's
+        // completed-status exclusion forever (the 2026-08-01 park-then-die
+        // specimen, session e883a2db). "interrupted" is the established
+        // ended-with-work-owed status every recovery reader already honors.
         let meta_path = self.dir.join("session_meta.json");
         if let Ok(meta_str) = fs::read_to_string(&meta_path) {
             if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
                 if meta.status.as_deref() != Some("interrupted") {
-                    meta.status = Some("completed".to_string());
+                    let stranded_park = meta
+                        .limit_park
+                        .as_ref()
+                        .is_some_and(|park| park.has_pending);
+                    meta.status = Some(
+                        if stranded_park {
+                            "interrupted"
+                        } else {
+                            "completed"
+                        }
+                        .to_string(),
+                    );
                 }
                 meta.last_turn = Some(total_turns);
                 meta.rounds = rounds;
@@ -2541,6 +2560,94 @@ mod tests {
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
         assert_eq!(meta.last_turn, Some(3));
+    }
+
+    /// The park-then-die backstop (2026-08-01 specimen e883a2db): a
+    /// session ending while its durable limit-park marker still owes
+    /// pending work must NOT be stamped "completed" — that status hides
+    /// the park from the boot readopt scan's completed-status exclusion
+    /// forever. session_end stamps the established "interrupted"
+    /// (ended-with-work-owed) status instead, keeping the session a
+    /// mid-work readopt candidate after a daemon restart.
+    #[test]
+    fn write_summary_never_stamps_completed_over_pending_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
+            resets_at_epoch: Some(1_785_649_200),
+            has_pending: true,
+        }));
+        log.write_summary(
+            "task",
+            "External agent round failed before any turn completed",
+            0,
+        );
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            meta.status.as_deref(),
+            Some("interrupted"),
+            "an armed pending park must survive session_end as an \
+             ended-with-work-owed status, never a clean completion"
+        );
+        // The marker itself survives the rewrite — the boot sweep reads it.
+        assert_eq!(
+            meta.limit_park,
+            Some(crate::session_log::SessionLimitParkMeta {
+                resets_at_epoch: Some(1_785_649_200),
+                has_pending: true,
+            })
+        );
+    }
+
+    /// A pending-less park (timer armed, no work owed) does not block the
+    /// clean completion — only owed work refuses "completed".
+    #[test]
+    fn write_summary_completes_over_pending_less_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
+            resets_at_epoch: Some(1_785_649_200),
+            has_pending: false,
+        }));
+        log.write_summary("task", "completed", 2);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("completed"));
+    }
+
+    /// A park the wrapper cancelled (marker cleared) before session_end
+    /// keeps today's clean completion — the backstop only engages on a
+    /// stranded marker.
+    #[test]
+    fn write_summary_completes_after_park_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.set_limit_park(Some(crate::session_log::SessionLimitParkMeta {
+            resets_at_epoch: None,
+            has_pending: true,
+        }));
+        log.set_limit_park(None);
+        log.write_summary("task", "completed", 4);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("completed"));
+        assert_eq!(meta.limit_park, None);
     }
 
     #[test]
