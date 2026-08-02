@@ -7876,7 +7876,11 @@ async fn successor_exec_refuses_mismatch_and_build_neutral() {
         .send()
         .await
         .expect("POST successor-exec without sha");
-    assert_eq!(unnamed.status(), 400, "a click that names no build never runs");
+    assert_eq!(
+        unnamed.status(),
+        400,
+        "a click that names no build never runs"
+    );
 
     // Offered sha ≠ on-disk target: the mismatch refusal, no spawn.
     let mismatch = authed
@@ -7885,7 +7889,11 @@ async fn successor_exec_refuses_mismatch_and_build_neutral() {
         .send()
         .await
         .expect("POST successor-exec with stale sha");
-    assert_eq!(mismatch.status(), 200, "the flow starts, then refuses at the probe");
+    assert_eq!(
+        mismatch.status(),
+        200,
+        "the flow starts, then refuses at the probe"
+    );
     let refusal = poll_until(
         "the mismatch refusal landing on the status block",
         RUN_TIMEOUT,
@@ -7975,10 +7983,10 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
     // avoids was observed live), a copy across devices. The mock
     // running-sha knob back-dates the RUNNING build so the real
     // binary's sha reads as the update.
-    let watched = rig.home.path().join(format!(
-        "watched-intendant{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let watched = rig
+        .home
+        .path()
+        .join(format!("watched-intendant{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&watched, b"placeholder-not-yet-a-binary").expect("seed watched placeholder");
     let daemon = spawn_co_daemon(
         &client,
@@ -8030,7 +8038,10 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
         RUN_TIMEOUT,
         || async {
             let body = http_get_json(&authed, &status_url).await?;
-            body["update"]["on_disk"]["git_sha"].as_str().is_some().then_some(body)
+            body["update"]["on_disk"]["git_sha"]
+                .as_str()
+                .is_some()
+                .then_some(body)
         },
         || {
             std::fs::read_to_string(rig.home.path().join("daemon.log"))
@@ -8078,7 +8089,9 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
         },
     )
     .await as u32;
-    let mut successor_guard = SuccessorKillGuard { pid: Some(child_pid) };
+    let mut successor_guard = SuccessorKillGuard {
+        pid: Some(child_pid),
+    };
 
     // The ruled sequence lands. The incumbent has ZERO sessions, so it
     // exits within moments of its own drain entry — every assertion
@@ -8099,7 +8112,10 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
                 .map(|log| tail(&log, 3000))
                 .unwrap_or_default();
             let successor_log = std::fs::read_to_string(
-                rig.home.path().join(".intendant").join("successor-exec.log"),
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
             )
             .map(|log| tail(&log, 2000))
             .unwrap_or_default();
@@ -8112,9 +8128,15 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
         offered_sha.as_str(),
         "the new holder runs the offered build: {sidecar}"
     );
-    let successor_boot = sidecar["boot_id"].as_str().expect("successor boot").to_string();
+    let successor_boot = sidecar["boot_id"]
+        .as_str()
+        .expect("successor boot")
+        .to_string();
     let successor_port = sidecar["port"].as_u64().expect("successor port") as u16;
-    assert_ne!(successor_port, daemon.port, "the successor bound its own port");
+    assert_ne!(
+        successor_port, daemon.port,
+        "the successor bound its own port"
+    );
 
     // The successor-side acquisition verdict (the durable half of the
     // post-takeover verification — the drainer may already be gone):
@@ -8124,15 +8146,23 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
         RUN_TIMEOUT,
         || async {
             let log = std::fs::read_to_string(
-                rig.home.path().join(".intendant").join("successor-exec.log"),
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
             )
             .ok()?;
             log.contains("runs the offered build").then_some(())
         },
         || {
-            std::fs::read_to_string(rig.home.path().join(".intendant").join("successor-exec.log"))
-                .map(|log| tail(&log, 2000))
-                .unwrap_or_default()
+            std::fs::read_to_string(
+                rig.home
+                    .path()
+                    .join(".intendant")
+                    .join("successor-exec.log"),
+            )
+            .map(|log| tail(&log, 2000))
+            .unwrap_or_default()
         },
     )
     .await;
@@ -8141,9 +8171,7 @@ async fn successor_exec_spawns_verified_build_and_hands_off() {
     poll_until(
         "the drained incumbent exiting",
         RUN_TIMEOUT,
-        || async {
-            (!boot_lock_is_held(&rig, &incumbent_boot)).then_some(())
-        },
+        || async { (!boot_lock_is_held(&rig, &incumbent_boot)).then_some(()) },
         || {
             std::fs::read_to_string(rig.home.path().join("daemon.log"))
                 .map(|log| tail(&log, 3000))
@@ -8223,7 +8251,11 @@ fn boot_lock_is_held(rig: &TestRig, boot_id: &str) -> bool {
         .join(".intendant")
         .join("daemons")
         .join(format!("{boot_id}.lock"));
-    let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
         Err(_) => return true,

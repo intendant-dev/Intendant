@@ -89,8 +89,11 @@ pub(crate) const OFFERED_SHA_ENV: &str = "INTENDANT_SUCCESSOR_EXEC_OFFERED_SHA";
 pub(crate) fn take_acquisition_verdict() -> Option<String> {
     static OFFERED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     static TAKEN: AtomicBool = AtomicBool::new(false);
-    let offered = OFFERED
-        .get_or_init(|| std::env::var(OFFERED_SHA_ENV).ok().filter(|sha| !sha.is_empty()));
+    let offered = OFFERED.get_or_init(|| {
+        std::env::var(OFFERED_SHA_ENV)
+            .ok()
+            .filter(|sha| !sha.is_empty())
+    });
     if offered.is_some() && !TAKEN.swap(true, Ordering::AcqRel) {
         offered.clone()
     } else {
@@ -169,7 +172,11 @@ pub(crate) struct SuccessorExecLane {
 }
 
 impl SuccessorExecLane {
-    fn new(runtime: &Arc<super::HandoverRuntime>, exe_path: PathBuf, replay_args: Vec<String>) -> Self {
+    fn new(
+        runtime: &Arc<super::HandoverRuntime>,
+        exe_path: PathBuf,
+        replay_args: Vec<String>,
+    ) -> Self {
         SuccessorExecLane {
             runtime: Arc::downgrade(runtime),
             exe_path,
@@ -194,10 +201,7 @@ impl SuccessorExecLane {
                 obj.insert("phase".into(), state.phase.clone().into());
                 obj.insert("started_ms".into(), state.started_ms.into());
                 obj.insert("offered_sha".into(), state.offered_sha.clone().into());
-                obj.insert(
-                    "in_flight".into(),
-                    state.outcome.is_none().into(),
-                );
+                obj.insert("in_flight".into(), state.outcome.is_none().into());
                 if let Some(requested_by) = &state.requested_by {
                     obj.insert("requested_by".into(), requested_by.clone().into());
                 }
@@ -715,7 +719,9 @@ pub(crate) fn spawn_successor_exec_lane(
     replay_args: Vec<String>,
 ) {
     let Some(exe_path) = super::update_watch::watched_binary_path() else {
-        eprintln!("[successor-exec] current_exe unresolvable — successor-exec lane off for this boot");
+        eprintln!(
+            "[successor-exec] current_exe unresolvable — successor-exec lane off for this boot"
+        );
         return;
     };
     let lane = Arc::new(SuccessorExecLane::new(runtime, exe_path, replay_args));
@@ -775,11 +781,8 @@ mod tests {
         #[cfg(unix)]
         {
             let dir = tempfile::tempdir().unwrap();
-            let mut supervised =
-                super::super::HandoverRuntime::initialize(dir.path(), 7002, 0);
-            supervised.set_app_supervisor_pid_for_test(Some(
-                std::os::unix::process::parent_id(),
-            ));
+            let mut supervised = super::super::HandoverRuntime::initialize(dir.path(), 7002, 0);
+            supervised.set_app_supervisor_pid_for_test(Some(std::os::unix::process::parent_id()));
             let supervised = Arc::new(supervised);
             let lane = test_lane(&supervised);
             let refusal = lane.request_spawn("abc123", None).unwrap_err();

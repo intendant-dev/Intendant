@@ -184,7 +184,10 @@ pub(crate) async fn daemon_successor_exec_api_response(
         return ApiResponse::json_error(503, "the successor-exec lane is not wired on this daemon");
     };
     let body = serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_default();
-    let Some(expected) = body.get("expected_git_sha").and_then(|value| value.as_str()) else {
+    let Some(expected) = body
+        .get("expected_git_sha")
+        .and_then(|value| value.as_str())
+    else {
         return ApiResponse::json_error(
             400,
             "the body must name the offered build: {\"expected_git_sha\": …} — the spawn \
