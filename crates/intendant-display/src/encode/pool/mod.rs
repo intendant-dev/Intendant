@@ -825,8 +825,7 @@ impl EncoderPool {
                 // layer no federated viewer ever demands — the encoder
                 // stayed paused and the peer streamed nothing (observed
                 // live against a Windows 11 peer, 2026-08-02).
-                let federated_h264_bank =
-                    prefs.federated && handle.id.codec == CodecKind::H264;
+                let federated_h264_bank = prefs.federated && handle.id.codec == CodecKind::H264;
                 if prefs.supports(handle.id.codec) && !federated_h264_bank {
                     subs.push(EncoderSubscription {
                         id: handle.id.clone(),
