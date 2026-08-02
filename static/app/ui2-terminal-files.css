@@ -100,7 +100,8 @@ html.ui-v2 .shell-host-status.error { color: var(--rose); }
 html.ui-v2 .shell-host-status.warn { color: var(--amber); }
 html.ui-v2 .shell-host-status.ok { color: var(--green); }
 
-html.ui-v2 .shell-share-btn {
+html.ui-v2 .shell-share-btn,
+html.ui-v2 .shell-restart-btn {
   min-height: 32px; /* match the 32px Target select — one control height per row */
   padding: 6px 12px;
   border: 1px solid var(--line);
@@ -110,7 +111,8 @@ html.ui-v2 .shell-share-btn {
   font: 600 12px var(--sans);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-html.ui-v2 .shell-share-btn:hover {
+html.ui-v2 .shell-share-btn:hover,
+html.ui-v2 .shell-restart-btn:hover {
   background: var(--surface-2);
   border-color: var(--line-2);
   color: var(--text);
@@ -119,6 +121,17 @@ html.ui-v2 .shell-share-btn.is-shared {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
   color: var(--green);
+}
+/* The re-entry affordance is the exited pane's one live control — accent
+   it so a dead terminal visibly offers the way back in. */
+html.ui-v2 .shell-restart-btn {
+  border-color: rgba(var(--iris-rgb), .38);
+  color: var(--iris);
+}
+html.ui-v2 .shell-restart-btn:hover {
+  background: rgba(var(--iris-rgb), .12);
+  border-color: rgba(var(--iris-rgb), .55);
+  color: var(--iris-2);
 }
 
 html.ui-v2 #tab-terminal .shell-toolbar .target-summary {

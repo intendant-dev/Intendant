@@ -603,11 +603,26 @@
     return `${others.length} predecessor daemons are draining${finishing}`;
   }
 
-  function handoverSuccessorPort(body) {
+  // The §5.1 live-holder resolution rule (update-abstraction intake) —
+  // the ONE place a successor doorway target may come from. The lease
+  // sidecar names the most recent acquirer OR the most recent drainer
+  // during the entry→acquisition window (6c), so the sidecar target
+  // counts only while its daemons entry is live and neither draining
+  // nor exited; otherwise the hand-off candidate rule is the fallback
+  // (live, non-draining, on-disk build preferred). Null means "nobody
+  // yet": render the pending line, never a doorway into a drain.
+  function resolveLiveHolder(body) {
+    const daemons = Array.isArray(body && body.daemons) ? body.daemons : [];
     const sidecar = body && body.sidecar;
-    if (!sidecar || !body.boot_id || sidecar.boot_id === body.boot_id) return null;
-    const port = Number(sidecar.port);
-    return Number.isFinite(port) && port > 0 ? port : null;
+    if (sidecar && body.boot_id && sidecar.boot_id !== body.boot_id) {
+      const entry = daemons.find((d) => d && d.boot_id === sidecar.boot_id);
+      if (entry && entry.live && entry.state !== 'draining' && entry.state !== 'exited') {
+        const port = Number(entry.port);
+        if (Number.isFinite(port) && port > 0) return entry;
+      }
+    }
+    const update = body && body.update;
+    return handoverSuccessorCandidate(body, update ? update.on_disk : null);
   }
 
   // Render at most this many holdout rows; the rest fold into an honest
@@ -707,14 +722,28 @@
   }
 
   // A real doorway to a co-homed daemon — same-host port substitution,
-  // like the old inline link, but rendered as a prominent element.
+  // like the old inline link, but rendered as a prominent element. On
+  // the loopback posture a sibling refuses tokenless pages, so the
+  // click decorates the URL through the same-home token map
+  // (withSiblingLoopbackToken, the fleet-links lane) and lands authed
+  // instead of on the named 401; non-loopback surfaces pass through
+  // untouched. Modifier/middle clicks keep their native semantics on
+  // the bare href.
   function handoverDaemonLink(port, label) {
     const link = document.createElement('a');
     link.className = 'handover-successor-link';
-    link.href = `${location.protocol}//${location.hostname}:${port}/`;
+    const bare = `${location.protocol}//${location.hostname}:${port}/`;
+    link.href = bare;
     link.target = '_blank';
     link.rel = 'noopener';
     link.textContent = label;
+    link.addEventListener('click', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+      ev.preventDefault();
+      Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
+        window.open(url, '_blank', 'noopener');
+      });
+    });
     return link;
   }
 
@@ -725,7 +754,7 @@
     }
     handoverUpdateRender(body);
     if (body.draining) {
-      const port = handoverSuccessorPort(body);
+      const holder = resolveLiveHolder(body);
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
@@ -750,8 +779,10 @@
         : ' In-flight sessions finish here, then it exits.';
       head.appendChild(tail);
       el.appendChild(head);
-      if (port) {
-        el.appendChild(handoverDaemonLink(port, `Open the successor daemon (:${port}) →`));
+      if (holder) {
+        el.appendChild(
+          handoverDaemonLink(holder.port, `Open the successor daemon (:${holder.port}) →`)
+        );
       } else {
         const none = document.createElement('div');
         none.className = 'handover-banner-note';

@@ -1064,10 +1064,11 @@ mod tests {
     }
 
     fn user_line(mode: &str, cwd: &str, ts: &str) -> String {
+        let cwd = serde_json::to_string(cwd).expect("fixture cwd encodes as JSON");
         format!(
             concat!(
                 r#"{{"parentUuid":null,"isSidechain":false,"type":"user","permissionMode":"{mode}","#,
-                r#""cwd":"{cwd}","sessionId":"cc-1","version":"2.1.217","timestamp":"{ts}","#,
+                r#""cwd":{cwd},"sessionId":"cc-1","version":"2.1.217","timestamp":"{ts}","#,
                 r#""message":{{"role":"user","content":"do the thing"}}}}"#,
             ),
             mode = mode,
@@ -1849,7 +1850,11 @@ mod tests {
                 ),
                 assistant_line("claude-fable-5", "max", "2026-07-22T07:10:00Z", false).replace(
                     "\"cwd\":\"/repo\"",
-                    &format!("\"cwd\":\"{}\"", worktree.display()),
+                    &format!(
+                        "\"cwd\":{}",
+                        serde_json::to_string(&worktree.to_string_lossy())
+                            .expect("fixture cwd encodes as JSON")
+                    ),
                 ),
             ]
             .join("\n")

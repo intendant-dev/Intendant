@@ -3,41 +3,9 @@
    request (never authority), and the target DAEMON decides via its
    local IAM. Roles get warmer colors the more they can do. */
 
-// ── Same-home sibling loopback-token handoff ──
-//
-// Sibling daemons on THIS home refuse tokenless loopback like every
-// daemon, and this page holds only its own daemon's token (per-origin
-// storage). Opening a loopback sibling therefore asks the reached
-// daemon for its same-home instance map (/api/local-daemons/tokens —
-// owner-posture only; served per-request, never persisted) and opens
-// the sibling's own tokened URL so its page seeds its own origin.
-// Non-loopback and mTLS targets pass through untouched. Cached per
-// page load; a stale map (sibling rebooted) degrades to the bare URL
-// and the sibling's named 401 guidance.
-let accessSiblingTokenMapPromise = null;
-
-async function withSiblingLoopbackToken(rawUrl) {
-  try {
-    const url = new URL(rawUrl, location.href);
-    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-    const loopback =
-      host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
-    if (!loopback || url.searchParams.has('token')) return rawUrl;
-    if (!accessSiblingTokenMapPromise) {
-      accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
-        .then(resp => (resp.ok ? resp.json() : { instances: [] }))
-        .catch(() => ({ instances: [] }));
-    }
-    const map = await accessSiblingTokenMapPromise;
-    const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-    const entry = (map.instances || []).find(inst => String(inst.port) === String(port));
-    if (!entry || !entry.token) return rawUrl;
-    url.searchParams.set('token', entry.token);
-    return url.toString();
-  } catch {
-    return rawUrl;
-  }
-}
+// The same-home sibling loopback-token handoff (withSiblingLoopbackToken)
+// lives in 31-init-identity-fleet.js beside the loopback-token machinery
+// it extends; the fleet links below and the handover doorways share it.
 
 const ACCESS_ROLE_META = {
   'role:root': { cls: 'role-root', warn: true, short: 'Full control of this daemon, including access administration.' },
@@ -2660,6 +2628,11 @@ function resetShellConnectionStateForHostChange() {
   shellPendingResize = null;
   shellOutputQueue = [];
   shellOutputQueuedBytes = 0;
+  // Buffered pre-init output belongs to the previous host; the exited/
+  // retry affordance does too.
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  offerShellRestart(false);
 }
 
 function refreshShellHostOptions() {

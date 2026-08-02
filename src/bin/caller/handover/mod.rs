@@ -807,12 +807,38 @@ impl HandoverRuntime {
         )
     }
 
-    /// The successor's port for `daemon_draining` refusal pointers, when
-    /// the sidecar already names one (None while the handoff is still in
-    /// flight — the refusal then says "successor pending").
+    /// The successor's port for `daemon_draining` refusal pointers — the
+    /// server-side mirror of the dashboard's `resolveLiveHolder` rule
+    /// (update-abstraction §5.1, refinement R-D1). The sidecar names the
+    /// most recent acquirer OR the most recent drainer during the
+    /// entry→acquisition window (6c), so its target counts only while
+    /// its presence is live and neither draining nor exited; otherwise a
+    /// live non-draining sibling is named (a spare accepts new work
+    /// immediately, and the freed lease lands on it within a poll).
+    /// None while nobody eligible exists — the refusal then says
+    /// "successor pending" rather than pointing callers into a drain.
     pub(crate) fn successor_port(&self) -> Option<u16> {
-        let sidecar = read_lease_sidecar(&self.state_root)?;
-        (sidecar.boot_id != self.boot_id).then_some(sidecar.port)
+        let records = read_presence_records(&self.state_root);
+        let eligible = |record: &presence::PresenceRecord| {
+            record.boot_id != self.boot_id
+                && record.state != "draining"
+                && record.state != "exited"
+                && boot_id_is_live(&self.state_root, &record.boot_id)
+        };
+        if let Some(sidecar) = read_lease_sidecar(&self.state_root) {
+            if sidecar.boot_id != self.boot_id
+                && records
+                    .iter()
+                    .find(|record| record.boot_id == sidecar.boot_id)
+                    .is_some_and(&eligible)
+            {
+                return Some(sidecar.port);
+            }
+        }
+        records
+            .iter()
+            .find(|record| eligible(record))
+            .map(|record| record.port)
     }
 
     /// The supervisor's drain wait set: served on the status surface
@@ -1144,6 +1170,74 @@ mod tests {
         }
     }
 
+    /// Update-abstraction slice 1 pin (intake §7, acceptance (a)): the
+    /// successor doorway resolves through the ONE live-holder rule —
+    /// the sidecar target only while its daemons entry is live and
+    /// neither draining nor exited (the 6c entry→acquisition window
+    /// where the sidecar names a drainer), with the hand-off candidate
+    /// rule as the fallback — and doorway clicks land authed through
+    /// the same-home sibling token map instead of on the named 401.
+    #[test]
+    fn doorway_resolves_live_holder_and_carries_the_sibling_token() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            // The resolver and its filter expression: never a doorway
+            // into a draining (or exited, or dead) sidecar target.
+            "function resolveLiveHolder",
+            "entry.live && entry.state !== 'draining' && entry.state !== 'exited'",
+            // The doorway consumes the resolver…
+            "const holder = resolveLiveHolder(body);",
+            // …with the shared hand-off candidate rule as its fallback.
+            "return handoverSuccessorCandidate(body,",
+            // The click-time token decoration (the fleet-links lane).
+            "withSiblingLoopbackToken(bare)",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the successor doorway lost its live-holder resolution: {needle}"
+            );
+        }
+        // The legacy boot-id-only port read is gone — the resolver is
+        // the one source of doorway targets.
+        assert!(
+            !fragment.contains("handoverSuccessorPort"),
+            "the boot-id-only successor read must not come back beside the resolver"
+        );
+        // The helper lives in the identity fragment (lifted, shared —
+        // never duplicated back into the access panes).
+        let identity = include_str!("../../../../static/app/31-init-identity-fleet.js");
+        assert!(
+            identity.contains("async function withSiblingLoopbackToken"),
+            "the sibling token helper left the identity fragment"
+        );
+        let panes = include_str!("../../../../static/app/43-access-panes.js");
+        assert_eq!(
+            panes
+                .matches("async function withSiblingLoopbackToken")
+                .count(),
+            0,
+            "the sibling token helper must not be duplicated in the access panes"
+        );
+        // And the served bundle carries the whole wiring, exactly once.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "function resolveLiveHolder",
+            "withSiblingLoopbackToken(bare)",
+            "async function withSiblingLoopbackToken",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the doorway resolution wiring: {needle}"
+            );
+        }
+        assert_eq!(
+            app.matches("async function withSiblingLoopbackToken")
+                .count(),
+            1,
+            "one shared sibling-token helper in the served bundle"
+        );
+    }
+
     /// The Cmd/Ctrl-K palette's update verbs are pure affordance
     /// re-exposure — the emission-shape law: the chip module keeps the
     /// only swap emissions (one relay POST, one webview bridge, one
@@ -1401,6 +1495,55 @@ mod tests {
         drop(successor);
         assert!(!holder.poll_acquire(0), "Q4: no draining→active edge");
         assert!(!holder.is_holder());
+    }
+
+    /// R-D1 (update-abstraction §5.1): `successor_port` is the
+    /// server-side mirror of the dashboard's live-holder rule. The 6c
+    /// window — the shared sidecar naming a DRAINING (or dead) target
+    /// between one drain's entry and the next acquisition — must never
+    /// leak into a refusal pointer; a live non-draining sibling is
+    /// named instead when one exists, and "pending" (None) otherwise.
+    #[test]
+    fn successor_port_never_names_a_draining_or_dead_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = HandoverRuntime::initialize(dir.path(), 7001, 0);
+        let b = HandoverRuntime::initialize(dir.path(), 7002, 0);
+
+        // A drains while spare B has not acquired yet: the sidecar
+        // still names A itself — the fallback names the live spare
+        // rather than leaving callers with "pending".
+        assert_eq!(a.request_drain(None), DrainRequest::Entered);
+        assert_eq!(
+            a.successor_port(),
+            Some(7002),
+            "a live spare beats 'pending'"
+        );
+
+        // B acquires: the sidecar arm names it.
+        assert!(b.poll_acquire(0));
+        assert_eq!(a.successor_port(), Some(7002));
+
+        // B drains before any C exists — the 6c window: the sidecar
+        // names B, draining. No pointer may follow it there.
+        assert_eq!(b.request_drain(None), DrainRequest::Entered);
+        assert_eq!(a.successor_port(), None, "never a doorway into a drain");
+        assert_eq!(b.successor_port(), None);
+
+        // C acquires: the sidecar self-heals and both drainers' pointers
+        // follow it.
+        let c = HandoverRuntime::initialize(dir.path(), 7003, 0);
+        assert_eq!(c.held_generation(), Some(3));
+        assert_eq!(a.successor_port(), Some(7003));
+        assert_eq!(b.successor_port(), Some(7003));
+
+        // C crashes: the sidecar still names it, but a dead boot is not
+        // a doorway either (B stays draining, so nothing is eligible).
+        drop(c);
+        assert_eq!(
+            a.successor_port(),
+            None,
+            "a crashed successor is not a doorway"
+        );
     }
 
     /// The Q4 pin: a drainer that observes its successor gone — crashed
@@ -1885,7 +2028,7 @@ mod tests {
     /// pin keeps the machinery and its load-bearing markers from being
     /// gutted silently). The app supervisor's one-click swap exists,
     /// follows the intake's spawn → readiness → swap → drain order, and
-    /// parks the predecessor in a draining slot the swap never
+    /// parks each predecessor in the draining array the swap never
     /// terminates; the app layer re-points the webview on
     /// `didSwapToPort` and the SPA marker gates the one-click button.
     #[test]
@@ -1894,6 +2037,15 @@ mod tests {
         for needle in [
             "func beginUpdateSwap",
             "drainingProcess",
+            // Update-abstraction slice 5 (intake 6a, multi-predecessor
+            // honesty): the draining slot is an ARRAY — a chained swap
+            // appends instead of displacing the elder from supervision,
+            // each termination handler removes exactly its own entry by
+            // identity, and the quit sweep tears down every drainer
+            // alongside the promoted successor.
+            "drainingProcesses: [Process]",
+            "drainingProcesses.removeAll { $0 === proc }",
+            "+ drainingProcesses)",
             // The intake's ordering marker (comment-wrapped in source).
             "spawn → readiness",
             "swap → drain",

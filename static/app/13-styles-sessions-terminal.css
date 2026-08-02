@@ -3250,7 +3250,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   padding: 4px 8px;
 }
 
-.shell-share-btn {
+.shell-share-btn,
+.shell-restart-btn {
   background: var(--bg-tertiary, #2a2a2e);
   color: var(--text-secondary, #b8b8bc);
   border: 1px solid var(--border-color, #3a3a3e);
@@ -3260,7 +3261,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   cursor: pointer;
 }
 
-.shell-share-btn:hover {
+.shell-share-btn:hover,
+.shell-restart-btn:hover {
   color: var(--text-primary, #e8e8ec);
 }
 
