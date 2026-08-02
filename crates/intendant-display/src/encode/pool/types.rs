@@ -276,6 +276,75 @@ pub const MIN_LAYER_DIM: u32 = 16;
 /// produces the un-reassemblable seed IDR this layer exists to avoid.
 pub const FEDERATED_H264_BITRATE_KBPS: u32 = 250;
 
+/// Link-aware ladder for the federated H.264 slot. The slot always
+/// STARTS at [`FederatedRung::Quarter`] (the loss-safe #67 shape) and
+/// the layer-policy coordinator steps it up on sustained-healthy links
+/// / back down on loss — see `advance_federated_ladder` in the
+/// aggregator. A rung change re-specs the slot by eviction: the encoder
+/// handle is cancelled, subscribers observe `RecvError::Closed`, and
+/// the pool-frame-intake reconnect resubscribes into a fresh slot built
+/// at the new rung (the same rebuild lane `on_resize` uses for
+/// on-demand slots). H.264 mid-stream resolution changes are fine for
+/// browsers — the new SPS/PPS ride the forced join keyframe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FederatedRung {
+    /// Quarter resolution @ [`FEDERATED_H264_BITRATE_KBPS`] — the
+    /// loss-resilient floor and the spawn default.
+    Quarter,
+    /// Half resolution @ 1000 kbps.
+    Half,
+    /// Full resolution @ 2500 kbps (the [`LayerSpec::single`] cap).
+    Full,
+}
+
+impl FederatedRung {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Quarter => 0,
+            Self::Half => 1,
+            Self::Full => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Quarter,
+            1 => Self::Half,
+            _ => Self::Full,
+        }
+    }
+
+    pub fn up(self) -> Self {
+        match self {
+            Self::Quarter => Self::Half,
+            Self::Half | Self::Full => Self::Full,
+        }
+    }
+
+    pub fn down(self) -> Self {
+        match self {
+            Self::Full => Self::Half,
+            Self::Half | Self::Quarter => Self::Quarter,
+        }
+    }
+
+    fn divisor(self) -> u32 {
+        match self {
+            Self::Quarter => 4,
+            Self::Half => 2,
+            Self::Full => 1,
+        }
+    }
+
+    fn bitrate_kbps(self) -> u32 {
+        match self {
+            Self::Quarter => FEDERATED_H264_BITRATE_KBPS,
+            Self::Half => 1000,
+            Self::Full => 2500,
+        }
+    }
+}
+
 /// Normalize a `(width, height)` pair to the constraints both
 /// VP8 encoder construction and [`crate::encode::downscale_i420`] require:
 ///
@@ -409,18 +478,29 @@ impl LayerSpec {
     /// a federated peer that negotiated H.264 must get *a* stream, never
     /// an empty layer set.
     pub fn single_federated(source_w: u32, source_h: u32, framerate: u32) -> LayerSpec {
-        // Quarter resolution, same even / MIN_LAYER_DIM normalization as
-        // the VP8 quarter floor. Fall back to normalized source dims if
-        // the quarter is too small to encode, and finally to the raw
-        // source so we always return an encodable layer.
-        let (width, height) = normalize_layer_dims(source_w / 4, source_h / 4)
+        Self::single_federated_at(FederatedRung::Quarter, source_w, source_h, framerate)
+    }
+
+    /// Rung-selected federated layer (see [`FederatedRung`]): the
+    /// rung's divisor with the same even / MIN_LAYER_DIM normalization
+    /// as the VP8 quarter floor. Fall back to normalized source dims if
+    /// the divided shape is too small to encode, and finally to the raw
+    /// source so we always return an encodable layer.
+    pub fn single_federated_at(
+        rung: FederatedRung,
+        source_w: u32,
+        source_h: u32,
+        framerate: u32,
+    ) -> LayerSpec {
+        let d = rung.divisor();
+        let (width, height) = normalize_layer_dims(source_w / d, source_h / d)
             .or_else(|| normalize_layer_dims(source_w, source_h))
             .unwrap_or((source_w, source_h));
         LayerSpec {
             rid: SimulcastRid::federated(),
             width,
             height,
-            target_bitrate_kbps: FEDERATED_H264_BITRATE_KBPS,
+            target_bitrate_kbps: rung.bitrate_kbps(),
             framerate,
         }
     }

@@ -146,7 +146,7 @@
 use crate::{visual_marker, EncodedFrame};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -204,6 +204,10 @@ pub(crate) struct EncoderPoolInner {
     /// (decrement + zero-check + cancel) so a blocking `.lock()` is
     /// acceptable even from async callers.
     on_demand: StdMutex<HashMap<EncoderId, OnDemandSlot>>,
+    /// Current [`FederatedRung`] for the federated H.264 slot
+    /// (`FederatedRung::as_u8` encoding). Read at slot construction;
+    /// stepped by [`EncoderPool::respec_federated`].
+    federated_rung: AtomicU8,
 
     /// Coalesces PLI/FIR across viewers per `(codec, rid)`.
     keyframe_coalescer: KeyframeCoalescer,
@@ -434,6 +438,7 @@ impl EncoderPool {
             inner: Arc::new(EncoderPoolInner {
                 always_on: StdRwLock::new(always_on),
                 on_demand: StdMutex::new(HashMap::new()),
+                federated_rung: AtomicU8::new(FederatedRung::Quarter.as_u8()),
                 keyframe_coalescer: KeyframeCoalescer::new(),
                 i420_tx,
                 duration_ms,
@@ -901,7 +906,8 @@ impl EncoderPool {
                     // at function entry — same gen, same dims,
                     // checked together by pass 3.
                     let layer = if federated_h264 {
-                        LayerSpec::single_federated(
+                        LayerSpec::single_federated_at(
+                            self.federated_rung(),
                             source_at_start.width,
                             source_at_start.height,
                             self.inner.framerate,
@@ -1200,6 +1206,41 @@ impl EncoderPool {
             .filter(|(_, slot)| slot.refcount > 0)
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Current rung of the federated H.264 slot's link-aware ladder.
+    pub fn federated_rung(&self) -> FederatedRung {
+        FederatedRung::from_u8(self.inner.federated_rung.load(Ordering::Relaxed))
+    }
+
+    /// Step the federated H.264 slot to `rung`. No-op when unchanged.
+    /// On change, the current `(H264, fed)` slot (if any) is EVICTED —
+    /// its encoder cancelled and its map entry removed — so subscribers
+    /// observe `RecvError::Closed` and the pool-frame-intake reconnect
+    /// resubscribes into a fresh slot built at the new rung (the same
+    /// rebuild lane `on_resize` uses for on-demand slots; stale leases
+    /// release against their recorded generation and are ignored).
+    /// Returns `true` when a change was applied.
+    pub fn respec_federated(&self, rung: FederatedRung) -> bool {
+        let prev = self.inner.federated_rung.swap(rung.as_u8(), Ordering::Relaxed);
+        if prev == rung.as_u8() {
+            return false;
+        }
+        let id = EncoderId::new(CodecKind::H264, SimulcastRid::federated());
+        let evicted = self.inner.on_demand.lock().unwrap().remove(&id);
+        if let Some(slot) = evicted {
+            slot.handle.shutdown.cancel();
+            eprintln!(
+                "[encoder/pool] federated ladder {} -> {:?}: re-spec {} by eviction",
+                prev, rung, id,
+            );
+        } else {
+            eprintln!(
+                "[encoder/pool] federated ladder {} -> {:?} (no live slot; next subscribe builds it)",
+                prev, rung,
+            );
+        }
+        true
     }
 
     /// **Phase 4d.0**: pause one encoder slot, identified by
