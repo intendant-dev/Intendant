@@ -70,11 +70,17 @@ final class BackendSupervisor {
     private let session: URLSession
 
     private var backendProcess: Process?
-    /// The swapped-out predecessor, draining toward its own exit (HS6/P3).
-    /// The swap NEVER terminates it — it serves its in-flight sessions and
-    /// exits at the last one (`app_supervisor_one_click_swaps_without_kill`);
-    /// only app quit tears it down along with everything else.
-    private var drainingProcess: Process?
+    /// The swapped-out predecessors, each draining toward its own exit
+    /// (HS6/P3). The swap NEVER terminates them — each serves its in-flight
+    /// sessions and exits at the last one
+    /// (`app_supervisor_one_click_swaps_without_kill`); only app quit tears
+    /// them down along with everything else. An array, not a single slot: a
+    /// chained swap (updating again while an elder still drains) appends
+    /// rather than displacing the elder from supervision (multi-predecessor
+    /// honesty). Deliberately uncapped — chained swaps are rare, each entry
+    /// self-exits and its termination handler removes it by identity, so
+    /// this is bookkeeping, not a queue.
+    private var drainingProcesses: [Process] = []
     private var swapInFlight = false
     private var healthTimer: Timer?
     private var healthProbeFailures = 0
@@ -269,12 +275,12 @@ final class BackendSupervisor {
                     NSLog("Drained predecessor exited (status \(proc.terminationStatus))")
                     self?.writeExitMarker(status: proc.terminationStatus,
                                           signalled: proc.terminationReason == .uncaughtSignal)
-                    if self?.drainingProcess === proc {
-                        self?.drainingProcess = nil
-                    }
+                    // Identity removal: each drainer clears exactly its own
+                    // entry, leaving still-draining siblings supervised.
+                    self?.drainingProcesses.removeAll { $0 === proc }
                 }
             }
-            drainingProcess = old
+            drainingProcesses.append(old)
         }
         backendProcess = successor
         port = newPort
@@ -398,13 +404,14 @@ final class BackendSupervisor {
 
     /// Quit teardown: kill the children on purpose without letting exit
     /// handlers paint a crash screen or schedule a restart mid-teardown.
-    /// Quit is the explicit "stop everything" gesture, so a mid-drain
+    /// Quit is the explicit "stop everything" gesture, so every mid-drain
     /// predecessor goes down with the promoted successor.
     func shutdown() {
         isTerminating = true
         backendAutoRestartTimer?.invalidate()
         healthTimer?.invalidate()
-        let children = [backendProcess, drainingProcess].compactMap { $0 }.filter { $0.isRunning }
+        // Quit sweep: the current backend plus every draining predecessor.
+        let children = ([backendProcess].compactMap { $0 } + drainingProcesses).filter { $0.isRunning }
         guard !children.isEmpty else { return }
         for proc in children {
             proc.terminationHandler = nil
