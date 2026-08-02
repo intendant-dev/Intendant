@@ -134,8 +134,9 @@ pub struct WorkerFingerprint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustc: Option<String>,
     /// Provenance of the worker's own Intendant binary, filled by the
-    /// running worker agent at enrollment. Probe-script fingerprints
-    /// measure the environment, not the binary, and leave these absent.
+    /// running worker agent on its authenticated attachment hello.
+    /// Probe-script fingerprints measure the environment, not the binary,
+    /// and leave these absent.
     /// Distinct from `git_rev` (the checkout's HEAD): a release-asset
     /// worker binary runs source at a different revision than its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]

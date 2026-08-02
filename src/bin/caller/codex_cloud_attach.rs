@@ -708,6 +708,23 @@ fn record_worker_json(lease_store_path: &Path, task_id: &str, value: &serde_json
     crate::codex_cloud::record_worker_fingerprint(lease_store_path, task_id, fingerprint);
 }
 
+/// Fingerprint metadata is informational and can be larger than the
+/// security-critical enrollment request. Carry it on the authenticated
+/// attachment socket so the duplicated enrollment body/header stays below
+/// managed-proxy header limits.
+fn worker_hello_fingerprint(
+    task_id: &str,
+    value: &serde_json::Value,
+) -> Option<crate::codex_cloud::WorkerFingerprint> {
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(2)
+        || value.get("kind").and_then(serde_json::Value::as_str) != Some(HELLO_KIND)
+        || value.get("task_id").and_then(serde_json::Value::as_str) != Some(task_id)
+    {
+        return None;
+    }
+    serde_json::from_value(value.get("worker")?.clone()).ok()
+}
+
 // ── Attachment frames + link registry (slice 2) ────────────────────────
 
 /// Worker→home reply kinds. The worker's inbound authority on home is
@@ -891,8 +908,9 @@ pub(crate) async fn serve_attachment_socket<S>(
 }
 
 /// Route one worker frame: a live job's capability-bound cache requests take
-/// their private bounded lane; ordinary reply kinds fan out to subscribers;
-/// everything else (hello included) is dropped without dispatch.
+/// their private bounded lane; the authenticated hello records informational
+/// worker provenance; ordinary reply kinds fan out to subscribers; everything
+/// else is dropped without dispatch.
 fn route_worker_frame(
     task_id: &str,
     from_worker_tx: &tokio::sync::broadcast::Sender<String>,
@@ -901,14 +919,24 @@ fn route_worker_frame(
     if crate::remote_compute::route_remote_cache_frame(task_id, text) {
         return;
     }
-    let kind = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("t")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(fingerprint) = value
+        .as_ref()
+        .and_then(|value| worker_hello_fingerprint(task_id, value))
+    {
+        crate::codex_cloud::record_worker_fingerprint(
+            &crate::codex_cloud::state_path(),
+            task_id,
+            fingerprint,
+        );
+        return;
+    }
+    let kind = value.and_then(|value| {
+        value
+            .get("t")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
     if kind
         .as_deref()
         .is_some_and(|kind| WORKER_REPLY_KINDS.contains(&kind))
@@ -1192,6 +1220,19 @@ pub async fn run_attach(args: &[String]) -> Result<(), String> {
 
 // ── Worker-side agent ──────────────────────────────────────────────────
 
+fn serialize_enrollment_request(token: &str, public_key_pem: &str) -> Result<Vec<u8>, String> {
+    // Keep the duplicated body/header to the security-critical ceremony.
+    // The richer, untrusted worker fingerprint follows on the authenticated
+    // WebSocket hello; including it here exceeded a managed proxy's custom-
+    // header ceiling and corrupted both enrollment copies in flight.
+    serde_json::to_vec(&serde_json::json!({
+        "version": ATTACHMENT_PROTOCOL_VERSION,
+        "token": token,
+        "public_key_pem": public_key_pem,
+    }))
+    .map_err(|e| format!("serialize enrollment request: {e}"))
+}
+
 pub async fn run_agent(args: &[String]) -> Result<(), String> {
     if args.is_empty()
         || args
@@ -1317,13 +1358,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("build enroll HTTP client: {e}"))?;
     let worker_fingerprint = collect_worker_fingerprint(crate::codex_cloud::now_unix_ms());
-    let enrollment_payload = serde_json::to_vec(&serde_json::json!({
-        "version": ATTACHMENT_PROTOCOL_VERSION,
-        "token": &token,
-        "public_key_pem": key_pair.public_key_pem(),
-        "worker": &worker_fingerprint,
-    }))
-    .map_err(|e| format!("serialize enrollment request: {e}"))?;
+    let enrollment_payload = serialize_enrollment_request(&token, &key_pair.public_key_pem())?;
     if enrollment_payload.len() > ENROLL_REQUEST_MAX_BYTES {
         return Err(format!(
             "enrollment request is too large ({} bytes; limit {ENROLL_REQUEST_MAX_BYTES})",
@@ -1421,6 +1456,7 @@ pub async fn run_agent(args: &[String]) -> Result<(), String> {
         key_pair: &key_pair,
         fingerprint: &fingerprint,
         task: &task,
+        worker_fingerprint: &worker_fingerprint,
         tls_terminated_proxy,
     };
     let mut attempt: u32 = 0;
@@ -1974,6 +2010,7 @@ struct AttachmentEndpoint<'a> {
     key_pair: &'a rcgen::KeyPair,
     fingerprint: &'a str,
     task: &'a str,
+    worker_fingerprint: &'a crate::codex_cloud::WorkerFingerprint,
     tls_terminated_proxy: bool,
 }
 
@@ -2046,9 +2083,15 @@ async fn hold_attachment(
             .await
             .map_err(|e| format!("dial {}: {e}", endpoint.home))?;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        serde_json::json!({ "v": 2, "kind": HELLO_KIND, "task_id": endpoint.task, "terminal": true })
-            .to_string()
-            .into(),
+        serde_json::json!({
+            "v": 2,
+            "kind": HELLO_KIND,
+            "task_id": endpoint.task,
+            "terminal": true,
+            "worker": endpoint.worker_fingerprint,
+        })
+        .to_string()
+        .into(),
     ))
     .await
     .map_err(|e| format!("send hello: {e}"))?;
@@ -2571,10 +2614,48 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_request_stays_compact_and_moves_fingerprint_to_hello() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let token = "t".repeat(64);
+        let payload = serialize_enrollment_request(&token, &key.public_key_pem()).unwrap();
+        let request: EnrollRequest = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(request.token, token);
+        assert!(request.worker.is_none());
+
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload);
+        assert!(
+            encoded.len() <= 512,
+            "security-critical enrollment header grew to {} characters",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn authenticated_hello_carries_worker_fingerprint() {
+        let hello = serde_json::json!({
+            "v": 2,
+            "kind": HELLO_KIND,
+            "task_id": "task_e_hello",
+            "worker": {
+                "hostname": "worker-a",
+                "intendant_version": "0.2.0-alpha.2",
+            },
+        });
+        let fingerprint = worker_hello_fingerprint("task_e_hello", &hello).unwrap();
+        assert_eq!(fingerprint.hostname.as_deref(), Some("worker-a"));
+        assert_eq!(
+            fingerprint.intendant_version.as_deref(),
+            Some("0.2.0-alpha.2")
+        );
+        assert!(worker_hello_fingerprint("task_e_other", &hello).is_none());
+    }
+
+    #[test]
     fn fingerprint_parse_tolerates_newer_worker_fields() {
-        // An older home receiving a newer worker's enrollment fingerprint
-        // must record what it knows and ignore the rest — the additive
-        // half of the ATTACHMENT_PROTOCOL_VERSION contract.
+        // An older home receiving a newer worker fingerprint must record
+        // what it knows and ignore the rest — the additive half of the
+        // ATTACHMENT_PROTOCOL_VERSION contract.
         let fingerprint =
             serde_json::from_value::<crate::codex_cloud::WorkerFingerprint>(serde_json::json!({
                 "hostname": "worker-a",
