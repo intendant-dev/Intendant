@@ -444,7 +444,8 @@ impl PresenceLayer {
         //   - completed / waiting_followup: a round just finished; this
         //     is exactly when the user types a follow-up, so accepting
         //     submit_task here is what unblocks follow-up dispatch
-        //   - "done: <reason>": TaskComplete-style terminal state
+        //   - "done: <reason>" / "failed: <reason>": TaskComplete-style
+        //     terminal states
         if let PresenceAction::SubmitTask(envelope) = action {
             let is_busy = {
                 let state = self.agent_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -930,13 +931,24 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
             }
         }
         AppEvent::TaskComplete {
-            reason, summary, ..
+            reason,
+            summary,
+            outcome,
+            ..
         } => {
             *last_phase = "done".to_string();
-            Some(PresenceEvent::TaskComplete {
-                reason: reason.clone(),
-                summary: summary.clone(),
-            })
+            match outcome {
+                crate::event::TaskOutcome::Completed => Some(PresenceEvent::TaskComplete {
+                    reason: reason.clone(),
+                    summary: summary.clone(),
+                }),
+                crate::event::TaskOutcome::Failed => Some(PresenceEvent::Error {
+                    message: match summary.as_deref().filter(|text| !text.trim().is_empty()) {
+                        Some(summary) => format!("Task failed ({reason}): {summary}"),
+                        None => format!("Task failed: {reason}"),
+                    },
+                }),
+            }
         }
         AppEvent::ApprovalRequired {
             id,
@@ -1249,6 +1261,7 @@ pub fn is_agent_idle(phase: &str) -> bool {
         phase,
         "" | "idle" | "waiting_for_task" | "waiting_followup" | "completed"
     ) || phase.starts_with("done")
+        || phase.starts_with("failed")
 }
 
 /// First `max_chars` characters of `s` as a borrowed slice (char-boundary
@@ -1297,9 +1310,15 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.last_output_summary = truncate(&combined, 500);
         }
         AppEvent::TaskComplete {
-            reason, summary, ..
+            reason,
+            summary,
+            outcome,
+            ..
         } => {
-            s.phase = format!("done: {}", reason);
+            s.phase = match outcome {
+                crate::event::TaskOutcome::Completed => format!("done: {reason}"),
+                crate::event::TaskOutcome::Failed => format!("failed: {reason}"),
+            };
             if let Some(text) = summary {
                 s.last_task_result = Some(text.clone());
             }
@@ -1447,6 +1466,7 @@ mod tests {
         assert!(is_agent_idle("done"));
         assert!(is_agent_idle("done: signal"));
         assert!(is_agent_idle("done: max_turns"));
+        assert!(is_agent_idle("failed: wrapper process exited"));
         // Busy states must still be rejected.
         assert!(!is_agent_idle("thinking"));
         assert!(!is_agent_idle("running_agent"));
@@ -1540,6 +1560,25 @@ mod tests {
 
         let event = AppEvent::LoopError("oops".to_string());
         assert!(filter_event(&event, &mut last_phase).is_some());
+    }
+
+    #[test]
+    fn failed_task_complete_is_announced_as_failure() {
+        let mut last_phase = String::new();
+        let event = AppEvent::TaskComplete {
+            session_id: None,
+            reason: "Claude Code process closed stdout".to_string(),
+            summary: Some("recovery was exhausted".to_string()),
+            outcome: crate::event::TaskOutcome::Failed,
+        };
+
+        let filtered = filter_event(&event, &mut last_phase).expect("presence event");
+        assert_eq!(last_phase, "done");
+        assert!(matches!(
+            filtered,
+            PresenceEvent::Error { message }
+                if message == "Task failed (Claude Code process closed stdout): recovery was exhausted"
+        ));
     }
 
     #[test]
@@ -1752,6 +1791,20 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert_eq!(s.phase, "done: done_signal");
+        }
+
+        update_agent_state(
+            &AppEvent::TaskComplete {
+                session_id: None,
+                reason: "wrapper process exited".to_string(),
+                summary: None,
+                outcome: crate::event::TaskOutcome::Failed,
+            },
+            &state,
+        );
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.phase, "failed: wrapper process exited");
         }
     }
 

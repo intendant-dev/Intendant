@@ -898,13 +898,12 @@ impl AppEventUpcaster {
                 session_id,
                 reason,
                 summary,
-                outcome: _,
+                outcome: task_outcome,
             } => {
-                let outcome = match reason.as_str() {
-                    "success" | "done" | "completed" => ActivityOutcome::Success,
-                    "cancelled" | "canceled" => ActivityOutcome::Cancelled,
-                    other => ActivityOutcome::Failed {
-                        message: other.to_string(),
+                let outcome = match task_outcome {
+                    crate::event::TaskOutcome::Completed => ActivityOutcome::Success,
+                    crate::event::TaskOutcome::Failed => ActivityOutcome::Failed {
+                        message: reason.clone(),
                     },
                 };
                 let mut out = vec![];
@@ -3923,20 +3922,23 @@ mod tests {
         assert_eq!(progress_id, start_id);
     }
 
-    /// A failing `TaskComplete` must propagate its failure outcome
-    /// to *both* the in-flight agent and the turn. Before the
-    /// outcome-threading fix, `close_pending_agent` hardcoded
-    /// `ActivityOutcome::Success`, so a failed task emitted a
-    /// Success ActivityCompleted for the agent and a Failed
-    /// ActivityCompleted for the turn — contradictory events in
-    /// the consumer's feed that would render as "the tool
-    /// succeeded but the turn it ran in failed." Verifies both
-    /// upcasters behave consistently on both failure and cancel.
+    /// `TaskComplete` must propagate its typed outcome to both the
+    /// in-flight agent and the turn. Reason text is descriptive and
+    /// cannot classify the terminal: failed externals routinely carry
+    /// prose such as "process closed stdout", while completed policy
+    /// exits may contain words such as "denied".
     #[test]
-    fn task_complete_failure_propagates_to_agent_and_turn() {
-        for (reason, expected) in &[("failed", "failed"), ("cancelled", "cancelled")] {
+    fn task_complete_uses_typed_outcome_for_agent_and_turn() {
+        for (reason, task_outcome, expected) in &[
+            ("success", crate::event::TaskOutcome::Failed, "failed"),
+            (
+                "Denied by user",
+                crate::event::TaskOutcome::Completed,
+                "success",
+            ),
+        ] {
             let mut u = AppEventUpcaster::new();
-            // Open turn + agent, then fail.
+            // Open turn + agent, then terminate it.
             let _ = u.upcast(&AppEvent::TurnStarted {
                 session_id: None,
                 turn: 4,
@@ -3955,7 +3957,7 @@ mod tests {
                 session_id: None,
                 reason: (*reason).to_string(),
                 summary: None,
-                outcome: crate::event::TaskOutcome::Completed,
+                outcome: *task_outcome,
             });
             let completions: Vec<_> = out
                 .iter()
@@ -3975,7 +3977,7 @@ mod tests {
             for (id, outcome) in &completions {
                 let outcome_matches = match (*expected, outcome) {
                     ("failed", ActivityOutcome::Failed { .. }) => true,
-                    ("cancelled", ActivityOutcome::Cancelled) => true,
+                    ("success", ActivityOutcome::Success) => true,
                     _ => false,
                 };
                 assert!(
