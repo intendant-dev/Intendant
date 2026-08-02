@@ -28,9 +28,7 @@ use crate::external_agent::codex::{
     decode_jsonrpc_message, write_codex_line, JsonRpcErrorResponse, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, JsonRpcResponseError,
 };
-use crate::external_agent::protocol_watch::{
-    codex_findings, ProtocolFinding, ProtocolWatchHandle,
-};
+use crate::external_agent::protocol_watch::{codex_findings, ProtocolFinding, ProtocolWatchHandle};
 
 /// Feature the broker requires from the App Server.
 pub(crate) const REALTIME_FEATURE: &str = "realtime_conversation";
@@ -194,11 +192,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> AppServerClient<W> {
     }
 
     /// Answer a server-initiated request (the dynamic tool lane).
-    pub(crate) async fn respond(
-        &self,
-        id: u64,
-        result: serde_json::Value,
-    ) -> Result<(), String> {
+    pub(crate) async fn respond(&self, id: u64, result: serde_json::Value) -> Result<(), String> {
         let line = serde_json::to_string(&JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
@@ -209,7 +203,6 @@ impl<W: AsyncWrite + Unpin + Send + 'static> AppServerClient<W> {
             .await
             .map_err(|e| format!("write response: {e}"))
     }
-
 }
 
 /// Wire a client + reader over arbitrary streams. The reader routes
@@ -374,8 +367,8 @@ impl VoiceAppServer {
         // over this stdio pipe). Stage B watched a backing model find
         // `$INTENDANT` and reach for `ctl`; nothing of the kind exists
         // here by construction.
-        for (name, _) in std::env::vars_os()
-            .filter_map(|(k, v)| k.into_string().ok().map(|k| (k, v)))
+        for (name, _) in
+            std::env::vars_os().filter_map(|(k, v)| k.into_string().ok().map(|k| (k, v)))
         {
             if name == "INTENDANT" || name.starts_with("INTENDANT_") {
                 cmd.env_remove(&name);
@@ -445,7 +438,11 @@ impl VoiceAppServer {
         self.client.notify("initialized", None).await?;
         let features = self
             .client
-            .request("experimentalFeature/list", Some(serde_json::json!({})), VOICE_REQUEST_TIMEOUT_SECS)
+            .request(
+                "experimentalFeature/list",
+                Some(serde_json::json!({})),
+                VOICE_REQUEST_TIMEOUT_SECS,
+            )
             .await
             .map_err(|e| format!("experimentalFeature/list: {e}"))?;
         let enabled = features
@@ -506,9 +503,18 @@ mod tests {
         assert!(joined.contains("-c features.plugins=false"));
         assert!(joined.contains("-c approval_policy=\"never\""));
         assert!(joined.contains("-c sandbox_mode=\"read-only\""));
-        assert!(!joined.contains("enabled=false"), "stub suppression shape is forbidden");
-        assert!(!joined.contains("mcp_servers.intendant"), "no MCP server on the presence thread");
-        assert!(!joined.contains("danger"), "no sandbox bypass on the voice lane");
+        assert!(
+            !joined.contains("enabled=false"),
+            "stub suppression shape is forbidden"
+        );
+        assert!(
+            !joined.contains("mcp_servers.intendant"),
+            "no MCP server on the presence thread"
+        );
+        assert!(
+            !joined.contains("danger"),
+            "no sandbox bypass on the voice lane"
+        );
     }
 
     // S-6 pin: the client request vocabulary is closed and carries no
@@ -636,10 +642,7 @@ mod tests {
     #[test]
     fn command_resolution_prefers_explicit_override() {
         assert_eq!(resolve_app_server_command(None, "codex"), "codex");
-        assert_eq!(
-            resolve_app_server_command(Some("  "), "codex"),
-            "codex"
-        );
+        assert_eq!(resolve_app_server_command(Some("  "), "codex"), "codex");
         assert_eq!(
             resolve_app_server_command(Some("/opt/chatgpt/codex"), "codex"),
             "/opt/chatgpt/codex"

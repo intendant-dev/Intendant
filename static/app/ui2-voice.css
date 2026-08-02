@@ -152,3 +152,27 @@ html.ui-v2 .ui2-vp-cam-slot .video-preview-info {
 html.ui-v2 .ui2-vp-cam-slot .video-preview-info .frame-id { color: var(--sky); }
 html.ui-v2 .ui2-vp-cam-slot #videoFps { display: none; } /* dead readout (never updated) — hidden under v2 */
 html.ui-v2 .ui2-vp-note { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+
+/* ── ChatGPT-lane voice card ── */
+.vp-chatgpt-card {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface0, rgba(127, 127, 127, 0.12));
+  font-size: 11px;
+  line-height: 1.5;
+}
+.vp-chatgpt-card .vp-cg-row { opacity: 0.85; }
+.vp-chatgpt-card .vp-cg-usage { opacity: 0.6; }
+.vp-chatgpt-card .vp-cg-err { color: var(--red, #d20f39); }
+.vp-chatgpt-card .vp-cg-purge {
+  margin-top: 4px;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--surface2, rgba(127, 127, 127, 0.35));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.vp-chatgpt-card .vp-cg-purge:hover { border-color: var(--red, #d20f39); }

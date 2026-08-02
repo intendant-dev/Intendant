@@ -195,8 +195,13 @@ pub enum VoiceCallPhase {
     Active,
     /// Teardown window: mic stopped; peer connection closes at
     /// `deadline_ms` or on the final usage flush, whichever first.
-    Draining { deadline_ms: u64, reason: String },
-    Closed { reason: String },
+    Draining {
+        deadline_ms: u64,
+        reason: String,
+    },
+    Closed {
+        reason: String,
+    },
 }
 
 /// Inputs to the machine. Fed by the provider from three sources: the
@@ -206,18 +211,28 @@ pub enum VoiceCallPhase {
 pub enum VoiceCallEvent {
     ConnectRequested,
     /// JS produced the local SDP offer.
-    OfferReady { sdp: String },
+    OfferReady {
+        sdp: String,
+    },
     /// The daemon relayed the provider's SDP answer.
-    AnswerReceived { sdp: String },
+    AnswerReceived {
+        sdp: String,
+    },
     PcConnected,
     /// The peer connection died underneath us (ICE failure, close).
-    PcTerminated { detail: String },
+    PcTerminated {
+        detail: String,
+    },
     /// Local stop: user clicked stop, or the provider is shutting down.
     LocalStopRequested,
     /// Daemon says the realtime session ended.
-    ServerClosed { reason: Option<String> },
+    ServerClosed {
+        reason: Option<String>,
+    },
     /// Daemon reports a voice-lane error.
-    ServerError { message: String },
+    ServerError {
+        message: String,
+    },
     /// The presence WS dropped: call-terminal (R4).
     SignalingLost,
     /// The final post-stop usage flush arrived on the data channel.
@@ -352,7 +367,10 @@ impl VoiceCallMachine {
             }
 
             // ── Server ended the session: drain for the usage flush.
-            (P::Preparing | P::Offering | P::Connecting | P::Active, E::ServerClosed { reason }) => {
+            (
+                P::Preparing | P::Offering | P::Connecting | P::Active,
+                E::ServerClosed { reason },
+            ) => {
                 let reason = reason.unwrap_or_else(|| "closed".into());
                 self.drain(now_ms, VOICE_DC_GRACE_MS, reason, &mut cmds);
             }
@@ -404,7 +422,13 @@ impl VoiceCallMachine {
                 });
                 self.phase = P::Closed { reason };
             }
-            (P::Draining { deadline_ms, reason }, E::Tick) => {
+            (
+                P::Draining {
+                    deadline_ms,
+                    reason,
+                },
+                E::Tick,
+            ) => {
                 if now_ms >= *deadline_ms {
                     let reason = reason.clone();
                     cmds.push(VoiceCallCommand::ClosePc);
@@ -460,7 +484,11 @@ mod tests {
             vec![VoiceCallCommand::SendOffer { sdp: "o".into() }]
         );
         assert_eq!(
-            advance(&mut m, VoiceCallEvent::AnswerReceived { sdp: "a".into() }, 2),
+            advance(
+                &mut m,
+                VoiceCallEvent::AnswerReceived { sdp: "a".into() },
+                2
+            ),
             vec![VoiceCallCommand::ApplyAnswer { sdp: "a".into() }]
         );
         assert_eq!(
@@ -570,7 +598,11 @@ mod tests {
             if target == "offering" {
                 return m;
             }
-            advance(&mut m, VoiceCallEvent::AnswerReceived { sdp: "a".into() }, 2);
+            advance(
+                &mut m,
+                VoiceCallEvent::AnswerReceived { sdp: "a".into() },
+                2,
+            );
             if target == "connecting" {
                 return m;
             }

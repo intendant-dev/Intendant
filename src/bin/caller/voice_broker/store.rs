@@ -84,8 +84,11 @@ impl VoiceThreadRecord {
         intendant_core::state_paths::create_private_dir_all(&dir)
             .map_err(|e| format!("create {}: {e}", dir.display()))?;
         let raw = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        intendant_core::state_paths::write_private_file(&thread_store_path(state_root), raw.as_bytes())
-            .map_err(|e| format!("write voice thread record: {e}"))
+        intendant_core::state_paths::write_private_file(
+            &thread_store_path(state_root),
+            raw.as_bytes(),
+        )
+        .map_err(|e| format!("write voice thread record: {e}"))
     }
 
     /// Adopt a freshly minted thread. When a predecessor existed, it
@@ -190,7 +193,10 @@ impl VoiceCheckpoint {
             self.summary = self.summary.chars().skip(drop.max(64)).collect();
         }
         self.recent_turns.extend_from_slice(call_turns);
-        let excess = self.recent_turns.len().saturating_sub(CHECKPOINT_RECENT_TURNS);
+        let excess = self
+            .recent_turns
+            .len()
+            .saturating_sub(CHECKPOINT_RECENT_TURNS);
         if excess > 0 {
             self.recent_turns.drain(..excess);
         }

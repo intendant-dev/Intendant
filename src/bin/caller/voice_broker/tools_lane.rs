@@ -137,10 +137,7 @@ pub(crate) enum EvidenceVerdict {
 /// text: the quote must appear inside one segment or inside the
 /// normalized concatenation of consecutive segments (ASR sometimes
 /// splits one utterance).
-pub(crate) fn verify_spoken_evidence(
-    claimed: &str,
-    user_segments: &[String],
-) -> EvidenceVerdict {
+pub(crate) fn verify_spoken_evidence(claimed: &str, user_segments: &[String]) -> EvidenceVerdict {
     let needle = normalize_for_evidence(claimed);
     if needle.chars().count() < MIN_EVIDENCE_CHARS {
         return EvidenceVerdict::Insufficient;
@@ -232,7 +229,10 @@ mod tests {
     #[test]
     fn dynamic_toolset_pins_composition_and_evidence_requirement() {
         let specs = dynamic_tool_specs();
-        assert_eq!(specs.len(), VOICE_AUTHORITY_TOOLS.len() + VOICE_READ_TOOLS.len());
+        assert_eq!(
+            specs.len(),
+            VOICE_AUTHORITY_TOOLS.len() + VOICE_READ_TOOLS.len()
+        );
         for spec in &specs {
             assert_eq!(spec["type"], "function");
             let name = spec["name"].as_str().unwrap();

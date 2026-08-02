@@ -10,6 +10,12 @@
 // app_state is pure Rust (no WASM deps) — available on all targets for testing.
 pub mod app_state;
 
+// The ChatGPT-subscription voice provider is a pure event->effects
+// translation over presence-core's call state machine — no web APIs, so
+// it compiles and tests natively; the wasm layer below executes its
+// effects (WS sends, RTC verbs to the JS glue, UI callbacks).
+pub mod chatgpt;
+
 // Pure-Rust envelope builders for the voice media send paths — compiled on
 // native too so their template-parity tests run in `cargo test`.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -117,6 +123,7 @@ mod wasm_impl {
         callbacks: Rc<Callbacks>,
         server: RefCell<server::ServerConnection>,
         gemini: RefCell<Option<gemini::GeminiProvider>>,
+        chatgpt: Rc<RefCell<Option<chatgpt::ChatGptProvider>>>,
         openai: Rc<RefCell<Option<openai::OpenAIProvider>>>,
         presence: Rc<RefCell<WasmPresence>>,
         active_provider: RefCell<String>, // "gemini" or "openai" or ""
@@ -129,12 +136,57 @@ mod wasm_impl {
         dashboard: RefCell<app_state::AppState>,
     }
 
+    fn now_ms() -> u64 {
+        js_sys::Date::now() as u64
+    }
+
+    /// Execute ChatGPT-provider effects. `server` is present on &self
+    /// entry points; inbound-message routing passes None (no effect
+    /// from an inbound voice message sends outbound — if one ever did,
+    /// it surfaces as a named diagnostic instead of vanishing).
+    fn run_chatgpt_effects_inner(
+        cb: &Rc<Callbacks>,
+        server: Option<&server::ServerConnection>,
+        effects: Vec<chatgpt::ChatGptEffect>,
+    ) {
+        for effect in effects {
+            match effect {
+                chatgpt::ChatGptEffect::ServerSend(raw) => match server {
+                    Some(srv) => {
+                        srv.send_raw(&raw);
+                    }
+                    None => cb.invoke_diagnostic(
+                        "voice_effect_dropped",
+                        "server send arose outside a connection context",
+                    ),
+                },
+                chatgpt::ChatGptEffect::RtcCommand(cmd) => {
+                    cb.invoke_voice_rtc(&cmd.to_string());
+                }
+                chatgpt::ChatGptEffect::VoiceReady => cb.invoke_voice_ready(),
+                chatgpt::ChatGptEffect::VoiceClosed { reason } => {
+                    // The JS voice controller reacts by running the same
+                    // disconnect path the stop button uses (idempotent),
+                    // which restores server text presence.
+                    cb.invoke_diagnostic("voice_call_ended", &reason);
+                }
+                chatgpt::ChatGptEffect::StatusUpdate(status) => {
+                    cb.invoke_voice_status(&status.to_string());
+                }
+                chatgpt::ChatGptEffect::Diagnostic { kind, detail } => {
+                    cb.invoke_diagnostic(&kind, &detail);
+                }
+            }
+        }
+    }
+
     fn route_server_message(
         cb: &Rc<Callbacks>,
         pending: &Rc<RefCell<std::collections::HashMap<String, js_sys::Function>>>,
         pending_async: &Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
         presence: &Rc<RefCell<WasmPresence>>,
         last_session_id: &Rc<RefCell<Option<String>>>,
+        chatgpt: &Rc<RefCell<Option<chatgpt::ChatGptProvider>>>,
         msg: serde_json::Value,
         fire_raw_message: bool,
     ) {
@@ -272,6 +324,18 @@ mod wasm_impl {
                     cb.invoke_inject_voice_text_passive(&text);
                 }
             }
+            Some(t @ ("voice_answer" | "voice_error" | "voice_closed" | "voice_status")) => {
+                let effects = chatgpt
+                    .borrow_mut()
+                    .as_mut()
+                    .map(|p| p.server_message(t, &msg, now_ms()));
+                if let Some(effects) = effects {
+                    // Server-message effects are callbacks-only by
+                    // construction (no WS sends arise from inbound
+                    // voice messages); the executor tolerates both.
+                    run_chatgpt_effects_inner(cb, None, effects);
+                }
+            }
             Some("display_input_authority_state") => {
                 if let (Some(display_id), Some(state)) = (
                     msg.get("display_id").and_then(|v| v.as_u64()),
@@ -316,6 +380,7 @@ mod wasm_impl {
                 callbacks,
                 server: RefCell::new(server),
                 gemini: RefCell::new(None),
+                chatgpt: Rc::new(RefCell::new(None)),
                 openai: Rc::new(RefCell::new(None)),
                 presence,
                 active_provider: RefCell::new(String::new()),
@@ -342,6 +407,16 @@ mod wasm_impl {
         #[wasm_bindgen]
         pub fn set_on_terminal_exited(&self, f: Function) {
             *self.callbacks.on_terminal_exited.borrow_mut() = Some(f);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_on_voice_rtc(&self, f: Function) {
+            *self.callbacks.on_voice_rtc.borrow_mut() = Some(f);
+        }
+
+        #[wasm_bindgen]
+        pub fn set_on_voice_status(&self, f: Function) {
+            *self.callbacks.on_voice_status.borrow_mut() = Some(f);
         }
 
         #[wasm_bindgen]
@@ -460,6 +535,7 @@ mod wasm_impl {
                 let pending_async = self.pending_async_calls.clone();
                 let presence = self.presence.clone();
                 let last_session_id = self.last_server_session_id.clone();
+                let chatgpt = self.chatgpt.clone();
                 Box::new(move |msg: serde_json::Value| {
                     route_server_message(
                         &cb,
@@ -467,6 +543,7 @@ mod wasm_impl {
                         &pending_async,
                         &presence,
                         &last_session_id,
+                        &chatgpt,
                         msg,
                         true,
                     );
@@ -507,6 +584,7 @@ mod wasm_impl {
                 &self.pending_async_calls,
                 &self.presence,
                 &self.last_server_session_id,
+                &self.chatgpt,
                 val,
                 false,
             );
@@ -563,6 +641,14 @@ mod wasm_impl {
                     openai.connect(token, model.as_deref(), prompt, &tools_js);
                     *self.openai.borrow_mut() = Some(openai);
                 }
+                "chatgpt" => {
+                    // Subscription lane: no browser-held token — the daemon
+                    // brokers signaling; media flows browser<->provider.
+                    let mut provider = chatgpt::ChatGptProvider::new();
+                    let effects = provider.connect(now_ms());
+                    *self.chatgpt.borrow_mut() = Some(provider);
+                    self.run_chatgpt_effects(effects);
+                }
                 _ => {
                     self.callbacks
                         .invoke_error(&format!("Unknown voice provider: {}", provider));
@@ -573,6 +659,9 @@ mod wasm_impl {
             let actual_model = model.as_deref().unwrap_or(match provider {
                 "gemini" => "gemini-2.5-flash-native-audio-preview-12-2025",
                 "openai" => "gpt-4o-realtime-preview",
+                // Resolved backing model arrives on voice_status after
+                // start; this is only the pre-start display label.
+                "chatgpt" => "chatgpt-subscription-voice",
                 _ => "unknown",
             });
             {
@@ -583,6 +672,49 @@ mod wasm_impl {
             self.server.borrow().send_presence_connect();
         }
 
+        fn run_chatgpt_effects(&self, effects: Vec<chatgpt::ChatGptEffect>) {
+            run_chatgpt_effects_inner(&self.callbacks, Some(&self.server.borrow()), effects);
+        }
+
+        /// Event from the JS RTC glue for the ChatGPT voice lane
+        /// (offer_ready / pc_connected / pc_terminated / mic_error /
+        /// dc_event / tick). The glue executes verbs; policy stays here.
+        #[wasm_bindgen]
+        pub fn chatgpt_rtc_event(&self, kind: &str, payload: &str) {
+            let effects = self
+                .chatgpt
+                .borrow_mut()
+                .as_mut()
+                .map(|p| p.rtc_event(kind, payload, now_ms()));
+            if let Some(effects) = effects {
+                self.run_chatgpt_effects(effects);
+            }
+        }
+
+        /// The presence WS dropped. Call-terminal for a live ChatGPT
+        /// voice call: mic stops now, the peer connection closes within
+        /// the bounded grace (a dead daemon must never leave a live mic
+        /// streaming).
+        /// Owner purge lever for the durable voice presence thread (D1).
+        #[wasm_bindgen]
+        pub fn voice_thread_purge(&self) {
+            self.server
+                .borrow()
+                .send_raw(&serde_json::json!({"t": "voice_thread_purge"}).to_string());
+        }
+
+        #[wasm_bindgen]
+        pub fn voice_signaling_lost(&self) {
+            let effects = self
+                .chatgpt
+                .borrow_mut()
+                .as_mut()
+                .map(|p| p.signaling_lost(now_ms()));
+            if let Some(effects) = effects {
+                self.run_chatgpt_effects(effects);
+            }
+        }
+
         #[wasm_bindgen]
         pub fn disconnect_voice(&self) {
             if let Some(ref mut g) = *self.gemini.borrow_mut() {
@@ -590,6 +722,14 @@ mod wasm_impl {
             }
             if let Some(ref mut o) = *self.openai.borrow_mut() {
                 o.disconnect();
+            }
+            let chatgpt_effects = self
+                .chatgpt
+                .borrow_mut()
+                .as_mut()
+                .map(|p| p.disconnect(now_ms()));
+            if let Some(effects) = chatgpt_effects {
+                self.run_chatgpt_effects(effects);
             }
             *self.active_provider.borrow_mut() = String::new();
 
@@ -668,6 +808,13 @@ mod wasm_impl {
                     if let Some(ref o) = *self.openai.borrow() {
                         o.send_text(text);
                     }
+                }
+                "chatgpt" => {
+                    let _ = text;
+                    self.callbacks.invoke_diagnostic(
+                        "voice_text_unsupported",
+                        "the chatgpt voice lane takes spoken input; text rides the dashboard",
+                    );
                 }
                 _ => {}
             }

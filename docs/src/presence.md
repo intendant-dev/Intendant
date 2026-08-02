@@ -200,6 +200,56 @@ The presence session protocol (`PresenceSession`, `PresenceEventWindow` in
 3. On reconnect, `presence_welcome` carries every event since `last_event_seq`
    plus the last checkpoint summary, so the voice model resumes mid-thread.
 
+## The ChatGPT-Subscription Voice Lane
+
+`live_provider = "chatgpt"` selects a third live lane with a different
+shape: instead of a browser-held key and a provider WebSocket, the daemon's
+**Voice broker** (`src/bin/caller/voice_broker/`) owns a dedicated, hardened
+Codex App Server child per call session, and media flows browser⇄provider
+over WebRTC — the daemon relays SDP only and never carries audio. Auth
+custody stays entirely inside the Codex process (subscription OAuth; no API
+key exists on this lane, and the broker's request vocabulary is a closed
+allow-list with no auth-custody surface).
+
+- **Hardened profile, both layers.** Launch args pin `--enable
+  realtime_conversation`, `mcp_servers={}` (full wipe — no inherited MCP
+  server exists on the presence thread), `approval_policy="never"`,
+  `sandbox_mode="read-only"`, plugins off, a neutral cwd, and an env scrub
+  of every `INTENDANT*` variable; `thread/start`/`thread/resume` re-pin
+  cwd/sandbox/approvals at the thread layer.
+- **Permanent presence thread, checkpoint-authoritative.** One durable
+  thread (id + successor lineage in `presence/voice_thread.json` under the
+  state root) is resumed each call; conversational memory rides a persisted
+  checkpoint that seeds every realtime session's `initialItems` under a
+  deliberate token budget. The dashboard voice card carries the owner's
+  purge lever (`thread/delete` + local identity reset).
+- **Tool lane = dynamicTools.** The presence toolset (minus the
+  frame-inspection pair) is declared on the backing thread and executed by
+  the broker itself. Authority-bearing tools (`approve_action`,
+  `deny_action`, `skip_action`, `respond_to_question`, `set_autonomy`,
+  `submit_task`, `send_message`) pass a three-part gate: a live owner
+  anchor (the authenticated dashboard presence connection that owns the
+  call, probed at entry and again immediately before dispatch), verbatim
+  spoken-instruction evidence mechanically verified against the user-role
+  sideband transcript, and a durable two-principal audit line
+  (`presence/voice_authority_audit.jsonl`) naming the acting broker surface
+  and the attributed owner surface on every dispatch and refusal.
+  Authorization is unchanged — the same authenticated active-connection
+  authority browser presence approvals ride; attribution never widens
+  authority.
+- **Teardown rules.** The browser closes its own peer connection on stop
+  (bounded data-channel grace to capture the final usage flush), signaling
+  loss is call-terminal with the mic stopped immediately, app-server death
+  is call-terminal for the browser, and handover or a dead connection stops
+  the call the connection owned. All of it is pinned by native tests over
+  the pure call state machine in `presence-core::voice` and a scripted mock
+  app-server.
+- **Allowance visibility.** The broker pulls `account/rateLimits/read`
+  before and after every call, folding limit-keyed windows into the shared
+  codex account view (non-codex limit ids become their own named window
+  classes); the browser forwards the data channel's `session.usage.updated`
+  telemetry as provider-reported decoration on the voice card.
+
 ## Presence Tools
 
 Presence has **12 tools**, defined once in `crates/presence-core/src/tools.rs`

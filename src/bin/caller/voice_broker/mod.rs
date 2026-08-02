@@ -162,7 +162,10 @@ impl VoiceBroker {
     }
 
     pub(crate) fn status(&self) -> VoiceStatus {
-        self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn set_status(&self, update: impl FnOnce(&mut VoiceStatus)) -> VoiceStatus {
@@ -204,7 +207,11 @@ impl VoiceBroker {
             send_voice_error(&reply_tx, &format!("voice pin invalid: {e}"));
             return;
         }
-        let wiring = self.wiring.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let wiring = self
+            .wiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let Some(wiring) = wiring else {
             send_voice_error(&reply_tx, "voice broker is not wired yet");
             return;
@@ -286,7 +293,8 @@ impl VoiceBroker {
     /// WS drop): the call is stopped — a dead browser must not leave a
     /// realtime session running.
     pub(crate) async fn connection_closed(&self, connection_id: &str) {
-        self.signal_stop(connection_id, "connection-closed", true).await;
+        self.signal_stop(connection_id, "connection-closed", true)
+            .await;
     }
 
     /// Presence handover force-disconnected the previous holder: the
@@ -339,10 +347,7 @@ impl VoiceBroker {
 
     /// Owner purge lever (D1): delete the durable presence thread and
     /// drop the identity + lineage; the next call mints fresh.
-    pub(crate) async fn purge_thread(
-        &self,
-        reply_tx: mpsc::UnboundedSender<String>,
-    ) {
+    pub(crate) async fn purge_thread(&self, reply_tx: mpsc::UnboundedSender<String>) {
         if self.active.lock().await.is_some() {
             send_voice_error(&reply_tx, "cannot purge the presence thread during a call");
             return;
@@ -414,7 +419,10 @@ impl VoiceBroker {
         {
             Ok(server) => server,
             Err(e) => {
-                send_voice_error(&deps.reply_tx, &format!("voice app-server spawn failed: {e}"));
+                send_voice_error(
+                    &deps.reply_tx,
+                    &format!("voice app-server spawn failed: {e}"),
+                );
                 return;
             }
         };
@@ -493,7 +501,9 @@ impl VoiceBroker {
                     thread_ready = true;
                 }
                 Err(e) => {
-                    eprintln!("[voice] Warning: presence thread resume failed ({e}); minting successor");
+                    eprintln!(
+                        "[voice] Warning: presence thread resume failed ({e}); minting successor"
+                    );
                     record_resume_failure_reason(&mut record, &e);
                 }
             }
@@ -536,7 +546,10 @@ impl VoiceBroker {
                     }
                 }
                 Err(e) => {
-                    send_voice_error(&deps.reply_tx, &format!("presence thread start failed: {e}"));
+                    send_voice_error(
+                        &deps.reply_tx,
+                        &format!("presence thread start failed: {e}"),
+                    );
                     return CallOutcome::failed("thread-start-failed");
                 }
             }
@@ -1092,8 +1105,7 @@ fn thread_pins(
         params["config"] = serde_json::json!({ "model_reasoning_effort": effort });
     }
     if declare_tools {
-        params["dynamicTools"] =
-            serde_json::Value::Array(tools_lane::dynamic_tool_specs());
+        params["dynamicTools"] = serde_json::Value::Array(tools_lane::dynamic_tool_specs());
     }
     params
 }
@@ -1157,7 +1169,9 @@ fn injection_for(event: &presence_core::PresenceEvent) -> Option<Injection> {
     let formatted = presence_core::format_event(event);
     match event {
         E::ApprovalNeeded { .. } | E::HumanQuestion { .. } => Some(Injection::Speech(formatted)),
-        E::TaskComplete { .. } | E::ApprovalResolved { .. } | E::Error { .. }
+        E::TaskComplete { .. }
+        | E::ApprovalResolved { .. }
+        | E::Error { .. }
         | E::BudgetWarning { .. } => Some(Injection::Text(format!(
             "State update (inform the owner if relevant): {formatted}"
         ))),
@@ -1214,14 +1228,11 @@ fn build_state_block(deps: &VoiceCallDeps) -> String {
                 .clone()
         })
         .unwrap_or_default();
-    let status = match crate::presence::dispatch_tool_call(
-        "check_status",
-        &serde_json::json!({}),
-        &state,
-    ) {
-        crate::presence::PresenceAction::TextResult(text) => text,
-        _ => String::new(),
-    };
+    let status =
+        match crate::presence::dispatch_tool_call("check_status", &serde_json::json!({}), &state) {
+            crate::presence::PresenceAction::TextResult(text) => text,
+            _ => String::new(),
+        };
     format!(
         "You are the voice of this Intendant daemon's presence layer. You hear the owner and can act through your tools; authority-bearing tools require quoting the owner's exact spoken words as spoken_instruction.\n\nLive state at session start:\n{status}"
     )
@@ -1268,7 +1279,9 @@ fn parse_keyed_rate_limit_windows(
     now_epoch: u64,
 ) -> Vec<crate::types::SessionLimitWindow> {
     let mut out = Vec::new();
-    let keyed = response.get("rateLimitsByLimitId").and_then(|k| k.as_object());
+    let keyed = response
+        .get("rateLimitsByLimitId")
+        .and_then(|k| k.as_object());
     match keyed {
         Some(map) => {
             for (limit_id, snapshot) in map {
@@ -1335,7 +1348,11 @@ mod tests {
         server_side: tokio::io::DuplexStream,
         fail_resume: bool,
         auto_answer_realtime: bool,
-    ) -> (Arc<std::sync::Mutex<Vec<serde_json::Value>>>, mpsc::UnboundedSender<String>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        mpsc::UnboundedSender<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (read_half, mut write_half) = tokio::io::split(server_side);
         let requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1598,7 +1615,11 @@ mod tests {
         // Layer-2 pins on the wire: thread/start carried cwd, sandbox,
         // approvalPolicy, non-ephemeral, dynamicTools; realtime start
         // carried includeStartupContext:false + webrtc transport.
-        let seen = rig.requests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let seen = rig
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let start = seen
             .iter()
             .find(|m| m["method"] == "thread/start")
@@ -1606,8 +1627,13 @@ mod tests {
         assert_eq!(start["params"]["sandbox"], "read-only");
         assert_eq!(start["params"]["approvalPolicy"], "never");
         assert_eq!(start["params"]["ephemeral"], false);
-        assert!(start["params"]["cwd"].as_str().unwrap().contains("neutral-cwd"));
-        let tools = start["params"]["dynamicTools"].as_array().expect("tools declared");
+        assert!(start["params"]["cwd"]
+            .as_str()
+            .unwrap()
+            .contains("neutral-cwd"));
+        let tools = start["params"]["dynamicTools"]
+            .as_array()
+            .expect("tools declared");
         assert_eq!(
             tools.len(),
             VOICE_AUTHORITY_TOOLS.len() + VOICE_READ_TOOLS.len()
@@ -1764,7 +1790,9 @@ mod tests {
             "approve_action",
             serde_json::json!({"id": "alpha-7", "spoken_instruction": "approve alpha-7 immediately"}),
         );
-        let resp = server_reply_for(&requests, 101).await.expect("tool response");
+        let resp = server_reply_for(&requests, 101)
+            .await
+            .expect("tool response");
         assert_eq!(resp["result"]["success"], false);
         assert!(resp["result"]["contentItems"][0]["text"]
             .as_str()
@@ -1782,7 +1810,9 @@ mod tests {
             "approve_action",
             serde_json::json!({"id": "alpha-7", "spoken_instruction": "approve alpha-7 immediately"}),
         );
-        let resp = server_reply_for(&requests, 102).await.expect("tool response");
+        let resp = server_reply_for(&requests, 102)
+            .await
+            .expect("tool response");
         assert_eq!(resp["result"]["success"], true);
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
@@ -1806,7 +1836,9 @@ mod tests {
             "deny_action",
             serde_json::json!({"id": "alpha-8", "spoken_instruction": "approve alpha-7 immediately"}),
         );
-        let resp = server_reply_for(&requests, 103).await.expect("tool response");
+        let resp = server_reply_for(&requests, 103)
+            .await
+            .expect("tool response");
         assert_eq!(resp["result"]["success"], false);
         assert!(resp["result"]["contentItems"][0]["text"]
             .as_str()
@@ -1874,7 +1906,9 @@ mod tests {
             "skip_action",
             serde_json::json!({"id": "alpha-9", "spoken_instruction": "skip the alpha-9 action now"}),
         );
-        let resp = server_reply_for(&requests, 201).await.expect("tool response");
+        let resp = server_reply_for(&requests, 201)
+            .await
+            .expect("tool response");
         assert_eq!(resp["result"]["success"], false);
         assert!(resp["result"]["contentItems"][0]["text"]
             .as_str()
@@ -1910,7 +1944,9 @@ mod tests {
         });
         let _ = recv_t(&mut reply_rx, "voice_answer").await;
         send_tool_call(&push_tx, 301, "check_status", serde_json::json!({}));
-        let resp = server_reply_for(&requests, 301).await.expect("tool response");
+        let resp = server_reply_for(&requests, 301)
+            .await
+            .expect("tool response");
         assert_eq!(resp["result"]["success"], true);
         stop_tx.send("stopped".to_string()).unwrap();
         let _ = task.await.unwrap();

@@ -37,6 +37,11 @@ pub struct Callbacks {
     pub on_voice_interrupted: RefCell<Option<Function>>,
     /// Error from any connection.
     pub on_error: RefCell<Option<Function>>,
+    /// ChatGPT-lane RTC command for the JS glue (JSON string with
+    /// `kind`; the glue executes verbs, policy stays in Rust).
+    pub on_voice_rtc: RefCell<Option<Function>>,
+    /// ChatGPT-lane voice status payload for the dashboard card (JSON string).
+    pub on_voice_status: RefCell<Option<Function>>,
     /// Diagnostic event (kind, detail) — for debug logging.
     pub on_diagnostic: RefCell<Option<Function>>,
     /// Inject system text into the active voice model (for async query results).
@@ -112,6 +117,18 @@ impl Callbacks {
     pub fn invoke_server_event(&self, event: &JsValue) {
         if let Some(ref f) = *self.on_server_event.borrow() {
             let _ = f.call1(&JsValue::NULL, event);
+        }
+    }
+
+    pub fn invoke_voice_rtc(&self, command_json: &str) {
+        if let Some(ref f) = *self.on_voice_rtc.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(command_json));
+        }
+    }
+
+    pub fn invoke_voice_status(&self, status_json: &str) {
+        if let Some(ref f) = *self.on_voice_status.borrow() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(status_json));
         }
     }
 
