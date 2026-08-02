@@ -354,6 +354,22 @@ instead of leaving them down until the next restart.
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | `false` leaves dead-boot sessions down for the owner to resume by hand and skips the commission sweep and the predecessor-exit watch. `INTENDANT_BOOT_READOPT=0`/`1` overrides the file in either direction |
 
+### `[landing_shepherd]`
+
+The daemon-side closed-loop watch over the fleet's open PRs (see
+[Multi-Agent](./multi-agent.md#the-landing-shepherd)): armed-DIRTY
+conflicts, merge-queue ejections, auto-merge disarms, and
+armed-but-never-queued stalls wake the owning session with the
+reconcile ritual, or park a `needs-you` agenda item when the seat is
+gone. Observe-and-wake only; `gh`-based with silent degrade when `gh`
+is absent; runs on the scheduler-lease holder only.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | `false` turns the watch off. `INTENDANT_LANDING_SHEPHERD=0`/`1` overrides the file in either direction |
+| `poll_secs` | int | `60` | Poll cadence in seconds (floor 5). `INTENDANT_LANDING_SHEPHERD_POLL_MS` overrides for rigs (floor 250 ms) |
+| `stall_secs` | int | `300` | Armed-with-settled-checks-but-never-queued grace before the stall wake (floor 30) |
+
 ### `[agent]` and external backends
 
 Routes coding tasks to an external CLI agent instead of the native loop (see

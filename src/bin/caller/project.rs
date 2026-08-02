@@ -119,6 +119,42 @@ fn default_readopt_enabled() -> bool {
     true
 }
 
+/// `[landing_shepherd]` in intendant.toml: the daemon-side closed-loop
+/// watch over the fleet's open PRs (armed-DIRTY conflicts, queue
+/// ejections, auto-merge disarms, armed-but-never-queued stalls) that
+/// wakes the owning session or parks a needs-you agenda item. See
+/// `landing_shepherd`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LandingShepherdConfig {
+    /// Default ON — the shepherd is the fleet-wide backstop for armed
+    /// landings nobody is watching; it degrades silently when `gh` is
+    /// absent. `enabled = false` (or `INTENDANT_LANDING_SHEPHERD=0`)
+    /// turns the watch off.
+    #[serde(default = "default_landing_shepherd_enabled")]
+    pub enabled: bool,
+    /// Poll cadence override in seconds (default 60, floor 5).
+    #[serde(default)]
+    pub poll_secs: Option<u64>,
+    /// Armed-but-never-queued stall grace override in seconds
+    /// (default 300, floor 30).
+    #[serde(default)]
+    pub stall_secs: Option<u64>,
+}
+
+impl Default for LandingShepherdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_landing_shepherd_enabled(),
+            poll_secs: None,
+            stall_secs: None,
+        }
+    }
+}
+
+fn default_landing_shepherd_enabled() -> bool {
+    true
+}
+
 /// `[integrations]` in intendant.toml — non-secret configuration for
 /// external service integrations. Credentials never live here: the
 /// GitHub App key and ids are sealed in OS-keystore custody
@@ -913,6 +949,10 @@ pub struct ProjectConfig {
     /// configuration (watch lists, cadences). See [`IntegrationsConfig`].
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// `[landing_shepherd]` section — the closed-loop watch over the
+    /// fleet's open PRs (default ON). See [`LandingShepherdConfig`].
+    #[serde(default)]
+    pub landing_shepherd: LandingShepherdConfig,
     /// `[readopt]` section — the boot auto-readopt pass (default ON).
     /// See [`ReadoptConfig`].
     #[serde(default)]

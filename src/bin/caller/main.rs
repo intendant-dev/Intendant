@@ -63,6 +63,7 @@ mod global_store;
 mod handover;
 mod hosted_verify;
 mod key_custody;
+mod landing_shepherd;
 mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
