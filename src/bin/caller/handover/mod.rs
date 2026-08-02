@@ -1609,8 +1609,18 @@ mod tests {
         // transition (definition + two call sites), one class toggle
         // shared by both kinds (the chip keeps its own).
         assert_eq!(fragment.matches("bannerStoreState(").count(), 3);
-        assert_eq!(fragment.matches("bannerStoreState(key, 'collapsed')").count(), 1);
-        assert_eq!(fragment.matches("bannerStoreState(key, 'expanded')").count(), 1);
+        assert_eq!(
+            fragment
+                .matches("bannerStoreState(key, 'collapsed')")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fragment
+                .matches("bannerStoreState(key, 'expanded')")
+                .count(),
+            1
+        );
         assert_eq!(fragment.matches("classList.toggle('collapsed'").count(), 2);
         // Both collapse buttons stop their click from bubbling into
         // the expand handler the collapsed re-render installs on the
