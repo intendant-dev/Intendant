@@ -619,7 +619,7 @@ fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
         "remote_command",
         manual_http_tool_definition!(
             "remote_command",
-            "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately through acquiring/preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local.",
+            "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, an optional pushed branch hint, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately with acquisition stage/task/deadline detail through preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local.",
             RemoteCommandParams
         ),
     );

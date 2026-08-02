@@ -298,6 +298,40 @@ impl RemoteCommandState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteCommandAcquisitionStage {
+    CheckingForWorker,
+    SubmittingTask,
+    WaitingForWorker,
+    Attached,
+    ProviderEnded,
+    TimedOut,
+}
+
+/// Live detail for the provider-owned worker acquisition that precedes an
+/// automatic command. The command timeout starts only after this succeeds;
+/// this separate deadline bounds the potentially cold provider bootstrap.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RemoteCommandAcquisitionView {
+    pub stage: RemoteCommandAcquisitionStage,
+    pub coalesced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_state: Option<crate::codex_cloud::AttachmentState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_provider_error: Option<String>,
+    pub timeout_s: u64,
+    pub deadline_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RemoteCommandResult {
     pub state: RemoteCommandState,
@@ -371,6 +405,8 @@ pub(crate) struct RemoteCommandJobView {
     pub timeout_s: u64,
     pub source: RemoteSourceMode,
     pub cache: RemoteCacheMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition: Option<RemoteCommandAcquisitionView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -545,6 +581,7 @@ async fn start_remote_command(
 
     let job_id = format!("remote-{}", uuid::Uuid::new_v4());
     let now = crate::codex_cloud::now_unix_ms();
+    let acquire_timeout_s = scheduler::acquire_timeout_s();
     let view = RemoteCommandJobView {
         job_id: job_id.clone(),
         host: requested_host.clone(),
@@ -563,6 +600,18 @@ async fn start_remote_command(
         timeout_s: spec.timeout_s,
         source: source_mode,
         cache: spec.cache,
+        acquisition: (requested_host == "auto").then(|| RemoteCommandAcquisitionView {
+            stage: RemoteCommandAcquisitionStage::CheckingForWorker,
+            coalesced: false,
+            branch: branch_hint.clone(),
+            task_id: None,
+            task_url: None,
+            provider_status: None,
+            attachment_state: None,
+            last_provider_error: None,
+            timeout_s: acquire_timeout_s,
+            deadline_at_unix_ms: now.saturating_add(acquire_timeout_s.saturating_mul(1000)),
+        }),
         snapshot_digest: snapshot.as_ref().map(|snapshot| snapshot.digest.clone()),
         snapshot_bytes: snapshot
             .as_ref()
@@ -582,6 +631,7 @@ async fn start_remote_command(
             cache_store,
             snapshot,
             branch_hint,
+            acquire_timeout_s,
         )
         .await
         {
@@ -604,9 +654,24 @@ async fn prepare_and_dispatch(
     cache_store: Option<cache_relay::HomeCacheStore>,
     snapshot: Option<source::HomeSourceSnapshot>,
     branch_hint: Option<String>,
+    acquire_timeout_s: u64,
 ) -> Result<(), String> {
     let host = if requested_host == "auto" {
-        let acquired = scheduler::acquire_worker(&spec.expected_revision, branch_hint).await?;
+        let progress_job_id = job_id.clone();
+        let observer: scheduler::AcquisitionObserver = Arc::new(move |progress| {
+            update_home_job(&progress_job_id, |job| {
+                if !job.state.is_terminal() {
+                    job.acquisition = Some(progress);
+                }
+            });
+        });
+        let acquired = scheduler::acquire_worker(
+            &spec.expected_revision,
+            branch_hint,
+            acquire_timeout_s,
+            observer,
+        )
+        .await?;
         acquired.host
     } else {
         requested_host
@@ -914,6 +979,7 @@ pub(crate) async fn execute_remote_command_operation(
     match params {
         crate::mcp::RemoteCommandParams::Start {
             host,
+            branch,
             argv,
             cwd,
             env,
@@ -923,7 +989,7 @@ pub(crate) async fn execute_remote_command_operation(
             cache,
             timeout_s,
         } => {
-            let (expected_revision, snapshot, branch_hint) = match source {
+            let (expected_revision, snapshot, derived_branch) = match source {
                 RemoteSourceMode::GitRevision => {
                     let revision = expected_revision
                         .map(|revision| revision.trim().to_string())
@@ -949,6 +1015,7 @@ pub(crate) async fn execute_remote_command_operation(
                     (base_revision, Some(snapshot), branch_hint)
                 }
             };
+            let branch_hint = scheduler::select_branch(branch, derived_branch)?;
             let DurableSccacheConfig {
                 cache_env,
                 cache_relay_token,
@@ -2191,6 +2258,7 @@ mod tests {
                 timeout_s: 10,
                 source: RemoteSourceMode::GitRevision,
                 cache: RemoteCacheMode::None,
+                acquisition: None,
                 snapshot_digest: None,
                 snapshot_bytes: None,
                 created_at_unix_ms: now,

@@ -42,7 +42,7 @@ impl ProviderLeaseState {
         }
     }
 
-    fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Finished | Self::Failed | Self::Cancelled)
     }
 }
@@ -207,6 +207,14 @@ pub fn warmth_label(warmth: Warmth) -> &'static str {
         Warmth::Unknown => "unknown",
         Warmth::ColdLikely => "cold",
     }
+}
+
+/// Whether this daemon can dispatch remote-compute frames to the worker now.
+/// Provider warmth and setup-cache likelihood are deliberately separate: a
+/// task can still look warm to the provider while its home attachment is gone.
+pub(crate) fn lease_remote_compute_usable(lease: &WorkerLease) -> bool {
+    lease.attachment_state == AttachmentState::Connected
+        && crate::codex_cloud_attach::attachment_channel(&lease.task_id).is_some()
 }
 
 #[derive(Debug, Clone)]
@@ -532,38 +540,49 @@ async fn run_list(args: &[String]) -> Result<(), String> {
 fn print_lease_table(leases: &[WorkerLease]) {
     let now = now_unix_ms();
     println!(
-        "{:<38}  {:<10}  {:<13}  {:<8}  TITLE",
-        "TASK", "PROVIDER", "ATTACHMENT", "WARMTH"
+        "{:<38}  {:<10}  {:<13}  {:<8}  {:<8}  TITLE",
+        "TASK", "PROVIDER", "ATTACHMENT", "REMOTE", "CACHE"
     );
     for lease in leases {
         println!(
-            "{:<38}  {:<10}  {:<13}  {:<8}  {}",
+            "{:<38}  {:<10}  {:<13}  {:<8}  {:<8}  {}",
             lease.task_id,
             lease.provider_status,
             attachment_label(&lease.attachment_state),
+            remote_compute_label(lease_remote_compute_usable(lease)),
             warmth_label(lease_warmth(lease, now)),
             lease.title
         );
     }
 }
 
-/// Serialize leases with the derived warmth attached — computed on the
-/// daemon side so no frontend re-implements the heuristic.
+/// Serialize leases with independent provider-cache and live-attachment
+/// derivations so no frontend has to infer reachability from warmth.
 pub fn leases_json(leases: &[WorkerLease]) -> Vec<serde_json::Value> {
     let now = now_unix_ms();
     leases
         .iter()
-        .map(|lease| {
-            let mut value = serde_json::to_value(lease).unwrap_or(serde_json::Value::Null);
-            if let Some(map) = value.as_object_mut() {
-                map.insert(
-                    "warmth".to_string(),
-                    serde_json::Value::String(warmth_label(lease_warmth(lease, now)).to_string()),
-                );
-            }
-            value
-        })
+        .map(|lease| lease_json_at(lease, now))
         .collect()
+}
+
+fn lease_json(lease: &WorkerLease) -> serde_json::Value {
+    lease_json_at(lease, now_unix_ms())
+}
+
+fn lease_json_at(lease: &WorkerLease, now: u64) -> serde_json::Value {
+    let mut value = serde_json::to_value(lease).unwrap_or(serde_json::Value::Null);
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "warmth".to_string(),
+            serde_json::Value::String(warmth_label(lease_warmth(lease, now)).to_string()),
+        );
+        map.insert(
+            "remote_compute_usable".to_string(),
+            serde_json::Value::Bool(lease_remote_compute_usable(lease)),
+        );
+    }
+    value
 }
 
 fn transition_title(transition: &TerminalTransition) -> String {
@@ -579,7 +598,7 @@ fn transition_title(transition: &TerminalTransition) -> String {
 /// without a daemon the printed notice is the whole delivery. The store
 /// lock already guarantees each edge is observed once, so whoever observes
 /// it parks it.
-async fn announce_transitions(transitions: &[TerminalTransition]) {
+pub(crate) async fn announce_transitions(transitions: &[TerminalTransition]) {
     for transition in transitions {
         eprintln!(
             "[intendant] task {} is now {} — {}",
@@ -784,7 +803,7 @@ async fn run_status(args: &[String]) -> Result<(), String> {
         if json {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&lease)
+                serde_json::to_string_pretty(&lease_json(&lease))
                     .map_err(|e| format!("serialize worker lease: {e}"))?
             );
         } else {
@@ -2585,7 +2604,11 @@ fn print_lease(lease: &WorkerLease) {
         attachment_label(&lease.attachment_state)
     );
     println!(
-        "  warmth: {}",
+        "  remote compute: {}",
+        remote_compute_label(lease_remote_compute_usable(lease))
+    );
+    println!(
+        "  provider cache: {}",
         warmth_label(lease_warmth(lease, now_unix_ms()))
     );
     if lease.turns_observed > 0 {
@@ -2637,6 +2660,14 @@ fn attachment_label(state: &AttachmentState) -> &'static str {
         AttachmentState::Connected => "connected",
         AttachmentState::Disconnected => "disconnected",
         AttachmentState::Expired => "expired",
+    }
+}
+
+fn remote_compute_label(usable: bool) -> &'static str {
+    if usable {
+        "usable"
+    } else {
+        "offline"
     }
 }
 
@@ -3037,6 +3068,14 @@ mod tests {
         let mut history = lease("task_e_hist");
         history.provider_state = ProviderLeaseState::Finished;
         assert_eq!(lease_warmth(&history, u64::MAX), Warmth::Unknown);
+
+        // Cache likelihood never implies that this daemon has a command
+        // transport. The two facts remain explicit in every JSON view.
+        done.attachment_state = AttachmentState::Expired;
+        done.last_terminal_at_unix_ms = Some(1_000);
+        let view = lease_json_at(&done, 1_001);
+        assert_eq!(view["warmth"], "warm");
+        assert_eq!(view["remote_compute_usable"], false);
     }
 
     #[test]
