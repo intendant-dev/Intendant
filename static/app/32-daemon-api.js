@@ -196,6 +196,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_agenda_ref_content: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/content', query: ['locator'] },
   api_agenda_reminder_policy: { verb: 'POST', path: '/api/agenda/reminders/policy' },
   api_daemon_handover: { verb: 'GET', path: '/api/daemon/handover' },
+  api_plugins_list: { verb: 'GET', path: '/api/plugins' },
+  api_plugin_set_enabled: { verb: 'POST', path: '/api/plugins/{plugin_id}' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
   api_agenda_occurrences: { verb: 'GET', path: '/api/agenda/occurrences', query: ['since', 'item', 'limit'] },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },

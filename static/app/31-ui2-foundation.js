@@ -16,6 +16,9 @@ const UI2_ICON_PATHS = {
   //   safe wheel; settings/debug kept) —
   activity: '<circle cx="5" cy="6.2" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="5" cy="17.8" r="1.3" fill="currentColor" stroke="none"/><path d="M9 6.2h7.5"/><path d="M9 12h11"/><path d="M9 17.8h5.5"/>',
   sessions: '<circle cx="12" cy="5.4" r="2.1"/><path d="M10.9 7.2 6.6 14.6"/><path d="M12 7.5v7.9"/><path d="M13.1 7.2l4.3 7.4"/><circle cx="5.8" cy="16.9" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="17.6" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.2" cy="16.9" r="1.5" fill="currentColor" stroke="none"/>',
+  // plugins: a power plug — prongs, body, cord (optional capability that
+  // plugs into the daemon).
+  plugins: '<path d="M9 3.5v3.5"/><path d="M15 3.5v3.5"/><path d="M7 7h10v3.8a5 5 0 0 1-5 5 5 5 0 0 1-5-5z"/><path d="M12 15.8v4.7"/>',
   live: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M9 21h6"/><circle cx="12" cy="10.5" r="1.4" fill="currentColor" stroke="none"/><path d="M9.2 13.3a4.4 4.4 0 0 1 0-5.6"/><path d="M14.8 7.7a4.4 4.4 0 0 1 0 5.6"/>',
   station: '<circle cx="12" cy="12" r="8.4"/><path d="M12 12l5.4-6.2"/><circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="8.3" cy="14.9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.2" r="1.3" fill="currentColor" stroke="none"/>',
   terminal: '<path d="M4.5 6.5 10 12l-5.5 5.5"/><rect x="13" y="15.7" width="6.5" height="2.6" rx="1.1" fill="currentColor" stroke="none"/>',

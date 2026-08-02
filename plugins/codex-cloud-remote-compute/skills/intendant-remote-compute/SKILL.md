@@ -4,10 +4,12 @@ description: Heavy platform-neutral development work — full compiles, broad te
 compatibility: Requires an Intendant-supervised session with the remote_command tool available (Remote Compute plugin enabled on the daemon; any backend — native, Codex, Claude Code, Kimi Code, Pi).
 ---
 
-> Applicability check first: if `remote_command` is not among your available
-> tools, this skill does not apply — you are not running under an Intendant
-> daemon with the Remote Compute plugin enabled. Say so if the task assumed
-> otherwise, and work locally at normal discretion.
+> Applicability check first: if the `remote_command` tool is not available
+> to you — as a native tool, or through `"$INTENDANT" ctl tools call
+> remote_command` under Intendant supervision — this skill does not apply:
+> you are not running under an Intendant daemon with the Remote Compute
+> plugin enabled. Say so if the task assumed otherwise, and work locally at
+> normal discretion.
 
 # Remote Compute: offload heavy work
 
@@ -23,12 +25,19 @@ compatibility: Requires an Intendant-supervised session with the remote_command 
   remains authoritative for platform-only behavior and for final
   cross-platform confidence.
 
-## How to submit work
+## How to invoke
 
+- Native Intendant sessions call the `remote_command` tool directly;
+  external backends under supervision reach the same lane with
+  `"$INTENDANT" ctl tools call remote_command`.
 - Always run from an isolated git worktree.
-- Iterate with a working-tree snapshot; run final/authoritative validation
-  against a pushed git revision.
-- Omit the host selector so scheduling stays provider-neutral.
+- Omit the `host` argument so scheduling stays provider-neutral —
+  reusing or acquiring a matching worker is the daemon's job.
+- Iterate with `source: "working_tree"` (an explicit content-addressed
+  snapshot of your local changes); run final, authoritative validation
+  with `source: "git_revision"` plus a pushed `expected_revision`.
+- Request `cache: "durable_sccache"` only when the daemon has configured
+  a durable cache relay.
 
 ## What to expect from caching (the honest version)
 

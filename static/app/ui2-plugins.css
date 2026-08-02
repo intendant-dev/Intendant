@@ -1,0 +1,50 @@
+/* Plugins tab (System → Plugins): the bundled-plugin catalog. Cards are
+   host-owned; every state/readiness/install fact derives from the daemon
+   body. Styles reuse the shared ui-* components (.ui-card, .ui-btn,
+   .ui-chip, .ui-empty, .ui-explainer) and the v2 token palette. */
+
+html.ui-v2 #tab-plugins { overflow-y: auto; }
+
+html.ui-v2 .plugins-wrap {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+html.ui-v2 .plugins-intro { color: var(--text-2); font-size: 13px; line-height: 1.5; }
+
+html.ui-v2 .plugins-status { min-height: 18px; font-size: 12.5px; color: var(--text-2); }
+html.ui-v2 .plugins-status-error { color: var(--rose); }
+
+html.ui-v2 .plugin-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+html.ui-v2 .plugin-card-head { display: flex; align-items: center; gap: 10px; }
+html.ui-v2 .plugin-card-title { font-weight: 600; font-size: 15px; margin-right: auto; }
+html.ui-v2 .plugin-card-summary { color: var(--text-2); font-size: 13px; line-height: 1.45; }
+html.ui-v2 .plugin-summary-line { font-size: 12.5px; color: var(--text-3); }
+
+html.ui-v2 .plugin-readiness,
+html.ui-v2 .plugin-skills {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid rgba(var(--iris-rgb), 0.12);
+  padding-top: 10px;
+}
+
+html.ui-v2 .plugin-layer-head { display: flex; align-items: center; gap: 8px; }
+html.ui-v2 .plugin-layer-name { font-family: monospace; font-size: 12px; color: var(--text-2); }
+html.ui-v2 .plugin-layer-detail { font-size: 12.5px; color: var(--text-3); }
+html.ui-v2 .plugin-layer-fix { font-size: 12.5px; color: var(--amber); }
+
+html.ui-v2 .plugin-skill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+html.ui-v2 .plugin-install-note { font-size: 12.5px; color: var(--text-3); }

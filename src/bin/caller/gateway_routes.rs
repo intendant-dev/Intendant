@@ -305,6 +305,13 @@ pub(crate) enum RouteHandlerId {
     SettingsGet,
     ApiKeysPost,
     ApiKeyStatus,
+    /// Bundled-plugin catalog: identity, enabled flag, derived lifecycle
+    /// state, readiness layers, and per-skill install facts as one
+    /// derived body.
+    PluginsList,
+    /// Enable/disable one bundled plugin; reconciles skill
+    /// materialization in the same request and reports the outcome.
+    PluginSetEnabled,
     /// Tier-2 PR render join for one anchor (expand-time, cached).
     AgendaPrState,
     /// One agenda item, full + decorated, by id or unique prefix
@@ -1013,6 +1020,32 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::CodexCloudEnroll,
         "Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out)",
     ),
+    // The bundled-plugin catalog (host-owned; plugins supply no code,
+    // hooks, or frames): one derived body — identity, enabled flag,
+    // lifecycle state, readiness layers, per-skill install facts — that
+    // the dashboard renders verbatim.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/plugins"),
+        PeerOperation::StatsRead,
+        BodyPolicy::None,
+        RouteHandlerId::PluginsList,
+        "Bundled-plugin catalog: enabled flags, derived lifecycle state, readiness layers, per-skill install facts",
+    )
+    .with_tunnel(tunnel_method("api_plugins_list")),
+    // Enable/disable one bundled plugin. Owner-grade like settings
+    // writes; skill materialization/sweep reconciles in-request and the
+    // response reports what the installer actually did — enabling on an
+    // unready setup persists intent but activates nothing.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Segments("/api/plugins", &[SegmentSpec::Capture("plugin_id")]),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::PluginSetEnabled,
+        "Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome)",
+    )
+    .with_tunnel(tunnel_method("api_plugin_set_enabled")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),
@@ -3342,6 +3375,11 @@ mod tests {
         // The takeover request carries only a display label (HS3).
         assert_eq!(
             policy("POST", "/api/daemon/takeover"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        // A plugin toggle carries only {"enabled": bool}.
+        assert_eq!(
+            policy("POST", "/api/plugins/codex-cloud-remote-compute"),
             BodyPolicy::Capped(4 * 1024)
         );
         // The update-lane actions carry at most a small JSON body.
