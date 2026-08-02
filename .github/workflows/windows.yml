@@ -344,16 +344,23 @@ jobs:
       # against a native target.
       # `--locked` makes lockfile drift a hard failure: CI must test exactly
       # the dependency set main pins, never a silent re-resolution of it.
-      - name: cargo test
+      # Keep each native command in its own step. On Windows, pwsh does not
+      # terminate a script merely because a native command exits non-zero;
+      # a later successful cargo invocation would overwrite $LASTEXITCODE and
+      # falsely green the step. Separate steps make Actions consume each exit
+      # status directly on every platform.
+      - name: cargo test (package bins)
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
-        run: |
-          cargo test -p intendant --bins --locked --target ${{ matrix.target }}
-          # Lib crates get their own invocation: a global `--bins` filter
-          # silently no-ops packages that have no bin targets, which is
-          # how the core/display lib tests went dark after extraction.
-          # owner-plane-core/-reducer carry the vendored D0-A kernel and
-          # its §D corpus conformance gate (170 stamped vectors).
-          cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
+        run: cargo test -p intendant --bins --locked --target ${{ matrix.target }}
+
+      # Lib crates get their own invocation: a global `--bins` filter
+      # silently no-ops packages that have no bin targets, which is
+      # how the core/display lib tests went dark after extraction.
+      # owner-plane-core/-reducer carry the vendored D0-A kernel and
+      # its §D corpus conformance gate (170 stamped vectors).
+      - name: cargo test (library crates)
+        if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
+        run: cargo test -p intendant-core -p intendant-custody -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
       # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
       # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only
