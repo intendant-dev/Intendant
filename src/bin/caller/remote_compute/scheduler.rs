@@ -98,7 +98,7 @@ struct OwnedWorker {
     active_jobs: usize,
     generation: u64,
     retiring: bool,
-    created_at: Instant,
+    retire_retry_deadline: Instant,
 }
 
 static OWNED_WORKERS: OnceLock<Mutex<HashMap<String, OwnedWorker>>> = OnceLock::new();
@@ -364,7 +364,7 @@ async fn acquire_new_worker(
     // Ownership starts when this process creates the provider task, not only
     // after a successful attachment. A late attachment after our wait timeout
     // must still retire instead of becoming an unowned leak.
-    register_owned(&host);
+    register_owned(&host, timeout_s);
     let mut last_lease = cached_task_lease(&lease_store, &task_id).or(submitted.lease);
     let mut last_provider_error = None;
     flight.publish(acquisition_progress(
@@ -384,11 +384,6 @@ async fn acquire_new_worker(
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            match refresh_acquiring_task(&lease_store, key, &task_id).await {
-                Ok(Some(lease)) => last_lease = Some(lease),
-                Ok(None) => {}
-                Err(error) => last_provider_error = Some(concise_error(&error)),
-            }
             if let Some(lease) = last_lease.as_ref().filter(|lease| {
                 lease.provider_state.is_terminal()
                     && crate::codex_cloud_attach::attachment_channel(&task_id).is_none()
@@ -583,7 +578,7 @@ fn acquisition_timeout_error(
         .map(|url| format!(" Inspect {url}."))
         .unwrap_or_default();
     let refresh = provider_error
-        .map(|error| format!(" The final provider refresh also failed: {error}."))
+        .map(|error| format!(" The last provider refresh failed: {error}."))
         .unwrap_or_default();
     format!(
         "Codex Cloud worker {task_id} did not attach before the {timeout_s}s acquisition deadline{status}. Intendant did not cancel the provider task; it may still be finishing cold setup.{url}{refresh} If this environment intentionally needs longer, raise INTENDANT_REMOTE_COMPUTE_ACQUIRE_TIMEOUT_S (maximum {MAX_ACQUIRE_TIMEOUT_S}s)."
@@ -604,10 +599,14 @@ fn concise_error(error: &str) -> String {
     concise
 }
 
-fn register_owned(host: &str) {
+fn register_owned(host: &str, acquire_timeout_s: u64) {
     let mut workers = owned_workers()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // An unbound enrollment may redeem at the very end of a cold acquisition.
+    // Keep retrying retirement until that latest possible identity has expired,
+    // rather than measuring only from provider task creation.
+    let retry_window_s = retire_retry_window_s(acquire_timeout_s);
     workers.insert(
         host.to_string(),
         OwnedWorker {
@@ -616,9 +615,15 @@ fn register_owned(host: &str) {
             active_jobs: 1,
             generation: 1,
             retiring: false,
-            created_at: Instant::now(),
+            retire_retry_deadline: Instant::now() + Duration::from_secs(retry_window_s),
         },
     );
+}
+
+fn retire_retry_window_s(acquire_timeout_s: u64) -> u64 {
+    enrollment_token_ttl_s(acquire_timeout_s)
+        .saturating_add(crate::codex_cloud_attach::DEFAULT_IDENTITY_TTL_S)
+        .saturating_add(60)
 }
 
 pub(super) struct WorkerUse {
@@ -731,11 +736,7 @@ fn schedule_retirement(host: String, generation: u64) {
                         let Some(worker) = workers.get_mut(&host) else {
                             return;
                         };
-                        if worker.created_at.elapsed()
-                            >= Duration::from_secs(
-                                crate::codex_cloud_attach::DEFAULT_IDENTITY_TTL_S + 60,
-                            )
-                        {
+                        if Instant::now() >= worker.retire_retry_deadline {
                             workers.remove(&host);
                             return;
                         }
@@ -847,6 +848,13 @@ mod tests {
         assert_eq!(
             enrollment_token_ttl_s(DEFAULT_ACQUIRE_TIMEOUT_S),
             DEFAULT_ACQUIRE_TIMEOUT_S + ENROLLMENT_TOKEN_GRACE_S
+        );
+        assert_eq!(
+            retire_retry_window_s(DEFAULT_ACQUIRE_TIMEOUT_S),
+            DEFAULT_ACQUIRE_TIMEOUT_S
+                + ENROLLMENT_TOKEN_GRACE_S
+                + crate::codex_cloud_attach::DEFAULT_IDENTITY_TTL_S
+                + 60
         );
     }
 }
