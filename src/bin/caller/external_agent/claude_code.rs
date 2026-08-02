@@ -1806,17 +1806,26 @@ impl CcReader {
         if self.announced_session_id.as_deref() == Some(id) {
             return;
         }
-        // Fresh adoption of an id by THIS reader: inspector-registry
-        // records under it belong to a previous process's background
-        // children (a resumed CLI does not own them — their task events
-        // will never arrive here), and on an id CHANGE the old id's
-        // records lose their observer the same way. Clear both sides;
-        // this precedes any arm this reader performs, since adoption
-        // happens before the line's handler runs.
+        // Fresh adoption of an id by THIS reader: still-running
+        // inspector-registry records under it belong to a previous
+        // process's background children (a resumed CLI does not own them
+        // — their task events will never arrive here), and on an id
+        // CHANGE the old id's records lose their observer the same way.
+        // Flip them to died-with-restart instead of clearing: terminal
+        // rows are history the owner can still inspect and re-run, and
+        // the wrapper's respawn seams usually pre-marked them with the
+        // specific restart cause (this generic mark then finds nothing
+        // running). Precedes any arm this reader performs, since
+        // adoption happens before the line's handler runs.
+        let now_epoch = crate::session_activity::epoch_seconds();
         if let Some(previous) = self.announced_session_id.as_deref() {
-            crate::background_tasks::clear_session(previous);
+            crate::background_tasks::mark_running_died_with_restart(
+                previous,
+                "a backend restart",
+                now_epoch,
+            );
         }
-        crate::background_tasks::clear_session(id);
+        crate::background_tasks::mark_running_died_with_restart(id, "a backend restart", now_epoch);
         self.announced_session_id = Some(id.to_string());
         self.shared.set_session_id(id);
         out.events.push(AgentEvent::NativeSessionId {
@@ -4638,11 +4647,18 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn shutdown(&mut self) -> Result<(), CallerError> {
-        // The CLI (and its supervision of background commands) is going
-        // away: nobody will confirm task state again, so the inspector
-        // registry must not keep claiming it.
+        // The CLI is going away and its background commands die with it:
+        // flip any still-running inspector records to died-with-restart
+        // (retained history — the owner can still inspect and choose to
+        // re-run) instead of claiming a running state nobody will ever
+        // confirm again. Respawn seams that know the specific restart
+        // pre-marked with its name; this generic mark is the backstop.
         if let Some(session) = self.shared.session_id() {
-            crate::background_tasks::clear_session(&session);
+            crate::background_tasks::mark_running_died_with_restart(
+                &session,
+                "the backend shutdown",
+                crate::session_activity::epoch_seconds(),
+            );
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -4670,10 +4686,15 @@ impl ExternalAgent for ClaudeCodeAgent {
 
 impl Drop for ClaudeCodeAgent {
     fn drop(&mut self) {
-        // Backstop for the shutdown-path clear (drop without shutdown):
-        // a dead wrapper's inspector records claim knowledge nobody has.
+        // Backstop for the shutdown-path mark (drop without shutdown):
+        // a dead wrapper's still-running inspector records claim
+        // knowledge nobody has — flip them, keep the history.
         if let Some(session) = self.shared.session_id() {
-            crate::background_tasks::clear_session(&session);
+            crate::background_tasks::mark_running_died_with_restart(
+                &session,
+                "the backend shutdown",
+                crate::session_activity::epoch_seconds(),
+            );
         }
         if let Some(ref mut child) = self.child {
             let child_pid = child.id();
@@ -5311,15 +5332,29 @@ mod tests {
             Some(std::path::Path::new(&structured_path))
         );
 
-        // A fresh reader adopting the same backend id clears the records.
+        // A fresh reader adopting the same backend id does not own the
+        // previous process's background children — but it no longer
+        // FORGETS them either: still-running records flip to
+        // died-with-restart (retained history the owner can inspect and
+        // choose to re-run; the wrapper's respawn seams usually pre-mark
+        // with the specific restart cause), and finished records stay as
+        // they were.
         let mut resumed = test_reader();
         resumed.process_line(&format!(
             r#"{{"type":"system","subtype":"init","session_id":"{sid}"}}"#,
         ));
+        let survived = background_tasks::find_task(sid, "breg2")
+            .expect("the running record is retained, flipped — never cleared");
+        assert_eq!(survived.status, BackgroundTaskStatus::DiedWithRestart);
+        assert_eq!(survived.died_cause.as_deref(), Some("a backend restart"));
+        assert!(survived.ended_at_epoch.is_some());
+        let done = background_tasks::find_task(sid, "breg1").expect("finished record retained");
+        assert_eq!(done.status, BackgroundTaskStatus::Completed);
         assert!(
-            !background_tasks::session_known(sid),
-            "re-adoption clears a previous process's records"
+            done.died_cause.is_none(),
+            "finished records never gain a cause"
         );
+        background_tasks::clear_session(sid);
     }
 
     /// The `system:init` `cwd` echo emits ONE `CwdAnnounced` per distinct

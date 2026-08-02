@@ -127,6 +127,17 @@ pub struct SessionMeta {
     /// Additive: metas written before 2026-08 lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safeguards_flag: Option<SessionSafeguardsFlagMeta>,
+    /// Durable trace of a park on backend-announced background tasks:
+    /// written while the session waits between turns on running tasks,
+    /// flipped to its died form when a backend restart kills them, and
+    /// cleared when the session works again (tasks drained or a new turn
+    /// ran). The tasks are OS children of the backend process, so they
+    /// die with EVERY respawn while this session-state marker survives —
+    /// this marker is how the boot pass and the drain wait set tell a
+    /// live wait from a dead one. Additive: metas written before 2026-08
+    /// lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_park: Option<SessionBgParkMeta>,
 }
 
 /// A provider-safeguards flag recorded durably (see
@@ -138,6 +149,24 @@ pub struct SessionSafeguardsFlagMeta {
     /// First line of the formatted cause, truncated for one-row surfaces
     /// (the full text is in the session log's error row).
     pub reason_preview: String,
+}
+
+/// A park on running background tasks recorded durably (see
+/// [`SessionMeta::bg_park`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionBgParkMeta {
+    /// Short descriptions of the tasks the park waits on (bounded by the
+    /// producer; display data, never commands).
+    pub tasks: Vec<String>,
+    /// The named restart that killed the tasks — `Some` flips the marker
+    /// from "waiting on live work" to the died-with-restart attention
+    /// state (nothing is re-run automatically; re-running is an owner
+    /// decision). `None` = the park is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_cause: Option<String>,
+    /// Epoch seconds the tasks died, present with `died_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_at_epoch: Option<u64>,
 }
 
 /// A parked rate-limit wait recorded durably (see
@@ -666,17 +695,23 @@ impl SessionLog {
         let existing = fs::read_to_string(self.dir.join("session_meta.json"))
             .ok()
             .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok());
-        let (existing_name, existing_worktree, existing_limit_park, existing_safeguards_flag) =
-            existing
-                .map(|meta| {
-                    (
-                        meta.name,
-                        meta.worktree,
-                        meta.limit_park,
-                        meta.safeguards_flag,
-                    )
-                })
-                .unwrap_or((None, None, None, None));
+        let (
+            existing_name,
+            existing_worktree,
+            existing_limit_park,
+            existing_safeguards_flag,
+            existing_bg_park,
+        ) = existing
+            .map(|meta| {
+                (
+                    meta.name,
+                    meta.worktree,
+                    meta.limit_park,
+                    meta.safeguards_flag,
+                    meta.bg_park,
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -698,6 +733,10 @@ impl SessionLog {
             // The safeguards flag is terminal for the conversation — no
             // meta rewrite may ever drop it.
             safeguards_flag: existing_safeguards_flag,
+            // Park transitions alone touch the marker (same law as
+            // limit_park): a respawn's meta rewrite must not silently
+            // release a wait — or erase a died-with-restart statement.
+            bg_park: existing_bg_park,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -744,6 +783,55 @@ impl SessionLog {
             return;
         }
         meta.limit_park = park;
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record (or clear) the durable background-task-park marker in
+    /// `session_meta.json` (see [`SessionMeta::bg_park`]). Missing or
+    /// unreadable meta is a quiet no-op, like [`Self::set_limit_park`].
+    pub fn set_bg_park(&self, park: Option<SessionBgParkMeta>) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta.bg_park == park {
+            return;
+        }
+        meta.bg_park = park;
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Clear the bg-park marker unless it records a died-with-restart
+    /// statement: activity settling quietly to idle (a respawned
+    /// backend's empty round) must not erase the attention state — only
+    /// real work does, via `set_bg_park(None)` on a turn-state publish.
+    pub fn clear_bg_park_if_live(&self) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta
+            .bg_park
+            .as_ref()
+            .is_none_or(|park| park.died_cause.is_some())
+        {
+            return;
+        }
+        meta.bg_park = None;
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
@@ -1862,6 +1950,7 @@ mod tests {
             worktree: None,
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -1871,6 +1960,50 @@ mod tests {
 
         let log = SessionLog::open(log_dir).unwrap();
         assert_eq!(log.session_id(), "test-session-123");
+    }
+
+    /// The bg-park marker survives every meta rewrite (the same law as
+    /// `limit_park` — a credential-reload respawn's `write_meta` mid-park
+    /// must not silently release the wait or erase a died-with-restart
+    /// statement), and `clear_bg_park_if_live` clears only the live form.
+    #[test]
+    fn bg_park_marker_survives_meta_rewrites_and_died_form_outlives_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let read = || -> SessionMeta {
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap()
+        };
+
+        log.set_bg_park(Some(SessionBgParkMeta {
+            tasks: vec!["cargo test battery".into()],
+            died_cause: None,
+            died_at_epoch: None,
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task again"));
+        assert!(
+            read().bg_park.is_some(),
+            "a meta rewrite must not release the park"
+        );
+
+        log.clear_bg_park_if_live();
+        assert!(read().bg_park.is_none(), "idle clears a LIVE marker");
+
+        log.set_bg_park(Some(SessionBgParkMeta {
+            tasks: vec!["cargo test battery".into()],
+            died_cause: Some("the daemon restart".into()),
+            died_at_epoch: Some(100),
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        log.clear_bg_park_if_live();
+        let park = read().bg_park.expect("died statement survives");
+        assert_eq!(park.died_cause.as_deref(), Some("the daemon restart"));
+        assert_eq!(park.died_at_epoch, Some(100));
+
+        log.set_bg_park(None);
+        assert!(read().bg_park.is_none(), "real work clears everything");
     }
 
     #[test]
@@ -1973,6 +2106,7 @@ mod tests {
             worktree: None,
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -1996,6 +2130,7 @@ mod tests {
             worktree: None,
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -2060,6 +2195,7 @@ mod tests {
             worktree: None,
             limit_park: None,
             safeguards_flag: None,
+            bg_park: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

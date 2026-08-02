@@ -109,6 +109,12 @@ fn task_json(record: &BackgroundTaskRecord) -> serde_json::Value {
     }
     (record.status == BackgroundTaskStatus::Running)
         .then(|| task["running"] = serde_json::json!(true));
+    // The honest restart statement: which restart killed the task. Present
+    // exactly on died-with-restart rows, so the inspector can say why the
+    // wait ended instead of the row just vanishing.
+    if let Some(cause) = record.died_cause.as_deref() {
+        task["diedCause"] = serde_json::json!(cause);
+    }
     task
 }
 
