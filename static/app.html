@@ -10961,7 +10961,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   padding: 4px 8px;
 }
 
-.shell-share-btn {
+.shell-share-btn,
+.shell-restart-btn {
   background: var(--bg-tertiary, #2a2a2e);
   color: var(--text-secondary, #b8b8bc);
   border: 1px solid var(--border-color, #3a3a3e);
@@ -10971,7 +10972,8 @@ html.ui-v2[data-theme="light"] .control-toast {
   cursor: pointer;
 }
 
-.shell-share-btn:hover {
+.shell-share-btn:hover,
+.shell-restart-btn:hover {
   color: var(--text-primary, #e8e8ec);
 }
 
@@ -16131,7 +16133,8 @@ html.ui-v2 .shell-host-status.error { color: var(--rose); }
 html.ui-v2 .shell-host-status.warn { color: var(--amber); }
 html.ui-v2 .shell-host-status.ok { color: var(--green); }
 
-html.ui-v2 .shell-share-btn {
+html.ui-v2 .shell-share-btn,
+html.ui-v2 .shell-restart-btn {
   min-height: 32px; /* match the 32px Target select — one control height per row */
   padding: 6px 12px;
   border: 1px solid var(--line);
@@ -16141,7 +16144,8 @@ html.ui-v2 .shell-share-btn {
   font: 600 12px var(--sans);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-html.ui-v2 .shell-share-btn:hover {
+html.ui-v2 .shell-share-btn:hover,
+html.ui-v2 .shell-restart-btn:hover {
   background: var(--surface-2);
   border-color: var(--line-2);
   color: var(--text);
@@ -16150,6 +16154,17 @@ html.ui-v2 .shell-share-btn.is-shared {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
   color: var(--green);
+}
+/* The re-entry affordance is the exited pane's one live control — accent
+   it so a dead terminal visibly offers the way back in. */
+html.ui-v2 .shell-restart-btn {
+  border-color: rgba(var(--iris-rgb), .38);
+  color: var(--iris);
+}
+html.ui-v2 .shell-restart-btn:hover {
+  background: rgba(var(--iris-rgb), .12);
+  border-color: rgba(var(--iris-rgb), .55);
+  color: var(--iris-2);
 }
 
 html.ui-v2 #tab-terminal .shell-toolbar .target-summary {
@@ -33654,6 +33669,7 @@ html.ui-v2 .daemon-relay-note {
             <label for="shell-host-select">Target</label>
             <select id="shell-host-select" title="Shell target"></select>
             <span class="shell-host-status" id="shell-host-status"></span>
+            <button id="shell-restart-btn" class="shell-restart-btn hidden" title="Start a fresh shell session">New shell</button>
             <button id="shell-share-btn" class="shell-share-btn hidden" title="Share this shell session so scoped collaborators (terminal.view / terminal.write) can attach">Share</button>
             <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
           </div>
@@ -38773,7 +38789,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'df39afbb785cc81e';
+const INTENDANT_APP_BUILD = '681c2efab721e411';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -46766,6 +46782,16 @@ let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
 let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
+// Whether the toolbar's "New shell" re-entry affordance is showing (the
+// shell exited or the open errored; a sent open clears it).
+let shellRestartOffered = false;
+// Shell events (output/exit) that arrived before xterm.js finished
+// loading: the open frame is sent the moment the Terminal tab is entered
+// so the PTY's startup overlaps the script fetch, and nothing from that
+// window may be dropped. Bounded; oldest output falls off first.
+let shellPreInitEvents = [];
+let shellPreInitEventBytes = 0;
+const SHELL_PRE_INIT_MAX_BYTES = 512 * 1024;
 let activeTermSubtab = 'shell';
 
 // Files editor state. Declared here, far above the editor's functions,
@@ -83975,6 +84001,11 @@ function resetShellConnectionStateForHostChange() {
   shellPendingResize = null;
   shellOutputQueue = [];
   shellOutputQueuedBytes = 0;
+  // Buffered pre-init output belongs to the previous host; the exited/
+  // retry affordance does too.
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  offerShellRestart(false);
 }
 
 function refreshShellHostOptions() {
@@ -84045,7 +84076,10 @@ function setShellHost(hostId) {
 // Called when the server sends {"t":"terminal_output", "data":"<base64>"}
 // for this host/terminal pair.
 function handleShellOutput(base64data) {
-  if (!shellTerm) return;
+  if (!shellTerm) {
+    bufferPreInitShellEvent({ kind: 'output', data: base64data });
+    return;
+  }
   const bytes = base64ToBytes(base64data);
   shellOutputQueue.push(bytes);
   shellOutputQueuedBytes += bytes.byteLength;
@@ -84083,21 +84117,72 @@ function flushShellOutput() {
   shellTerm.write(merged);
 }
 
+// ── Pre-init event buffer ──
+// initShell sends terminal_open before the xterm scripts have loaded (the
+// PTY's shell startup then overlaps the fetch). Output or an exit landing
+// in that window is held here — bounded, oldest output dropped first —
+// and replayed into xterm by initShell's start().
+function bufferPreInitShellEvent(evt) {
+  if (evt.kind === 'output') shellPreInitEventBytes += evt.data.length;
+  shellPreInitEvents.push(evt);
+  while (shellPreInitEventBytes > SHELL_PRE_INIT_MAX_BYTES && shellPreInitEvents.length > 1) {
+    const dropped = shellPreInitEvents.shift();
+    if (dropped.kind === 'output') shellPreInitEventBytes -= dropped.data.length;
+  }
+}
+
+function flushPreInitShellEvents() {
+  if (!shellTerm || shellPreInitEvents.length === 0) return;
+  const events = shellPreInitEvents;
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  for (const evt of events) {
+    if (evt.kind === 'output') handleShellOutput(evt.data);
+    else if (evt.kind === 'exited') handleShellExited(evt.status);
+  }
+}
+
 function handleShellExited(status) {
-  if (!shellTerm) return;
+  if (!shellTerm) {
+    bufferPreInitShellEvent({ kind: 'exited', status });
+    return;
+  }
   flushShellOutput();
   shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
-  setShellHostStatus(`Shell exited on ${shellHostLabel()}`, 'warn');
+  shellTerm.write('\x1b[90m[press Enter to start a new shell]\x1b[0m\r\n');
+  setShellHostStatus(`Shell exited (status ${status}) on ${shellHostLabel()}`, 'warn');
   shellOpenSent = false;
   shellOpenAcked = false;
   shellQueuedInput = '';
   shellWaitingNoticeShown = false;
+  offerShellRestart(true);
+}
+
+// ── Shell re-entry (exited state) ──
+// The dead session stays replayable server-side until the next open
+// replaces it with a fresh spawn (terminal.rs open_or_attach). Typing has
+// always re-opened; the button and the in-terminal hint make the way back
+// in visible instead of a hidden gesture.
+function offerShellRestart(on) {
+  shellRestartOffered = !!on;
+  const btn = document.getElementById('shell-restart-btn');
+  if (btn) btn.classList.toggle('hidden', !shellRestartOffered);
+}
+
+function restartShellSession() {
+  if (!shellInitialized) {
+    initShell();
+    return;
+  }
+  openShellSessionIfPossible();
+  if (shellTerm) shellTerm.focus();
 }
 
 function handleShellOpened(ack) {
   shellOpenSent = true;
   shellOpenAcked = true;
   shellWaitingNoticeShown = false;
+  offerShellRestart(false);
   shellShared = !!(ack && ack.shared);
   shellCanShare = !!(ack && ack.can_share);
   renderShellShareState();
@@ -84148,6 +84233,9 @@ function handleShellError(error) {
     const message = String(error || 'shell unavailable');
     shellTerm.write(`\r\n\x1b[31m[shell error: ${message}]\x1b[0m\r\n`);
   }
+  // The open failed or the session broke: the button doubles as the
+  // visible retry (clicking sends a fresh terminal_open).
+  offerShellRestart(true);
 }
 
 function showShellWaitingNotice() {
@@ -84597,13 +84685,18 @@ function queueShellInput(bytes) {
 }
 
 function openShellSessionIfPossible(force = false) {
-  if (!shellTerm) return false;
+  // shellInitialized (not shellTerm): the open is sent as soon as the
+  // Terminal tab is entered, before the xterm scripts finish loading —
+  // shellOpenFrame falls back to 80x24 and the post-ack resize corrects.
+  if (!shellInitialized) return false;
   if (shellOpenSent && !force) return true;
   const sent = sendShellMessage(shellOpenFrame());
   if (sent) {
     shellOpenSent = true;
     shellOpenAcked = false;
     shellWaitingNoticeShown = false;
+    offerShellRestart(false);
+    setShellHostStatus(`Connecting to ${shellHostLabel()}…`, '');
     return true;
   }
   shellOpenSent = false;
@@ -84613,7 +84706,7 @@ function openShellSessionIfPossible(force = false) {
 
 function maybeOpenShellAfterTransportReady() {
   if (activeTab !== 'terminal' || activeTermSubtab !== 'shell') return;
-  if (!shellInitialized || !shellTerm || shellOpenSent) return;
+  if (!shellInitialized || shellOpenSent) return;
   openShellSessionIfPossible();
 }
 
@@ -84728,6 +84821,15 @@ function initShell() {
   // Ensure the xterm.js stylesheet is active.
   document.getElementById('xterm-css').removeAttribute('disabled');
 
+  // Ask the server to open (or reattach to) the session NOW, before the
+  // xterm scripts load, so the shell's own startup (login rc files are
+  // the slow part) overlaps the fetch instead of following it. Output
+  // that beats the scripts lands in the pre-init buffer and replays in
+  // start(). In Connect mode the dashboard-control tunnel may still be
+  // negotiating; if so, this is retried from
+  // dashboardUpdateTransportStatus() once terminal frames are ready.
+  openShellSessionIfPossible();
+
   const start = () => {
     // Theme from the design tokens (blinking block cursor per the
     // design); `|| undefined` keeps xterm's built-in default as the net
@@ -84801,31 +84903,41 @@ function initShell() {
       }
     }).observe(document.getElementById('shell-container'));
 
-    // Ask the server to open (or reattach to) the session. In Connect mode the
-    // dashboard-control tunnel may still be negotiating; if so, this is retried
-    // from dashboardUpdateTransportStatus() once terminal frames are ready.
+    // Replay everything the early open produced while the scripts loaded,
+    // then re-ask in case the early send found no transport (no-op when
+    // the open is already in flight or acked).
+    flushPreInitShellEvents();
     openShellSessionIfPossible();
   };
 
   // If xterm.js is already loaded, start immediately. Otherwise load the
-  // vendored copies (embedded static assets — no external fetch) and start.
+  // vendored copies (embedded static assets — no external fetch) in
+  // PARALLEL — the fit addon's UMD wrapper only touches Terminal when an
+  // addon instance is loaded, not at parse time — and start once both are
+  // in.
   if (typeof Terminal !== 'undefined' && typeof FitAddon !== 'undefined') {
     start();
     return;
   }
-  const script = document.createElement('script');
-  script.src = '/xterm.min.js';
-  script.onload = () => {
-    const fitScript = document.createElement('script');
-    fitScript.src = '/xterm-addon-fit.min.js';
-    fitScript.onload = start;
-    document.head.appendChild(fitScript);
+  let scriptsRemaining = 2;
+  const scriptArrived = () => {
+    scriptsRemaining -= 1;
+    if (scriptsRemaining === 0) start();
   };
-  document.head.appendChild(script);
+  for (const src of ['/xterm.min.js', '/xterm-addon-fit.min.js']) {
+    const script = document.createElement('script');
+    script.src = src;
+    script.onload = scriptArrived;
+    document.head.appendChild(script);
+  }
 }
 
 function switchTerminalSubtab(name) {
   if (activeTermSubtab === name) {
+    // Re-entering the already-active Shell sub-tab: if the shell exited
+    // while the user was away, this is the respawn seam (no-op when a
+    // session is already open).
+    if (name === 'shell' && shellInitialized) openShellSessionIfPossible();
     syncTerminalPaneAccessibility();
     return;
   }
@@ -85004,6 +85116,7 @@ document.addEventListener('DOMContentLoaded', wireShellKeybar);
 document.addEventListener('DOMContentLoaded', () => {
   syncTerminalPaneAccessibility();
   refreshShellHostOptions();
+  document.getElementById('shell-restart-btn')?.addEventListener('click', restartShellSession);
 });
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('[data-shared-view-close]').forEach(btn => {
@@ -107939,6 +108052,9 @@ function switchTab(tabId) {
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'shell') {
       if (!shellInitialized) initShell();
+      // Revisit seam: if the shell exited while the tab was hidden, this
+      // spawns a fresh one (no-op when a session is already open).
+      else openShellSessionIfPossible();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
     syncTerminalPaneAccessibility();

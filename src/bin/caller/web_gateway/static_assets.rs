@@ -722,6 +722,36 @@ mod tests {
         assert!(text.ends_with("self.onmessage=null;\n"));
     }
 
+    /// The Terminal tab's honest exited lifecycle: when the shell dies
+    /// (Ctrl-D, `exit`, crash) the pane must SAY so — with the status —
+    /// and offer a visible way back in (the toolbar's New shell button
+    /// plus the in-terminal hint); and output racing the lazy xterm load
+    /// must be buffered, never dropped (the open is sent before the
+    /// scripts finish so shell startup overlaps the fetch). If a needle
+    /// disappears, the dashboard has regrown the dead-end or the blank
+    /// first paint these pinned away — restore the affordance, don't
+    /// widen the test.
+    #[test]
+    fn terminal_exited_reentry_and_early_open_are_pinned() {
+        assert_eq!(
+            APP_HTML.matches("id=\"shell-restart-btn\"").count(),
+            1,
+            "the Terminal toolbar must carry exactly one New shell re-entry button"
+        );
+        assert!(
+            APP_HTML.contains("[shell exited with status ${status}]"),
+            "the exited state must name the shell's exit status"
+        );
+        assert!(
+            APP_HTML.contains("[press Enter to start a new shell]"),
+            "the exited state must tell the user how to get a shell back"
+        );
+        assert!(
+            APP_HTML.contains("bufferPreInitShellEvent"),
+            "shell output arriving before xterm loads must be buffered, not dropped"
+        );
+    }
+
     /// Agent-authored question-preview HTML must only ever render inside
     /// a sandboxed iframe with an opaque origin. Dashboard authentication
     /// is ambient (mTLS client cert → IAM principal), so a same-origin

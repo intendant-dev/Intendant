@@ -465,6 +465,27 @@ revoke them. Revising a manifest changes the digest and voids the previous
 approval. The spawned session gets ordinary session authority; the approval
 does not bypass its sandbox, IAM, autonomy policy, or action approvals.
 
+**Approve-to-fire is event-driven, not polled (2026-08-01).** Every
+accepted agenda op funnels through one apply seam that both nudges the
+scheduler and broadcasts the change on the bus it selects over; the bus
+subscription queues, so an op landing mid-pass still forces the next
+pass instead of waiting out a sleep. Approving a manifest whose fire
+time already passed therefore dispatches in the same governed slot
+(milliseconds, then the stagger below under contention), and approving
+before the fire time fires at that instant itself — verified live to
+13 ms. The scheduler's 300 s safety tick is a no-signal backstop, never
+the operating cadence. What CAN honestly defer a fire: the governor's
+30 s slots under contention, the no-overlap rule while an occurrence of
+the same effect still runs, and daemon handover — a draining daemon
+stops firing while a successor acquires the freed lease (60 s poll), so
+an instant due inside that window lands right after acquisition. The
+apparent 10-minute approve-to-fire gap investigated 2026-08-01 was
+exactly these mechanics composed: fire-time floors still minutes in the
+future at approval plus a live handover window — the fires landed 13 ms
+and 4 ms after their floors, under the new holder, with the earlier
+same-evening batch (floors already past) firing the very second it was
+approved.
+
 **The spawn governor (2026-08-01): simultaneous fires stagger.** When
 several due occurrences would dispatch at once — eight approvals in seven
 seconds once fired eight seats in one second, pinning the daemon at 230%

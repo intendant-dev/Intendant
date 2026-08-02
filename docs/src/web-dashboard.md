@@ -581,6 +581,16 @@ An embedded xterm.js terminal hosting an interactive **Shell** session on the
 daemon (or a selected peer). Session monitoring and control live in the
 Activity/Station tabs, not here.
 
+Entering the tab opens the PTY immediately — the shell's own startup runs
+while the lazily loaded xterm scripts fetch in parallel, with any output from
+that window buffered and replayed, so the first prompt is not serialized
+behind the script load. When the shell exits (Ctrl-D, `exit`, a crash) the
+pane says so with the exit status and offers the way back in: a **New shell**
+toolbar button, a press-Enter hint, and automatic re-open on the next visit
+to the tab. The daemon keeps the dead session's scrollback replayable until
+the next open replaces it with a fresh spawn (spawn rules apply — replacing
+requires `shell.spawn`, exactly like creating).
+
 ### Live display
 
 The Computer Use workspace combines a selected WebRTC stage with a live rail

@@ -2660,6 +2660,11 @@ function resetShellConnectionStateForHostChange() {
   shellPendingResize = null;
   shellOutputQueue = [];
   shellOutputQueuedBytes = 0;
+  // Buffered pre-init output belongs to the previous host; the exited/
+  // retry affordance does too.
+  shellPreInitEvents = [];
+  shellPreInitEventBytes = 0;
+  offerShellRestart(false);
 }
 
 function refreshShellHostOptions() {
