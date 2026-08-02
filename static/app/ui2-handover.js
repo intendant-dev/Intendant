@@ -160,6 +160,50 @@
     mount.appendChild(handoverUpdateActions(body, disk));
   }
 
+  // The one-click's behavior, NAMED: the chip button and the palette's
+  // dynamic entry both invoke this — the webview bridge or the daemon
+  // relay, one implementation, never a second swap path.
+  function performOneClickSwap(body) {
+    if (updateAction.inFlight || relayPendingNow(lastHandoverBody)) return;
+    if (window.__intendantAppSupervisor === true) {
+      updateAction.inFlight = true;
+      updateAction.note = 'Starting the new daemon — this dashboard reloads when it takes over; in-flight sessions finish on the old one.';
+      try {
+        window.webkit.messageHandlers.updateSwap.postMessage(null);
+      } catch (_) {
+        updateAction.inFlight = false;
+        updateAction.note = 'Could not reach the app supervisor.';
+      }
+      handoverUpdateRender(body);
+    } else {
+      updateAction.relayRequestedMs = Date.now();
+      relayUpdateSwap(body);
+    }
+  }
+
+  // The unsupervised arm's hand-off, equally named for both surfaces:
+  // ask THIS daemon to drain toward an already-running newer daemon.
+  async function performTakeoverHandoff(successor, body) {
+    if (updateAction.inFlight) return;
+    updateAction.inFlight = true;
+    updateAction.note = `Asking this daemon to drain — :${successor.port} takes over.`;
+    handoverUpdateRender(body);
+    try {
+      const resp = await authedFetch('/api/daemon/takeover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requested_by: 'dashboard update chip' }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      updateAction.note = 'Draining — in-flight sessions finish here, then this daemon exits.';
+    } catch (err) {
+      updateAction.note = `Hand-off failed from this surface: ${(err && err.message) || err}`;
+    } finally {
+      updateAction.inFlight = false;
+      if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
+    }
+  }
+
   // The co-homed daemon a hand-off would drain toward: live, not this
   // boot, not already on its way out. Prefer one whose build matches the
   // on-disk update.
@@ -193,23 +237,7 @@
       const btn = document.createElement('button');
       btn.textContent = busy ? 'Updating…' : 'Update now';
       btn.disabled = busy;
-      btn.addEventListener('click', () => {
-        if (updateAction.inFlight || relayPendingNow(lastHandoverBody)) return;
-        if (window.__intendantAppSupervisor === true) {
-          updateAction.inFlight = true;
-          updateAction.note = 'Starting the new daemon — this dashboard reloads when it takes over; in-flight sessions finish on the old one.';
-          try {
-            window.webkit.messageHandlers.updateSwap.postMessage(null);
-          } catch (_) {
-            updateAction.inFlight = false;
-            updateAction.note = 'Could not reach the app supervisor.';
-          }
-          handoverUpdateRender(body);
-        } else {
-          updateAction.relayRequestedMs = Date.now();
-          relayUpdateSwap(body);
-        }
-      });
+      btn.addEventListener('click', () => performOneClickSwap(body));
       actions.appendChild(btn);
     } else {
       const successor = handoverSuccessorCandidate(body, disk);
@@ -218,26 +246,7 @@
         const btn = document.createElement('button');
         btn.textContent = `Hand off to :${successor.port}${matches ? ' (runs the on-disk build)' : ''}`;
         btn.disabled = updateAction.inFlight;
-        btn.addEventListener('click', async () => {
-          if (updateAction.inFlight) return;
-          updateAction.inFlight = true;
-          updateAction.note = `Asking this daemon to drain — :${successor.port} takes over.`;
-          handoverUpdateRender(body);
-          try {
-            const resp = await authedFetch('/api/daemon/takeover', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ requested_by: 'dashboard update chip' }),
-            });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            updateAction.note = 'Draining — in-flight sessions finish here, then this daemon exits.';
-          } catch (err) {
-            updateAction.note = `Hand-off failed from this surface: ${(err && err.message) || err}`;
-          } finally {
-            updateAction.inFlight = false;
-            if (lastHandoverBody) handoverUpdateRender(lastHandoverBody);
-          }
-        });
+        btn.addEventListener('click', () => performTakeoverHandoff(successor, body));
         actions.appendChild(btn);
       } else {
         const reach = document.createElement('div');
@@ -568,13 +577,49 @@
     render: (body) => handoverRender(body),
   };
 
-  // The update panel's composition hook (production, not QA): the panel
-  // registers its swap mount here and this module keeps it honest.
+  // The palette's dynamic entry, as data (ui2-chrome reads this by name
+  // at event time): the SAME one-click affordance the chip is currently
+  // serving, or null — no update on disk, a drain in motion (the chip's
+  // own suppression), and the honest no-reach arm all serve no action,
+  // so the palette shows none. Labels say what happens NOW and always
+  // carry 'update' (the palette matches labels only — users type what
+  // they see); `busy` mirrors the chip button's disabled state.
+  function updatePaletteEntry() {
+    const body = lastHandoverBody;
+    const update = body && body.update;
+    if (!update || body.draining) return null;
+    const disk = update.on_disk;
+    const tag = disk ? String(disk.git_sha || disk.version || '').slice(0, 10) : '';
+    const what = tag ? `update ${tag}` : 'update (binary changed on disk)';
+    const supervised = window.__intendantAppSupervisor === true
+      || (body && body.app_supervised === true);
+    if (supervised) {
+      const busy = updateAction.inFlight || relayPendingNow(body);
+      return {
+        label: busy ? `Installing ${what}…` : `Install ${what}`,
+        busy,
+        run: () => performOneClickSwap(body),
+      };
+    }
+    const successor = handoverSuccessorCandidate(body, disk);
+    if (!successor) return null;
+    const matches = disk && successor.version && successor.version.git_sha === disk.git_sha;
+    return {
+      label: `Update: hand off to :${successor.port}${matches ? ' (runs the on-disk build)' : ''}`,
+      busy: updateAction.inFlight,
+      run: () => performTakeoverHandoff(successor, body),
+    };
+  }
+
+  // The update panel's and palette's composition hooks (production, not
+  // QA): the panel registers its swap mount here, the palette asks for
+  // the served one-click as data — this module keeps both honest.
   window.intendantHandoverUpdate = {
     renderSwapSection: (mount) => {
       panelSwapMount = mount;
       fillPanelSwapSection();
     },
+    paletteEntry: updatePaletteEntry,
   };
 
   function handoverStart() {

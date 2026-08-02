@@ -825,7 +825,7 @@ pub(crate) async fn serve_attachment_socket<S>(
                 Some(Ok(message)) if message.is_close() => break,
                 Some(Ok(message)) => {
                     if let Ok(text) = message.into_text() {
-                        route_worker_frame(&from_worker_tx, text.as_str());
+                        route_worker_frame(&task_id, &from_worker_tx, text.as_str());
                     }
                 }
                 Some(Err(_)) => break,
@@ -879,9 +879,17 @@ pub(crate) async fn serve_attachment_socket<S>(
     }
 }
 
-/// Route one worker frame: reply kinds fan out to dashboard subscribers,
+/// Route one worker frame: a live job's capability-bound cache requests take
+/// their private bounded lane; ordinary reply kinds fan out to subscribers;
 /// everything else (hello included) is dropped without dispatch.
-fn route_worker_frame(from_worker_tx: &tokio::sync::broadcast::Sender<String>, text: &str) {
+fn route_worker_frame(
+    task_id: &str,
+    from_worker_tx: &tokio::sync::broadcast::Sender<String>,
+    text: &str,
+) {
+    if crate::remote_compute::route_remote_cache_frame(task_id, text) {
+        return;
+    }
     let kind = serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .and_then(|value| {
@@ -2645,21 +2653,25 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(8);
         // A reply kind reaches subscribers.
         route_worker_frame(
+            "task-test",
             &tx,
             r#"{"t":"terminal_output","host_id":"cloud:x","terminal_id":"shell-0","data":"aGk="}"#,
         );
         assert!(rx.try_recv().is_ok());
         route_worker_frame(
+            "task-test",
             &tx,
             r#"{"t":"display_tiles","host_id":"cloud:x","data":"aGk="}"#,
         );
         assert!(rx.try_recv().is_ok());
         route_worker_frame(
+            "task-test",
             &tx,
             r#"{"t":"remote_command_result","host_id":"cloud:x","id":"remote-1","result":{"state":"succeeded","exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"duration_ms":1}}"#,
         );
         assert!(rx.try_recv().is_ok());
         route_worker_frame(
+            "task-test",
             &tx,
             r#"{"t":"remote_source_result","host_id":"cloud:x","id":"source-a","state":"ready"}"#,
         );
@@ -2673,11 +2685,12 @@ mod tests {
             r#"{"t":"remote_command_start","host_id":"cloud:x","id":"remote-1"}"#,
             r#"{"t":"remote_command_cancel","host_id":"cloud:x","id":"remote-1"}"#,
             r#"{"t":"remote_source_begin","host_id":"cloud:x","id":"source-a"}"#,
+            r#"{"t":"remote_cache_request","host_id":"cloud:x","id":"remote-1","relay_token":"00000000000000000000000000000000","request_id":"11111111111111111111111111111111","op":"stat"}"#,
             r#"{"v":2,"kind":"cloud-worker-hello","task_id":"x"}"#,
             r#"{"t":"api_sessions"}"#,
             "not json",
         ] {
-            route_worker_frame(&tx, dropped);
+            route_worker_frame("task-test", &tx, dropped);
             assert!(rx.try_recv().is_err(), "{dropped}");
         }
     }

@@ -112,6 +112,31 @@ jobs:
             exit 1
           fi
 
+      # Machine-tool preflight: the PGP lane needs gnupg and the publish
+      # step needs the gh CLI, but no dry-run exercises either (publish is
+      # tag-only; signing needs secrets), so a missing tool otherwise
+      # surfaces deep into a real tag build — the v0.1.0 ladder burned a
+      # run each on absent gnupg and absent gh. Fail a tag build here, in
+      # seconds; dispatch dry-runs warn and continue, changing nothing on
+      # paths that never reach those steps.
+      - name: Release tool preflight (gnupg, gh)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Self-hosted runner PATH may not include Homebrew (same export
+          # as the publish step).
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          missing=""
+          command -v gpg > /dev/null || missing="$missing gnupg"
+          command -v gh > /dev/null || missing="$missing gh"
+          if [ -n "$missing" ]; then
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              echo "::error::Missing on this runner:$missing — a tag release needs gnupg (PGP artifact signing) and the gh CLI (publish step). Install on the runner account (brew install$missing), then rerun."
+              exit 1
+            fi
+            echo "::warning::Missing on this runner:$missing — tolerable for a dry-run, but a tag release will fail this preflight. Install on the runner account: brew install$missing"
+          fi
+
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # The default persisted token grants every later step push access;

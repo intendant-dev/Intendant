@@ -313,6 +313,29 @@
     }, immediate ? 400 : (busy ? UPDATE_LANE_BUSY_POLL_MS : UPDATE_LANE_POLL_MS));
   }
 
+  // The palette's 'Check for updates' seam (production, not QA): the
+  // SAME consent POST the panel's check button sends, for the channel
+  // this install natively follows per the served catalog (source → dev,
+  // else releases; a channel the payload marks uncheckable falls back
+  // to the other) — never a new check path. Routing to the panel is the
+  // caller's job; the click lands here so the panel's in-flight latch,
+  // notes, and poll cadence stay the one story. A missing block (first
+  // poll not landed, or a daemon without the lane) no-ops honestly.
+  function nativeCheckChannel() {
+    const block = lastBlock;
+    if (!block) return null;
+    const native = block.flavor === 'source' ? 'dev' : 'releases';
+    if (channelInfo(block, native).check) return native;
+    const other = native === 'dev' ? 'releases' : 'dev';
+    return channelInfo(block, other).check ? other : null;
+  }
+  window.intendantUpdateLane = {
+    check: () => {
+      const channel = nativeCheckChannel();
+      if (channel) updateLanePost('/api/daemon/update-lane/check', channel);
+    },
+  };
+
   function start() {
     poll().then(() => schedulePoll(false));
   }
