@@ -272,6 +272,8 @@ pub(crate) async fn control_request_frame(
             api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
         }
         "api_daemon_handover" => api_daemon_handover_response(id, &runtime).await,
+        "api_plugins_list" => api_plugins_list_response(id).await,
+        "api_plugin_set_enabled" => api_plugin_set_enabled_response(id, params.as_ref()).await,
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
@@ -1683,6 +1685,38 @@ pub(crate) async fn api_daemon_handover_response(
         id,
         crate::web_gateway::daemon_handover_status_api_response(runtime.mcp_server.as_ref()).await,
         "daemon handover",
+    )
+}
+
+/// Tunnel twin of `GET /api/plugins`.
+pub(crate) async fn api_plugins_list_response(id: String) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::plugins_list_api_response().await,
+        "plugins list",
+    )
+}
+
+/// Tunnel twin of `POST /api/plugins/{plugin_id}` — `plugin_id` and
+/// `enabled` ride `params`; the whole params object doubles as the body
+/// (the HTTP core ignores unknown keys).
+pub(crate) async fn api_plugin_set_enabled_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let plugin_id = params
+        .and_then(|p| p.get("plugin_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let body = params
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::plugin_set_enabled_api_response(&plugin_id, &body).await,
+        "plugin set-enabled",
     )
 }
 

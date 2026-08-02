@@ -51,6 +51,8 @@ mod routes_handover;
 pub(crate) use routes_handover::*;
 mod routes_codex_cloud;
 pub(crate) use routes_codex_cloud::*;
+mod routes_plugins;
+pub(crate) use routes_plugins::*;
 mod routes_github;
 pub(crate) use routes_github::*;
 mod routes_memory;

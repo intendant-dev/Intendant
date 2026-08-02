@@ -77,6 +77,7 @@ mod openai_chatgpt_auth;
 mod peer;
 mod peer_file_transfer;
 mod pgp_identity;
+mod plugin_registry;
 pub(crate) use intendant_platform::platform;
 mod presence;
 mod project;

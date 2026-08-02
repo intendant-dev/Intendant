@@ -93,16 +93,27 @@ the idle daemon loop.
 
 ## Tabs
 
-The v2 chrome groups thirteen destinations in the left navigation rail —
+The v2 chrome groups fourteen destinations in the left navigation rail —
 **Activity**, **Sessions**, **Agenda**, and **Memory** (Work), **Live display**
 and **Station** (Watch), **Terminal** and **Files** (Machine), **Usage**
-(Insight), **Access** and **Vault** (Trust), **Settings** and **Debug**
-(System). The oversight bar on top carries the phase pill, stop control,
+(Insight), **Access** and **Vault** (Trust), **Settings**, **Plugins**, and
+**Debug** (System). The oversight bar on top carries the phase pill, stop control,
 context meter, transport state, and the ⌘K command palette. Activity's own
 header carries its five-view switch and Timeline-only session/layout controls;
 the composer — the global task input — docks at the bottom
 and reaches the daemon from any destination. New events arriving while you are
 elsewhere raise a badge on the rail item.
+
+**Plugins** (System) is the bundled-plugin catalog: first-party, default-off
+capabilities — V1 ships **Codex Cloud Remote Compute** — rendered as
+host-owned cards whose lifecycle state (Available / Needs setup / Enabled /
+Setup failed), readiness layers with named fixes, and per-skill install facts
+all derive from `GET /api/plugins`. Enabling materializes the plugin's agent
+skill for every supervised backend and the response reports exactly what the
+installer did; disabling removes only Intendant-managed copies. Plugins here
+ship no dashboard code, hooks, or frames (a plugin ecosystem is the stated
+direction, but today's catalog is bundled first-party only) — see the
+Remote Compute plugin section of the Codex Cloud workers chapter.
 
 On content-heavy destinations the composer can collapse to a compact pill and
 expand in place; each tab remembers its own state. Its target switcher can move
@@ -2018,6 +2029,8 @@ response omits the header.
 | GET | `/api/codex-cloud/workers` | StatsRead | own origin | none | Codex Cloud worker leases from the cached store (`?refresh=1` re-syncs via the Codex CLI) |
 | POST | `/api/codex-cloud/submit` | Task | own origin | bounded | Submit a new Codex Cloud task via the daemon host's Codex CLI and track its worker lease |
 | POST | `/api/codex-cloud/enroll` | public | public | ≤ 8 KiB | Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out) |
+| GET | `/api/plugins` | StatsRead | own origin | none | Bundled-plugin catalog: enabled flags, derived lifecycle state, readiness layers, per-skill install facts |
+| POST | `/api/plugins/{plugin_id}` | Settings | own origin | ≤ 4 KiB | Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search), window=live|archive (+before/before_id/limit paging) — the bare call serves the full ledger forever |
 | GET | `/api/agenda/items/{item_id}` | AgendaRead | own origin | none | One agenda item, full + decorated, by id or unique prefix (+ its sessions join) |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
