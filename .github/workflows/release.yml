@@ -1,8 +1,16 @@
-name: macOS app release
+name: release
 
-# Builds, signs, notarizes, and publishes the native macOS app
-# (the macos-app/ WKWebView wrapper bundling the release `intendant` +
-# `intendant-runtime` binaries) via scripts/bundle-macos.sh.
+# Builds, signs, and publishes the release artifacts:
+#  - the native macOS app (the macos-app/ WKWebView wrapper bundling the
+#    release `intendant` + `intendant-runtime` binaries) via
+#    scripts/bundle-macos.sh, built/signed/notarized on the fleet Mac;
+#  - standalone Linux `intendant` binaries (x86_64 + aarch64), the
+#    checksum-pinned fast path for Codex Cloud / remote-compute workers
+#    (scripts/codex-cloud/setup.sh's INTENDANT_CLOUD_BINARY_URL lane;
+#    docs/src/codex-cloud-workers.md, "Environment bootstrap");
+#  - the release-pinned install scripts.
+# Every published asset is PGP-signed and committed to the public
+# transparency log by the same steps, whichever job built it.
 #
 # Triggers are version tags (v*) and manual dispatch ONLY — deliberately
 # never pull_request or merge_group, so this workflow can never gate the
@@ -87,12 +95,69 @@ permissions:
 
 # One release build at a time per ref; never cancel a half-published release.
 concurrency:
-  group: macos-release-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # Standalone Linux binaries: the checksum-pinned worker fast path.
+  # Built on GitHub-hosted runners deliberately — an ephemeral image with
+  # a known library baseline (the glibc + system libs of ubuntu-24.04,
+  # the same image the fork-PR CI legs prove the tree builds on) rather
+  # than a long-lived fleet box; per-arch native runners, so no cross
+  # toolchain. The binaries flow into the macos-app job's dist/, where
+  # the PGP sign, publish, and transparency-log steps cover them exactly
+  # like the app archive and installers.
+  linux-binaries:
+    name: linux-binaries (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            asset: intendant-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            asset: intendant-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The build-time subset of scripts/setup-linux.sh's APT_PACKAGES the
+      # hosted CI legs install (windows.yml carries the canonical comment
+      # on why exactly these).
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libclang-dev libvpx-dev libpipewire-0.3-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin intendant
+
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/release/intendant "out/${{ matrix.asset }}"
+          (cd out && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          ls -l out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: out/*
+          if-no-files-found: error
+
   macos-app:
     name: macos-app
+    # The whole release publishes or none of it does: a red Linux leg must
+    # stop the publish/transparency steps, which all live in this job.
+    needs: linux-binaries
     # Tags and manual dispatch only exist on trusted refs, so this always
     # runs on the fleet Mac (same label windows.yml places its macOS leg on);
     # there is no fork-PR path to route to hosted runners.
@@ -409,6 +474,31 @@ jobs:
           (cd dist && shasum -a 256 install.ps1 > install.ps1.sha256)
           ls -l dist
 
+      # Pull the Linux worker binaries into dist/ so the PGP sign,
+      # publish, and transparency-log steps below cover them exactly like
+      # the app archive and installers.
+      - name: Collect Linux release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: intendant-linux-*
+          path: dist
+          merge-multiple: true
+
+      # Re-verify the staged checksums: proves the artifact transport
+      # delivered the built bytes AND that each .sha256 verifies by name
+      # from inside dist/ — the exact ritual the release notes document.
+      - name: Verify collected Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for asset in intendant-linux-x86_64 intendant-linux-aarch64; do
+            if [ ! -f "dist/$asset" ]; then
+              echo "::error::dist/$asset missing after artifact download"
+              exit 1
+            fi
+            (cd dist && shasum -a 256 -c "$asset.sha256")
+          done
+
       # Every artifact that will publish gets a detached armored signature
       # from the release signing subkey; the repo-committed public key is
       # staged beside them byte-identically; and every signature is
@@ -518,6 +608,12 @@ jobs:
             echo '```'
             cat dist/*.sha256
             echo '```'
+            echo
+            echo "**Linux worker binaries (Codex Cloud / remote compute):** standalone \`intendant\` binaries for x86_64 and aarch64 glibc Linux (built on ubuntu-24.04; they need that image's library baseline at runtime — glibc 2.39+, libvpx, libpipewire, libxcb). They exist for the checksum-pinned worker bootstrap fast path; configure the Codex Cloud environment with:"
+            echo '```'
+            echo "INTENDANT_CLOUD_BINARY_URL=https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/intendant-linux-x86_64"
+            echo "INTENDANT_CLOUD_BINARY_SHA256=$(awk '{print $1}' dist/intendant-linux-x86_64.sha256)"
+            echo '```'
           } > "$RUNNER_TEMP/release-notes.md"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
@@ -579,7 +675,7 @@ jobs:
           print(json.dumps({
               "tag": tag,
               "version": tag.removeprefix("v"),
-              "platforms": ["macos-arm64"],
+              "platforms": ["macos-arm64", "linux-x86_64", "linux-aarch64"],
               "pgp_fingerprint": fingerprint,
               "artifacts": artifacts,
           }, indent=2))
@@ -600,6 +696,6 @@ jobs:
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: intendant-macos-app
+          name: intendant-release-dist
           path: dist/*
           if-no-files-found: error
