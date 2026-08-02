@@ -191,6 +191,13 @@ impl IntendantServer {
                 Ok(Ok(AppEvent::DisplayCaptureLost { display_id, reason }))
                     if !known.contains(&display_id) =>
                 {
+                    // The handler's failure reasons already carry this
+                    // prefix (virtual_display.rs phrases them for the
+                    // dashboard's capture-lost surface); only bare
+                    // reasons need it added.
+                    if reason.starts_with("virtual display create failed") {
+                        return reason;
+                    }
                     return format!("virtual display create failed: {reason}");
                 }
                 Ok(Ok(_)) => continue,
