@@ -2470,7 +2470,24 @@ mod tests {
         for _ in 0..8 {
             let cert_dir = dir.path().to_path_buf();
             workers.push(std::thread::spawn(move || {
-                next_dns_mutation_unix_ms_in(&cert_dir, 1_000).unwrap()
+                // Eight intentionally simultaneous durable fsyncs can exceed
+                // the authority store's two-second fail-closed wait on a busy
+                // Windows filesystem. A timeout promises that no state was
+                // changed, so retry it while preserving the production lock
+                // budget; any other error remains an immediate failure.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    match next_dns_mutation_unix_ms_in(&cert_dir, 1_000) {
+                        Ok(issued) => break issued,
+                        Err(error)
+                            if error.starts_with("timed out after ")
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("DNS mutation clock allocation failed: {error}"),
+                    }
+                }
             }));
         }
         let mut issued = workers
