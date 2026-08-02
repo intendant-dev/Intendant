@@ -991,62 +991,62 @@ pub(crate) async fn ws_inbound_task(
                         // Request to become the active voice owner
                         let mut superseded_voice_conn: Option<String> = None;
                         {
-                        let mut slot = active_presence_inbound
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        let previous_active =
-                            slot.as_ref().map(|active| active.connection_id.clone());
-                        if let Some(ref sl) = session_log_inbound {
-                            if let Ok(mut l) = sl.lock() {
-                                l.voice_diagnostic(
-                                    "make_active_received_gateway",
-                                    &format!(
-                                        "request from connection={} previous_active={}",
-                                        connection_id_inbound,
-                                        previous_active.as_deref().unwrap_or("none"),
-                                    ),
-                                );
-                            }
-                        }
-
-                        // Tell old active to disconnect voice
-                        if let Some(ref old) = *slot {
-                            if old.connection_id != connection_id_inbound {
-                                superseded_voice_conn = Some(old.connection_id.clone());
-                                let force_msg = serde_json::json!({
-                                    "t": "force_disconnect_voice",
-                                    "reason": "handover",
-                                });
-                                let _ = old.direct_tx.send(force_msg.to_string());
-                                if let Some(ref sl) = session_log_inbound {
-                                    if let Ok(mut l) = sl.lock() {
-                                        l.voice_diagnostic(
-                                            "make_active_force_disconnect_gateway",
-                                            &format!(
-                                                "old_active={} new_active={}",
-                                                old.connection_id, connection_id_inbound,
-                                            ),
-                                        );
-                                    }
-                                }
-                            } else if let Some(ref sl) = session_log_inbound {
+                            let mut slot = active_presence_inbound
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let previous_active =
+                                slot.as_ref().map(|active| active.connection_id.clone());
+                            if let Some(ref sl) = session_log_inbound {
                                 if let Ok(mut l) = sl.lock() {
                                     l.voice_diagnostic(
-                                        "make_active_noop_gateway",
+                                        "make_active_received_gateway",
                                         &format!(
-                                            "request from already-active connection={}",
+                                            "request from connection={} previous_active={}",
                                             connection_id_inbound,
+                                            previous_active.as_deref().unwrap_or("none"),
                                         ),
                                     );
                                 }
                             }
-                        }
 
-                        // Install this connection as new active
-                        *slot = Some(ActivePresence {
-                            connection_id: connection_id_inbound.clone(),
-                            direct_tx: direct_tx_inbound.clone(),
-                        });
+                            // Tell old active to disconnect voice
+                            if let Some(ref old) = *slot {
+                                if old.connection_id != connection_id_inbound {
+                                    superseded_voice_conn = Some(old.connection_id.clone());
+                                    let force_msg = serde_json::json!({
+                                        "t": "force_disconnect_voice",
+                                        "reason": "handover",
+                                    });
+                                    let _ = old.direct_tx.send(force_msg.to_string());
+                                    if let Some(ref sl) = session_log_inbound {
+                                        if let Ok(mut l) = sl.lock() {
+                                            l.voice_diagnostic(
+                                                "make_active_force_disconnect_gateway",
+                                                &format!(
+                                                    "old_active={} new_active={}",
+                                                    old.connection_id, connection_id_inbound,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else if let Some(ref sl) = session_log_inbound {
+                                    if let Ok(mut l) = sl.lock() {
+                                        l.voice_diagnostic(
+                                            "make_active_noop_gateway",
+                                            &format!(
+                                                "request from already-active connection={}",
+                                                connection_id_inbound,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Install this connection as new active
+                            *slot = Some(ActivePresence {
+                                connection_id: connection_id_inbound.clone(),
+                                direct_tx: direct_tx_inbound.clone(),
+                            });
                         }
 
                         // Single-active: a handover stops the superseded
@@ -1267,22 +1267,20 @@ pub(crate) async fn ws_inbound_task(
                             }
                         }
                     }
-                    Some("voice_thread_purge") => {
-                        match voice_broker_inbound.as_ref() {
-                            Some(broker) => {
-                                broker.purge_thread(direct_tx_inbound.clone()).await;
-                            }
-                            None => {
-                                let _ = direct_tx_inbound.send(
-                                    serde_json::json!({
-                                        "t": "voice_error",
-                                        "message": "voice broker unavailable on this daemon",
-                                    })
-                                    .to_string(),
-                                );
-                            }
+                    Some("voice_thread_purge") => match voice_broker_inbound.as_ref() {
+                        Some(broker) => {
+                            broker.purge_thread(direct_tx_inbound.clone()).await;
                         }
-                    }
+                        None => {
+                            let _ = direct_tx_inbound.send(
+                                serde_json::json!({
+                                    "t": "voice_error",
+                                    "message": "voice broker unavailable on this daemon",
+                                })
+                                .to_string(),
+                            );
+                        }
+                    },
                     Some("user_audio") => {
                         // Browser sends base64-encoded PCM16 audio for server-side transcription.
                         if let Some(ref transcriber) = transcriber_inbound {
