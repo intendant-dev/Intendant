@@ -90,6 +90,56 @@ pub fn process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Configure `cmd` so the spawned child is signal-scoped away from this
+/// process: its own process group on Unix (a Ctrl-C SIGINT to the
+/// parent's foreground group must not reach a spawned successor
+/// daemon), its own process group + no console window on Windows. This
+/// is signal scoping, not daemonization — the child simply reparents
+/// when this process exits.
+pub fn configure_detached_spawn(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NEW_PROCESS_GROUP: console Ctrl-C events do not
+        // propagate to the child; CREATE_NO_WINDOW: no console window.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Ask a process to terminate gracefully. Unix: SIGTERM (`true` when
+/// delivered). Other platforms: `false` — the caller falls back to its
+/// hard kill (`std::process::Child::kill`), the honest degrade where no
+/// graceful signal exists.
+pub fn request_graceful_terminate(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // pid_t is i32; overflowed/negative values have special kill()
+        // semantics (-1 = every process) — reject instead of signaling.
+        let pid = match libc::pid_t::try_from(pid) {
+            Ok(p) if p > 0 => p,
+            _ => return false,
+        };
+        // SAFETY: kill(2) with SIGTERM on a validated positive pid.
+        unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Return the main display's dimensions on macOS, in **points** (the
 /// logical/global display coordinate space), not backing pixels.
 ///

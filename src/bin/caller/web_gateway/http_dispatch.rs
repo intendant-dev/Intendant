@@ -1339,6 +1339,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::DaemonSuccessorExec => {
+                return handle_daemon_successor_exec(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::DaemonUpdateLaneCheck => {
                 return handle_daemon_update_lane(
                     stream,

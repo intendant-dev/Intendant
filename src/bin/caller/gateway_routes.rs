@@ -445,6 +445,10 @@ pub(crate) enum RouteHandlerId {
     /// One-click swap relay: the app supervisor reports the attempt's
     /// outcome.
     DaemonUpdateSwapResult,
+    /// Successor exec (ruled 2026-07-31): on a CLI-launched daemon the
+    /// owner's explicit click spawns the verified on-disk build as a
+    /// successor, confirms readiness, then drains toward it.
+    DaemonSuccessorExec,
     /// Raw bytes of one parked-ask preview blob (agenda blob store).
     AgendaBlobRaw,
     AgendaRefDrift,
@@ -1179,9 +1183,10 @@ pub(crate) static ROUTES: &[Route] = &[
     // surfaces watch progress through the handover status block but
     // cannot click a build/download onto the box (widening that is a
     // trust-surface decision the owner has not ratified). The check is
-    // bounded compare only; produce is the consent click, and the
-    // daemon never execs a successor — the shipped chip/one-click lane
-    // performs the swap.
+    // bounded compare only; produce is the consent click and only lands
+    // an artifact on disk — the swap is a SEPARATE explicit click (the
+    // app supervisor's one-click, or the ruled successor-exec row
+    // below), never a side effect of produce.
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/daemon/update-lane/check"),
@@ -1229,6 +1234,25 @@ pub(crate) static ROUTES: &[Route] = &[
         BodyPolicy::Capped(4 * 1024),
         RouteHandlerId::DaemonUpdateSwapResult,
         "App supervisor report: the outcome of a claimed swap attempt (failures surface on the chip and the notification lane)",
+    ),
+    // The successor-exec lane (ruled 2026-07-31, the update-channels
+    // gate's deferred question): on a CLI-launched daemon with NO live
+    // app supervisor, the owner's explicit click spawns the verified
+    // on-disk build as a successor secondary (never `--takeover`),
+    // confirms readiness, then drains toward it — with the exec target
+    // pinned by path AND hash (the body's required `expected_git_sha`)
+    // and a post-takeover build verification. Owner-grade like the
+    // other update rows, same loopback/own-origin trust class, and
+    // deliberately NO tunnel twin — remote surfaces observe through the
+    // handover status block, they cannot click a successor-exec onto
+    // the box (ruling binding 4).
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/daemon/successor-exec"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::DaemonSuccessorExec,
+        "Successor exec: spawn the verified on-disk build as this daemon's successor and drain toward it (CLI-launched daemons; body requires {\"expected_git_sha\": …})",
     ),
     // Parked-ask preview bytes (agenda blob store). Served with the same
     // attachment + nosniff posture as the session-upload raw route; the
@@ -3403,6 +3427,11 @@ mod tests {
         );
         assert_eq!(
             policy("POST", "/api/daemon/update-swap/result"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        // Successor exec carries the offered sha + a display label.
+        assert_eq!(
+            policy("POST", "/api/daemon/successor-exec"),
             BodyPolicy::Capped(4 * 1024)
         );
         // The agenda command lane accepts the rich-ask park payload: the
