@@ -858,4 +858,56 @@ mod tests {
                 + 60
         );
     }
+
+    #[test]
+    fn coalesced_callers_receive_the_leaders_acquisition_progress() {
+        let flight = AcquireFlight {
+            result: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+            progress: Mutex::new(None),
+            observers: Mutex::new(Vec::new()),
+        };
+        let leader_seen = Arc::new(Mutex::new(Vec::new()));
+        let follower_seen = Arc::new(Mutex::new(Vec::new()));
+        for (seen, coalesced) in [
+            (Arc::clone(&leader_seen), false),
+            (Arc::clone(&follower_seen), true),
+        ] {
+            flight.add_observer(
+                Arc::new(move |progress| {
+                    seen.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(progress);
+                }),
+                coalesced,
+            );
+        }
+        let key = WorkerKey {
+            environment: "env-a".into(),
+            revision: "abc".into(),
+            branch: Some("feature/worker".into()),
+        };
+        flight.publish(acquisition_progress(
+            &key,
+            RemoteCommandAcquisitionStage::WaitingForWorker,
+            3_600,
+            99_000,
+            None,
+            Some("task_e_shared"),
+            None,
+        ));
+
+        let leader = leader_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let follower = follower_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(leader.len(), 1);
+        assert_eq!(follower.len(), 1);
+        assert!(!leader[0].coalesced);
+        assert!(follower[0].coalesced);
+        assert_eq!(follower[0].task_id.as_deref(), Some("task_e_shared"));
+        assert_eq!(follower[0].deadline_at_unix_ms, 99_000);
+    }
 }
