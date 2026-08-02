@@ -884,6 +884,10 @@ mod tests {
                 .as_deref(),
             "native remote_command description drifted from the MCP surface"
         );
+        assert!(
+            native.parameters["properties"]["branch"].is_object(),
+            "native remote_command schema must expose the owner-supplied branch hint"
+        );
     }
 
     #[test]
