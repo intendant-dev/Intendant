@@ -33,7 +33,10 @@ Every real deployment decision sits on two independent axes:
   [anchor rule](./trust-architecture.md#anchor-daemons)). The packaged macOS
   app contains a local mTLS bridge, but no Developer ID-signed/notarized
   release has been published for this alpha; an `-unsigned-dev` bundle is not
-  a distribution anchor.
+  a distribution anchor. The qualifying lane that is compiled in —
+  `macos-pgp-logged-v1`, publisher-PGP signatures plus the transparency log
+  plus the verified install ceremony — has no completable instance published
+  yet.
 
 The doctrine is one sentence: **match the client's provenance to the payload
 of the daemon it is driving — per daemon, not per person.**
@@ -49,8 +52,11 @@ Stated per tier, and resolving what looks like a paradox:
   ceiling choice: loopback or independently reached direct mTLS remains the
   root anchor; its hosted lane still starts at **Tasks**, and **Operate**
   requires per-daemon opt-up plus the integrated-tier hardening
-  acknowledgement. A future Developer ID-signed/notarized packaged macOS
-  release may qualify as an application anchor; an unsigned artifact cannot.
+  acknowledgement. A packaged macOS release qualifies as an application
+  anchor through either provenance lane — Apple Developer ID-signed/notarized
+  (dormant), or publisher-PGP + transparency-logged through the verified
+  install ceremony (the compiled set's first entry); an unsigned artifact
+  cannot.
 
 Trust machinery scales with payload, not with paranoia. A user who keeps every
 daemon disposable can lean heavily on hosted discovery, bounded control, and
@@ -135,10 +141,11 @@ bundled macOS daemon:
 - **Integrated tier**: the same shipped anchors, with stricter device and
   credential discipline. The hosted ceiling still defaults to **Tasks**;
   **Operate** needs explicit per-daemon opt-up and the integrated-tier
-  acknowledgement. A Developer ID-signed/notarized native release could become
-  an out-of-band application anchor a bare browser tab cannot have, but no such
-  release is available in this alpha; the current `-unsigned-dev` artifact is
-  development-only.
+  acknowledgement. A qualifying native release — Apple-signed/notarized, or
+  publisher-PGP + transparency-logged through the verified install ceremony —
+  becomes an out-of-band application anchor a bare browser tab cannot have,
+  but no completable instance is available in this alpha; the current
+  `-unsigned-dev` artifact is development-only.
 
 Getting a direct control origin today: use a typed/pinned address, an
 owner-controlled hostname, mDNS or a tailnet route, then complete the direct
@@ -172,9 +179,11 @@ traffic must prove an approved short-lived lease and pass the exact
 route/method/frame/action projection. The rendezvous controls the name and can
 serve code at the same origin, so the lease ceiling and immutable floor—not the
 name—bound that code. Peer certificate witnesses are shipped. The
-signed-application witness protocol may also report when a qualifying signed
-distribution exists, but the current unsigned development artifact is never
-eligible. CT remains the slower fallback when no outside vantage is available.
+signed-application witness protocol accepts reports from anchors enrolled
+under the compiled qualifying set (first entry: the publisher-PGP +
+transparency-log lane), but the current unsigned development artifact is
+never eligible and no published instance can enroll yet. CT remains the
+slower fallback when no outside vantage is available.
 None of those signals grants authority. Certless root exists only on verified
 loopback; `--allow-public-plaintext` and fleet WebPKI grant no authority by
 themselves.
@@ -222,9 +231,10 @@ Three rungs, ordered by what betrayal costs the attacker:
    bytes only. The optional hosted lane does not promote the origin; it admits
    only a confirmed, short-lived lease under a compiled preset, while all
    unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused.
-   Peer witnessing is shipped, an eligible signed application can report only
-   when a qualifying distribution anchor exists, and CT remains the fallback
-   when neither outside vantage is available. Detection is not authority.
+   Peer witnessing is shipped, a signed application can report only under an
+   active anchor enrollment of a compiled qualifying distribution, and CT
+   remains the fallback when neither outside vantage is available. Detection
+   is not authority.
    Assigned fleet names are remembered
    durably even when Connect is later disabled or reports no current zone; a
    previously service-controlled name never decays into a direct anchor.
@@ -266,11 +276,14 @@ collapse code trust to install-and-update
 moments. The release pipeline fail-closes on detached PGP signatures over
 every published artifact, committed with the signing-key fingerprint to
 the transparency log (the key is the repo's `RELEASE-SIGNING-KEY.asc`,
-pinned at compile time by `intendant hosted-verify --releases`); the
+pinned at compile time by `intendant hosted-verify --releases`); that
+publisher-PGP lane is now the compiled application-anchor set's first
+qualifying entry, pending the app-side verified-install ceremony. The
 Apple Developer ID/notarization lane stays dormant — its credentials are
 not provisioned and no Developer ID-signed/notarized release has been
-published for this alpha, so app archives keep their clearly labelled
-`-unsigned-dev` suffix and remain outside the application-anchor set.
+published for this alpha — so app archives keep their clearly labelled
+`-unsigned-dev` suffix and labelled archives remain outside the
+application-anchor set.
 Separately, serving origins are
 answerable to **code transparency** —
 the artifacts an origin serves are committed to the rendezvous's public
@@ -405,9 +418,10 @@ enforces and audits. Every fleet surface sits in one of two lanes:
 
 - **The user lane** — the target binds *you* through loopback/direct mTLS, or
   binds a short-lived hosted lease that you confirmed on such a surface. A
-  future Developer ID-signed/notarized packaged app release could add its
-  bridge for the locally bundled macOS daemon; the current unsigned bundle
-  cannot.
+  future qualifying packaged app release — Apple-signed/notarized or
+  publisher-PGP + transparency-logged through the verified install ceremony —
+  could add its bridge for the locally bundled macOS daemon; the current
+  unsigned bundle cannot.
   A local session or mTLS certificate carries the owner role. A general browser
   identity key remains record-only and the Connect account is route metadata,
   not an authenticator. A hosted tab key authenticates only possession of its

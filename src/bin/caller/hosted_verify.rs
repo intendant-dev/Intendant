@@ -149,7 +149,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     sha256(data)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1741,10 +1741,10 @@ pub(crate) const GITHUB_API_BASE: &str = "https://api.github.com";
 const RELEASE_DOWNLOAD_BYTE_CAP: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ReleaseArtifact {
-    name: String,
-    sha256: String,
-    size: u64,
+pub(crate) struct ReleaseArtifact {
+    pub(crate) name: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
 }
 
 /// Canonical release-manifest hash — REPLICATES
@@ -2785,8 +2785,282 @@ async fn run_release_cli(
     }
 }
 
+/// Hermetic release-log fixtures shared by this module's tests and the
+/// hosted-control enrollment tests: a real Merkle log + signed tree head
+/// served from 127.0.0.1, twinned GitHub API included, so release flows
+/// run end to end with injected base URLs and no external network.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use super::*;
+
+    // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
+    // exercised against real trees, mirroring the service's tests. ──
+
+    pub(crate) fn split_point(n: usize) -> usize {
+        let mut k = 1usize;
+        while k * 2 < n {
+            k *= 2;
+        }
+        k
+    }
+
+    pub(crate) fn tree_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+        match leaves.len() {
+            0 => sha256(b""),
+            1 => leaves[0],
+            n => {
+                let k = split_point(n);
+                node_hash(&tree_root(&leaves[..k]), &tree_root(&leaves[k..]))
+            }
+        }
+    }
+
+    pub(crate) fn inclusion_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let n = leaves.len();
+        if n <= 1 {
+            return Vec::new();
+        }
+        let k = split_point(n);
+        if m < k {
+            let mut path = inclusion_proof(m, &leaves[..k]);
+            path.push(tree_root(&leaves[k..]));
+            path
+        } else {
+            let mut path = inclusion_proof(m - k, &leaves[k..]);
+            path.push(tree_root(&leaves[..k]));
+            path
+        }
+    }
+
+    pub(crate) fn consistency_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        fn subproof(m: usize, leaves: &[[u8; 32]], complete: bool) -> Vec<[u8; 32]> {
+            let n = leaves.len();
+            if m == n {
+                return if complete {
+                    Vec::new()
+                } else {
+                    vec![tree_root(leaves)]
+                };
+            }
+            let k = split_point(n);
+            if m <= k {
+                let mut proof = subproof(m, &leaves[..k], complete);
+                proof.push(tree_root(&leaves[k..]));
+                proof
+            } else {
+                let mut proof = subproof(m - k, &leaves[k..], false);
+                proof.push(tree_root(&leaves[..k]));
+                proof
+            }
+        }
+        if m == 0 || m > leaves.len() {
+            return Vec::new();
+        }
+        subproof(m, leaves, true)
+    }
+
+    pub(crate) struct FixtureLog {
+        pub(crate) leaves_json: Vec<String>,
+        pub(crate) keypair: ring::signature::EcdsaKeyPair,
+        rng: ring::rand::SystemRandom,
+    }
+
+    impl FixtureLog {
+        pub(crate) fn new(leaves_json: Vec<String>) -> Self {
+            let rng = ring::rand::SystemRandom::new();
+            let document = ring::signature::EcdsaKeyPair::generate_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                &rng,
+            )
+            .unwrap();
+            let keypair = ring::signature::EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                document.as_ref(),
+                &rng,
+            )
+            .unwrap();
+            Self {
+                leaves_json,
+                keypair,
+                rng,
+            }
+        }
+
+        pub(crate) fn leaves(&self) -> Vec<[u8; 32]> {
+            self.leaves_json
+                .iter()
+                .map(|leaf| leaf_hash(leaf))
+                .collect()
+        }
+
+        pub(crate) fn sth_json(&self) -> serde_json::Value {
+            use ring::signature::KeyPair as _;
+            let leaves = self.leaves();
+            let root_b64u = crate::daemon_identity::b64u(&tree_root(&leaves));
+            let unix_ms = 1_700_000_000_000u64;
+            let payload = sth_payload(leaves.len() as u64, &root_b64u, unix_ms);
+            let signature = self.keypair.sign(&self.rng, payload.as_bytes()).unwrap();
+            serde_json::json!({
+                "size": leaves.len(),
+                "root": root_b64u,
+                "unix_ms": unix_ms,
+                "signature": crate::daemon_identity::b64u(signature.as_ref()),
+                "public_key": crate::daemon_identity::b64u(self.keypair.public_key().as_ref()),
+            })
+        }
+
+        pub(crate) fn manifest_response(&self, index: usize) -> serde_json::Value {
+            let leaves = self.leaves();
+            let proof: Vec<String> = inclusion_proof(index, &leaves)
+                .iter()
+                .map(|hash| crate::daemon_identity::b64u(hash))
+                .collect();
+            serde_json::json!({
+                "ok": true,
+                "found": true,
+                "index": index,
+                "kind": "release_manifest",
+                "unix_ms": 4242,
+                "leaf_json": self.leaves_json[index],
+                "proof": proof,
+                "sth": self.sth_json(),
+            })
+        }
+
+        pub(crate) fn consistency_response(&self, old: usize) -> serde_json::Value {
+            let leaves = self.leaves();
+            let proof: Vec<String> = consistency_proof(old, &leaves)
+                .iter()
+                .map(|hash| crate::daemon_identity::b64u(hash))
+                .collect();
+            serde_json::json!({ "ok": true, "proof": proof })
+        }
+    }
+
+    pub(crate) struct Fixture {
+        pub(crate) log: FixtureLog,
+        pub(crate) manifest_index: usize,
+        pub(crate) release_status: u16,
+        pub(crate) release_body: serde_json::Value,
+        pub(crate) downloads: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    /// Serve the fixture over loopback; both the "rendezvous" and the
+    /// "GitHub API" live on the same ephemeral listener.
+    pub(crate) async fn spawn_fixture_server(
+        fixture: std::sync::Arc<std::sync::Mutex<Fixture>>,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        use axum::extract::{Path as AxumPath, Query as AxumQuery};
+        let manifest_fixture = fixture.clone();
+        let consistency_fixture = fixture.clone();
+        let release_fixture = fixture.clone();
+        let download_fixture = fixture.clone();
+        let router = axum::Router::new()
+            .route(
+                "/api/log/release-manifest",
+                axum::routing::get(move || {
+                    let fixture = manifest_fixture.clone();
+                    async move {
+                        let fixture = fixture.lock().unwrap();
+                        axum::Json(fixture.log.manifest_response(fixture.manifest_index))
+                    }
+                }),
+            )
+            .route(
+                "/api/log/consistency",
+                axum::routing::get(
+                    move |AxumQuery(params): AxumQuery<
+                        std::collections::HashMap<String, String>,
+                    >| {
+                        let fixture = consistency_fixture.clone();
+                        async move {
+                            let old: usize =
+                                params.get("old").and_then(|v| v.parse().ok()).unwrap_or(0);
+                            let fixture = fixture.lock().unwrap();
+                            axum::Json(fixture.log.consistency_response(old))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/repos/{owner}/{repo}/releases/tags/{tag}",
+                axum::routing::get(move || {
+                    let fixture = release_fixture.clone();
+                    async move {
+                        let fixture = fixture.lock().unwrap();
+                        (
+                            axum::http::StatusCode::from_u16(fixture.release_status).unwrap(),
+                            axum::Json(fixture.release_body.clone()),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/dl/{name}",
+                axum::routing::get(move |AxumPath(name): AxumPath<String>| {
+                    let fixture = download_fixture.clone();
+                    async move {
+                        let fixture = fixture.lock().unwrap();
+                        fixture.downloads.get(&name).cloned().unwrap_or_default()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        (url, handle)
+    }
+
+    pub(crate) fn release_leaf_fixture(tag: &str, artifacts: &[ReleaseArtifact]) -> String {
+        serde_json::json!({
+            "kind": "release_manifest",
+            "unix_ms": 4242,
+            "tag": tag,
+            "version": tag.trim_start_matches('v'),
+            "platforms": ["macos-arm64"],
+            "manifest_hash": release_manifest_hash_hex(tag, artifacts),
+            "pgp_fingerprint": crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT,
+            "artifacts": artifacts
+                .iter()
+                .map(|a| serde_json::json!({ "name": a.name, "sha256": a.sha256, "size": a.size }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// The committed public key as a logged artifact — exactly the bytes
+    /// this binary embeds, which is what the read-side pin demands.
+    pub(crate) fn release_key_artifact() -> ReleaseArtifact {
+        ReleaseArtifact {
+            name: crate::pgp_identity::RELEASE_SIGNING_KEY_ASSET.to_string(),
+            sha256: sha256_hex(crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.as_bytes()),
+            size: crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.len() as u64,
+        }
+    }
+
+    /// A base artifact with full PGP coverage: its detached signature and
+    /// the public-key asset beside it.
+    pub(crate) fn signed_release_artifacts(
+        base: &ReleaseArtifact,
+        sig_bytes: &[u8],
+    ) -> Vec<ReleaseArtifact> {
+        vec![
+            base.clone(),
+            ReleaseArtifact {
+                name: format!("{}.asc", base.name),
+                sha256: sha256_hex(sig_bytes),
+                size: sig_bytes.len() as u64,
+            },
+            release_key_artifact(),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::*;
     use super::*;
 
     fn required_manifest_artifacts(bytes: &[u8]) -> Vec<ManifestArtifact> {
@@ -3057,72 +3331,6 @@ mod tests {
         assert!(parse_manifest_leaf(&leaf)
             .unwrap_err()
             .contains("string bounds"));
-    }
-
-    // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
-    // exercised against real trees, mirroring the service's tests. ──
-
-    fn split_point(n: usize) -> usize {
-        let mut k = 1usize;
-        while k * 2 < n {
-            k *= 2;
-        }
-        k
-    }
-
-    fn tree_root(leaves: &[[u8; 32]]) -> [u8; 32] {
-        match leaves.len() {
-            0 => sha256(b""),
-            1 => leaves[0],
-            n => {
-                let k = split_point(n);
-                node_hash(&tree_root(&leaves[..k]), &tree_root(&leaves[k..]))
-            }
-        }
-    }
-
-    fn inclusion_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        let n = leaves.len();
-        if n <= 1 {
-            return Vec::new();
-        }
-        let k = split_point(n);
-        if m < k {
-            let mut path = inclusion_proof(m, &leaves[..k]);
-            path.push(tree_root(&leaves[k..]));
-            path
-        } else {
-            let mut path = inclusion_proof(m - k, &leaves[k..]);
-            path.push(tree_root(&leaves[..k]));
-            path
-        }
-    }
-
-    fn consistency_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
-        fn subproof(m: usize, leaves: &[[u8; 32]], complete: bool) -> Vec<[u8; 32]> {
-            let n = leaves.len();
-            if m == n {
-                return if complete {
-                    Vec::new()
-                } else {
-                    vec![tree_root(leaves)]
-                };
-            }
-            let k = split_point(n);
-            if m <= k {
-                let mut proof = subproof(m, &leaves[..k], complete);
-                proof.push(tree_root(&leaves[k..]));
-                proof
-            } else {
-                let mut proof = subproof(m - k, &leaves[k..], false);
-                proof.push(tree_root(&leaves[..k]));
-                proof
-            }
-        }
-        if m == 0 || m > leaves.len() {
-            return Vec::new();
-        }
-        subproof(m, leaves, true)
     }
 
     #[test]
@@ -3591,47 +3799,6 @@ mod tests {
         );
     }
 
-    fn release_leaf_fixture(tag: &str, artifacts: &[ReleaseArtifact]) -> String {
-        serde_json::json!({
-            "kind": "release_manifest",
-            "unix_ms": 4242,
-            "tag": tag,
-            "version": tag.trim_start_matches('v'),
-            "platforms": ["macos-arm64"],
-            "manifest_hash": release_manifest_hash_hex(tag, artifacts),
-            "pgp_fingerprint": crate::pgp_identity::RELEASE_SIGNING_KEY_FINGERPRINT,
-            "artifacts": artifacts
-                .iter()
-                .map(|a| serde_json::json!({ "name": a.name, "sha256": a.sha256, "size": a.size }))
-                .collect::<Vec<_>>(),
-        })
-        .to_string()
-    }
-
-    /// The committed public key as a logged artifact — exactly the bytes
-    /// this binary embeds, which is what the read-side pin demands.
-    fn release_key_artifact() -> ReleaseArtifact {
-        ReleaseArtifact {
-            name: crate::pgp_identity::RELEASE_SIGNING_KEY_ASSET.to_string(),
-            sha256: sha256_hex(crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.as_bytes()),
-            size: crate::pgp_identity::RELEASE_SIGNING_PUBKEY_ASC.len() as u64,
-        }
-    }
-
-    /// A base artifact with full PGP coverage: its detached signature and
-    /// the public-key asset beside it.
-    fn signed_release_artifacts(base: &ReleaseArtifact, sig_bytes: &[u8]) -> Vec<ReleaseArtifact> {
-        vec![
-            base.clone(),
-            ReleaseArtifact {
-                name: format!("{}.asc", base.name),
-                sha256: sha256_hex(sig_bytes),
-                size: sig_bytes.len() as u64,
-            },
-            release_key_artifact(),
-        ]
-    }
-
     #[test]
     fn release_leaf_parses_and_self_verifies() {
         let artifacts = vec![ReleaseArtifact {
@@ -3821,165 +3988,6 @@ mod tests {
             lines[0]
         );
         assert!(unlogged_assets(&[logged], &[asset(16, None)]).is_empty());
-    }
-
-    // ── Hermetic full-flow fixtures: a real Merkle log + signed tree
-    // head served from 127.0.0.1, twinned GitHub API included, so the
-    // release flow runs end to end with injected base URLs and no
-    // external network. ──
-
-    struct FixtureLog {
-        leaves_json: Vec<String>,
-        keypair: ring::signature::EcdsaKeyPair,
-        rng: ring::rand::SystemRandom,
-    }
-
-    impl FixtureLog {
-        fn new(leaves_json: Vec<String>) -> Self {
-            let rng = ring::rand::SystemRandom::new();
-            let document = ring::signature::EcdsaKeyPair::generate_pkcs8(
-                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-                &rng,
-            )
-            .unwrap();
-            let keypair = ring::signature::EcdsaKeyPair::from_pkcs8(
-                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-                document.as_ref(),
-                &rng,
-            )
-            .unwrap();
-            Self {
-                leaves_json,
-                keypair,
-                rng,
-            }
-        }
-
-        fn leaves(&self) -> Vec<[u8; 32]> {
-            self.leaves_json
-                .iter()
-                .map(|leaf| leaf_hash(leaf))
-                .collect()
-        }
-
-        fn sth_json(&self) -> serde_json::Value {
-            use ring::signature::KeyPair as _;
-            let leaves = self.leaves();
-            let root_b64u = crate::daemon_identity::b64u(&tree_root(&leaves));
-            let unix_ms = 1_700_000_000_000u64;
-            let payload = sth_payload(leaves.len() as u64, &root_b64u, unix_ms);
-            let signature = self.keypair.sign(&self.rng, payload.as_bytes()).unwrap();
-            serde_json::json!({
-                "size": leaves.len(),
-                "root": root_b64u,
-                "unix_ms": unix_ms,
-                "signature": crate::daemon_identity::b64u(signature.as_ref()),
-                "public_key": crate::daemon_identity::b64u(self.keypair.public_key().as_ref()),
-            })
-        }
-
-        fn manifest_response(&self, index: usize) -> serde_json::Value {
-            let leaves = self.leaves();
-            let proof: Vec<String> = inclusion_proof(index, &leaves)
-                .iter()
-                .map(|hash| crate::daemon_identity::b64u(hash))
-                .collect();
-            serde_json::json!({
-                "ok": true,
-                "found": true,
-                "index": index,
-                "kind": "release_manifest",
-                "unix_ms": 4242,
-                "leaf_json": self.leaves_json[index],
-                "proof": proof,
-                "sth": self.sth_json(),
-            })
-        }
-
-        fn consistency_response(&self, old: usize) -> serde_json::Value {
-            let leaves = self.leaves();
-            let proof: Vec<String> = consistency_proof(old, &leaves)
-                .iter()
-                .map(|hash| crate::daemon_identity::b64u(hash))
-                .collect();
-            serde_json::json!({ "ok": true, "proof": proof })
-        }
-    }
-
-    struct Fixture {
-        log: FixtureLog,
-        manifest_index: usize,
-        release_status: u16,
-        release_body: serde_json::Value,
-        downloads: std::collections::HashMap<String, Vec<u8>>,
-    }
-
-    /// Serve the fixture over loopback; both the "rendezvous" and the
-    /// "GitHub API" live on the same ephemeral listener.
-    async fn spawn_fixture_server(
-        fixture: std::sync::Arc<std::sync::Mutex<Fixture>>,
-    ) -> (Url, tokio::task::JoinHandle<()>) {
-        use axum::extract::{Path as AxumPath, Query as AxumQuery};
-        let manifest_fixture = fixture.clone();
-        let consistency_fixture = fixture.clone();
-        let release_fixture = fixture.clone();
-        let download_fixture = fixture.clone();
-        let router = axum::Router::new()
-            .route(
-                "/api/log/release-manifest",
-                axum::routing::get(move || {
-                    let fixture = manifest_fixture.clone();
-                    async move {
-                        let fixture = fixture.lock().unwrap();
-                        axum::Json(fixture.log.manifest_response(fixture.manifest_index))
-                    }
-                }),
-            )
-            .route(
-                "/api/log/consistency",
-                axum::routing::get(
-                    move |AxumQuery(params): AxumQuery<
-                        std::collections::HashMap<String, String>,
-                    >| {
-                        let fixture = consistency_fixture.clone();
-                        async move {
-                            let old: usize =
-                                params.get("old").and_then(|v| v.parse().ok()).unwrap_or(0);
-                            let fixture = fixture.lock().unwrap();
-                            axum::Json(fixture.log.consistency_response(old))
-                        }
-                    },
-                ),
-            )
-            .route(
-                "/repos/{owner}/{repo}/releases/tags/{tag}",
-                axum::routing::get(move || {
-                    let fixture = release_fixture.clone();
-                    async move {
-                        let fixture = fixture.lock().unwrap();
-                        (
-                            axum::http::StatusCode::from_u16(fixture.release_status).unwrap(),
-                            axum::Json(fixture.release_body.clone()),
-                        )
-                    }
-                }),
-            )
-            .route(
-                "/dl/{name}",
-                axum::routing::get(move |AxumPath(name): AxumPath<String>| {
-                    let fixture = download_fixture.clone();
-                    async move {
-                        let fixture = fixture.lock().unwrap();
-                        fixture.downloads.get(&name).cloned().unwrap_or_default()
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, router).await.ok();
-        });
-        (url, handle)
     }
 
     fn release_json(assets: Vec<serde_json::Value>) -> serde_json::Value {

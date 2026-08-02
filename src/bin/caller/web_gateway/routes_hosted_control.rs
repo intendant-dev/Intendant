@@ -529,18 +529,73 @@ pub(crate) async fn handle_hosted_control_request_poll(
 
 pub(crate) async fn handle_hosted_control_anchor_decision(
     stream: DemuxStream,
+    body: String,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response = if !runtime.configured() {
-        ApiResponse::json_error(404, "hosted control is disabled")
-    } else {
-        ApiResponse::json_error(
-            503,
-            "no qualifying signed application distribution is enabled in this build",
-        )
+    let result = match serde_json::from_str::<
+        crate::access::hosted_control::HostedAnchorDecisionDocument,
+    >(&body)
+    .map_err(|error| format!("invalid anchor decision document: {error}"))
+    {
+        Ok(document) => {
+            let runtime = Arc::clone(&runtime);
+            run_hosted_authority_io(move || runtime.apply_anchor_decision(document))
+                .await
+                .map_err(AnchorDecisionRefusal::Verification)
+        }
+        Err(error) => Err(AnchorDecisionRefusal::Parse(error)),
     };
+    let response = anchor_decision_response(result, runtime.configured(), runtime.enabled());
     write_api_response(stream, response, cors, None).await;
+}
+
+pub(crate) enum AnchorDecisionRefusal {
+    Parse(String),
+    Verification(String),
+}
+
+/// Route-layer status mapping for the public anchor-decision doorbell,
+/// pinned by test: a dark lane stays 404 regardless of the refusal, an
+/// initialization error is 503, a changed request digest is 409 (the
+/// witness lane's changed-evidence posture), malformed documents are 400,
+/// and every verification refusal is an undifferentiated 403.
+pub(crate) fn anchor_decision_response(
+    result: Result<crate::access::hosted_control::HostedLeaseRequestStatus, AnchorDecisionRefusal>,
+    configured: bool,
+    enabled: bool,
+) -> ApiResponse {
+    match result {
+        Ok(status) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({
+                "ok": true,
+                "status": status,
+            })),
+        ),
+        Err(refusal) => {
+            let error = match &refusal {
+                AnchorDecisionRefusal::Parse(error) => error,
+                AnchorDecisionRefusal::Verification(error) => error,
+            };
+            if !configured {
+                return ApiResponse::json_error(404, "hosted control is disabled");
+            }
+            if !enabled {
+                return ApiResponse::json_error(503, error);
+            }
+            if error == HOSTED_AUTHORITY_BUSY_ERROR {
+                return ApiResponse::json_error(429, error);
+            }
+            if error == crate::access::hosted_control::ANCHOR_DECISION_REQUEST_CHANGED_ERROR {
+                return ApiResponse::json_error(409, error);
+            }
+            match refusal {
+                AnchorDecisionRefusal::Parse(error) => ApiResponse::json_error(400, error),
+                AnchorDecisionRefusal::Verification(error) => ApiResponse::json_error(403, error),
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_hosted_control_certificate_ledger(
@@ -825,15 +880,19 @@ pub(crate) async fn handle_hosted_control_management(
             }
         }
         ("POST", "/api/access/hosted-control/anchors") => {
-            match serde_json::from_str::<crate::access::hosted_control::SignedAppAnchor>(&body)
-                .map_err(|error| format!("invalid signed-app anchor enrollment: {error}"))
-                .and_then(|anchor| {
-                    runtime
-                        .enroll_signed_app_anchor(anchor, actor)
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(()) => ApiResponse::json(200, JsonBody::Value(serde_json::json!({"ok": true}))),
-                Err(error) => ApiResponse::json_error(503, error),
+            match serde_json::from_str::<
+                crate::access::hosted_control::SignedAppAnchorEnrollmentInput,
+            >(&body)
+            .map_err(|error| format!("invalid signed-app anchor enrollment: {error}"))
+            {
+                Ok(input) => match runtime.enroll_signed_app_anchor(input, actor).await {
+                    Ok(anchor) => ApiResponse::json(
+                        200,
+                        JsonBody::Value(serde_json::json!({"ok": true, "anchor": anchor})),
+                    ),
+                    Err(error) => ApiResponse::json_error(400, error.to_string()),
+                },
+                Err(error) => ApiResponse::json_error(400, error),
             }
         }
         _ => ApiResponse::json_error(404, "unknown hosted-control management operation"),
@@ -1120,6 +1179,95 @@ mod tests {
         assert!(!custom_domain_hosted_authority_revoked(true, false, || {
             false
         }));
+    }
+
+    #[test]
+    fn anchor_decision_route_statuses_are_pinned() {
+        use crate::access::hosted_control::{
+            HostedLeaseRequestStatus, ANCHOR_DECISION_REFUSED_ERROR,
+            ANCHOR_DECISION_REQUEST_CHANGED_ERROR,
+        };
+        fn status(response: ApiResponse) -> u16 {
+            match response {
+                ApiResponse::Json { status, .. } => status,
+                _ => panic!("anchor decision responses are JSON"),
+            }
+        }
+        // Dark lane: 404 regardless of the refusal detail.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Verification(
+                    "hosted control is disabled".to_string()
+                )),
+                false,
+                false,
+            )),
+            404
+        );
+        // Configured but failed to initialize: 503.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Verification(
+                    "hosted control failed to initialize: x".to_string()
+                )),
+                true,
+                false,
+            )),
+            503
+        );
+        // Lit lane: malformed documents are 400.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Parse(
+                    "invalid anchor decision document: x".to_string()
+                )),
+                true,
+                true,
+            )),
+            400
+        );
+        // Verification refusals are an undifferentiated 403.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Verification(
+                    ANCHOR_DECISION_REFUSED_ERROR.to_string()
+                )),
+                true,
+                true,
+            )),
+            403
+        );
+        // Admission-bounded authority workers: 429.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Verification(
+                    HOSTED_AUTHORITY_BUSY_ERROR.to_string()
+                )),
+                true,
+                true,
+            )),
+            429
+        );
+        // The changed-digest refusal keeps the witness lane's 409 posture.
+        assert_eq!(
+            status(anchor_decision_response(
+                Err(AnchorDecisionRefusal::Verification(
+                    ANCHOR_DECISION_REQUEST_CHANGED_ERROR.to_string()
+                )),
+                true,
+                true,
+            )),
+            409
+        );
+        // A verified decision reports the outcome only.
+        assert_eq!(
+            status(anchor_decision_response(
+                Ok(HostedLeaseRequestStatus::Approved),
+                true,
+                true,
+            )),
+            200
+        );
     }
 
     #[test]

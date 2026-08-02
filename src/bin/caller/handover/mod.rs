@@ -31,7 +31,7 @@ mod update_watch;
 pub(crate) use lease::{read_lease_sidecar, LeaseAttempt, SchedulerLease};
 pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence, DrainHoldout};
 pub(crate) use successor_exec::spawn_successor_exec_lane;
-pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane};
+pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane, update_rendezvous_url};
 pub(crate) use update_watch::spawn_update_watch;
 
 use std::path::{Path, PathBuf};

@@ -62,9 +62,17 @@ Pick your rung of the trust ladder honestly:
 2. **Download, read, then run** the same asset — it is a short script.
    Check it against the release's `install.sh.sha256` and the logged release
    manifest first.
-3. **A signed native app** outranks both once published. No Developer
-   ID-signed/notarized release exists for this alpha, and an `-unsigned-dev`
-   artifact never qualifies as an anchor.
+3. **A signed native app** outranks both once published, through either
+   provenance lane: Apple Developer ID-signed/notarized (that lane is dormant
+   — no such release exists), or publisher-PGP-signed + transparency-logged,
+   installed through the app's fail-closed verified install ceremony — the
+   lane the daemon's compiled qualifying set already names
+   (`macos-pgp-logged-v1`). No published artifact can complete that ceremony
+   yet, and an `-unsigned-dev` artifact never qualifies as an anchor. One
+   instant stays on you either way: a drag-installed bootstrap executes
+   before any verification has happened, so run the independent check —
+   `gpg --verify` plus `intendant hosted-verify --releases --download` —
+   against the downloaded archive before first launch.
 
 `https://intendant.dev/install.sh` survives only as a **non-canonical**
 convenience: it answers with a redirect (HTTP 302) to the release asset and
