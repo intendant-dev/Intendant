@@ -38430,7 +38430,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '6b02238ee1ae660a';
+const INTENDANT_APP_BUILD = '326dd293c1627eb1';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -104876,6 +104876,12 @@ async function memoryProposeFromForm(button) {
       honesty.textContent = update.honesty;
       mount.appendChild(honesty);
     }
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    const bounds = document.createElement('div');
+    bounds.className = 'update-lane-note';
+    bounds.textContent = 'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.';
+    mount.appendChild(bounds);
     mount.appendChild(handoverUpdateActions(body, disk));
   }
 
@@ -105053,6 +105059,12 @@ async function memoryProposeFromForm(button) {
         `provenance unreadable${update.probe_error ? ` (${update.probe_error})` : ''}`
       ));
     }
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    const bounds = document.createElement('div');
+    bounds.className = 'handover-update-note';
+    bounds.textContent = 'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.';
+    el.appendChild(bounds);
     if (body.swap_result && body.swap_result.ok === false && !updateAction.note) {
       const failed = document.createElement('div');
       failed.className = 'handover-update-note';
@@ -105626,6 +105638,10 @@ async function memoryProposeFromForm(button) {
       window.intendantHandoverUpdate.renderSwapSection(swap);
     }
 
+    // The pinned honesty sentence — byte-identical on every update surface
+    // (static_assets.rs pins the served copy).
+    line(card, 'update-lane-footer',
+      'The update installs alongside the current version — running sessions finish uninterrupted, and the old version may keep running until they are done.');
     line(card, 'update-lane-footer',
       'Updates happen only on your click here — nothing installs or restarts automatically.');
     mount.appendChild(card);
