@@ -8305,33 +8305,40 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
     let rig = TestRig::new();
     rig.write_script(&serde_json::json!({ "profiles": [] }));
 
-    // The fake claude: run 1 waits for the first user message, announces
-    // a rejected five_hour window resetting ~15s out, ends the turn with
-    // the limit-text error result, and exits — the death rattle. Run 2
-    // (the wake's resume-attached respawn; the marker file
-    // discriminates) answers the parked re-send with a clean result and
-    // stays alive reading stdin. The reset clock starts only after the
-    // wrapper is fully up and delivering, so the 15s window prices in a
-    // loaded CI box: only the wrapper's own line-drain sits between the
-    // fake's emit and the park arming.
+    // The fake claude: the FIRST spawn (no `--resume` argv — the session's
+    // fresh backend) waits for the first user message, announces a
+    // rejected five_hour window resetting ~15s out, ends the turn with
+    // the limit-text error result, and exits — the death rattle. The
+    // wake's respawn carries `--resume <id>` (resume-attached by
+    // construction), and that argv discriminates run 2: answer the parked
+    // re-send with a clean result and stay alive reading stdin. Argv
+    // keying over a marker file is deliberate: it needs no external
+    // binaries and no filesystem state, so a platform's extra probe spawn
+    // of the command (observed on the Linux leg, where a marker-file
+    // discriminator was consumed before the session's real spawn) cannot
+    // desynchronize the runs — a stdin-less probe dies at `read` with
+    // zero side effects. The reset clock starts only after the wrapper is
+    // fully up and delivering, so the 15s window prices in a loaded CI
+    // box: only the wrapper's own line-drain sits between the fake's emit
+    // and the park arming.
     let fake = rig.home.path().join("fake-claude.sh");
     std::fs::write(
         &fake,
         concat!(
             "#!/bin/sh\n",
             "SID=\"11111111-2222-4333-8444-555555555555\"\n",
-            "MARKER=\"$(dirname \"$0\")/fake-claude-ran-once\"\n",
-            "if [ ! -f \"$MARKER\" ]; then\n",
-            "  : > \"$MARKER\"\n",
-            "  read -r _line || exit 1\n",
-            "  printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
+            "resumed=0\n",
+            "for a in \"$@\"; do\n",
+            "  [ \"$a\" = \"--resume\" ] && resumed=1\n",
+            "done\n",
+            "read -r _line || exit 1\n",
+            "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
+            "if [ \"$resumed\" = \"0\" ]; then\n",
             "  RESET=$(( $(/bin/date +%s) + 15 ))\n",
             "  printf '{\"type\":\"rate_limit_event\",\"rate_limit_info\":{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":%d},\"session_id\":\"%s\"}\\n' \"$RESET\" \"$SID\"\n",
             "  printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You have hit your session limit\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
             "  exit 1\n",
             "fi\n",
-            "read -r _line || exit 1\n",
-            "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
             "printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"resumed after the park wake\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
             "while read -r _line; do :; done\n",
         ),
