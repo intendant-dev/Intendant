@@ -2528,14 +2528,15 @@ pub(crate) async fn run_with_presence(
                                             SERVICE_RECOVERY_RESTART_CAUSE,
                                             turn_had_started,
                                         );
-                                        let (mut park, park_line) = transient_round_death_error_park(
-                                            &reason,
-                                            tokio::time::Instant::now(),
-                                            persistent_error_park_streak,
-                                            error_park_jitter_secs(),
-                                            turn_had_started,
-                                            None,
-                                        );
+                                        let (mut park, park_line) =
+                                            transient_round_death_error_park(
+                                                &reason,
+                                                tokio::time::Instant::now(),
+                                                persistent_error_park_streak,
+                                                error_park_jitter_secs(),
+                                                turn_had_started,
+                                                None,
+                                            );
                                         if let (Some(pending), Some(addendum)) =
                                             (park.pending.as_mut(), died_addendum)
                                         {

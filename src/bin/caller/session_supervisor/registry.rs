@@ -60,8 +60,11 @@ impl SessionSupervisor {
                 // mark the session's park as dead (releasable for the
                 // drain while idle); any publish without them means the
                 // session works again and clears the mark.
-                self.update_session_died_park(session_id, !activity.died_background_tasks.is_empty())
-                    .await;
+                self.update_session_died_park(
+                    session_id,
+                    !activity.died_background_tasks.is_empty(),
+                )
+                .await;
             }
             AppEvent::BackendCredentialsReloadProgress {
                 session_id,

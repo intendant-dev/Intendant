@@ -729,7 +729,13 @@ mod tests {
         let sid = "session-respawn";
         reg.record_started(sid, "task-live", "toolu_live", "cargo test battery", 100);
         reg.record_started(sid, "task-done", "toolu_done", "quick job", 101);
-        reg.record_finished(sid, "toolu_done", BackgroundTaskStatus::Completed, None, 102);
+        reg.record_finished(
+            sid,
+            "toolu_done",
+            BackgroundTaskStatus::Completed,
+            None,
+            102,
+        );
 
         let died = reg.mark_running_died_with_restart(sid, "the credential-reload restart", 160);
         assert_eq!(died.len(), 1, "only running records flip");

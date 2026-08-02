@@ -2292,7 +2292,13 @@ mod tests {
     fn died_with_restart_marking_never_arms_delivery() {
         let sid = "cc-died-pin-session";
         crate::background_tasks::clear_session(sid);
-        crate::background_tasks::record_started(sid, "task-1", "toolu_1", "cargo test battery", 100);
+        crate::background_tasks::record_started(
+            sid,
+            "task-1",
+            "toolu_1",
+            "cargo test battery",
+            100,
+        );
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
         let dir = tempfile::tempdir().unwrap();
@@ -2316,18 +2322,20 @@ mod tests {
             task.status,
             crate::background_tasks::BackgroundTaskStatus::DiedWithRestart
         );
-        assert_eq!(task.died_cause.as_deref(), Some(SERVICE_RECOVERY_RESTART_CAUSE));
+        assert_eq!(
+            task.died_cause.as_deref(),
+            Some(SERVICE_RECOVERY_RESTART_CAUSE)
+        );
 
         // The durable marker flipped to its died form.
-        let meta_park = log
-            .lock()
-            .unwrap()
-            .dir()
-            .join("session_meta.json");
+        let meta_park = log.lock().unwrap().dir().join("session_meta.json");
         let meta: session_log::SessionMeta =
             serde_json::from_str(&std::fs::read_to_string(meta_park).unwrap()).unwrap();
         let park = meta.bg_park.expect("died marker stamped");
-        assert_eq!(park.died_cause.as_deref(), Some(SERVICE_RECOVERY_RESTART_CAUSE));
+        assert_eq!(
+            park.died_cause.as_deref(),
+            Some(SERVICE_RECOVERY_RESTART_CAUSE)
+        );
         assert_eq!(park.tasks, vec!["cargo test battery".to_string()]);
 
         // THE PIN: the bus carries surfaces only. No follow-up, steer,

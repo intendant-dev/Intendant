@@ -1076,8 +1076,11 @@ mod tests {
                 "died_at_epoch": 100,
             }),
         );
-        let text =
-            readopt_continuation_with_died_tasks(home.path(), "sess-died-park", ResumeLens::MidWork);
+        let text = readopt_continuation_with_died_tasks(
+            home.path(),
+            "sess-died-park",
+            ResumeLens::MidWork,
+        );
         assert!(text.starts_with(READOPT_CONTINUATION_TEXT), "{text}");
         assert!(text.contains("cargo test battery"), "{text}");
         assert!(text.contains("NOT re-run automatically"), "{text}");

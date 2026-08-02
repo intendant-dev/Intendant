@@ -1200,9 +1200,10 @@ mod tests {
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
         {
             let mut state = supervisor.state.lock().await;
-            state
-                .sessions
-                .insert("s-died".to_string(), managed_session("s-died", "claude-code"));
+            state.sessions.insert(
+                "s-died".to_string(),
+                managed_session("s-died", "claude-code"),
+            );
         }
         let died = crate::types::SessionActivityVitals {
             died_background_tasks: vec!["cargo test battery".into()],
@@ -1241,12 +1242,7 @@ mod tests {
                 activity: crate::types::SessionActivityVitals::default(),
             })
             .await;
-        assert!(supervisor
-            .state
-            .lock()
-            .await
-            .died_park_sessions
-            .is_empty());
+        assert!(supervisor.state.lock().await.died_park_sessions.is_empty());
     }
 
     pub(crate) fn managed_session(id: &str, source: &str) -> ManagedSession {
