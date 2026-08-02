@@ -5260,9 +5260,13 @@ mod tests {
             "a non-holder pass must journal nothing"
         );
         let wake = wake.expect("secondaries wake at the poll cadence");
+        // The cadence is the runtime's secondary poll interval — ~1 s
+        // for this freshly initialized (young-convergence-window) boot —
+        // and NEVER the overdue item's instant, which is far in the
+        // past: any future wake proves the item did not drive it.
         assert!(
-            wake >= now + 30_000,
-            "the wake is the lease poll interval, never the overdue instant: {wake} vs {now}"
+            wake >= now + 900,
+            "the wake is the secondary poll cadence, never the overdue instant: {wake} vs {now}"
         );
     }
 
