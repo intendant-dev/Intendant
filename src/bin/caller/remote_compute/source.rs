@@ -314,6 +314,27 @@ pub(super) fn branch_for_revision(project_root: &Path, revision: &str) -> Option
     remote.starts_with(&expected).then_some(branch)
 }
 
+pub(super) fn validate_provider_branch(raw: &str) -> Result<String, String> {
+    let branch = raw.trim();
+    if branch.is_empty() || branch.len() > 255 || branch.starts_with('-') {
+        return Err("branch must be a valid pushed Git branch name".to_string());
+    }
+    let full_ref = format!("refs/heads/{branch}");
+    let valid = std::process::Command::new("git")
+        .args(["check-ref-format", &full_ref])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("validate provider branch with Git: {error}"))?
+        .success();
+    if !valid {
+        return Err("branch must be a valid pushed Git branch name".to_string());
+    }
+    Ok(branch.to_string())
+}
+
 fn git_stdout(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mut command = std::process::Command::new("git");
     command
@@ -1268,6 +1289,17 @@ mod tests {
         let second = capture_working_tree(repo.path(), Some(&revision)).unwrap();
         assert_eq!(first.digest, second.digest);
         assert_eq!(first.archive.as_slice(), second.archive.as_slice());
+    }
+
+    #[test]
+    fn provider_branch_validation_uses_git_ref_rules() {
+        assert_eq!(
+            validate_provider_branch("feature/cloud-worker").unwrap(),
+            "feature/cloud-worker"
+        );
+        assert!(validate_provider_branch("-provider-option").is_err());
+        assert!(validate_provider_branch("feature..broken").is_err());
+        assert!(validate_provider_branch("refs/heads/").is_err());
     }
 
     #[tokio::test]

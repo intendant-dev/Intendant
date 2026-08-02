@@ -9,8 +9,29 @@ repo_root="${CODEX_CLOUD_REPO_ROOT:-$PWD}"
 # after install_downloaded_binary has returned, where a local would be
 # unbound under set -u (and the download would leak).
 downloaded=""
+sccache_tmp=""
 
 mkdir -p "$bin_dir" "$libexec_dir"
+export PATH="$bin_dir:$PATH"
+
+cleanup_downloads() {
+  rm -f "${downloaded:-}"
+  if [[ -n "${sccache_tmp:-}" && -d "$sccache_tmp" ]]; then
+    rm -rf -- "$sccache_tmp"
+  fi
+}
+trap cleanup_downloads EXIT
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "sha256sum or shasum is required to verify downloaded binaries" >&2
+    return 2
+  fi
+}
 
 install_downloaded_binary() {
   if [[ -z "${INTENDANT_CLOUD_BINARY_SHA256:-}" ]]; then
@@ -20,28 +41,85 @@ install_downloaded_binary() {
 
   local actual
   downloaded="$(mktemp)"
-  # EXIT, not RETURN: a set -e abort inside the function skips RETURN traps
-  # and would leak the download.
-  trap 'rm -f "${downloaded:-}"' EXIT
   curl --fail --silent --show-error --location \
     --proto '=https' --tlsv1.2 \
     "$INTENDANT_CLOUD_BINARY_URL" \
     --output "$downloaded"
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$downloaded" | awk '{print $1}')"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$downloaded" | awk '{print $1}')"
-  else
-    echo "sha256sum or shasum is required to verify the Intendant binary" >&2
-    return 2
-  fi
+  actual="$(file_sha256 "$downloaded")"
 
   if [[ "$actual" != "$INTENDANT_CLOUD_BINARY_SHA256" ]]; then
     echo "Intendant binary checksum mismatch" >&2
     return 2
   fi
   install -m 0755 "$downloaded" "$bin_dir/intendant"
+}
+
+SCCACHE_VERSION="0.15.0"
+
+sccache_is_usable() {
+  local binary="$1"
+  local version major rest minor
+  version="$("$binary" --version 2>/dev/null | awk '{print $2}')"
+  version="${version#v}"
+  major="${version%%.*}"
+  rest="${version#*.}"
+  minor="${rest%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] \
+    && (( major > 0 || minor >= 14 ))
+}
+
+install_prebuilt_sccache() {
+  local target checksum asset archive actual extracted
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64)
+      target="x86_64-unknown-linux-musl"
+      checksum="782d2b5dd7ae0a55ebe368ab258114d0928d019ac2d949ab85d5d02f3926709e"
+      ;;
+    Linux:aarch64|Linux:arm64)
+      target="aarch64-unknown-linux-musl"
+      checksum="3a6a3712b49da3d263bf2d30d702de4302793016019e800bfb81c0c69401d8f8"
+      ;;
+    *) return 1 ;;
+  esac
+
+  asset="sccache-v${SCCACHE_VERSION}-${target}.tar.gz"
+  sccache_tmp="$(mktemp -d)" || return 1
+  archive="$sccache_tmp/$asset"
+  curl --fail --silent --show-error --location \
+    --proto '=https' --tlsv1.2 \
+    "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$asset" \
+    --output "$archive" || return 1
+  actual="$(file_sha256 "$archive")" || return 1
+  if [[ "$actual" != "$checksum" ]]; then
+    echo "sccache $SCCACHE_VERSION checksum mismatch for $target" >&2
+    return 1
+  fi
+  tar -xzf "$archive" -C "$sccache_tmp" || return 1
+  extracted="$sccache_tmp/sccache-v${SCCACHE_VERSION}-${target}/sccache"
+  [[ -f "$extracted" ]] || return 1
+  install -m 0755 "$extracted" "$bin_dir/sccache" || return 1
+  rm -rf -- "$sccache_tmp"
+  sccache_tmp=""
+  echo "installed checksum-verified sccache $SCCACHE_VERSION prebuilt for $target"
+}
+
+install_sccache() {
+  local existing
+  existing="$(command -v sccache || true)"
+  if [[ -n "$existing" ]] && sccache_is_usable "$existing"; then
+    echo "worker sccache prerequisite present ($("$existing" --version))"
+    return 0
+  fi
+  if install_prebuilt_sccache; then
+    return 0
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "warning: no supported sccache prebuilt and cargo is unavailable" >&2
+    return 1
+  fi
+  echo "warning: prebuilt sccache unavailable; compiling pinned $SCCACHE_VERSION fallback" >&2
+  cargo install --locked --version "$SCCACHE_VERSION" --root "$install_root" sccache
 }
 
 build_checked_out_binary() {
@@ -56,6 +134,10 @@ build_checked_out_binary() {
   cargo build --locked --release --bin intendant --manifest-path "$repo_root/Cargo.toml"
   install -m 0755 "$repo_root/target/release/intendant" "$bin_dir/intendant"
 }
+
+if [[ "${INTENDANT_CLOUD_SKIP_SCCACHE:-0}" != "1" ]]; then
+  install_sccache || echo "warning: sccache installation failed; durable_sccache jobs will be unavailable" >&2
+fi
 
 if [[ -n "${INTENDANT_CLOUD_BINARY_URL:-}" ]]; then
   install_downloaded_binary

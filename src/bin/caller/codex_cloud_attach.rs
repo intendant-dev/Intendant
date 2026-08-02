@@ -29,8 +29,9 @@ use std::time::Duration;
 use crate::codex_cloud::{record_attachment_state, state_path, AttachmentState, StoreLock};
 
 const BROKER_VERSION: u32 = 1;
-/// Enrollment tokens are delivery secrets for one attach ceremony:
-/// minutes, not hours.
+/// Default for a manual attach ceremony. Automatic acquisition extends its
+/// one-time token to the separately bounded cold-start deadline plus a small
+/// grace window; neither form is a durable credential.
 pub(crate) const DEFAULT_TOKEN_TTL_S: u64 = 900;
 /// The issued identity's record expiry (independent of cert validity —
 /// the record is what the gateway enforces on every connection).

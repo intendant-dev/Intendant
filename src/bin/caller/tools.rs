@@ -583,7 +583,7 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
     // 18. remote_command (caller-handled, acquired/attached remote workers)
     tools.push(ToolDefinition {
         name: "remote_command".to_string(),
-        description: "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately through acquiring/preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local.".to_string(),
+        description: "Use this instead of local execution for heavy platform-neutral compilation and testing. Start, inspect, wait for, or cancel a provider-neutral remote command job. Start accepts argv (never a shell string), host auto by default (reuse/acquire Codex Cloud) or explicit cloud:<task-id>, an optional pushed branch hint, source git_revision or an explicit working_tree snapshot, and optional durable_sccache. Git-revision jobs require expected_revision; working-tree jobs resolve a pinned base. Start returns immediately with acquisition stage/task/deadline detail through preparing/running states; status/wait returns bounded output and exact terminal/cache results. Keep only small OS-specific checks local.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -595,6 +595,10 @@ fn build_built_in_tools() -> Vec<ToolDefinition> {
                 "host": {
                     "type": "string",
                     "description": "Omit or use auto to reuse/acquire a matching worker; cloud:<codex-task-id> selects an existing attachment."
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Optional pushed provider branch containing expected_revision; useful when no supervised project root can derive it."
                 },
                 "argv": {
                     "type": "array",

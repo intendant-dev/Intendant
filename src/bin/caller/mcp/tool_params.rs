@@ -183,6 +183,11 @@ pub enum RemoteCommandParams {
         /// available for operator-selected attachments.
         #[serde(default)]
         host: Option<String>,
+        /// Pushed provider branch that contains `expected_revision`. This is
+        /// useful for owner-triggered calls without a supervised project
+        /// root. The attached worker still has to report the exact revision.
+        #[serde(default)]
+        branch: Option<String>,
         /// Executable followed by its arguments. This is never parsed by a shell.
         argv: Vec<String>,
         /// Repository-relative working directory; omitted means repository root.
