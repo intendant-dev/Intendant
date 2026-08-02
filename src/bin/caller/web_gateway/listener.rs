@@ -503,6 +503,7 @@ pub fn spawn_web_gateway(
     local_card_auth: crate::peer::AuthRequirements,
     tls_client_cert_required: bool,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    voice_broker: Option<Arc<crate::voice_broker::VoiceBroker>>,
 ) -> tokio::task::JoinHandle<()> {
     spawn_web_gateway_from_cert_dir(
         listener,
@@ -520,6 +521,7 @@ pub fn spawn_web_gateway(
         local_card_auth,
         tls_client_cert_required,
         tls_acceptor,
+        voice_broker,
         default_access_cert_dir(),
     )
 }
@@ -584,6 +586,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
     // `0x16` handshake-record first byte, which is disjoint from both the
     // STUN length-prefix and HTTP method bytes.
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    voice_broker: Option<Arc<crate::voice_broker::VoiceBroker>>,
     access_cert_dir: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let relay_ingress_listener = bind_relay_gateway_ingress(&config.connect);
@@ -603,6 +606,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
         local_card_auth,
         tls_client_cert_required,
         tls_acceptor,
+        voice_broker,
         access_cert_dir,
         relay_ingress_listener,
     )
@@ -625,6 +629,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     local_card_auth: crate::peer::AuthRequirements,
     tls_client_cert_required: bool,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    voice_broker: Option<Arc<crate::voice_broker::VoiceBroker>>,
     access_cert_dir: std::path::PathBuf,
     relay_ingress_listener: Option<TcpListener>,
 ) -> tokio::task::JoinHandle<()> {
@@ -818,6 +823,25 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
     let active_presence: Arc<Mutex<Option<ActivePresence>>> = Arc::new(Mutex::new(None));
+    // Bind the ChatGPT-lane voice broker to this gateway's collaborators:
+    // the owner anchor is "this connection holds the active presence
+    // slot right now", probed live at call start and again at every
+    // authority-bearing dispatch.
+    if let Some(broker) = voice_broker.as_ref() {
+        let probe_slot = active_presence.clone();
+        broker.wire(crate::voice_broker::VoiceBrokerWiring {
+            shared_session: shared_session.clone(),
+            task_tx: task_tx.clone(),
+            anchor_probe: Arc::new(move |conn: &str| {
+                probe_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|a| a.connection_id == conn)
+                    .unwrap_or(false)
+            }),
+        });
+    }
     // Per-display input authority (phase 5).  Entry absence = unclaimed
     // (any connection can input — pre-phase-5 default); entry presence =
     // exclusive ownership by that one `connection_id`.
@@ -1545,6 +1569,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let tcp_advertised_port = tcp_advertised_port;
             let shared_session = shared_session.clone();
             let voice_debug = voice_debug.clone();
+            let voice_broker = voice_broker.clone();
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
             let app_html = app_html.clone();
@@ -3015,6 +3040,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         tcp_advertised_port,
                         tcp_peer_registry: Arc::clone(&tcp_peer_registry),
                         session_cancel: ws_session_cancel.clone(),
+                        voice_broker: voice_broker.clone(),
                     };
                     let inbound = tokio::spawn(ws_inbound_task(inbound_ctx, ws_rx, peer_id));
 
@@ -3611,6 +3637,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             Some(acceptor),
+            None,
             access_dir.path().to_path_buf(),
             Some(relay_ingress_listener),
         );
@@ -3798,6 +3825,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             Some(acceptor),
+            None,
             access_dir.path().to_path_buf(),
             Some(relay_ingress_listener),
         );
@@ -4058,6 +4086,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
 
@@ -4855,6 +4884,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -4915,6 +4945,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -4973,6 +5004,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5039,6 +5071,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5098,6 +5131,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5182,6 +5216,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5297,6 +5332,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5371,6 +5407,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5452,6 +5489,7 @@ mod tests {
                 crate::peer::AuthRequirements::none(),
                 false,
                 None,
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5510,6 +5548,7 @@ mod tests {
                 None,
                 crate::peer::AuthRequirements::none(),
                 false,
+                None,
                 None,
             )
         };
@@ -5578,6 +5617,7 @@ mod tests {
                 None,
                 crate::peer::AuthRequirements::none(),
                 false,
+                None,
                 None,
             )
         };
@@ -5655,6 +5695,7 @@ mod tests {
                 crate::peer::AuthRequirements::none(),
                 false,
                 None,
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5720,6 +5761,7 @@ mod tests {
                 None,
                 crate::peer::AuthRequirements::none(),
                 false,
+                None,
                 None,
             )
         };
@@ -5793,6 +5835,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5857,6 +5900,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -5926,6 +5970,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -5984,6 +6029,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -6052,6 +6098,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -6111,6 +6158,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -6206,6 +6254,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -6337,6 +6386,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -6442,6 +6492,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -6539,6 +6590,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

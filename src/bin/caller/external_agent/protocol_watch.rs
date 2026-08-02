@@ -772,6 +772,7 @@ fn profile_key(profile: &str) -> &'static str {
         "vanilla" => "vanilla",
         "server-v1" => "server-v1",
         "rpc" => "rpc",
+        "voice" => "voice",
         _ => "other",
     }
 }

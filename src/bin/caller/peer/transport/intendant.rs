@@ -1003,6 +1003,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             None,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle, bus_rx)
@@ -1059,6 +1060,7 @@ mod tests {
             None,
             crate::peer::AuthRequirements::none(),
             false,
+            None,
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1757,6 +1759,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             false,
             Some(acceptor),
+            None,
             access_dir.path().to_path_buf(),
         );
         tokio::time::sleep(Duration::from_millis(150)).await;

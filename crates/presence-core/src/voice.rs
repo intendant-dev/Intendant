@@ -53,6 +53,10 @@ pub struct PresenceVoiceConfig {
     /// Realtime protocol version: "v1" | "v2" | "v3". Unset = v3.
     #[serde(default)]
     pub realtime_version: Option<String>,
+    /// Explicit App Server binary override (e.g. a bundled desktop-app
+    /// codex). Unset = the configured `[codex] command`.
+    #[serde(default)]
+    pub app_server_command: Option<String>,
 }
 
 /// Default realtime protocol version for the ChatGPT lane.

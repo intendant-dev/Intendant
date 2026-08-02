@@ -517,6 +517,24 @@ pub(crate) fn spawn_mode_web_gateway(
         bus.clone(),
     )));
     let advertise_urls = resolve_advertise_urls_from_flags_and_config(flags, project);
+    // The ChatGPT-lane voice broker: constructed for every daemon (cheap;
+    // the app-server child spawns on demand per call), selected as the
+    // live voice lane only when `[presence] live_provider = "chatgpt"`.
+    let voice_broker = {
+        let presence_cfg = &project.config.presence;
+        let settings = crate::voice_broker::VoiceBrokerSettings {
+            provider_selected: presence_cfg.live_provider.as_deref()
+                == Some(presence_core::voice::CHATGPT_VOICE_PROVIDER),
+            app_server_command: crate::voice_broker::resolve_app_server_command(
+                presence_cfg.voice.app_server_command.as_deref(),
+                &project.config.agent.codex.command,
+            ),
+            codex_home: None,
+            state_root: crate::platform::intendant_home(),
+            voice: presence_cfg.voice.clone(),
+        };
+        Some(crate::voice_broker::VoiceBroker::new(settings, bus.clone()))
+    };
     let handle = web_gateway::spawn_web_gateway(
         web_listener
             .take()
@@ -538,6 +556,7 @@ pub(crate) fn spawn_mode_web_gateway(
         )?,
         web_tls_client_cert_required,
         web_tls_acceptor.clone(),
+        voice_broker,
     );
     // The runtime sandbox walls this port off from model-driven shells
     // (see sandbox::seatbelt_loopback_guard_clause) — recorded here, the
