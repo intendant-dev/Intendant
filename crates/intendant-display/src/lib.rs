@@ -1391,6 +1391,63 @@ fn all_tile_ids(grid: &tile::grid::TileGrid) -> Vec<tile::grid::TileId> {
     out
 }
 
+/// Resolve the final dirty rects for one allowed delta tick from the
+/// damage collected since the last tick. Shared by the WebRTC tile
+/// bridge and the socket tile stream so both lanes make identical
+/// dirt decisions.
+///
+/// Frame-diff mode (`uses_frame_diff` — the platforms without a
+/// per-frame damage source): hash every tile of the frame against the
+/// tracker's baseline. This walks the whole frame, so it runs on the
+/// blocking pool, never inline on the runtime, and only on allowed
+/// ticks. Skipping frames is safe: the baseline only advances when a
+/// diff runs, so a change landing on a skipped frame is caught by the
+/// next diff.
+///
+/// Rect mode (in-frame dirty rects or OS damage events): the collected
+/// rects are returned as reported.
+///
+/// `tracker_slot` round-trips the tracker through the blocking task
+/// (moved in, moved back out). A cancelled/panicked task loses it; the
+/// replacement re-baselines on the next tick.
+async fn resolve_tile_tick_damage(
+    frame: &Arc<Frame>,
+    mut collected: Vec<capture::damage::Rect>,
+    uses_frame_diff: bool,
+    tracker_slot: &mut Option<capture::frame_diff::FrameDiffDamageTracker>,
+    display_id: u32,
+    log_prefix: &'static str,
+) -> Vec<capture::damage::Rect> {
+    if uses_frame_diff {
+        let tracker = tracker_slot.take().unwrap_or_else(|| {
+            capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX)
+        });
+        let diff_result = tokio::task::spawn_blocking({
+            let frame = Arc::clone(frame);
+            move || {
+                let mut tracker = tracker;
+                let rects = tracker.diff_frame(&frame);
+                (tracker, rects)
+            }
+        })
+        .await;
+        match diff_result {
+            Ok((tracker, Ok(diff_rects))) => {
+                *tracker_slot = Some(tracker);
+                collected.extend(diff_rects);
+            }
+            Ok((tracker, Err(e))) => {
+                *tracker_slot = Some(tracker);
+                eprintln!("{log_prefix} display {display_id} frame-diff failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("{log_prefix} display {display_id} frame-diff task failed: {e}");
+            }
+        }
+    }
+    collected
+}
+
 fn encode_tile_records(
     frame: &Frame,
     tiles: Vec<tile::grid::TileId>,
@@ -3370,55 +3427,15 @@ impl DisplaySession {
                         }
                         last_delta_tick_at = Some(now);
 
-                        let mut rects = std::mem::take(&mut pending_rects);
-
-                        // Frame-diff fallback (macOS/Windows/Wayland —
-                        // the platforms without an OS damage source):
-                        // hash every tile of the frame and diff against
-                        // the previous baseline. This walks the whole
-                        // frame, so it runs on the blocking pool, never
-                        // inline on the runtime, and only on allowed
-                        // ticks. Skipping frames is safe: the baseline
-                        // only advances when a diff runs, so a change
-                        // landing on a skipped frame is caught by the
-                        // next diff.
-                        if uses_frame_diff {
-                            let tracker = frame_diff.take().unwrap_or_else(|| {
-                                capture::frame_diff::FrameDiffDamageTracker::new(
-                                    TILE_STREAM_TILE_SIZE_PX,
-                                )
-                            });
-                            let diff_result = tokio::task::spawn_blocking({
-                                let frame = Arc::clone(&frame);
-                                move || {
-                                    let mut tracker = tracker;
-                                    let rects = tracker.diff_frame(&frame);
-                                    (tracker, rects)
-                                }
-                            })
-                            .await;
-                            match diff_result {
-                                Ok((tracker, Ok(diff_rects))) => {
-                                    frame_diff = Some(tracker);
-                                    rects.extend(diff_rects);
-                                }
-                                Ok((tracker, Err(e))) => {
-                                    frame_diff = Some(tracker);
-                                    eprintln!(
-                                        "[display/tile] display {display_id} frame-diff failed: {e}"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Tracker lost with the cancelled/
-                                    // panicked task; the replacement
-                                    // re-baselines (all tiles dirty) on
-                                    // the next allowed tick.
-                                    eprintln!(
-                                        "[display/tile] display {display_id} frame-diff task failed: {e}"
-                                    );
-                                }
-                            }
-                        }
+                        let mut rects = resolve_tile_tick_damage(
+                            &frame,
+                            std::mem::take(&mut pending_rects),
+                            uses_frame_diff,
+                            &mut frame_diff,
+                            display_id,
+                            "[display/tile]",
+                        )
+                        .await;
 
                         let policy_dirty = next_grid.dirty_tiles(&rects);
                         let dirty_fraction = next_grid.dirty_fraction(policy_dirty.len());
