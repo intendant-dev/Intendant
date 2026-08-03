@@ -7337,12 +7337,24 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
         .build()
         .expect("successor-authed client");
     let held_row = |sessions: &serde_json::Value, sid: &str| -> Option<serde_json::Value> {
+        // The plain GET serves a bare row array; the stream lane nests
+        // rows under "sessions" — accept both like the catalog's other
+        // e2e consumers.
         sessions["sessions"]
-            .as_array()?
+            .as_array()
+            .or_else(|| sessions.as_array())?
             .iter()
             .find(|row| row["session_id"] == sid)
             .cloned()
     };
+    let drainer_presence_path = daemon_a
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{holder_boot}.json"));
+    let last_served_row = std::sync::Mutex::new(String::from("(row never served)"));
     poll_until(
         "the successor serving held_by on the drained row",
         RUN_TIMEOUT,
@@ -7353,6 +7365,7 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
             )
             .await?;
             let row = held_row(&sessions, &sid)?;
+            *last_served_row.lock().unwrap() = row.to_string();
             let held = row.pointer("/boot/held_by")?;
             (held["boot_id"] == holder_boot.as_str()
                 && held["port"] == port_a
@@ -7366,9 +7379,10 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
         },
         || {
             format!(
-                "--- A tail ---\n{}\n--- B presence view ---\n{:?}",
-                daemon_a.log_tail(),
-                lease_sidecar(&daemon_a.rig)
+                "--- drainer presence record ---\n{}\n--- last served row ---\n{}\n--- A tail ---\n{}",
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                last_served_row.lock().unwrap(),
+                daemon_a.log_tail()
             )
         },
     )
