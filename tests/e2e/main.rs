@@ -7804,7 +7804,8 @@ async fn follow_contract_carries_the_scripted_tab_to_the_successor() {
     .await
     .expect("C's handover payload");
     assert_ne!(
-        c_payload["boot_id"], boot_a.as_str(),
+        c_payload["boot_id"],
+        boot_a.as_str(),
         "the landing is a different boot: {c_payload}"
     );
     let c_entry = c_payload["daemons"]
