@@ -1245,6 +1245,172 @@ mod tests {
         );
     }
 
+    /// Update-abstraction slice 2 pin (intake §7, acceptance (b)): the
+    /// follow watch — armed exactly by the own-drain render branch,
+    /// resolving through the ONE live-holder rule (the doorway's — two
+    /// consumers, one rule, never a second), tokening through the
+    /// shared sibling map with R-A2's re-fetch-on-miss, probing the
+    /// target origin (no-cors HEAD), and moving the tab with
+    /// location.replace + the tokened URL + the carry fragment. The
+    /// packaged-app webview stands down; a relay surface gets honest
+    /// copy instead of a meaningless port substitution.
+    #[test]
+    fn spa_arms_the_follow_watch_on_own_drain() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            "function armFollowWatch",
+            "armFollowWatch(body);",
+            "function followWatchTick",
+            "function followSurfaceExclusion",
+            "siblingTokenForPort(followWatch.port)",
+            "mode: 'no-cors'",
+            "method: 'HEAD'",
+            "location.replace(url)",
+            "&carry=",
+            "Moving to the updated daemon…",
+            "if (document.hidden) {",
+            "FOLLOW_GRACE_MS",
+            "through a relay",
+            "if (followWatch.armed) disarmFollowWatch();",
+            "window.qa.followState",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the follow watch lost its wiring: {needle}"
+            );
+        }
+        // ONE resolution rule, two consumers: the doorway and the watch
+        // tick both read the holder through resolveLiveHolder — a
+        // follow that resolved any other way could walk into a drain.
+        assert_eq!(
+            fragment
+                .matches("const holder = resolveLiveHolder(body);")
+                .count(),
+            2,
+            "doorway + follow tick both consume the one live-holder rule"
+        );
+    }
+
+    /// Slice 2 (b): the carry — capture-stripped from the hash before
+    /// the router or the session-windows reader evaluates (the ?token=
+    /// pattern applied to the fragment), seeded into the same persisted
+    /// keys this origin would have written itself, the pre-swap stamps
+    /// one-shot for the completion compare, and the legacy federation
+    /// bearer carried across the hop (R-A4 — per-origin storage never
+    /// follows an origin change by itself). R-A2's shared token helper
+    /// lives here too: the cached map is a resilience floor and a miss
+    /// re-fetches — which also heals the slice-1 doorway's
+    /// per-page-load cache (the ruling's N1 note) through the same
+    /// mechanism.
+    #[test]
+    fn follow_carry_capture_strips_and_seeds_the_landing() {
+        let identity = include_str!("../../../../static/app/31-init-identity-fleet.js");
+        for needle in [
+            "function captureFollowCarry",
+            "hash.indexOf('&carry=')",
+            "function applyFollowCarry",
+            "localStorage.setItem(SESSION_WINDOW_STATE_KEY, JSON.stringify({ windows }));",
+            "'intendant_settings_subtab'",
+            "'intendant_access_subtab'",
+            "setFederationToken(bearer)",
+            "function takeFollowArrivalStamps",
+            "input.value = draft;",
+            "function siblingTokenForPort",
+            "siblingLoopbackTokenMap(true)",
+            "followCarryApplied",
+        ] {
+            assert!(
+                identity.contains(needle),
+                "the carry capture/landing lost its wiring: {needle}"
+            );
+        }
+        // The sub-tab keys are literals here (the router's constants
+        // are TDZ at this fragment's eval) — parity-pinned to the
+        // router's declarations so a key rename cannot ship as drift.
+        let router = include_str!("../../../../static/app/48-router-settings.js");
+        assert!(
+            router.contains("= 'intendant_settings_subtab'"),
+            "the settings sub-tab key moved — update the carry literals"
+        );
+        assert!(
+            router.contains("= 'intendant_access_subtab'"),
+            "the access sub-tab key moved — update the carry literals"
+        );
+        // Served bundle: the whole wiring lands, each definition once.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "function captureFollowCarry",
+            "function applyFollowCarry",
+            "function siblingTokenForPort",
+            "function armFollowWatch",
+        ] {
+            assert_eq!(
+                app.matches(needle).count(),
+                1,
+                "the served bundle must carry exactly one {needle}"
+            );
+        }
+    }
+
+    /// Slice 2 (b): the composer guard — any draft demotes the move to
+    /// a one-button consent ("Continue on the updated daemon"), R-A3's
+    /// over-cap loss is named in the consent copy BEFORE navigation
+    /// (never a post-hoc toast), the cap-drop lives at carry BUILD
+    /// time, and the guard reads the same input the reload nudges
+    /// already guard — one composer, one truth.
+    #[test]
+    fn follow_composer_guard_demotes_to_consent() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            "function composerDraftText",
+            "if (composerDraftText()) {",
+            "Continue on the updated daemon",
+            "too large to carry",
+            "Your composer draft moves with you.",
+            "function followDraftOverCap",
+            "if (encoded.length > FOLLOW_CARRY_CAP && blob.draft)",
+            "document.getElementById('new-session-input')",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the composer guard lost its wiring: {needle}"
+            );
+        }
+    }
+
+    /// Slice 2 refinement R-A1: completion honesty compares the
+    /// git_sha AND built_at PAIR — a same-commit rebuild is a real
+    /// update on a dev box, and only a genuinely unchanged pair may be
+    /// narrated as "didn't change builds"; unreadable stamps get the
+    /// neutral line, never a claim.
+    #[test]
+    fn completion_honesty_compares_the_stamp_pair() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            "function followCompletionCheck",
+            "succ.git_sha !== pred.git_sha || succ.built_at !== pred.built_at",
+            "All set — running ",
+            "The restart didn't change builds.",
+            "Moved to the updated daemon.",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the completion-honesty compare lost its wiring: {needle}"
+            );
+        }
+        // Both sides of the carry keep the stamps as pairs.
+        let identity = include_str!("../../../../static/app/31-init-identity-fleet.js");
+        for needle in [
+            "git_sha: str(value.git_sha, 128)",
+            "built_at: str(value.built_at, 128)",
+        ] {
+            assert!(
+                identity.contains(needle),
+                "the carried stamps lost the R-A1 pair: {needle}"
+            );
+        }
+    }
+
     /// The Cmd/Ctrl-K palette's update verbs are pure affordance
     /// re-exposure — the emission-shape law: the chip module keeps the
     /// only swap emissions (one relay POST, one webview bridge, one
