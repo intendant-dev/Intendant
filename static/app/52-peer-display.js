@@ -141,8 +141,10 @@ const PEER_DISPLAY_POLICY = {
       // at all — every Windows peer (Media Foundation is H.264-only)
       // — which the VP8-only pin hard-failed with NoCompatibleCodec:
       // the peer never answered and the viewer surfaced the misleading
-      // no-track watchdog ("may need a capture grant"). Observed live
-      // against a Windows 11 peer, 2026-08-02.
+      // catch-all no-track watchdog copy ("may need a capture grant" —
+      // since split: a never-applied answer now reports a codec or
+      // permission mismatch). Observed live against a Windows 11 peer,
+      // 2026-08-02.
       const caps = (typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities)
         ? RTCRtpReceiver.getCapabilities('video')
         : null;
@@ -241,6 +243,9 @@ class PeerDisplayConnection {
     this.pc = null;
     this.stream = null;
     this._pendingCandidates = [];
+    // Set by displayViewerApplyRemoteAnswer once setRemoteDescription
+    // succeeds. Gates direct addIceCandidate vs. buffering, and picks
+    // the no-track watchdog's verdict (no answer vs. no frames).
     this._answerApplied = false;
     // F-1.3c: federated input authority state for THIS browser's
     // view of THIS peer-display. Mirrors local DisplaySlot's
@@ -331,11 +336,13 @@ class PeerDisplayConnection {
     this.displayStatusText = 'Connecting...';
     this.displayStatusKind = '';
     // No-track watchdog: a viewed display that never delivers a video
-    // track (peer dropped the offer — e.g. no capture grant — or ICE
-    // stalled) previously sat in 'Offer sent…' forever while the Station
-    // thumbnail showed 'linking display' indefinitely. Armed in
-    // connect(), cleared by ontrack and close(); a retry click opens a
-    // fresh connection, which arms a fresh watchdog.
+    // track previously sat in 'Offer sent…' forever while the Station
+    // thumbnail showed 'linking display' indefinitely. The verdict copy
+    // branches on `_answerApplied` — no answer at all (codec mismatch,
+    // IAM refusal, unknown display) vs. answered but trackless (encoder
+    // idle in tile mode, media-path stall). Armed in connect(), cleared
+    // by ontrack and close(); a retry click opens a fresh connection,
+    // which arms a fresh watchdog.
     this._noTrackTimer = null;
   }
 
@@ -348,7 +355,16 @@ class PeerDisplayConnection {
   _armNoTrackWatchdog() {
     displayViewerArmNoTrackWatchdog(this, () => {
       if (this.stream) return;
-      const message = 'peer did not answer — its display may need a capture grant';
+      // Verdict branches on `_answerApplied` (set by
+      // displayViewerApplyRemoteAnswer once setRemoteDescription
+      // succeeds): a never-answered offer is a negotiation failure
+      // (codec mismatch, IAM refusal, unknown display), while an
+      // answered-but-trackless session points at the media path or an
+      // encoder idling in tile mode. One `message` feeds the status
+      // line, the stage overlay, and the activity event alike.
+      const message = this._answerApplied
+        ? 'connected, but no video frames arrived — the stream may be idle (tile mode) or blocked on the media path'
+        : "no answer from the peer — likely a codec or permission mismatch; check the peer daemon's log";
       this._log('warn', `no video track within ${PeerDisplayConnection.NO_TRACK_TIMEOUT_MS}ms — ${message}`);
       this.setStatus(message, 'error');
       // Item 5: the watchdog verdict belongs on the stage too, with a
