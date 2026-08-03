@@ -27857,6 +27857,43 @@ html.ui-v2 .handover-update-panel-link {
   text-decoration: underline;
   align-self: flex-start;
 }
+
+/* ── Follow watch (update-abstraction slice 2) ── */
+/* The grace toast: a small fixed notice above the chip dock — the move
+   is announced, never silent. Removed on navigation or disarm. */
+html.ui-v2 #handover-follow-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 9600;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.92));
+  color: var(--text, #e6e6e6);
+  font-size: 12px;
+  pointer-events: none;
+}
+html.ui-v2 .handover-follow-consent {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+html.ui-v2 .handover-follow-continue {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+  color: var(--text, #e6e6e6);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .handover-follow-note {
+  margin-top: 4px;
+}
 /* ── static/app/ui2-grid.css ── */
 /* ── ui-v2 Activity Grid mode: lineage lanes + session-window re-skin ──
    All scoped html.ui-v2. Grid layout (ratified 2026-07-21, candidate B
@@ -38862,7 +38899,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5fdc4d7413521562';
+const INTENDANT_APP_BUILD = '5efaa4e26a3a046c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39026,6 +39063,51 @@ const LOOPBACK_TOKEN_KEY = 'intendantLoopbackToken';
   }
 })();
 
+// ── Follow carry (update-abstraction §2.3) ──
+//
+// A drain auto-follow hops ORIGINS, so the predecessor tab's state
+// arrives explicitly: a `&carry=<base64 json>` suffix on the hash
+// (fragments never reach the server), holding the route, the open
+// session-window set, the two sub-tab choices, the composer draft, the
+// pre-swap build stamps for the completion-honesty compare, and — on
+// the legacy `[server.auth] bearer_token` posture (R-A4) — the bearer,
+// which is per-origin localStorage and would not follow the hop by
+// itself. The capture-strip pattern applies verbatim: decode, strip
+// from the visible URL, apply. Everything in the blob is data the
+// LINKING page could already put in a URL — the same trust class as
+// the `?token=` capture above (junk seeds break only this tab's own
+// state, loudly).
+let pendingFollowCarry = null;
+
+(function captureFollowCarry() {
+  try {
+    const hash = String(location.hash || '');
+    const at = hash.indexOf('&carry=');
+    if (at < 0) return;
+    const rest = hash.slice(at + '&carry='.length);
+    const end = rest.indexOf('&');
+    const encoded = end >= 0 ? rest.slice(0, end) : rest;
+    const cleanedHash =
+      hash.slice(0, at) + (end >= 0 ? rest.slice(end) : '');
+    // Strip the blob from the visible/bookmarkable URL before anything
+    // else can read it (the router parses location.hash later in this
+    // same module pass).
+    history.replaceState(
+      null,
+      '',
+      location.pathname + location.search + (cleanedHash === '#' ? '' : cleanedHash)
+    );
+    if (!encoded || encoded.length > 32768) return;
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = JSON.parse(new TextDecoder().decode(bytes));
+    if (blob && typeof blob === 'object' && blob.v === 1) pendingFollowCarry = blob;
+  } catch {
+    /* malformed or oversized carry — land with this origin's own state */
+  }
+})();
+
 function getLoopbackToken() {
   try {
     return localStorage.getItem(LOOPBACK_TOKEN_KEY) || '';
@@ -39076,11 +39158,39 @@ function getLoopbackToken() {
 // owner-posture only; served per-request, never persisted) and opens
 // the sibling's own tokened URL so its page seeds its own origin.
 // Non-loopback and mTLS targets pass through untouched. Cached per
-// page load; a stale map (sibling rebooted) degrades to the bare URL
-// and the sibling's named 401 guidance. Shared: the Access fleet links
-// (43-access-panes) and the handover doorways (ui2-handover) both
-// route through this one helper.
+// page load, but the cache is a resilience floor, not the read of
+// record (R-A2): a port the cached map does not name triggers ONE
+// re-fetch — a successor that booted after the cache filled (the
+// doorway-click and follow-watch window) is found by the fresh map,
+// and only a genuinely unknown port degrades to the bare URL and the
+// sibling's named 401 guidance. Shared: the Access fleet links
+// (43-access-panes), the handover doorways, and the drain follow
+// watch (ui2-handover) all route through these helpers.
 let accessSiblingTokenMapPromise = null;
+
+function siblingLoopbackTokenMap(fresh) {
+  if (fresh || !accessSiblingTokenMapPromise) {
+    accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
+      .then(resp => (resp.ok ? resp.json() : { instances: [] }))
+      .catch(() => ({ instances: [] }));
+  }
+  return accessSiblingTokenMapPromise;
+}
+
+// The one token read: cached map first, ONE re-fetch on a miss (the
+// map served by a draining daemon keeps naming newcomers until it
+// exits). '' when the port stays unknown.
+async function siblingTokenForPort(port) {
+  const wanted = String(port || '');
+  if (!wanted) return '';
+  const lookup = map =>
+    ((map && map.instances) || []).find(inst => String(inst.port) === wanted);
+  let entry = lookup(await siblingLoopbackTokenMap(false));
+  if (!entry || !entry.token) {
+    entry = lookup(await siblingLoopbackTokenMap(true));
+  }
+  return (entry && entry.token) || '';
+}
 
 async function withSiblingLoopbackToken(rawUrl) {
   try {
@@ -39089,16 +39199,10 @@ async function withSiblingLoopbackToken(rawUrl) {
     const loopback =
       host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
     if (!loopback || url.searchParams.has('token')) return rawUrl;
-    if (!accessSiblingTokenMapPromise) {
-      accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
-        .then(resp => (resp.ok ? resp.json() : { instances: [] }))
-        .catch(() => ({ instances: [] }));
-    }
-    const map = await accessSiblingTokenMapPromise;
     const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-    const entry = (map.instances || []).find(inst => String(inst.port) === String(port));
-    if (!entry || !entry.token) return rawUrl;
-    url.searchParams.set('token', entry.token);
+    const token = await siblingTokenForPort(port);
+    if (!token) return rawUrl;
+    url.searchParams.set('token', token);
     return url.toString();
   } catch {
     return rawUrl;
@@ -40493,6 +40597,114 @@ async function accessFleetRefreshProvenance() {
   }
   if (changed) renderAccessAdminSummaries();
 }
+
+// ── Follow carry: apply on landing ──
+//
+// Runs at the tail of this fragment — before the session-windows
+// fragment reads its persisted state and before the router parses the
+// (already-stripped) hash — so a carried tab lands with its windows,
+// sub-tab choices, bearer, and draft where the predecessor tab had
+// them. The build stamps ride to the handover module for the
+// completion-honesty compare (R-A1). Bounded and typed field by field;
+// a hostile or garbled blob at worst seeds this tab's own display
+// state, exactly like any deep link.
+let followArrivalStamps = null;
+const followCarryApplied = { windows: 0, subtabs: 0, draft: false, bearer: false };
+
+// One-shot: the handover module takes the stamps for its first-payload
+// compare; a second read (or a carry-less load) sees null.
+function takeFollowArrivalStamps() {
+  const stamps = followArrivalStamps;
+  followArrivalStamps = null;
+  return stamps;
+}
+
+(function applyFollowCarry() {
+  const blob = pendingFollowCarry;
+  pendingFollowCarry = null;
+  if (!blob) return;
+  const str = (value, cap) =>
+    typeof value === 'string' && value.length <= cap ? value : '';
+  try {
+    // Open session-window SET: seed the persisted-state key this origin
+    // would have written itself; the normal restore path rebuilds the
+    // windows from THIS daemon's own catalog (only the set carries).
+    const windows = Array.isArray(blob.windows)
+      ? blob.windows
+          .slice(0, 8)
+          .map(record => ({
+            session_id: str(record && record.session_id, 128),
+            source: str(record && record.source, 64),
+          }))
+          .filter(record => record.session_id && record.source)
+      : [];
+    if (windows.length) {
+      localStorage.setItem(SESSION_WINDOW_STATE_KEY, JSON.stringify({ windows }));
+      followCarryApplied.windows = windows.length;
+    }
+    // The two sub-tab choices (48-router-settings reads these keys at
+    // its own eval, after this fragment; the daemon-side pin holds the
+    // literals in parity with the router's constants).
+    const subtabs = blob.subtabs && typeof blob.subtabs === 'object' ? blob.subtabs : {};
+    const settingsSubtab = str(subtabs.settings, 64);
+    const accessSubtab = str(subtabs.access, 64);
+    if (settingsSubtab) {
+      localStorage.setItem('intendant_settings_subtab', settingsSubtab);
+      followCarryApplied.subtabs++;
+    }
+    if (accessSubtab) {
+      localStorage.setItem('intendant_access_subtab', accessSubtab);
+      followCarryApplied.subtabs++;
+    }
+    // R-A4: the legacy federation bearer is per-origin storage — a
+    // carried one keeps the LAN-bearer posture working across the hop.
+    const bearer = str(blob.bearer, 512);
+    if (bearer) {
+      setFederationToken(bearer);
+      followCarryApplied.bearer = true;
+    }
+    // The composer draft (guarded follow: the user consented with the
+    // draft named). The input exists once the DOM is parsed; value
+    // assignment only — never markup.
+    const draft = str(blob.draft, 65536);
+    if (draft) {
+      const applyDraft = () => {
+        const input = document.getElementById('new-session-input');
+        if (!input || input.value.trim()) return;
+        input.value = draft;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        followCarryApplied.draft = true;
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', applyDraft);
+      } else {
+        applyDraft();
+      }
+    }
+    // Pre-swap build stamps for the completion-honesty compare (R-A1:
+    // the PAIR — git_sha AND built_at — a same-sha rebuild is a real
+    // update on this box).
+    const stamps = blob.stamps && typeof blob.stamps === 'object' ? blob.stamps : null;
+    if (stamps) {
+      const pair = value =>
+        value && typeof value === 'object'
+          ? { git_sha: str(value.git_sha, 128), built_at: str(value.built_at, 128) }
+          : null;
+      followArrivalStamps = {
+        pred_boot: str(stamps.pred_boot, 128),
+        pred: pair(stamps.pred),
+        on_disk: pair(stamps.on_disk),
+      };
+    }
+  } catch {
+    /* storage unavailable — the tab still lands, just stateless */
+  }
+})();
+
+// QA readback for the headed follow scenario: what the landing applied.
+window.qa = Object.assign(window.qa || {}, {
+  followCarryApplied: () => ({ ...followCarryApplied }),
+});
 /* ── static/app/31b-hosted-control.js ── */
 // ── Hosted-control lease client ────────────────────────────────────────
 // The private key and lease live only in this module's tab memory. Reloading
@@ -106060,6 +106272,17 @@ async function memoryProposeFromForm(button) {
 // (maybeNudgeDaemonBoot), beside the config-lane chokepoint.
 // Elements are removed when nothing applies; transient poll failures
 // keep the last honest render rather than flapping.
+//   - THIS daemon draining, on a same-host direct browser surface: the
+//     follow watch (update-abstraction §2) — re-resolve the live holder,
+//     fetch its admission token through the same-home map, probe the
+//     target origin, then move the tab there with its state in a carry
+//     blob; hidden tabs move at once, visible tabs after a short grace
+//     toast, and a composer draft turns the move into a one-button
+//     consent. On landing, the carried build stamps drive the
+//     completion-honesty line (R-A1: the git_sha+built_at PAIR — a
+//     same-sha rebuild is a real update). The packaged app follows by
+//     itself (didSwapToPort) and relay-reached surfaces get honest copy
+//     instead — port substitution means nothing there.
 (() => {
   const HANDOVER_POLL_MS = 30000;
   let bannerEl = null;
@@ -106876,6 +107099,449 @@ async function memoryProposeFromForm(button) {
     return handoverSuccessorCandidate(body, update ? update.on_disk : null);
   }
 
+  // ── The follow watch (update-abstraction §2, slice 2) ──────────────
+  //
+  // A browser tab's origin IS host:port, so a drain hands its user an
+  // origin change the packaged app never sees (the app re-points its
+  // scheme handler). The watch closes that gap on same-host direct
+  // surfaces: while THIS daemon drains, keep re-resolving the live
+  // holder through resolveLiveHolder (never onto a draining daemon —
+  // 6c), keep the sibling token map fresh until the resolved target's
+  // token is in hand (R-A2: the pre-fetch is a resilience floor, the
+  // re-fetch is the read of record), probe the target origin until it
+  // answers (the BackendSupervisor readiness pattern), then
+  // location.replace onto the successor with ?token=, the route hash,
+  // and the carry blob. Hidden tabs move immediately; visible tabs get
+  // a short grace under a toast; a composer draft demotes the move to
+  // a one-button consent (R-A3: an over-cap draft names its loss
+  // BEFORE navigation, never after).
+  const FOLLOW_WATCH_TICK_MS = 2500;
+  const FOLLOW_GRACE_MS = 5000;
+  const FOLLOW_CARRY_CAP = 8192;
+  const FOLLOW_TOAST_TEXT = 'Moving to the updated daemon…';
+
+  const followWatch = {
+    armed: false,
+    // idle | watching | grace | consent | navigating
+    phase: 'idle',
+    excluded: '', // '' | 'app' | 'relay'
+    port: 0,
+    bootId: '',
+    token: '',
+    probed: false,
+    stamps: null,
+    misses: 0,
+    timer: null,
+    graceTimer: null,
+  };
+
+  // Where following cannot apply, said once at arm time. The packaged
+  // app's webview follows through its own supervisor (didSwapToPort re-
+  // points the origin-stable scheme handler) — the watch stands down
+  // silently there. A hosted-control relay surface reaches the daemon
+  // through a relay, so a host:port substitution is meaningless — the
+  // banner carries honest copy instead (§2.5; the durable fix is the
+  // parked canonical-port-rebind lane, not client-side substitution).
+  function followSurfaceExclusion() {
+    if (
+      window.__intendantAppSupervisor === true ||
+      (location.protocol !== 'http:' && location.protocol !== 'https:')
+    ) {
+      return 'app';
+    }
+    if (
+      (typeof hostedControlActive === 'function' && hostedControlActive()) ||
+      (typeof DASHBOARD_CONNECT_MODE !== 'undefined' && DASHBOARD_CONNECT_MODE)
+    ) {
+      return 'relay';
+    }
+    return '';
+  }
+
+  function composerDraftText() {
+    const input = document.getElementById('new-session-input');
+    return ((input && input.value) || '').trim();
+  }
+
+  // Pre-swap build stamps off the drainer's own payload: this daemon's
+  // presence entry (the running build) and the on-disk image, each as
+  // the git_sha+built_at PAIR (R-A1). They ride the carry so the
+  // landing page can say honestly whether the hop changed builds.
+  function captureFollowStamps(body) {
+    const pair = value =>
+      value && typeof value === 'object'
+        ? {
+            git_sha: String(value.git_sha || ''),
+            built_at: String(value.built_at || ''),
+          }
+        : null;
+    const own = (Array.isArray(body.daemons) ? body.daemons : []).find(
+      d => d && d.boot_id === body.boot_id
+    );
+    const stamps = { pred_boot: String(body.boot_id || '') };
+    const pred = pair(own && own.version);
+    if (pred) stamps.pred = pred;
+    const disk = pair(body.update && body.update.on_disk);
+    if (disk) stamps.on_disk = disk;
+    followWatch.stamps = stamps;
+  }
+
+  function followCarryEncode(blob) {
+    const bytes = new TextEncoder().encode(JSON.stringify(blob));
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 4096) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 4096));
+    }
+    return btoa(binary);
+  }
+
+  // The carry blob (§2.3): route, the open-session-window SET, the two
+  // sub-tab choices, the pre-swap stamps, the legacy federation bearer
+  // when one is configured (R-A4 — it is per-origin storage and would
+  // not survive the hop), and — on a consented follow — the composer
+  // draft. Capped: the draft drops first (its loss is named in the
+  // consent copy BEFORE navigation), then the window set.
+  function buildFollowCarry(includeDraft) {
+    try {
+      if (typeof flushPendingSessionWindowPersist === 'function') {
+        flushPendingSessionWindowPersist();
+      }
+    } catch (_) { /* persistence unavailable — carry what we can */ }
+    let windows = [];
+    try {
+      const persisted =
+        typeof readPersistedSessionWindowState === 'function'
+          ? readPersistedSessionWindowState()
+          : [];
+      windows = persisted
+        .map(record => ({
+          session_id: String((record && record.session_id) || ''),
+          source: String((record && record.source) || ''),
+        }))
+        .filter(record => record.session_id && record.source)
+        .slice(0, 8);
+    } catch (_) { /* no window set — the successor starts from its own */ }
+    const subtabs = {};
+    try {
+      const settings = localStorage.getItem('intendant_settings_subtab');
+      if (settings) subtabs.settings = settings;
+      const access = localStorage.getItem('intendant_access_subtab');
+      if (access) subtabs.access = access;
+    } catch (_) { /* storage unavailable */ }
+    const blob = {
+      v: 1,
+      route: (location.hash || '').replace(/^#/, ''),
+      windows,
+      subtabs,
+    };
+    const bearer =
+      typeof getFederationToken === 'function' ? getFederationToken() : '';
+    if (bearer) blob.bearer = bearer;
+    if (followWatch.stamps) blob.stamps = followWatch.stamps;
+    let droppedDraft = false;
+    if (includeDraft) {
+      const draft = composerDraftText();
+      if (draft) blob.draft = draft;
+    }
+    let encoded = followCarryEncode(blob);
+    if (encoded.length > FOLLOW_CARRY_CAP && blob.draft) {
+      delete blob.draft;
+      droppedDraft = true;
+      encoded = followCarryEncode(blob);
+    }
+    if (encoded.length > FOLLOW_CARRY_CAP) {
+      blob.windows = [];
+      encoded = followCarryEncode(blob);
+    }
+    return { encoded, droppedDraft };
+  }
+
+  // Would the current draft survive the carry cap? Decides the consent
+  // copy (R-A3): when it cannot, the loss is named on the banner BEFORE
+  // the user clicks — a post-hoc toast would be disclosure, not consent.
+  function followDraftOverCap() {
+    return composerDraftText() ? buildFollowCarry(true).droppedDraft : false;
+  }
+
+  let followToastEl = null;
+  function followToastShow(text) {
+    if (!followToastEl) {
+      followToastEl = document.createElement('div');
+      followToastEl.id = 'handover-follow-toast';
+      document.body.appendChild(followToastEl);
+    }
+    followToastEl.textContent = text;
+  }
+  function followToastClear() {
+    if (followToastEl) {
+      followToastEl.remove();
+      followToastEl = null;
+    }
+  }
+
+  function disarmFollowWatch() {
+    if (followWatch.timer) clearInterval(followWatch.timer);
+    if (followWatch.graceTimer) clearTimeout(followWatch.graceTimer);
+    followWatch.armed = false;
+    followWatch.phase = 'idle';
+    followWatch.excluded = '';
+    followWatch.port = 0;
+    followWatch.bootId = '';
+    followWatch.token = '';
+    followWatch.probed = false;
+    followWatch.misses = 0;
+    followWatch.timer = null;
+    followWatch.graceTimer = null;
+    followToastClear();
+  }
+
+  // The move itself: the successor's own tokened URL (the doorway's
+  // withSiblingLoopbackToken shape), the current route hash, and the
+  // carry appended INSIDE the fragment — fragments never reach the
+  // server, and the landing page capture-strips both the token and the
+  // carry before its router reads the hash. location.replace, not
+  // href: the drained origin must not linger as a back-button trap.
+  function performFollowNavigation(includeDraft) {
+    if (followWatch.phase === 'navigating') return;
+    followWatch.phase = 'navigating';
+    const carry = buildFollowCarry(includeDraft);
+    const hash =
+      location.hash && location.hash !== '#' ? location.hash : '#activity';
+    const query = followWatch.token
+      ? `?token=${encodeURIComponent(followWatch.token)}`
+      : '';
+    const url =
+      `${location.protocol}//${location.hostname}:${followWatch.port}/` +
+      `${query}${hash}&carry=${carry.encoded}`;
+    followToastShow(FOLLOW_TOAST_TEXT);
+    try {
+      location.replace(url);
+    } catch (_) {
+      followWatch.phase = 'watching';
+    }
+  }
+
+  // One watch tick: freshest payload from the drainer (it serves until
+  // exit), re-resolve, re-token, probe, then decide. A drainer that
+  // stops answering after the target was resolved+probed is the follow
+  // signal itself — the exit happened between polls.
+  async function followWatchTick() {
+    if (followWatch.phase === 'grace' || followWatch.phase === 'navigating') {
+      return;
+    }
+    let body = null;
+    try {
+      if (typeof daemonApi !== 'undefined' && daemonApi.availability('api_daemon_handover').ok) {
+        const resp = await daemonApi.request('api_daemon_handover', {});
+        if (resp && resp.ok) body = resp.body;
+      }
+    } catch (_) { /* drainer unreachable — counted below */ }
+    if (body && body.available !== false) {
+      if (!body.draining) {
+        // A non-draining answer on this origin is a NEW daemon already
+        // serving here (same-port successor): the boot nudge owns that
+        // path; the watch stands down.
+        disarmFollowWatch();
+        handoverRender(body);
+        return;
+      }
+      followWatch.misses = 0;
+      lastHandoverBody = body;
+      captureFollowStamps(body);
+      const holder = resolveLiveHolder(body);
+      const port = holder && Number(holder.port);
+      if (!holder || !Number.isFinite(port) || port <= 0) {
+        followWatch.port = 0;
+        followWatch.token = '';
+        followWatch.probed = false;
+        return;
+      }
+      if (followWatch.port !== port) {
+        // Resolution moved (a chained drain healed to a later
+        // successor): stale token and probe state go with it.
+        followWatch.port = port;
+        followWatch.bootId = String(holder.boot_id || '');
+        followWatch.token = '';
+        followWatch.probed = false;
+      }
+    } else {
+      followWatch.misses++;
+      if (!followWatch.port || followWatch.misses < 2) return;
+    }
+    if (!followWatch.port) return;
+    // R-A2: the token map is re-fetched, not only pre-fetched — the
+    // helper retries a fresh map when the cached one misses the port,
+    // and the drainer keeps serving the map until it exits. Loopback
+    // only: a LAN/mTLS surface authenticates by cert (or the carried
+    // bearer), and ?token= means nothing to it.
+    if (!followWatch.token && isLoopbackSurface()) {
+      try {
+        followWatch.token = await siblingTokenForPort(followWatch.port);
+      } catch (_) { /* map unreachable this tick — retried next tick */ }
+      if (!followWatch.token) return;
+    }
+    if (!followWatch.probed) {
+      const probed = await probeFollowTarget(followWatch.port);
+      if (!probed) return;
+      followWatch.probed = true;
+    }
+    decideFollowNow();
+  }
+
+  function isLoopbackSurface() {
+    const host = location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return (
+      host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host)
+    );
+  }
+
+  // HEAD / against the successor origin (the BackendSupervisor
+  // readiness pattern, §2.1(c)): an opaque no-cors answer proves a
+  // listener; a network rejection means "not yet".
+  async function probeFollowTarget(port) {
+    try {
+      await fetch(`${location.protocol}//${location.hostname}:${port}/`, {
+        method: 'HEAD',
+        mode: 'no-cors',
+        cache: 'no-store',
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Target resolved, token in hand, origin answering — move, with the
+  // Q1-ruled posture: a composer draft always demotes to one-button
+  // consent (hidden or visible — a draft is never auto-lost); hidden
+  // tabs move at once; visible tabs get the grace toast.
+  function decideFollowNow() {
+    if (composerDraftText()) {
+      if (followWatch.phase !== 'consent') {
+        followWatch.phase = 'consent';
+        followToastClear();
+        if (lastHandoverBody) handoverRender(lastHandoverBody);
+      }
+      return;
+    }
+    if (document.hidden) {
+      performFollowNavigation(false);
+      return;
+    }
+    followWatch.phase = 'grace';
+    followToastShow(FOLLOW_TOAST_TEXT);
+    followWatch.graceTimer = setTimeout(() => {
+      followWatch.graceTimer = null;
+      // The grace window is exactly the time to start typing: re-check.
+      if (composerDraftText()) {
+        followWatch.phase = 'consent';
+        followToastClear();
+        if (lastHandoverBody) handoverRender(lastHandoverBody);
+        return;
+      }
+      performFollowNavigation(false);
+    }, FOLLOW_GRACE_MS);
+  }
+
+  function armFollowWatch(body) {
+    if (followWatch.armed) return;
+    followWatch.armed = true;
+    followWatch.excluded = followSurfaceExclusion();
+    captureFollowStamps(body);
+    if (followWatch.excluded) return;
+    followWatch.phase = 'watching';
+    // §2.1(a): pre-fetch the sibling token map while the drainer still
+    // serves it — a resilience floor under the per-tick re-fetch.
+    if (isLoopbackSurface()) {
+      try { siblingLoopbackTokenMap(false); } catch (_) { /* re-fetched per tick */ }
+    }
+    followWatch.timer = setInterval(followWatchTick, FOLLOW_WATCH_TICK_MS);
+    followWatchTick();
+  }
+
+  // The banner's follow section (draining branch): honest copy for the
+  // relay exclusion, the one-button consent when a draft holds the
+  // move, and the in-motion status line under grace.
+  function followBannerSection() {
+    if (!followWatch.armed) return null;
+    if (followWatch.excluded === 'relay') {
+      const note = document.createElement('div');
+      note.className = 'handover-banner-note handover-follow-note';
+      note.textContent =
+        'This surface reaches the daemon through a relay, so it cannot ' +
+        'follow the update to a new local address itself. Reopen the ' +
+        'dashboard from your usual entry point once the update completes.';
+      return note;
+    }
+    if (followWatch.excluded) return null;
+    if (followWatch.phase === 'consent') {
+      const wrap = document.createElement('div');
+      wrap.className = 'handover-follow-consent';
+      const note = document.createElement('div');
+      note.className = 'handover-banner-note';
+      note.textContent = followDraftOverCap()
+        ? 'Your composer draft is too large to carry — copy it first; continuing moves without it.'
+        : 'Your composer draft moves with you.';
+      wrap.appendChild(note);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'handover-follow-continue';
+      btn.textContent = 'Continue on the updated daemon';
+      btn.addEventListener('click', () => performFollowNavigation(true));
+      wrap.appendChild(btn);
+      return wrap;
+    }
+    if (followWatch.phase === 'grace' || followWatch.phase === 'navigating') {
+      const note = document.createElement('div');
+      note.className = 'handover-banner-note handover-follow-note';
+      note.textContent = FOLLOW_TOAST_TEXT;
+      return note;
+    }
+    return null;
+  }
+
+  // ── Landing side: completion honesty (§2.4, R-A1) ──────────────────
+  //
+  // A carried arrival left its pre-swap stamps with the identity
+  // fragment; the first handover payload here names the build THIS
+  // daemon runs (its own presence entry). Compare the PAIR — git_sha
+  // AND built_at — because a rebuild of the same commit is a real
+  // update on a dev box, and only a genuinely unchanged pair may be
+  // narrated as "didn't change builds". Unreadable stamps get the
+  // neutral line, never a claim.
+  let followArrivalStamps =
+    typeof takeFollowArrivalStamps === 'function' ? takeFollowArrivalStamps() : null;
+
+  function followCompletionCheck(body) {
+    if (!followArrivalStamps || !body || body.available === false) return;
+    const arrival = followArrivalStamps;
+    followArrivalStamps = null;
+    if (typeof showControlToast !== 'function') return;
+    const own = (Array.isArray(body.daemons) ? body.daemons : []).find(
+      d => d && d.boot_id === body.boot_id
+    );
+    const version = own && own.version;
+    const succ = version
+      ? { git_sha: String(version.git_sha || ''), built_at: String(version.built_at || '') }
+      : null;
+    const pred = arrival.pred;
+    if (succ && succ.git_sha && pred && pred.git_sha) {
+      const changed =
+        succ.git_sha !== pred.git_sha || succ.built_at !== pred.built_at;
+      if (changed) {
+        const label = String((version && version.pkg) || '').trim();
+        showControlToast(
+          'success',
+          `All set — running ${label || succ.git_sha.slice(0, 10)}.`
+        );
+      } else {
+        showControlToast('info', "The restart didn't change builds.");
+      }
+    } else {
+      showControlToast('info', 'Moved to the updated daemon.');
+    }
+  }
+
   // Render at most this many holdout rows; the rest fold into an honest
   // "…and N more" (parked rows arrive sorted first from the daemon, so
   // the decisive parked-until facts survive the fold).
@@ -107008,22 +107674,35 @@ async function memoryProposeFromForm(button) {
     if (body.boot_id && typeof maybeNudgeDaemonBoot === 'function') {
       maybeNudgeDaemonBoot(body.boot_id);
     }
+    followCompletionCheck(body);
     handoverUpdateRender(body);
     handoverReleaseRender(body);
     if (body.draining) {
+      armFollowWatch(body);
       const holder = resolveLiveHolder(body);
       const el = handoverBanner();
       el.dataset.kind = 'draining';
       el.textContent = '';
       const key = bannerStateKey('draining', body.boot_id);
       const rows = Array.isArray(body.holdouts) ? body.holdouts : [];
-      if (bannerCollapsedNow(el, key)) {
+      // A pending consent (a draft holds the move) outranks the stored
+      // collapse: the one decision the user must see never hides in a
+      // pill.
+      if (followWatch.phase !== 'consent' && bannerCollapsedNow(el, key)) {
         bannerFillPill(el, key, rows.length
           ? `This daemon is draining — waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}`
           : 'This daemon is draining — in-flight sessions are finishing');
         handoverBannerReserve();
         return;
       }
+      // Consent renders expanded even under a stored collapse — strip
+      // any pill affordances a previous collapsed render left behind.
+      el.classList.remove('collapsed');
+      el.onclick = null;
+      el.onkeydown = null;
+      el.removeAttribute('role');
+      el.removeAttribute('tabindex');
+      el.removeAttribute('title');
       el.appendChild(bannerCollapseButton(key, 'Collapse the drain banner to a pill'));
       const head = document.createElement('div');
       head.className = 'handover-banner-head';
@@ -107046,10 +107725,13 @@ async function memoryProposeFromForm(button) {
         none.textContent = 'No successor has acquired the lease yet.';
         el.appendChild(none);
       }
+      const followSection = followBannerSection();
+      if (followSection) el.appendChild(followSection);
       if (rows.length) el.appendChild(handoverHoldoutList(rows, rows.length));
       handoverBannerReserve();
       return;
     }
+    if (followWatch.armed) disarmFollowWatch();
     const others = Array.isArray(body.daemons)
       ? body.daemons.filter((d) => d && d.live && d.state === 'draining' && d.boot_id !== body.boot_id)
       : [];
@@ -107131,6 +107813,19 @@ async function memoryProposeFromForm(button) {
     render: (body) => { lastHandoverBody = body; handoverReleaseRender(body); },
     stateKey: releaseChipStateKey,
   };
+  // The follow watch's live state for the headed follow scenario
+  // (tests/skills/handover-follow): arming, phase transitions, the
+  // resolved target, and the exclusion verdict — token presence only,
+  // never the token itself.
+  window.qa.followState = () => ({
+    armed: followWatch.armed,
+    phase: followWatch.phase,
+    excluded: followWatch.excluded,
+    port: followWatch.port,
+    tokenHeld: Boolean(followWatch.token),
+    probed: followWatch.probed,
+    stamps: followWatch.stamps ? JSON.parse(JSON.stringify(followWatch.stamps)) : null,
+  });
 
   // The palette's dynamic entry, as data (ui2-chrome reads this by name
   // at event time): the SAME one-click affordance the chip is currently

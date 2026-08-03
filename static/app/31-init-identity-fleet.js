@@ -177,6 +177,51 @@ const LOOPBACK_TOKEN_KEY = 'intendantLoopbackToken';
   }
 })();
 
+// ── Follow carry (update-abstraction §2.3) ──
+//
+// A drain auto-follow hops ORIGINS, so the predecessor tab's state
+// arrives explicitly: a `&carry=<base64 json>` suffix on the hash
+// (fragments never reach the server), holding the route, the open
+// session-window set, the two sub-tab choices, the composer draft, the
+// pre-swap build stamps for the completion-honesty compare, and — on
+// the legacy `[server.auth] bearer_token` posture (R-A4) — the bearer,
+// which is per-origin localStorage and would not follow the hop by
+// itself. The capture-strip pattern applies verbatim: decode, strip
+// from the visible URL, apply. Everything in the blob is data the
+// LINKING page could already put in a URL — the same trust class as
+// the `?token=` capture above (junk seeds break only this tab's own
+// state, loudly).
+let pendingFollowCarry = null;
+
+(function captureFollowCarry() {
+  try {
+    const hash = String(location.hash || '');
+    const at = hash.indexOf('&carry=');
+    if (at < 0) return;
+    const rest = hash.slice(at + '&carry='.length);
+    const end = rest.indexOf('&');
+    const encoded = end >= 0 ? rest.slice(0, end) : rest;
+    const cleanedHash =
+      hash.slice(0, at) + (end >= 0 ? rest.slice(end) : '');
+    // Strip the blob from the visible/bookmarkable URL before anything
+    // else can read it (the router parses location.hash later in this
+    // same module pass).
+    history.replaceState(
+      null,
+      '',
+      location.pathname + location.search + (cleanedHash === '#' ? '' : cleanedHash)
+    );
+    if (!encoded || encoded.length > 32768) return;
+    const binary = atob(encoded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = JSON.parse(new TextDecoder().decode(bytes));
+    if (blob && typeof blob === 'object' && blob.v === 1) pendingFollowCarry = blob;
+  } catch {
+    /* malformed or oversized carry — land with this origin's own state */
+  }
+})();
+
 function getLoopbackToken() {
   try {
     return localStorage.getItem(LOOPBACK_TOKEN_KEY) || '';
@@ -227,11 +272,39 @@ function getLoopbackToken() {
 // owner-posture only; served per-request, never persisted) and opens
 // the sibling's own tokened URL so its page seeds its own origin.
 // Non-loopback and mTLS targets pass through untouched. Cached per
-// page load; a stale map (sibling rebooted) degrades to the bare URL
-// and the sibling's named 401 guidance. Shared: the Access fleet links
-// (43-access-panes) and the handover doorways (ui2-handover) both
-// route through this one helper.
+// page load, but the cache is a resilience floor, not the read of
+// record (R-A2): a port the cached map does not name triggers ONE
+// re-fetch — a successor that booted after the cache filled (the
+// doorway-click and follow-watch window) is found by the fresh map,
+// and only a genuinely unknown port degrades to the bare URL and the
+// sibling's named 401 guidance. Shared: the Access fleet links
+// (43-access-panes), the handover doorways, and the drain follow
+// watch (ui2-handover) all route through these helpers.
 let accessSiblingTokenMapPromise = null;
+
+function siblingLoopbackTokenMap(fresh) {
+  if (fresh || !accessSiblingTokenMapPromise) {
+    accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
+      .then(resp => (resp.ok ? resp.json() : { instances: [] }))
+      .catch(() => ({ instances: [] }));
+  }
+  return accessSiblingTokenMapPromise;
+}
+
+// The one token read: cached map first, ONE re-fetch on a miss (the
+// map served by a draining daemon keeps naming newcomers until it
+// exits). '' when the port stays unknown.
+async function siblingTokenForPort(port) {
+  const wanted = String(port || '');
+  if (!wanted) return '';
+  const lookup = map =>
+    ((map && map.instances) || []).find(inst => String(inst.port) === wanted);
+  let entry = lookup(await siblingLoopbackTokenMap(false));
+  if (!entry || !entry.token) {
+    entry = lookup(await siblingLoopbackTokenMap(true));
+  }
+  return (entry && entry.token) || '';
+}
 
 async function withSiblingLoopbackToken(rawUrl) {
   try {
@@ -240,16 +313,10 @@ async function withSiblingLoopbackToken(rawUrl) {
     const loopback =
       host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
     if (!loopback || url.searchParams.has('token')) return rawUrl;
-    if (!accessSiblingTokenMapPromise) {
-      accessSiblingTokenMapPromise = fetch('/api/local-daemons/tokens')
-        .then(resp => (resp.ok ? resp.json() : { instances: [] }))
-        .catch(() => ({ instances: [] }));
-    }
-    const map = await accessSiblingTokenMapPromise;
     const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-    const entry = (map.instances || []).find(inst => String(inst.port) === String(port));
-    if (!entry || !entry.token) return rawUrl;
-    url.searchParams.set('token', entry.token);
+    const token = await siblingTokenForPort(port);
+    if (!token) return rawUrl;
+    url.searchParams.set('token', token);
     return url.toString();
   } catch {
     return rawUrl;
@@ -1644,3 +1711,111 @@ async function accessFleetRefreshProvenance() {
   }
   if (changed) renderAccessAdminSummaries();
 }
+
+// ── Follow carry: apply on landing ──
+//
+// Runs at the tail of this fragment — before the session-windows
+// fragment reads its persisted state and before the router parses the
+// (already-stripped) hash — so a carried tab lands with its windows,
+// sub-tab choices, bearer, and draft where the predecessor tab had
+// them. The build stamps ride to the handover module for the
+// completion-honesty compare (R-A1). Bounded and typed field by field;
+// a hostile or garbled blob at worst seeds this tab's own display
+// state, exactly like any deep link.
+let followArrivalStamps = null;
+const followCarryApplied = { windows: 0, subtabs: 0, draft: false, bearer: false };
+
+// One-shot: the handover module takes the stamps for its first-payload
+// compare; a second read (or a carry-less load) sees null.
+function takeFollowArrivalStamps() {
+  const stamps = followArrivalStamps;
+  followArrivalStamps = null;
+  return stamps;
+}
+
+(function applyFollowCarry() {
+  const blob = pendingFollowCarry;
+  pendingFollowCarry = null;
+  if (!blob) return;
+  const str = (value, cap) =>
+    typeof value === 'string' && value.length <= cap ? value : '';
+  try {
+    // Open session-window SET: seed the persisted-state key this origin
+    // would have written itself; the normal restore path rebuilds the
+    // windows from THIS daemon's own catalog (only the set carries).
+    const windows = Array.isArray(blob.windows)
+      ? blob.windows
+          .slice(0, 8)
+          .map(record => ({
+            session_id: str(record && record.session_id, 128),
+            source: str(record && record.source, 64),
+          }))
+          .filter(record => record.session_id && record.source)
+      : [];
+    if (windows.length) {
+      localStorage.setItem(SESSION_WINDOW_STATE_KEY, JSON.stringify({ windows }));
+      followCarryApplied.windows = windows.length;
+    }
+    // The two sub-tab choices (48-router-settings reads these keys at
+    // its own eval, after this fragment; the daemon-side pin holds the
+    // literals in parity with the router's constants).
+    const subtabs = blob.subtabs && typeof blob.subtabs === 'object' ? blob.subtabs : {};
+    const settingsSubtab = str(subtabs.settings, 64);
+    const accessSubtab = str(subtabs.access, 64);
+    if (settingsSubtab) {
+      localStorage.setItem('intendant_settings_subtab', settingsSubtab);
+      followCarryApplied.subtabs++;
+    }
+    if (accessSubtab) {
+      localStorage.setItem('intendant_access_subtab', accessSubtab);
+      followCarryApplied.subtabs++;
+    }
+    // R-A4: the legacy federation bearer is per-origin storage — a
+    // carried one keeps the LAN-bearer posture working across the hop.
+    const bearer = str(blob.bearer, 512);
+    if (bearer) {
+      setFederationToken(bearer);
+      followCarryApplied.bearer = true;
+    }
+    // The composer draft (guarded follow: the user consented with the
+    // draft named). The input exists once the DOM is parsed; value
+    // assignment only — never markup.
+    const draft = str(blob.draft, 65536);
+    if (draft) {
+      const applyDraft = () => {
+        const input = document.getElementById('new-session-input');
+        if (!input || input.value.trim()) return;
+        input.value = draft;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        followCarryApplied.draft = true;
+      };
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', applyDraft);
+      } else {
+        applyDraft();
+      }
+    }
+    // Pre-swap build stamps for the completion-honesty compare (R-A1:
+    // the PAIR — git_sha AND built_at — a same-sha rebuild is a real
+    // update on this box).
+    const stamps = blob.stamps && typeof blob.stamps === 'object' ? blob.stamps : null;
+    if (stamps) {
+      const pair = value =>
+        value && typeof value === 'object'
+          ? { git_sha: str(value.git_sha, 128), built_at: str(value.built_at, 128) }
+          : null;
+      followArrivalStamps = {
+        pred_boot: str(stamps.pred_boot, 128),
+        pred: pair(stamps.pred),
+        on_disk: pair(stamps.on_disk),
+      };
+    }
+  } catch {
+    /* storage unavailable — the tab still lands, just stateless */
+  }
+})();
+
+// QA readback for the headed follow scenario: what the landing applied.
+window.qa = Object.assign(window.qa || {}, {
+  followCarryApplied: () => ({ ...followCarryApplied }),
+});

@@ -385,3 +385,40 @@ html.ui-v2 .handover-update-panel-link {
   text-decoration: underline;
   align-self: flex-start;
 }
+
+/* ── Follow watch (update-abstraction slice 2) ── */
+/* The grace toast: a small fixed notice above the chip dock — the move
+   is announced, never silent. Removed on navigation or disarm. */
+html.ui-v2 #handover-follow-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 9600;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.92));
+  color: var(--text, #e6e6e6);
+  font-size: 12px;
+  pointer-events: none;
+}
+html.ui-v2 .handover-follow-consent {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+html.ui-v2 .handover-follow-continue {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--accent, #62a0ea);
+  background: var(--surface0, rgba(24, 24, 30, 0.35));
+  color: var(--text, #e6e6e6);
+  font-size: 12px;
+  cursor: pointer;
+}
+html.ui-v2 .handover-follow-note {
+  margin-top: 4px;
+}
