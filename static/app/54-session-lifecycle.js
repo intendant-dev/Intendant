@@ -794,6 +794,97 @@ function dispatchPeerTaskText(peerTarget, text) {
   return true;
 }
 
+// ── The held_by composer lane (update-abstraction slice 3, owner
+//    amendment) ──
+//
+// A held_by row's session still RUNS on a draining co-homed sibling
+// daemon — monitors and subagents live in ITS process, and the drain
+// exists to protect them, so the session is never reattached here.
+// Instead a targeted message routes to the sibling daemon's OWN
+// gateway: its drain gate refuses only session-CREATING intents, and a
+// targeted start_task at an existing session is served by design. The
+// admission token comes from the same-home sibling token map
+// (/api/local-daemons/tokens, slice 1's substrate) — fetched FRESH per
+// send, so the doorway cache's staleness class (slice-1 N1) cannot
+// misroute a message; sends are rare and the map read is cheap. The
+// send rides the sibling's legacy /ws lane — the same ControlMsg intent
+// stream this dashboard uses on its own daemon; no new route, no new
+// authority, the loopback-admission trust class throughout.
+async function siblingDaemonStartTask(port, msg) {
+  const resp = await fetch('/api/local-daemons/tokens');
+  if (!resp.ok) throw new Error('the sibling token map is unavailable');
+  const map = await resp.json().catch(() => ({ instances: [] }));
+  const entry = (map.instances || []).find((inst) => String(inst.port) === String(port));
+  if (!entry || !entry.token) {
+    const gone = new Error('gone');
+    gone.siblingGone = true;
+    throw gone;
+  }
+  const scheme = entry.scheme === 'https' ? 'wss' : 'ws';
+  const url = `${scheme}://${location.hostname}:${port}/ws?token=${encodeURIComponent(entry.token)}`;
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let ws;
+    const fail = (why) => {
+      if (settled) return;
+      settled = true;
+      try { if (ws) ws.close(); } catch (_) { /* already closed */ }
+      reject(new Error(why));
+    };
+    try {
+      ws = new WebSocket(url);
+    } catch (err) {
+      fail(err && err.message ? err.message : 'could not open the connection');
+      return;
+    }
+    const timer = setTimeout(() => fail('no answer'), 8000);
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify(msg));
+      } catch (err) {
+        clearTimeout(timer);
+        fail(err && err.message ? err.message : 'send failed');
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      // Queued frames flush before the close handshake completes.
+      setTimeout(() => { try { ws.close(); } catch (_) { /* gone */ } }, 250);
+      resolve();
+    };
+    ws.onerror = () => { clearTimeout(timer); fail('unreachable'); };
+    ws.onclose = () => { clearTimeout(timer); fail('closed before the send'); };
+  });
+}
+
+// Composer routing for a held_by target: deliver the text as a targeted
+// start_task to the draining sibling that still runs the session.
+// Delivery bookkeeping (steer rows, pending follow-ups) stays OFF this
+// lane — those track via this daemon's event stream, which the
+// sibling's session never feeds; the reply lands in the session's
+// transcript on shared disk instead, and the toast says so. When the
+// sibling is gone the refusal is honest and named: the session isn't
+// reachable there anymore and moves here when the handover completes.
+function dispatchHeldBySessionFollowUp(sid, heldBy, text) {
+  const port = Number(heldBy && heldBy.port);
+  if (!Number.isFinite(port) || port <= 0) return false;
+  if (pendingAttachments.length > 0) {
+    showControlToast('error', 'Attachments cannot ride to the previous daemon — remove them or wait until the session continues here.');
+    return false;
+  }
+  siblingDaemonStartTask(port, { action: 'start_task', task: text, session_id: sid })
+    .then(() => {
+      showControlToast('info', `Sent to ${shortSessionId(sid)} on the previous daemon — the reply lands in its transcript here.`);
+    })
+    .catch((err) => {
+      const gone = !!(err && err.siblingGone);
+      showControlToast('error', gone
+        ? `The previous daemon (:${port}) is gone — this session can't take messages there anymore. It continues here when the handover completes.`
+        : `Could not reach the previous daemon (:${port})${err && err.message ? ` (${err.message})` : ''} — it may have just exited. The session continues here when the handover completes.`);
+    });
+  return true;
+}
+
 // One-tap re-run for background tasks that died with a backend restart
 // (the activity chip's died-tasks action): an OWNER action that asks the
 // session to re-run them — a normal follow-up through the existing
@@ -834,6 +925,15 @@ function dispatchTaskText(text, options = {}) {
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const targetSessionId = resolvePromptTargetSessionId();
+  // A held_by target routes to the draining sibling that still runs it
+  // (the owner-amended promptable lane). Both composer paths funnel
+  // through here — the steer branch never fires for held rows (steer-
+  // active needs live local turn events, which a sibling-held session
+  // never emits on this daemon).
+  const heldByTarget = targetSessionId && typeof sessionWindowHeldBy === 'function'
+    ? sessionWindowHeldBy(targetSessionId)
+    : null;
+  if (heldByTarget) return dispatchHeldBySessionFollowUp(targetSessionId, heldByTarget, text);
   const msg = targetSessionId
     ? { action: 'start_task', task: text, session_id: targetSessionId }
     : { action: 'create_session', task: text };

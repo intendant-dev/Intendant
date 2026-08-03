@@ -1,6 +1,20 @@
 function runSessionWindowAction(sessionId, op) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
+  // Update-abstraction §3 (R4) affordance gate: a held_by row's session
+  // is LIVE on a draining sibling daemon — process-shaped actions here
+  // (stop/restart/attach/delegate/thread ops) would target a wrapper
+  // this daemon doesn't hold. Meta-shaped actions stay (allowlist, so a
+  // new write op defaults gated). The composer routes to the sibling
+  // (54-session-lifecycle); everything else waits until the session
+  // moves here. The supervisor's own drop remains the backstop — this
+  // gate is display honesty, not authority.
+  const HELD_BY_SAFE_OPS = ['copy-session-id', 'rename-session', 'configure-launch'];
+  if (!HELD_BY_SAFE_OPS.includes(op)
+      && typeof sessionWindowHeldBy === 'function' && sessionWindowHeldBy(sid)) {
+    showControlToast('info', 'Still finishing on the previous version — it continues here when done. Messages route to it; other actions wait.');
+    return;
+  }
   if (op === 'copy-session-id') {
     copyTextToClipboard(sid)
       .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sid)}`))
