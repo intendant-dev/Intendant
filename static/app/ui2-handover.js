@@ -1060,7 +1060,7 @@
   // carry before its router reads the hash. location.replace, not
   // href: the drained origin must not linger as a back-button trap.
   function performFollowNavigation(includeDraft) {
-    if (followWatch.phase === 'navigating') return;
+    if (followWatch.phase === 'navigating' || !followWatch.port) return;
     followWatch.phase = 'navigating';
     const carry = buildFollowCarry(includeDraft);
     const hash =
@@ -1186,6 +1186,7 @@
       performFollowNavigation(false);
       return;
     }
+    if (followWatch.phase === 'grace' || followWatch.phase === 'navigating') return;
     followWatch.phase = 'grace';
     followToastShow(FOLLOW_TOAST_TEXT);
     followWatch.graceTimer = setTimeout(() => {
@@ -1424,6 +1425,7 @@
 
   function handoverRender(body) {
     if (!body || body.available === false) {
+      if (followWatch.armed) disarmFollowWatch();
       handoverClear();
       updateChipClear();
       releaseChipClear();
@@ -1584,6 +1586,13 @@
     probed: followWatch.probed,
     stamps: followWatch.stamps ? JSON.parse(JSON.stringify(followWatch.stamps)) : null,
   });
+  // Test driver (the __testNudgeDaemonBoot precedent): the tokenless
+  // QA posture cannot walk the token+probe ladder, so the headed
+  // scenario forces the decision point to assert the guard/grace
+  // posture. Armed-only; production never calls it.
+  window.qa.__testFollowDecide = () => {
+    if (followWatch.armed && !followWatch.excluded) decideFollowNow();
+  };
 
   // The palette's dynamic entry, as data (ui2-chrome reads this by name
   // at event time): the SAME one-click affordance the chip is currently

@@ -7569,6 +7569,265 @@ async fn chained_drain_payload_resolves_only_live_non_draining_holder() {
     drop(daemon_b);
 }
 
+/// Update-abstraction slice 2, acceptance (a): the served follow
+/// contract, walked exactly as the scripted tab. While A drains with no
+/// successor (the entry→acquisition window), A's payload resolves
+/// NOBODY, and A's token map — the §2.1(a) pre-fetch — cannot name a
+/// successor that has not booted yet (R-A2's resilience floor). Once C
+/// boots and acquires, the re-fetched payload resolves :C, the
+/// RE-fetched map (the read of record) names C's own admission token,
+/// the target origin answers a probe, and the follow URL the watch
+/// builds — ?token= plus the route hash; the carry rides the fragment
+/// and never reaches the server — lands an authed 200 on C. Both ends
+/// of the completion-honesty compare ride the same payloads: each
+/// daemon's own presence entry names its build as the git_sha+built_at
+/// PAIR (R-A1's substrate).
+#[tokio::test]
+async fn follow_contract_carries_the_scripted_tab_to_the_successor() {
+    let rig = TestRig::new();
+    let barrier = rig.home.path().join("follow-barrier");
+    let script = handover_script(Some(&barrier));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let boot_a = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // A's holdout: a scheduled session parked on the file barrier keeps
+    // A alive — and draining, below — while the tab walks the contract.
+    let item_a = approve_manifest_at(
+        &daemon_a.rig,
+        daemon_a.port,
+        now_epoch_ms() + 1_500,
+        "follow-park-a",
+    )
+    .await;
+    poll_until(
+        "A's in-flight started row",
+        RUN_TIMEOUT,
+        || async {
+            journal_states_for_item(&daemon_a.rig, &item_a)
+                .contains(&"started".to_string())
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // Drain A with no successor running: the window opens.
+    let takeover = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/daemon/takeover",
+            daemon_a.port
+        ))
+        .header(
+            "x-intendant-loopback-token",
+            rig_loopback_token(&daemon_a.rig, daemon_a.port),
+        )
+        .json(&serde_json::json!({ "requested_by": "follow e2e" }))
+        .send()
+        .await
+        .expect("takeover request reaches A");
+    assert!(
+        takeover.status().is_success(),
+        "drain request on A refused: {}",
+        takeover.status()
+    );
+    poll_until(
+        "the sidecar naming A draining",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] == boot_a.as_str() && sidecar["state"] == "draining").then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // The scripted tab's mid-window reads. The payload: draining, this
+    // boot's own presence entry carrying the R-A1 stamp pair (the
+    // pre-swap capture the carry ships), and NO resolvable holder.
+    let a_client = daemon_a.authed_client();
+    let handover_url = format!("http://127.0.0.1:{}/api/daemon/handover", daemon_a.port);
+    let payload = http_get_json(&a_client, &handover_url)
+        .await
+        .expect("A's handover payload");
+    assert_eq!(payload["draining"], true, "{payload}");
+    let a_entry = payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == payload["boot_id"])
+                .cloned()
+        })
+        .expect("A's own presence entry in its payload");
+    for stamp in ["git_sha", "built_at"] {
+        assert!(
+            a_entry["version"][stamp]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "the pre-swap stamp pair rides the drainer's own entry: {a_entry}"
+        );
+    }
+    assert_eq!(
+        resolve_live_holder_port(&payload),
+        None,
+        "nobody resolvable during the window: {payload}"
+    );
+
+    // §2.1(a)'s pre-fetch, taken mid-window: a resilience floor that
+    // cannot name a successor that has not booted.
+    let tokens_url = format!(
+        "http://127.0.0.1:{}/api/local-daemons/tokens",
+        daemon_a.port
+    );
+    let prefetch = http_get_json(&a_client, &tokens_url)
+        .await
+        .expect("the drainer serves the token map mid-window");
+    let prefetched_ports: std::collections::HashSet<u64> = prefetch["instances"]
+        .as_array()
+        .map(|instances| {
+            instances
+                .iter()
+                .filter_map(|inst| inst["port"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // C boots plain — the freed lease lands on it.
+    let daemon_c = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-c.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &[],
+    )
+    .await;
+    poll_until(
+        "C acquiring the lease",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["state"] == "active" && sidecar["boot_id"] != boot_a.as_str()).then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+    assert!(
+        !prefetched_ports.contains(&u64::from(daemon_c.port)),
+        "the pre-fetch predates C — only the re-fetch can name it: {prefetched_ports:?}"
+    );
+
+    // The watch's per-tick re-resolution reaches :C on a fresh payload.
+    poll_until(
+        "A's payload resolving :C",
+        RUN_TIMEOUT,
+        || async {
+            let payload = http_get_json(&a_client, &handover_url).await?;
+            (resolve_live_holder_port(&payload) == Some(daemon_c.port)).then_some(())
+        },
+        || format!("last sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // R-A2: the RE-fetched map is the read of record — it now names
+    // C's own admission token, still served by the DRAINING daemon.
+    let tokens = http_get_json(&a_client, &tokens_url)
+        .await
+        .expect("the drainer re-serves the token map");
+    let c_token = tokens["instances"]
+        .as_array()
+        .and_then(|instances| {
+            instances
+                .iter()
+                .find(|inst| inst["port"].as_u64() == Some(u64::from(daemon_c.port)))
+                .cloned()
+        })
+        .expect("the re-fetched map names the successor")["token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        c_token,
+        rig_loopback_token(&daemon_a.rig, daemon_c.port),
+        "the map's token IS the successor's own admission token"
+    );
+
+    // §2.1(c)'s probe: the successor origin ANSWERS — any HTTP answer
+    // proves a listener (the browser probe is opaque no-cors; a named
+    // 401 on a tokenless read is still an answering daemon).
+    client
+        .get(format!("http://127.0.0.1:{}/", daemon_c.port))
+        .send()
+        .await
+        .expect("the successor origin answers the readiness probe");
+
+    // The follow URL the watch builds: ?token= plus the route hash and
+    // the carry (both fragment-side, never on the wire). Authed 200.
+    let follow = client
+        .get(format!(
+            "http://127.0.0.1:{}/?token={}",
+            daemon_c.port, c_token
+        ))
+        .send()
+        .await
+        .expect("the follow navigation reaches C");
+    assert!(
+        follow.status().is_success(),
+        "the follow lands authed on the successor: {}",
+        follow.status()
+    );
+
+    // The landing side's compare substrate: C's own payload names C's
+    // build as the same stamp pair, under a different boot.
+    let mut c_headers = reqwest::header::HeaderMap::new();
+    c_headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&daemon_a.rig, daemon_c.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let c_client = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(c_headers)
+        .build()
+        .expect("authed client for C");
+    let c_payload = http_get_json(
+        &c_client,
+        &format!("http://127.0.0.1:{}/api/daemon/handover", daemon_c.port),
+    )
+    .await
+    .expect("C's handover payload");
+    assert_ne!(
+        c_payload["boot_id"], boot_a.as_str(),
+        "the landing is a different boot: {c_payload}"
+    );
+    let c_entry = c_payload["daemons"]
+        .as_array()
+        .and_then(|daemons| {
+            daemons
+                .iter()
+                .find(|d| d["boot_id"] == c_payload["boot_id"])
+                .cloned()
+        })
+        .expect("C's own presence entry in its payload");
+    for stamp in ["git_sha", "built_at"] {
+        assert!(
+            c_entry["version"][stamp]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "the landing-side stamp pair rides the successor's own entry: {c_entry}"
+        );
+    }
+
+    drop(daemon_c);
+}
+
 /// A probe-able fake "binary": a shell script printing exactly
 /// `build_info::version_line`'s shape with the given sha. Unix-only —
 /// the update watch execs it for `--version`.
