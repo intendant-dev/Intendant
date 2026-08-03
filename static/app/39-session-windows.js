@@ -618,7 +618,57 @@ function normalizeSessionBootEra(raw) {
   if (terminal) out.terminal = terminal;
   const continuedAs = normalizeSessionContinuedAs(raw.continued_as || raw.continuedAs);
   if (continuedAs) out.continuedAs = continuedAs;
+  // Update-abstraction §3 (R4): the drain-map claim rides BESIDE the era
+  // vocabulary — a session still FINISHING on a draining co-homed
+  // sibling daemon (never a new era value; the strictness above stands).
+  const heldBy = normalizeSessionHeldBy(raw.held_by || raw.heldBy);
+  if (heldBy) out.heldBy = heldBy;
   return out;
+}
+
+// boot.held_by: which draining sibling daemon still RUNS this session,
+// on what build (same_build = the daemon's R-A1 stamp compare against
+// itself), in what phase, parked until when. Sessions are never moved
+// mid-flight — this is display truth plus the composer's routing key.
+function normalizeSessionHeldBy(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const port = Number(raw.port);
+  if (!Number.isFinite(port) || port <= 0) return null;
+  const out = {
+    port,
+    sameBuild: raw.same_build === true || raw.sameBuild === true,
+  };
+  const bootId = compactSessionText(raw.boot_id || raw.bootId);
+  if (bootId) out.bootId = bootId;
+  const phase = compactSessionText(raw.phase);
+  if (phase) out.phase = phase;
+  const version = raw.version;
+  if (version && typeof version === 'object') {
+    const gitSha = compactSessionText(version.git_sha || version.gitSha);
+    const builtAt = compactSessionText(version.built_at || version.builtAt);
+    if (gitSha || builtAt) {
+      out.version = {};
+      if (gitSha) out.version.gitSha = gitSha;
+      if (builtAt) out.version.builtAt = builtAt;
+    }
+  }
+  const park = raw.limit_park || raw.limitPark;
+  if (park && typeof park === 'object') {
+    const resetsAtEpoch = Number(park.resets_at_epoch ?? park.resetsAtEpoch);
+    if (Number.isFinite(resetsAtEpoch) && resetsAtEpoch > 0) {
+      out.limitPark = { resetsAtEpoch };
+    }
+  }
+  return out;
+}
+
+// The held_by claim behind a session id, from the merged window metadata
+// — the composer and the window-action gate share this one lookup.
+function sessionWindowHeldBy(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const boot = (sessionMetadataById.get(sid) || {}).boot;
+  return boot && boot.heldBy ? boot.heldBy : null;
 }
 
 // Dir-local terminal facts served on the row (and lifted into the boot
@@ -1065,7 +1115,7 @@ function sessionWindowMetadataSignature(meta = {}) {
       ].join('|')
       : '',
     meta.boot
-      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}|${meta.boot.sourceSessionId || ''}|${meta.boot.lineageTip === undefined ? '' : (meta.boot.lineageTip ? '1' : '0')}|${meta.boot.continuedAs ? `${meta.boot.continuedAs.sessionId || ''}:${meta.boot.continuedAs.backendSessionId || ''}:${meta.boot.continuedAs.live ? '1' : '0'}` : ''}|${sessionTerminalFactsSignature(meta.boot.terminal)}`
+      ? `${meta.boot.era}|${meta.boot.liveWrapper ? '1' : '0'}|${meta.boot.ghost ? '1' : '0'}|${meta.boot.sourceSessionId || ''}|${meta.boot.lineageTip === undefined ? '' : (meta.boot.lineageTip ? '1' : '0')}|${meta.boot.continuedAs ? `${meta.boot.continuedAs.sessionId || ''}:${meta.boot.continuedAs.backendSessionId || ''}:${meta.boot.continuedAs.live ? '1' : '0'}` : ''}|${sessionTerminalFactsSignature(meta.boot.terminal)}|${meta.boot.heldBy ? `${meta.boot.heldBy.port}:${meta.boot.heldBy.phase || ''}:${meta.boot.heldBy.sameBuild ? '1' : '0'}:${meta.boot.heldBy.limitPark ? meta.boot.heldBy.limitPark.resetsAtEpoch : ''}` : ''}`
       : '',
     sessionTerminalFactsSignature(meta.terminal),
     meta.updatedAt || '',
@@ -2364,6 +2414,38 @@ const VITALS_SYMBOLS = {
     },
     brief: (v) => (v.ghost ? 'Ghost — pre-boot, nothing behind it; safe to close' : ''),
   },
+  // Update-abstraction §3 (R4): a session still FINISHING on a draining
+  // sibling daemon. Chip copy is grade-1 (the product event — never a
+  // port, boot id, or drain word); the explainer pane is the mechanics
+  // reveal. The old-build indicator is the copy split itself: a
+  // different build (the daemon's R-A1 stamp compare) reads "previous
+  // version", the same build reads "previous daemon".
+  'held-by': {
+    label: 'Previous daemon',
+    priority: 26,
+    icon: 'clock',
+    chip: (v) => (v.sameBuild
+      ? '⏳ finishing on the previous daemon'
+      : '⏳ finishing on the previous version'),
+    explain: (v) => {
+      const lines = [
+        v.sameBuild
+          ? 'This session is still running on the previous daemon process — the same build as the one serving this dashboard.'
+          : 'This session is still running on the previous daemon, which runs a different (older) build than the one serving this dashboard.',
+        'It keeps working there until it finishes, then continues here — sessions are never moved mid-flight.',
+        'Messages you send route to it where it runs; other actions wait until it moves here.',
+      ];
+      lines.push(`Held by :${v.port}${v.bootId ? ` — boot ${v.bootId}` : ''}${v.phase ? ` — ${v.phase}` : ''}`);
+      if (v.gitSha || v.builtAt) {
+        lines.push(`Its build: ${[v.gitSha ? `commit ${v.gitSha}` : '', v.builtAt ? `built ${v.builtAt}` : ''].filter(Boolean).join(' · ')}`);
+      }
+      if (v.parkedUntil) {
+        lines.push(`Rate-limit parked until ${formatLimitResetWallClock(v.parkedUntil)}.`);
+      }
+      return lines;
+    },
+    brief: (v) => (v.sameBuild ? 'Finishing on the previous daemon' : 'Finishing on the previous version'),
+  },
 };
 
 // Fixed display order for chips and the glossary (semantic, not priority:
@@ -2372,7 +2454,7 @@ const VITALS_SYMBOLS = {
 // activity signal.
 const VITALS_SYMBOL_ORDER = [
   'health', 'activity', 'model', 'permissions', 'agenda-source',
-  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'boot', 'worktree', 'worktree-state', 'branch', 'dirty',
+  'agenda-occurrence', 'agenda-attestation', 'sealed-inputs', 'held-by', 'boot', 'worktree', 'worktree-state', 'branch', 'dirty',
   'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
   'cache-ttl', 'limit',
 ];
@@ -2633,6 +2715,17 @@ function vitalsChipModels(vitals, meta, sessionId) {
       ghost: bootMeta.ghost === true,
     }, {
       severity: bootMeta.ghost ? 'warn' : '',
+    });
+  }
+  if (bootMeta?.heldBy) {
+    push('held-by', 'held-by', {
+      port: bootMeta.heldBy.port,
+      bootId: bootMeta.heldBy.bootId || '',
+      phase: bootMeta.heldBy.phase || '',
+      sameBuild: bootMeta.heldBy.sameBuild === true,
+      gitSha: bootMeta.heldBy.version?.gitSha || '',
+      builtAt: bootMeta.heldBy.version?.builtAt || '',
+      parkedUntil: bootMeta.heldBy.limitPark?.resetsAtEpoch || 0,
     });
   }
   const worktreeState = meta?.worktreeState && typeof meta.worktreeState === 'object'

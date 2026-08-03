@@ -7219,6 +7219,309 @@ async fn drainer_exits_at_last_session_end() {
     drop(daemon_b);
 }
 
+/// Update-abstraction slice 3 (§3 residual R4 + the owner-amended
+/// composer lane), acceptance (c)(e)(f): a drainer's parked-for-
+/// follow-ups session appears in the SUCCESSOR's catalog wearing
+/// `boot.held_by` — the drainer's boot/port, the R-A1 build compare
+/// (same binary here, so `same_build`), and the holdout phase — while
+/// the era/ghost vocabulary stays untouched beside it. The holder-side
+/// composer contract then runs end to end as the scripted tab: the
+/// sibling token map on the holder names the drainer's OWN admission
+/// token, a targeted `start_task` through the drainer's own gateway is
+/// SERVED during drain (the gate refuses only session-creating
+/// intents), the held session ANSWERS on the drainer (never
+/// reattached), and the reply reads back through the successor's
+/// served view of shared disk (the Q5 disk-tail posture). After the
+/// drainer's last session ends and it exits on its own, the join
+/// self-clears, and the sibling lane's refusal constituent is honest
+/// and named: the drainer's gateway stops answering — the class the
+/// SPA's refusal copy renders.
+#[tokio::test]
+async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
+    use futures_util::SinkExt;
+    let script = serde_json::json!({
+        "profiles": [
+            { "match": "drain composer target",
+              "steps": [
+                { "content": "turn one done — parked for follow-ups." },
+                { "content": "composer reply delivered through the drain." }
+              ] },
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    let mut daemon_a = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let port_a = daemon_a.port;
+    let holder_boot = lease_sidecar(&daemon_a.rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // The held session: a managed session on A that completes round one
+    // and PARKS for follow-ups — alive, so it holds the coming drain.
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        port_a,
+        rig_loopback_token(&daemon_a.rig, port_a)
+    ))
+    .await
+    .expect("connect drainer websocket");
+    let started = ctl(
+        &daemon_a,
+        &["task", "start", "--task", "drain composer target"],
+    )
+    .await;
+    assert!(started.status.success(), "{}", text_of(&started));
+    let session_started = next_matching_ws_event(&mut ws_a, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(serde_json::Value::as_str) == Some("session_started")
+            && json.get("task").and_then(serde_json::Value::as_str) == Some("drain composer target")
+    })
+    .await
+    .unwrap_or_else(|| panic!("held session never started:\n{}", daemon_a.log_tail()));
+    let sid = session_started
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("held session id")
+        .to_string();
+    next_matching_ws_event(&mut ws_a, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(serde_json::Value::as_str) == Some("round_complete")
+            && json.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str())
+    })
+    .await
+    .unwrap_or_else(|| panic!("round one never completed:\n{}", daemon_a.log_tail()));
+
+    // The successor boots with --takeover: the lease transfers, A drains.
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &daemon_a.rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &["--takeover"],
+    )
+    .await;
+    let port_b = daemon_b.port;
+    poll_until(
+        "the lease transferring to the successor",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&daemon_a.rig)?;
+            (sidecar["boot_id"] != holder_boot.as_str() && sidecar["state"] == "active")
+                .then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&daemon_a.rig)),
+    )
+    .await;
+
+    // (c) The successor's catalog carries the join while the drainer
+    // still runs the session: held_by names the drainer, the R-A1
+    // compare reads same-build (one binary in the rig), and the era
+    // vocabulary is untouched beside it.
+    let mut headers_b = reqwest::header::HeaderMap::new();
+    headers_b.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&daemon_a.rig, port_b)
+            .parse()
+            .expect("token header value"),
+    );
+    let client_b = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers_b)
+        .build()
+        .expect("successor-authed client");
+    let held_row = |sessions: &serde_json::Value, sid: &str| -> Option<serde_json::Value> {
+        // The plain GET serves a bare row array; the stream lane nests
+        // rows under "sessions" — accept both like the catalog's other
+        // e2e consumers.
+        sessions["sessions"]
+            .as_array()
+            .or_else(|| sessions.as_array())?
+            .iter()
+            .find(|row| row["session_id"] == sid)
+            .cloned()
+    };
+    let drainer_presence_path = daemon_a
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{holder_boot}.json"));
+    let last_served_row = std::sync::Mutex::new(String::from("(row never served)"));
+    poll_until(
+        "the successor serving held_by on the drained row",
+        RUN_TIMEOUT,
+        || async {
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
+            let row = held_row(&sessions, &sid)?;
+            *last_served_row.lock().unwrap() = row.to_string();
+            let held = row.pointer("/boot/held_by")?;
+            (held["boot_id"] == holder_boot.as_str()
+                && held["port"] == port_a
+                && held["same_build"] == true
+                && held["phase"]
+                    .as_str()
+                    .is_some_and(|phase| !phase.is_empty())
+                && row["boot"]["era"] == "current"
+                && row["boot"]["ghost"] == false)
+                .then_some(())
+        },
+        || {
+            format!(
+                "--- drainer presence record ---\n{}\n--- last served row ---\n{}\n--- A tail ---\n{}",
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                last_served_row.lock().unwrap(),
+                daemon_a.log_tail()
+            )
+        },
+    )
+    .await;
+
+    // (e) The composer contract, as the scripted tab: the sibling token
+    // map on the HOLDER names the drainer's OWN admission token…
+    let tokens = http_get_json(
+        &client_b,
+        &format!("http://127.0.0.1:{port_b}/api/local-daemons/tokens"),
+    )
+    .await
+    .expect("sibling token map");
+    let drainer_token = tokens["instances"]
+        .as_array()
+        .expect("token map instances")
+        .iter()
+        .find(|inst| inst["port"] == port_a)
+        .and_then(|inst| inst["token"].as_str())
+        .expect("the drainer's instance rides the map")
+        .to_string();
+    assert_eq!(
+        drainer_token,
+        rig_loopback_token(&daemon_a.rig, port_a),
+        "the map serves the drainer's own admission token"
+    );
+
+    // …and a targeted start_task through the drainer's own gateway is
+    // SERVED mid-drain — the drain gate refuses only session-creating
+    // intents. The send is exactly the dashboard lane's frame.
+    let (mut ws_tab, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port_a}/ws?token={drainer_token}"
+    ))
+    .await
+    .expect("the map token admits the drainer's gateway");
+    ws_tab
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "start_task",
+                "task": "composer follow-up through the drain",
+                "session_id": sid,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send the composer follow-up");
+
+    // The held session answers ON the drainer (round two, no reattach)…
+    next_matching_ws_event(&mut ws_a, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(serde_json::Value::as_str) == Some("round_complete")
+            && json.get("session_id").and_then(serde_json::Value::as_str) == Some(sid.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the composer follow-up never ran on the drainer:\n{}",
+            daemon_a.log_tail()
+        )
+    });
+
+    // …and the reply reads back through the SUCCESSOR's served view of
+    // shared disk (Q5's disk-tail posture — the holder dashboard shows
+    // the answer without any cross-daemon proxying).
+    poll_until(
+        "the reply landing in the successor-served transcript",
+        RUN_TIMEOUT,
+        || async {
+            let detail = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/session/{sid}"),
+            )
+            .await?;
+            serde_json::to_string(&detail)
+                .ok()?
+                .contains("composer reply delivered through the drain")
+                .then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // The held session ends through the drainer's own lane (stop is not
+    // session-creating), the drain completes, and the drainer exits on
+    // its own.
+    ws_tab
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "stop_session",
+                "session_id": sid,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send stop_session to the drainer");
+    let exited = tokio::time::timeout(Duration::from_secs(60), daemon_a.child.wait())
+        .await
+        .expect("the drained daemon must exit after its last session ends")
+        .expect("collect drainer exit status");
+    assert!(
+        exited.success(),
+        "graceful drain exit, not a crash: {exited:?}\n{}",
+        daemon_a.log_tail()
+    );
+
+    // The join self-clears: the drainer's boot lock freed, `live` reads
+    // false, and the successor's rows drop held_by.
+    poll_until(
+        "held_by clearing after the drainer exits",
+        RUN_TIMEOUT,
+        || async {
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
+            let row = held_row(&sessions, &sid)?;
+            row.pointer("/boot/held_by").is_none().then_some(())
+        },
+        || daemon_a.log_tail(),
+    )
+    .await;
+
+    // (f) The refusal constituent the SPA's named copy renders: the
+    // drainer's gateway no longer answers (its stale token file may
+    // keep the map row — as-found-on-disk semantics — but the port
+    // refusing is the truth the honest refusal names).
+    let refused = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port_a}/ws?token={drainer_token}"
+    ))
+    .await;
+    assert!(
+        refused.is_err(),
+        "the exited drainer's gateway must not answer the composer lane"
+    );
+    drop(daemon_b);
+}
+
 /// A mock script whose scheduled-session profile parks mid-turn on a
 /// long provider delay — the holdout that keeps each drainer in the
 /// three-daemon chain below alive (and draining) for the whole

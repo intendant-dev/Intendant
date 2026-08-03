@@ -74,6 +74,66 @@ pub(crate) struct GridEnvelopeJoins {
     /// an unchanged index) and handed to every row's tip memo check —
     /// never re-derived per row.
     lineage_epoch: Option<u64>,
+    /// Update-abstraction §3 (residual R4): session id → the draining
+    /// co-homed sibling still RUNNING it, resolved once per build from
+    /// presence (see [`resolve_drain_map`]). Empty when no live sibling
+    /// drains — the common case costs one directory read.
+    drain_map: HashMap<String, DrainHold>,
+}
+
+/// One draining LIVE co-homed sibling's holdout claim on a session row —
+/// the `boot.held_by` wire block's source. Presence-derived and
+/// read-only (the F1 watershed law: this join never writes presence).
+pub(crate) struct DrainHold {
+    boot_id: String,
+    port: u16,
+    /// The sibling's build stamps, served for the mechanics reveal.
+    version: crate::handover::BuildVersion,
+    /// R-A1 build-stamp compare against THIS daemon's build (the whole
+    /// stamp — a rebuild of the same commit still reads different):
+    /// `false` = the sibling runs another build ("finishing on the
+    /// previous version"); `true` = same build, restart without update.
+    same_build: bool,
+    phase: String,
+    limit_park: Option<crate::session_log::SessionLimitParkMeta>,
+}
+
+/// The co-homed drain map: presence records that are DRAINING and
+/// provably live (the boot-lock probe — the same liveness truth
+/// `status_json` serves), excluding this process's own record, with
+/// their named holdout rows indexed by session id. Sessions beyond the
+/// presence holdout cap (16) get no entry — `session_count` keeps the
+/// full truth and the drain banner stays the aggregate surface. The
+/// join self-clears: a drainer's exit frees its boot lock, `live`
+/// reads false, and the map stops carrying it.
+fn resolve_drain_map(state_root: &Path) -> HashMap<String, DrainHold> {
+    let own_pid = std::process::id();
+    let current_build = crate::handover::BuildVersion::current();
+    let mut map = HashMap::new();
+    for record in crate::handover::read_presence_records(state_root) {
+        if record.pid == own_pid || record.state != "draining" {
+            continue;
+        }
+        let Some(holdouts) = record.holdouts.as_ref().filter(|rows| !rows.is_empty()) else {
+            continue;
+        };
+        if !crate::handover::boot_id_is_live(state_root, &record.boot_id) {
+            continue;
+        }
+        let same_build = record.version == current_build;
+        for holdout in holdouts {
+            map.entry(holdout.session_id.clone())
+                .or_insert_with(|| DrainHold {
+                    boot_id: record.boot_id.clone(),
+                    port: record.port,
+                    version: record.version.clone(),
+                    same_build,
+                    phase: holdout.phase.clone(),
+                    limit_park: holdout.limit_park.clone(),
+                });
+        }
+    }
+    map
 }
 
 impl GridEnvelopeJoins {
@@ -94,6 +154,7 @@ impl GridEnvelopeJoins {
             agenda,
             lineage_epoch: Some(crate::external_wrapper_index::lineage_epoch(home_path)),
             home: Some(home_path.to_path_buf()),
+            drain_map: resolve_drain_map(&state_root),
         }
     }
 
@@ -106,6 +167,7 @@ impl GridEnvelopeJoins {
             agenda: None,
             home: None,
             lineage_epoch: None,
+            drain_map: HashMap::new(),
         }
     }
 
@@ -127,7 +189,17 @@ impl GridEnvelopeJoins {
                 .as_deref()
                 .map(crate::external_wrapper_index::lineage_epoch),
             home,
+            drain_map: HashMap::new(),
         }
+    }
+
+    /// Test builder: resolve the co-homed drain map from a fixture state
+    /// root through the REAL resolver, so the unit matrix exercises its
+    /// filters (draining/live/own-pid) rather than a hand-built map.
+    #[cfg(test)]
+    pub(crate) fn with_drain_map_from(mut self, state_root: &Path) -> Self {
+        self.drain_map = resolve_drain_map(state_root);
+        self
     }
 
     /// Attach the envelope blocks to one intendant wrapper row.
@@ -247,6 +319,31 @@ impl GridEnvelopeJoins {
         // the winning row's terminal is the one the card states.
         if let Some(terminal) = row.get("terminal").filter(|value| value.is_object()) {
             boot_block["terminal"] = terminal.clone();
+        }
+        // Update-abstraction §3 (residual R4): a session still RUNNING on
+        // a draining live sibling carries `held_by` BESIDE the era
+        // vocabulary (old SPAs ignore the field; `normalizeSessionBootEra`
+        // stays strict) — era/ghost above are untouched by this join. A
+        // locally live wrapper outranks any stale sibling claim: double
+        // supervision never happens by design, so the local wrapper is
+        // the stronger truth and the sibling row is debris.
+        if !live_wrapper {
+            if let Some(hold) = self.drain_map.get(session_id) {
+                let mut held_by = serde_json::json!({
+                    "boot_id": hold.boot_id,
+                    "port": hold.port,
+                    "version": serde_json::to_value(&hold.version)
+                        .unwrap_or(serde_json::Value::Null),
+                    "same_build": hold.same_build,
+                    "phase": hold.phase,
+                });
+                if let Some(park) = hold.limit_park.as_ref() {
+                    if let Ok(park) = serde_json::to_value(park) {
+                        held_by["limit_park"] = park;
+                    }
+                }
+                boot_block["held_by"] = held_by;
+            }
         }
         if ghost {
             match dead_row_lineage_tip(self.home.as_deref(), session_id, dir, self.lineage_epoch) {
@@ -541,6 +638,223 @@ mod tests {
         assert!(row.get("boot").is_none());
     }
 
+    /// Fixture presence: a full record (state/version/holdouts) under a
+    /// FOREIGN pid by default — the drain map excludes own-pid records.
+    fn write_presence_record(
+        state_root: &Path,
+        boot_id: &str,
+        pid: u32,
+        port: u16,
+        state: &str,
+        version: serde_json::Value,
+        holdouts: serde_json::Value,
+    ) {
+        let dir = state_root.join("daemons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = serde_json::json!({
+            "v": 1,
+            "boot_id": boot_id,
+            "pid": pid,
+            "port": port,
+            "version": version,
+            "state": state,
+            "session_count": 1,
+            "holdouts": holdouts,
+            "updated_ms": 5_000,
+        });
+        std::fs::write(dir.join(format!("{boot_id}.json")), record.to_string()).unwrap();
+    }
+
+    /// Hold `boot_id`'s presence lock from this process. flock/LockFileEx
+    /// deny per file description, so the drain map's probe sees exactly
+    /// what it would against another live daemon.
+    fn hold_boot_lock(state_root: &Path, boot_id: &str) -> std::fs::File {
+        let dir = state_root.join("daemons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(format!("{boot_id}.lock")))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    }
+
+    fn parked_holdout_rows(session_id: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "session_id": session_id,
+            "source": "claude-code",
+            "name": "seat",
+            "phase": "waiting_rate_limit",
+            "limit_park": { "resets_at_epoch": 1_754_000_000u64, "has_pending": true },
+        }])
+    }
+
+    /// Slice-3 acceptance (a), the drain-map matrix: a DRAINING sibling
+    /// whose boot lock is HELD joins `boot.held_by` onto its holdout
+    /// rows (port/phase/limit_park + the R-A1 build-stamp compare); a
+    /// non-draining, non-live, exited, or own-pid record joins nothing;
+    /// a locally live wrapper outranks any sibling claim; and the
+    /// era/ghost vocabulary is byte-identical with and without the join
+    /// (the map only READS presence — F1 untouched).
+    #[test]
+    fn held_by_matrix_joins_only_draining_live_siblings() {
+        let sessions = tempfile::tempdir().unwrap();
+        let dir = session_dir_with_transcript(sessions.path(), "s1");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let watershed = now_secs.saturating_sub(3_600);
+        let foreign_pid = std::process::id() + 1;
+        let elder_build =
+            serde_json::json!({"pkg": "0.0.0", "git_sha": "elder", "built_at": "elder-ts"});
+        let attach_with = |state_root: &Path, live: &[&str], session_id: &str| {
+            let mut row = serde_json::json!({});
+            joins(Some(watershed), Some(live), None)
+                .with_drain_map_from(state_root)
+                .attach(&mut row, session_id, &dir);
+            row
+        };
+
+        // Draining + provably live sibling → the whole held_by block.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-drainer",
+            foreign_pid,
+            8770,
+            "draining",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        let _drainer_lock = hold_boot_lock(root.path(), "boot-drainer");
+        let row = attach_with(root.path(), &[], "s1");
+        let held = &row["boot"]["held_by"];
+        assert_eq!(held["boot_id"], "boot-drainer");
+        assert_eq!(held["port"], 8770);
+        assert_eq!(held["phase"], "waiting_rate_limit");
+        assert_eq!(
+            held["limit_park"]["resets_at_epoch"], 1_754_000_000_u64,
+            "the parked-until instant rides the block — the decisive fact"
+        );
+        assert_eq!(
+            held["same_build"], false,
+            "fixture build differs from this binary (the R-A1 stamp compare)"
+        );
+        assert_eq!(held["version"]["git_sha"], "elder");
+        assert_eq!(held["version"]["built_at"], "elder-ts");
+        assert_eq!(row["boot"]["era"], "current");
+        assert_eq!(row["boot"]["ghost"], false);
+
+        // Era honesty: strip held_by and the joined row is byte-identical
+        // to an un-joined attach — the field rides BESIDE the era
+        // vocabulary, never inside it.
+        let mut baseline = serde_json::json!({});
+        joins(Some(watershed), Some(&[]), None).attach(&mut baseline, "s1", &dir);
+        let mut joined = row.clone();
+        joined["boot"]
+            .as_object_mut()
+            .unwrap()
+            .remove("held_by")
+            .expect("held_by was attached");
+        assert_eq!(
+            joined, baseline,
+            "era/ghost outputs byte-identical; held_by is the only addition"
+        );
+
+        // A session outside the holdout rows joins nothing.
+        let other = attach_with(root.path(), &[], "s2");
+        assert!(other["boot"].get("held_by").is_none());
+
+        // A locally live wrapper outranks a (stale) sibling claim.
+        let live_row = attach_with(root.path(), &["s1"], "s1");
+        assert_eq!(live_row["boot"]["live_wrapper"], true);
+        assert!(live_row["boot"].get("held_by").is_none());
+
+        // Same-build sibling → the compare says restart, not update.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-twin",
+            foreign_pid,
+            8771,
+            "draining",
+            serde_json::to_value(crate::handover::BuildVersion::current()).unwrap(),
+            parked_holdout_rows("s1"),
+        );
+        let _twin_lock = hold_boot_lock(root.path(), "boot-twin");
+        assert_eq!(
+            attach_with(root.path(), &[], "s1")["boot"]["held_by"]["same_build"],
+            true
+        );
+
+        // Non-draining (running) live sibling → absent.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-running",
+            foreign_pid,
+            8772,
+            "running",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        let _running_lock = hold_boot_lock(root.path(), "boot-running");
+        assert!(attach_with(root.path(), &[], "s1")["boot"]
+            .get("held_by")
+            .is_none());
+
+        // Draining but provably dead (takeable/absent lock) → absent.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-dead",
+            foreign_pid,
+            8773,
+            "draining",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        assert!(attach_with(root.path(), &[], "s1")["boot"]
+            .get("held_by")
+            .is_none());
+
+        // Exited (lock still held on the way out) → absent.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-exited",
+            foreign_pid,
+            8774,
+            "exited",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        let _exited_lock = hold_boot_lock(root.path(), "boot-exited");
+        assert!(attach_with(root.path(), &[], "s1")["boot"]
+            .get("held_by")
+            .is_none());
+
+        // This process's own record never claims its own rows.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-self",
+            std::process::id(),
+            8775,
+            "draining",
+            elder_build,
+            parked_holdout_rows("s1"),
+        );
+        let _self_lock = hold_boot_lock(root.path(), "boot-self");
+        assert!(attach_with(root.path(), &[], "s1")["boot"]
+            .get("held_by")
+            .is_none());
+    }
+
     fn envelope(
         state: crate::agenda::OccurrenceState,
         lineage_role: crate::agenda::SessionLineageRole,
@@ -744,6 +1058,18 @@ mod tests {
             "worktree_state",
             "normalizeSessionWorktreeState(",
             "'worktree-state'",
+            // Update-abstraction §3 (R4): the drain-map claim — wire
+            // name, normalize seam, chip id, and the old-build
+            // indicator (acceptance (b)+(g): the R-A1 same_build
+            // compare splits the grade-1 copy).
+            "held_by",
+            "normalizeSessionHeldBy(",
+            "sessionWindowHeldBy(",
+            "'held-by'",
+            "same_build",
+            "sameBuild",
+            "finishing on the previous version",
+            "finishing on the previous daemon",
         ] {
             assert!(
                 fragment.contains(needle),
@@ -762,6 +1088,49 @@ mod tests {
             styles.contains(".session-window.session-window-ghost"),
             "the stylesheet lost the ghost window treatment"
         );
+        // Slice-3 affordance gating + the amended composer lane: the
+        // window-action gate consults the shared held_by lookup; the
+        // sessions-tab card wears the chip and gates resume; the
+        // composer routes held targets to the sibling's own gateway
+        // through the sibling token map, and the sibling-gone refusal
+        // stays honest and named (acceptance (f)'s copy pin).
+        for needle in [
+            "sessionWindowHeldBy(",
+            "HELD_BY_SAFE_OPS",
+            "Still finishing on the previous version",
+        ] {
+            assert!(
+                actions.contains(needle),
+                "the actions fragment lost the held_by affordance gate: {needle}"
+            );
+        }
+        let cards = include_str!("../../../../../static/app/57a-sessions-list.js");
+        for needle in [
+            "sc-held-by-chip",
+            "held_by",
+            "same_build",
+            "finishing on the previous version",
+            "finishing on the previous daemon",
+        ] {
+            assert!(
+                cards.contains(needle),
+                "the sessions-tab card lost its held_by treatment: {needle}"
+            );
+        }
+        let lifecycle = include_str!("../../../../../static/app/54-session-lifecycle.js");
+        for needle in [
+            "dispatchHeldBySessionFollowUp(",
+            "siblingDaemonStartTask(",
+            "/api/local-daemons/tokens",
+            "action: 'start_task', task: text, session_id: sid",
+            "is gone — this session can't take messages there anymore",
+            "continues here when the handover completes",
+        ] {
+            assert!(
+                lifecycle.contains(needle),
+                "the composer lost the held_by sibling lane: {needle}"
+            );
+        }
     }
 
     /// The join the original matrix missed (the 2026-07-28 ghost-flag
