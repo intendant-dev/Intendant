@@ -330,21 +330,33 @@ per-tile staleness check.
 ### Tiles, damage, and fallback
 
 - **Tiles** are **64×64 px** (`TILE_STREAM_TILE_SIZE_PX`).
-- **Damage** comes from platform metadata when possible. On **X11**, XDamage
-  (`crates/intendant-display/src/capture/x11_damage.rs`) reports real OS-level
-  dirty rects
-  (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rect
+- **Damage** comes from platform metadata when possible — as *candidates*,
+  not truth. On **X11**, XDamage
+  (`crates/intendant-display/src/capture/x11_damage.rs`) reports OS-level
+  dirty rects (`ReportLevel::BoundingBox`); under a compositing WM these
+  degenerate badly — the compositor repaints (and XDamage fires on repaints,
+  not pixel change), so a GNOME Shell clock tick reports an up-to-full-root
+  bounding box every second over pixel-identical content. On **macOS**,
+  ScreenCaptureKit dirty rect
   extraction is **on by default** (`INTENDANT_MACOS_SCK_DIRTY_RECTS=0` is the
   opt-out escape hatch): frames carry SCK's native dirty rects, a frame whose
   sample lacks the attachment ships a conservative full-frame rect (the
   Chromium missing-attachment rule), and the composited cursor
   (`shows_cursor(true)`) is content change inside the same pipeline that mints
-  the rects — so the X11 hardware-cursor hazard does not transfer. Other paths
-  use a CPU-bound **frame-diff fallback**
+  the rects — so the X11 hardware-cursor hazard does not transfer. Reported
+  rects are therefore **pixel-verified** before they become tile dirt
+  (`FrameDiffDamageTracker::verify_damage`): only tiles inside the rects whose
+  content hash actually changed since the tracker last saw them survive, so a
+  repaint of identical pixels produces zero dirty tiles (and cannot flap the
+  video-fallback policy below). Platforms without per-frame damage metadata
+  use the CPU-bound **frame-diff fallback**
   (`crates/intendant-display/src/capture/frame_diff.rs`) that hashes every
   tile and emits the ones whose hash changed. A damage backend reporting
   `DamageCapability::None` means no platform damage metadata is active; the
-  bridge still runs that CPU frame-diff fallback.
+  bridge still runs that CPU frame-diff fallback. In every mode the hash
+  skips byte 3 of each pixel — alpha on alpha-carrying sources, *undefined
+  padding* on 24-bit-depth X11 BGRX captures — so pad-byte noise can't mint
+  phantom dirt either.
 - **Tile ↔ video fallback policy**
   (`crates/intendant-display/src/tile/policy.rs`) switches to
   whole-frame video on high-motion content and back to tiles when motion subsides,

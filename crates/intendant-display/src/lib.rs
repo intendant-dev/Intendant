@@ -1404,8 +1404,17 @@ fn all_tile_ids(grid: &tile::grid::TileGrid) -> Vec<tile::grid::TileId> {
 /// diff runs, so a change landing on a skipped frame is caught by the
 /// next diff.
 ///
-/// Rect mode (in-frame dirty rects or OS damage events): the collected
-/// rects are returned as reported.
+/// Rect mode (in-frame dirty rects or OS damage events): platform
+/// damage metadata says where to *look*, never what changed — OS
+/// damage over-reports by design, and under a compositing WM
+/// root-window XDamage degenerates to full-root bounding boxes over
+/// pixel-identical content (see
+/// [`capture::frame_diff::FrameDiffDamageTracker::verify_damage`]).
+/// The collected rects are pixel-verified against the tracker's tile
+/// baseline; only tiles that really changed survive. Verification
+/// errors fail open to the rects as reported: over-encoding is
+/// recoverable, a dropped real change would stay stale until the
+/// periodic snapshot.
 ///
 /// `tracker_slot` round-trips the tracker through the blocking task
 /// (moved in, moved back out). A cancelled/panicked task loses it; the
@@ -1442,6 +1451,33 @@ async fn resolve_tile_tick_damage(
             }
             Err(e) => {
                 eprintln!("{log_prefix} display {display_id} frame-diff task failed: {e}");
+            }
+        }
+    } else if !collected.is_empty() {
+        let tracker = tracker_slot.take().unwrap_or_else(|| {
+            capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX)
+        });
+        let verify_result = tokio::task::spawn_blocking({
+            let frame = Arc::clone(frame);
+            let candidates = collected.clone();
+            move || {
+                let mut tracker = tracker;
+                let verified = tracker.verify_damage(&frame, &candidates);
+                (tracker, verified)
+            }
+        })
+        .await;
+        match verify_result {
+            Ok((tracker, Ok(verified))) => {
+                *tracker_slot = Some(tracker);
+                collected = verified;
+            }
+            Ok((tracker, Err(e))) => {
+                *tracker_slot = Some(tracker);
+                eprintln!("{log_prefix} display {display_id} damage verify failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("{log_prefix} display {display_id} damage verify task failed: {e}");
             }
         }
     }
@@ -4723,6 +4759,86 @@ mod tests {
         let counters = Arc::new(DisplayMetricsCounters::new());
         counters.peer_count.store(1, Ordering::Relaxed);
         (peers, tile_subscribers, tile_gauge, counters, peer)
+    }
+
+    fn diff_test_frame(w: u32, h: u32, data: Vec<u8>) -> Arc<Frame> {
+        Arc::new(Frame {
+            data,
+            format: FrameFormat::Bgra,
+            width: w,
+            height: h,
+            stride: w * 4,
+            timestamp: Instant::now(),
+            dirty_rects: None,
+        })
+    }
+
+    /// The live X11 phantom-dirt shape: under a compositing WM the root
+    /// window's XDamage fires on *repaints*, not pixel changes — GNOME
+    /// Shell's clock actor repainting identical pixels reports a huge
+    /// (up to full-root) bounding box every second. Damage rects are
+    /// candidates, not truth: the tile path must pixel-verify them, so
+    /// an identical frame verifies to zero dirt, a pad-byte-only frame
+    /// (undefined BGRX byte 3) verifies to zero dirt, and a small real
+    /// change verifies to its own tiles' fraction — never 1.0.
+    #[tokio::test]
+    async fn os_damage_rects_are_pixel_verified_before_tile_dirt() {
+        let w = 256u32;
+        let h = 128u32; // 4×2 tiles at 64px → 8 total
+        let full = capture::damage::Rect::new(0, 0, w, h);
+        let grid = tile::grid::TileGrid::new(w, h, TILE_STREAM_TILE_SIZE_PX).expect("grid");
+        let mut tracker = Some(capture::frame_diff::FrameDiffDamageTracker::new(
+            TILE_STREAM_TILE_SIZE_PX,
+        ));
+        let fraction =
+            |rects: &Vec<capture::damage::Rect>| grid.dirty_fraction(grid.dirty_tiles(rects).len());
+        let base = vec![0x40u8; (w * h * 4) as usize];
+
+        // Tick 1: no baseline exists yet, so the reported damage is
+        // trusted once while the baseline is established.
+        let f0 = diff_test_frame(w, h, base.clone());
+        let _ = resolve_tile_tick_damage(&f0, vec![full], false, &mut tracker, 0, "[test]").await;
+
+        // Pixel-identical frame + full-screen damage report → no dirt.
+        let f1 = diff_test_frame(w, h, base.clone());
+        let out = resolve_tile_tick_damage(&f1, vec![full], false, &mut tracker, 0, "[test]").await;
+        assert_eq!(
+            fraction(&out),
+            0.0,
+            "phantom full-screen damage over identical pixels must verify to zero dirt"
+        );
+
+        // Identical except every pixel's pad byte → still no dirt.
+        let mut padded = base.clone();
+        for px in padded.chunks_exact_mut(4) {
+            px[3] = 0x77;
+        }
+        let f2 = diff_test_frame(w, h, padded);
+        let out = resolve_tile_tick_damage(&f2, vec![full], false, &mut tracker, 0, "[test]").await;
+        assert_eq!(
+            fraction(&out),
+            0.0,
+            "pad-byte-only differences must verify to zero dirt"
+        );
+
+        // One 8×8 region really changed (inside tile (1, 0)) while the
+        // OS still over-reports full-screen damage → exactly that
+        // tile's fraction, never 1.0.
+        let mut changed = base.clone();
+        for y in 10..18usize {
+            for x in 70..78usize {
+                changed[(y * w as usize + x) * 4] = 0xFF;
+            }
+        }
+        let f3 = diff_test_frame(w, h, changed);
+        let out = resolve_tile_tick_damage(&f3, vec![full], false, &mut tracker, 0, "[test]").await;
+        let dirty = grid.dirty_tiles(&out);
+        assert_eq!(
+            dirty.into_iter().collect::<Vec<_>>(),
+            vec![tile::grid::TileId::new(1, 0)],
+            "a small real change must verify to exactly its owning tile"
+        );
+        assert!((fraction(&out) - 1.0 / 8.0).abs() < f32::EPSILON);
     }
 
     #[tokio::test]
