@@ -7274,12 +7274,15 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
     ))
     .await
     .expect("connect drainer websocket");
-    let started = ctl(&daemon_a, &["task", "start", "--task", "drain composer target"]).await;
+    let started = ctl(
+        &daemon_a,
+        &["task", "start", "--task", "drain composer target"],
+    )
+    .await;
     assert!(started.status.success(), "{}", text_of(&started));
     let session_started = next_matching_ws_event(&mut ws_a, RUN_TIMEOUT, |json| {
         json.get("event").and_then(serde_json::Value::as_str) == Some("session_started")
-            && json.get("task").and_then(serde_json::Value::as_str)
-                == Some("drain composer target")
+            && json.get("task").and_then(serde_json::Value::as_str) == Some("drain composer target")
     })
     .await
     .unwrap_or_else(|| panic!("held session never started:\n{}", daemon_a.log_tail()));
@@ -7344,15 +7347,19 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
         "the successor serving held_by on the drained row",
         RUN_TIMEOUT,
         || async {
-            let sessions =
-                http_get_json(&client_b, &format!("http://127.0.0.1:{port_b}/api/sessions"))
-                    .await?;
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
             let row = held_row(&sessions, &sid)?;
             let held = row.pointer("/boot/held_by")?;
             (held["boot_id"] == holder_boot.as_str()
                 && held["port"] == port_a
                 && held["same_build"] == true
-                && held["phase"].as_str().is_some_and(|phase| !phase.is_empty())
+                && held["phase"]
+                    .as_str()
+                    .is_some_and(|phase| !phase.is_empty())
                 && row["boot"]["era"] == "current"
                 && row["boot"]["ghost"] == false)
                 .then_some(())
@@ -7474,9 +7481,11 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
         "held_by clearing after the drainer exits",
         RUN_TIMEOUT,
         || async {
-            let sessions =
-                http_get_json(&client_b, &format!("http://127.0.0.1:{port_b}/api/sessions"))
-                    .await?;
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
             let row = held_row(&sessions, &sid)?;
             row.pointer("/boot/held_by").is_none().then_some(())
         },
@@ -7488,9 +7497,10 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
     // drainer's gateway no longer answers (its stale token file may
     // keep the map row — as-found-on-disk semantics — but the port
     // refusing is the truth the honest refusal names).
-    let refused =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port_a}/ws?token={drainer_token}"))
-            .await;
+    let refused = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port_a}/ws?token={drainer_token}"
+    ))
+    .await;
     assert!(
         refused.is_err(),
         "the exited drainer's gateway must not answer the composer lane"
