@@ -659,8 +659,13 @@ pub type PeerId = u64;
 pub enum DisplayEvent {
     /// The capture backend stopped without a clean shutdown.
     CaptureLost { display_id: u32, reason: String },
-    /// Periodic metrics snapshot from `spawn_metrics_logger`.
-    Metrics { snapshot: DisplayMetricsSnapshot },
+    /// Periodic metrics snapshot from `spawn_metrics_logger`. Boxed:
+    /// the snapshot dwarfs the other variants (clippy
+    /// `large_enum_variant`), and every other event would otherwise
+    /// pay its footprint on the channel.
+    Metrics {
+        snapshot: Box<DisplayMetricsSnapshot>,
+    },
     /// The source changed resolution; encoders were recreated.
     Resize {
         display_id: u32,
@@ -2605,7 +2610,9 @@ impl DisplaySession {
                             last_state = Some(state);
                         }
                         if let Some(ref events) = events {
-                            let _ = events.send(DisplayEvent::Metrics { snapshot: m });
+                            let _ = events.send(DisplayEvent::Metrics {
+                                snapshot: Box::new(m),
+                            });
                         }
                     }
                 }
