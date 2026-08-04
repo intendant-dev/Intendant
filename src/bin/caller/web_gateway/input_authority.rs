@@ -1,8 +1,10 @@
 //! Display input authority: the holder state machine, grant/release
 //! application for local, dashboard-control, and federated websockets,
-//! federated authority subscribers, and bootstrap snapshots.
+//! federated authority subscribers, federated authority continuity
+//! across subscription churn, and bootstrap snapshots.
 
 use super::*;
+use std::time::{Duration, Instant};
 
 /// Identity of who currently holds input authority for one display.
 ///
@@ -166,9 +168,16 @@ impl DisplayInputHolder {
 /// at injection. Keeping both in one object prevents fast A -> B -> A handoffs
 /// from resurrecting stale events without coupling independent gateways or
 /// parallel tests.
+///
+/// `federated_continuity` rides in the same object because its records are
+/// minted and consumed under the holder write lock (see
+/// [`apply_lifecycle_release_input_authority_federated`] /
+/// [`apply_resume_input_authority_federated`]) — a successor subscription
+/// must never observe "holder removed but no continuity record yet".
 pub(crate) struct DisplayInputAuthority {
     holders: StdRwLock<HashMap<u32, DisplayInputHolder>>,
     revisions: Mutex<HashMap<u32, Arc<AtomicU64>>>,
+    federated_continuity: FederatedAuthorityContinuity,
 }
 
 impl Default for DisplayInputAuthority {
@@ -176,6 +185,7 @@ impl Default for DisplayInputAuthority {
         Self {
             holders: StdRwLock::new(HashMap::new()),
             revisions: Mutex::new(HashMap::new()),
+            federated_continuity: FederatedAuthorityContinuity::default(),
         }
     }
 }
@@ -221,6 +231,25 @@ impl DisplayInputAuthority {
         new_holder: DisplayInputHolder,
     ) -> (Option<DisplayInputHolder>, u64) {
         let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        self.install_holder_locked(&mut holders, display_id, new_holder)
+    }
+
+    /// Core of [`Self::install_holder`] for callers that already hold the
+    /// holder write lock (the resume path gates and installs under one
+    /// guard so a concurrent user grant cannot interleave).
+    ///
+    /// An identity-changing install also breaks any pending federated
+    /// continuity window for the display: a fresh arbitration (user click,
+    /// dashboard-control grant, another federated tab) supersedes an
+    /// interrupted hold, so a later automatic resume must not yank the
+    /// display back once that newer holder releases. Same-identity
+    /// refreshes leave the window untouched (no arbitration happened).
+    fn install_holder_locked(
+        &self,
+        holders: &mut HashMap<u32, DisplayInputHolder>,
+        display_id: u32,
+        new_holder: DisplayInputHolder,
+    ) -> (Option<DisplayInputHolder>, u64) {
         let same_identity = holders
             .get(&display_id)
             .is_some_and(|current| current.same_identity(&new_holder));
@@ -228,6 +257,7 @@ impl DisplayInputAuthority {
         let revision = if same_identity {
             self.revision(display_id).load(Ordering::SeqCst)
         } else {
+            self.federated_continuity.clear_display(display_id);
             self.bump_revision(display_id)
         };
         (prior, revision)
@@ -255,6 +285,9 @@ impl DisplayInputAuthority {
     pub(crate) fn clear_display(&self, display_id: u32) -> (Option<DisplayInputHolder>, u64) {
         let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
         let removed = holders.remove(&display_id);
+        // The display itself is going away — an interrupted federated hold
+        // cannot survive its display's teardown.
+        self.federated_continuity.clear_display(display_id);
         // Recreating an unclaimed display is still a new authority epoch.
         let revision = self.bump_revision(display_id);
         drop(holders);
@@ -268,6 +301,10 @@ impl DisplayInputAuthority {
     /// lets callers publish an unclaimed state without exposing holder details.
     pub(crate) fn clear_all(&self) -> Vec<(u32, u64)> {
         let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        // Fail-closed recovery also voids interrupted-hold continuity — the
+        // gap this path recovers from means the interruption records can no
+        // longer be trusted to describe a still-standing user grant.
+        self.federated_continuity.clear_all();
         let mut revisions = self
             .revisions
             .lock()
@@ -290,6 +327,166 @@ impl DisplayInputAuthority {
                 (display_id, revision)
             })
             .collect()
+    }
+}
+
+/// How long an interrupted federated hold stays resumable. Covers the
+/// viewer's bounded auto-reconnect ladder (a handful of backoff retries)
+/// with margin, without leaving a stale automatic claim armed for long:
+/// after this window an automatic `resume` re-request is refused and
+/// taking control requires a fresh user click.
+pub(crate) const FEDERATED_AUTHORITY_CONTINUITY_WINDOW: Duration = Duration::from_secs(45);
+
+/// One interrupted federated hold: which federation transport's viewer
+/// held input authority for a display when its per-subscriber lifecycle
+/// (WebRTC peer) was torn down by transport churn rather than by an
+/// explicit user release.
+struct ContinuityWindow {
+    federation_connection_id: String,
+    /// Session id of the subscription that held the grant when it was
+    /// interrupted. Diagnostics only — the successor subscription has a
+    /// fresh session id, so matching is by `federation_connection_id`.
+    predecessor_session_id: String,
+    deadline: Instant,
+}
+
+/// Continuity records for interrupted federated input-authority holds.
+///
+/// ## Why (2026-08-02, federated ladder fallout)
+///
+/// The adaptive federated encoder ladder (`respec_federated`) evicts the
+/// `(H264, fed)` encoder slot on every rung change. The viewer recovers
+/// media by reconnecting — a fresh `PeerDisplayConnection`, hence a fresh
+/// `session_id` — but the old subscription's teardown released the user's
+/// input-authority grant, and nothing re-established it: the user saw
+/// healthy video with dead input. This registry preserves the *standing
+/// user grant* across that churn.
+///
+/// ## Contract
+///
+/// - A record is minted only when a **held** federated grant is released
+///   by lifecycle churn (peer teardown / transport close), atomically with
+///   the holder removal — never for a subscriber that wasn't holding, and
+///   never for an explicit user release.
+/// - A `resume` re-request (viewer-automatic, sent only by a pane whose
+///   user held control and never released) is honored only inside the
+///   window, only for the same federation transport, and only while the
+///   display has no live holder — an automatic frame can never displace a
+///   holder or win an arbitration a user click did not already win.
+/// - Any identity-changing grant (a real arbitration) breaks the chain,
+///   as do display teardown, federation-WS close, and fail-closed
+///   recovery.
+///
+/// Time is injected (`now: Instant`) so the state machine is testable
+/// without sleeping; production callers pass `Instant::now()`.
+#[derive(Default)]
+pub(crate) struct FederatedAuthorityContinuity {
+    windows: Mutex<HashMap<u32, ContinuityWindow>>,
+}
+
+impl FederatedAuthorityContinuity {
+    /// Record an interrupted hold for `display_id`. Overwrites any prior
+    /// record (a chained interruption — e.g. two ladder steps inside one
+    /// window — restarts the clock from the newest interruption).
+    fn note_interrupted_hold(
+        &self,
+        display_id: u32,
+        federation_connection_id: &str,
+        predecessor_session_id: &str,
+        now: Instant,
+    ) {
+        self.windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                display_id,
+                ContinuityWindow {
+                    federation_connection_id: federation_connection_id.to_string(),
+                    predecessor_session_id: predecessor_session_id.to_string(),
+                    deadline: now + FEDERATED_AUTHORITY_CONTINUITY_WINDOW,
+                },
+            );
+    }
+
+    /// Decide whether a `resume` re-request from
+    /// `(federation_connection_id, requesting_session_id)` may re-grant
+    /// `display_id`, consuming the record on success. Returns the
+    /// predecessor session id when allowed, `None` when refused.
+    ///
+    /// Refusals:
+    /// - no record, or a record owned by a different federation transport
+    ///   (left in place — it isn't this requester's to spend);
+    /// - record expired (dropped);
+    /// - a live holder other than the requester itself (record dropped:
+    ///   a real arbitration superseded the interrupted hold — see
+    ///   [`Self::note_interrupted_hold`]'s minting contract for why the
+    ///   holder can never be the predecessor: the record only exists
+    ///   after the predecessor's holder entry was removed).
+    fn try_resume(
+        &self,
+        display_id: u32,
+        federation_connection_id: &str,
+        requesting_session_id: &str,
+        current_holder: Option<&DisplayInputHolder>,
+        now: Instant,
+    ) -> Option<String> {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let window = windows.get(&display_id)?;
+        if window.federation_connection_id != federation_connection_id {
+            return None;
+        }
+        if now > window.deadline {
+            windows.remove(&display_id);
+            return None;
+        }
+        match current_holder {
+            None => {}
+            Some(holder)
+                if holder.matches_federated(federation_connection_id, requesting_session_id) => {}
+            Some(_) => {
+                windows.remove(&display_id);
+                return None;
+            }
+        }
+        windows
+            .remove(&display_id)
+            .map(|window| window.predecessor_session_id)
+    }
+
+    fn clear_display(&self, display_id: u32) {
+        self.windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&display_id);
+    }
+
+    /// Drop every record owned by a dropping federation transport. A new
+    /// transport gets a new connection id, so these records could never
+    /// match again — this is hygiene, and it also voids continuity when
+    /// the identity anchor (the federation WS) itself is gone.
+    fn clear_connection(&self, federation_connection_id: &str) {
+        self.windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|_, window| window.federation_connection_id != federation_connection_id);
+    }
+
+    fn clear_all(&self) {
+        self.windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn window_count(&self) -> usize {
+        self.windows
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
     }
 }
 
@@ -583,6 +780,10 @@ pub(crate) fn apply_release_input_authority_federated(
         match map.get(&display_id) {
             Some(entry) if entry.matches_federated(federation_connection_id, session_id) => {
                 map.remove(&display_id);
+                // An explicit user release ends the standing grant — void
+                // any continuity record so an automatic resume can't
+                // resurrect what the user just gave up.
+                authority.federated_continuity.clear_display(display_id);
                 Some(authority.bump_revision(display_id))
             }
             _ => None,
@@ -596,6 +797,120 @@ pub(crate) fn apply_release_input_authority_federated(
         });
     }
     removed_revision.is_some()
+}
+
+/// Federated release for *lifecycle churn* — WebRTC peer teardown
+/// (encoder-slot rebuild reconnects, `WebRtcSignal::Close` from the
+/// viewer's retry path, ICE death) rather than an explicit user release.
+///
+/// Identical to [`apply_release_input_authority_federated`] — the holder
+/// is removed, the revision advances, and the `None`-holder broadcast
+/// still drives the input-queue reset whose safety releases (synthetic
+/// keyups) cover the old subscription — except that a matched removal
+/// also mints a [`FederatedAuthorityContinuity`] record *under the same
+/// holder write lock*: the user's grant was interrupted, not surrendered,
+/// so the same viewer's successor subscription may resume it inside the
+/// continuity window via [`apply_resume_input_authority_federated`].
+/// Minting atomically with the removal means a successor can never
+/// observe "holder gone but not yet resumable".
+///
+/// A non-matching release stays a strict no-op — a subscriber that never
+/// held the grant mints nothing (never auto-grant a never-granted
+/// subscriber).
+pub(crate) fn apply_lifecycle_release_input_authority_federated(
+    display_id: u32,
+    federation_connection_id: &str,
+    session_id: &str,
+    authority: &Arc<DisplayInputAuthority>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+    now: Instant,
+) -> bool {
+    let removed_revision = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        match map.get(&display_id) {
+            Some(entry) if entry.matches_federated(federation_connection_id, session_id) => {
+                map.remove(&display_id);
+                authority.federated_continuity.note_interrupted_hold(
+                    display_id,
+                    federation_connection_id,
+                    session_id,
+                    now,
+                );
+                Some(authority.bump_revision(display_id))
+            }
+            _ => None,
+        }
+    };
+    if let Some(revision) = removed_revision {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id,
+            holder: None,
+            revision,
+        });
+    }
+    removed_revision.is_some()
+}
+
+/// Apply an automatic federated continuity re-request (`resume: true` on
+/// the authority channel). Gate and grant happen under one holder write
+/// lock, so a concurrent user grant cannot interleave between the
+/// continuity check and the install.
+///
+/// Grants iff [`FederatedAuthorityContinuity::try_resume`] allows it:
+/// same federation transport as the interrupted hold, inside the window,
+/// and no live holder other than the requester itself. On success the
+/// successor identity is installed exactly like a user grant — the fresh
+/// `session_id` is an identity change, so the revision advances and the
+/// input queue starts a clean epoch. Returns `false` (a silent no-op —
+/// the requester's chip already shows the truthful personalized state,
+/// and the viewer-side pending timeout clears its optimistic flag)
+/// when refused.
+///
+/// The prior-holder direct revoke that
+/// [`apply_grant_input_authority_federated`] performs has no counterpart
+/// here by construction: a resume never displaces a live holder, so the
+/// prior entry is either absent or the requester itself.
+pub(crate) fn apply_resume_input_authority_federated(
+    display_id: u32,
+    federation_connection_id: String,
+    session_id: String,
+    authority: &Arc<DisplayInputAuthority>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+    now: Instant,
+) -> bool {
+    let installed = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        let predecessor = authority.federated_continuity.try_resume(
+            display_id,
+            &federation_connection_id,
+            &session_id,
+            map.get(&display_id),
+            now,
+        );
+        predecessor.map(|predecessor_session_id| {
+            let new_holder = DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: federation_connection_id.clone(),
+                session_id: session_id.clone(),
+            };
+            let broadcast_holder = new_holder.clone();
+            let (_prior, revision) =
+                authority.install_holder_locked(&mut map, display_id, new_holder);
+            (broadcast_holder, revision, predecessor_session_id)
+        })
+    };
+    let Some((broadcast_holder, revision, predecessor_session_id)) = installed else {
+        return false;
+    };
+    eprintln!(
+        "[display/input-authority] resumed interrupted federated hold of display {display_id} \
+         (predecessor session {predecessor_session_id} -> successor session {session_id})"
+    );
+    let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+        display_id,
+        holder: Some(broadcast_holder),
+        revision,
+    });
+    true
 }
 
 pub(crate) fn dashboard_control_authority_state_frame(
@@ -756,6 +1071,13 @@ pub(crate) fn apply_federated_ws_close_input_authority(
 ) -> Vec<u32> {
     let released: Vec<(u32, u64)> = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        // The federation transport is the identity anchor for continuity
+        // records; with it gone they could never match again (a new WS
+        // gets a new connection id). Void them rather than letting them
+        // linger to expiry.
+        authority
+            .federated_continuity
+            .clear_connection(federation_connection_id);
         let mut out = Vec::new();
         map.retain(|did, entry| match entry {
             DisplayInputHolder::FederatedWebRtc {
@@ -888,14 +1210,36 @@ pub(crate) fn build_federated_authority_handler(
     Arc::new(move |msg| match msg {
         AuthorityChannelMessage::Request {
             display_id: req_did,
+            resume,
         } if req_did == display_id && session_authorized() => {
-            apply_grant_input_authority_federated(
-                display_id,
-                federation_connection_id.clone(),
-                session_id.clone(),
-                &authority,
-                &authority_change_tx,
-            );
+            if resume {
+                // Automatic continuity re-request: the viewer's pane held
+                // the grant when its subscription was torn down by
+                // transport churn and is re-asserting the user's
+                // still-standing intent from the successor subscription.
+                // Strictly narrower than a plain request — only honored
+                // inside the continuity window minted by the lifecycle
+                // release, and never displacing a live holder. Refusal is
+                // a silent no-op: the personalized authority state the
+                // subscriber already received is the truth, and the
+                // viewer's pending timeout clears its optimistic flag.
+                apply_resume_input_authority_federated(
+                    display_id,
+                    federation_connection_id.clone(),
+                    session_id.clone(),
+                    &authority,
+                    &authority_change_tx,
+                    Instant::now(),
+                );
+            } else {
+                apply_grant_input_authority_federated(
+                    display_id,
+                    federation_connection_id.clone(),
+                    session_id.clone(),
+                    &authority,
+                    &authority_change_tx,
+                );
+            }
         }
         AuthorityChannelMessage::Request { .. } => {
             // Read-only, revoked, or disconnected peer: ignore authority requests.
@@ -1053,12 +1397,19 @@ pub(crate) fn register_federated_authority_subscriber(
         };
         if let Some(entry) = removed {
             entry.shutdown.cancel();
-            apply_release_input_authority_federated(
+            // Lifecycle churn, not a user release: a held grant leaves a
+            // continuity window behind so the same viewer's successor
+            // subscription (fresh session id after the reconnect) can
+            // resume the user's still-standing grant. The `None`-holder
+            // broadcast below still resets the input queue, so safety
+            // releases for anything the old subscription held run first.
+            apply_lifecycle_release_input_authority_federated(
                 display_id,
                 &federation_connection_id,
                 &session_id,
                 &authority,
                 &authority_change_tx,
+                Instant::now(),
             );
         }
     });
@@ -2061,6 +2412,577 @@ mod tests {
         );
     }
 
+    // ===================================================================
+    // Federated authority continuity across subscription churn
+    // (the encoder-ladder eviction fallout: held grants must survive
+    // the viewer's reconnect-with-fresh-session-id recovery).
+    // ===================================================================
+
+    /// The incident path, end to end at the state-machine level: a held
+    /// federated grant is torn down by lifecycle churn (encoder-slot
+    /// rebuild → viewer reconnect → Close/peer teardown), the successor
+    /// subscription — same federation transport, fresh session id — sends
+    /// an automatic resume, and the peer re-grants the user's standing
+    /// grant with a fresh input epoch.
+    #[test]
+    fn lifecycle_release_mints_continuity_and_resume_regrants_successor() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+
+        let released = apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        assert!(released, "the held grant must release (safety epoch)");
+        let change = auth_rx.try_recv().expect("release change emitted");
+        assert!(
+            change.holder.is_none(),
+            "lifecycle release still broadcasts the None holder that drives \
+             the input-queue reset (safety keyups for the old subscription)"
+        );
+        let revision_after_release = map.revision(7).load(Ordering::SeqCst);
+
+        let resumed = apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(5),
+        );
+        assert!(resumed, "successor resume inside the window must re-grant");
+        let change = auth_rx.try_recv().expect("resume change emitted");
+        assert!(
+            change
+                .holder
+                .as_ref()
+                .map(|h| h.matches_federated("fed-conn-1", "sess-B"))
+                .unwrap_or(false),
+            "resume must install the successor identity"
+        );
+        assert!(
+            serial_like_advanced(revision_after_release, change.revision),
+            "the successor is a new identity — the input epoch must advance"
+        );
+        assert!(
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .unwrap()
+                .matches_federated("fed-conn-1", "sess-B"),
+            "registry must hold the successor"
+        );
+        assert_eq!(
+            map.federated_continuity.window_count(),
+            0,
+            "a successful resume consumes the record"
+        );
+
+        // The record is spent: a second automatic resume (duplicate frame,
+        // very late replay) is refused without touching the live holder.
+        let resumed_again = apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-C".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(6),
+        );
+        assert!(!resumed_again, "a consumed record must not re-grant");
+        assert!(
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .unwrap()
+                .matches_federated("fed-conn-1", "sess-B"),
+            "refused resume must not disturb the live holder"
+        );
+    }
+
+    /// Wrapping-tolerant "revision advanced" helper for the tests above:
+    /// the revision counter is practically monotonic, so a plain
+    /// less-than is fine except at the wrap seam the queue's serial
+    /// comparison already covers.
+    fn serial_like_advanced(before: u64, after: u64) -> bool {
+        after.wrapping_sub(before) != 0 && after.wrapping_sub(before) < (1_u64 << 63)
+    }
+
+    /// A subscriber that never held the grant mints nothing on lifecycle
+    /// teardown — its successor cannot self-grant via resume. This is the
+    /// "never auto-grant a never-granted subscriber" constraint.
+    #[test]
+    fn lifecycle_release_of_non_holder_mints_nothing() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-2", "sess-HOLDER");
+        let t0 = Instant::now();
+
+        let released = apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        assert!(!released, "non-holder lifecycle release is a no-op");
+        assert!(auth_rx.try_recv().is_err(), "no change for the no-op");
+        assert_eq!(
+            map.federated_continuity.window_count(),
+            0,
+            "no continuity record for a subscriber that never held"
+        );
+        assert!(
+            !apply_resume_input_authority_federated(
+                7,
+                "fed-conn-1".to_string(),
+                "sess-B".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(1),
+            ),
+            "its successor must not be able to resume"
+        );
+        assert!(
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .unwrap()
+                .matches_federated("fed-conn-2", "sess-HOLDER"),
+            "the real holder is untouched"
+        );
+    }
+
+    /// Resume with no interrupted hold on record at all is refused — the
+    /// baseline deny.
+    #[test]
+    fn resume_refused_without_interrupted_hold() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        assert!(!apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            Instant::now(),
+        ));
+        assert!(auth_rx.try_recv().is_err(), "refusal emits nothing");
+        assert!(
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .is_none(),
+            "refusal must not install anything"
+        );
+    }
+
+    /// The continuity window is bounded: past the deadline the record is
+    /// purged and the resume is refused — a stale automatic claim cannot
+    /// re-grab a display minutes later.
+    #[test]
+    fn resume_refused_after_window_expiry() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+
+        let too_late = t0 + FEDERATED_AUTHORITY_CONTINUITY_WINDOW + Duration::from_secs(1);
+        assert!(!apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            too_late,
+        ));
+        assert_eq!(
+            map.federated_continuity.window_count(),
+            0,
+            "an expired record is purged on the refusing lookup"
+        );
+
+        // Exactly at the deadline still resumes (inclusive window).
+        seed_federated_holder(&map, 8, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            8,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        assert!(apply_resume_input_authority_federated(
+            8,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            t0 + FEDERATED_AUTHORITY_CONTINUITY_WINDOW,
+        ));
+    }
+
+    /// Continuity is anchored to the federation transport identity: a
+    /// different connection cannot spend the record — and the refusal
+    /// leaves the record intact for its rightful owner.
+    #[test]
+    fn resume_refused_for_different_federation_connection() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+
+        assert!(!apply_resume_input_authority_federated(
+            7,
+            "fed-conn-2".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(1),
+        ));
+        assert!(
+            apply_resume_input_authority_federated(
+                7,
+                "fed-conn-1".to_string(),
+                "sess-B".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(2),
+            ),
+            "the wrong-connection refusal must not destroy the rightful owner's record"
+        );
+    }
+
+    /// An automatic resume never displaces a live holder — and finding one
+    /// breaks the chain for good: once the interloper releases, the old
+    /// record must not resurrect (that arbitration superseded it).
+    #[test]
+    fn resume_never_displaces_a_live_holder_and_breaks_the_chain() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+
+        // A local user claims the display during the reconnect gap.
+        let (local_tx, _local_rx) = mpsc::unbounded_channel::<String>();
+        apply_grant_input_authority(7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx);
+
+        assert!(
+            !apply_resume_input_authority_federated(
+                7,
+                "fed-conn-1".to_string(),
+                "sess-B".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(1),
+            ),
+            "resume must not steal from a live holder"
+        );
+        assert!(
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .unwrap()
+                .matches_local_ws("conn-LOCAL"),
+            "the live holder is untouched"
+        );
+
+        apply_release_input_authority(7, "conn-LOCAL", &map, &auth_tx);
+        assert!(
+            !apply_resume_input_authority_federated(
+                7,
+                "fed-conn-1".to_string(),
+                "sess-B".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(2),
+            ),
+            "the superseded record must not resurrect after the newer holder releases"
+        );
+    }
+
+    /// The idempotent self case: the requester already holds the display
+    /// (grant raced ahead of a duplicate resume). The record is consumed,
+    /// the holder stays, and — same identity — the input epoch is
+    /// preserved so an in-flight drag isn't reset.
+    #[test]
+    fn resume_is_idempotent_for_current_holder_and_preserves_revision() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        map.federated_continuity
+            .note_interrupted_hold(7, "fed-conn-1", "sess-A", Instant::now());
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-B");
+        let revision_before = map.revision(7).load(Ordering::SeqCst);
+
+        assert!(apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            Instant::now(),
+        ));
+        assert_eq!(
+            map.revision(7).load(Ordering::SeqCst),
+            revision_before,
+            "same-identity resume must not start a new input epoch"
+        );
+        assert_eq!(map.federated_continuity.window_count(), 0);
+    }
+
+    /// An explicit user release is a surrendered grant, not an interrupted
+    /// one: it mints nothing, and it voids any pending record.
+    #[test]
+    fn explicit_release_voids_continuity() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+
+        // Surrender: no record.
+        assert!(apply_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx
+        ));
+        assert_eq!(map.federated_continuity.window_count(), 0);
+        assert!(!apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(1),
+        ));
+
+        // Defensive: a stale record (interruption) followed by the user
+        // re-claiming and then explicitly releasing must end fully
+        // unclaimed and non-resumable.
+        seed_federated_holder(&map, 8, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            8,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        apply_grant_input_authority_federated(
+            8,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+        );
+        apply_release_input_authority_federated(8, "fed-conn-1", "sess-B", &map, &auth_tx);
+        assert!(!apply_resume_input_authority_federated(
+            8,
+            "fed-conn-1".to_string(),
+            "sess-C".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(2),
+        ));
+    }
+
+    /// Any identity-changing grant — a real arbitration — breaks a
+    /// pending continuity chain at install time, before anyone releases.
+    #[test]
+    fn fresh_grant_breaks_the_continuity_chain() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        let t0 = Instant::now();
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        assert_eq!(map.federated_continuity.window_count(), 1);
+
+        // A user click (plain request) from another tab of the same
+        // primary claims the display.
+        apply_grant_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-OTHER".to_string(),
+            &map,
+            &auth_tx,
+        );
+        assert_eq!(
+            map.federated_continuity.window_count(),
+            0,
+            "an identity-changing grant must void the pending record"
+        );
+    }
+
+    /// A chained interruption (the ladder stepping twice) overwrites the
+    /// record and restarts the clock from the newest interruption of an
+    /// actually-held grant.
+    #[test]
+    fn chained_interruption_restarts_the_window() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let t0 = Instant::now();
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        assert!(apply_resume_input_authority_federated(
+            7,
+            "fed-conn-1".to_string(),
+            "sess-B".to_string(),
+            &map,
+            &auth_tx,
+            t0 + Duration::from_secs(30),
+        ));
+        // Second churn interrupts the resumed hold near the first
+        // window's edge; the successor of the successor still resumes.
+        let t1 = t0 + Duration::from_secs(40);
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-B",
+            &map,
+            &auth_tx,
+            t1,
+        );
+        assert!(
+            apply_resume_input_authority_federated(
+                7,
+                "fed-conn-1".to_string(),
+                "sess-C".to_string(),
+                &map,
+                &auth_tx,
+                t1 + FEDERATED_AUTHORITY_CONTINUITY_WINDOW - Duration::from_secs(1),
+            ),
+            "the window must run from the second interruption"
+        );
+    }
+
+    /// Display teardown and fail-closed recovery both void continuity.
+    #[test]
+    fn display_clear_and_clear_all_void_continuity() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let t0 = Instant::now();
+
+        seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            7,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        map.clear_display(7);
+        assert_eq!(map.federated_continuity.window_count(), 0);
+
+        seed_federated_holder(&map, 8, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            8,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        map.clear_all();
+        assert_eq!(map.federated_continuity.window_count(), 0);
+    }
+
+    /// Federated WS-close voids every record owned by the dropping
+    /// transport and leaves other transports' records spendable.
+    #[test]
+    fn ws_close_voids_continuity_for_that_connection_only() {
+        let map = empty_authority_map();
+        let (auth_tx, _auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(16);
+        let t0 = Instant::now();
+        seed_federated_holder(&map, 1, "fed-conn-1", "sess-A");
+        apply_lifecycle_release_input_authority_federated(
+            1,
+            "fed-conn-1",
+            "sess-A",
+            &map,
+            &auth_tx,
+            t0,
+        );
+        seed_federated_holder(&map, 2, "fed-conn-2", "sess-C");
+        apply_lifecycle_release_input_authority_federated(
+            2,
+            "fed-conn-2",
+            "sess-C",
+            &map,
+            &auth_tx,
+            t0,
+        );
+
+        apply_federated_ws_close_input_authority("fed-conn-1", &map, &auth_tx);
+        assert!(
+            !apply_resume_input_authority_federated(
+                1,
+                "fed-conn-1".to_string(),
+                "sess-B".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(1),
+            ),
+            "records anchored to the dropped transport are void"
+        );
+        assert!(
+            apply_resume_input_authority_federated(
+                2,
+                "fed-conn-2".to_string(),
+                "sess-D".to_string(),
+                &map,
+                &auth_tx,
+                t0 + Duration::from_secs(1),
+            ),
+            "other transports' records survive"
+        );
+    }
+
     /// Federated WS-close releases ALL `FederatedWebRtc` entries with
     /// matching `federation_connection_id`, regardless of `session_id`
     /// (the WS drop kills every session multiplexed over that primary's
@@ -2444,7 +3366,10 @@ mod tests {
             Arc::new(|| true),
         );
 
-        handler(AuthorityChannelMessage::Request { display_id: 0 });
+        handler(AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: false,
+        });
 
         let guard = map.read().unwrap_or_else(|e| e.into_inner());
         match guard.get(&0) {
@@ -2457,6 +3382,121 @@ mod tests {
             }
             other => panic!("expected FederatedWebRtc holder, got {other:?}"),
         }
+    }
+
+    /// Handler-level continuity round trip: after a lifecycle release of
+    /// a held grant from the same federation transport, a `resume: true`
+    /// request from the successor session re-grants; without any
+    /// interrupted hold on record the identical frame does nothing.
+    #[test]
+    fn build_federated_authority_handler_resume_regrants_within_window() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 0, "fed-1", "sess-A");
+        assert!(apply_lifecycle_release_input_authority_federated(
+            0,
+            "fed-1",
+            "sess-A",
+            &map,
+            &change_tx,
+            Instant::now(),
+        ));
+
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-B".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::new(|| true),
+        );
+        handler(AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: true,
+        });
+
+        let guard = map.read().unwrap_or_else(|e| e.into_inner());
+        match guard.get(&0) {
+            Some(DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id,
+                session_id,
+            }) => {
+                assert_eq!(federation_connection_id, "fed-1");
+                assert_eq!(session_id, "sess-B");
+            }
+            other => panic!("expected resumed FederatedWebRtc holder, got {other:?}"),
+        }
+    }
+
+    /// A `resume: true` frame from a subscriber whose viewer never held
+    /// the grant is a strict no-op — unlike a plain request, it cannot
+    /// claim an unclaimed display. This is what keeps the automatic
+    /// re-request narrower than a user click.
+    #[test]
+    fn build_federated_authority_handler_resume_refused_when_never_held() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::new(|| true),
+        );
+
+        handler(AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: true,
+        });
+
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a never-granted subscriber's resume must not claim the display"
+        );
+    }
+
+    /// The live session predicate gates resume exactly like a plain
+    /// request: a revoked/disconnected peer cannot resume even inside
+    /// the window.
+    #[test]
+    fn build_federated_authority_handler_resume_rechecks_live_session_authority() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        use std::sync::atomic::AtomicBool;
+
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        seed_federated_holder(&map, 0, "fed-1", "sess-A");
+        assert!(apply_lifecycle_release_input_authority_federated(
+            0,
+            "fed-1",
+            "sess-A",
+            &map,
+            &change_tx,
+            Instant::now(),
+        ));
+
+        let live = Arc::new(AtomicBool::new(false));
+        let live_for_handler = Arc::clone(&live);
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-B".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::new(move || live_for_handler.load(Ordering::Acquire)),
+        );
+        handler(AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: true,
+        });
+
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "a revoked session must not resume federated input authority"
+        );
     }
 
     /// `Release` against a holder of this same identity removes the
@@ -2552,7 +3592,10 @@ mod tests {
             Arc::new(|| true),
         );
 
-        handler(AuthorityChannelMessage::Request { display_id: 99 });
+        handler(AuthorityChannelMessage::Request {
+            display_id: 99,
+            resume: false,
+        });
         handler(AuthorityChannelMessage::Release { display_id: 99 });
 
         assert!(
@@ -2580,7 +3623,10 @@ mod tests {
         );
 
         live.store(false, Ordering::Release);
-        handler(AuthorityChannelMessage::Request { display_id: 0 });
+        handler(AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: false,
+        });
 
         assert!(
             map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),

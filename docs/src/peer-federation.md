@@ -828,6 +828,17 @@ is dropped silently at the peer regardless of what the browser believes; the
 browser-side check is UX only. The full protocol is in
 [`docs/design-federated-input-authority.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-federated-input-authority.md).
 
+A held federated grant also survives *subscription churn*: the adaptive federated
+encoder ladder rebuilds the fed encoder slot on rung changes, and the viewer
+recovers by reconnecting with a fresh session id. When a **held** grant is torn
+down by that kind of lifecycle churn (never by an explicit release, and never for
+a subscriber that wasn't holding), the peer mints a short continuity window
+(~45 s), and the successor pane automatically re-requests with a `resume` marker.
+A resume is strictly narrower than a user click — honored only inside the window,
+only for the same federation transport, and never displacing a live holder — so
+the user's "Take Control" outlives the rebuild without an automatic frame ever
+winning an arbitration a click didn't already win.
+
 ## Dashboard Access and TLS
 
 Two independent mechanisms expose the dashboard securely; they can be used

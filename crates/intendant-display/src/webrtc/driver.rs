@@ -1871,8 +1871,15 @@ pub(crate) fn parse_clipboard_set(text: &str) -> Option<ClipboardContent> {
 ///
 /// ```text
 /// { "t": "display_input_authority_request", "display_id": 0 }
+/// { "t": "display_input_authority_request", "display_id": 0, "resume": true }
 /// { "t": "display_input_authority_release", "display_id": 0 }
 /// ```
+///
+/// `resume` is optional and defaults to `false` (a frame from a
+/// pre-continuity browser is a plain user-intent request). Any
+/// non-boolean `resume` value also reads as `false` — the flag only
+/// ever narrows what the policy layer will grant, so collapsing a
+/// malformed marker to a plain request is the conservative parse.
 ///
 /// Returns `None` for unrecognized `t` discriminators, missing or
 /// non-numeric `display_id`, or `display_id` values that don't fit
@@ -1890,7 +1897,13 @@ pub(crate) fn parse_authority_channel_message(text: &str) -> Option<AuthorityCha
         .try_into()
         .ok()?;
     match t {
-        "display_input_authority_request" => Some(AuthorityChannelMessage::Request { display_id }),
+        "display_input_authority_request" => Some(AuthorityChannelMessage::Request {
+            display_id,
+            resume: parsed
+                .get("resume")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }),
         "display_input_authority_release" => Some(AuthorityChannelMessage::Release { display_id }),
         _ => None,
     }
@@ -2959,13 +2972,62 @@ mod tests {
             r#"{ "t": "display_input_authority_request", "display_id": 7 }"#,
         )
         .expect("request frame must parse");
-        assert_eq!(req, AuthorityChannelMessage::Request { display_id: 7 });
+        assert_eq!(
+            req,
+            AuthorityChannelMessage::Request {
+                display_id: 7,
+                resume: false
+            }
+        );
 
         let rel = parse_authority_channel_message(
             r#"{ "t": "display_input_authority_release", "display_id": 0 }"#,
         )
         .expect("release frame must parse");
         assert_eq!(rel, AuthorityChannelMessage::Release { display_id: 0 });
+    }
+
+    /// Authority-continuity: the optional `resume` marker parses through
+    /// to the policy layer, and non-boolean values conservatively read
+    /// as a plain (non-resume) request rather than dropping the frame.
+    #[test]
+    fn parse_authority_channel_message_reads_resume_marker() {
+        let resumed = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": 3, "resume": true }"#,
+        )
+        .expect("resume frame must parse");
+        assert_eq!(
+            resumed,
+            AuthorityChannelMessage::Request {
+                display_id: 3,
+                resume: true
+            }
+        );
+
+        let explicit_false = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": 3, "resume": false }"#,
+        )
+        .expect("resume=false frame must parse");
+        assert_eq!(
+            explicit_false,
+            AuthorityChannelMessage::Request {
+                display_id: 3,
+                resume: false
+            }
+        );
+
+        let malformed_marker = parse_authority_channel_message(
+            r#"{ "t": "display_input_authority_request", "display_id": 3, "resume": "yes" }"#,
+        )
+        .expect("a malformed resume marker must not drop the frame");
+        assert_eq!(
+            malformed_marker,
+            AuthorityChannelMessage::Request {
+                display_id: 3,
+                resume: false
+            },
+            "non-boolean resume must collapse to a plain request (narrowing-only flag)"
+        );
     }
 
     /// F-1.3b2: extra/unknown fields on a well-formed frame are
@@ -2986,7 +3048,13 @@ mod tests {
                  "actor": { "kind": "operator" } }"#,
         )
         .expect("extra fields must not block parse");
-        assert_eq!(msg, AuthorityChannelMessage::Request { display_id: 0 });
+        assert_eq!(
+            msg,
+            AuthorityChannelMessage::Request {
+                display_id: 0,
+                resume: false
+            }
+        );
     }
 
     /// F-1.3b2: malformed frames silently drop. Strict by design —
