@@ -29,7 +29,7 @@ use screencapturekit::cg::CGRect as ScRect;
 use screencapturekit::cm::{CMTime, SCFrameStatus};
 use screencapturekit::cv::CVPixelBufferLockFlags;
 use screencapturekit::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use tokio::sync::{mpsc, Mutex};
 
@@ -116,6 +116,13 @@ pub struct MacOSBackend {
     height: Arc<AtomicU32>,
     input_geometry: Arc<RwLock<InputGeometry>>,
     target: CaptureTarget,
+    /// Observability slot for pre-bridge frame drops (see
+    /// [`super::DisplayBackend::install_capture_frame_drop_counter`]).
+    /// The SCK output handler clones the installed counter at
+    /// `start_capture` time and bumps it whenever `try_send` fails
+    /// with `Full` — the silent drop point that otherwise makes
+    /// "SCK delivered but the consumer was starved" invisible.
+    drop_counter: Arc<StdMutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl Default for MacOSBackend {
@@ -138,6 +145,7 @@ impl MacOSBackend {
             height: Arc::new(AtomicU32::new(0)),
             input_geometry: Arc::new(RwLock::new(InputGeometry::from_frame_size(0, 0))),
             target,
+            drop_counter: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -743,6 +751,14 @@ impl DisplayBackend for MacOSBackend {
 
         let handler_slot = Arc::clone(&frame_slot);
         let handler_shutdown = Arc::clone(&shutdown_flag);
+        // Snapshot the installed drop counter for this session's handler.
+        // Cloned out here (not read per callback) so the handler never
+        // takes the backend-level lock on the SCK delivery queue.
+        let handler_drop_counter = self
+            .drop_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // Share width/height atomics with the output handler so it can
         // update them when ScreenCaptureKit delivers frames at a different
         // resolution (e.g. Retina scale change, resolution switch).
@@ -831,13 +847,19 @@ impl DisplayBackend for MacOSBackend {
                 // the slot under the same lock, so once it returns no
                 // callback can slip another frame into the channel.
                 // Backpressure: `try_send` drops the frame if the channel
-                // is full.
+                // is full — counted (Full only; a Closed send during
+                // teardown is not a drop under pressure) so metrics can
+                // tell a starved consumer from a slow source.
                 if let Some(tx) = handler_slot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                 {
-                    let _ = tx.try_send(frame);
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
+                        if let Some(counter) = &handler_drop_counter {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             },
             SCStreamOutputType::Screen,
@@ -1000,6 +1022,11 @@ impl DisplayBackend for MacOSBackend {
             }
         }
         Ok(())
+    }
+
+    fn install_capture_frame_drop_counter(&self, counter: Arc<AtomicU64>) -> bool {
+        *self.drop_counter.lock().unwrap_or_else(|e| e.into_inner()) = Some(counter);
+        true
     }
 
     fn resolution(&self) -> (u32, u32) {

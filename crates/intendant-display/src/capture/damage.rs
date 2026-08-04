@@ -8,11 +8,16 @@
 //! ## Capability tiers
 //!
 //! Damage backends advertise [`DamageCapability`] so the consumer can
-//! decide whether to trust per-tick dirty fractions or assume worst-case:
+//! decide how to obtain trustworthy dirty regions:
 //!
 //! - [`DamageCapability::OsLevel`] — backend uses real OS damage events
 //!   (X11 XDamage, macOS dirty rects when ScreenCaptureKit exposes them,
-//!   Wayland damage metadata). Dirty fraction is meaningful.
+//!   Wayland damage metadata). These rects locate change but
+//!   **over-report** (bounding boxes merge distant damage; compositing
+//!   WMs fire root-window damage on *repaints* of identical pixels), so
+//!   consumers pixel-verify them via
+//!   [`super::frame_diff::FrameDiffDamageTracker::verify_damage`]
+//!   before treating them as dirt.
 //! - [`DamageCapability::FrameDiff`] — backend computes damage by hashing
 //!   tiles and diffing against last-frame hashes. CPU-bound but works
 //!   anywhere. Dirty fraction is approximate (false negatives possible
@@ -66,8 +71,9 @@ impl fmt::Display for Rect {
 /// Capability tier of a damage backend. See module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DamageCapability {
-    /// OS reports damage events directly (X11 XDamage, etc.). Dirty
-    /// fraction reported per poll is trustworthy.
+    /// OS reports damage events directly (X11 XDamage, etc.). Rects
+    /// locate change but over-report — consumers pixel-verify them
+    /// before deriving dirty tiles or fractions (see module docs).
     #[allow(dead_code)]
     OsLevel,
     /// Damage computed from frame-diff (tile hashing). Approximate;

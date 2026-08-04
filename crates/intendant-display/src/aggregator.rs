@@ -825,6 +825,53 @@ pub fn compose_effective_wanted(
     effective
 }
 
+/// Render one policy vote set for the decision log line: members are
+/// listed in `current_rids` (spec) order for deterministic output, and
+/// members outside the current always-on bank (e.g. the federated RID
+/// in a demand set) are summarized as an off-bank count rather than
+/// silently dropped — the line must never under-report demand.
+fn fmt_rid_set(set: &HashSet<SimulcastRid>, current_rids: &[SimulcastRid]) -> String {
+    let mut parts: Vec<String> = current_rids
+        .iter()
+        .filter(|rid| set.contains(*rid))
+        .map(|rid| rid.as_str().to_string())
+        .collect();
+    let off_bank = set.iter().filter(|rid| !current_rids.contains(rid)).count();
+    if off_bank > 0 {
+        parts.push(format!("+{off_bank} off-bank"));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+/// One-line explanation of a layer-policy tick that produced actions:
+/// the composed effective wanted set plus every input that shaped it
+/// (presence, the TWCC and RR policy votes, single-RID pins, and the
+/// demand bound). Logged by the coordinator alongside its
+/// `PauseLayer` / `ResumeLayer` emissions so the log answers *why* a
+/// layer paused, not just that it did — the startup-flake class of
+/// report ("stream degraded after boot") needs the vote vector to rule
+/// layer policy in or out without a reproduction.
+#[allow(clippy::too_many_arguments)] // mirror of the coordinator's compose inputs, not a bundle
+pub fn describe_layer_policy_decision(
+    presence_active: bool,
+    twcc_union: &HashSet<SimulcastRid>,
+    rr_union: &HashSet<SimulcastRid>,
+    pinned_layers: &HashSet<SimulcastRid>,
+    demanded_layers: &HashSet<SimulcastRid>,
+    effective: &HashSet<SimulcastRid>,
+    current_rids: &[SimulcastRid],
+) -> String {
+    format!(
+        "effective={} presence={} twcc={} rr={} pinned={} demanded={}",
+        fmt_rid_set(effective, current_rids),
+        if presence_active { "up" } else { "idle" },
+        fmt_rid_set(twcc_union, current_rids),
+        fmt_rid_set(rr_union, current_rids),
+        fmt_rid_set(pinned_layers, current_rids),
+        fmt_rid_set(demanded_layers, current_rids),
+    )
+}
+
 /// Probe for a simulcast layer's paused state (`None` = the pool does
 /// not know the layer). Shared by the coordinator signature and its
 /// callers, which would otherwise each spell the boxed-closure type.
@@ -1054,6 +1101,7 @@ pub fn reconcile_on_demand_standby(hooks: &OnDemandStandbyHooks, peers: &[PeerDe
 /// Returned `JoinHandle` exits cleanly on `shutdown.cancelled()`.
 #[allow(clippy::too_many_arguments)] // injected-dependency seam: each param is a distinct policy input, not a bundle
 pub fn spawn_layer_policy_coordinator(
+    display_id: u32,
     peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
     get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
     is_layer_paused: LayerPauseProbe,
@@ -1339,6 +1387,24 @@ pub fn spawn_layer_policy_coordinator(
                 .collect();
 
             let actions = diff_wanted_aggregate(&actual_active, &effective_wanted, &current_rids);
+            if !actions.is_empty() {
+                // Explain WHY alongside the PauseLayer/ResumeLayer lines
+                // the actions are about to emit. Logged only on ticks
+                // that change pool state, so steady state stays silent.
+                eprintln!(
+                    "[layer-policy] display {} decision: {}",
+                    display_id,
+                    describe_layer_policy_decision(
+                        presence_active,
+                        &twcc_union,
+                        &rr_union,
+                        &pinned_layers,
+                        &demanded_layers,
+                        &effective_wanted,
+                        &current_rids,
+                    ),
+                );
+            }
             for action in actions {
                 on_action(action);
             }
@@ -1349,6 +1415,46 @@ pub fn spawn_layer_policy_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Decision-line rendering ------------------------------------------
+
+    /// The `[layer-policy] decision:` explanation renders every vote set
+    /// in spec (`current_rids`) order — deterministic across runs — and
+    /// summarizes members outside the always-on bank (the federated RID
+    /// in a demand set) as an off-bank count instead of dropping them.
+    #[test]
+    fn describe_layer_policy_decision_renders_deterministically() {
+        let current = vec![
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ];
+        let all: HashSet<SimulcastRid> = current.iter().cloned().collect();
+        let mut demanded: HashSet<SimulcastRid> = HashSet::new();
+        demanded.insert(SimulcastRid::full());
+        demanded.insert(SimulcastRid::federated());
+        let mut effective: HashSet<SimulcastRid> = HashSet::new();
+        effective.insert(SimulcastRid::full());
+        let pinned: HashSet<SimulcastRid> = [SimulcastRid::full()].into_iter().collect();
+
+        let line = describe_layer_policy_decision(
+            true, &all, &all, &pinned, &demanded, &effective, &current,
+        );
+        assert_eq!(
+            line,
+            "effective={f} presence=up twcc={f,h,q} rr={f,h,q} \
+             pinned={f} demanded={f,+1 off-bank}"
+        );
+
+        // Zero-peer idle pause: empty effective, presence down.
+        let empty: HashSet<SimulcastRid> = HashSet::new();
+        let line =
+            describe_layer_policy_decision(false, &all, &all, &empty, &empty, &empty, &current);
+        assert_eq!(
+            line,
+            "effective={} presence=idle twcc={f,h,q} rr={f,h,q} pinned={} demanded={}"
+        );
+    }
 
     // ----- Pure transition tests --------------------------------------------
 
@@ -3011,6 +3117,7 @@ mod tests {
         let kick = Arc::new(Notify::new());
         let shutdown = CancellationToken::new();
         let handle = spawn_layer_policy_coordinator(
+            0,
             Arc::clone(&peers),
             get_current_rids,
             is_layer_paused,
@@ -3117,6 +3224,7 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let handle = spawn_layer_policy_coordinator(
+            0,
             Arc::clone(&peers),
             get_current_rids,
             is_layer_paused,
@@ -3223,6 +3331,7 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let handle = spawn_layer_policy_coordinator(
+            0,
             Arc::clone(&peers),
             get_current_rids,
             is_layer_paused,

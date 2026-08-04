@@ -659,8 +659,13 @@ pub type PeerId = u64;
 pub enum DisplayEvent {
     /// The capture backend stopped without a clean shutdown.
     CaptureLost { display_id: u32, reason: String },
-    /// Periodic metrics snapshot from `spawn_metrics_logger`.
-    Metrics { snapshot: DisplayMetricsSnapshot },
+    /// Periodic metrics snapshot from `spawn_metrics_logger`. Boxed:
+    /// the snapshot dwarfs the other variants (clippy
+    /// `large_enum_variant`), and every other event would otherwise
+    /// pay its footprint on the channel.
+    Metrics {
+        snapshot: Box<DisplayMetricsSnapshot>,
+    },
     /// The source changed resolution; encoders were recreated.
     Resize {
         display_id: u32,
@@ -678,6 +683,28 @@ pub struct DisplayMetricsCounters {
     pub capture_frames: AtomicU64,
     /// Frames dropped at the broadcast send (no subscribers or lagging).
     pub capture_drops: AtomicU64,
+    /// Of `capture_frames`, the deliveries the backend explicitly marked
+    /// as "content unchanged" (empty dirty-rect set — ScreenCaptureKit's
+    /// `Idle` status frames are the canonical source). Splitting these
+    /// out is what lets a low `capture_fps` window be classified from
+    /// the log: a mostly-idle desktop shows low capture with the
+    /// remainder here, while "source starved/throttled" shows low
+    /// capture with zero idle deliveries. Backends that never annotate
+    /// dirty rects contribute nothing (their frames all count as
+    /// content).
+    pub capture_idle_frames: AtomicU64,
+    /// Frames the platform capture producer built but could not enqueue
+    /// because the bounded backend→bridge channel was full (the
+    /// `try_send` drop-on-full contract in [`DisplayBackend::start_capture`]).
+    /// This is the *before-the-bridge* drop point that `capture_frames`
+    /// (counted at the bridge) never sees — without it, "the source
+    /// delivered at full rate but the consumer was starved" is
+    /// indistinguishable from "the source delivered slowly".
+    ///
+    /// `Arc<AtomicU64>` so [`DisplaySession::start`] can hand the same
+    /// counter to the backend via
+    /// [`DisplayBackend::install_capture_frame_drop_counter`].
+    pub capture_backend_drops: Arc<AtomicU64>,
 
     /// Total frames successfully VP8-encoded.
     pub encode_frames: AtomicU64,
@@ -709,6 +736,21 @@ pub struct DisplayMetricsCounters {
     /// idle-cost gate is observable (and unit-testable) without exposing
     /// bridge internals.
     pub pool_feed_conversions: AtomicU64,
+    /// Pool-feed pushes forwarded because the I420 buffer changed since
+    /// the last send (fresh capture content). See
+    /// [`pool_feed_push_reason`] for the gate taxonomy.
+    pub pool_feed_push_changed: AtomicU64,
+    /// Pool-feed pushes forwarded by the 1 Hz idle heartbeat — a
+    /// **re-push of the previous buffer with its original arrival
+    /// stamp**, so each one re-encodes stale content and drags
+    /// `encode_freshness_avg_ms` up by design. This counter is what
+    /// makes "encode_fps exceeds capture_fps and freshness looks awful"
+    /// self-explaining on an idle desktop instead of reading like an
+    /// encoder stall.
+    pub pool_feed_push_heartbeat: AtomicU64,
+    /// Pool-feed pushes forwarded by an open peer-join burst window
+    /// (encoder clocked through to a keyframe after attach).
+    pub pool_feed_push_burst: AtomicU64,
 
     /// Tile-stream damage samples processed in the current metrics window.
     pub tile_damage_samples: AtomicU64,
@@ -753,12 +795,17 @@ impl DisplayMetricsCounters {
         Self {
             capture_frames: AtomicU64::new(0),
             capture_drops: AtomicU64::new(0),
+            capture_idle_frames: AtomicU64::new(0),
+            capture_backend_drops: Arc::new(AtomicU64::new(0)),
             encode_frames: AtomicU64::new(0),
             encode_drops: AtomicU64::new(0),
             encode_freshness_us_sum: AtomicU64::new(0),
             peer_drops: Arc::new(AtomicU64::new(0)),
             peer_count: AtomicU64::new(0),
             pool_feed_conversions: AtomicU64::new(0),
+            pool_feed_push_changed: AtomicU64::new(0),
+            pool_feed_push_heartbeat: AtomicU64::new(0),
+            pool_feed_push_burst: AtomicU64::new(0),
             tile_damage_samples: AtomicU64::new(0),
             tile_dirty_rects: AtomicU64::new(0),
             tile_dirty_tiles: AtomicU64::new(0),
@@ -809,6 +856,100 @@ impl DisplayMetricsCounters {
     }
 }
 
+/// How the capture bridge classifies one delivered [`Frame`] for the
+/// idle/content split (see
+/// [`DisplayMetricsCounters::capture_idle_frames`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedFrameKind {
+    /// The backend reported content change for this frame (non-empty
+    /// dirty rects), or did not annotate damage at all (`None` — the
+    /// conservative default: unknown damage counts as content).
+    Content,
+    /// The backend explicitly reported "nothing changed" (`Some` with an
+    /// empty rect set — ScreenCaptureKit's `Idle` status verdict).
+    Idle,
+}
+
+/// Classify a captured frame's damage annotation for the metrics split.
+pub fn captured_frame_kind(dirty_rects: Option<&[capture::damage::Rect]>) -> CapturedFrameKind {
+    match dirty_rects {
+        Some([]) => CapturedFrameKind::Idle,
+        _ => CapturedFrameKind::Content,
+    }
+}
+
+/// Which gate let one pool-feed forward through (see the bridge's
+/// changed / heartbeat / burst decision in
+/// `DisplaySession::spawn_pool_feed_bridge`). Precedence mirrors the
+/// semantic weight of the gates: fresh content > idle heartbeat > join
+/// burst — a push that qualifies under several gates is attributed to
+/// the strongest one so the counters partition the pushes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolFeedPushReason {
+    /// A fresher I420 buffer than last sent (real captured change).
+    Changed,
+    /// The 1 Hz idle heartbeat re-pushing the previous buffer (stale
+    /// re-encode by design; carries the original arrival stamp).
+    Heartbeat,
+    /// An open peer-join burst window clocking the encoder to a
+    /// keyframe.
+    Burst,
+}
+
+/// The pool-feed bridge's forward gate as a pure decision: `None` =
+/// nothing to forward this tick.
+pub fn pool_feed_push_reason(
+    changed: bool,
+    heartbeat_due: bool,
+    in_burst: bool,
+) -> Option<PoolFeedPushReason> {
+    if changed {
+        Some(PoolFeedPushReason::Changed)
+    } else if heartbeat_due {
+        Some(PoolFeedPushReason::Heartbeat)
+    } else if in_burst {
+        Some(PoolFeedPushReason::Burst)
+    } else {
+        None
+    }
+}
+
+/// Coarse capture-rate bucket for the pipeline-state fingerprint: the
+/// startup-flake triage question is "was the source delivering nothing,
+/// a trickle, or full rate", not the exact fps (which the metrics line
+/// already carries). Boundaries: < 0.5 fps = `none`, < 10 fps =
+/// `trickle`, otherwise `full`.
+pub fn capture_rate_bucket(fps: f64) -> &'static str {
+    if fps < 0.5 {
+        "none"
+    } else if fps < 10.0 {
+        "trickle"
+    } else {
+        "full"
+    }
+}
+
+/// The per-display pipeline-state fingerprint logged by
+/// [`DisplaySession::spawn_metrics_logger`] whenever it changes between
+/// metrics ticks (`[display/pipeline-state]`). Deliberately built from
+/// *classifications*, not raw counts, so ordinary frame-count jitter
+/// never flaps it: capture bucket, the paused always-on layers, whether
+/// the pool has an active consumer, and whether the backend reported
+/// pre-bridge drops in the window.
+pub fn pipeline_state_fingerprint(snapshot: &DisplayMetricsSnapshot) -> String {
+    format!(
+        "capture={} paused=[{}] consumer={} backend_drops={}",
+        capture_rate_bucket(snapshot.capture_fps),
+        snapshot.paused_layers.join(","),
+        if snapshot.active_consumer { 1 } else { 0 },
+        match snapshot.capture_backend_drops {
+            None => "n/a",
+            Some(0) => "no",
+            Some(_) => "yes",
+        },
+    )
+}
+
 /// A point-in-time snapshot of display pipeline metrics, suitable for
 /// serialisation and logging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,12 +957,49 @@ pub struct DisplayMetricsSnapshot {
     pub display_id: u32,
     pub capture_fps: f64,
     pub capture_drops: u64,
+    /// Idle-verdict deliveries per second (see
+    /// [`DisplayMetricsCounters::capture_idle_frames`]). Subset of
+    /// `capture_fps`.
+    #[serde(default)]
+    pub capture_idle_fps: f64,
+    /// Pre-bridge backend drops in the window (`None` = this backend has
+    /// not wired the drop counter, so absence of drops is *unknown*, not
+    /// zero — rendered as `n/a` in the log line).
+    #[serde(default)]
+    pub capture_backend_drops: Option<u64>,
     pub encode_fps: f64,
     pub encode_freshness_avg_ms: f64,
     pub encode_drops: u64,
     pub peer_count: u64,
     pub peer_drops: u64,
     pub resolution: (u32, u32),
+    /// Seconds since the owning session was created. 0 when the snapshot
+    /// was built outside a session (bare `from_counters` callers).
+    #[serde(default)]
+    pub uptime_secs: u64,
+    /// Pool-feed pushes attributed to fresh content in the window.
+    #[serde(default)]
+    pub pool_feed_pushes_changed: u64,
+    /// Pool-feed pushes attributed to the 1 Hz idle heartbeat (stale
+    /// re-encodes by design — each carries its original arrival stamp,
+    /// so a heartbeat-dominated window legitimately shows
+    /// `encode_fps > capture_fps` with high freshness).
+    #[serde(default)]
+    pub pool_feed_pushes_heartbeat: u64,
+    /// Pool-feed pushes attributed to a peer-join burst window.
+    #[serde(default)]
+    pub pool_feed_pushes_burst: u64,
+    /// RIDs of always-on baseline layers currently paused by the layer
+    /// policy, in spec order. Empty when nothing is paused (or the pool
+    /// is not constructed yet).
+    #[serde(default)]
+    pub paused_layers: Vec<String>,
+    /// Whether the encoder pool had at least one active (unpaused,
+    /// subscribed) consumer at snapshot time — the pool-feed bridge's F2
+    /// idle gate. `false` explains a window with zero conversions and
+    /// zero encodes without implicating capture.
+    #[serde(default)]
+    pub active_consumer: bool,
     pub tile_damage_samples: u64,
     pub tile_dirty_rects: u64,
     pub tile_dirty_tiles: u64,
@@ -846,6 +1024,11 @@ impl DisplayMetricsSnapshot {
     ) -> Self {
         let capture_frames = counters.capture_frames.swap(0, Ordering::Relaxed);
         let capture_drops = counters.capture_drops.swap(0, Ordering::Relaxed);
+        let capture_idle_frames = counters.capture_idle_frames.swap(0, Ordering::Relaxed);
+        let capture_backend_drops = counters.capture_backend_drops.swap(0, Ordering::Relaxed);
+        let pool_feed_push_changed = counters.pool_feed_push_changed.swap(0, Ordering::Relaxed);
+        let pool_feed_push_heartbeat = counters.pool_feed_push_heartbeat.swap(0, Ordering::Relaxed);
+        let pool_feed_push_burst = counters.pool_feed_push_burst.swap(0, Ordering::Relaxed);
         let encode_frames = counters.encode_frames.swap(0, Ordering::Relaxed);
         let encode_drops = counters.encode_drops.swap(0, Ordering::Relaxed);
         let encode_freshness_us = counters.encode_freshness_us_sum.swap(0, Ordering::Relaxed);
@@ -882,12 +1065,23 @@ impl DisplayMetricsSnapshot {
             display_id,
             capture_fps: capture_frames as f64 / elapsed_secs,
             capture_drops,
+            capture_idle_fps: capture_idle_frames as f64 / elapsed_secs,
+            // `Some` here because the counter itself always exists; the
+            // session-level `metrics()` downgrades to `None` when the
+            // backend never acknowledged the install (unwired = unknown).
+            capture_backend_drops: Some(capture_backend_drops),
             encode_fps: encode_frames as f64 / elapsed_secs,
             encode_freshness_avg_ms,
             encode_drops,
             peer_count,
             peer_drops,
             resolution,
+            uptime_secs: 0,
+            pool_feed_pushes_changed: pool_feed_push_changed,
+            pool_feed_pushes_heartbeat: pool_feed_push_heartbeat,
+            pool_feed_pushes_burst: pool_feed_push_burst,
+            paused_layers: Vec::new(),
+            active_consumer: false,
             tile_damage_samples,
             tile_dirty_rects,
             tile_dirty_tiles,
@@ -1015,6 +1209,30 @@ pub trait DisplayBackend: Send + Sync + 'static {
         let _ = probe;
     }
 
+    /// Install the shared counter for frames the capture producer built
+    /// but dropped at the bounded channel's `try_send` (the drop-on-full
+    /// contract in [`Self::start_capture`]). Purely observational — the
+    /// drop behavior itself is unchanged; the counter is what lets a
+    /// metrics window distinguish "the source delivered slowly" from
+    /// "the source delivered at rate but the consumer was starved"
+    /// (the two are otherwise identical in bridge-side `capture_fps`).
+    ///
+    /// Returns `true` when the backend wires the counter to its drop
+    /// site; the default ignores it and returns `false`, which the
+    /// session reports as `bdrops=n/a` (unknown) rather than a
+    /// misleading zero. Wired: ScreenCaptureKit (macOS) and the
+    /// synthetic test backend. The remaining `try_send` backends
+    /// (X11, Wayland/PipeWire, Windows DXGI) are mechanical follow-ups:
+    /// route this counter to their capture loop's send site and return
+    /// `true`.
+    ///
+    /// Install before [`Self::start_capture`]; like the demand probe,
+    /// the installed counter applies to sessions started afterwards.
+    fn install_capture_frame_drop_counter(&self, counter: Arc<AtomicU64>) -> bool {
+        let _ = counter;
+        false
+    }
+
     /// Inject a browser input event into the display.
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError>;
 
@@ -1074,6 +1292,12 @@ pub struct DisplaySession {
     capture_handle: Mutex<Option<JoinHandle<()>>>,
     shutdown: CancellationToken,
     counters: Arc<DisplayMetricsCounters>,
+    /// Whether the backend acknowledged
+    /// [`DisplayBackend::install_capture_frame_drop_counter`] during
+    /// [`Self::start`]. `false` = backend never wired it, so
+    /// [`Self::metrics`] reports pre-bridge drops as unknown (`None`)
+    /// instead of a misleading zero.
+    backend_drop_counter_wired: AtomicBool,
     /// Instant used as the epoch for rate computations.
     metrics_epoch: Mutex<Instant>,
     /// Clipboard monitor for bidirectional clipboard sync.
@@ -1389,6 +1613,99 @@ fn all_tile_ids(grid: &tile::grid::TileGrid) -> Vec<tile::grid::TileId> {
         }
     }
     out
+}
+
+/// Resolve the final dirty rects for one allowed delta tick from the
+/// damage collected since the last tick. Shared by the WebRTC tile
+/// bridge and the socket tile stream so both lanes make identical
+/// dirt decisions.
+///
+/// Frame-diff mode (`uses_frame_diff` — the platforms without a
+/// per-frame damage source): hash every tile of the frame against the
+/// tracker's baseline. This walks the whole frame, so it runs on the
+/// blocking pool, never inline on the runtime, and only on allowed
+/// ticks. Skipping frames is safe: the baseline only advances when a
+/// diff runs, so a change landing on a skipped frame is caught by the
+/// next diff.
+///
+/// Rect mode (in-frame dirty rects or OS damage events): platform
+/// damage metadata says where to *look*, never what changed — OS
+/// damage over-reports by design, and under a compositing WM
+/// root-window XDamage degenerates to full-root bounding boxes over
+/// pixel-identical content (see
+/// [`capture::frame_diff::FrameDiffDamageTracker::verify_damage`]).
+/// The collected rects are pixel-verified against the tracker's tile
+/// baseline; only tiles that really changed survive. Verification
+/// errors fail open to the rects as reported: over-encoding is
+/// recoverable, a dropped real change would stay stale until the
+/// periodic snapshot.
+///
+/// `tracker_slot` round-trips the tracker through the blocking task
+/// (moved in, moved back out). A cancelled/panicked task loses it; the
+/// replacement re-baselines on the next tick.
+async fn resolve_tile_tick_damage(
+    frame: &Arc<Frame>,
+    mut collected: Vec<capture::damage::Rect>,
+    uses_frame_diff: bool,
+    tracker_slot: &mut Option<capture::frame_diff::FrameDiffDamageTracker>,
+    display_id: u32,
+    log_prefix: &'static str,
+) -> Vec<capture::damage::Rect> {
+    if uses_frame_diff {
+        let tracker = tracker_slot.take().unwrap_or_else(|| {
+            capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX)
+        });
+        let diff_result = tokio::task::spawn_blocking({
+            let frame = Arc::clone(frame);
+            move || {
+                let mut tracker = tracker;
+                let rects = tracker.diff_frame(&frame);
+                (tracker, rects)
+            }
+        })
+        .await;
+        match diff_result {
+            Ok((tracker, Ok(diff_rects))) => {
+                *tracker_slot = Some(tracker);
+                collected.extend(diff_rects);
+            }
+            Ok((tracker, Err(e))) => {
+                *tracker_slot = Some(tracker);
+                eprintln!("{log_prefix} display {display_id} frame-diff failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("{log_prefix} display {display_id} frame-diff task failed: {e}");
+            }
+        }
+    } else if !collected.is_empty() {
+        let tracker = tracker_slot.take().unwrap_or_else(|| {
+            capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX)
+        });
+        let verify_result = tokio::task::spawn_blocking({
+            let frame = Arc::clone(frame);
+            let candidates = collected.clone();
+            move || {
+                let mut tracker = tracker;
+                let verified = tracker.verify_damage(&frame, &candidates);
+                (tracker, verified)
+            }
+        })
+        .await;
+        match verify_result {
+            Ok((tracker, Ok(verified))) => {
+                *tracker_slot = Some(tracker);
+                collected = verified;
+            }
+            Ok((tracker, Err(e))) => {
+                *tracker_slot = Some(tracker);
+                eprintln!("{log_prefix} display {display_id} damage verify failed: {e}");
+            }
+            Err(e) => {
+                eprintln!("{log_prefix} display {display_id} damage verify task failed: {e}");
+            }
+        }
+    }
+    collected
 }
 
 fn encode_tile_records(
@@ -1771,6 +2088,7 @@ impl DisplaySession {
             capture_handle: Mutex::new(None),
             shutdown: CancellationToken::new(),
             counters: Arc::new(DisplayMetricsCounters::new()),
+            backend_drop_counter_wired: AtomicBool::new(false),
             metrics_epoch: Mutex::new(Instant::now()),
             clipboard_monitor: Arc::new(clipboard::ClipboardMonitor::new()),
             clipboard_handle: Mutex::new(None),
@@ -1864,6 +2182,16 @@ impl DisplaySession {
         >,
         events: Option<DisplayEventSender>,
     ) -> Result<(), CallerError> {
+        // Observability: hand the backend the pre-bridge drop counter
+        // before capture starts so its very first session is covered.
+        // Backends that don't wire it return false and the metrics
+        // report the drop count as unknown (`bdrops=n/a`).
+        let drop_counter_wired = self
+            .backend
+            .install_capture_frame_drop_counter(Arc::clone(&self.counters.capture_backend_drops));
+        self.backend_drop_counter_wired
+            .store(drop_counter_wired, Ordering::Relaxed);
+
         let mut capture_rx = self.backend.start_capture(fps).await?;
 
         // Source resolution is resolved AFTER `start_capture` because
@@ -1946,6 +2274,13 @@ impl DisplaySession {
                             break;
                         };
                         cap_counters.capture_frames.fetch_add(1, Ordering::Relaxed);
+                        if captured_frame_kind(frame.dirty_rects.as_deref())
+                            == CapturedFrameKind::Idle
+                        {
+                            cap_counters
+                                .capture_idle_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         let arc_frame = Arc::new(frame);
                         *latest.write().await = Some(Arc::clone(&arc_frame));
                         // If no subscribers, the send fails -- count as a drop.
@@ -2116,6 +2451,7 @@ impl DisplaySession {
             pool_for_query.is_layer_paused(encode::pool::BASELINE_CODEC, rid.clone())
         });
         let pool_for_action = Arc::clone(&pool_arc);
+        let action_display_id = self.display_id;
         let on_action: Box<dyn Fn(aggregator::CapacityAction) + Send + Sync> =
             Box::new(move |action| {
                 // Operational observability: one line per layer-policy
@@ -2123,13 +2459,19 @@ impl DisplaySession {
                 // events per drop+recover cycle: pause top, pause mid,
                 // resume mid, resume top) plus presence transitions.
                 // Format mirrors the action variant for grep-ability:
-                // `[layer-policy] PauseLayer(<rid>)` / `ResumeLayer(<rid>)`.
+                // `[layer-policy] display <id>: PauseLayer(<rid>)` /
+                // `ResumeLayer(<rid>)`; the coordinator logs the vote
+                // vector behind the burst on its own `decision:` line.
                 match &action {
                     aggregator::CapacityAction::PauseLayer(rid) => {
-                        eprintln!("[layer-policy] PauseLayer({rid:?})");
+                        eprintln!(
+                            "[layer-policy] display {action_display_id}: PauseLayer({rid:?})"
+                        );
                     }
                     aggregator::CapacityAction::ResumeLayer(rid) => {
-                        eprintln!("[layer-policy] ResumeLayer({rid:?})");
+                        eprintln!(
+                            "[layer-policy] display {action_display_id}: ResumeLayer({rid:?})"
+                        );
                     }
                 }
                 match action {
@@ -2164,6 +2506,7 @@ impl DisplaySession {
         };
         let pool_for_federated_respec = Arc::clone(&pool_arc);
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
+            self.display_id,
             Arc::clone(&self.peers),
             get_current_rids,
             is_layer_paused,
@@ -2260,13 +2603,24 @@ impl DisplaySession {
     /// `metrics()` (or since `start()` if this is the first call).
     pub async fn metrics(&self) -> DisplayMetricsSnapshot {
         let mut epoch = self.metrics_epoch.lock().await;
-        let snap = DisplayMetricsSnapshot::from_counters(
+        let mut snap = DisplayMetricsSnapshot::from_counters(
             &self.counters,
             self.display_id,
             self.backend.resolution(),
             &epoch,
         );
         *epoch = Instant::now();
+        snap.uptime_secs = self.session_epoch.elapsed().as_secs();
+        // Unwired backend = the pre-bridge drop count is unknown, not
+        // zero; `from_counters` filled `Some(n)` from the (never
+        // incremented) counter, so downgrade honestly.
+        if !self.backend_drop_counter_wired.load(Ordering::Relaxed) {
+            snap.capture_backend_drops = None;
+        }
+        if let Some(pool) = self.pool.get() {
+            snap.paused_layers = pool.paused_baseline_rids();
+            snap.active_consumer = pool.has_active_consumer();
+        }
         snap
     }
 
@@ -2285,6 +2639,10 @@ impl DisplaySession {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             // Skip the immediate first tick.
             interval.tick().await;
+            // Last logged pipeline-state fingerprint; the state line
+            // below fires only on change, so it is rate-limited to at
+            // most one line per 30 s tick by construction.
+            let mut last_state: Option<String> = None;
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -2294,7 +2652,8 @@ impl DisplaySession {
                             "[display/metrics] id={} capture={:.1}fps encode={:.1}fps \
                              drops=cap:{}/enc:{}/peer:{} peers={} freshness_avg={:.1}ms res={}x{} \
                              tile=dirty:{}r/{}t/{:.3} delta={:.1}fps/{:.1}kbps/{}rec/skips:{} \
-                             snap={}f/{:.1}kbps/{}rec",
+                             snap={}f/{:.1}kbps/{}rec up={}s idle={:.1}fps bdrops={} \
+                             push=c{}/h{}/b{} paused=[{}] consumer={}",
                             m.display_id,
                             m.capture_fps,
                             m.encode_fps,
@@ -2315,9 +2674,38 @@ impl DisplaySession {
                             m.tile_snapshot_frames,
                             m.tile_snapshot_kbps,
                             m.tile_snapshot_records,
+                            m.uptime_secs,
+                            m.capture_idle_fps,
+                            match m.capture_backend_drops {
+                                None => "n/a".to_string(),
+                                Some(n) => n.to_string(),
+                            },
+                            m.pool_feed_pushes_changed,
+                            m.pool_feed_pushes_heartbeat,
+                            m.pool_feed_pushes_burst,
+                            m.paused_layers.join(","),
+                            if m.active_consumer { 1 } else { 0 },
                         );
+                        // Startup-flake observability: name the pipeline's
+                        // throttle state whenever its classification
+                        // changes, so a degraded boot window and its
+                        // self-heal edge are explicit in the log instead
+                        // of inferred from fps deltas 30 s apart.
+                        let state = pipeline_state_fingerprint(&m);
+                        if last_state.as_deref() != Some(state.as_str()) {
+                            eprintln!(
+                                "[display/pipeline-state] id={} {} (was: {}) up={}s",
+                                m.display_id,
+                                state,
+                                last_state.as_deref().unwrap_or("<start>"),
+                                m.uptime_secs,
+                            );
+                            last_state = Some(state);
+                        }
                         if let Some(ref events) = events {
-                            let _ = events.send(DisplayEvent::Metrics { snapshot: m });
+                            let _ = events.send(DisplayEvent::Metrics {
+                                snapshot: Box::new(m),
+                            });
                         }
                     }
                 }
@@ -3370,55 +3758,15 @@ impl DisplaySession {
                         }
                         last_delta_tick_at = Some(now);
 
-                        let mut rects = std::mem::take(&mut pending_rects);
-
-                        // Frame-diff fallback (macOS/Windows/Wayland —
-                        // the platforms without an OS damage source):
-                        // hash every tile of the frame and diff against
-                        // the previous baseline. This walks the whole
-                        // frame, so it runs on the blocking pool, never
-                        // inline on the runtime, and only on allowed
-                        // ticks. Skipping frames is safe: the baseline
-                        // only advances when a diff runs, so a change
-                        // landing on a skipped frame is caught by the
-                        // next diff.
-                        if uses_frame_diff {
-                            let tracker = frame_diff.take().unwrap_or_else(|| {
-                                capture::frame_diff::FrameDiffDamageTracker::new(
-                                    TILE_STREAM_TILE_SIZE_PX,
-                                )
-                            });
-                            let diff_result = tokio::task::spawn_blocking({
-                                let frame = Arc::clone(&frame);
-                                move || {
-                                    let mut tracker = tracker;
-                                    let rects = tracker.diff_frame(&frame);
-                                    (tracker, rects)
-                                }
-                            })
-                            .await;
-                            match diff_result {
-                                Ok((tracker, Ok(diff_rects))) => {
-                                    frame_diff = Some(tracker);
-                                    rects.extend(diff_rects);
-                                }
-                                Ok((tracker, Err(e))) => {
-                                    frame_diff = Some(tracker);
-                                    eprintln!(
-                                        "[display/tile] display {display_id} frame-diff failed: {e}"
-                                    );
-                                }
-                                Err(e) => {
-                                    // Tracker lost with the cancelled/
-                                    // panicked task; the replacement
-                                    // re-baselines (all tiles dirty) on
-                                    // the next allowed tick.
-                                    eprintln!(
-                                        "[display/tile] display {display_id} frame-diff task failed: {e}"
-                                    );
-                                }
-                            }
-                        }
+                        let mut rects = resolve_tile_tick_damage(
+                            &frame,
+                            std::mem::take(&mut pending_rects),
+                            uses_frame_diff,
+                            &mut frame_diff,
+                            display_id,
+                            "[display/tile]",
+                        )
+                        .await;
 
                         let policy_dirty = next_grid.dirty_tiles(&rects);
                         let dirty_fraction = next_grid.dirty_fraction(policy_dirty.len());
@@ -4055,9 +4403,11 @@ impl DisplaySession {
                         let changed = last_sent_gen != Some(generation);
                         let heartbeat_due =
                             last_send_at.elapsed() >= IDLE_HEARTBEAT;
-                        if !(changed || heartbeat_due || in_burst) {
+                        let Some(push_reason) =
+                            pool_feed_push_reason(changed, heartbeat_due, in_burst)
+                        else {
                             continue;
-                        }
+                        };
 
                         let visual_marker_value =
                             if marker_flag.load(Ordering::Relaxed) {
@@ -4107,6 +4457,12 @@ impl DisplaySession {
                             arrived,
                             visual_marker_value,
                         );
+                        match push_reason {
+                            PoolFeedPushReason::Changed => &counters.pool_feed_push_changed,
+                            PoolFeedPushReason::Heartbeat => &counters.pool_feed_push_heartbeat,
+                            PoolFeedPushReason::Burst => &counters.pool_feed_push_burst,
+                        }
+                        .fetch_add(1, Ordering::Relaxed);
                         last_sent_gen = Some(generation);
                         last_send_at = Instant::now();
                     }
@@ -4708,6 +5064,86 @@ mod tests {
         (peers, tile_subscribers, tile_gauge, counters, peer)
     }
 
+    fn diff_test_frame(w: u32, h: u32, data: Vec<u8>) -> Arc<Frame> {
+        Arc::new(Frame {
+            data,
+            format: FrameFormat::Bgra,
+            width: w,
+            height: h,
+            stride: w * 4,
+            timestamp: Instant::now(),
+            dirty_rects: None,
+        })
+    }
+
+    /// The live X11 phantom-dirt shape: under a compositing WM the root
+    /// window's XDamage fires on *repaints*, not pixel changes — GNOME
+    /// Shell's clock actor repainting identical pixels reports a huge
+    /// (up to full-root) bounding box every second. Damage rects are
+    /// candidates, not truth: the tile path must pixel-verify them, so
+    /// an identical frame verifies to zero dirt, a pad-byte-only frame
+    /// (undefined BGRX byte 3) verifies to zero dirt, and a small real
+    /// change verifies to its own tiles' fraction — never 1.0.
+    #[tokio::test]
+    async fn os_damage_rects_are_pixel_verified_before_tile_dirt() {
+        let w = 256u32;
+        let h = 128u32; // 4×2 tiles at 64px → 8 total
+        let full = capture::damage::Rect::new(0, 0, w, h);
+        let grid = tile::grid::TileGrid::new(w, h, TILE_STREAM_TILE_SIZE_PX).expect("grid");
+        let mut tracker = Some(capture::frame_diff::FrameDiffDamageTracker::new(
+            TILE_STREAM_TILE_SIZE_PX,
+        ));
+        let fraction =
+            |rects: &Vec<capture::damage::Rect>| grid.dirty_fraction(grid.dirty_tiles(rects).len());
+        let base = vec![0x40u8; (w * h * 4) as usize];
+
+        // Tick 1: no baseline exists yet, so the reported damage is
+        // trusted once while the baseline is established.
+        let f0 = diff_test_frame(w, h, base.clone());
+        let _ = resolve_tile_tick_damage(&f0, vec![full], false, &mut tracker, 0, "[test]").await;
+
+        // Pixel-identical frame + full-screen damage report → no dirt.
+        let f1 = diff_test_frame(w, h, base.clone());
+        let out = resolve_tile_tick_damage(&f1, vec![full], false, &mut tracker, 0, "[test]").await;
+        assert_eq!(
+            fraction(&out),
+            0.0,
+            "phantom full-screen damage over identical pixels must verify to zero dirt"
+        );
+
+        // Identical except every pixel's pad byte → still no dirt.
+        let mut padded = base.clone();
+        for px in padded.chunks_exact_mut(4) {
+            px[3] = 0x77;
+        }
+        let f2 = diff_test_frame(w, h, padded);
+        let out = resolve_tile_tick_damage(&f2, vec![full], false, &mut tracker, 0, "[test]").await;
+        assert_eq!(
+            fraction(&out),
+            0.0,
+            "pad-byte-only differences must verify to zero dirt"
+        );
+
+        // One 8×8 region really changed (inside tile (1, 0)) while the
+        // OS still over-reports full-screen damage → exactly that
+        // tile's fraction, never 1.0.
+        let mut changed = base.clone();
+        for y in 10..18usize {
+            for x in 70..78usize {
+                changed[(y * w as usize + x) * 4] = 0xFF;
+            }
+        }
+        let f3 = diff_test_frame(w, h, changed);
+        let out = resolve_tile_tick_damage(&f3, vec![full], false, &mut tracker, 0, "[test]").await;
+        let dirty = grid.dirty_tiles(&out);
+        assert_eq!(
+            dirty.into_iter().collect::<Vec<_>>(),
+            vec![tile::grid::TileId::new(1, 0)],
+            "a small real change must verify to exactly its owning tile"
+        );
+        assert!((fraction(&out) - 1.0 / 8.0).abs() < f32::EPSILON);
+    }
+
     #[tokio::test]
     async fn reap_removes_the_registered_peer_and_decrements_the_gauge() {
         let (peers, subs, tile_gauge, counters, peer) = reaper_fixture(7);
@@ -5158,11 +5594,16 @@ mod tests {
         let c = DisplayMetricsCounters::new();
         assert_eq!(c.capture_frames.load(Ordering::Relaxed), 0);
         assert_eq!(c.capture_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.capture_idle_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.capture_backend_drops.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_drops.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_freshness_us_sum.load(Ordering::Relaxed), 0);
         assert_eq!(c.peer_drops.load(Ordering::Relaxed), 0);
         assert_eq!(c.peer_count.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_changed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_heartbeat.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_burst.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -5172,6 +5613,11 @@ mod tests {
         // 3 peer drops over the window.
         c.capture_frames.store(150, Ordering::Relaxed);
         c.capture_drops.store(2, Ordering::Relaxed);
+        c.capture_idle_frames.store(50, Ordering::Relaxed);
+        c.capture_backend_drops.store(4, Ordering::Relaxed);
+        c.pool_feed_push_changed.store(90, Ordering::Relaxed);
+        c.pool_feed_push_heartbeat.store(5, Ordering::Relaxed);
+        c.pool_feed_push_burst.store(7, Ordering::Relaxed);
         c.encode_frames.store(140, Ordering::Relaxed);
         c.encode_drops.store(1, Ordering::Relaxed);
         // 140 frames * 5000us avg = 700_000us total
@@ -5193,6 +5639,18 @@ mod tests {
         // ~30 fps capture (150 / 5s)
         assert!((snap.capture_fps - 30.0).abs() < 1.0);
         assert_eq!(snap.capture_drops, 2);
+        // ~10 fps idle-verdict deliveries (50 / 5s)
+        assert!((snap.capture_idle_fps - 10.0).abs() < 1.0);
+        // Bare from_counters reports the raw counter as Some — only the
+        // session-level metrics() knows whether the backend wired it.
+        assert_eq!(snap.capture_backend_drops, Some(4));
+        assert_eq!(snap.pool_feed_pushes_changed, 90);
+        assert_eq!(snap.pool_feed_pushes_heartbeat, 5);
+        assert_eq!(snap.pool_feed_pushes_burst, 7);
+        // Session-level facts default until metrics() fills them.
+        assert_eq!(snap.uptime_secs, 0);
+        assert!(snap.paused_layers.is_empty());
+        assert!(!snap.active_consumer);
         // ~28 fps encode (140 / 5s)
         assert!((snap.encode_fps - 28.0).abs() < 1.0);
         assert_eq!(snap.encode_drops, 1);
@@ -5214,6 +5672,11 @@ mod tests {
 
         // Counters should be reset after snapshot (except peer_count which is gauge).
         assert_eq!(c.capture_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.capture_idle_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(c.capture_backend_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_changed.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_heartbeat.load(Ordering::Relaxed), 0);
+        assert_eq!(c.pool_feed_push_burst.load(Ordering::Relaxed), 0);
         assert_eq!(c.encode_frames.load(Ordering::Relaxed), 0);
         assert_eq!(c.tile_delta_records.load(Ordering::Relaxed), 0);
         assert_eq!(c.tile_snapshot_records.load(Ordering::Relaxed), 0);
@@ -5236,12 +5699,20 @@ mod tests {
             display_id: 1,
             capture_fps: 30.0,
             capture_drops: 5,
+            capture_idle_fps: 1.5,
+            capture_backend_drops: Some(3),
             encode_fps: 28.5,
             encode_freshness_avg_ms: 4.2,
             encode_drops: 2,
             peer_count: 1,
             peer_drops: 0,
             resolution: (1920, 1080),
+            uptime_secs: 42,
+            pool_feed_pushes_changed: 20,
+            pool_feed_pushes_heartbeat: 8,
+            pool_feed_pushes_burst: 2,
+            paused_layers: vec!["h".to_string(), "q".to_string()],
+            active_consumer: true,
             tile_damage_samples: 3,
             tile_dirty_rects: 4,
             tile_dirty_tiles: 5,
@@ -5259,6 +5730,144 @@ mod tests {
         assert!(json.contains("\"capture_fps\":30.0"));
         assert!(json.contains("\"encode_drops\":2"));
         assert!(json.contains("\"tile_delta_records\":7"));
+        assert!(json.contains("\"capture_idle_fps\":1.5"));
+        assert!(json.contains("\"capture_backend_drops\":3"));
+        assert!(json.contains("\"uptime_secs\":42"));
+        assert!(json.contains("\"pool_feed_pushes_heartbeat\":8"));
+        assert!(json.contains("\"paused_layers\":[\"h\",\"q\"]"));
+        assert!(json.contains("\"active_consumer\":true"));
+    }
+
+    /// Snapshots serialized before the startup-flake observability fields
+    /// existed (and any external producer still emitting the old shape)
+    /// must keep deserializing — every added field is `#[serde(default)]`.
+    #[test]
+    fn metrics_snapshot_deserializes_pre_observability_shape() {
+        let old_json = r#"{
+            "display_id": 7,
+            "capture_fps": 29.0,
+            "capture_drops": 0,
+            "encode_fps": 28.0,
+            "encode_freshness_avg_ms": 18.0,
+            "encode_drops": 0,
+            "peer_count": 1,
+            "peer_drops": 0,
+            "resolution": [1024, 640],
+            "tile_damage_samples": 0,
+            "tile_dirty_rects": 0,
+            "tile_dirty_tiles": 0,
+            "tile_dirty_fraction_avg": 0.0,
+            "tile_delta_cadence_skips": 0,
+            "tile_delta_records": 0,
+            "tile_delta_fps": 0.0,
+            "tile_delta_kbps": 0.0,
+            "tile_snapshot_records": 0,
+            "tile_snapshot_frames": 0,
+            "tile_snapshot_kbps": 0.0
+        }"#;
+        let snap: DisplayMetricsSnapshot = serde_json::from_str(old_json).unwrap();
+        assert_eq!(snap.display_id, 7);
+        assert!((snap.capture_idle_fps - 0.0).abs() < f64::EPSILON);
+        assert_eq!(snap.capture_backend_drops, None);
+        assert_eq!(snap.uptime_secs, 0);
+        assert_eq!(snap.pool_feed_pushes_changed, 0);
+        assert!(snap.paused_layers.is_empty());
+        assert!(!snap.active_consumer);
+    }
+
+    // -----------------------------------------------------------------------
+    // Startup-flake observability: pure classification helpers
+    // -----------------------------------------------------------------------
+
+    /// Damage-annotation classification: an explicit empty rect set is
+    /// the backend's "nothing changed" verdict (SCK `Idle`); rects or a
+    /// missing annotation count as content (conservative default).
+    #[test]
+    fn captured_frame_kind_classifies_idle_vs_content() {
+        assert_eq!(captured_frame_kind(None), CapturedFrameKind::Content);
+        assert_eq!(captured_frame_kind(Some(&[])), CapturedFrameKind::Idle);
+        let rects = [capture::damage::Rect::new(0, 0, 8, 8)];
+        assert_eq!(
+            captured_frame_kind(Some(&rects)),
+            CapturedFrameKind::Content
+        );
+    }
+
+    /// Push-reason attribution partitions the pushes: fresh content wins
+    /// over the heartbeat, the heartbeat over the burst, and no open
+    /// gate means no push.
+    #[test]
+    fn pool_feed_push_reason_precedence() {
+        assert_eq!(pool_feed_push_reason(false, false, false), None);
+        assert_eq!(
+            pool_feed_push_reason(true, true, true),
+            Some(PoolFeedPushReason::Changed)
+        );
+        assert_eq!(
+            pool_feed_push_reason(false, true, true),
+            Some(PoolFeedPushReason::Heartbeat)
+        );
+        assert_eq!(
+            pool_feed_push_reason(false, false, true),
+            Some(PoolFeedPushReason::Burst)
+        );
+    }
+
+    #[test]
+    fn capture_rate_bucket_boundaries() {
+        assert_eq!(capture_rate_bucket(0.0), "none");
+        assert_eq!(capture_rate_bucket(0.49), "none");
+        assert_eq!(capture_rate_bucket(0.5), "trickle");
+        assert_eq!(capture_rate_bucket(4.0), "trickle");
+        assert_eq!(capture_rate_bucket(9.99), "trickle");
+        assert_eq!(capture_rate_bucket(10.0), "full");
+        assert_eq!(capture_rate_bucket(29.2), "full");
+    }
+
+    /// The pipeline-state fingerprint is built from classifications, not
+    /// raw counts: fps jitter within a bucket and varying (non-zero)
+    /// drop counts must not flap it, while a bucket change, a pause-set
+    /// change, a consumer change, or drops appearing must.
+    #[test]
+    fn pipeline_state_fingerprint_tracks_classifications_not_counts() {
+        let mut snap = DisplayMetricsSnapshot::from_counters(
+            &DisplayMetricsCounters::new(),
+            0,
+            (1024, 640),
+            &(Instant::now() - std::time::Duration::from_secs(5)),
+        );
+        snap.capture_fps = 3.2;
+        snap.capture_backend_drops = None;
+        snap.paused_layers = vec!["h".into(), "q".into()];
+        snap.active_consumer = true;
+        let degraded = pipeline_state_fingerprint(&snap);
+        assert_eq!(
+            degraded,
+            "capture=trickle paused=[h,q] consumer=1 backend_drops=n/a"
+        );
+
+        // Within-bucket jitter: identical fingerprint.
+        snap.capture_fps = 5.9;
+        assert_eq!(pipeline_state_fingerprint(&snap), degraded);
+
+        // Wired-but-zero drops render as "no", non-zero as "yes", and
+        // the count itself does not appear (so 3 → 7 cannot flap it).
+        snap.capture_backend_drops = Some(0);
+        let no_drops = pipeline_state_fingerprint(&snap);
+        assert!(no_drops.ends_with("backend_drops=no"));
+        snap.capture_backend_drops = Some(3);
+        let some_drops = pipeline_state_fingerprint(&snap);
+        assert!(some_drops.ends_with("backend_drops=yes"));
+        snap.capture_backend_drops = Some(7);
+        assert_eq!(pipeline_state_fingerprint(&snap), some_drops);
+
+        // The self-heal edge: bucket flips to full.
+        snap.capture_backend_drops = None;
+        snap.capture_fps = 29.2;
+        assert_eq!(
+            pipeline_state_fingerprint(&snap),
+            "capture=full paused=[h,q] consumer=1 backend_drops=n/a"
+        );
     }
 
     // -----------------------------------------------------------------------

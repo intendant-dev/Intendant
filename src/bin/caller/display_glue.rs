@@ -26,9 +26,9 @@ pub(crate) fn display_event_forwarder(bus: EventBus) -> display::DisplayEventSen
                 display::DisplayEvent::CaptureLost { display_id, reason } => {
                     AppEvent::DisplayCaptureLost { display_id, reason }
                 }
-                display::DisplayEvent::Metrics { snapshot } => {
-                    AppEvent::DisplayMetrics { snapshot }
-                }
+                display::DisplayEvent::Metrics { snapshot } => AppEvent::DisplayMetrics {
+                    snapshot: *snapshot,
+                },
                 display::DisplayEvent::Resize {
                     display_id,
                     width,

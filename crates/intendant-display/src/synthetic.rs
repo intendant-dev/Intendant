@@ -43,8 +43,8 @@ use super::capture::pacing::{self, DemandProbeSlot};
 use super::{DisplayBackend, DisplayInfo, DisplayInfoKind, Frame, FrameFormat, InputEvent};
 use async_trait::async_trait;
 use intendant_core::error::CallerError;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 
@@ -119,6 +119,12 @@ pub struct SyntheticBackend {
     /// lets CI exercise the pacing contract (keepalive on demand drop,
     /// full rate + wake on demand restore) without a real display.
     demand: Arc<DemandProbeSlot>,
+    /// Pre-bridge drop counter slot (see
+    /// [`DisplayBackend::install_capture_frame_drop_counter`]); the
+    /// producer thread bumps the installed counter on every
+    /// `try_send` `Full` drop. Wired here so the drop-counter contract
+    /// has a hermetic, OS-free test backend.
+    drop_counter: Arc<StdMutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl SyntheticBackend {
@@ -127,6 +133,7 @@ impl SyntheticBackend {
             capture: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
             demand: Arc::new(DemandProbeSlot::new()),
+            drop_counter: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -228,6 +235,12 @@ impl DisplayBackend for SyntheticBackend {
         let (tx, rx) = mpsc::channel::<Frame>(4);
         let shutdown = Arc::clone(&self.shutdown);
         let demand = Arc::clone(&self.demand);
+        // Snapshot the installed drop counter for this session's producer.
+        let drop_counter = self
+            .drop_counter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let interval = std::time::Duration::from_millis(1000 / u64::from(fps.clamp(1, MAX_FPS)));
 
         // The producer owns `tx` (the channel's only sender): thread exit IS
@@ -241,8 +254,15 @@ impl DisplayBackend for SyntheticBackend {
                     break;
                 }
                 let start = Instant::now();
-                // Bounded channel, drop-on-full per the capture contract.
-                let _ = tx.try_send(synthetic_frame(&base, frame_index));
+                // Bounded channel, drop-on-full per the capture contract —
+                // Full drops counted for the pre-bridge drop metric.
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    tx.try_send(synthetic_frame(&base, frame_index))
+                {
+                    if let Some(counter) = &drop_counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 frame_index += 1;
                 // Demand-aware pacing, same contract as the X11 loops:
                 // full fps with demand, 1 fps keepalive without, and a
@@ -275,6 +295,11 @@ impl DisplayBackend for SyntheticBackend {
 
     fn set_capture_demand_probe(&self, probe: pacing::CaptureDemandProbe) {
         self.demand.install(probe);
+    }
+
+    fn install_capture_frame_drop_counter(&self, counter: Arc<AtomicU64>) -> bool {
+        *self.drop_counter.lock().unwrap_or_else(|e| e.into_inner()) = Some(counter);
+        true
     }
 
     async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {
@@ -379,6 +404,34 @@ mod tests {
             .expect("frame within 5s of restart")
             .expect("fresh channel open");
         backend.stop_capture().await;
+    }
+
+    /// The pre-bridge drop counter contract: an installed counter is
+    /// bumped when the producer drops a frame at the full bounded
+    /// channel, and installing at all makes the backend report itself
+    /// wired (`true`). Hermetic — no OS capture; the producer is a pure
+    /// test-card thread whose channel simply isn't drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_counter_counts_try_send_full_drops() {
+        let backend = SyntheticBackend::new();
+        let drops = Arc::new(AtomicU64::new(0));
+        assert!(
+            backend.install_capture_frame_drop_counter(Arc::clone(&drops)),
+            "synthetic backend must report the drop counter as wired"
+        );
+
+        // Never drain the receiver: the channel (capacity 4) fills and
+        // every further send is a Full drop.
+        let _rx = backend.start_capture(30).await.expect("start");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        backend.stop_capture().await;
+        assert!(
+            drops.load(Ordering::SeqCst) > 0,
+            "producer must count Full drops while the channel goes undrained"
+        );
     }
 
     /// The real-OS backends get this treatment `#[ignore]`d on operator
