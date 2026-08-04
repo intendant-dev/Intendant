@@ -1187,6 +1187,24 @@ impl EncoderPool {
             .collect()
     }
 
+    /// RIDs of always-on [`BASELINE_CODEC`] layers currently paused, in
+    /// spec order. Observability accessor for the session metrics
+    /// snapshot (`paused_layers` in `DisplayMetricsSnapshot`): the
+    /// paused set at a point in time is the layer-policy fact a
+    /// degraded-stream log needs alongside fps rates. Same
+    /// return-a-`Vec` rationale as [`Self::always_on_ids`] — callers
+    /// never hold the `always_on` read lock.
+    pub fn paused_baseline_rids(&self) -> Vec<String> {
+        self.inner
+            .always_on
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|h| h.id.codec == BASELINE_CODEC && h.paused.load(Ordering::SeqCst))
+            .map(|h| h.id.rid.to_string())
+            .collect()
+    }
+
     /// Snapshot the on-demand encoder IDs that currently have at least
     /// one subscriber (`refcount > 0`) — the same active-encoder
     /// universe [`Self::request_keyframe_all`] targets on the on-demand
@@ -3598,6 +3616,37 @@ mod tests {
             pool.has_active_consumer(),
             "a single resumed layer re-establishes demand"
         );
+    }
+
+    /// `paused_baseline_rids` — the metrics snapshot's paused-layer
+    /// probe: names exactly the paused always-on [`BASELINE_CODEC`]
+    /// layers, in spec order, tracking pause/resume live. (On Windows,
+    /// where the baseline codec is H.264, a VP8 pool contributes
+    /// nothing — the accessor reports only baseline-bank state.)
+    #[tokio::test]
+    async fn pool_paused_baseline_rids_tracks_pause_state() {
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
+        assert!(
+            pool.paused_baseline_rids().is_empty(),
+            "nothing paused at construction"
+        );
+
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::quarter());
+        pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Spec order (f, h, q), not pause order.
+            assert_eq!(pool.paused_baseline_rids(), vec!["h", "q"]);
+            pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
+            assert_eq!(pool.paused_baseline_rids(), vec!["q"]);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // VP8 is not the Windows baseline codec: paused VP8 layers
+            // are not baseline-bank state.
+            assert!(pool.paused_baseline_rids().is_empty());
+        }
     }
 
     /// Tile-standby contract on the on-demand side: a paused on-demand
