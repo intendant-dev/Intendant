@@ -2101,8 +2101,8 @@ function updateSharedViewBanner() {
 }
 
 // ── Peer shared-view banners ────────────────────────────────────────────
-// One banner per federated peer whose agent currently presents a shared
-// view ("look here"), derived from the daemons snapshot
+// One compact, dismissible chip per federated peer whose agent currently
+// presents a shared view ("look here"), derived from the daemons snapshot
 // (PeerSnapshot.shared_view — folded daemon-side, hide retires it to
 // null, every change arrives as a peer_state_changed push). Rendered
 // into #peer-shared-view-banners on the Activity log pane by
@@ -2110,6 +2110,16 @@ function updateSharedViewBanner() {
 // announcement also routes to Activity like the local shared-view
 // handler does.
 const peerSharedViewLastSig = new Map();
+// Browser-local dismissals: host_id → the dismissed announcement
+// signature. Purely this-tab UI state — the daemon-side fold and the
+// Live peer display row are untouched. A genuinely new announcement
+// (any signature change) re-surfaces the chip, and hide/disconnect
+// drops the host from all three maps, so a fresh show after a hide
+// re-surfaces it too.
+const peerSharedViewDismissed = new Map();
+// host_id → epoch ms when the current signature was first seen (feeds
+// the chip tooltip; the wire fold carries no timestamp).
+const peerSharedViewSeenAt = new Map();
 
 function peerSharedViewSignature(view) {
   return [view.action || '', view.display_id ?? '', view.display_target || '',
@@ -2125,13 +2135,24 @@ function renderPeerSharedViewBanners() {
   let newArrival = false;
   const liveHosts = new Set(rows.map(d => d.host_id));
   for (const host of Array.from(peerSharedViewLastSig.keys())) {
-    if (!liveHosts.has(host)) peerSharedViewLastSig.delete(host);
+    if (!liveHosts.has(host)) {
+      peerSharedViewLastSig.delete(host);
+      peerSharedViewDismissed.delete(host);
+      peerSharedViewSeenAt.delete(host);
+    }
   }
   const frag = document.createDocumentFragment();
+  let shown = 0;
   for (const d of rows) {
     const view = d.shared_view;
+    const sig = peerSharedViewSignature(view);
     if (!peerSharedViewLastSig.has(d.host_id)) newArrival = true;
-    peerSharedViewLastSig.set(d.host_id, peerSharedViewSignature(view));
+    if (peerSharedViewLastSig.get(d.host_id) !== sig) {
+      peerSharedViewSeenAt.set(d.host_id, Date.now());
+    }
+    peerSharedViewLastSig.set(d.host_id, sig);
+    if (peerSharedViewDismissed.get(d.host_id) === sig) continue;
+    peerSharedViewDismissed.delete(d.host_id);
     const name = (typeof compactSessionText === 'function'
       ? compactSessionText(d.label || d.host_id)
       : (d.label || d.host_id)) || d.host_id;
@@ -2144,20 +2165,27 @@ function renderPeerSharedViewBanners() {
         : action === 'capture' ? 'Captured'
           : 'Viewing';
     const detail = view.reason || view.note || '';
-    const banner = document.createElement('div');
-    banner.className = 'shared-view-banner peer-shared-view-banner';
-    banner.setAttribute('role', 'status');
-    const kicker = document.createElement('span');
-    kicker.className = 'shared-view-kicker';
-    kicker.textContent = `Peer · ${name}`;
-    const message = document.createElement('span');
-    message.className = 'shared-view-message';
-    message.textContent = detail ? `${verb} ${target}: ${detail}` : `${verb} ${target}`;
-    const actions = document.createElement('span');
-    actions.className = 'shared-view-actions';
+    const seenAt = peerSharedViewSeenAt.get(d.host_id);
+    const seen = seenAt
+      ? new Date(seenAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '';
+    const chip = document.createElement('div');
+    chip.className = 'peer-shared-view-chip';
+    chip.setAttribute('role', 'status');
+    chip.title = `${name} — ${verb} ${target}${detail ? `: ${detail}` : ''}`
+      + (seen ? ` (since ${seen})` : '');
+    const host = document.createElement('span');
+    host.className = 'peer-chip-host';
+    host.textContent = name;
+    const what = document.createElement('span');
+    what.className = 'peer-chip-what';
+    what.textContent = `${verb} ${target}`;
+    const reason = document.createElement('span');
+    reason.className = 'peer-chip-reason';
+    reason.textContent = detail;
     const open = document.createElement('button');
     open.type = 'button';
-    open.className = 'shared-view-action';
+    open.className = 'peer-chip-open';
     open.textContent = 'Open';
     open.title = `Watch this display live on ${name}`;
     open.addEventListener('click', () => {
@@ -2166,14 +2194,22 @@ function renderPeerSharedViewBanners() {
         window.selectLivePeerDisplay(d.host_id, view.display_id ?? null);
       }
     });
-    actions.appendChild(open);
-    banner.appendChild(kicker);
-    banner.appendChild(message);
-    banner.appendChild(actions);
-    frag.appendChild(banner);
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'peer-chip-dismiss';
+    dismiss.textContent = '×';
+    dismiss.title = 'Dismiss (this browser only)';
+    dismiss.setAttribute('aria-label', `Dismiss shared-view notice from ${name}`);
+    dismiss.addEventListener('click', () => {
+      peerSharedViewDismissed.set(d.host_id, sig);
+      renderPeerSharedViewBanners();
+    });
+    chip.append(host, what, reason, open, dismiss);
+    frag.appendChild(chip);
+    shown += 1;
   }
   container.replaceChildren(frag);
-  container.classList.toggle('hidden', rows.length === 0);
+  container.classList.toggle('hidden', shown === 0);
   if (newArrival
       && activeTab !== 'displays'
       && (activeTab !== 'activity' || activeActivitySubtab !== 'log')) {
