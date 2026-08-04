@@ -762,6 +762,25 @@ function buildSessionCard(m, derived, ctx) {
     top.appendChild(badge);
   }
 
+  // Update-abstraction §3 (R4): a session still FINISHING on a draining
+  // sibling daemon wears its origin — grade-1 chip text (the old-build
+  // indicator is the copy split, per the daemon's R-A1 stamp compare);
+  // the title carries the mechanics.
+  const heldBy = s.boot && typeof s.boot === 'object'
+    && s.boot.held_by && typeof s.boot.held_by === 'object'
+    ? s.boot.held_by : null;
+  if (heldBy) {
+    const chip = document.createElement('span');
+    chip.className = 'ui-chip info sc-held-by-chip';
+    chip.textContent = heldBy.same_build === true
+      ? 'finishing on the previous daemon'
+      : 'finishing on the previous version';
+    chip.title = `Still running on the previous daemon (:${heldBy.port}`
+      + `${heldBy.boot_id ? `, boot ${heldBy.boot_id}` : ''}`
+      + `${heldBy.phase ? `, ${heldBy.phase}` : ''}) — messages route there; it continues here when done.`;
+    top.appendChild(chip);
+  }
+
   main.appendChild(top);
 
   // Task
@@ -923,7 +942,11 @@ function buildSessionCard(m, derived, ctx) {
     const actions = document.createElement('div');
     actions.className = 'sc-actions';
 
-    if (s.can_resume !== false) {
+    // A held_by row's session is LIVE on the draining sibling — resuming
+    // here would mint a competing wrapper for a session that never
+    // ended (the specimen-5 write-side blindness). It moves here on its
+    // own when done; the chip says so.
+    if (s.can_resume !== false && !heldBy) {
       const resumeBtn = document.createElement('button');
       resumeBtn.className = 'ui-btn sc-resume-btn';
       resumeBtn.textContent = 'Resume session';
@@ -1007,7 +1030,9 @@ function buildSessionCard(m, derived, ctx) {
         const hasMedia = (s.recordings || 0) > 0 || (s.frames_bytes || 0) > 0;
         if (hasMedia) addItem('Delete all media', 'media', (s.recording_bytes || 0) + (s.frames_bytes || 0));
         if ((s.turns_bytes || 0) > 0) addItem('Delete turn data', 'turns', s.turns_bytes);
-        if (!isCurrent) addItem(sessionDeleteLabel, 'session', sessionDeleteBytes, true);
+        // No whole-session delete while a draining sibling still runs it
+        // (same reasoning as the current-session guard: live work).
+        if (!isCurrent && !heldBy) addItem(sessionDeleteLabel, 'session', sessionDeleteBytes, true);
 
         if (menu.children.length > 0) {
           actions.appendChild(menu);
