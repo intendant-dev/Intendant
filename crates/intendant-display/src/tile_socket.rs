@@ -205,38 +205,15 @@ impl DisplaySession {
                 }
                 last_delta_tick_at = Some(now);
 
-                let mut rects = std::mem::take(&mut pending_rects);
-                if uses_frame_diff {
-                    let tracker = frame_diff.take().unwrap_or_else(|| {
-                        capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX)
-                    });
-                    let diff_result = tokio::task::spawn_blocking({
-                        let frame = Arc::clone(&frame);
-                        move || {
-                            let mut tracker = tracker;
-                            let rects = tracker.diff_frame(&frame);
-                            (tracker, rects)
-                        }
-                    })
-                    .await;
-                    match diff_result {
-                        Ok((tracker, Ok(diff_rects))) => {
-                            frame_diff = Some(tracker);
-                            rects.extend(diff_rects);
-                        }
-                        Ok((tracker, Err(e))) => {
-                            frame_diff = Some(tracker);
-                            eprintln!(
-                                "[display/tile-socket] display {display_id} frame-diff failed: {e}"
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[display/tile-socket] display {display_id} frame-diff task failed: {e}"
-                            );
-                        }
-                    }
-                }
+                let rects = crate::resolve_tile_tick_damage(
+                    &frame,
+                    std::mem::take(&mut pending_rects),
+                    uses_frame_diff,
+                    &mut frame_diff,
+                    display_id,
+                    "[display/tile-socket]",
+                )
+                .await;
 
                 if rects.is_empty() {
                     continue;

@@ -15,6 +15,23 @@
 //! many tile re-encodes per frame — that decision is empirical and
 //! belongs to the integration slice, not D-1.
 //!
+//! ## These rects are candidates, not truth
+//!
+//! Under a compositing WM (GNOME Shell/Mutter, KWin, …) root-window
+//! damage fires on compositor *repaints*, not pixel change: observed
+//! live (2026-08-02, GNOME X11), an on-screen clock repainting
+//! pixel-identical content reported an up-to-full-root bounding box
+//! about once a second, and any small real change did the same —
+//! trusted as dirt, that flooded the tile lane with full-screen deltas
+//! and flapped the tile↔video fallback policy. Even without a
+//! compositor, one BoundingBox event merges two distant small damages
+//! into a near-full-screen box, and RawRectangles would not fix the
+//! repaint-without-change class. The tile consumers therefore
+//! pixel-verify every reported rect
+//! ([`super::frame_diff::FrameDiffDamageTracker::verify_damage`])
+//! before it becomes tile dirt; this backend stays a cheap *where to
+//! look* signal.
+//!
 //! ## Why this connection is independent of the XShm capture connection
 //!
 //! XDamage subscriptions are per-X11-connection. Sharing a connection
