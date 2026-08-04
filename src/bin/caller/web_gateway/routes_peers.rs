@@ -2272,12 +2272,22 @@ pub(crate) async fn handle_federated_webrtc_signal(
             // through their own subscriber loops. Federation WS-close
             // does the bulk variant of both at the gateway WS-close
             // hook.
-            apply_release_input_authority_federated(
+            //
+            // Lifecycle variant: a Close signal is subscription
+            // teardown, not a user's Release — the viewer's bounded
+            // auto-reconnect sends it before re-opening (and a pane
+            // close sends it too). A held grant therefore leaves a
+            // continuity window so the same viewer's successor
+            // subscription can resume the user's still-standing grant;
+            // an explicit user Release arrives separately on the
+            // authority data channel and voids continuity instead.
+            apply_lifecycle_release_input_authority_federated(
                 display_id,
                 &federation_connection_id,
                 &session_id,
                 &display_input_authority,
                 &authority_change_tx,
+                std::time::Instant::now(),
             );
             unregister_federated_authority_subscriber(
                 &federation_connection_id,

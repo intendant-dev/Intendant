@@ -38899,7 +38899,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'd6bd088769679ecd';
+const INTENDANT_APP_BUILD = '8c93e0387d153b63';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -118568,6 +118568,15 @@ if (tileTestEnabled()) {
 // successful connect and by the manual Retry button.
 const peerDisplayReconnectAttempts = new Map();
 
+// Authority continuity: how long a pane keeps auto-resuming a held
+// federated input-authority grant across reconnects. Mirrors the
+// peer-side FEDERATED_AUTHORITY_CONTINUITY_WINDOW
+// (web_gateway/input_authority.rs) — the peer is the enforcement point
+// (an automatic resume request is refused outside its window, and never
+// displaces a live holder); this browser-side deadline only stops the
+// pane from re-asking after the peer would refuse anyway.
+const PEER_AUTHORITY_RESUME_WINDOW_MS = 45000;
+
 // ── FEDERATED peer-display viewer policy ────────────────────────────────
 // The named home for every deliberate difference between
 // PeerDisplayConnection and the local DisplaySlot (whose counterpart is
@@ -118890,6 +118899,19 @@ class PeerDisplayConnection {
     this._fallbackNoteTimer = null;
     // Item 7b: 5s no-answer timeout for Take Control.
     this._takePendingTimer = null;
+    // Authority continuity across transport churn (the federated encoder
+    // ladder's slot rebuilds reconnect the whole pane): set on the
+    // SUCCESSOR connection by openPeerDisplay when the pane it replaces
+    // held federated input authority ('you') — a standing user grant the
+    // user never released — or was itself still mid-resume. While set,
+    // the first authoritative non-'you' state on the new authority
+    // channel triggers an automatic `resume: true` re-request; the peer
+    // only honors it inside its continuity window and never against a
+    // live holder, so this can't steal control that moved elsewhere
+    // during the reconnect. Cleared on grant ('you'), on explicit
+    // releaseControl(), and when the deadline lapses.
+    this._pendingAuthorityResume = false;
+    this._authorityResumeDeadline = 0;
     // **Phase 0 visual-freshness sampler** (task #83). `null` unless
     // the dashboard URL is opened with `?diag=1`. Activated in
     // `ontrack` once the video stream is attached (so videoWidth /
@@ -119441,8 +119463,11 @@ class PeerDisplayConnection {
     // `crates/intendant-display/src/webrtc/mod.rs::AUTHORITY_CHANNEL_LABEL`). Wire
     // format pinned by `parse_authority_channel_message_round_trip`:
     //   { "t": "display_input_authority_request", "display_id": N }
+    //   { "t": "display_input_authority_request", "display_id": N, "resume": true }
     //   { "t": "display_input_authority_release", "display_id": N }
     //   { "t": "display_input_authority_state",   "display_id": N, "state": "you|other|unclaimed" }
+    // (`resume: true` marks the automatic continuity re-request sent by
+    // `_attemptAuthorityResume`; peers predating it read a plain request.)
     //
     // Default ordered+reliable — authority state must not be
     // reordered (a `you → other → you` flap arriving as
@@ -119952,6 +119977,17 @@ class PeerDisplayConnection {
       // user no longer wants.
       this._takeControlPending = false;
     }
+    // Authority continuity: a grant consumes the carried resume intent;
+    // any other authoritative state while it's armed is the cue to
+    // re-assert the user's standing grant on this successor connection.
+    // Attempts are strictly state-push-driven (at most one in flight),
+    // so a peer-side refusal — which sends nothing — can't loop.
+    if (state === 'you') {
+      this._pendingAuthorityResume = false;
+      this._authorityResumeDeadline = 0;
+    } else if (this._pendingAuthorityResume) {
+      this._attemptAuthorityResume(state);
+    }
     // F-2: enter / exit interactive mode based on the authoritative
     // state. Mirrors local DisplaySlot's `setAuthority` arms exactly:
     //   - state == 'you' AND not yet interactive → install listeners.
@@ -120127,15 +120163,52 @@ class PeerDisplayConnection {
     }
     // Item 7b: parity with the local slot — a request the peer never
     // answers resets itself with a toast instead of hanging forever.
+    this._armTakePendingTimer(false);
+  }
+
+  // Item 7b timer, shared by the user click (takeControl → toast on
+  // silence) and the automatic continuity re-request (silent: an unmet
+  // automatic attempt is not the user's failure to confess by toast —
+  // the chip already shows the truthful state).
+  _armTakePendingTimer(silent) {
     if (this._takePendingTimer) window.clearTimeout(this._takePendingTimer);
     this._takePendingTimer = window.setTimeout(() => {
       this._takePendingTimer = null;
       if (!this._takeControlPending) return;
       this._takeControlPending = false;
-      if (typeof showControlToast === 'function') {
+      if (!silent && typeof showControlToast === 'function') {
         showControlToast('error', 'The peer did not answer the input-control request — try again');
       }
     }, DISPLAY_VIEWER_TAKE_PENDING_TIMEOUT_MS);
+  }
+
+  // Authority continuity: re-assert a carried, still-standing user grant
+  // from this successor connection. Sent with `resume: true`, which the
+  // peer honors only inside the continuity window minted when the
+  // predecessor's held grant was torn down by transport churn — and never
+  // against a live holder — so this automatic frame can't win an
+  // arbitration the user's click didn't already win. Called from
+  // setPeerAuthorityState on each authoritative non-'you' push while the
+  // intent is armed: the first push is usually 'unclaimed' (peer released
+  // on the predecessor's close) and resumes immediately; an 'other' push
+  // can be the predecessor's not-yet-reaped ghost after an unclean drop —
+  // the peer refuses that attempt silently and the follow-up 'unclaimed'
+  // broadcast (when the ghost reaps) triggers the attempt that lands.
+  _attemptAuthorityResume(state) {
+    if (Date.now() > this._authorityResumeDeadline) {
+      this._pendingAuthorityResume = false;
+      this._authorityResumeDeadline = 0;
+      this._log('info', 'input-authority resume window expired — Take Control needs a fresh click');
+      return;
+    }
+    if (this._takeControlPending) return; // an attempt is already in flight
+    this._takeControlPending = true;
+    if (!this._sendAuthorityFrame('display_input_authority_request', { resume: true })) {
+      this._takeControlPending = false;
+      return;
+    }
+    this._log('info', `auto-resuming held input authority (state was '${state}')`);
+    this._armTakePendingTimer(true);
   }
 
   // F-1.3c: user-intent release. Sends Release on the authority
@@ -120154,6 +120227,10 @@ class PeerDisplayConnection {
     }
     this._sendAuthorityFrame('display_input_authority_release');
     this._takeControlPending = false;
+    // Explicit user release ends the standing grant — never auto-resume
+    // past it. (The peer-side release also voids its continuity window.)
+    this._pendingAuthorityResume = false;
+    this._authorityResumeDeadline = 0;
   }
 
   // F-1.3c: serialize and send a Request/Release frame on the
@@ -120162,8 +120239,10 @@ class PeerDisplayConnection {
   // finishes negotiating; in that case we silently drop and let
   // the user retry once the chip resolves out of 'unknown'. Same
   // forgive-the-race policy as local DisplaySlot's
-  // `request_display_input_authority` WS path.
-  _sendAuthorityFrame(t) {
+  // `request_display_input_authority` WS path. `extra` merges
+  // additional fields into the frame (the continuity path's
+  // `{ resume: true }` marker).
+  _sendAuthorityFrame(t, extra) {
     if (!this.authorityChannel || this.authorityChannel.readyState !== 'open') {
       this._log('warn',
         `${t} dropped — authority channel not open ` +
@@ -120179,6 +120258,7 @@ class PeerDisplayConnection {
       this.authorityChannel.send(JSON.stringify({
         t,
         display_id: this.displayId,
+        ...(extra || {}),
       }));
       this._log('debug', `sent ${t} (display_id=${this.displayId})`);
       return true;
@@ -120336,6 +120416,27 @@ class PeerDisplayConnection {
 }
 
 async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
+  // Authority continuity: every reconnect (auto-retry, manual Retry, a
+  // re-click of "View display") replaces the PeerDisplayConnection —
+  // fresh session id — via this path. If the pane being replaced held
+  // federated input authority ('you' — a standing user grant that was
+  // never released) or was itself still mid-resume, carry that intent to
+  // the successor so it can auto-re-request control once its authority
+  // channel reports the post-churn state. The deadline carries across
+  // chained reconnects — the clock runs from the first interruption of an
+  // actually-held grant, matching the peer-side continuity window.
+  let resumeAuthority = false;
+  let resumeDeadline = 0;
+  for (const conn of peerDisplayConnections.values()) {
+    if (conn.hostId !== hostId || Number(conn.displayId) !== Number(displayId)) continue;
+    if (conn.peerAuthorityState === 'you') {
+      resumeAuthority = true;
+      resumeDeadline = Date.now() + PEER_AUTHORITY_RESUME_WINDOW_MS;
+    } else if (conn._pendingAuthorityResume) {
+      resumeAuthority = true;
+      resumeDeadline = conn._authorityResumeDeadline;
+    }
+  }
   // One session per host in slice 3a — close any previous before
   // opening a fresh one. Avoids accumulating stale RTCPeerConnections
   // when the user clicks "View display" repeatedly.
@@ -120355,6 +120456,11 @@ async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
     }
   }
   const conn = new PeerDisplayConnection(hostId, displayId, sessionId, effectiveUrl);
+  if (resumeAuthority && resumeDeadline > Date.now()) {
+    conn._pendingAuthorityResume = true;
+    conn._authorityResumeDeadline = resumeDeadline;
+    conn._log('info', 'carrying held input authority across the reconnect — will auto-resume');
+  }
   peerDisplayConnections.set(conn.sessionKey(), conn);
   conn.attachToDom();
   await conn.connect();
@@ -120468,6 +120574,7 @@ window.qa = Object.assign(window.qa || {}, {
           ? { mode: conn._overlay.mode, text: conn._overlay.text }
           : null,
         authority: conn.peerAuthorityState,
+        pendingAuthorityResume: Boolean(conn._pendingAuthorityResume),
       };
     });
   },

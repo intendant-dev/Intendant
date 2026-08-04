@@ -596,8 +596,20 @@ impl DisplayInputAuthorityState {
 ///
 /// ```text
 /// { "t": "display_input_authority_request", "display_id": 0 }
+/// { "t": "display_input_authority_request", "display_id": 0, "resume": true }
 /// { "t": "display_input_authority_release", "display_id": 0 }
 /// ```
+///
+/// `resume` (optional, default `false`) marks an *automatic continuity
+/// re-request*: the viewer held input authority when its subscription was
+/// torn down by transport churn (encoder-slot rebuild, reconnect) and is
+/// re-asserting the user's still-standing grant on the successor
+/// subscription. The policy layer treats it strictly narrower than a plain
+/// request — it only re-grants inside the peer-side continuity window and
+/// never displaces a live holder — so an automated frame can never win an
+/// arbitration a user click did not already win. Peers predating the field
+/// ignore unknown keys and see a plain request (their pre-continuity
+/// grant semantics).
 ///
 /// This module parses these frames off the wire and hands
 /// them to an opaque [`AuthorityChannelHandler`] without applying any
@@ -608,7 +620,7 @@ impl DisplayInputAuthorityState {
 /// module parses the wire shape, while the gate lives outside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityChannelMessage {
-    Request { display_id: u32 },
+    Request { display_id: u32, resume: bool },
     Release { display_id: u32 },
 }
 

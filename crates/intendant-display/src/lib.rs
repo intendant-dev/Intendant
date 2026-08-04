@@ -7108,7 +7108,10 @@ mod tests {
         let handler = lifecycle_gated_authority_handler(&source, inner);
         let handler_in_flight = Arc::clone(&handler);
         let request_thread = std::thread::spawn(move || {
-            handler_in_flight(webrtc::AuthorityChannelMessage::Request { display_id: 0 });
+            handler_in_flight(webrtc::AuthorityChannelMessage::Request {
+                display_id: 0,
+                resume: false,
+            });
         });
 
         // The callback is now running. Its lifecycle read guard must span the
@@ -7148,7 +7151,10 @@ mod tests {
             !invalidation_finished_while_handler_ran,
             "source invalidation completed while the authority callback still held the gate"
         );
-        handler(webrtc::AuthorityChannelMessage::Request { display_id: 0 });
+        handler(webrtc::AuthorityChannelMessage::Request {
+            display_id: 0,
+            resume: false,
+        });
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
