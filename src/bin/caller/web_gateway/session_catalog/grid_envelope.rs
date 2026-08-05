@@ -1124,6 +1124,11 @@ mod tests {
             "/api/local-daemons/tokens",
             "action: 'start_task', task: text, session_id: sid",
             "is gone — this session can't take messages there anymore",
+            // Slice-3 ruling N2, folded into slice 4's re-pin pass: the
+            // unreachable branch's distinctive prefix gets its own
+            // needle — without it that branch alone could vanish while
+            // the shared tail below still matched the gone branch.
+            "Could not reach the previous daemon",
             "continues here when the handover completes",
         ] {
             assert!(

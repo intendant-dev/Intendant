@@ -301,6 +301,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var backendSupervisor: BackendSupervisor!
     var port: Int = 8765
     let portSearchLimit = 20
+    /// Q6 (update-abstraction §4.4): while this app supervises a
+    /// single-instance daemon, the port is an implementation detail —
+    /// the window is just "Intendant", including across one-click
+    /// update swaps. The suffix survives only when the app launched
+    /// into a shared-host topology (its preferred port was already
+    /// taken — the manual multi-instance case), where it is
+    /// load-bearing disambiguation between co-homed instances.
+    var sharedHostTopology = false
+
+    func windowTitle(for port: Int) -> String {
+        sharedHostTopology ? "Intendant (port \(port))" : "Intendant"
+    }
     var launchPlan: BackendLaunchPlan!
     var backendSession: URLSession!
     var backendTrustDelegate: BackendTrustDelegate?
@@ -338,6 +350,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             port = availablePort
             if port != preferredPort {
                 NSLog("Port \(preferredPort) in use — using port \(port)")
+                sharedHostTopology = true
             }
         } else {
             let lastPort = preferredPort + portSearchLimit - 1
@@ -910,7 +923,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         if let controller = webView?.configuration.userContentController {
             installUserScripts(controller, port: newPort)
         }
-        window?.title = newPort == 8765 ? "Intendant" : "Intendant (port \(newPort))"
+        // Q6: an app-supervised swap never renames the window — the
+        // fresh port is the supervisor's own mechanics. The suffix
+        // stays only for shared-host topologies (set at launch).
+        window?.title = windowTitle(for: newPort)
         if dashboardActive {
             dashboardActive = false
             activateDashboard()
@@ -1020,7 +1036,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             backing: .buffered,
             defer: false
         )
-        window.title = port == 8765 ? "Intendant" : "Intendant (port \(port))"
+        window.title = windowTitle(for: port)
         window.contentView = webView
         window.minSize = NSSize(width: 600, height: 400)
         // ARC owns the window through `self.window`; the default

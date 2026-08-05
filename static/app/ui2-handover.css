@@ -354,6 +354,20 @@ html.ui-v2 .update-lane-advanced > summary {
   font-size: 11px;
   color: var(--muted, #7e8896);
 }
+/* The shared grade-2 fold (update-abstraction §4): mechanics under one
+   sticky "Advanced" disclosure on the banner, the predecessor
+   sections, and the update chip alike. */
+html.ui-v2 .handover-advanced {
+  margin-top: 6px;
+}
+html.ui-v2 .handover-advanced > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted, #7e8896);
+}
+html.ui-v2 .handover-advanced[open] > summary {
+  margin-bottom: 4px;
+}
 html.ui-v2 .update-lane-swap:not(:empty) {
   margin-top: 10px;
   padding: 8px 10px;

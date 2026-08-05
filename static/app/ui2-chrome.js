@@ -43,6 +43,12 @@ const UI2_NAV_GROUPS = [
 
 const UI2_TAB_TITLES = {};
 
+// The update family's palette synonyms — what users type when they mean
+// the update lane without knowing its labels ("release", "hotswap").
+// Rides the generic `keywords` field palette entries may carry; the
+// palette stays a what-you-see label matcher first.
+const UI2_UPDATE_KEYWORDS = ['update', 'release', 'channel', 'upgrade', 'hotswap', 'swap'];
+
 function ui2BuildNav() {
   const groupsHost = document.getElementById('ui2-nav-groups');
   if (!groupsHost) return;
@@ -723,6 +729,7 @@ function ui2PaletteActionEntries(q) {
       entries.push({
         section: 'Actions', icon: 'daemon', label: String(served.label),
         inert: served.busy === true,
+        keywords: UI2_UPDATE_KEYWORDS,
         run: () => { try { served.run(); } catch (e) { console.warn('[ui2] update action failed', e); } },
       });
     }
@@ -731,6 +738,7 @@ function ui2PaletteActionEntries(q) {
   if (updateLane && typeof updateLane.check === 'function') {
     entries.push({
       section: 'Actions', icon: 'daemon', label: 'Check for updates',
+      keywords: UI2_UPDATE_KEYWORDS,
       run: () => {
         routeTo('access', 'daemons');
         try { updateLane.check(); } catch (e) { console.warn('[ui2] update check failed', e); }
@@ -758,13 +766,29 @@ function ui2PaletteEntries(q) {
       entries.push(item);
     }
   }
-  // Label-only matching for labeled entries: users type what they SEE
+  // The update lane's pure destination (owner-directed, 2026-08-04):
+  // goes to the Daemon update card and fires NOTHING — the "Check for
+  // updates" action beside it stays the consent POST. Palette-only (no
+  // nav-rail seat): a Go-to row, not a machine surface of its own.
+  entries.push({
+    label: 'Daemon update', icon: 'daemon',
+    route: ['access', 'daemons'], anchor: 'update-lane-card',
+    keywords: UI2_UPDATE_KEYWORDS,
+  });
+  // Label matching for labeled entries: users type what they SEE
   // (id matching surprised — "sta" surfaced Usage via its internal id).
-  // `matchless` entries carry the query themselves (sessions already
-  // matched; the deep-search verb embeds it).
-  const filtered = entries.filter((item) => !query || item.label.toLowerCase().includes(query));
+  // An entry may also carry an explicit `keywords` alias list — the
+  // deliberate synonyms lane (generic; the update family populates it)
+  // — matched the same substring way. `matchless` entries carry the
+  // query themselves (sessions already matched; the deep-search verb
+  // embeds it).
+  const matchesQuery = (item) => !query
+    || item.label.toLowerCase().includes(query)
+    || (Array.isArray(item.keywords)
+        && item.keywords.some((k) => String(k).toLowerCase().includes(query)));
+  const filtered = entries.filter(matchesQuery);
   const actions = ui2PaletteActionEntries(q)
-    .filter((item) => item.matchless || !query || item.label.toLowerCase().includes(query));
+    .filter((item) => item.matchless || matchesQuery(item));
   // Agenda section (lens destinations + item hits): provided by
   // ui2-agenda-hood.js under this fragment's convention — cross-fragment
   // state is read by name at event time with a typeof guard, so the
@@ -845,7 +869,15 @@ function ui2PaletteGo(item) {
     return;
   }
   if (item.tab) routeTo(item.tab);
-  else if (item.route) routeTo(item.route[0], item.route[1]);
+  else if (item.route) {
+    routeTo(item.route[0], item.route[1]);
+    // Destination entries may name an in-pane anchor: pure scroll,
+    // never an action.
+    if (item.anchor) {
+      const anchorEl = document.getElementById(item.anchor);
+      if (anchorEl) anchorEl.scrollIntoView({ block: 'start' });
+    }
+  }
 }
 
 function ui2PaletteOpen() {

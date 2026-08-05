@@ -443,13 +443,20 @@ successor without kill-and-relaunch:
   `holdouts` (each holding session's id, name, backend, phase, and its
   durable `limit_park` marker with the reset instant), the drainer's
   presence record mirrors a capped row copy beside `session_count`, and
-  the dashboard's drain banner lists WHO holds and until WHEN under a
-  prominent doorway to the successor. Both banner kinds (this daemon
-  draining; a predecessor draining) dock in a strip under the oversight
-  bar — never over the tab chrome — and collapse to a one-line pill
-  persisted per (kind, boot id): an unseen fact expands once, and no
-  dismiss exists while the fact is true, mirroring the update chip's
-  standing-fact pattern. If the successor dies while the
+  the dashboard's drain banner speaks two grades: grade 1 tells the
+  product event plainly ("Updating Intendant — your work continues",
+  a portless "Open the updated dashboard →" doorway, "Waiting for the
+  updated daemon to start…" while no successor serves), while the
+  mechanics — the drain/lease story, the ported doorway, and the WHO
+  holds / until WHEN wait-set rows — live verbatim under a sticky
+  Advanced fold shared by every handover surface. Both banner kinds
+  (this daemon draining; a predecessor draining) dock in a strip under
+  the oversight bar — never over the tab chrome — and collapse to a
+  one-line pill persisted per (kind, boot id): an unseen fact expands
+  once, and no dismiss exists while the fact is true, mirroring the
+  update chip's standing-fact pattern. The drain-entry notification
+  layers the same two grades into its one body — the grade-1 event,
+  then the mechanics sentence after a line break. If the successor dies while the
   drainer still drains, ONE loud notification says standing automations
   are paused until someone relaunches or takes over — the drainer never
   reclaims the lease.
@@ -469,9 +476,13 @@ successor without kill-and-relaunch:
   drainer that exited while the successor was down, or crashed
   mid-drain, is still adjudicated. The summary notification names the
   predecessor, so a handover pickup reads apart from crash recovery.
-  While the predecessor still drains, the successor-side banner names
-  the spared set ("N sessions still finishing there", with the same
-  holdout rows), one section per draining co-homed daemon.
+  While the predecessor still drains, the successor-side banner tells
+  the grade-1 story ("Finishing up (N tasks) on the previous version",
+  counts summed across however many daemons still finish); the
+  mechanics — one section per draining co-homed daemon, its port, and
+  its named holdout rows ("N sessions still finishing there") — sit
+  under the banner's Advanced fold, which shares one sticky open-state
+  key across every handover surface.
 
 `intendant ctl status` shows the whole story under `scheduler_lease`
 (role, drain state, and every co-homed boot with probed liveness).

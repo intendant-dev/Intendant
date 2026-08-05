@@ -41,6 +41,15 @@
 //     same-sha rebuild is a real update). The packaged app follows by
 //     itself (didSwapToPort) and relay-reached surfaces get honest copy
 //     instead — port substitution means nothing there.
+// Vocabulary (update-abstraction §4, slice 4): every surface here
+// speaks TWO GRADES. Grade 1, the default, tells the product event in
+// plain words — "Updating Intendant — your work continues." — and
+// never names ports, boot ids, lease state, or drain mechanics (the
+// negative vocabulary pin makes that mechanical). Grade 2 is the full
+// mechanics copy, verbatim, inside a per-surface <details> fold that
+// persists under ONE shared key across the handover surfaces (Q7):
+// open the mechanics once and the banner, the predecessor sections,
+// and the update chip all stay open to them.
 (() => {
   const HANDOVER_POLL_MS = 30000;
   let bannerEl = null;
@@ -509,9 +518,11 @@
     head.appendChild(collapse);
     el.appendChild(head);
     if (disk) {
-      strong.textContent = 'Update on disk';
+      // Grade 1: the product fact; the commit/built/running provenance
+      // is grade-2 mechanics under the shared fold below.
+      strong.textContent = 'Update ready';
       el.appendChild(document.createTextNode(
-        `commit ${disk.git_sha || '?'} · built ${disk.built_at || '?'} — running ${running.git_sha || '?'}`
+        'A newer build of Intendant is ready to install.'
       ));
       if (update.honesty) {
         const honesty = document.createElement('div');
@@ -543,6 +554,16 @@
       el.appendChild(pending);
     }
     el.appendChild(handoverUpdateActions(body, disk));
+    // Grade 2 — both builds' provenance, verbatim, inside the shared
+    // fold (the banner's key: mechanics open together everywhere).
+    if (disk) {
+      const fold = handoverAdvancedFold();
+      const mech = document.createElement('div');
+      mech.className = 'handover-update-note';
+      mech.textContent = `commit ${disk.git_sha || '?'} · built ${disk.built_at || '?'} — running ${running.git_sha || '?'}`;
+      fold.appendChild(mech);
+      el.appendChild(fold);
+    }
     // The pill expands into the full update panel: the chip stays the
     // standing fact; channels, checks, and builds live there.
     if (typeof routeTo === 'function') {
@@ -818,21 +839,64 @@
     return collapse;
   }
 
-  // The predecessor pill's one line, honest about what is known: the
-  // port when there is one predecessor, the summed still-finishing
-  // count only when every predecessor reports one.
-  function bannerPredecessorPill(others) {
+  // ── The two-grade vocabulary (update-abstraction §4, slice 4) ──────
+  // Grade 2 lives inside a <details> fold persisted under ONE shared
+  // key (Q7): "show me the mechanics" is a stance, not a per-surface
+  // choice — the banner, the predecessor sections, and the update chip
+  // all honor it together. (The update panel's Dev-channel fold keeps
+  // its own key: that one selects a channel, it does not disclose
+  // mechanics.)
+  const HANDOVER_ADVANCED_KEY = 'handover-advanced-open';
+  function handoverAdvancedStored() {
+    try { return localStorage.getItem(HANDOVER_ADVANCED_KEY) === '1'; } catch (_) { return false; }
+  }
+  function handoverAdvancedStore(open) {
+    try {
+      if (open) localStorage.setItem(HANDOVER_ADVANCED_KEY, '1');
+      else localStorage.removeItem(HANDOVER_ADVANCED_KEY);
+    } catch (_) { /* storage unavailable — the fold lives for this page only */ }
+  }
+  function handoverAdvancedFold() {
+    const fold = document.createElement('details');
+    fold.className = 'handover-advanced';
+    if (handoverAdvancedStored()) fold.open = true;
+    fold.addEventListener('toggle', () => handoverAdvancedStore(fold.open));
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced';
+    fold.appendChild(summary);
+    return fold;
+  }
+
+  function handoverTaskCount(n) {
+    return `${n} task${n === 1 ? '' : 's'}`;
+  }
+
+  // The grade-1 predecessor story (§5.3): N draining siblings fold into
+  // ONE line. The count sums session_count when every sibling reports
+  // one, and stays silent when any does not — never a guessed number.
+  // The version/daemon split is the slice-3 honesty precedent carried
+  // over (R-A1's stamp-pair law: git_sha AND built_at — a same-commit
+  // rebuild is a different build): only when EVERY draining sibling
+  // provably runs this daemon's own build does the story say "the
+  // previous daemon" instead of narrating an update that never was.
+  function predecessorStoryLine(body, others) {
     const counts = others.map((d) => Number(d && d.session_count));
     const total = counts.every((n) => Number.isFinite(n) && n >= 0)
       ? counts.reduce((a, b) => a + b, 0)
       : null;
-    const finishing = total === null ? '' : ` — ${total} session${total === 1 ? '' : 's'} finishing`;
-    if (others.length === 1) {
-      const port = Number(others[0] && others[0].port);
-      const where = Number.isFinite(port) && port > 0 ? ` on :${port}` : '';
-      return `A predecessor daemon is draining${where}${finishing}`;
-    }
-    return `${others.length} predecessor daemons are draining${finishing}`;
+    const pair = (v) => (v && typeof v === 'object' && v.git_sha)
+      ? `${v.git_sha}@${v.built_at || ''}`
+      : '';
+    const own = (Array.isArray(body.daemons) ? body.daemons : []).find(
+      (d) => d && d.boot_id === body.boot_id
+    );
+    const ownPair = pair(own && own.version);
+    const sameBuild = Boolean(ownPair)
+      && others.every((d) => pair(d && d.version) === ownPair);
+    const where = sameBuild ? 'on the previous daemon' : 'on the previous version';
+    return total === null
+      ? `Finishing up ${where}`
+      : `Finishing up (${handoverTaskCount(total)}) ${where}`;
   }
 
   // The §5.1 live-holder resolution rule (update-abstraction intake) —
@@ -1450,8 +1514,8 @@
       // pill.
       if (followWatch.phase !== 'consent' && bannerCollapsedNow(el, key)) {
         bannerFillPill(el, key, rows.length
-          ? `This daemon is draining — waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}`
-          : 'This daemon is draining — in-flight sessions are finishing');
+          ? `Updating Intendant — finishing up (${handoverTaskCount(rows.length)})`
+          : 'Updating Intendant — your work continues');
         handoverBannerReserve();
         return;
       }
@@ -1463,31 +1527,52 @@
       el.removeAttribute('role');
       el.removeAttribute('tabindex');
       el.removeAttribute('title');
-      el.appendChild(bannerCollapseButton(key, 'Collapse the drain banner to a pill'));
+      el.appendChild(bannerCollapseButton(key, 'Collapse the update banner to a pill'));
+      // Grade 1: the product event, plain — the port stays in the
+      // doorway's href and inside Advanced (§4.2).
       const head = document.createElement('div');
       head.className = 'handover-banner-head';
       const lead = document.createElement('strong');
-      lead.textContent = 'This daemon is draining.';
+      lead.textContent = 'Updating Intendant — your work continues.';
       head.appendChild(lead);
       const tail = document.createElement('span');
       tail.textContent = rows.length
-        ? ` Waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}, then it exits.`
-        : ' In-flight sessions finish here, then it exits.';
+        ? ` Finishing up (${handoverTaskCount(rows.length)}) here, then the updated daemon takes over.`
+        : ' Wrapping up here, then the updated daemon takes over.';
       head.appendChild(tail);
       el.appendChild(head);
       if (holder) {
-        el.appendChild(
-          handoverDaemonLink(holder.port, `Open the successor daemon (:${holder.port}) →`)
-        );
+        el.appendChild(handoverDaemonLink(holder.port, 'Open the updated dashboard →'));
       } else {
         const none = document.createElement('div');
         none.className = 'handover-banner-note';
-        none.textContent = 'No successor has acquired the lease yet.';
+        none.textContent = 'Waiting for the updated daemon to start…';
         el.appendChild(none);
       }
       const followSection = followBannerSection();
       if (followSection) el.appendChild(followSection);
-      if (rows.length) el.appendChild(handoverHoldoutList(rows, rows.length));
+      // Grade 2 — the mechanics, verbatim, inside the shared fold: the
+      // lease story, the ported doorway, and the named wait set with
+      // its phases.
+      const fold = handoverAdvancedFold();
+      const mech = document.createElement('div');
+      mech.className = 'handover-banner-note';
+      mech.textContent = 'This daemon is draining.' + (rows.length
+        ? ` Waiting on ${rows.length} in-flight session${rows.length === 1 ? '' : 's'}, then it exits.`
+        : ' In-flight sessions finish here, then it exits.');
+      fold.appendChild(mech);
+      if (holder) {
+        fold.appendChild(
+          handoverDaemonLink(holder.port, `Open the successor daemon (:${holder.port}) →`)
+        );
+      } else {
+        const pending = document.createElement('div');
+        pending.className = 'handover-banner-note';
+        pending.textContent = 'No successor has acquired the lease yet.';
+        fold.appendChild(pending);
+      }
+      if (rows.length) fold.appendChild(handoverHoldoutList(rows, rows.length));
+      el.appendChild(fold);
       handoverBannerReserve();
       return;
     }
@@ -1504,36 +1589,54 @@
       // once; the same set stays as the owner left it.
       const key = bannerStateKey('predecessor',
         others.map((d) => String((d && d.boot_id) || 'unknown')).sort().join('+'));
+      const story = predecessorStoryLine(body, others);
       if (bannerCollapsedNow(el, key)) {
-        bannerFillPill(el, key, bannerPredecessorPill(others));
+        bannerFillPill(el, key, story);
         handoverBannerReserve();
         return;
       }
-      el.appendChild(bannerCollapseButton(key, 'Collapse the predecessor banner to a pill'));
+      el.appendChild(bannerCollapseButton(key, 'Collapse the finishing-up banner to a pill'));
+      // Grade 1: one story for however many daemons still finish (§5.3)
+      // — the counts fold into one number, the ports stay in Advanced.
+      const head = document.createElement('div');
+      head.className = 'handover-banner-head';
+      const lead = document.createElement('strong');
+      lead.textContent = `${story}.`;
+      head.appendChild(lead);
+      el.appendChild(head);
+      const promise = document.createElement('div');
+      promise.className = 'handover-banner-note';
+      promise.textContent = 'Everything continues here once that work finishes.';
+      el.appendChild(promise);
+      // Grade 2 — the #729 per-daemon enumeration, verbatim, inside the
+      // shared fold: one section per draining co-homed daemon, its
+      // port, its doorway, and its named holdout rows.
+      const fold = handoverAdvancedFold();
       others.forEach((d) => {
         const port = Number(d.port);
         const count = Number(d.session_count);
         const section = document.createElement('div');
         section.className = 'handover-predecessor';
-        const head = document.createElement('div');
-        head.className = 'handover-banner-head';
-        const lead = document.createElement('span');
-        lead.textContent = `A predecessor daemon is draining${Number.isFinite(port) ? ` on :${port}` : ''}`
+        const mech = document.createElement('div');
+        mech.className = 'handover-banner-head';
+        const line = document.createElement('span');
+        line.textContent = `A predecessor daemon is draining${Number.isFinite(port) ? ` on :${port}` : ''}`
           + `${Number.isFinite(count) ? ` — ${count} session${count === 1 ? '' : 's'} still finishing there` : ''}.`;
-        head.appendChild(lead);
+        mech.appendChild(line);
         if (Number.isFinite(port) && port > 0) {
-          head.appendChild(document.createTextNode(' '));
-          head.appendChild(handoverDaemonLink(port, `Open :${port} →`));
+          mech.appendChild(document.createTextNode(' '));
+          mech.appendChild(handoverDaemonLink(port, `Open :${port} →`));
         }
-        section.appendChild(head);
+        section.appendChild(mech);
         const rows = Array.isArray(d.holdouts) ? d.holdouts : [];
         if (rows.length) section.appendChild(handoverHoldoutList(rows, count));
         const note = document.createElement('div');
         note.className = 'handover-banner-note';
         note.textContent = 'Mid-work sessions it releases are picked up here when it exits.';
         section.appendChild(note);
-        el.appendChild(section);
+        fold.appendChild(section);
       });
+      el.appendChild(fold);
       handoverBannerReserve();
       return;
     }
