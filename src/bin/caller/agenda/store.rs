@@ -7651,8 +7651,14 @@ mod tests {
         let err = store3
             .apply_stamp_command(stamp_cmd_with_notes("triage", &["  "]), owner(), 5000)
             .unwrap_err();
-        assert!(err.to_string().contains("stamp note must not be empty"), "{err}");
-        assert!(store3.snapshot().is_empty(), "nothing parks on a refused note");
+        assert!(
+            err.to_string().contains("stamp note must not be empty"),
+            "{err}"
+        );
+        assert!(
+            store3.snapshot().is_empty(),
+            "nothing parks on a refused note"
+        );
     }
 
     /// Steward N1 (slice-1 gate): the deleted registry invariants used
