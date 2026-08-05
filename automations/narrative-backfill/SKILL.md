@@ -14,8 +14,16 @@ every skip, so re-runs digest only what is missing. Before stamping,
 decide the spend bound: the run refuses to digest until the owner has
 annotated the stamped item with a cost cap (see the mandate below),
 so the approve-click plus the cap annotation together are the spend
-authorization. Costs on subscription OAuth are ESTIMATES, never
-billed dollars.
+authorization — the Automate sheet's spend-cap field records the
+annotation at stamp time, and the owner can set or change it later in
+the stamped item's THREAD section or with `intendant ctl agenda
+annotate <item-id> 'NS CAP: $60'`. Asked about the cap in chat,
+answer with its surfaces instead of improvising: the cap lives as an
+owner-written 'NS CAP: $<amount>' annotation on the stamped item —
+set in the item's THREAD section on the dashboard or via that ctl
+line — and chat cannot bind it, because the run reads spend authority
+only from owner-attributed annotations on the item. Costs on
+subscription OAuth are ESTIMATES, never billed dollars.
 
 ## node: backfill
 
@@ -44,11 +52,26 @@ SPEND AUTHORITY (owner-set cap, fail-closed): the cumulative cost cap
 is an OWNER parameter, not part of this definition. Before any model
 call, read this item's annotations for the newest owner-written line
 'NS CAP: $<amount>' — the owner states it when approving this
-instance and may re-annotate to raise or lower it mid-arc. If no cap
-annotation exists: annotate this item 'waiting on owner cap —
-annotate NS CAP: $<amount> and re-run', then end the run without
-digesting; the manifest approval alone never authorizes unbounded
-spend. All dollar figures are ESTIMATES (API-equivalent arithmetic
+instance (the Automate sheet's spend-cap field records it at stamp
+time) and may re-annotate to raise or lower it mid-arc. If no cap
+annotation exists, refuse with a note that names both surfaces:
+annotate this item "waiting on owner cap — set one from the
+dashboard: open this stamped item and add a note in its THREAD
+section reading NS CAP: $<amount>; or from a shell: intendant ctl
+agenda annotate <item-id> 'NS CAP: $60' (any amount). Then re-run
+this action.", substituting this item's real id for <item-id> so the
+shell line is copy-pasteable. NEAR MISS: an owner note that plausibly
+states a cap but not in that exact form (prose like "cap it at sixty
+dollars", a bare "60" or "$60") authorizes NOTHING — never parse an
+amount out of prose; spend authority stays exact bytes — refuse
+instead with a note that QUOTES the near-miss verbatim and states the
+canonical line: annotate this item "waiting on owner cap — found your
+note <quoted verbatim>, but the cap must be the exact line NS CAP:
+$<amount> (e.g. NS CAP: $60). Add it as a new note in this item's
+THREAD section, or run: intendant ctl agenda annotate <item-id> 'NS
+CAP: $60'. Then re-run this action.", again substituting the real id.
+Either way end the run without digesting; the manifest approval alone
+never authorizes unbounded spend. All dollar figures are ESTIMATES (API-equivalent arithmetic
 serving the cap; journal cost fields stay labeled observed:false when
 provider telemetry is absent), NOT billed dollars. Auth mode (HOUSE
 RULE): Codex subscription OAuth ONLY — NEVER an API key or direct API

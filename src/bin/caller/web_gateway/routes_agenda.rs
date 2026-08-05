@@ -536,6 +536,11 @@ struct StampRequest {
     suspend_after: Option<u32>,
     #[serde(default)]
     agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+    /// Stamp-time owner notes — recorded on the stamped instance's
+    /// annotation surface with the caller's gate-resolved attribution
+    /// (the sheet's note / spend-cap field rides this).
+    #[serde(default)]
+    annotations: Vec<String>,
     #[serde(default)]
     source: Option<String>,
 }
@@ -568,6 +573,7 @@ pub(crate) async fn agenda_stamp_api_response(
         every_ms: request.every_ms,
         suspend_after: request.suspend_after,
         agent_config: request.agent_config,
+        annotations: request.annotations,
         source: request.source,
     };
     match agenda.stamp(cmd, actor) {

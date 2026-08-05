@@ -1056,9 +1056,16 @@ pin) for the approval sheet; `GET /api/agenda/sealed/{sha256}`
 content-addressed and re-hashed against the pin, so a card revisited
 after "Later" renders exactly what was sealed. From the CLI,
 `ctl agenda stamp <name|file:…/SKILL.md> [--project DIR] [--at WHEN]
-[--every INTERVAL] [--suspend-after N] [--agent …]` rides the ordinary
-op lane (works from owner shells and supervised sessions alike);
-approval stays per-effect on the dashboard or `ctl agenda approve`.
+[--every INTERVAL] [--suspend-after N] [--note TEXT]… [--agent …]`
+rides the ordinary op lane (works from owner shells and supervised
+sessions alike); approval stays per-effect on the dashboard or
+`ctl agenda approve`. The stamp op's `annotations` field records
+owner notes on the instance at park time, attributed to the stamping
+caller exactly like the annotate op: they land on the annotation
+surface the fired mandates read — the hub for a workflow (whose
+nodes are directed to read the hub's annotations), the action's
+single item otherwise (the item an action mandate's annotation-read
+laws mean by "this item", e.g. the narrative-backfill spend cap).
 The dashboard's Automate sheet consumes exactly these surfaces: the
 picker renders every catalog entry as what it means — title,
 house/personal provenance chip, shape line, description; invalid and
@@ -1067,10 +1074,18 @@ selecting one previews it for reading (header, per-node executors and
 edges for workflows, the authored prose) with the **exact bytes a stamp
 seals** one explicit expander away, labeled with their sha256.
 Stamping is one explicit gesture for every kind: a pre-stamp summary
-states what will be sealed, parked, and proposed, and the Stamp button
-fires the stamp op — the sheet neither proposes nor approves
-client-side. After the stamp, the ordinary card (or the workflow
-approval sheet) carries the ceremony. Stamped manifests then render
+states what will be sealed, parked, and proposed — including the
+executor pins that will actually record (the definition's node pins
+when no explicit pick is made; "daemon defaults" only when neither
+exists) — and the Stamp button fires the stamp op — the sheet
+neither proposes nor approves client-side. The sheet also carries a
+"Note to the stamped item" input riding the stamp op's `annotations`
+field; when the selected definition's text demands a spend cap (the
+`NS CAP: $` convention), the input relabels as the spend-cap field
+and a bare typed amount records as the canonical `NS CAP: $<amount>`
+line — no human hand-formats spend-authority bytes. After the stamp,
+the ordinary card (or the workflow approval sheet) carries the
+ceremony. Stamped manifests then render
 their sealed pins on the item panel: a refs strip (locator + pin chip +
 expandable sealed view served from the sealed lane) with an expand-time
 drift chip — `GET /api/agenda/items/{id}/refs/drift` re-hashes manifest
@@ -1515,10 +1530,17 @@ interrupted arc resumes from the journal; the live arc's standing
 resurrection cadence deliberately did not carry over). Its spend
 bound is an owner-set parameter, fail-closed: the run digests
 nothing until the owner has annotated the stamped item
-`NS CAP: $<amount>`, and re-annotating steers the cap mid-arc the
-way the live arc's owner did; on subscription OAuth every figure is
-an API-equivalent ESTIMATE, never billed dollars. The definition's
-orientation:
+`NS CAP: $<amount>` — the Automate sheet's spend-cap field records
+the annotation at stamp time, and it can be set or changed later in
+the item's THREAD section or via
+`intendant ctl agenda annotate <item-id> 'NS CAP: $60'`. A run that
+finds no cap refuses with an annotation naming both of those
+surfaces; a near-miss note that states a cap in prose is QUOTED
+verbatim in the refusal beside the canonical line to write — never
+parsed for an amount, so spend authority stays exact bytes.
+Re-annotating steers the cap mid-arc the way the live arc's owner
+did; on subscription OAuth every figure is an API-equivalent
+ESTIMATE, never billed dollars. The definition's orientation:
 
 ```text
 The bootstrap stage of the narrative-synthesis cycle: run once at
@@ -1528,8 +1550,16 @@ every skip, so re-runs digest only what is missing. Before stamping,
 decide the spend bound: the run refuses to digest until the owner has
 annotated the stamped item with a cost cap (see the mandate below),
 so the approve-click plus the cap annotation together are the spend
-authorization. Costs on subscription OAuth are ESTIMATES, never
-billed dollars.
+authorization — the Automate sheet's spend-cap field records the
+annotation at stamp time, and the owner can set or change it later in
+the stamped item's THREAD section or with `intendant ctl agenda
+annotate <item-id> 'NS CAP: $60'`. Asked about the cap in chat,
+answer with its surfaces instead of improvising: the cap lives as an
+owner-written 'NS CAP: $<amount>' annotation on the stamped item —
+set in the item's THREAD section on the dashboard or via that ctl
+line — and chat cannot bind it, because the run reads spend authority
+only from owner-attributed annotations on the item. Costs on
+subscription OAuth are ESTIMATES, never billed dollars.
 ```
 
 The mandate (byte-pinned to the definition file):
@@ -1554,11 +1584,26 @@ SPEND AUTHORITY (owner-set cap, fail-closed): the cumulative cost cap
 is an OWNER parameter, not part of this definition. Before any model
 call, read this item's annotations for the newest owner-written line
 'NS CAP: $<amount>' — the owner states it when approving this
-instance and may re-annotate to raise or lower it mid-arc. If no cap
-annotation exists: annotate this item 'waiting on owner cap —
-annotate NS CAP: $<amount> and re-run', then end the run without
-digesting; the manifest approval alone never authorizes unbounded
-spend. All dollar figures are ESTIMATES (API-equivalent arithmetic
+instance (the Automate sheet's spend-cap field records it at stamp
+time) and may re-annotate to raise or lower it mid-arc. If no cap
+annotation exists, refuse with a note that names both surfaces:
+annotate this item "waiting on owner cap — set one from the
+dashboard: open this stamped item and add a note in its THREAD
+section reading NS CAP: $<amount>; or from a shell: intendant ctl
+agenda annotate <item-id> 'NS CAP: $60' (any amount). Then re-run
+this action.", substituting this item's real id for <item-id> so the
+shell line is copy-pasteable. NEAR MISS: an owner note that plausibly
+states a cap but not in that exact form (prose like "cap it at sixty
+dollars", a bare "60" or "$60") authorizes NOTHING — never parse an
+amount out of prose; spend authority stays exact bytes — refuse
+instead with a note that QUOTES the near-miss verbatim and states the
+canonical line: annotate this item "waiting on owner cap — found your
+note <quoted verbatim>, but the cap must be the exact line NS CAP:
+$<amount> (e.g. NS CAP: $60). Add it as a new note in this item's
+THREAD section, or run: intendant ctl agenda annotate <item-id> 'NS
+CAP: $60'. Then re-run this action.", again substituting the real id.
+Either way end the run without digesting; the manifest approval alone
+never authorizes unbounded spend. All dollar figures are ESTIMATES (API-equivalent arithmetic
 serving the cap; journal cost fields stay labeled observed:false when
 provider telemetry is absent), NOT billed dollars. Auth mode (HOUSE
 RULE): Codex subscription OAuth ONLY — NEVER an API key or direct API

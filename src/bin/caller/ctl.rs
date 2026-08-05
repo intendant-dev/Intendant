@@ -2417,6 +2417,7 @@ async fn run_agenda(
                 "--at",
                 "--every",
                 "--suspend-after",
+                "--note",
                 "--source",
             ];
             value_flags.extend(AGENDA_LAUNCH_FLAGS);
@@ -2451,6 +2452,17 @@ async fn run_agenda(
                     .parse()
                     .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
                 map.insert("suspend_after".to_string(), Value::from(n));
+            }
+            // Stamp-time owner notes (repeatable): recorded on the stamped
+            // instance's annotation surface with this caller's
+            // attribution — e.g. --note 'NS CAP: $60' rides the exact
+            // spend-authority bytes the narrative-backfill mandate reads.
+            let notes: Vec<Value> = args
+                .all("--note")
+                .map(|n| Value::String(n.to_string()))
+                .collect();
+            if !notes.is_empty() {
+                map.insert("annotations".to_string(), Value::Array(notes));
             }
             insert_string(&mut map, "project_root", args.one("--project"));
             insert_string(&mut map, "source", args.one("--source"));
@@ -5880,6 +5892,9 @@ fn help_agenda() {
       # validates + seals the file, parks the instance graph, and proposes one manifest\n\
       # per node with the definition pinned as a binding ref — approves NOTHING; cadence/\n\
       # executor overrides apply to single-node actions only\n\
+      [--note TEXT]...   # stamp-time owner notes, recorded with your attribution on the\n\
+      # annotation surface the fired mandates read (a workflow's hub, an action's item) —\n\
+      # e.g. --note 'NS CAP: $60' sets the narrative-backfill spend cap at park\n\
       [--agent BACKEND] [--claude-model M] [--claude-effort E]\n\
       [--codex-model M] [--codex-reasoning-effort E] [--kimi-model M] [--kimi-thinking T]\n\
   intendant ctl agenda approve ID_PREFIX [--digest HEX]   # a blocked item approves fine —\n\
