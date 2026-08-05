@@ -165,13 +165,144 @@ pub(crate) fn check_refusal(flavor: &InstallFlavor, channel: UpdateChannel) -> O
     }
 }
 
+// ── The release-asset table (the per-platform gate) ─────────────────
+
+/// Host identity for the release-asset lookup (`std::env::consts`
+/// vocabulary), carried as a parameter everywhere it matters so the
+/// whole per-platform matrix stays hermetic under test on every host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostPlatform {
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+}
+
+impl HostPlatform {
+    /// The machine this daemon runs on — the transport edge; tests
+    /// name their platforms explicitly.
+    pub(crate) fn current() -> Self {
+        HostPlatform {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        }
+    }
+}
+
+/// How a verified release asset installs — declared per table row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseInstallKind {
+    /// A zip carrying `Intendant.app` at its root: unpacked and swapped
+    /// beside the running app ([`install_app_swap`]).
+    AppBundle,
+    /// A daemon binary for the watched path (future Windows/Linux
+    /// rows): staged beside the watched binary and renamed into place —
+    /// today [`install_plain_binary_release`] is a prepared, cleanly
+    /// refusing seam.
+    #[allow(dead_code)] // the prepared seam: first constructed by the first non-macOS table row
+    PlainBinary,
+}
+
+/// One installable release asset for one host platform.
+pub(crate) struct ReleaseAssetLane {
+    /// `std::env::consts::OS` / `ARCH` vocabulary.
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    /// The asset's exact name shape, `<prefix>…<suffix>` — the
+    /// selection filter and the selection refusal's "wanted" clause.
+    pub(crate) name_prefix: &'static str,
+    pub(crate) name_suffix: &'static str,
+    /// What the asset is, for owner-facing copy.
+    pub(crate) artifact_label: &'static str,
+    pub(crate) install: ReleaseInstallKind,
+}
+
+/// THE release-asset declaration: which published release asset
+/// installs on which host, stated once. Only macOS rows exist — the
+/// release lane publishes no Windows or Linux daemon assets yet — and
+/// every gate derives from here: produce refusals, the status
+/// `unavailable` note, and the chip's `one_click` fact consult
+/// [`release_asset_lane`]; asset selection takes the row's name shape;
+/// the install step takes the row's kind. Publishing assets for a new
+/// platform = adding its row (and filling the
+/// [`ReleaseInstallKind::PlainBinary`] install arm the first time) —
+/// the platform's refusals then age out by themselves; there is no
+/// further gating change to make.
+const RELEASE_ASSET_LANES: &[ReleaseAssetLane] = &[
+    ReleaseAssetLane {
+        os: "macos",
+        arch: "aarch64",
+        name_prefix: "Intendant-",
+        // The bundle script's arch vocabulary: aarch64 publishes as arm64.
+        name_suffix: "-macos-arm64.zip",
+        artifact_label: "the packaged macOS app",
+        install: ReleaseInstallKind::AppBundle,
+    },
+    ReleaseAssetLane {
+        os: "macos",
+        arch: "x86_64",
+        name_prefix: "Intendant-",
+        name_suffix: "-macos-x86_64.zip",
+        artifact_label: "the packaged macOS app",
+        install: ReleaseInstallKind::AppBundle,
+    },
+];
+
+/// The table row for a host, when its installable release asset exists.
+pub(crate) fn release_asset_lane(host: HostPlatform) -> Option<&'static ReleaseAssetLane> {
+    RELEASE_ASSET_LANES
+        .iter()
+        .find(|lane| lane.os == host.os && lane.arch == host.arch)
+}
+
+/// `std::env::consts::OS` → the platform's display name for refusal
+/// copy ("macos" prints poorly in an owner-facing sentence).
+fn platform_display_name(os: &str) -> &str {
+    match os {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    }
+}
+
+/// The one sentence naming a platform the release lane publishes no
+/// installable asset for. Every refusal that turns on "does this host
+/// have a release asset" composes it, so the copy has one author (the
+/// table above) and ages out with the platform's row. When the OS has
+/// rows for other arches, the sentence names the uncovered arch.
+fn no_release_assets_sentence(host: HostPlatform) -> String {
+    let os_name = platform_display_name(host.os);
+    if RELEASE_ASSET_LANES.iter().any(|lane| lane.os == host.os) {
+        format!(
+            "no {os_name} release assets are published yet for {}",
+            host.arch
+        )
+    } else {
+        format!("no {os_name} release assets are published yet")
+    }
+}
+
+/// The consumer-install refusal for a host without a published release
+/// asset (`None` = the asset exists) — also the status block's
+/// `unavailable` note, so the two surfaces cannot drift.
+pub(crate) fn release_asset_unavailable(host: HostPlatform) -> Option<String> {
+    if release_asset_lane(host).is_some() {
+        return None;
+    }
+    Some(format!(
+        "{} — rebuild from source on this platform",
+        no_release_assets_sentence(host)
+    ))
+}
+
 /// Why a produce click on `channel` cannot run for this install
-/// (`None` = it can). `macos` is a parameter so the whole matrix stays
-/// hermetic under test on every host.
+/// (`None` = it can). The host rides as a parameter so the whole
+/// per-platform matrix stays hermetic under test on every host; the
+/// release-channel arms consult the asset table, never a compile-time
+/// platform check.
 pub(crate) fn produce_refusal(
     flavor: &InstallFlavor,
     channel: UpdateChannel,
-    macos: bool,
+    host: HostPlatform,
 ) -> Option<String> {
     match (channel, flavor) {
         (_, InstallFlavor::Unmanaged { reason }) => {
@@ -181,41 +312,43 @@ pub(crate) fn produce_refusal(
         (UpdateChannel::Dev, InstallFlavor::ConsumerApp { .. }) => {
             check_refusal(flavor, UpdateChannel::Dev)
         }
-        (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) if !macos => Some(
-            "releases currently ship only the macOS app — rebuild from source on this \
-             platform"
-                .to_string(),
-        ),
-        (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) => None,
+        (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) => {
+            release_asset_unavailable(host)
+        }
         (
             UpdateChannel::Releases,
             InstallFlavor::Source {
                 repo_root,
                 app_bundle,
             },
-        ) => Some(if *app_bundle {
-            format!(
+        ) => Some(match release_asset_lane(host) {
+            None => format!(
+                "{} — updates for this install build from main (the Dev channel behind \
+                 Advanced)",
+                no_release_assets_sentence(host)
+            ),
+            Some(_) if *app_bundle => format!(
                 "this app is a source build from {} — its update path rebuilds from main \
                  (the Dev channel behind Advanced), not the release download",
                 repo_root.display()
-            )
-        } else {
-            format!(
-                "this daemon runs from the checkout at {} — a release would install the \
-                 packaged macOS app, not this binary; updates for this install build from \
-                 main (the Dev channel behind Advanced)",
-                repo_root.display()
-            )
+            ),
+            Some(lane) => format!(
+                "this daemon runs from the checkout at {} — a release would install {}, \
+                 not this binary; updates for this install build from main (the Dev \
+                 channel behind Advanced)",
+                repo_root.display(),
+                lane.artifact_label
+            ),
         }),
     }
 }
 
 /// The per-channel availability catalog the panel derives its sections
 /// and buttons from — declared here once, never mirrored client-side.
-pub(crate) fn channel_catalog(flavor: &InstallFlavor, macos: bool) -> serde_json::Value {
+pub(crate) fn channel_catalog(flavor: &InstallFlavor, host: HostPlatform) -> serde_json::Value {
     let channel_block = |channel: UpdateChannel| {
         let check = check_refusal(flavor, channel);
-        let produce = produce_refusal(flavor, channel, macos);
+        let produce = produce_refusal(flavor, channel, host);
         let mut block = serde_json::json!({
             "check": check.is_none(),
             "produce": produce.is_none(),
@@ -544,22 +677,14 @@ async fn probe_headroom() -> Headroom {
 
 // ── Verify seams (consumer lane) ────────────────────────────────────
 
-/// Map the running binary's arch vocabulary to the bundle script's
-/// (`uname -m`): release zips are named `Intendant-<ver>-macos-<arch>.zip`.
-pub(crate) fn bundle_arch(rust_arch: &str) -> &'static str {
-    match rust_arch {
-        "aarch64" => "arm64",
-        _ => "x86_64",
-    }
-}
-
-/// Pick the installable app artifact for this machine from a VERIFIED
-/// release plan, requiring its detached signature beside it. Refuses
-/// `-unsigned-dev` / `-signed-unnotarized` artifacts by construction:
-/// the accepted name shape is exactly `Intendant-…-macos-<arch>.zip`.
+/// Pick the installable artifact for this host's asset lane from a
+/// VERIFIED release plan, requiring its detached signature beside it.
+/// Refuses `-unsigned-dev` / `-signed-unnotarized` artifacts by
+/// construction: the accepted name shape is exactly the lane row's
+/// `<prefix>…<suffix>`.
 pub(crate) fn select_release_asset<'a>(
     artifacts: &'a [crate::hosted_verify::ReleaseArtifactPlan],
-    arch: &str,
+    lane: &ReleaseAssetLane,
 ) -> Result<
     (
         &'a crate::hosted_verify::ReleaseArtifactPlan,
@@ -567,16 +692,19 @@ pub(crate) fn select_release_asset<'a>(
     ),
     String,
 > {
-    let suffix = format!("-macos-{arch}.zip");
     let zip = artifacts
         .iter()
         .find(|artifact| {
-            artifact.name.starts_with("Intendant-") && artifact.name.ends_with(&suffix)
+            artifact.name.starts_with(lane.name_prefix) && artifact.name.ends_with(lane.name_suffix)
         })
         .ok_or_else(|| {
             format!(
-                "this release carries no installable macOS app for {arch} \
-                 (wanted Intendant-…{suffix}; dev/unnotarized artifacts are refused)"
+                "this release carries no installable asset for {} {} (wanted {}…{}; \
+                 dev/unnotarized artifacts are refused)",
+                platform_display_name(lane.os),
+                lane.arch,
+                lane.name_prefix,
+                lane.name_suffix
             )
         })?;
     let asc_name = format!("{}.asc", zip.name);
@@ -773,11 +901,8 @@ impl UpdateLane {
             }
             InstallFlavor::ConsumerApp { app_root } => {
                 obj.insert("app_root".into(), app_root.display().to_string().into());
-                if !cfg!(target_os = "macos") {
-                    obj.insert(
-                        "unavailable".into(),
-                        "releases currently ship only the macOS app".into(),
-                    );
+                if let Some(unavailable) = release_asset_unavailable(HostPlatform::current()) {
+                    obj.insert("unavailable".into(), unavailable.into());
                 }
             }
             InstallFlavor::Unmanaged { reason } => {
@@ -795,7 +920,7 @@ impl UpdateLane {
         }
         obj.insert(
             "channels".into(),
-            channel_catalog(&self.flavor, cfg!(target_os = "macos")),
+            channel_catalog(&self.flavor, HostPlatform::current()),
         );
         obj.insert("default_channel".into(), "releases".into());
         if let Ok(job) = self.job.lock() {
@@ -1012,7 +1137,7 @@ impl UpdateLane {
         channel: Option<UpdateChannel>,
     ) -> Result<serde_json::Value, String> {
         let channel = channel.unwrap_or_else(|| self.flavor.native_channel());
-        if let Some(refusal) = produce_refusal(&self.flavor, channel, cfg!(target_os = "macos")) {
+        if let Some(refusal) = produce_refusal(&self.flavor, channel, HostPlatform::current()) {
             return Err(refusal);
         }
         if self
@@ -1241,7 +1366,31 @@ impl UpdateLane {
             .await?;
             self.exe_path.clone()
         } else {
-            if let Some(mock_build) = mock_build_override() {
+            let produced = repo_root
+                .join("target")
+                .join("release")
+                .join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+            // Windows locks a running image against write and delete, so
+            // the build's final copy at the watched path — this daemon's
+            // own exe on a source install — fails with access denied. A
+            // same-volume RENAME of a running image is permitted: stage
+            // the old binary aside so the fresh build lands at the
+            // vacated path, and put it back if the build then fails.
+            // Unix replaces a running binary natively (the final step is
+            // an unlink + relink of the inode), so the flow is untouched
+            // there.
+            let aside = if cfg!(windows) {
+                stage_aside_build_output(&produced)?
+            } else {
+                None
+            };
+            if let Some(aside) = aside.as_deref() {
+                self.job_log(format!(
+                    "set the running binary aside at {} so the build can land",
+                    aside.display()
+                ));
+            }
+            let build = if let Some(mock_build) = mock_build_override() {
                 // Rig lane (PROVIDER=mock only): the e2e legs cannot pay
                 // for a real cargo build; the override script stands in
                 // for it and must still land the artifact at the watched
@@ -1254,7 +1403,7 @@ impl UpdateLane {
                     CHILD_ENV_BUILD,
                     BUILD_TIMEOUT,
                 )
-                .await?;
+                .await
             } else {
                 self.run_child(
                     "build",
@@ -1274,12 +1423,19 @@ impl UpdateLane {
                     CHILD_ENV_BUILD,
                     BUILD_TIMEOUT,
                 )
-                .await?;
+                .await
+            };
+            if let Err(err) = build {
+                if let Some(aside) = aside.as_deref() {
+                    if restore_aside_build_output(aside, &produced) {
+                        self.job_log(
+                            "build failed — restored the previous binary at the watched path",
+                        );
+                    }
+                }
+                return Err(err);
             }
-            repo_root
-                .join("target")
-                .join("release")
-                .join(format!("intendant{}", std::env::consts::EXE_SUFFIX))
+            produced
         };
 
         self.set_phase("verify");
@@ -1298,11 +1454,17 @@ impl UpdateLane {
     // ── Produce: consumer lane ──
 
     async fn produce_consumer(self: &Arc<Self>, app_root: &Path) -> Result<String, String> {
+        let host = HostPlatform::current();
+        let Some(lane) = release_asset_lane(host) else {
+            // request_produce's gate refused already; fail closed for
+            // any direct caller, with the table's own sentence.
+            return Err(release_asset_unavailable(host)
+                .unwrap_or_else(|| "no release-asset lane for this host".to_string()));
+        };
         self.set_phase("verify-manifest");
         let report = self.verified_release(None).await?;
-        let (zip, asc) =
-            select_release_asset(&report.artifacts, bundle_arch(std::env::consts::ARCH))
-                .map(|(zip, asc)| (zip.clone(), asc.clone()))?;
+        let (zip, asc) = select_release_asset(&report.artifacts, lane)
+            .map(|(zip, asc)| (zip.clone(), asc.clone()))?;
         self.job_log(format!(
             "release {} verified against the transparency log ({} artifacts; signing key {})",
             report.tag, report.artifact_count, report.pgp_fingerprint
@@ -1335,6 +1497,13 @@ impl UpdateLane {
         ));
 
         self.set_phase("install");
+        match lane.install {
+            // The prepared seam (no table row declares it yet): refuse
+            // cleanly; `cleanup` drops the verified download with the
+            // staging tree.
+            ReleaseInstallKind::PlainBinary => return install_plain_binary_release(lane),
+            ReleaseInstallKind::AppBundle => {}
+        }
         let unpack_dir = staging.join("unpacked");
         std::fs::create_dir_all(&unpack_dir).map_err(|err| format!("unpack dir: {err}"))?;
         self.run_child(
@@ -1539,7 +1708,7 @@ fn check_state_block(check: &CheckState) -> serde_json::Value {
 fn release_update_block(
     flavor: &InstallFlavor,
     releases: &CheckState,
-    macos: bool,
+    host: HostPlatform,
     running_version: &str,
 ) -> Option<serde_json::Value> {
     let checked_at_ms = releases.checked_at_ms?;
@@ -1554,7 +1723,7 @@ fn release_update_block(
     if *newer != Some(true) {
         return None;
     }
-    let produce = produce_refusal(flavor, UpdateChannel::Releases, macos);
+    let produce = produce_refusal(flavor, UpdateChannel::Releases, host);
     let mut block = serde_json::json!({
         "latest_tag": tag,
         "latest_version": version,
@@ -1581,7 +1750,7 @@ impl UpdateLane {
         release_update_block(
             &self.flavor,
             &slots.releases,
-            cfg!(target_os = "macos"),
+            HostPlatform::current(),
             crate::build_info::pkg_version(),
         )
     }
@@ -1646,6 +1815,87 @@ fn install_app_swap(new_app: &Path, app_root: &Path) -> Result<(), String> {
         return Err(format!("could not move the new app into place: {err}"));
     }
     Ok(())
+}
+
+/// The plain-binary release install arm — the prepared seam for the
+/// first non-macOS asset row. The shape, when a table row declares
+/// [`ReleaseInstallKind::PlainBinary`]: the verified artifact stages
+/// beside the watched binary and renames into place through the same
+/// set-aside dance the dev build uses ([`stage_aside_build_output`] —
+/// Windows cannot overwrite a running image in place), and the shipped
+/// watch/chip/swap lane takes over exactly as for a produced dev
+/// build. No published asset defines its archive layout yet, so this
+/// stub refuses cleanly instead of guessing — landing the first
+/// `PlainBinary` row means filling this arm in with that asset's real
+/// shape; until then the refusal names the gap honestly.
+fn install_plain_binary_release(lane: &ReleaseAssetLane) -> Result<String, String> {
+    Err(format!(
+        "the {} {} release asset verified, but its plain-binary install step is not built \
+         yet — refusing to guess at the artifact layout; rebuild from source on this \
+         platform",
+        platform_display_name(lane.os),
+        lane.arch
+    ))
+}
+
+/// The set-aside name prefix beside a build output — stale copies from
+/// earlier produces are recognized (and swept) by it.
+fn build_output_aside_prefix(file_name: &str) -> String {
+    format!("{file_name}.pre-update-")
+}
+
+/// Vacate the build-output path by renaming the file already there
+/// (the Windows dev-produce fix): Windows locks a running image
+/// against write and delete — cargo's final copy onto the watched
+/// path, which IS the running `intendant.exe` on a source install,
+/// fails with access denied — but permits a same-volume rename, so
+/// the fresh build can land at the vacated path. Stale set-asides
+/// from earlier produces are swept best-effort first (one still
+/// backing a running process stays locked until that process exits,
+/// and falls to a later sweep). Pure over the filesystem — hermetic
+/// under a tempdir on every host; the caller gates it to Windows,
+/// where the collision exists.
+fn stage_aside_build_output(output: &Path) -> Result<Option<PathBuf>, String> {
+    if !output.exists() {
+        return Ok(None);
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| "the build output path has no parent directory".to_string())?;
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the build output path has no usable name".to_string())?;
+    let prefix = build_output_aside_prefix(file_name);
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    let aside = parent.join(format!("{prefix}{}", super::now_ms()));
+    std::fs::rename(output, &aside).map_err(|err| {
+        format!(
+            "could not set the binary at {} aside for the build: {err}",
+            output.display()
+        )
+    })?;
+    Ok(Some(aside))
+}
+
+/// Undo a set-aside after a failed build: the watched path must not be
+/// left vacant — the update watch and the next produce both expect a
+/// binary there. A build that DID land something keeps it.
+fn restore_aside_build_output(aside: &Path, output: &Path) -> bool {
+    if output.exists() {
+        return false;
+    }
+    std::fs::rename(aside, output).is_ok()
 }
 
 /// Rig knob (PROVIDER=mock only): a script standing in for the cargo
@@ -1793,6 +2043,23 @@ pub(crate) fn spawn_update_lane(runtime: &Arc<super::HandoverRuntime>) {
 mod tests {
     use super::*;
 
+    const MACOS_ARM: HostPlatform = HostPlatform {
+        os: "macos",
+        arch: "aarch64",
+    };
+    const MACOS_X86: HostPlatform = HostPlatform {
+        os: "macos",
+        arch: "x86_64",
+    };
+    const WINDOWS: HostPlatform = HostPlatform {
+        os: "windows",
+        arch: "x86_64",
+    };
+    const LINUX: HostPlatform = HostPlatform {
+        os: "linux",
+        arch: "x86_64",
+    };
+
     // ── The pinned compare seam ──
 
     /// Commission pin: the behind-main compare folds the bounded git
@@ -1871,7 +2138,7 @@ mod tests {
             repo_root: PathBuf::from("/checkout"),
             app_bundle: false,
         };
-        let catalog = channel_catalog(&source, true);
+        let catalog = channel_catalog(&source, MACOS_ARM);
         assert_eq!(catalog["dev"]["check"], true);
         assert_eq!(catalog["dev"]["produce"], true);
         assert_eq!(
@@ -1890,7 +2157,7 @@ mod tests {
         let consumer = InstallFlavor::ConsumerApp {
             app_root: PathBuf::from("/Applications/Intendant.app"),
         };
-        let catalog = channel_catalog(&consumer, true);
+        let catalog = channel_catalog(&consumer, MACOS_ARM);
         assert_eq!(catalog["releases"]["produce"], true);
         assert_eq!(catalog["dev"]["check"], false);
         assert_eq!(catalog["dev"]["produce"], false);
@@ -1901,20 +2168,18 @@ mod tests {
                 .contains("no source checkout"),
             "{catalog}"
         );
-        let off_macos = channel_catalog(&consumer, false);
+        let off_macos = channel_catalog(&consumer, WINDOWS);
         assert_eq!(off_macos["releases"]["produce"], false);
-        assert!(
-            off_macos["releases"]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("only the macOS app"),
+        assert_eq!(
+            off_macos["releases"]["reason"],
+            "no Windows release assets are published yet — rebuild from source on this platform",
             "{off_macos}"
         );
 
         let unmanaged = InstallFlavor::Unmanaged {
             reason: "stray binary".to_string(),
         };
-        let catalog = channel_catalog(&unmanaged, true);
+        let catalog = channel_catalog(&unmanaged, MACOS_ARM);
         assert_eq!(catalog["releases"]["produce"], false);
         assert_eq!(catalog["dev"]["produce"], false);
         assert!(
@@ -1956,23 +2221,24 @@ mod tests {
             app_bundle: false,
         };
         assert_eq!(source.native_channel(), UpdateChannel::Dev);
-        assert!(produce_refusal(&source, UpdateChannel::Dev, true).is_none());
-        let cross = produce_refusal(&source, UpdateChannel::Releases, true).unwrap();
+        assert!(produce_refusal(&source, UpdateChannel::Dev, MACOS_ARM).is_none());
+        let cross = produce_refusal(&source, UpdateChannel::Releases, MACOS_ARM).unwrap();
         assert!(cross.contains("/checkout"), "{cross}");
+        assert!(cross.contains("packaged macOS app"), "{cross}");
 
         let bundle = InstallFlavor::Source {
             repo_root: PathBuf::from("/checkout"),
             app_bundle: true,
         };
-        let cross = produce_refusal(&bundle, UpdateChannel::Releases, true).unwrap();
+        let cross = produce_refusal(&bundle, UpdateChannel::Releases, MACOS_ARM).unwrap();
         assert!(cross.contains("source build"), "{cross}");
 
         let consumer = InstallFlavor::ConsumerApp {
             app_root: PathBuf::from("/Applications/Intendant.app"),
         };
         assert_eq!(consumer.native_channel(), UpdateChannel::Releases);
-        assert!(produce_refusal(&consumer, UpdateChannel::Releases, true).is_none());
-        assert!(produce_refusal(&consumer, UpdateChannel::Dev, true)
+        assert!(produce_refusal(&consumer, UpdateChannel::Releases, MACOS_ARM).is_none());
+        assert!(produce_refusal(&consumer, UpdateChannel::Dev, MACOS_ARM)
             .unwrap()
             .contains("no source checkout"));
 
@@ -1980,10 +2246,118 @@ mod tests {
             reason: "stray".to_string(),
         };
         for channel in [UpdateChannel::Releases, UpdateChannel::Dev] {
-            assert!(produce_refusal(&unmanaged, channel, true)
+            assert!(produce_refusal(&unmanaged, channel, MACOS_ARM)
                 .unwrap()
                 .contains("no update lane"));
         }
+    }
+
+    // ── The per-platform release-asset gate (the one declaration) ──
+
+    /// Current truth, pinned: the release lane publishes exactly the
+    /// two macOS app assets. Windows/Linux rows are the intended
+    /// aging-out path — the first one updates this pin and fills the
+    /// `PlainBinary` install arm with the asset's real shape; the
+    /// GATING (refusals, selection, `one_click`) needs no further
+    /// change, which the macOS rows prove through the same lookup.
+    #[test]
+    fn release_asset_table_is_macos_app_only_today() {
+        assert_eq!(RELEASE_ASSET_LANES.len(), 2);
+        for lane in RELEASE_ASSET_LANES {
+            assert_eq!(lane.os, "macos");
+            assert_eq!(lane.install, ReleaseInstallKind::AppBundle);
+        }
+        assert!(release_asset_lane(MACOS_ARM).is_some());
+        assert!(release_asset_lane(MACOS_X86).is_some());
+        assert!(release_asset_lane(WINDOWS).is_none());
+        assert!(release_asset_lane(LINUX).is_none());
+    }
+
+    /// The Windows-e2e finding's fix, pinned by exact copy: a platform
+    /// the asset table carries no row for refuses release produce by
+    /// NAME, and the one declaration drives the consumer refusal, the
+    /// source install's cross-channel copy, and the status note — so a
+    /// published asset ages every one of them out at once.
+    #[test]
+    fn missing_platform_refusals_name_the_platform_exactly() {
+        let consumer = InstallFlavor::ConsumerApp {
+            app_root: PathBuf::from("/opt/Intendant.app"),
+        };
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, WINDOWS).as_deref(),
+            Some(
+                "no Windows release assets are published yet — rebuild from source on this \
+                 platform"
+            ),
+        );
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, LINUX).as_deref(),
+            Some(
+                "no Linux release assets are published yet — rebuild from source on this \
+                 platform"
+            ),
+        );
+
+        // A covered OS with an uncovered arch names the arch too.
+        let exotic = HostPlatform {
+            os: "macos",
+            arch: "riscv64",
+        };
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, exotic).as_deref(),
+            Some(
+                "no macOS release assets are published yet for riscv64 — rebuild from \
+                 source on this platform"
+            ),
+        );
+
+        // The source install's releases refusal keeps pointing at the
+        // Dev channel, with the platform fact folded in.
+        let source = InstallFlavor::Source {
+            repo_root: PathBuf::from("/checkout"),
+            app_bundle: false,
+        };
+        assert_eq!(
+            produce_refusal(&source, UpdateChannel::Releases, WINDOWS).as_deref(),
+            Some(
+                "no Windows release assets are published yet — updates for this install \
+                 build from main (the Dev channel behind Advanced)"
+            ),
+        );
+
+        // The status note derives from the same declaration.
+        assert_eq!(
+            release_asset_unavailable(WINDOWS).as_deref(),
+            Some(
+                "no Windows release assets are published yet — rebuild from source on this \
+                 platform"
+            ),
+        );
+        assert_eq!(release_asset_unavailable(MACOS_ARM), None);
+        assert_eq!(release_asset_unavailable(MACOS_X86), None);
+    }
+
+    /// The plain-binary install arm is a prepared seam that refuses
+    /// cleanly by exact copy — download/verify are the shared lane
+    /// above it; the swap-in lands with the first Windows/Linux asset
+    /// row (no row declares `PlainBinary` yet, which the table pin
+    /// above enforces).
+    #[test]
+    fn plain_binary_install_arm_refuses_cleanly_today() {
+        let lane = ReleaseAssetLane {
+            os: "windows",
+            arch: "x86_64",
+            name_prefix: "Intendant-",
+            name_suffix: "-windows-x86_64.zip",
+            artifact_label: "the Windows daemon binary",
+            install: ReleaseInstallKind::PlainBinary,
+        };
+        assert_eq!(
+            install_plain_binary_release(&lane).unwrap_err(),
+            "the Windows x86_64 release asset verified, but its plain-binary install step \
+             is not built yet — refusing to guess at the artifact layout; rebuild from \
+             source on this platform"
+        );
     }
 
     /// Commission pin: release-vs-running is a semver compare that
@@ -2041,35 +2415,37 @@ mod tests {
     }
 
     /// Commission pin: the consumer lane installs only a release-shaped,
-    /// signed macOS artifact for THIS machine's arch — dev/unnotarized
-    /// suffixes and signature-less artifacts are refused.
+    /// signed artifact matching THIS host's asset-lane row —
+    /// dev/unnotarized suffixes and signature-less artifacts are
+    /// refused.
     #[test]
     fn release_asset_selection_fails_closed() {
+        let arm_lane = release_asset_lane(MACOS_ARM).expect("macOS aarch64 row");
+        let x86_lane = release_asset_lane(MACOS_X86).expect("macOS x86_64 row");
         let artifacts = vec![
             plan("Intendant-v0.1.0-macos-arm64.zip", "aa"),
             plan("Intendant-v0.1.0-macos-arm64.zip.asc", "bb"),
             plan("install.sh", "cc"),
         ];
-        let (zip, asc) = select_release_asset(&artifacts, "arm64").expect("selects the app zip");
+        let (zip, asc) = select_release_asset(&artifacts, arm_lane).expect("selects the app zip");
         assert_eq!(zip.name, "Intendant-v0.1.0-macos-arm64.zip");
         assert_eq!(asc.name, "Intendant-v0.1.0-macos-arm64.zip.asc");
 
+        let missing = select_release_asset(&artifacts, x86_lane).unwrap_err();
         assert!(
-            select_release_asset(&artifacts, "x86_64").is_err(),
-            "no artifact for another arch"
+            missing.contains("macOS x86_64") && missing.contains("Intendant-…-macos-x86_64.zip"),
+            "the selection refusal names the lane's platform and wanted shape: {missing}"
         );
         let unsigned = vec![plan("Intendant-v0.1.0-macos-arm64-unsigned-dev.zip", "aa")];
         assert!(
-            select_release_asset(&unsigned, "arm64").is_err(),
+            select_release_asset(&unsigned, arm_lane).is_err(),
             "dev-suffixed artifacts never install"
         );
         let missing_asc = vec![plan("Intendant-v0.1.0-macos-arm64.zip", "aa")];
         assert!(
-            select_release_asset(&missing_asc, "arm64").is_err(),
+            select_release_asset(&missing_asc, arm_lane).is_err(),
             "an artifact without its .asc is refused"
         );
-        assert_eq!(bundle_arch("aarch64"), "arm64");
-        assert_eq!(bundle_arch("x86_64"), "x86_64");
     }
 
     /// Commission pin (verify seam): downloaded bytes must hash to the
@@ -2309,7 +2685,7 @@ mod tests {
         let block = release_update_block(
             &consumer,
             &consumer_state("v0.2.0", "0.2.0", Some(true)),
-            true,
+            MACOS_ARM,
             "0.1.0",
         )
         .expect("a newer release renders the block");
@@ -2327,7 +2703,7 @@ mod tests {
             release_update_block(
                 &consumer,
                 &consumer_state("v0.1.0", "0.1.0", Some(false)),
-                true,
+                MACOS_ARM,
                 "0.1.0",
             )
             .is_none(),
@@ -2337,7 +2713,7 @@ mod tests {
             release_update_block(
                 &consumer,
                 &consumer_state("nightly", "nightly", None),
-                true,
+                MACOS_ARM,
                 "0.1.0",
             )
             .is_none(),
@@ -2349,20 +2725,20 @@ mod tests {
             outcome: Some(Err("release verification FAILED: tree head".to_string())),
         };
         assert!(
-            release_update_block(&consumer, &failed, true, "0.1.0").is_none(),
+            release_update_block(&consumer, &failed, MACOS_ARM, "0.1.0").is_none(),
             "an unverifiable release never becomes a chip"
         );
         assert!(
-            release_update_block(&consumer, &CheckState::default(), true, "0.1.0").is_none(),
+            release_update_block(&consumer, &CheckState::default(), MACOS_ARM, "0.1.0").is_none(),
             "never checked = no block"
         );
     }
 
     /// Slice-6 pin (one-click honesty): where the consumer produce lane
-    /// cannot honor a click — a source install, a non-macOS consumer,
-    /// an unmanaged binary — the block says so with the produce
-    /// refusal's own reason, and the chip's button becomes the panel
-    /// deep-link.
+    /// cannot honor a click — a source install, a consumer install on a
+    /// platform without a published asset, an unmanaged binary — the
+    /// block says so with the produce refusal's own reason, and the
+    /// chip's button becomes the panel deep-link.
     #[test]
     fn release_update_block_is_honest_about_the_one_click() {
         let state = consumer_state("v9.9.9", "9.9.9", Some(true));
@@ -2370,7 +2746,8 @@ mod tests {
             repo_root: PathBuf::from("/checkout"),
             app_bundle: false,
         };
-        let block = release_update_block(&source, &state, true, "0.1.0").expect("fact renders");
+        let block =
+            release_update_block(&source, &state, MACOS_ARM, "0.1.0").expect("fact renders");
         assert_eq!(block["one_click"], false);
         assert!(
             block["reason"].as_str().unwrap().contains("Dev channel"),
@@ -2380,21 +2757,28 @@ mod tests {
         let consumer = InstallFlavor::ConsumerApp {
             app_root: PathBuf::from("/apps/Intendant.app"),
         };
-        let off_macos =
-            release_update_block(&consumer, &state, false, "0.1.0").expect("fact renders");
-        assert_eq!(off_macos["one_click"], false);
-        assert!(
-            off_macos["reason"]
-                .as_str()
-                .unwrap()
-                .contains("only the macOS app"),
-            "{off_macos}"
+        let on_windows =
+            release_update_block(&consumer, &state, WINDOWS, "0.1.0").expect("fact renders");
+        assert_eq!(on_windows["one_click"], false);
+        assert_eq!(
+            on_windows["reason"],
+            "no Windows release assets are published yet — rebuild from source on this platform",
+            "{on_windows}"
+        );
+        let on_linux =
+            release_update_block(&consumer, &state, LINUX, "0.1.0").expect("fact renders");
+        assert_eq!(on_linux["one_click"], false);
+        assert_eq!(
+            on_linux["reason"],
+            "no Linux release assets are published yet — rebuild from source on this platform",
+            "{on_linux}"
         );
 
         let unmanaged = InstallFlavor::Unmanaged {
             reason: "stray binary".to_string(),
         };
-        let block = release_update_block(&unmanaged, &state, true, "0.1.0").expect("fact renders");
+        let block =
+            release_update_block(&unmanaged, &state, MACOS_ARM, "0.1.0").expect("fact renders");
         assert_eq!(block["one_click"], false);
         assert!(
             block["reason"].as_str().unwrap().contains("no update lane"),
@@ -2495,5 +2879,53 @@ mod tests {
             .join("MacOS")
             .join("old-marker")
             .is_file());
+    }
+
+    /// The Windows dev-produce lock fix, pinned hermetically (the
+    /// helper is pure over paths; production gates it to Windows,
+    /// where the running image blocks cargo's final copy but permits
+    /// the rename): an existing output is set aside so the path
+    /// vacates, stale asides from earlier produces are swept, a failed
+    /// build restores the set-aside binary — the watched path is never
+    /// left vacant behind a failure — and a landed build is never
+    /// clobbered by the restore.
+    #[test]
+    fn build_output_set_aside_vacates_sweeps_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir
+            .path()
+            .join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+
+        // Nothing on disk: nothing to set aside.
+        assert_eq!(stage_aside_build_output(&output).unwrap(), None);
+
+        std::fs::write(&output, b"running-binary").unwrap();
+        let file_name = output.file_name().unwrap().to_str().unwrap().to_string();
+        let stale = dir
+            .path()
+            .join(format!("{}stale", build_output_aside_prefix(&file_name)));
+        std::fs::write(&stale, b"stale-aside").unwrap();
+
+        let aside = stage_aside_build_output(&output)
+            .unwrap()
+            .expect("existing output set aside");
+        assert!(!output.exists(), "the path is vacated for the build");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"running-binary");
+        assert!(!stale.exists(), "stale asides from earlier produces are swept");
+
+        // Failed build (the path still vacant): the set-aside restores.
+        assert!(restore_aside_build_output(&aside, &output));
+        assert_eq!(std::fs::read(&output).unwrap(), b"running-binary");
+
+        // Successful build (a fresh artifact landed): never clobbered.
+        let aside = stage_aside_build_output(&output)
+            .unwrap()
+            .expect("set aside again");
+        std::fs::write(&output, b"fresh-build").unwrap();
+        assert!(
+            !restore_aside_build_output(&aside, &output),
+            "a landed build is never clobbered by the restore"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"fresh-build");
     }
 }
