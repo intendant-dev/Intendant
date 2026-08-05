@@ -260,8 +260,7 @@ if ($LASTEXITCODE -ne 0) {
     $caPath = Join-Path $certDir "ca.crt"
     $p12Path = Join-Path $certDir "client.p12"
     $passPath = Join-Path $certDir "p12_password"
-    $pkiReady = (Get-Command Import-Certificate -ErrorAction SilentlyContinue) -and
-        (Get-Command Import-PfxCertificate -ErrorAction SilentlyContinue)
+    $pkiReady = ((Get-Command Import-Certificate -ErrorAction SilentlyContinue) -and (Get-Command Import-PfxCertificate -ErrorAction SilentlyContinue))
     if ((Test-Path $caPath) -and (Test-Path $p12Path) -and (Test-Path $passPath) -and $pkiReady) {
         try {
             $caCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($caPath)
@@ -316,8 +315,7 @@ $connectBake = ""
 if ($Connect) {
     $connectBake = "`$env:INTENDANT_CONNECT_RENDEZVOUS_URL = '" + ($Connect -replace "'", "''") + "'"
     if ($DaemonId) {
-        $connectBake = $connectBake + [Environment]::NewLine +
-            "`$env:INTENDANT_CONNECT_DAEMON_ID = '" + ($DaemonId -replace "'", "''") + "'"
+        $connectBake = $connectBake + [Environment]::NewLine + "`$env:INTENDANT_CONNECT_DAEMON_ID = '" + ($DaemonId -replace "'", "''") + "'"
     }
 }
 $launcher = @'
@@ -328,9 +326,12 @@ $launcher = @'
 $exe = '__DAEMON_EXE__'
 __CONNECT_ENV__
 function Get-DashboardUrl {
-    $line = (& $exe ctl dashboard-url 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or -not $line) { return $null }
-    $url = "$line".Trim()
+    # Collect all output (it is one line) instead of piping into
+    # Select-Object -First: an early pipeline stop can kill the probe
+    # before it exits and leave $LASTEXITCODE stale.
+    $out = @(& $exe ctl dashboard-url 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $out.Count -eq 0 -or -not $out[0]) { return $null }
+    $url = "$($out[0])".Trim()
     # The token sidecar can outlive a dead daemon (reboot, power loss):
     # trust the URL only when its port actually accepts connections.
     $port = 8765
@@ -442,8 +443,10 @@ function Get-TokenedDashboardUrl {
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $line = (& $daemonExe ctl dashboard-url 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -eq 0 -and $line) { return "$line".Trim() }
+        # @(...) instead of `| Select-Object -First 1`: an early pipeline
+        # stop can kill the probe mid-run and leave $LASTEXITCODE stale.
+        $out = @(& $daemonExe ctl dashboard-url 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0 -and $out[0]) { return "$($out[0])".Trim() }
         return $null
     } catch {
         return $null
