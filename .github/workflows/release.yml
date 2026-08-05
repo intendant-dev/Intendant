@@ -8,6 +8,10 @@ name: release
 #    checksum-pinned fast path for Codex Cloud / remote-compute workers
 #    (scripts/codex-cloud/setup.sh's INTENDANT_CLOUD_BINARY_URL lane;
 #    docs/src/codex-cloud-workers.md, "Environment bootstrap");
+#  - the standalone Windows daemon + runtime pair (x86_64): one zip
+#    carrying `intendant.exe` + `intendant-runtime.exe` at their final
+#    sibling names; not Authenticode-signed while that lane stays
+#    dormant (SmartScreen will warn; the release notes say so);
 #  - the release-pinned install scripts.
 # Every published asset is PGP-signed and committed to the public
 # transparency log by the same steps, whichever job built it.
@@ -52,6 +56,24 @@ name: release
 #   NOTARY_KEY_B64           base64 of an App Store Connect API private key (.p8)
 #   NOTARY_KEY_ID            Key ID of that API key
 #   NOTARY_ISSUER_ID         Issuer ID of the API-keys page
+#
+# Windows Authenticode (DORMANT — parked like the Apple lane, but with
+# no signing step implemented yet; the owner may elect it later, with
+# Azure Trusted Signing as the named engagement path). Until then the
+# Windows zip publishes unsigned — SmartScreen will interpose on first
+# run, the release notes say so, and authenticity rides the PGP
+# signatures + transparency log like every other asset. The gate keeps
+# this family all-or-nothing and fails a tag run that configures it
+# while the signing step remains unbuilt: secrets that silently do
+# nothing are exactly the half-trust these gates refuse. Secret names,
+# exactly:
+#
+#   WINDOWS_SIGN_AZURE_TENANT_ID      Entra tenant of the signing identity
+#   WINDOWS_SIGN_AZURE_CLIENT_ID      app registration (client) ID
+#   WINDOWS_SIGN_AZURE_CLIENT_SECRET  client secret for that registration
+#   WINDOWS_SIGN_AZURE_ENDPOINT       Trusted Signing account endpoint URI
+#   WINDOWS_SIGN_AZURE_ACCOUNT        Trusted Signing account name
+#   WINDOWS_SIGN_AZURE_CERT_PROFILE   certificate profile name
 #
 # Each group is all-or-nothing; a partially configured group fails the run
 # rather than silently shipping a less-signed artifact. Provisioning
@@ -153,11 +175,86 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # Standalone Windows binaries: the daemon + runtime pair in one
+  # versioned zip, both at their final sibling names (`intendant.exe` +
+  # `intendant-runtime.exe`) — the controller resolves its runtime as a
+  # sibling of the running exe (src/bin/caller/agent_runner.rs), so the
+  # renamed-bare-asset shape the Linux workers use would break the
+  # pairing. Built on a GitHub-hosted runner for the same reason as the
+  # Linux binaries: an ephemeral image with a known baseline, the same
+  # image family the fork-PR CI legs prove the tree builds on. The zip
+  # flows into the macos-app job's dist/, where the PGP sign, publish,
+  # and transparency-log steps cover it exactly like the app archive and
+  # installers. Authenticode signing stays dormant (see WINDOWS_SIGN_*
+  # above): the zip publishes unsigned, and the release notes state the
+  # SmartScreen consequence plainly.
+  windows-binary:
+    name: windows-binary (x86_64-pc-windows-msvc)
+    runs-on: windows-2025
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          # Full history so dispatch dry-runs can stamp a `git describe
+          # --tags` dev version into the zip name (same reason as the
+          # macos-app checkout).
+          fetch-depth: 0
+
+      # Same provisioning as windows.yml's hosted Windows leg: `ring`
+      # (our TLS provider) builds its x86_64 perlasm assembly with NASM
+      # on the MSVC target, and the hosted image does not ship it.
+      - name: Install NASM (for ring)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Build release binaries
+        shell: bash
+        run: cargo build --release --locked --bin intendant --bin intendant-runtime
+
+      # One zip on the macOS artifact's naming scheme
+      # (Intendant-<version>-<platform>-<arch>.zip; version = the tag
+      # minus its "v", or bundle-macos.sh's `git describe` dev stamp on
+      # tagless dispatch), with both exes at the final names sibling
+      # resolution requires.
+      - name: Stage zipped asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="$(git describe --tags --match 'v*' --always --dirty 2>/dev/null || true)"
+          fi
+          [ -n "$version" ] || version="0.0.0-dev"
+          version="${version#v}"
+          case "$version" in
+            *.*) : ;;
+            *) version="0.0.0-${version}" ;;
+          esac
+          zip_name="Intendant-${version}-windows-x86_64.zip"
+          mkdir -p out/stage
+          cp target/release/intendant.exe target/release/intendant-runtime.exe out/stage/
+          (cd out/stage && 7z a "../$zip_name" intendant.exe intendant-runtime.exe)
+          rm -rf out/stage
+          (cd out && sha256sum "$zip_name" > "$zip_name.sha256")
+          ls -l out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: intendant-windows-x86_64
+          path: out/*
+          if-no-files-found: error
+
   macos-app:
     name: macos-app
-    # The whole release publishes or none of it does: a red Linux leg must
-    # stop the publish/transparency steps, which all live in this job.
-    needs: linux-binaries
+    # The whole release publishes or none of it does: a red Linux or
+    # Windows leg must stop the publish/transparency steps, which all
+    # live in this job.
+    needs: [linux-binaries, windows-binary]
     # Tags and manual dispatch only exist on trusted refs, so this always
     # runs on the fleet Mac (same label windows.yml places its macOS leg on);
     # there is no fork-PR path to route to hosted runners.
@@ -241,6 +338,12 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
           PGP_KEY_B64: ${{ secrets.PGP_SIGN_KEY_B64 }}
           PGP_PASSPHRASE: ${{ secrets.PGP_SIGN_KEY_PASSPHRASE }}
+          WIN_SIGN_TENANT_ID: ${{ secrets.WINDOWS_SIGN_AZURE_TENANT_ID }}
+          WIN_SIGN_CLIENT_ID: ${{ secrets.WINDOWS_SIGN_AZURE_CLIENT_ID }}
+          WIN_SIGN_CLIENT_SECRET: ${{ secrets.WINDOWS_SIGN_AZURE_CLIENT_SECRET }}
+          WIN_SIGN_ENDPOINT: ${{ secrets.WINDOWS_SIGN_AZURE_ENDPOINT }}
+          WIN_SIGN_ACCOUNT: ${{ secrets.WINDOWS_SIGN_AZURE_ACCOUNT }}
+          WIN_SIGN_CERT_PROFILE: ${{ secrets.WINDOWS_SIGN_AZURE_CERT_PROFILE }}
         run: |
           set -euo pipefail
           pgp_set=0
@@ -253,6 +356,13 @@ jobs:
           [ -n "$NOTARY_KEY_B64" ] && notary_set=$((notary_set + 1))
           [ -n "$NOTARY_KEY_ID" ] && notary_set=$((notary_set + 1))
           [ -n "$NOTARY_ISSUER_ID" ] && notary_set=$((notary_set + 1))
+          win_sign_set=0
+          [ -n "$WIN_SIGN_TENANT_ID" ] && win_sign_set=$((win_sign_set + 1))
+          [ -n "$WIN_SIGN_CLIENT_ID" ] && win_sign_set=$((win_sign_set + 1))
+          [ -n "$WIN_SIGN_CLIENT_SECRET" ] && win_sign_set=$((win_sign_set + 1))
+          [ -n "$WIN_SIGN_ENDPOINT" ] && win_sign_set=$((win_sign_set + 1))
+          [ -n "$WIN_SIGN_ACCOUNT" ] && win_sign_set=$((win_sign_set + 1))
+          [ -n "$WIN_SIGN_CERT_PROFILE" ] && win_sign_set=$((win_sign_set + 1))
           if [ "$pgp_set" = "1" ]; then
             echo "::error::Partial PGP config: set both PGP_SIGN_KEY_B64 and PGP_SIGN_KEY_PASSPHRASE, or neither."
             exit 1
@@ -269,16 +379,21 @@ jobs:
             echo "::error::Notarization secrets are set but the signing identity is not; Apple only notarizes Developer ID-signed bundles."
             exit 1
           fi
-          pgp=false sign=false notarize=false
+          if [ "$win_sign_set" != "0" ] && [ "$win_sign_set" != "6" ]; then
+            echo "::error::Partial Windows signing config: set all six WINDOWS_SIGN_AZURE_* secrets, or none."
+            exit 1
+          fi
+          pgp=false sign=false notarize=false win_sign=false
           [ "$pgp_set" = "2" ] && pgp=true
           [ "$sign_set" = "2" ] && sign=true
           [ "$notary_set" = "3" ] && notarize=true
+          [ "$win_sign_set" = "6" ] && win_sign=true
           {
             echo "pgp=$pgp"
             echo "sign=$sign"
             echo "notarize=$notarize"
           } >> "$GITHUB_OUTPUT"
-          echo "PGP: $pgp — Apple signing: $sign — notarization: $notarize"
+          echo "PGP: $pgp — Apple signing: $sign — notarization: $notarize — Windows signing: $win_sign"
           # Official releases fail closed on the PGP lane: a tag build must
           # detach-sign and log every artifact, or nothing is built or
           # published. Unsigned output stays available for
@@ -297,6 +412,20 @@ jobs:
           fi
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$sign" != "true" ]; then
             echo "::warning::Apple lane dormant — this release publishes the PGP-signed, transparency-logged app archive with its explicit -unsigned-dev suffix (Gatekeeper will warn; the release notes say so)."
+          fi
+          # The Windows Authenticode lane is dormant AND unbuilt: no
+          # signing step exists yet. Secrets configured on a tag would
+          # publish an unsigned zip while the owner believes otherwise —
+          # exactly the silent half-trust these gates refuse.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$win_sign" = "true" ]; then
+            echo "::error::WINDOWS_SIGN_AZURE_* secrets are configured, but the Windows Authenticode lane has no signing step yet — a tag release cannot engage it. Unset the secrets (the Windows zip publishes unsigned; the release notes say so) or land the signing lane first."
+            exit 1
+          fi
+          if [ "$win_sign" = "true" ]; then
+            echo "::warning::WINDOWS_SIGN_AZURE_* secrets are configured but the Windows signing lane is not implemented yet — this dry-run ignores them, and a tag build will fail its gate."
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$win_sign" != "true" ]; then
+            echo "::warning::Windows Authenticode lane dormant — this release publishes the PGP-signed, transparency-logged Windows zip unsigned (SmartScreen will interpose; the release notes say so)."
           fi
           if [ "$pgp" = "false" ]; then
             echo "::warning::No PGP signing secrets configured — this dry-run produces an unsigned-dev artifact with no signatures."
@@ -499,6 +628,39 @@ jobs:
             (cd dist && shasum -a 256 -c "$asset.sha256")
           done
 
+      # Same collection for the Windows zip.
+      - name: Collect Windows release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: intendant-windows-*
+          path: dist
+          merge-multiple: true
+
+      # Checksum re-verify like the Linux binaries, plus the shape the
+      # zip exists to guarantee: both exes at their final sibling names
+      # at the zip root — the controller resolves intendant-runtime.exe
+      # as a sibling of the running intendant.exe, so a renamed or
+      # nested entry would ship a broken pairing.
+      - name: Verify collected Windows binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(dist/Intendant-*-windows-x86_64.zip)
+          if [ "${#zips[@]}" != "1" ]; then
+            echo "::error::expected exactly one Intendant-*-windows-x86_64.zip in dist/ after artifact download, found ${#zips[@]}"
+            exit 1
+          fi
+          (cd dist && shasum -a 256 -c "$(basename "${zips[0]}").sha256")
+          listing="$(zipinfo -1 "${zips[0]}")"
+          for entry in intendant.exe intendant-runtime.exe; do
+            if ! grep -qx "$entry" <<< "$listing"; then
+              echo "::error::$(basename "${zips[0]}") does not carry $entry at the zip root — the runtime must stay a sibling of the daemon exe at their final names."
+              echo "$listing"
+              exit 1
+            fi
+          done
+
       # Every artifact that will publish gets a detached armored signature
       # from the release signing subkey; the repo-committed public key is
       # staged beside them byte-identically; and every signature is
@@ -543,7 +705,10 @@ jobs:
           export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
           command -v gh > /dev/null || { echo "::error::gh CLI not found on the runner"; exit 1; }
           tag="$GITHUB_REF_NAME"
-          zip_file="$(ls dist/Intendant-*.zip)"
+          # Two Intendant-*.zip families live in dist/ now; keep the
+          # macOS app zip and the Windows binaries zip distinct.
+          zip_file="$(ls dist/Intendant-*-macos-*.zip)"
+          win_zip="$(ls dist/Intendant-*-windows-x86_64.zip)"
           # Alpha marking rides the version string (v0.2.0-alpha.1) and
           # the notes banner below — deliberately NOT GitHub's prerelease
           # flag. While the whole line is alpha there is no stable release
@@ -621,6 +786,10 @@ jobs:
             cat dist/*.sha256
             echo '```'
             echo
+            echo "**Windows binaries (x86_64):** \`$(basename "$win_zip")\` carries the standalone \`intendant.exe\` + \`intendant-runtime.exe\` pair. Unzip anywhere and keep the two files side by side — the daemon resolves its runtime as a sibling of the running exe — then run \`intendant.exe\` from a terminal. No packaged Windows app yet: this is the daemon + runtime, CLI-first."
+            echo
+            echo "These binaries are not Authenticode-signed: on first run, Windows SmartScreen will interpose (\"Windows protected your PC\") — choose **More info → Run anyway**. Authenticity rides the detached \`.asc\` PGP signatures, the public transparency log, and \`intendant hosted-verify --releases $tag\` — verify before running."
+            echo
             echo "**Linux worker binaries (Codex Cloud / remote compute):** standalone \`intendant\` binaries for x86_64 and aarch64 glibc Linux (built on ubuntu-24.04; they need that image's library baseline at runtime — glibc 2.39+, libvpx, libpipewire, libxcb). They exist for the checksum-pinned worker bootstrap fast path; configure the Codex Cloud environment with:"
             echo '```'
             echo "INTENDANT_CLOUD_BINARY_URL=https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/intendant-linux-x86_64"
@@ -687,7 +856,7 @@ jobs:
           print(json.dumps({
               "tag": tag,
               "version": tag.removeprefix("v"),
-              "platforms": ["macos-arm64", "linux-x86_64", "linux-aarch64"],
+              "platforms": ["macos-arm64", "linux-x86_64", "linux-aarch64", "windows-x86_64"],
               "pgp_fingerprint": fingerprint,
               "artifacts": artifacts,
           }, indent=2))
