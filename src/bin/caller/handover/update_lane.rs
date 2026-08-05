@@ -197,7 +197,9 @@ pub(crate) enum ReleaseInstallKind {
     /// rows): staged beside the watched binary and renamed into place —
     /// today [`install_plain_binary_release`] is a prepared, cleanly
     /// refusing seam.
-    #[allow(dead_code)] // the prepared seam: first constructed by the first non-macOS table row
+    // The prepared seam: first constructed (outside tests) by the
+    // first non-macOS table row, which ages this allow out.
+    #[allow(dead_code)]
     PlainBinary,
 }
 
@@ -2911,7 +2913,10 @@ mod tests {
             .expect("existing output set aside");
         assert!(!output.exists(), "the path is vacated for the build");
         assert_eq!(std::fs::read(&aside).unwrap(), b"running-binary");
-        assert!(!stale.exists(), "stale asides from earlier produces are swept");
+        assert!(
+            !stale.exists(),
+            "stale asides from earlier produces are swept"
+        );
 
         // Failed build (the path still vacant): the set-aside restores.
         assert!(restore_aside_build_output(&aside, &output));
