@@ -117,7 +117,10 @@ curl -s -X POST "http://127.0.0.1:8934/api/daemon/takeover" \
 Watch the tab (within one 30s handover poll, then a ~2.5s tick
 cadence):
 
-1. The drain banner appears, naming the parked holdout.
+1. The drain banner appears with the grade-1 story ("Updating
+   Intendant — your work continues."); the parked holdout's named row
+   sits under the banner's **Advanced** fold (shared sticky key —
+   opening it once keeps every handover surface's mechanics open).
 2. The follow status/toast: "Moving to the updated daemon…" (about 5s,
    the visible-tab grace).
 3. The tab **replaces itself onto `http://127.0.0.1:8935`**, lands
