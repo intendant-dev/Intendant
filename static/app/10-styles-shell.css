@@ -797,11 +797,12 @@ html {
   vertical-align: middle;
 }
 
-/* Stale-build / daemon-boot reload nudges + event-lane staleness banner:
-   slim fixed strips at the top of the viewport, above everything, never
-   blocking. */
+/* Stale-build / daemon-boot reload nudges + event-lane staleness and
+   stale-admission-token banners: slim fixed strips at the top of the
+   viewport, above everything, never blocking. */
 #ui-stale-build-banner,
 #ui-daemon-boot-banner,
+#ui-loopback-token-banner,
 #ui-event-lane-banner {
   position: fixed;
   top: 8px;
@@ -820,7 +821,8 @@ html {
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
 #ui-stale-build-banner button,
-#ui-daemon-boot-banner button {
+#ui-daemon-boot-banner button,
+#ui-loopback-token-banner button {
   border: 1px solid var(--blue);
   background: transparent;
   color: var(--blue);
@@ -829,6 +831,11 @@ html {
   font-size: 12px;
   cursor: pointer;
 }
-#ui-event-lane-banner {
+#ui-event-lane-banner,
+#ui-loopback-token-banner {
   border-color: var(--yellow, #f9e2af);
+}
+#ui-loopback-token-banner code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
 }

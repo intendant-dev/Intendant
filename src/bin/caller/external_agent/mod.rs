@@ -2880,6 +2880,28 @@ mod tests {
         }
     }
 
+    /// The sign-in cards' machine pre-flight consumes GET
+    /// /api/external-agents (`backend_availability_json` above): a
+    /// backend the daemon reports `installed: false` renders as the
+    /// muted not-installed card whose copy names the CLI looked for,
+    /// instead of a Start button that can only fail after the click.
+    /// Pin the SPA wiring by needle (the artifact-scan pattern).
+    #[test]
+    fn spa_signin_cards_preflight_missing_clis() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "function agentSigninMissingAvailability",
+            "installed === false",
+            "agent-signin-missing",
+            "was not found on the daemon host",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the sign-in not-installed pre-flight: {needle}"
+            );
+        }
+    }
+
     #[test]
     fn canonical_thread_ids_match_backend_capabilities() {
         assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));

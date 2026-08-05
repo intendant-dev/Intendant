@@ -873,11 +873,12 @@ html {
   vertical-align: middle;
 }
 
-/* Stale-build / daemon-boot reload nudges + event-lane staleness banner:
-   slim fixed strips at the top of the viewport, above everything, never
-   blocking. */
+/* Stale-build / daemon-boot reload nudges + event-lane staleness and
+   stale-admission-token banners: slim fixed strips at the top of the
+   viewport, above everything, never blocking. */
 #ui-stale-build-banner,
 #ui-daemon-boot-banner,
+#ui-loopback-token-banner,
 #ui-event-lane-banner {
   position: fixed;
   top: 8px;
@@ -896,7 +897,8 @@ html {
   box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
 }
 #ui-stale-build-banner button,
-#ui-daemon-boot-banner button {
+#ui-daemon-boot-banner button,
+#ui-loopback-token-banner button {
   border: 1px solid var(--blue);
   background: transparent;
   color: var(--blue);
@@ -905,8 +907,13 @@ html {
   font-size: 12px;
   cursor: pointer;
 }
-#ui-event-lane-banner {
+#ui-event-lane-banner,
+#ui-loopback-token-banner {
   border-color: var(--yellow, #f9e2af);
+}
+#ui-loopback-token-banner code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
 }
 /* ── static/app/11-styles-access-files.css ── */
 /* ── Access redesign components (.acc-*) ──
@@ -17955,6 +17962,12 @@ html.ui-v2 #agent-signin-section {
 html.ui-v2 #agent-signin-section .agent-signin + .agent-signin {
   border-top: 1px solid var(--line);
   padding-top: 18px;
+}
+/* Not-installed pre-flight: the card stays visible but reads muted —
+   its copy names the CLI the daemon looked for, and nothing renders to
+   click until it exists. */
+html.ui-v2 #agent-signin-section .agent-signin.agent-signin-missing {
+  opacity: .55;
 }
 html.ui-v2 #agent-signin-section .vault-card {
   border: 0;
@@ -38975,7 +38988,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c1e4676e0471e66e';
+const INTENDANT_APP_BUILD = 'd8455c38ebdcf84c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39081,6 +39094,10 @@ window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
   bootInfo: () => ({ bootId: daemonBootId, nudged: daemonBootNudged }),
   tabId: () => INTENDANT_TAB_ID,
+  loopbackLaneInfo: () => ({
+    staleTokenNudged: loopbackTokenStaleNudged,
+    failStreak: ownerLaneApiFailStreak,
+  }),
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
   __testNudgeDaemonBoot: (v) => maybeNudgeDaemonBoot(v),
 });
@@ -39192,6 +39209,93 @@ function getLoopbackToken() {
   }
 }
 
+// ── Owner-lane API outcome watch ──
+//
+// Static assets are authority-free, so a tab holding a stale per-boot
+// admission token still loads while every owner-lane /api call bounces
+// off the daemon's NAMED 401 — without a surface the page just looks
+// empty. Every /api HTTP call funnels through the wrapped window.fetch
+// below (the facade's HTTP adapters, authedFetch, and bare call sites
+// alike), so ONE observer there does two honest things:
+//   - the named admission-token refusal raises a once-per-page,
+//     dismissible banner telling the owner how to reopen the tab;
+//   - the first delivered-OK response after a failure streak re-runs
+//     the unfueled empty-state probe, which otherwise retires forever
+//     after its ~40s boot window (recovery cases: the daemon came up
+//     after the probe gave up, or a freshly tokened tab re-seeded this
+//     origin's storage and the stale tab's calls started landing).
+// The marker below must match the server's refusal copy —
+// loopback_token.rs pins both sides.
+const LOOPBACK_STALE_TOKEN_MARKER = 'per-boot admission token';
+let loopbackTokenStaleNudged = false;
+let ownerLaneApiFailStreak = 0;
+
+function maybeShowStaleLoopbackTokenBanner() {
+  if (loopbackTokenStaleNudged) return;
+  loopbackTokenStaleNudged = true;
+  console.warn(
+    '[dashboard] the daemon refused this tab\'s loopback admission token '
+    + '(tokens rotate every daemon boot) — reopen via `intendant ctl dashboard-url`'
+  );
+  const banner = document.createElement('div');
+  banner.id = 'ui-loopback-token-banner';
+  const text = document.createElement('span');
+  text.textContent =
+    'This tab\'s admission token is stale, so the daemon is refusing its API '
+    + 'calls. Reopen the dashboard with ';
+  const cmd = document.createElement('code');
+  cmd.textContent = 'intendant ctl dashboard-url';
+  text.appendChild(cmd);
+  text.appendChild(document.createTextNode(' (or from the app).'));
+  const btn = document.createElement('button');
+  btn.textContent = 'Dismiss';
+  btn.addEventListener('click', () => banner.remove());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+}
+
+function noteOwnerLaneApiFailure() {
+  ownerLaneApiFailStreak += 1;
+}
+
+function noteOwnerLaneApiSuccess() {
+  if (ownerLaneApiFailStreak === 0) return;
+  ownerLaneApiFailStreak = 0;
+  // The lane just proved itself after refusals/outages — re-ask the
+  // empty-state probe, whose own retries may have long expired.
+  refreshUnfueledEmptyState().catch(() => {});
+}
+
+// Never alters the caller's promise: observation only. A delivered
+// non-401 4xx is a per-route verdict on a WORKING lane — neither a
+// failure nor a recovery.
+function observeOwnerLaneApiOutcome(fetchPromise) {
+  fetchPromise.then(resp => {
+    try {
+      if (!resp) return;
+      if (resp.ok) {
+        noteOwnerLaneApiSuccess();
+      } else if (resp.status === 401) {
+        noteOwnerLaneApiFailure();
+        if (!loopbackTokenStaleNudged) {
+          resp.clone().json().then(body => {
+            if (String(body?.error || '').includes(LOOPBACK_STALE_TOKEN_MARKER)) {
+              maybeShowStaleLoopbackTokenBanner();
+            }
+          }).catch(() => {});
+        }
+      } else if (resp.status >= 500) {
+        noteOwnerLaneApiFailure();
+      }
+    } catch {
+      /* observation is best-effort */
+    }
+  }, () => {
+    noteOwnerLaneApiFailure();
+  });
+}
+
 // Attach the loopback token to every same-origin request. Cross-cutting
 // by design — the token is transport admission, not per-call auth — and
 // deliberately installed BEFORE the hosted-control (31b), multihost
@@ -39221,7 +39325,21 @@ function getLoopbackToken() {
     } catch {
       /* malformed input — fall through to the bare call untouched */
     }
-    return bareFetch(input, init);
+    const result = bareFetch(input, init);
+    try {
+      const url =
+        typeof input === 'string' ? input : (input && input.url) || '';
+      const path = url.startsWith(location.origin)
+        ? url.slice(location.origin.length)
+        : url;
+      // Same-origin owner-lane calls only: a fleet daemon's absolute
+      // origin never matches, so ITS refusals cannot raise THIS tab's
+      // banner or count against this lane's streak.
+      if (path.startsWith('/api/')) observeOwnerLaneApiOutcome(result);
+    } catch {
+      /* observation is best-effort; the caller's promise is untouched */
+    }
+    return result;
   };
 })();
 
@@ -44890,9 +45008,12 @@ async function agentSigninStart(provider) {
   const state = agentSigninState[provider];
   if (state.busy) return;
   state.busy = true;
-  state.lastError = '';
-  renderAgentSigninSection();
+  // Everything after the latch runs under one try/finally: a throw
+  // anywhere — the pre-flight render included — must release `busy`,
+  // or the guard above mutes the button for the rest of the page load.
   try {
+    state.lastError = '';
+    renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
       state.status = resp.body?.status || state.status;
@@ -44914,9 +45035,11 @@ async function agentSigninSubmitCode(provider, code) {
   const state = agentSigninState[provider];
   if (!spec.codeMethod || state.busy) return;
   state.busy = true;
-  state.lastError = '';
-  renderAgentSigninSection();
+  // Same latch discipline as agentSigninStart: one try/finally spans
+  // everything after busy=true, so no render throw can strand it.
   try {
+    state.lastError = '';
+    renderAgentSigninSection();
     const resp = await daemonApi.request(spec.codeMethod, { code });
     if (resp.ok) {
       if (state.status) state.status.phase = 'verifying';
@@ -45237,6 +45360,23 @@ function agentSigninWatchNotes(status, note) {
   }
 }
 
+/* Pre-flight honesty for the sign-in cards: GET /api/external-agents
+   already reports whether each backend's CLI resolves on the daemon
+   host (`installed`, plus the command it looked for) — consume it so a
+   missing CLI mutes its card with copy naming the binary instead of a
+   Start button that can only fail after the click. `installed === false`
+   is the ONLY muting verdict; unknown availability (probe not landed
+   yet, an older daemon without the field) keeps the card live. The
+   provider's `sessionKind` IS the backend id (AgentBackend::
+   as_short_str — the same vocabulary the availability rows serve). */
+function agentSigninMissingAvailability(spec) {
+  if (!Array.isArray(externalAgentAvailability)) return null;
+  const entry = externalAgentAvailability.find(
+    agent => agent && agent.id === spec.sessionKind
+  );
+  return entry && entry.installed === false ? entry : null;
+}
+
 function renderAgentSigninSection() {
   const mount = document.getElementById('agent-signin-section');
   if (!mount) return;
@@ -45246,6 +45386,15 @@ function renderAgentSigninSection() {
     document.activeElement.matches('input, textarea, select')
   ) {
     return;
+  }
+  // The not-installed pre-flight reads the shared availability probe:
+  // ask once while this page hasn't heard yet, repaint when it lands.
+  // A failed probe resolves null and does NOT re-render, so there is
+  // no fetch/render loop — the next user-driven render retries.
+  if (externalAgentAvailability === null) {
+    refreshExternalAgentAvailability().then(list => {
+      if (Array.isArray(list)) renderAgentSigninSection();
+    });
   }
   mount.innerHTML = '';
   for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
@@ -45294,6 +45443,23 @@ function agentSigninProviderCard(provider) {
   }
   if (avail.reason === 'unsupported') {
     note(spec.unsupportedNote);
+    return card;
+  }
+
+  // Machine pre-flight: a backend the daemon reports uninstalled can
+  // only click-then-fail — mute the card and name what was looked for.
+  const missing = agentSigninMissingAvailability(spec);
+  if (missing) {
+    card.classList.add('agent-signin-missing');
+    const chip = document.createElement('span');
+    chip.className = 'vault-chip';
+    chip.textContent = 'not installed';
+    head.appendChild(chip);
+    note(
+      `The ${spec.label} CLI (${missing.command || spec.sessionKind}) ` +
+        'was not found on the daemon host, so there is no account to sign ' +
+        'in yet. Install it on the daemon machine, then sign in from here.'
+    );
     return card;
   }
 
