@@ -612,6 +612,12 @@ html.ui-v2 #agent-signin-section .agent-signin + .agent-signin {
   border-top: 1px solid var(--line);
   padding-top: 18px;
 }
+/* Not-installed pre-flight: the card stays visible but reads muted —
+   its copy names the CLI the daemon looked for, and nothing renders to
+   click until it exists. */
+html.ui-v2 #agent-signin-section .agent-signin.agent-signin-missing {
+  opacity: .55;
+}
 html.ui-v2 #agent-signin-section .vault-card {
   border: 0;
   border-radius: 0;

@@ -1885,9 +1885,12 @@ async function agentSigninStart(provider) {
   const state = agentSigninState[provider];
   if (state.busy) return;
   state.busy = true;
-  state.lastError = '';
-  renderAgentSigninSection();
+  // Everything after the latch runs under one try/finally: a throw
+  // anywhere — the pre-flight render included — must release `busy`,
+  // or the guard above mutes the button for the rest of the page load.
   try {
+    state.lastError = '';
+    renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
       state.status = resp.body?.status || state.status;
@@ -1909,9 +1912,11 @@ async function agentSigninSubmitCode(provider, code) {
   const state = agentSigninState[provider];
   if (!spec.codeMethod || state.busy) return;
   state.busy = true;
-  state.lastError = '';
-  renderAgentSigninSection();
+  // Same latch discipline as agentSigninStart: one try/finally spans
+  // everything after busy=true, so no render throw can strand it.
   try {
+    state.lastError = '';
+    renderAgentSigninSection();
     const resp = await daemonApi.request(spec.codeMethod, { code });
     if (resp.ok) {
       if (state.status) state.status.phase = 'verifying';
@@ -2232,6 +2237,23 @@ function agentSigninWatchNotes(status, note) {
   }
 }
 
+/* Pre-flight honesty for the sign-in cards: GET /api/external-agents
+   already reports whether each backend's CLI resolves on the daemon
+   host (`installed`, plus the command it looked for) — consume it so a
+   missing CLI mutes its card with copy naming the binary instead of a
+   Start button that can only fail after the click. `installed === false`
+   is the ONLY muting verdict; unknown availability (probe not landed
+   yet, an older daemon without the field) keeps the card live. The
+   provider's `sessionKind` IS the backend id (AgentBackend::
+   as_short_str — the same vocabulary the availability rows serve). */
+function agentSigninMissingAvailability(spec) {
+  if (!Array.isArray(externalAgentAvailability)) return null;
+  const entry = externalAgentAvailability.find(
+    agent => agent && agent.id === spec.sessionKind
+  );
+  return entry && entry.installed === false ? entry : null;
+}
+
 function renderAgentSigninSection() {
   const mount = document.getElementById('agent-signin-section');
   if (!mount) return;
@@ -2241,6 +2263,15 @@ function renderAgentSigninSection() {
     document.activeElement.matches('input, textarea, select')
   ) {
     return;
+  }
+  // The not-installed pre-flight reads the shared availability probe:
+  // ask once while this page hasn't heard yet, repaint when it lands.
+  // A failed probe resolves null and does NOT re-render, so there is
+  // no fetch/render loop — the next user-driven render retries.
+  if (externalAgentAvailability === null) {
+    refreshExternalAgentAvailability().then(list => {
+      if (Array.isArray(list)) renderAgentSigninSection();
+    });
   }
   mount.innerHTML = '';
   for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
@@ -2289,6 +2320,23 @@ function agentSigninProviderCard(provider) {
   }
   if (avail.reason === 'unsupported') {
     note(spec.unsupportedNote);
+    return card;
+  }
+
+  // Machine pre-flight: a backend the daemon reports uninstalled can
+  // only click-then-fail — mute the card and name what was looked for.
+  const missing = agentSigninMissingAvailability(spec);
+  if (missing) {
+    card.classList.add('agent-signin-missing');
+    const chip = document.createElement('span');
+    chip.className = 'vault-chip';
+    chip.textContent = 'not installed';
+    head.appendChild(chip);
+    note(
+      `The ${spec.label} CLI (${missing.command || spec.sessionKind}) ` +
+        'was not found on the daemon host, so there is no account to sign ' +
+        'in yet. Install it on the daemon machine, then sign in from here.'
+    );
     return card;
   }
 

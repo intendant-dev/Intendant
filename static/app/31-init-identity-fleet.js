@@ -119,6 +119,10 @@ window.qa = Object.assign(window.qa || {}, {
   buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
   bootInfo: () => ({ bootId: daemonBootId, nudged: daemonBootNudged }),
   tabId: () => INTENDANT_TAB_ID,
+  loopbackLaneInfo: () => ({
+    staleTokenNudged: loopbackTokenStaleNudged,
+    failStreak: ownerLaneApiFailStreak,
+  }),
   __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
   __testNudgeDaemonBoot: (v) => maybeNudgeDaemonBoot(v),
 });
@@ -230,6 +234,93 @@ function getLoopbackToken() {
   }
 }
 
+// ── Owner-lane API outcome watch ──
+//
+// Static assets are authority-free, so a tab holding a stale per-boot
+// admission token still loads while every owner-lane /api call bounces
+// off the daemon's NAMED 401 — without a surface the page just looks
+// empty. Every /api HTTP call funnels through the wrapped window.fetch
+// below (the facade's HTTP adapters, authedFetch, and bare call sites
+// alike), so ONE observer there does two honest things:
+//   - the named admission-token refusal raises a once-per-page,
+//     dismissible banner telling the owner how to reopen the tab;
+//   - the first delivered-OK response after a failure streak re-runs
+//     the unfueled empty-state probe, which otherwise retires forever
+//     after its ~40s boot window (recovery cases: the daemon came up
+//     after the probe gave up, or a freshly tokened tab re-seeded this
+//     origin's storage and the stale tab's calls started landing).
+// The marker below must match the server's refusal copy —
+// loopback_token.rs pins both sides.
+const LOOPBACK_STALE_TOKEN_MARKER = 'per-boot admission token';
+let loopbackTokenStaleNudged = false;
+let ownerLaneApiFailStreak = 0;
+
+function maybeShowStaleLoopbackTokenBanner() {
+  if (loopbackTokenStaleNudged) return;
+  loopbackTokenStaleNudged = true;
+  console.warn(
+    '[dashboard] the daemon refused this tab\'s loopback admission token '
+    + '(tokens rotate every daemon boot) — reopen via `intendant ctl dashboard-url`'
+  );
+  const banner = document.createElement('div');
+  banner.id = 'ui-loopback-token-banner';
+  const text = document.createElement('span');
+  text.textContent =
+    'This tab\'s admission token is stale, so the daemon is refusing its API '
+    + 'calls. Reopen the dashboard with ';
+  const cmd = document.createElement('code');
+  cmd.textContent = 'intendant ctl dashboard-url';
+  text.appendChild(cmd);
+  text.appendChild(document.createTextNode(' (or from the app).'));
+  const btn = document.createElement('button');
+  btn.textContent = 'Dismiss';
+  btn.addEventListener('click', () => banner.remove());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+}
+
+function noteOwnerLaneApiFailure() {
+  ownerLaneApiFailStreak += 1;
+}
+
+function noteOwnerLaneApiSuccess() {
+  if (ownerLaneApiFailStreak === 0) return;
+  ownerLaneApiFailStreak = 0;
+  // The lane just proved itself after refusals/outages — re-ask the
+  // empty-state probe, whose own retries may have long expired.
+  refreshUnfueledEmptyState().catch(() => {});
+}
+
+// Never alters the caller's promise: observation only. A delivered
+// non-401 4xx is a per-route verdict on a WORKING lane — neither a
+// failure nor a recovery.
+function observeOwnerLaneApiOutcome(fetchPromise) {
+  fetchPromise.then(resp => {
+    try {
+      if (!resp) return;
+      if (resp.ok) {
+        noteOwnerLaneApiSuccess();
+      } else if (resp.status === 401) {
+        noteOwnerLaneApiFailure();
+        if (!loopbackTokenStaleNudged) {
+          resp.clone().json().then(body => {
+            if (String(body?.error || '').includes(LOOPBACK_STALE_TOKEN_MARKER)) {
+              maybeShowStaleLoopbackTokenBanner();
+            }
+          }).catch(() => {});
+        }
+      } else if (resp.status >= 500) {
+        noteOwnerLaneApiFailure();
+      }
+    } catch {
+      /* observation is best-effort */
+    }
+  }, () => {
+    noteOwnerLaneApiFailure();
+  });
+}
+
 // Attach the loopback token to every same-origin request. Cross-cutting
 // by design — the token is transport admission, not per-call auth — and
 // deliberately installed BEFORE the hosted-control (31b), multihost
@@ -259,7 +350,21 @@ function getLoopbackToken() {
     } catch {
       /* malformed input — fall through to the bare call untouched */
     }
-    return bareFetch(input, init);
+    const result = bareFetch(input, init);
+    try {
+      const url =
+        typeof input === 'string' ? input : (input && input.url) || '';
+      const path = url.startsWith(location.origin)
+        ? url.slice(location.origin.length)
+        : url;
+      // Same-origin owner-lane calls only: a fleet daemon's absolute
+      // origin never matches, so ITS refusals cannot raise THIS tab's
+      // banner or count against this lane's streak.
+      if (path.startsWith('/api/')) observeOwnerLaneApiOutcome(result);
+    } catch {
+      /* observation is best-effort; the caller's promise is untouched */
+    }
+    return result;
   };
 })();
 
