@@ -155,6 +155,18 @@ struct SwapResult {
 /// wrapper is gone or wedged — the chip re-enables instead of spinning.
 const SWAP_REQUEST_TTL_MS: u64 = 90_000;
 
+/// The drain-entry notification's two layers (update-abstraction §4,
+/// Q8 ruling): OS notification surfaces have no Advanced fold, so the
+/// one body carries the grade-1 product event first and the mechanics
+/// sentence after a line break. The grade-1 half is held to the
+/// negative vocabulary law (no ports, boot ids, lease/drain words —
+/// see `grade_one_vocabulary_is_pinned_and_never_names_the_mechanics`);
+/// the mechanics half deliberately is not.
+const DRAIN_NOTIFICATION_GRADE1: &str =
+    "Updating Intendant — sessions are finishing on the previous version";
+const DRAIN_NOTIFICATION_MECHANICS: &str =
+    "standing automations handed off; in-flight sessions finish here, then this daemon exits";
+
 /// Refusals for [`HandoverRuntime::request_update_swap`], each an honest
 /// sentence for the requesting surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,12 +772,14 @@ impl HandoverRuntime {
         // its zero-session exit waited on the next unrelated bus
         // event). The event also lands on the supervisor's observation
         // lane, which re-evaluates the drain exit condition — covering
-        // zero-sessions-at-entry on both paths.
+        // zero-sessions-at-entry on both paths. Copy is the Q8 layered
+        // one-body shape (update-abstraction §4): OS notification
+        // surfaces have no Advanced fold, so the grade-1 product event
+        // leads and the mechanics sentence follows after a line break.
         self.notify_user(
             "handover-draining",
-            Some("Daemon draining"),
-            "standing automations handed off; in-flight sessions finish here, \
-             then this daemon exits",
+            Some("Updating Intendant"),
+            &format!("{DRAIN_NOTIFICATION_GRADE1}\n{DRAIN_NOTIFICATION_MECHANICS}"),
             crate::types::NotificationUrgency::Attention,
         );
     }
@@ -1148,33 +1162,184 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Commission pin (drain holdout honesty): the shipped dashboard
-    /// bundle carries the banner wiring — the named wait set, the
-    /// parked-until rendering, the prominent successor doorway, the
-    /// per-predecessor sections, and the tokenless QA hook — so the
-    /// honest banner cannot be silently gutted from the SPA (the HS6
-    /// artifact-scan pattern).
+    /// Commission pin (drain holdout honesty), re-pinned BOTH-GRADE by
+    /// update-abstraction slice 4 (§4.3): the shipped dashboard bundle
+    /// carries the banner wiring in two grades — grade 1's product
+    /// story (plain, portless), and INSIDE the shared Advanced fold
+    /// the verbatim mechanics: the named wait set, the parked-until
+    /// rendering, the ported successor doorway, the per-predecessor
+    /// sections — plus the tokenless QA hook. Source-scan reach, per
+    /// the HS6 artifact-scan pattern: the fold NESTING is the
+    /// fragment's structure (probe-verified in the operator battery);
+    /// this pin keeps either grade's strings and the fold machinery
+    /// from being gutted silently.
     #[test]
     fn spa_carries_the_drain_holdout_banner() {
         let app = include_str!("../../../../static/app.html");
         for needle in [
+            // Structure: the wait set, the doorway class, the wire
+            // read, and the QA hook.
             "handover-holdouts",
             "handover-holdout-list",
             "handover-successor-link",
-            "Open the successor daemon",
             "rate-limit parked until",
             "reset time unknown",
+            "body.holdouts",
+            "qa.handoverBanner",
+            // Grade 1 — the §4.1 product story on both banner kinds.
+            "Updating Intendant — your work continues.",
+            "Waiting for the updated daemon to start…",
+            "Open the updated dashboard →",
+            "on the previous version",
+            "Everything continues here once that work finishes.",
+            // Grade 2 — the mechanics, verbatim, behind the ONE shared
+            // sticky fold key (Q7).
+            "'handover-advanced-open'",
+            "handoverAdvancedFold",
+            "This daemon is draining.",
+            "Open the successor daemon",
             "No successor has acquired the lease yet.",
             "still finishing there",
             "Mid-work sessions it releases are picked up here when it exits.",
-            "body.holdouts",
-            "qa.handoverBanner",
         ] {
             assert!(
                 app.contains(needle),
                 "the dashboard bundle lost the drain-holdout banner wiring: {needle}"
             );
         }
+        // The fold is SHARED: three surfaces (own-drain banner,
+        // predecessor sections, update chip) build it through the one
+        // helper keyed on the one stored choice.
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        assert!(fragment.contains("function handoverAdvancedFold"));
+        assert_eq!(
+            fragment.matches("= handoverAdvancedFold();").count(),
+            3,
+            "banner + predecessor sections + update chip all ride the one shared fold"
+        );
+        assert_eq!(
+            fragment.matches("'handover-advanced-open'").count(),
+            1,
+            "one stored key — the Q7 stance, never per-surface copies"
+        );
+    }
+
+    /// Update-abstraction slice 4, the NEGATIVE grade-1 vocabulary pin
+    /// (intake §4.3): every grade-1 string — across the banner, the
+    /// predecessor story, the update chip, the follow/completion lines,
+    /// the held-by chips, and the drain notification's grade-1 lead —
+    /// is present in its owning surface AND matches none of the
+    /// mechanics class `/(port\s|:\d{4}|boot[_ ]id|lease|drain|
+    /// predecessor|successor)/i`. Grep-terminating: mechanics leaking
+    /// into grade 1 fails here mechanically, whatever the wording.
+    /// (Template needles pin the static copy; their interpolations are
+    /// task counts and the plural 's' only. The sibling-lane error
+    /// toasts in 54-session-lifecycle deliberately stay out: they name
+    /// the port for actionability — slice-3's ruled error-lane copy,
+    /// not grade-1 narration.)
+    #[test]
+    fn grade_one_vocabulary_is_pinned_and_never_names_the_mechanics() {
+        let handover = include_str!("../../../../static/app/ui2-handover.js");
+        let windows = include_str!("../../../../static/app/39-session-windows.js");
+        let cards = include_str!("../../../../static/app/57a-sessions-list.js");
+        let actions = include_str!("../../../../static/app/41-session-window-actions.js");
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "ui2-handover.js",
+                handover,
+                &[
+                    // Own-drain banner: lead, tails, pill, waiting
+                    // state, portless doorway.
+                    "Updating Intendant — your work continues.",
+                    "Updating Intendant — finishing up (",
+                    ") here, then the updated daemon takes over.",
+                    " Wrapping up here, then the updated daemon takes over.",
+                    "Waiting for the updated daemon to start…",
+                    "Open the updated dashboard →",
+                    // Predecessor story (§5.3, one line for N daemons)
+                    // + the continuation promise.
+                    "Finishing up (",
+                    "on the previous version",
+                    "on the previous daemon",
+                    "Everything continues here once that work finishes.",
+                    // Update chip.
+                    "Update ready",
+                    "A newer build of Intendant is ready to install.",
+                    // Follow + consent (slice 2's grade-1 lines).
+                    "Moving to the updated daemon…",
+                    "Continue on the updated daemon",
+                    "Your composer draft moves with you.",
+                    // Completion honesty (§4.1 app states).
+                    "All set — running ",
+                    "The restart didn't change builds.",
+                    "Moved to the updated daemon.",
+                ],
+            ),
+            (
+                "39-session-windows.js",
+                windows,
+                &[
+                    "finishing on the previous version",
+                    "finishing on the previous daemon",
+                ],
+            ),
+            (
+                "57a-sessions-list.js",
+                cards,
+                &[
+                    "finishing on the previous version",
+                    "finishing on the previous daemon",
+                ],
+            ),
+            (
+                "41-session-window-actions.js",
+                actions,
+                &["Still finishing on the previous version — it continues here when done."],
+            ),
+        ];
+        let banned =
+            regex::Regex::new(r"(?i)(port\s|:\d{4}|boot[_ ]id|lease|drain|predecessor|successor)")
+                .expect("the mechanics class compiles");
+        for (fragment_name, fragment, needles) in cases {
+            for needle in *needles {
+                assert!(
+                    fragment.contains(needle),
+                    "{fragment_name} lost the grade-1 string: {needle}"
+                );
+                assert!(
+                    !banned.is_match(needle),
+                    "grade-1 string names the mechanics ({fragment_name}): {needle}"
+                );
+            }
+        }
+        // The notification's grade-1 lead obeys the same law. (Its
+        // mechanics half is exempt by design — Q8's layered one-body
+        // shape has no fold to hide behind — and is pinned verbatim by
+        // `inline_drain_entry_emits_the_owner_notification`.)
+        assert!(
+            !banned.is_match(DRAIN_NOTIFICATION_GRADE1),
+            "the drain notification's grade-1 lead names the mechanics"
+        );
+        // Q6: the window-title rule — the packaged app is just
+        // "Intendant" while it supervises a single-instance daemon; the
+        // port suffix survives only for shared-host topologies, where
+        // it is load-bearing disambiguation.
+        let app_layer = include_str!("../../../../macos-app/main.swift");
+        for needle in [
+            "var sharedHostTopology = false",
+            "func windowTitle(for port: Int) -> String",
+            "window?.title = windowTitle(for: newPort)",
+            "window.title = windowTitle(for: port)",
+        ] {
+            assert!(
+                app_layer.contains(needle),
+                "the app layer lost the Q6 window-title rule: {needle}"
+            );
+        }
+        assert!(
+            !app_layer.contains("newPort == 8765"),
+            "the swap site must keep the topology rule, not a port special-case"
+        );
     }
 
     /// Update-abstraction slice 1 pin (intake §7, acceptance (a)): the
@@ -1427,10 +1592,34 @@ mod tests {
         let chip = include_str!("../../../../static/app/ui2-handover.js");
         let lane = include_str!("../../../../static/app/ui2-update-lane.js");
         // Both entries exist and their labels carry 'update' — the
-        // palette matches labels only (users type what they see).
+        // palette matches labels first (users type what they see).
         assert!(chrome.contains("label: 'Check for updates'"));
         assert!(chrome.contains("updateChipSurface.paletteEntry"));
         assert!(chrome.contains("window.qa.paletteUpdateActions"));
+        // Slice-4 owner-directed additions: the PURE destination — a
+        // Go-to row that routes to the Daemon update card and fires no
+        // check POST (the wire-shape bans below stay the structural
+        // proof) — and the generic keywords lane, populated once for
+        // the whole update family so the synonyms users actually type
+        // ("release", "hotswap") find these entries.
+        assert!(chrome.contains("label: 'Daemon update'"));
+        assert!(chrome.contains("anchor: 'update-lane-card'"));
+        assert!(chrome.contains("const UI2_UPDATE_KEYWORDS"));
+        for synonym in ["'release'", "'channel'", "'upgrade'", "'hotswap'", "'swap'"] {
+            assert!(
+                chrome.contains(synonym),
+                "the update keyword family lost {synonym}"
+            );
+        }
+        assert_eq!(
+            chrome.matches("keywords: UI2_UPDATE_KEYWORDS").count(),
+            3,
+            "one keyword list, three carriers: destination + check action + dynamic entry"
+        );
+        assert!(
+            chrome.contains("item.keywords.some("),
+            "the palette lost the generic keyword matching lane"
+        );
         // The chip module serves the dynamic entry; its labels state
         // the live arm (install / installing / hand off), and its
         // suppression rule is the chip's own.
@@ -1811,9 +2000,24 @@ mod tests {
         assert_eq!(runtime.request_drain(None), DrainRequest::Entered);
         let mut saw_draining_notification = false;
         while let Ok(event) = events.try_recv() {
-            if let crate::event::AppEvent::UserNotification { id, urgency, .. } = event {
+            if let crate::event::AppEvent::UserNotification {
+                id,
+                title,
+                text,
+                urgency,
+                ..
+            } = event
+            {
                 if id == "handover-draining" {
                     assert_eq!(urgency, crate::types::NotificationUrgency::Attention);
+                    // Q8's layered one-body shape: the grade-1 product
+                    // event leads, the mechanics sentence follows after
+                    // a line break — never one grade without the other.
+                    assert_eq!(title.as_deref(), Some("Updating Intendant"));
+                    let (lead, mechanics) =
+                        text.split_once('\n').expect("the body carries both grades");
+                    assert_eq!(lead, DRAIN_NOTIFICATION_GRADE1);
+                    assert_eq!(mechanics, DRAIN_NOTIFICATION_MECHANICS);
                     saw_draining_notification = true;
                 }
             }
