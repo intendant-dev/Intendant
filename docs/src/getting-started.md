@@ -46,6 +46,19 @@ stopping to name the command for you to run. Rust and the native build
 dependencies follow the same law via the per-OS setup scripts from the
 cloned tree.
 
+The install ends concretely, not silently: once the daemon reports ready, the
+installer prints the dashboard's tokened loopback owner URL (`intendant ctl
+dashboard-url` reprints it any time; the token rotates each boot) and opens it
+in a browser where a GUI opener exists. On Windows, `install.ps1` additionally
+imports the generated access certificates into the user's certificate stores
+(the root import asks for consent; a declined dialog costs only browser mTLS —
+the tokened URL still works), puts the binaries on the user PATH, and creates
+Desktop/Start-menu shortcuts that start the daemon when needed and open the
+fresh tokened dashboard, preferring an Edge app-mode window. Failures pause on
+screen instead of closing the window, and without `-Service` the daemon runs
+in its own console window — closing that window stops it, and nothing
+restarts it at logon.
+
 For reproducibility, pin the tag instead of `latest`:
 `…/releases/download/v0.1.0/install.sh`. Release assets are immutable, and a
 stamped installer double-checks itself: it prints its release identity
@@ -77,10 +90,10 @@ Pick your rung of the trust ladder honestly:
 `https://intendant.dev/install.sh` survives only as a **non-canonical**
 convenience: it answers with a redirect (HTTP 302) to the release asset and
 never a script body — script against the GitHub URL, not the pretty one.
-While no `v*` release has been published yet (the current state of this
-alpha), the asset URL 404s; until the first release, clone and build from
-source — the [prerequisites and build steps below](#prerequisites) are
-exactly what the installer automates.
+The first `v*` releases are published, so the asset URLs above resolve;
+cloning and building from source stays fully supported — the
+[prerequisites and build steps below](#prerequisites) are exactly what the
+installer automates.
 
 What happens next is the whole story in four steps:
 
@@ -741,7 +754,14 @@ To be explicit about the default, pass `--mtls`:
 
 `--mtls` verifies browser/client certificates against the installed Intendant
 access CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca` overrides it.
-Clients without the installed client identity cannot complete the TLS handshake.
+Client authentication is *optional at the TLS layer* (`OptionalCa`): a client
+without the installed identity still completes the handshake, but dashboard
+authority outside a direct loopback connection is refused without a verified
+client certificate. The one certless owner lane is deliberate and local — a
+direct loopback request presenting the daemon's per-boot admission token.
+`intendant ctl dashboard-url` prints that URL
+(`https://127.0.0.1:<port>/?token=…`), the install scripts open it at the end
+of a fresh install, and the token rotates every daemon boot.
 If access certs are missing, startup fails closed with setup guidance. Use
 `--no-tls` only when you intentionally want plain HTTP for local/programmatic
 debugging. Prefer `--no-tls --bind 127.0.0.1`; wildcard plaintext refuses

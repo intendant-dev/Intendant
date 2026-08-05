@@ -320,7 +320,10 @@ than a panic or silent no-op.
   the same pure-Rust CA/server/client generation and owner-IAM seeding as Unix,
   then prints exact PowerShell commands to import the CA into
   `Cert:\CurrentUser\Root` and the client identity into
-  `Cert:\CurrentUser\My`; it does not start a server. `serve-certs` returns an
+  `Cert:\CurrentUser\My`; it does not start a server. `install.ps1` runs those
+  imports automatically at the end of a fresh install (the root import shows
+  Windows' consent dialog; declining costs only browser mTLS — the tokened
+  loopback URL still grants the local dashboard). `serve-certs` returns an
   explicit unsupported/manual-import error. Remote phone/browser enrollment
   can be run from a macOS/Linux anchor. A generic HTTPS reverse proxy is not an
   authentication substitute: if it terminates into daemon loopback it becomes

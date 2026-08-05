@@ -218,9 +218,21 @@ pub(crate) fn build_web_tls_acceptor(
                 })?;
                 match provisioned {
                     Some(cert_dir) => {
+                        // serve-certs (the strict HTTPS enrollment server) is
+                        // Unix-only; the Windows enrollment lane is the
+                        // CurrentUser cert-store import whose exact commands
+                        // `intendant access setup` (re)prints — pointing a
+                        // Windows first boot at serve-certs is a dead end.
+                        let enroll_hint = if cfg!(windows) {
+                            "enroll this user's browser with the PowerShell import \
+                             commands `intendant access setup` prints (serve-certs \
+                             is Unix-only)"
+                        } else {
+                            "enroll a browser with `intendant access serve-certs`"
+                        };
                         eprintln!(
                             "[access] first boot: generated dashboard access certificates \
-                             in {} — enroll a browser with `intendant access serve-certs`; \
+                             in {} — {enroll_hint}; \
                              the Connect claim flow is discovery-only",
                             cert_dir.display()
                         );
@@ -464,9 +476,14 @@ pub(crate) fn dashboard_display_url(
 
 pub(crate) fn dashboard_display_host(web_bind: Option<IpAddr>) -> String {
     match web_bind {
-        Some(IpAddr::V4(ip)) => ip.to_string(),
-        Some(IpAddr::V6(ip)) => format!("[{ip}]"),
-        None => "0.0.0.0".to_string(),
+        Some(IpAddr::V4(ip)) if !ip.is_unspecified() => ip.to_string(),
+        Some(IpAddr::V6(ip)) if !ip.is_unspecified() => format!("[{ip}]"),
+        // A wildcard bind (the default) listens on every interface, but
+        // "https://0.0.0.0:8765" is not a URL a browser opens — print the
+        // loopback form that actually works from the daemon's own machine.
+        // Display-only: the bind address itself is resolved elsewhere.
+        Some(IpAddr::V6(_)) => "[::1]".to_string(),
+        Some(IpAddr::V4(_)) | None => "127.0.0.1".to_string(),
     }
 }
 
@@ -619,6 +636,32 @@ mod tests {
         assert_ne!(port2, 0);
         assert_ne!(port2, port);
         drop((listener, listener2));
+    }
+
+    #[test]
+    fn dashboard_display_host_prints_pasteable_loopback_for_wildcard_binds() {
+        // The default bind is wildcard: the printed Dashboard URL must be
+        // one a browser on this machine can open, and "https://0.0.0.0"
+        // is not. Explicit interface binds keep printing their address.
+        assert_eq!(dashboard_display_host(None), "127.0.0.1");
+        assert_eq!(
+            dashboard_display_host(Some("0.0.0.0".parse().unwrap())),
+            "127.0.0.1"
+        );
+        assert_eq!(dashboard_display_host(Some("::".parse().unwrap())), "[::1]");
+        assert_eq!(
+            dashboard_display_host(Some("192.168.1.5".parse().unwrap())),
+            "192.168.1.5"
+        );
+        assert_eq!(
+            dashboard_display_host(Some("fd00::5".parse().unwrap())),
+            "[fd00::5]"
+        );
+        let no_tls: Option<tokio_rustls::TlsAcceptor> = None;
+        assert_eq!(
+            dashboard_display_url(&no_tls, 8765, None),
+            "http://127.0.0.1:8765"
+        );
     }
 
     #[test]
