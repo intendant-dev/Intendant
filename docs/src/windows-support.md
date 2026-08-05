@@ -273,6 +273,32 @@ implementations of the cross-platform process and network helpers:
   advertise URLs and WebRTC ICE host-candidate gathering. On Windows the crate
   wraps `GetAdaptersAddresses`.
 
+## Self-Update Lane
+
+The dashboard's Daemon-update panel (Access → Daemons) exists on every OS —
+what differs per platform is what each channel can honestly do, and the daemon
+derives that from one declared release-asset table
+(`RELEASE_ASSET_LANES` in `src/bin/caller/handover/update_lane.rs`), never
+from a compile-time OS check:
+
+- **Dev channel (build from main)** works on a Windows source checkout,
+  including the lock collision the naive flow hits: the cargo build's final
+  copy lands at `target\release\intendant.exe` — the running daemon's own
+  image, which Windows locks against write and delete. The produce job sets
+  the running binary aside by rename (which Windows permits on a running
+  image) so the fresh build lands at the vacated path, and restores it if the
+  build fails. Unix needs none of this (the final step replaces the inode by
+  unlink + relink) and is untouched.
+- **Releases channel** checks are honest data everywhere, but release
+  *install* refuses on Windows and Linux by name — "no Windows release assets
+  are published yet — rebuild from source on this platform" — because the
+  release lane publishes no daemon assets for them yet. The refusal, the
+  panel's availability catalog, and the chip's `one_click` fact all derive
+  from the asset table, so publishing assets for a platform ages the refusals
+  out by adding that platform's table row (plus its plain-binary install arm,
+  a prepared seam that today refuses cleanly) — there is no separate gate to
+  update.
+
 ## Known Limitations
 
 These are tracked deferrals, not bugs. Each degrades with a clear error rather

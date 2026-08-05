@@ -8628,11 +8628,15 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
         .expect("POST cross-channel produce");
     assert_eq!(cross.status(), 409, "cross-channel produce refuses");
     let cross: serde_json::Value = cross.json().await.expect("refusal body");
+    // Platform-stable pin: on a host with a published release asset
+    // (macOS) the refusal names the install-shape mismatch; on one
+    // without (the Linux leg) it names the missing platform — both
+    // point the source install at the Dev channel.
     assert!(
         cross["detail"]
             .as_str()
             .unwrap_or_default()
-            .contains("packaged macOS app"),
+            .contains("build from main"),
         "the refusal names the mismatch: {cross}"
     );
     // And the vocabulary is exactly two: an unknown channel is a 400.
