@@ -261,6 +261,33 @@ else
   say "note: no --connect rendezvous URL — the daemon will not publish a discovery route (its local dashboard still works)."
 fi
 
+# Auto-open the dashboard once the daemon reports ready (install.ps1
+# twin). `ctl dashboard-url` prints this boot's tokened loopback owner
+# URL — certless, local-only, token rotating each boot — so the first
+# dashboard needs no certificate enrollment. Backgrounded because the
+# launches below `exec`; a subshell survives that. Only attempted where
+# a GUI opener exists: a headless SSH box skips it silently, and the
+# URL is reprintable any time with `intendant ctl dashboard-url`.
+spawn_dashboard_opener() {
+  OPENER=""
+  if command -v open >/dev/null 2>&1; then OPENER="open"
+  elif command -v xdg-open >/dev/null 2>&1; then OPENER="xdg-open"
+  else return 0; fi
+  (
+    tries=0
+    while [ "$tries" -lt 60 ]; do
+      sleep 2
+      URL="$("$INSTALL_DIR/target/release/intendant" ctl dashboard-url 2>/dev/null || true)"
+      if [ -n "$URL" ]; then
+        say "dashboard ready: $URL (token rotates each boot; reprint with: intendant ctl dashboard-url)"
+        "$OPENER" "$URL" >/dev/null 2>&1 || true
+        exit 0
+      fi
+      tries=$((tries + 1))
+    done
+  ) &
+}
+
 if [ "$SERVICE" = "1" ]; then
   # A daemon on a rented box must outlive this SSH session and restart
   # on failure. The binary itself picks the platform's supervisor
@@ -268,12 +295,14 @@ if [ "$SERVICE" = "1" ]; then
   # where the one-time claim code lands. The INTENDANT_CONNECT_* exports above
   # are captured into the service definition.
   if [ "$RUN" = "1" ]; then
+    spawn_dashboard_opener
     exec "$INSTALL_DIR/target/release/intendant" service install --now -- "$@"
   else
     exec "$INSTALL_DIR/target/release/intendant" service install -- "$@"
   fi
 elif [ "$RUN" = "1" ]; then
   say "starting the daemon — its one-time Connect code links discovery only and grants no access. Establish owner through this machine's local console or direct mTLS."
+  spawn_dashboard_opener
   exec "$INSTALL_DIR/target/release/intendant" "$@"
 else
   say "done. Start it with:"
