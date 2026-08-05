@@ -39034,7 +39034,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '81575fa84a48273a';
+const INTENDANT_APP_BUILD = '795934a711c6c908';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -108725,7 +108725,8 @@ async function memoryProposeFromForm(button) {
     flavorChip.className = 'update-lane-flavor';
     flavorChip.textContent = block.flavor === 'source'
       ? 'source install'
-      : block.flavor === 'consumer-app' ? 'release install' : 'unmanaged';
+      : (block.flavor === 'consumer-app' || block.flavor === 'consumer-binary')
+        ? 'release install' : 'unmanaged';
     head.appendChild(flavorChip);
     card.appendChild(head);
 
@@ -108738,6 +108739,8 @@ async function memoryProposeFromForm(button) {
       line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
     } else if (block.flavor === 'consumer-app' && block.app_root) {
       line(body, 'update-lane-note', `Installed app: ${block.app_root}`);
+    } else if (block.flavor === 'consumer-binary' && block.install_dir) {
+      line(body, 'update-lane-note', `Installed at: ${block.install_dir}`);
     }
     if (block.unavailable) {
       line(body, 'update-lane-note', block.unavailable);

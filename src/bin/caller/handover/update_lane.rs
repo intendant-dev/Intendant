@@ -18,14 +18,16 @@
 //!   config wrapper stays engaged) and is HEADROOM-GATED: under memory
 //!   pressure the job refuses to start rather than joining an OOM
 //!   spiral.
-//! - **Consumer** (an installed release app with no source checkout):
-//!   the latest release manifest via the transparency-log ritual
-//!   (`hosted_verify::verify_hosted_release` — inclusion proof, signed
-//!   tree head, append-only pin, PGP identity/coverage), then download
-//!   with sha256 checked against the LOG, `gpg --verify` against the
-//!   compiled-in release signing key in a throwaway GNUPGHOME, then
-//!   install beside the running app. FAIL CLOSED on every verify step:
-//!   unverified bytes are deleted, never installed.
+//! - **Consumer** (an installed release with no source checkout — the
+//!   macOS app bundle, or the plain daemon + runtime pair the Windows
+//!   zip unpacks to): the latest release manifest via the
+//!   transparency-log ritual (`hosted_verify::verify_hosted_release` —
+//!   inclusion proof, signed tree head, append-only pin, PGP
+//!   identity/coverage), then download with sha256 checked against the
+//!   LOG, `gpg --verify` against the compiled-in release signing key
+//!   in a throwaway GNUPGHOME, then install beside the running app (or
+//!   land the pair at the watched binary path). FAIL CLOSED on every
+//!   verify step: unverified bytes are deleted, never installed.
 //!
 //! Boundary (the commission's first-class gate line): the daemon never
 //! self-execs the build or fetch, and this module never execs a
@@ -92,6 +94,11 @@ pub(crate) enum InstallFlavor {
     /// An installed app bundle with no reachable source checkout: the
     /// release download lane.
     ConsumerApp { app_root: PathBuf },
+    /// The unzipped-release shape (the Windows install): the daemon
+    /// binary with its `intendant-runtime` sibling at their final
+    /// names, outside any checkout or app bundle — the release
+    /// download lane's plain-binary arm.
+    ConsumerBinary { install_dir: PathBuf },
     /// Neither lane can honestly produce an artifact at the watched
     /// path; the panel says why instead of offering a button.
     Unmanaged { reason: String },
@@ -102,6 +109,7 @@ impl InstallFlavor {
         match self {
             InstallFlavor::Source { .. } => "source",
             InstallFlavor::ConsumerApp { .. } => "consumer-app",
+            InstallFlavor::ConsumerBinary { .. } => "consumer-binary",
             InstallFlavor::Unmanaged { .. } => "unmanaged",
         }
     }
@@ -156,7 +164,10 @@ pub(crate) fn check_refusal(flavor: &InstallFlavor, channel: UpdateChannel) -> O
     match (channel, flavor) {
         (UpdateChannel::Releases, _) => None,
         (UpdateChannel::Dev, InstallFlavor::Source { .. }) => None,
-        (UpdateChannel::Dev, InstallFlavor::ConsumerApp { .. }) => Some(
+        (
+            UpdateChannel::Dev,
+            InstallFlavor::ConsumerApp { .. } | InstallFlavor::ConsumerBinary { .. },
+        ) => Some(
             "no source checkout around this install — the Dev channel compares against and \
              rebuilds a git checkout"
                 .to_string(),
@@ -193,13 +204,12 @@ pub(crate) enum ReleaseInstallKind {
     /// A zip carrying `Intendant.app` at its root: unpacked and swapped
     /// beside the running app ([`install_app_swap`]).
     AppBundle,
-    /// A daemon binary for the watched path (future Windows/Linux
-    /// rows): staged beside the watched binary and renamed into place —
-    /// today [`install_plain_binary_release`] is a prepared, cleanly
-    /// refusing seam.
-    // The prepared seam: first constructed (outside tests) by the
-    // first non-macOS table row, which ages this allow out.
-    #[allow(dead_code)]
+    /// A zip carrying the daemon + runtime pair at its root, at their
+    /// final sibling names (release.yml pins that layout): unpacked,
+    /// probed, and landed beside the watched binary
+    /// ([`install_plain_binary_release`]) — the runtime first, the
+    /// watched daemon image last, so the update chip only fires on a
+    /// complete pair.
     PlainBinary,
 }
 
@@ -218,16 +228,15 @@ pub(crate) struct ReleaseAssetLane {
 }
 
 /// THE release-asset declaration: which published release asset
-/// installs on which host, stated once. Only macOS rows exist — the
-/// release lane publishes no Windows or Linux daemon assets yet — and
-/// every gate derives from here: produce refusals, the status
-/// `unavailable` note, and the chip's `one_click` fact consult
-/// [`release_asset_lane`]; asset selection takes the row's name shape;
-/// the install step takes the row's kind. Publishing assets for a new
-/// platform = adding its row (and filling the
-/// [`ReleaseInstallKind::PlainBinary`] install arm the first time) —
-/// the platform's refusals then age out by themselves; there is no
-/// further gating change to make.
+/// installs on which host, stated once. Every gate derives from here:
+/// produce refusals, the status `unavailable` note, and the chip's
+/// `one_click` fact consult [`release_asset_lane`]; asset selection
+/// takes the row's name shape; the install step takes the row's kind.
+/// No Linux rows exist — the release lane publishes standalone Linux
+/// WORKER binaries, not daemon zips — and publishing daemon assets for
+/// a new platform = adding its row; the platform's refusals then age
+/// out by themselves, with no further gating change to make (the
+/// Windows row proved the aging-out live).
 const RELEASE_ASSET_LANES: &[ReleaseAssetLane] = &[
     ReleaseAssetLane {
         os: "macos",
@@ -245,6 +254,17 @@ const RELEASE_ASSET_LANES: &[ReleaseAssetLane] = &[
         name_suffix: "-macos-x86_64.zip",
         artifact_label: "the packaged macOS app",
         install: ReleaseInstallKind::AppBundle,
+    },
+    // release.yml's windows-binary job: both exes at their final
+    // sibling names at the zip root (the layout its collection step
+    // asserts before publish).
+    ReleaseAssetLane {
+        os: "windows",
+        arch: "x86_64",
+        name_prefix: "Intendant-",
+        name_suffix: "-windows-x86_64.zip",
+        artifact_label: "the Windows daemon + runtime binaries",
+        install: ReleaseInstallKind::PlainBinary,
     },
 ];
 
@@ -311,11 +331,26 @@ pub(crate) fn produce_refusal(
             Some(format!("no update lane for this install: {reason}"))
         }
         (UpdateChannel::Dev, InstallFlavor::Source { .. }) => None,
-        (UpdateChannel::Dev, InstallFlavor::ConsumerApp { .. }) => {
-            check_refusal(flavor, UpdateChannel::Dev)
-        }
+        (
+            UpdateChannel::Dev,
+            InstallFlavor::ConsumerApp { .. } | InstallFlavor::ConsumerBinary { .. },
+        ) => check_refusal(flavor, UpdateChannel::Dev),
         (UpdateChannel::Releases, InstallFlavor::ConsumerApp { .. }) => {
             release_asset_unavailable(host)
+        }
+        (UpdateChannel::Releases, InstallFlavor::ConsumerBinary { .. }) => {
+            match release_asset_lane(host) {
+                None => release_asset_unavailable(host),
+                // The host's asset is an app bundle: unpacking it beside a
+                // plain daemon binary would never update the watched path.
+                Some(lane) if lane.install == ReleaseInstallKind::AppBundle => Some(format!(
+                    "the {} release asset is {}, which does not install over a plain \
+                     daemon binary — rebuild from source on this platform",
+                    platform_display_name(lane.os),
+                    lane.artifact_label
+                )),
+                Some(_) => None,
+            }
         }
         (
             UpdateChannel::Releases,
@@ -334,12 +369,18 @@ pub(crate) fn produce_refusal(
                  (the Dev channel behind Advanced), not the release download",
                 repo_root.display()
             ),
-            Some(lane) => format!(
+            Some(lane) if lane.install == ReleaseInstallKind::AppBundle => format!(
                 "this daemon runs from the checkout at {} — a release would install {}, \
                  not this binary; updates for this install build from main (the Dev \
                  channel behind Advanced)",
                 repo_root.display(),
                 lane.artifact_label
+            ),
+            Some(_) => format!(
+                "this daemon runs from the checkout at {} — updates for this install \
+                 build from main (the Dev channel behind Advanced), not the release \
+                 download",
+                repo_root.display()
             ),
         }),
     }
@@ -455,6 +496,20 @@ pub(crate) fn detect_install_flavor(exe: &Path) -> InstallFlavor {
             };
         }
         ancestor = dir.parent();
+    }
+    // The unzipped-release shape: the runtime sibling at its final name
+    // (the layout release.yml asserts before publish, and what sibling
+    // resolution needs) marks the plain-binary consumer install.
+    if let Some(dir) = exe.parent() {
+        let runtime_sibling = dir.join(format!(
+            "intendant-runtime{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        if runtime_sibling.is_file() {
+            return InstallFlavor::ConsumerBinary {
+                install_dir: dir.to_path_buf(),
+            };
+        }
     }
     InstallFlavor::Unmanaged {
         reason: "no source checkout or app bundle found around the running binary".to_string(),
@@ -907,6 +962,21 @@ impl UpdateLane {
                     obj.insert("unavailable".into(), unavailable.into());
                 }
             }
+            InstallFlavor::ConsumerBinary { install_dir } => {
+                obj.insert(
+                    "install_dir".into(),
+                    install_dir.display().to_string().into(),
+                );
+                // The produce refusal covers both the missing-platform
+                // and the asset-shape-mismatch stories for this flavor.
+                if let Some(unavailable) = produce_refusal(
+                    &self.flavor,
+                    UpdateChannel::Releases,
+                    HostPlatform::current(),
+                ) {
+                    obj.insert("unavailable".into(), unavailable.into());
+                }
+            }
             InstallFlavor::Unmanaged { reason } => {
                 obj.insert("unavailable".into(), reason.clone().into());
             }
@@ -1150,7 +1220,8 @@ impl UpdateLane {
             return Err("an update job is already running".to_string());
         }
         // The guard above pins channel↔flavor: Dev only passes on a
-        // Source install, Releases only on a consumer app.
+        // Source install, Releases only on a consumer install (app
+        // bundle or plain binary).
         let lane_kind = match channel {
             UpdateChannel::Dev => "source",
             UpdateChannel::Releases => "consumer",
@@ -1171,7 +1242,10 @@ impl UpdateLane {
                     repo_root,
                     app_bundle,
                 } => lane.produce_source(&repo_root, app_bundle).await,
-                InstallFlavor::ConsumerApp { app_root } => lane.produce_consumer(&app_root).await,
+                InstallFlavor::ConsumerApp { app_root } => {
+                    lane.produce_consumer(Some(&app_root)).await
+                }
+                InstallFlavor::ConsumerBinary { .. } => lane.produce_consumer(None).await,
                 InstallFlavor::Unmanaged { .. } => unreachable!("refused above"),
             };
             lane.finish_job(outcome);
@@ -1455,7 +1529,13 @@ impl UpdateLane {
 
     // ── Produce: consumer lane ──
 
-    async fn produce_consumer(self: &Arc<Self>, app_root: &Path) -> Result<String, String> {
+    /// The shared release download-and-verify lane; `app_root` is
+    /// `Some` on an app-bundle install (its swap target) and `None` on
+    /// a plain-binary install (which lands at the watched path).
+    async fn produce_consumer(
+        self: &Arc<Self>,
+        app_root: Option<&Path>,
+    ) -> Result<String, String> {
         let host = HostPlatform::current();
         let Some(lane) = release_asset_lane(host) else {
             // request_produce's gate refused already; fail closed for
@@ -1499,13 +1579,24 @@ impl UpdateLane {
         ));
 
         self.set_phase("install");
-        match lane.install {
-            // The prepared seam (no table row declares it yet): refuse
-            // cleanly; `cleanup` drops the verified download with the
-            // staging tree.
-            ReleaseInstallKind::PlainBinary => return install_plain_binary_release(lane),
-            ReleaseInstallKind::AppBundle => {}
+        if lane.install == ReleaseInstallKind::PlainBinary {
+            // `cleanup` moves into the arm — a failure inside it still
+            // drops the staging tree with the verified download.
+            return self
+                .produce_plain_binary_install(&report, &zip_path, &staging, cleanup)
+                .await;
         }
+        let Some(app_root) = app_root else {
+            // request_produce's gate refused already (an app-bundle
+            // asset never installs over a plain-binary install); fail
+            // closed for any direct caller.
+            return Err(format!(
+                "the {} release asset is {}, which does not install over a plain daemon \
+                 binary",
+                platform_display_name(lane.os),
+                lane.artifact_label
+            ));
+        };
         let unpack_dir = staging.join("unpacked");
         std::fs::create_dir_all(&unpack_dir).map_err(|err| format!("unpack dir: {err}"))?;
         self.run_child(
@@ -1547,6 +1638,62 @@ impl UpdateLane {
             build.git_sha,
             build.version,
             app_root.display(),
+        ))
+    }
+
+    /// The plain-binary install arm, after the shared verify chain
+    /// (transparency log + sha + PGP) accepted the zip: unpack with the
+    /// workspace zip crate (Windows has no ditto), require the daemon +
+    /// runtime pair at the zip root, probe the daemon image, then land
+    /// the pair beside the watched binary
+    /// ([`install_plain_binary_release`]). The handoff is the same as
+    /// the source lane's: the artifact sits at the watched path, the
+    /// update watch chips it, and the shipped swap lane (the app
+    /// supervisor's one-click, or successor-exec on CLI daemons) takes
+    /// over on its own explicit click.
+    async fn produce_plain_binary_install(
+        self: &Arc<Self>,
+        report: &crate::hosted_verify::ReleaseVerifyReport,
+        zip_path: &Path,
+        staging: &Path,
+        cleanup: StagingCleanup,
+    ) -> Result<String, String> {
+        let unpack_dir = staging.join("unpacked");
+        {
+            let zip_path = zip_path.to_path_buf();
+            let unpack_dir = unpack_dir.clone();
+            tokio::task::spawn_blocking(move || unpack_release_zip(&zip_path, &unpack_dir))
+                .await
+                .map_err(|err| format!("unpack task: {err}"))??;
+        }
+        let (new_daemon, new_runtime) = locate_plain_binary_pair(&unpack_dir)?;
+        let build = super::update_watch::run_version_probe(&new_daemon)
+            .await
+            .map_err(|err| format!("the downloaded binary failed its --version probe: {err}"))?;
+        self.job_log(format!(
+            "staging the daemon + runtime pair beside {}",
+            self.exe_path.display()
+        ));
+        {
+            // Filesystem renames (a copy on cross-volume staging) —
+            // blocking work off the executor, like the app swap.
+            let new_daemon = new_daemon.clone();
+            let new_runtime = new_runtime.clone();
+            let watched = self.exe_path.clone();
+            tokio::task::spawn_blocking(move || {
+                install_plain_binary_release(&new_daemon, &new_runtime, &watched)
+            })
+            .await
+            .map_err(|err| format!("install task: {err}"))??;
+        }
+        drop(cleanup);
+        Ok(format!(
+            "release {} (commit {}, {}) installed at {} — the update chip offers the swap once \
+             the watch confirms it on disk",
+            report.tag,
+            build.git_sha,
+            build.version,
+            self.exe_path.display(),
         ))
     }
 
@@ -1609,7 +1756,8 @@ impl UpdateLane {
         .map_err(|err| {
             format!(
                 "{err} — the consumer lane needs gnupg for the signature check \
-                 (macOS: brew install gnupg); refusing to install without it"
+                 (macOS: brew install gnupg; Windows: Gpg4win or Git for Windows' gpg on \
+                 PATH); refusing to install without it"
             )
         })?;
         let status_out = self
@@ -1819,25 +1967,163 @@ fn install_app_swap(new_app: &Path, app_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The plain-binary release install arm — the prepared seam for the
-/// first non-macOS asset row. The shape, when a table row declares
-/// [`ReleaseInstallKind::PlainBinary`]: the verified artifact stages
-/// beside the watched binary and renames into place through the same
-/// set-aside dance the dev build uses ([`stage_aside_build_output`] —
-/// Windows cannot overwrite a running image in place), and the shipped
-/// watch/chip/swap lane takes over exactly as for a produced dev
-/// build. No published asset defines its archive layout yet, so this
-/// stub refuses cleanly instead of guessing — landing the first
-/// `PlainBinary` row means filling this arm in with that asset's real
-/// shape; until then the refusal names the gap honestly.
-fn install_plain_binary_release(lane: &ReleaseAssetLane) -> Result<String, String> {
-    Err(format!(
-        "the {} {} release asset verified, but its plain-binary install step is not built \
-         yet — refusing to guess at the artifact layout; rebuild from source on this \
-         platform",
-        platform_display_name(lane.os),
-        lane.arch
-    ))
+/// Unpack the verified release zip with the workspace's zip crate —
+/// portable (Windows has no ditto), and traversal-shaped entry names
+/// are refused by the crate's own extract guard.
+fn unpack_release_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|err| format!("unpack dir: {err}"))?;
+    let file = std::fs::File::open(zip_path)
+        .map_err(|err| format!("open {}: {err}", zip_path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|err| format!("read release zip: {err}"))?;
+    archive
+        .extract(dest)
+        .map_err(|err| format!("unpack release zip: {err}"))
+}
+
+/// The pair the plain-binary release zip carries at its root, at their
+/// final sibling names (release.yml asserts that layout before it
+/// publishes) — refused by name when either is missing. Marks both
+/// executable on Unix: a zip built on Windows carries no mode bits,
+/// and the daemon image is about to be `--version`-probed.
+fn locate_plain_binary_pair(unpack_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let daemon = unpack_dir.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+    let runtime = unpack_dir.join(format!(
+        "intendant-runtime{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    for path in [&daemon, &runtime] {
+        if !path.is_file() {
+            return Err(format!(
+                "the release zip did not contain {} at its root",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("the expected binary")
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in [&daemon, &runtime] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|err| format!("mark {} executable: {err}", path.display()))?;
+        }
+    }
+    Ok((daemon, runtime))
+}
+
+/// Land the verified plain-binary pair beside the watched binary: the
+/// runtime first, the watched daemon image LAST — the update watch
+/// chips on the daemon image, so a chip implies the complete pair —
+/// reusing the dev build's set-aside dance
+/// ([`stage_aside_build_output`]): on Windows it vacates paths a
+/// running image locks against rename-over, and everywhere it keeps
+/// the old bytes for rollback. The daemon image itself is replaced
+/// atomically on Unix (the dev build's exact landing); a failed
+/// landing rolls the pair back together, so the install dir never
+/// keeps a half-updated pair. Pure over the filesystem — hermetic
+/// under a tempdir on every host.
+fn install_plain_binary_release(
+    new_daemon: &Path,
+    new_runtime: &Path,
+    watched_exe: &Path,
+) -> Result<(), String> {
+    let parent = watched_exe
+        .parent()
+        .ok_or_else(|| "the watched binary path has no parent directory".to_string())?;
+    let daemon_name = watched_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the watched binary path has no usable name".to_string())?;
+    let runtime_name = new_runtime
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the runtime binary has no usable name".to_string())?;
+    let dest_runtime = parent.join(runtime_name);
+
+    // Stage the pair INTO the install dir first: renames from here are
+    // same-volume (the staging tree may not be), and a cross-volume
+    // copy failure aborts before anything live is touched.
+    let staged_daemon = parent.join(format!(".{daemon_name}.update-{}", std::process::id()));
+    let staged_runtime = parent.join(format!(".{runtime_name}.update-{}", std::process::id()));
+    stage_local_copy(new_daemon, &staged_daemon)?;
+    if let Err(err) = stage_local_copy(new_runtime, &staged_runtime) {
+        let _ = std::fs::remove_file(&staged_daemon);
+        return Err(err);
+    }
+
+    // The runtime lands first: vacate (Windows locks a running image
+    // against rename-over; the aside doubles as the rollback copy on
+    // every host), then rename into the vacated path.
+    let runtime_aside = match stage_aside_build_output(&dest_runtime) {
+        Ok(aside) => aside,
+        Err(err) => {
+            let _ = std::fs::remove_file(&staged_daemon);
+            let _ = std::fs::remove_file(&staged_runtime);
+            return Err(err);
+        }
+    };
+    if let Err(err) = std::fs::rename(&staged_runtime, &dest_runtime) {
+        rollback_runtime(&dest_runtime, runtime_aside.as_deref());
+        let _ = std::fs::remove_file(&staged_daemon);
+        return Err(format!("could not move the new runtime into place: {err}"));
+    }
+
+    // The watched daemon image lands last. Windows needs the vacate
+    // dance; Unix replaces the inode atomically, exactly like the dev
+    // build's landing — the watch never observes a vacant watched path.
+    let daemon_aside = if cfg!(windows) {
+        match stage_aside_build_output(watched_exe) {
+            Ok(aside) => aside,
+            Err(err) => {
+                let _ = std::fs::remove_file(&staged_daemon);
+                rollback_runtime(&dest_runtime, runtime_aside.as_deref());
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(err) = std::fs::rename(&staged_daemon, watched_exe) {
+        if let Some(aside) = daemon_aside.as_deref() {
+            let _ = restore_aside_build_output(aside, watched_exe);
+        }
+        let _ = std::fs::remove_file(&staged_daemon);
+        rollback_runtime(&dest_runtime, runtime_aside.as_deref());
+        return Err(format!(
+            "could not move the new daemon binary into place: {err}"
+        ));
+    }
+    Ok(())
+}
+
+/// Undo a landed runtime after the daemon image failed to land: the
+/// pair stays coherent (old daemon + old runtime) rather than half
+/// updated. Best-effort — a runtime child still executing the new
+/// image on Windows keeps its lock until it exits, and the next
+/// produce's set-aside sweep collects the leftovers.
+fn rollback_runtime(dest_runtime: &Path, aside: Option<&Path>) {
+    let Some(aside) = aside else { return };
+    let _ = std::fs::remove_file(dest_runtime);
+    let _ = restore_aside_build_output(aside, dest_runtime);
+}
+
+/// Stage a file into the destination directory: rename when the
+/// staging tree shares the volume, a plain copy (permission bits ride
+/// along) when it does not.
+fn stage_local_copy(src: &Path, dest: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_file(dest);
+    if std::fs::rename(src, dest).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dest).map(|_| ()).map_err(|err| {
+        format!(
+            "could not stage {} into {}: {err}",
+            src.display(),
+            dest.display()
+        )
+    })
 }
 
 /// The set-aside name prefix beside a build output — stale copies from
@@ -2014,8 +2300,14 @@ pub(crate) fn auto_check_channels(
             }
             channels
         }
-        InstallFlavor::ConsumerApp { .. } if connect_configured => vec![UpdateChannel::Releases],
-        InstallFlavor::ConsumerApp { .. } | InstallFlavor::Unmanaged { .. } => vec![],
+        InstallFlavor::ConsumerApp { .. } | InstallFlavor::ConsumerBinary { .. }
+            if connect_configured =>
+        {
+            vec![UpdateChannel::Releases]
+        }
+        InstallFlavor::ConsumerApp { .. }
+        | InstallFlavor::ConsumerBinary { .. }
+        | InstallFlavor::Unmanaged { .. } => vec![],
     }
 }
 
@@ -2170,11 +2462,11 @@ mod tests {
                 .contains("no source checkout"),
             "{catalog}"
         );
-        let off_macos = channel_catalog(&consumer, WINDOWS);
+        let off_macos = channel_catalog(&consumer, LINUX);
         assert_eq!(off_macos["releases"]["produce"], false);
         assert_eq!(
             off_macos["releases"]["reason"],
-            "no Windows release assets are published yet — rebuild from source on this platform",
+            "no Linux release assets are published yet — rebuild from source on this platform",
             "{off_macos}"
         );
 
@@ -2256,22 +2548,28 @@ mod tests {
 
     // ── The per-platform release-asset gate (the one declaration) ──
 
-    /// Current truth, pinned: the release lane publishes exactly the
-    /// two macOS app assets. Windows/Linux rows are the intended
-    /// aging-out path — the first one updates this pin and fills the
-    /// `PlainBinary` install arm with the asset's real shape; the
-    /// GATING (refusals, selection, `one_click`) needs no further
-    /// change, which the macOS rows prove through the same lookup.
+    /// Current truth, pinned: the two macOS app rows plus the Windows
+    /// x86_64 plain-binary row (release.yml's windows-binary job — the
+    /// name shape is the exact zip it stages). No Linux rows: the
+    /// release lane publishes standalone Linux WORKER binaries, not
+    /// daemon zips — a future Linux daemon asset lands by adding its
+    /// row, and the platform-generic `PlainBinary` arm lights up free.
     #[test]
-    fn release_asset_table_is_macos_app_only_today() {
-        assert_eq!(RELEASE_ASSET_LANES.len(), 2);
+    fn release_asset_table_pins_the_published_lanes() {
+        assert_eq!(RELEASE_ASSET_LANES.len(), 3);
         for lane in RELEASE_ASSET_LANES {
-            assert_eq!(lane.os, "macos");
-            assert_eq!(lane.install, ReleaseInstallKind::AppBundle);
+            assert_ne!(lane.os, "linux", "no Linux daemon assets exist");
         }
-        assert!(release_asset_lane(MACOS_ARM).is_some());
-        assert!(release_asset_lane(MACOS_X86).is_some());
-        assert!(release_asset_lane(WINDOWS).is_none());
+        let windows = release_asset_lane(WINDOWS).expect("the Windows x86_64 row");
+        assert_eq!(windows.name_prefix, "Intendant-");
+        assert_eq!(windows.name_suffix, "-windows-x86_64.zip");
+        assert_eq!(windows.install, ReleaseInstallKind::PlainBinary);
+        for host in [MACOS_ARM, MACOS_X86] {
+            assert_eq!(
+                release_asset_lane(host).expect("macOS row").install,
+                ReleaseInstallKind::AppBundle
+            );
+        }
         assert!(release_asset_lane(LINUX).is_none());
     }
 
@@ -2279,19 +2577,13 @@ mod tests {
     /// the asset table carries no row for refuses release produce by
     /// NAME, and the one declaration drives the consumer refusal, the
     /// source install's cross-channel copy, and the status note — so a
-    /// published asset ages every one of them out at once.
+    /// published asset ages every one of them out at once (the Windows
+    /// row did exactly that: its old refusals below became Linux's).
     #[test]
     fn missing_platform_refusals_name_the_platform_exactly() {
         let consumer = InstallFlavor::ConsumerApp {
             app_root: PathBuf::from("/opt/Intendant.app"),
         };
-        assert_eq!(
-            produce_refusal(&consumer, UpdateChannel::Releases, WINDOWS).as_deref(),
-            Some(
-                "no Windows release assets are published yet — rebuild from source on this \
-                 platform"
-            ),
-        );
         assert_eq!(
             produce_refusal(&consumer, UpdateChannel::Releases, LINUX).as_deref(),
             Some(
@@ -2312,6 +2604,17 @@ mod tests {
                  source on this platform"
             ),
         );
+        let windows_arm = HostPlatform {
+            os: "windows",
+            arch: "aarch64",
+        };
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, windows_arm).as_deref(),
+            Some(
+                "no Windows release assets are published yet for aarch64 — rebuild from \
+                 source on this platform"
+            ),
+        );
 
         // The source install's releases refusal keeps pointing at the
         // Dev channel, with the platform fact folded in.
@@ -2320,45 +2623,83 @@ mod tests {
             app_bundle: false,
         };
         assert_eq!(
+            produce_refusal(&source, UpdateChannel::Releases, LINUX).as_deref(),
+            Some(
+                "no Linux release assets are published yet — updates for this install \
+                 build from main (the Dev channel behind Advanced)"
+            ),
+        );
+        // On a host WITH a plain-binary row the source install still
+        // updates from main — the copy names the posture, not a
+        // missing asset.
+        assert_eq!(
             produce_refusal(&source, UpdateChannel::Releases, WINDOWS).as_deref(),
             Some(
-                "no Windows release assets are published yet — updates for this install \
-                 build from main (the Dev channel behind Advanced)"
+                "this daemon runs from the checkout at /checkout — updates for this \
+                 install build from main (the Dev channel behind Advanced), not the \
+                 release download"
             ),
         );
 
         // The status note derives from the same declaration.
         assert_eq!(
-            release_asset_unavailable(WINDOWS).as_deref(),
+            release_asset_unavailable(LINUX).as_deref(),
             Some(
-                "no Windows release assets are published yet — rebuild from source on this \
+                "no Linux release assets are published yet — rebuild from source on this \
                  platform"
             ),
         );
+        assert_eq!(release_asset_unavailable(WINDOWS), None);
         assert_eq!(release_asset_unavailable(MACOS_ARM), None);
         assert_eq!(release_asset_unavailable(MACOS_X86), None);
     }
 
-    /// The plain-binary install arm is a prepared seam that refuses
-    /// cleanly by exact copy — download/verify are the shared lane
-    /// above it; the swap-in lands with the first Windows/Linux asset
-    /// row (no row declares `PlainBinary` yet, which the table pin
-    /// above enforces).
+    /// The plain-binary consumer install's own gate matrix: the
+    /// Windows row lights produce up; a rowless platform refuses by
+    /// name; a host whose asset is the app bundle refuses by shape
+    /// (unpacking an app beside a plain binary would never update the
+    /// watched path); the Dev channel stays honest about the missing
+    /// checkout; and the standing cadence treats the flavor exactly
+    /// like the app-shaped consumer install.
     #[test]
-    fn plain_binary_install_arm_refuses_cleanly_today() {
-        let lane = ReleaseAssetLane {
-            os: "windows",
-            arch: "x86_64",
-            name_prefix: "Intendant-",
-            name_suffix: "-windows-x86_64.zip",
-            artifact_label: "the Windows daemon binary",
-            install: ReleaseInstallKind::PlainBinary,
+    fn plain_binary_consumer_gates_derive_from_the_row() {
+        let consumer = InstallFlavor::ConsumerBinary {
+            install_dir: PathBuf::from("/opt/intendant"),
         };
+        assert_eq!(consumer.native_channel(), UpdateChannel::Releases);
         assert_eq!(
-            install_plain_binary_release(&lane).unwrap_err(),
-            "the Windows x86_64 release asset verified, but its plain-binary install step \
-             is not built yet — refusing to guess at the artifact layout; rebuild from \
-             source on this platform"
+            produce_refusal(&consumer, UpdateChannel::Releases, WINDOWS),
+            None,
+            "the Windows row lights the release install up"
+        );
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, LINUX).as_deref(),
+            Some(
+                "no Linux release assets are published yet — rebuild from source on this \
+                 platform"
+            ),
+        );
+        assert_eq!(
+            produce_refusal(&consumer, UpdateChannel::Releases, MACOS_ARM).as_deref(),
+            Some(
+                "the macOS release asset is the packaged macOS app, which does not \
+                 install over a plain daemon binary — rebuild from source on this \
+                 platform"
+            ),
+        );
+        assert!(produce_refusal(&consumer, UpdateChannel::Dev, WINDOWS)
+            .unwrap()
+            .contains("no source checkout"));
+        assert!(check_refusal(&consumer, UpdateChannel::Releases).is_none());
+
+        let catalog = channel_catalog(&consumer, WINDOWS);
+        assert_eq!(catalog["releases"]["produce"], true, "{catalog}");
+        assert_eq!(catalog["dev"]["produce"], false, "{catalog}");
+
+        assert_eq!(auto_check_channels(&consumer, false), vec![]);
+        assert_eq!(
+            auto_check_channels(&consumer, true),
+            vec![UpdateChannel::Releases]
         );
     }
 
@@ -2592,6 +2933,220 @@ mod tests {
         ));
     }
 
+    /// The unzipped-release shape: the runtime sibling at its final
+    /// name marks the plain-binary consumer install; a lone stray
+    /// binary stays unmanaged, and a checkout's release output stays
+    /// source (the ancestor walk wins — target/release carries the
+    /// runtime sibling too).
+    #[test]
+    fn flavor_detects_plain_binary_install_by_runtime_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("install");
+        let exe = install.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+        touch(&exe);
+        assert!(matches!(
+            detect_install_flavor(&exe),
+            InstallFlavor::Unmanaged { .. }
+        ));
+        touch(&install.join(format!(
+            "intendant-runtime{}",
+            std::env::consts::EXE_SUFFIX
+        )));
+        assert_eq!(
+            detect_install_flavor(&exe),
+            InstallFlavor::ConsumerBinary {
+                install_dir: install.clone()
+            }
+        );
+
+        // A checkout's release output keeps its source flavor even
+        // with the runtime sibling beside it.
+        let repo = dir.path().join("checkout");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        touch(&repo.join("Cargo.toml"));
+        touch(&repo.join("scripts").join("bundle-macos.sh"));
+        let release = repo.join("target").join("release");
+        let checkout_exe = release.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+        touch(&checkout_exe);
+        touch(&release.join(format!(
+            "intendant-runtime{}",
+            std::env::consts::EXE_SUFFIX
+        )));
+        assert_eq!(
+            detect_install_flavor(&checkout_exe),
+            InstallFlavor::Source {
+                repo_root: repo,
+                app_bundle: false
+            }
+        );
+    }
+
+    /// The Windows row selects release.yml's exact asset shape —
+    /// `Intendant-<version>-windows-x86_64.zip` (version carries no
+    /// leading v) plus its required detached signature — and the
+    /// sidecar `.sha256` assets never confuse the suffix filter.
+    #[test]
+    fn windows_release_asset_selection_uses_the_row_shape() {
+        let lane = release_asset_lane(WINDOWS).expect("Windows row");
+        let artifacts = vec![
+            plan("Intendant-0.2.0-alpha.4-windows-x86_64.zip", "aa"),
+            plan("Intendant-0.2.0-alpha.4-windows-x86_64.zip.asc", "bb"),
+            plan("Intendant-0.2.0-alpha.4-windows-x86_64.zip.sha256", "cc"),
+            plan("Intendant-0.2.0-alpha.4-macos-arm64.zip", "dd"),
+            plan("intendant-linux-x86_64", "ee"),
+        ];
+        let (zip, asc) = select_release_asset(&artifacts, lane).expect("selects the Windows zip");
+        assert_eq!(zip.name, "Intendant-0.2.0-alpha.4-windows-x86_64.zip");
+        assert_eq!(asc.name, "Intendant-0.2.0-alpha.4-windows-x86_64.zip.asc");
+
+        let missing = select_release_asset(
+            &[plan("Intendant-0.2.0-alpha.4-macos-arm64.zip", "dd")],
+            lane,
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("Windows x86_64") && missing.contains("Intendant-…-windows-x86_64.zip"),
+            "the refusal names the wanted shape: {missing}"
+        );
+    }
+
+    // ── The plain-binary install arm (hermetic over fixture zips) ──
+
+    /// Write a fixture release zip carrying the given members at its
+    /// root — the layout release.yml stages and asserts.
+    fn write_fixture_zip(path: &Path, members: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in members {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    /// The unpack + pair-location seam: the zip crate unpacks the
+    /// verified bytes portably, the pair is required at the zip root
+    /// by its final sibling names (missing members refuse by name),
+    /// and both land executable on Unix (a Windows-built zip carries
+    /// no mode bits).
+    #[test]
+    fn unpack_locates_and_marks_the_plain_binary_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_name = format!("intendant{}", std::env::consts::EXE_SUFFIX);
+        let runtime_name = format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX);
+        let zip_path = dir.path().join("release.zip");
+        write_fixture_zip(
+            &zip_path,
+            &[
+                (daemon_name.as_str(), b"new-daemon".as_slice()),
+                (runtime_name.as_str(), b"new-runtime".as_slice()),
+            ],
+        );
+        let unpack = dir.path().join("unpacked");
+        unpack_release_zip(&zip_path, &unpack).expect("unpack");
+        let (daemon, runtime) = locate_plain_binary_pair(&unpack).expect("pair at the root");
+        assert_eq!(std::fs::read(&daemon).unwrap(), b"new-daemon");
+        assert_eq!(std::fs::read(&runtime).unwrap(), b"new-runtime");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [&daemon, &runtime] {
+                let mode = std::fs::metadata(path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o111, 0o111, "{} is executable", path.display());
+            }
+        }
+
+        // A zip missing the runtime refuses by the missing member's name.
+        let bad_zip = dir.path().join("bad.zip");
+        write_fixture_zip(&bad_zip, &[(daemon_name.as_str(), b"only-daemon".as_slice())]);
+        let bad_unpack = dir.path().join("bad-unpacked");
+        unpack_release_zip(&bad_zip, &bad_unpack).expect("unpack");
+        let refusal = locate_plain_binary_pair(&bad_unpack).unwrap_err();
+        assert!(refusal.contains(&runtime_name), "{refusal}");
+        assert!(refusal.contains("did not contain"), "{refusal}");
+    }
+
+    /// The landing itself: the verified pair stages into the install
+    /// dir and lands runtime-first, daemon-image-last; the old runtime
+    /// is kept as a set-aside rollback copy on every host, the old
+    /// daemon image as one on Windows (Unix replaces the watched inode
+    /// atomically, the dev build's exact landing); and a fresh install
+    /// dir (no prior pair) lands cleanly too.
+    #[test]
+    fn plain_binary_install_lands_the_pair_beside_the_watched_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let install = dir.path().join("install");
+        std::fs::create_dir_all(&install).unwrap();
+
+        let daemon_name = format!("intendant{}", std::env::consts::EXE_SUFFIX);
+        let runtime_name = format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX);
+        let watched = install.join(&daemon_name);
+        let dest_runtime = install.join(&runtime_name);
+        std::fs::write(&watched, b"old-daemon").unwrap();
+        std::fs::write(&dest_runtime, b"old-runtime").unwrap();
+
+        let new_daemon = staging.join(&daemon_name);
+        let new_runtime = staging.join(&runtime_name);
+        std::fs::write(&new_daemon, b"new-daemon").unwrap();
+        std::fs::write(&new_runtime, b"new-runtime").unwrap();
+
+        install_plain_binary_release(&new_daemon, &new_runtime, &watched).expect("landing");
+        assert_eq!(std::fs::read(&watched).unwrap(), b"new-daemon");
+        assert_eq!(std::fs::read(&dest_runtime).unwrap(), b"new-runtime");
+        let aside_prefix = build_output_aside_prefix(&runtime_name);
+        let runtime_aside = std::fs::read_dir(&install)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&aside_prefix))
+            })
+            .expect("the old runtime is kept as the rollback set-aside");
+        assert_eq!(std::fs::read(runtime_aside.path()).unwrap(), b"old-runtime");
+        let daemon_aside_prefix = build_output_aside_prefix(&daemon_name);
+        let daemon_aside = std::fs::read_dir(&install).unwrap().flatten().find(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&daemon_aside_prefix))
+        });
+        assert_eq!(
+            daemon_aside.is_some(),
+            cfg!(windows),
+            "the watched image is set aside only where rename-over is blocked"
+        );
+        assert!(
+            !std::fs::read_dir(&install).unwrap().flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.') && name.contains(".update-"))
+            }),
+            "no staged temporaries linger after the landing"
+        );
+
+        // A fresh install dir (nothing to set aside) lands the pair too.
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let fresh_watched = fresh.join(&daemon_name);
+        std::fs::write(&new_daemon, b"new-daemon").unwrap();
+        std::fs::write(&new_runtime, b"new-runtime").unwrap();
+        install_plain_binary_release(&new_daemon, &new_runtime, &fresh_watched)
+            .expect("fresh landing");
+        assert_eq!(std::fs::read(&fresh_watched).unwrap(), b"new-daemon");
+        assert_eq!(
+            std::fs::read(fresh.join(&runtime_name)).unwrap(),
+            b"new-runtime"
+        );
+    }
+
     /// Commission pin: the shipped dashboard bundle carries the Daemon
     /// update panel — the Access→Daemons mount, the two-channel
     /// vocabulary (Releases default, Dev behind Advanced), both consent
@@ -2610,6 +3165,7 @@ mod tests {
             "Fetch & compare",
             "update-lane-advanced",
             "update-lane-shortlog",
+            "consumer-binary",
             "/api/daemon/update-lane/produce",
             "/api/daemon/update-lane/check",
             "update_lane",
@@ -2759,14 +3315,6 @@ mod tests {
         let consumer = InstallFlavor::ConsumerApp {
             app_root: PathBuf::from("/apps/Intendant.app"),
         };
-        let on_windows =
-            release_update_block(&consumer, &state, WINDOWS, "0.1.0").expect("fact renders");
-        assert_eq!(on_windows["one_click"], false);
-        assert_eq!(
-            on_windows["reason"],
-            "no Windows release assets are published yet — rebuild from source on this platform",
-            "{on_windows}"
-        );
         let on_linux =
             release_update_block(&consumer, &state, LINUX, "0.1.0").expect("fact renders");
         assert_eq!(on_linux["one_click"], false);
@@ -2774,6 +3322,30 @@ mod tests {
             on_linux["reason"],
             "no Linux release assets are published yet — rebuild from source on this platform",
             "{on_linux}"
+        );
+
+        // The plain-binary consumer install: one click on the host
+        // whose row declares the plain-binary asset, honest shape
+        // mismatch where the asset is the app bundle.
+        let plain = InstallFlavor::ConsumerBinary {
+            install_dir: PathBuf::from("/opt/intendant"),
+        };
+        let on_windows =
+            release_update_block(&plain, &state, WINDOWS, "0.1.0").expect("fact renders");
+        assert_eq!(
+            on_windows["one_click"], true,
+            "the Windows plain-binary install takes the release on one click: {on_windows}"
+        );
+        assert!(on_windows.get("reason").is_none(), "{on_windows}");
+        let plain_on_macos =
+            release_update_block(&plain, &state, MACOS_ARM, "0.1.0").expect("fact renders");
+        assert_eq!(plain_on_macos["one_click"], false);
+        assert!(
+            plain_on_macos["reason"]
+                .as_str()
+                .unwrap()
+                .contains("does not install over a plain daemon binary"),
+            "{plain_on_macos}"
         );
 
         let unmanaged = InstallFlavor::Unmanaged {
