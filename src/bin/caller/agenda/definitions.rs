@@ -1333,6 +1333,19 @@ mod tests {
         // narrative-backfill: the backfill arc's dispatch/quota/patience/
         // never-detach/cap discipline, translated one-shot.
         let backfill = by_name("narrative-backfill");
+        // The orientation's cap-surface guidance (card 01KZ8PK1FD): the
+        // stamp-time field, the two owner surfaces by name, and the
+        // scripted chat answer — chat never binds spend authority.
+        carries(
+            &backfill.orientation,
+            "narrative-backfill orientation",
+            &[
+                "the Automate sheet's spend-cap field records the annotation at stamp time",
+                "intendant ctl agenda annotate <item-id> 'NS CAP: $60'",
+                "chat cannot bind it, because the run reads spend authority only from \
+                 owner-attributed annotations on the item",
+            ],
+        );
         carries(
             &backfill.nodes[0].goal,
             "narrative-backfill",
@@ -1361,6 +1374,14 @@ mod tests {
                 "NS CAP: $<amount>",
                 "STOP REFILLING, wait out attached workers",
                 "NS CAP REACHED",
+                // The cap refusal names BOTH owner surfaces and stays
+                // copy-pasteable; near-misses are quoted back verbatim,
+                // never parsed for amounts (card 01KZ8PK1FD).
+                "add a note in its THREAD section reading NS CAP: $<amount>",
+                "intendant ctl agenda annotate <item-id> 'NS CAP: $60'",
+                "substituting this item's real id for <item-id>",
+                "never parse an amount out of prose; spend authority stays exact bytes",
+                "QUOTES the near-miss verbatim",
                 // Enumeration + digest + journal discipline.
                 "(newest_mtime_ms,total_bytes)",
                 "idle >6h",

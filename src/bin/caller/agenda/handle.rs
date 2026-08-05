@@ -2094,6 +2094,7 @@ mod tests {
                     every_ms: None,
                     suspend_after: None,
                     agent_config: None,
+                    annotations: Vec::new(),
                     source: None,
                 },
                 actor("agent_session", Some("sess-1")),

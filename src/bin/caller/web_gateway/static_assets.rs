@@ -893,6 +893,44 @@ mod tests {
         assert!(sheet.contains("shadowed by a personal definition of the same name"));
     }
 
+    /// Card 01KZ8PK1FD: the automate sheet's stamp-time note lane. The
+    /// note input rides the stamp op's `annotations`; for a
+    /// cap-demanding definition it is the spend-cap field whose bare
+    /// typed amount canonicalizes client-side to the exact
+    /// `NS CAP: $<amount>` bytes the mandate greps for — no human
+    /// hand-formats spend authority. And the executor summary stays
+    /// honest: it names the definition's node pins instead of claiming
+    /// "daemon defaults" when pins exist.
+    #[test]
+    fn automate_sheet_note_field_canonicalizes_spend_caps() {
+        let sheet = include_str!("../../../../static/app/ui2-agenda.js");
+        assert!(
+            sheet.contains("function agendaStampCapDemanded"),
+            "the sheet must detect cap-demanding definitions from their served text"
+        );
+        assert!(
+            sheet.contains("NS CAP: $${bare}"),
+            "a bare typed amount must canonicalize to the exact NS CAP: $<amount> bytes"
+        );
+        assert!(
+            sheet.contains("overrides.annotations = [noteText]"),
+            "the note must ride the stamp op's annotations field"
+        );
+        // Copy law: the user-facing name for the annotation surface is
+        // THREAD (the UI's label), never the internal inspector name.
+        assert!(
+            sheet.contains("THREAD section"),
+            "note copy must name the THREAD section"
+        );
+        // Executor honesty (the sheet-summary half of the card): the
+        // definition's node pins are named when no explicit pick is
+        // made — the stamp lane's actual fallback.
+        assert!(
+            sheet.contains("the definition’s node pins, recorded on the manifest"),
+            "the pre-stamp summary must show the definition's node pins"
+        );
+    }
+
     /// Track AW, the workflow half of the emission-shape law,
     /// retargeted to the generic flow (its registry-era twin,
     /// workflow_approval_sheet_approves_only_in_the_owner_confirm_lane,

@@ -1099,6 +1099,25 @@ impl AgendaStore {
                     .into(),
             ));
         }
+        // Stamp-time notes validate BEFORE anything parks: these are the
+        // annotate intake's own bounds, run early so a bad note is a
+        // whole-stamp refusal instead of a parked prefix.
+        if stamp.annotations.len() > MAX_ANNOTATIONS_PER_ITEM {
+            return Err(AgendaError::Invalid(format!(
+                "more than {MAX_ANNOTATIONS_PER_ITEM} stamp notes"
+            )));
+        }
+        for note in &stamp.annotations {
+            let note = note.trim();
+            if note.is_empty() {
+                return Err(AgendaError::Invalid("stamp note must not be empty".into()));
+            }
+            if note.len() > MAX_BODY_BYTES {
+                return Err(AgendaError::Invalid(format!(
+                    "stamp note exceeds {MAX_BODY_BYTES} bytes"
+                )));
+            }
+        }
         let fire_at_ms = stamp.fire_at_ms.unwrap_or(now_ms);
 
         // Park the instance graph (today's stamp topologies, verbatim):
@@ -1141,6 +1160,30 @@ impl AgendaStore {
                 self.apply_place(&item.id, &hub.id, actor.clone(), source.clone(), now_ms)?;
             }
             parked.push((node.id.clone(), title, item.id));
+        }
+        // Stamp-time owner notes land on the annotation surface the fired
+        // mandates read: the hub for a workflow (its nodes are directed
+        // to read the hub's annotations — the narrative-pyramid context
+        // pickup), the action's single item otherwise ("this item" in an
+        // action's own laws, e.g. the narrative-backfill NS CAP spend
+        // cap). Ordinary annotate ops through the ordinary intake, so
+        // the stamp's gate-resolved attribution rides each note — an
+        // owner-submitted sheet lands owner-attributed annotations,
+        // exactly what an owner-parameter law requires.
+        let note_target = hub
+            .as_ref()
+            .map(|h| h.id.clone())
+            .unwrap_or_else(|| parked[0].2.clone());
+        for note in &stamp.annotations {
+            let op = self.command_to_op(
+                AgendaCommand::Annotate {
+                    id: note_target.clone(),
+                    text: note.clone(),
+                    source: None,
+                },
+                now_ms,
+            )?;
+            self.append_op(op, actor.clone(), source.clone(), now_ms)?;
         }
         let item_of = |parked: &[(String, String, String)], node_id: &str| -> String {
             parked
@@ -2641,6 +2684,7 @@ struct StampFields {
     every_ms: Option<u64>,
     suspend_after: Option<u32>,
     agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+    annotations: Vec<String>,
 }
 
 impl StampFields {
@@ -2652,6 +2696,7 @@ impl StampFields {
             every_ms,
             suspend_after,
             agent_config,
+            annotations,
             source: _,
         } = cmd
         else {
@@ -2666,6 +2711,7 @@ impl StampFields {
             every_ms,
             suspend_after,
             agent_config,
+            annotations,
         })
     }
 }
@@ -7377,6 +7423,10 @@ mod tests {
     }
 
     fn stamp_cmd(definition: &str) -> AgendaCommand {
+        stamp_cmd_with_notes(definition, &[])
+    }
+
+    fn stamp_cmd_with_notes(definition: &str, notes: &[&str]) -> AgendaCommand {
         AgendaCommand::Stamp {
             definition: definition.to_string(),
             project_root: None,
@@ -7384,6 +7434,7 @@ mod tests {
             every_ms: None,
             suspend_after: None,
             agent_config: None,
+            annotations: notes.iter().map(|n| n.to_string()).collect(),
             source: None,
         }
     }
@@ -7554,6 +7605,62 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&blob).unwrap(), embedded);
     }
 
+    /// Card 01KZ8PK1FD: stamp-time notes land on the annotation surface
+    /// the fired mandates read — an action's single item ("this item" in
+    /// its own laws, e.g. the narrative-backfill NS CAP spend cap), a
+    /// workflow's hub (whose nodes are directed to read the hub's
+    /// annotations) — attributed to the stamping actor, so an
+    /// owner-submitted sheet lands the owner-written line the cap law
+    /// greps for. Bad notes refuse by name BEFORE anything parks.
+    #[test]
+    fn stamp_notes_land_owner_attributed_on_the_surface_the_mandate_reads() {
+        // Action: the note lands on the single parked item, and the
+        // returned outcome already carries it.
+        let (_root, mut store) = stamp_rig();
+        let outcome = store
+            .apply_stamp_command(
+                stamp_cmd_with_notes("narrative-backfill", &["NS CAP: $60"]),
+                owner(),
+                5000,
+            )
+            .unwrap();
+        assert!(outcome.hub.is_none());
+        let item = &outcome.nodes[0].item;
+        assert_eq!(item.annotations.len(), 1);
+        assert_eq!(item.annotations[0].text, "NS CAP: $60");
+        assert_eq!(item.annotations[0].principal.as_deref(), Some("owner"));
+
+        // Workflow: the note lands on the hub — the instance-wide
+        // surface — never duplicated across node items.
+        let (_root2, mut store2) = stamp_rig();
+        let outcome = store2
+            .apply_stamp_command(
+                stamp_cmd_with_notes("fix-task", &["scope: the flaky e2e leg only"]),
+                owner(),
+                5000,
+            )
+            .unwrap();
+        let hub = outcome.hub.as_ref().expect("workflow hub");
+        assert_eq!(hub.annotations.len(), 1);
+        assert_eq!(hub.annotations[0].text, "scope: the flaky e2e leg only");
+        assert_eq!(hub.annotations[0].principal.as_deref(), Some("owner"));
+        assert!(outcome.nodes.iter().all(|n| n.item.annotations.is_empty()));
+
+        // Refusals are whole-stamp and early: a blank note parks nothing.
+        let (_root3, mut store3) = stamp_rig();
+        let err = store3
+            .apply_stamp_command(stamp_cmd_with_notes("triage", &["  "]), owner(), 5000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("stamp note must not be empty"),
+            "{err}"
+        );
+        assert!(
+            store3.snapshot().is_empty(),
+            "nothing parks on a refused note"
+        );
+    }
+
     /// Steward N1 (slice-1 gate): the deleted registry invariants used
     /// to check at CI time that shipped defaults respect the intake
     /// floors; under one-authority that check moved to stamp time — so
@@ -7707,6 +7814,7 @@ mod tests {
                     every_ms: Some(60_000),
                     suspend_after: None,
                     agent_config: None,
+                    annotations: Vec::new(),
                     source: None,
                 },
                 owner(),
@@ -7729,6 +7837,7 @@ mod tests {
                     every_ms: None,
                     suspend_after: None,
                     agent_config: None,
+                    annotations: Vec::new(),
                     source: None,
                 },
                 owner(),
@@ -7753,6 +7862,7 @@ mod tests {
                         every_ms: None,
                         suspend_after: None,
                         agent_config: None,
+                        annotations: Vec::new(),
                         source: None,
                     },
                     owner(),
@@ -7777,6 +7887,7 @@ mod tests {
                     every_ms: Some(3_600_000),
                     suspend_after: None,
                     agent_config: None,
+                    annotations: Vec::new(),
                     source: None,
                 },
                 owner(),
@@ -7813,6 +7924,7 @@ mod tests {
                     every_ms: None,
                     suspend_after: None,
                     agent_config: Some(Box::new(over)),
+                    annotations: Vec::new(),
                     source: None,
                 },
                 owner(),

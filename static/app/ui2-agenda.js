@@ -2275,6 +2275,26 @@ const AGENDA_AUTOMATION_CADENCES = [
   { label: 'Every 30 days', ms: 30 * 24 * 60 * 60 * 1000 },
 ];
 
+// Cap-demanding definitions (the narrative-backfill class): the
+// definition's own text carries the owner-cap annotation convention,
+// so the sheet's note input doubles as the spend-cap lane for it.
+function agendaStampCapDemanded(entry) {
+  return !!(entry && typeof entry.text === 'string' && entry.text.includes('NS CAP: $'));
+}
+
+// Spend-authority bytes are exact: a bare amount typed into the cap
+// field canonicalizes to `NS CAP: $<amount>` here, so no human ever
+// hand-formats the line the mandate greps for. Anything else passes
+// through verbatim — an already-canonical line stays untouched, and
+// free text stays an ordinary note (the mandate's near-miss refusal
+// quotes it back kindly instead of parsing amounts out of prose).
+function agendaStampNoteText(entry, raw) {
+  const text = String(raw || '').trim();
+  if (!text || !agendaStampCapDemanded(entry)) return text;
+  const bare = text.startsWith('$') ? text.slice(1).trim() : text;
+  return /^\d+(\.\d+)?$/.test(bare) ? `NS CAP: $${bare}` : text;
+}
+
 function agendaOpenAutomationSheet(anchor) {
   const host = agendaEnsureAutomationSheet();
   const panel = host.querySelector('.ags-panel');
@@ -2434,6 +2454,25 @@ function agendaOpenAutomationSheet(anchor) {
       });
   }
 
+  // Note to the stamped item: one optional owner note recorded AT PARK
+  // on the annotation surface the fired mandates read (a workflow's
+  // hub, an action's item), attributed to whoever stamps. When the
+  // selected definition demands a spend cap, this input IS the cap
+  // lane — a bare amount canonicalizes to `NS CAP: $<amount>` at
+  // submit (agendaStampNoteText), so nobody hand-formats authority
+  // bytes; renderSelection relabels the row per definition.
+  const noteRow = agendaStartSheetEl('div', 'ags-config-row');
+  const noteLabel = agendaStartSheetEl('label', 'ags-label', 'Note');
+  noteLabel.setAttribute('for', 'agsx-note');
+  noteRow.appendChild(noteLabel);
+  const note = document.createElement('input');
+  note.type = 'text';
+  note.id = 'agsx-note';
+  noteRow.appendChild(note);
+  const noteHint = agendaStartSheetEl('div', 'ags-hint', '');
+  noteRow.appendChild(noteHint);
+  panel.appendChild(noteRow);
+
   // Pre-stamp summary: exactly what the Stamp gesture will seal, park,
   // and propose — rendered before the button, re-rendered as the
   // controls change, so the gesture is never a surprise.
@@ -2456,7 +2495,7 @@ function agendaOpenAutomationSheet(anchor) {
   stampBtn.type = 'button';
   stampBtn.title = 'Seals the definition, parks the item(s), proposes the manifest(s) — approves nothing';
   stampBtn.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { entry: () => entry, cadence, fire, suspend, project, configState, error, stampBtn }));
+    { entry: () => entry, cadence, fire, suspend, project, note, configState, error, stampBtn }));
   foot.appendChild(cancel);
   foot.appendChild(stampBtn);
   panel.appendChild(foot);
@@ -2544,9 +2583,26 @@ function agendaOpenAutomationSheet(anchor) {
       if (configState.backendOverride) picks.push(configState.backendOverride);
       if (configState.modelSel && configState.modelSel.value) picks.push(configState.modelSel.value);
       if (configState.effortSel && configState.effortSel.value) picks.push(configState.effortSel.value);
-      add(`executor: ${picks.length ? `${picks.join(' · ')} — recorded on the manifest` : 'daemon defaults'} · project: ${project.value.trim() || 'daemon default'}`);
+      // Executor honesty: untouched controls record the DEFINITION'S
+      // node pins (the stamp lane's actual fallback), so say those —
+      // "daemon defaults" only when neither picks nor pins exist.
+      const pinned = nodeExecutorLabel((entry.nodes && entry.nodes[0]) || {});
+      const executor = picks.length
+        ? `${picks.join(' · ')} — your picks, recorded on the manifest${pinned !== 'daemon default' ? ' (replacing the definition’s pins)' : ''}`
+        : (pinned !== 'daemon default'
+          ? `${pinned} — the definition’s node pins, recorded on the manifest`
+          : 'daemon defaults');
+      add(`executor: ${executor} · project: ${project.value.trim() || 'daemon default'}`);
     } else {
-      add(`per-node executors and edges come from the definition · project: ${project.value.trim() || 'daemon default'}`);
+      // Per-node honesty for workflows: the pins each manifest will
+      // actually record, node by node — never a vague deferral.
+      const rows = (entry.nodes || [])
+        .map((n) => `${n.title || n.id}: ${nodeExecutorLabel(n)}`).join('; ');
+      add(`per-node executors are the definition’s pins — ${rows} · project: ${project.value.trim() || 'daemon default'}`);
+    }
+    const noteText = agendaStampNoteText(entry, note.value);
+    if (noteText) {
+      add(`annotate the stamped ${kind === 'workflow' ? 'hub' : 'item'} with your note: ${noteText}`);
     }
   };
 
@@ -2562,6 +2618,16 @@ function agendaOpenAutomationSheet(anchor) {
     fireRow.hidden = kind !== 'action';
     suspendRow.hidden = kind !== 'action';
     config.hidden = !kind || kind === 'workflow';
+    noteRow.hidden = !kind;
+    // The note input is definition-aware: for a cap-demanding
+    // definition it is the spend-cap field — labeled as such, hinting
+    // the canonical form, canonicalizing a bare amount at submit.
+    const capField = agendaStampCapDemanded(entry);
+    noteLabel.textContent = capField ? 'Spend cap' : 'Note';
+    note.placeholder = capField ? '60' : 'optional note to the stamped item';
+    noteHint.textContent = capField
+      ? 'this definition reads an owner-set cap from the stamped item — type the amount; recorded as the canonical annotation NS CAP: $<amount> in the item’s THREAD section'
+      : 'optional — recorded with your attribution in the stamped item’s THREAD section';
     stampBtn.disabled = !entry;
     if (entry && kind === 'action') {
       const prefill = (entry.nodes && entry.nodes[0]) || {};
@@ -2584,7 +2650,7 @@ function agendaOpenAutomationSheet(anchor) {
   // The summary mirrors the controls live — a stale promise line would
   // be worse than none.
   for (const [control, event] of [[cadence, 'change'], [fire, 'change'],
-    [suspend, 'input'], [project, 'input'], [config, 'change']]) {
+    [suspend, 'input'], [project, 'input'], [note, 'input'], [config, 'change']]) {
     control.addEventListener(event, renderSummary);
   }
 
@@ -2673,6 +2739,13 @@ async function agendaAutomationSheetSubmit(form) {
     const everyMs = Number(form.cadence.value);
     if (Number.isFinite(everyMs) && everyMs > 0) overrides.every_ms = everyMs;
   }
+  // The stamp-time note rides the stamp op for every kind: the daemon
+  // records it owner-attributed on the annotation surface the fired
+  // mandates read (a workflow's hub, an action's item). A bare amount
+  // in a cap-demanding definition's field was canonicalized to the
+  // exact `NS CAP: $<amount>` bytes above the wire, never by hand.
+  const noteText = form.note ? agendaStampNoteText(entry, form.note.value) : '';
+  if (noteText) overrides.annotations = [noteText];
   form.stampBtn.disabled = true;
   try {
     // THE stamp gesture — the only place this sheet stamps. One

@@ -1313,6 +1313,14 @@ pub enum AgendaCommand {
         /// wholesale when non-empty).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_config: Option<Box<crate::event::AgentLaunchConfig>>,
+        /// Stamp-time owner notes, recorded at park on the annotation
+        /// surface the fired mandates read (the hub for a workflow, the
+        /// action's single item otherwise) with the stamp's gate-resolved
+        /// attribution — the lane an owner-parameter annotation (e.g. the
+        /// narrative-backfill `NS CAP: $<amount>` spend cap) rides so the
+        /// approve-click and the parameter land together.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
