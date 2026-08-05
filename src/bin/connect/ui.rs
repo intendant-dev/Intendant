@@ -2448,7 +2448,10 @@ mod tests {
             "This computer, right here",
             "The one you're using now",
         ] {
-            assert!(html.contains(option), "advisor box option must say: {option}");
+            assert!(
+                html.contains(option),
+                "advisor box option must say: {option}"
+            );
         }
         // The terminal title stays honest when the chosen box is the
         // visitor's own computer rather than a fresh box.
