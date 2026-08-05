@@ -8831,6 +8831,235 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
     assert_eq!(body["draining"], false);
 }
 
+/// Steward card 01KZ8YN35TVRKTEHD6HK6G3XVE: a daemon born under
+/// launchd, the packaged app, or a Windows service inherits the bare
+/// system PATH — no `~/.cargo/bin` — and the produce click died as
+/// `bundle: bash exited exit status: 127` (bundle) or a bare spawn
+/// miss (direct `cargo`). The sibling leg's mock_build_override stands
+/// in for the build child, which is exactly why CI never saw it; this
+/// leg drives the REAL (non-mock) build branch under that env shape —
+/// PATH scrubbed of every cargo-bearing dir, CARGO_HOME pointing
+/// nowhere — so the lane must resolve `$HOME/.cargo/bin/cargo` and
+/// prepend its bin dir to the child PATH. Act one, before the fake
+/// toolchain exists, pins the NAMED refusal that replaces the bare
+/// 127. Unix-gated like its siblings (shebang-exec fakes).
+#[cfg(unix)]
+#[tokio::test]
+async fn update_lane_produce_resolves_cargo_for_bare_path_daemons() {
+    use std::os::unix::fs::PermissionsExt;
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The buildable-checkout fixture with a real origin (the produce's
+    // pull leg is real; origin holds the same commit, so the pull is a
+    // no-op fast-forward).
+    let origin = rig.home.path().join("origin.git");
+    std::fs::create_dir_all(&origin).expect("origin dir");
+    fixture_git(&origin, &["init", "--bare", "--initial-branch=main", "."]);
+    let checkout = rig.home.path().join("checkout");
+    fixture_git(
+        rig.home.path(),
+        &["clone", origin.to_str().expect("utf8"), "checkout"],
+    );
+    std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").expect("seed Cargo.toml");
+    std::fs::write(checkout.join(".gitignore"), "/target\n").expect("seed gitignore");
+    std::fs::create_dir_all(checkout.join("scripts")).expect("seed scripts dir");
+    std::fs::write(
+        checkout.join("scripts").join("bundle-macos.sh"),
+        "#!/bin/bash\n",
+    )
+    .expect("seed bundle script");
+    fixture_git(&checkout, &["add", "."]);
+    fixture_git(&checkout, &["commit", "-m", "commit A"]);
+    fixture_git(&checkout, &["push", "origin", "main"]);
+    let watched = checkout.join("target").join("release").join("intendant");
+    std::fs::create_dir_all(watched.parent().expect("target dir")).expect("target dirs");
+    write_fake_watched_binary(&watched, "fakesha1");
+
+    // The launchd/service shape, deterministically: drop every PATH dir
+    // holding a cargo (the test process runs under `cargo test`, so the
+    // inherited PATH has at least one) — git and bash keep resolving —
+    // and point CARGO_HOME at nothing.
+    let scrubbed_path = std::env::join_paths(
+        std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+            .filter(|dir| !dir.join("cargo").is_file()),
+    )
+    .expect("join scrubbed PATH")
+    .to_string_lossy()
+    .into_owned();
+    let no_cargo_home = rig.home.path().join("no-cargo-home");
+
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_HEADROOM", "ok"),
+            ("PATH", scrubbed_path.as_str()),
+            ("CARGO_HOME", no_cargo_home.to_str().expect("utf8 rig path")),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+    let produce_url = format!("{base}/api/daemon/update-lane/produce");
+
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(body["update_lane"]["flavor"], "source", "{body}");
+
+    // Act one: no toolchain anywhere — the job fails with the NAMED
+    // refusal, never a bash 127.
+    let produce: serde_json::Value = authed
+        .post(&produce_url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("POST update-lane produce")
+        .error_for_status()
+        .expect("produce accepted")
+        .json()
+        .await
+        .expect("produce body");
+    assert_eq!(produce["started"], true, "{produce}");
+    let body = poll_until(
+        "the toolchainless produce refusing by name",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            (body["update_lane"]["job"]["ok"] == false).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 4000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let error = body["update_lane"]["job"]["error"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        error.contains("cargo was not found on the daemon's PATH or in ~/.cargo/bin"),
+        "the refusal names the miss: {body}"
+    );
+    assert!(error.contains("install rustup"), "…and the remedy: {body}");
+
+    // Act two: rustup's default install target appears — a fake cargo
+    // that records the PATH it was spawned with, then lands the
+    // artifact exactly where a real build would.
+    let cargo_bin = rig.home.path().join(".cargo").join("bin");
+    std::fs::create_dir_all(&cargo_bin).expect("fake cargo bin dir");
+    let path_dump = rig.home.path().join("fake-cargo-path.txt");
+    let fake_cargo = cargo_bin.join("cargo");
+    std::fs::write(
+        &fake_cargo,
+        format!(
+            "#!/bin/bash\nprintf '%s' \"$PATH\" > '{dump}'\n\
+             mkdir -p target/release\ncat > target/release/intendant << 'FAKE'\n#!/bin/sh\n\
+             echo \"intendant 9.9.10 (commit fakesha2, built 2026-08-05T00:00:00Z, \
+             e2e-fake-triple)\"\nFAKE\nchmod +x target/release/intendant\n",
+            dump = path_dump.display()
+        ),
+    )
+    .expect("write fake cargo");
+    std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755))
+        .expect("mark fake cargo executable");
+
+    // Re-click (poll: the finished job releases its running flag just
+    // after the outcome lands, so the first re-click can race a 409).
+    let produce = poll_until(
+        "the second produce click arming",
+        RUN_TIMEOUT,
+        || async {
+            let response = authed
+                .post(&produce_url)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let body: serde_json::Value = response.json().await.ok()?;
+            (body["started"] == true).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 4000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    assert_eq!(produce["started"], true, "{produce}");
+    let body = poll_until(
+        "the produce job finishing ok via the resolved cargo",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            (body["update_lane"]["job"]["ok"] == true).then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 4000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    assert!(
+        body["update_lane"]["job"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fakesha2"),
+        "the job reports the produced commit: {body}"
+    );
+
+    // The needles the mock lane could never carry: the REAL branch's
+    // direct spawn used the resolved absolute cargo…
+    let log_tail = body["update_lane"]["job"]["log_tail"]
+        .as_array()
+        .expect("job log tail")
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        log_tail.contains(&format!("$ {} build --release", fake_cargo.display())),
+        "the direct spawn used the resolved absolute cargo: {log_tail}"
+    );
+    // …and its spawn env carried the prepended bin dir (what the bundle
+    // script's bare `cargo` and the rustup shims resolve with).
+    let child_path = std::fs::read_to_string(&path_dump).expect("fake cargo PATH dump");
+    assert!(
+        child_path.starts_with(&format!("{}:", cargo_bin.display())),
+        "the build child's PATH leads with the resolved bin dir: {child_path}"
+    );
+    assert!(
+        child_path.ends_with(&scrubbed_path),
+        "…prepended to, not replacing, the curated PATH: {child_path}"
+    );
+}
+
 /// The release-availability surface (the slice-6 amendment card): a
 /// releases-channel check that verifies a NEWER release promotes the
 /// fact onto the handover payload as the DISTINCT `release_update`

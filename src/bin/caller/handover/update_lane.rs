@@ -13,11 +13,15 @@
 //!   source-checkout stamp): a bounded behind-`origin/main` compare;
 //!   on click, `git pull --ff-only` + `cargo build` (or
 //!   `scripts/bundle-macos.sh` for the app shape) as supervised child
-//!   processes. The build rides the machine's rustc governor untouched
-//!   (the child env never sets `RUSTC_WRAPPER`, so the box-wide cargo
-//!   config wrapper stays engaged) and is HEADROOM-GATED: under memory
-//!   pressure the job refuses to start rather than joining an OOM
-//!   spiral.
+//!   processes. The toolchain is resolved explicitly for those build
+//!   children ([`resolve_build_cargo`]): a daemon born under launchd,
+//!   the packaged app, or a Windows service inherits the bare system
+//!   PATH with no `~/.cargo/bin`, so trusting the inherited PATH alone
+//!   127s the produce. The build rides the machine's rustc governor
+//!   untouched (the child env never sets `RUSTC_WRAPPER`, so the
+//!   box-wide cargo config wrapper stays engaged) and is
+//!   HEADROOM-GATED: under memory pressure the job refuses to start
+//!   rather than joining an OOM spiral.
 //! - **Consumer** (an installed release app with no source checkout):
 //!   the latest release manifest via the transparency-log ritual
 //!   (`hosted_verify::verify_hosted_release` — inclusion proof, signed
@@ -809,6 +813,142 @@ fn curated_env(extra: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Which curated-env tier a supervised child runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildTier {
+    /// [`CHILD_ENV_BASE`] only (gpg, ditto).
+    Base,
+    /// Base + [`CHILD_ENV_GIT`].
+    Git,
+    /// Base + [`CHILD_ENV_BUILD`], with `cargo` resolved explicitly —
+    /// see [`resolve_build_cargo`].
+    Build,
+}
+
+impl ChildTier {
+    fn extras(self) -> &'static [&'static str] {
+        match self {
+            ChildTier::Base => &[],
+            ChildTier::Git => CHILD_ENV_GIT,
+            ChildTier::Build => CHILD_ENV_BUILD,
+        }
+    }
+}
+
+/// The build lane's toolchain refusal (string pinned by test). It
+/// replaces the story the owner actually saw — `bundle: bash exited
+/// exit status: 127`, the bundle script's bare `cargo` dying on a
+/// daemon whose inherited PATH never had a toolchain.
+const CARGO_MISSING_REFUSAL: &str =
+    "cargo was not found on the daemon's PATH or in ~/.cargo/bin — install rustup, or launch \
+     the daemon from a shell that has the toolchain";
+
+/// `cargo`'s file name on this platform (`cargo.exe` on Windows).
+fn cargo_file_name() -> String {
+    format!("cargo{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// How the build lane found its toolchain (see [`resolve_build_cargo`]).
+#[derive(Debug, PartialEq, Eq)]
+enum CargoResolution {
+    /// `cargo` already resolves on the child PATH: spawn by name and
+    /// leave the curated env untouched — a daemon launched from a full
+    /// shell keeps byte-identical build children.
+    OnPath,
+    /// The child PATH misses; this absolute `…/bin/cargo` won. Direct
+    /// `cargo` spawns use it, and its bin dir is prepended to the child
+    /// PATH so the bundle script's bare `cargo` and the rustup shims
+    /// cargo re-execs resolve too.
+    Fallback(PathBuf),
+}
+
+/// Explicit toolchain resolution for build/bundle children.
+///
+/// A daemon born under launchd, the packaged app, or a Windows service
+/// task inherits the bare system PATH — no `~/.cargo/bin` — so trusting
+/// the inherited PATH alone made every produce click from such a daemon
+/// die as a bash 127 (bundle) or a spawn miss (direct `cargo`).
+/// Resolution order, first hit wins:
+///
+/// 1. the curated child PATH;
+/// 2. `$CARGO_HOME/bin` (when the daemon carries `CARGO_HOME`);
+/// 3. `<home>/.cargo/bin` — rustup's default install target
+///    (`%USERPROFILE%\.cargo\bin` on Windows via the platform home).
+///
+/// No hit anywhere is the named refusal, never a bare 127. Pure over
+/// the injected env/home/lookup — hermetic under test.
+fn resolve_build_cargo(
+    child_env: &[(String, String)],
+    home: &Path,
+    cargo_exists: &dyn Fn(&Path) -> bool,
+) -> Result<CargoResolution, String> {
+    let env_value = |name: &str| {
+        child_env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let cargo = cargo_file_name();
+    if let Some(path) = env_value("PATH") {
+        for dir in std::env::split_paths(path) {
+            if !dir.as_os_str().is_empty() && cargo_exists(&dir.join(&cargo)) {
+                return Ok(CargoResolution::OnPath);
+            }
+        }
+    }
+    let fallback_bins = [
+        env_value("CARGO_HOME").map(|cargo_home| Path::new(cargo_home).join("bin")),
+        Some(home.join(".cargo").join("bin")),
+    ];
+    for bin in fallback_bins.into_iter().flatten() {
+        let candidate = bin.join(&cargo);
+        if cargo_exists(&candidate) {
+            return Ok(CargoResolution::Fallback(candidate));
+        }
+    }
+    Err(CARGO_MISSING_REFUSAL.to_string())
+}
+
+/// Finalize one build/bundle child's (program, env): on a PATH miss the
+/// winning fallback bin dir is prepended to the child PATH, and a
+/// direct `cargo` spawn gets the resolved absolute path; a PATH hit
+/// changes nothing. This is the REAL build branches' env construction —
+/// the mock rig lane rides the same seam.
+fn plan_build_child(
+    program: &str,
+    mut env: Vec<(String, String)>,
+    home: &Path,
+    cargo_exists: &dyn Fn(&Path) -> bool,
+) -> Result<(String, Vec<(String, String)>), String> {
+    match resolve_build_cargo(&env, home, cargo_exists)? {
+        CargoResolution::OnPath => Ok((program.to_string(), env)),
+        CargoResolution::Fallback(cargo) => {
+            let bin_dir = cargo
+                .parent()
+                .expect("a resolved …/bin/cargo has a parent")
+                .to_path_buf();
+            match env.iter_mut().find(|(name, _)| name == "PATH") {
+                Some((_, value)) => {
+                    let joined = std::env::join_paths(
+                        std::iter::once(bin_dir.clone()).chain(std::env::split_paths(value)),
+                    )
+                    .map_err(|err| {
+                        format!("prepending {} to the child PATH: {err}", bin_dir.display())
+                    })?;
+                    *value = joined.to_string_lossy().into_owned();
+                }
+                None => env.push(("PATH".to_string(), bin_dir.display().to_string())),
+            }
+            let program = if program == "cargo" {
+                cargo.display().to_string()
+            } else {
+                program.to_string()
+            };
+            Ok((program, env))
+        }
+    }
+}
+
 // ── Job + check state (rendered onto the handover status payload) ───
 
 #[derive(Debug, Clone)]
@@ -1016,22 +1156,33 @@ impl UpdateLane {
     /// Run one supervised child: curated env, bounded runtime, stdout+
     /// stderr streamed line-by-line into the job log as they happen
     /// (ordinary visibility), kill-on-drop. Returns the captured stdout
-    /// on success.
+    /// on success. [`ChildTier::Build`] children additionally get the
+    /// explicit toolchain resolution ([`plan_build_child`]) — the
+    /// shared seam every produce branch's build child spawns through.
     async fn run_child(
         self: &Arc<Self>,
         label: &str,
         program: &str,
         args: Vec<String>,
         cwd: Option<&Path>,
-        extra_env: &[&str],
+        tier: ChildTier,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        let env = curated_env(tier.extras());
+        let (program, env) = if tier == ChildTier::Build {
+            plan_build_child(program, env, &crate::platform::home_dir(), &|candidate| {
+                candidate.is_file()
+            })
+            .map_err(|err| format!("{label}: {err}"))?
+        } else {
+            (program.to_string(), env)
+        };
         self.job_log(format!("$ {program} {}", args.join(" ")));
-        let mut command = tokio::process::Command::new(program);
+        let mut command = tokio::process::Command::new(&program);
         command
             .args(&args)
             .env_clear()
-            .envs(curated_env(extra_env))
+            .envs(env)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1246,7 +1397,7 @@ impl UpdateLane {
             "git",
             argv,
             None,
-            CHILD_ENV_GIT,
+            ChildTier::Git,
             GIT_TIMEOUT,
         )
         .await
@@ -1362,7 +1513,7 @@ impl UpdateLane {
                 "bash",
                 vec!["scripts/bundle-macos.sh".to_string()],
                 Some(repo_root),
-                CHILD_ENV_BUILD,
+                ChildTier::Build,
                 BUILD_TIMEOUT,
             )
             .await?;
@@ -1402,7 +1553,7 @@ impl UpdateLane {
                     "bash",
                     vec![mock_build],
                     Some(repo_root),
-                    CHILD_ENV_BUILD,
+                    ChildTier::Build,
                     BUILD_TIMEOUT,
                 )
                 .await
@@ -1422,7 +1573,7 @@ impl UpdateLane {
                     .map(|arg| arg.to_string())
                     .collect(),
                     Some(repo_root),
-                    CHILD_ENV_BUILD,
+                    ChildTier::Build,
                     BUILD_TIMEOUT,
                 )
                 .await
@@ -1518,7 +1669,7 @@ impl UpdateLane {
                 unpack_dir.display().to_string(),
             ],
             None,
-            &[],
+            ChildTier::Base,
             UNPACK_TIMEOUT,
         )
         .await?;
@@ -1602,7 +1753,7 @@ impl UpdateLane {
                 key_path.display().to_string(),
             ],
             None,
-            &[],
+            ChildTier::Base,
             GPG_TIMEOUT,
         )
         .await
@@ -1627,7 +1778,7 @@ impl UpdateLane {
                     artifact.display().to_string(),
                 ],
                 None,
-                &[],
+                ChildTier::Base,
                 GPG_TIMEOUT,
             )
             .await;
@@ -2127,6 +2278,174 @@ mod tests {
         assert!(folded[0].starts_with("abc1234 "), "truncated, not mangled");
 
         assert!(fold_shortlog("\n  \n").is_empty(), "blank lines drop out");
+    }
+
+    // ── The build lane's explicit toolchain resolution ──
+
+    fn env_of(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Injected filesystem lookup — the resolution seam is pure and
+    /// never scans a real HOME under test.
+    fn exists_in(present: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |candidate: &Path| present.iter().any(|path| path.as_path() == candidate)
+    }
+
+    /// Steward card 01KZ8YN35TVRKTEHD6HK6G3XVE resolution order, leg 1:
+    /// a PATH hit wins, and the child spawns exactly as before — bare
+    /// name, curated env byte-identical (full-shell daemons keep
+    /// today's behavior even when CARGO_HOME and a home install also
+    /// exist).
+    #[test]
+    fn build_toolchain_path_hit_keeps_children_byte_identical() {
+        let cargo = cargo_file_name();
+        let shell_bin = PathBuf::from("shell").join("bin");
+        let cargo_home = PathBuf::from("cargo-home");
+        let home = PathBuf::from("home");
+        let path_value = std::env::join_paths([shell_bin.clone()])
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
+        let env = vec![
+            ("PATH".to_string(), path_value),
+            ("CARGO_HOME".to_string(), cargo_home.display().to_string()),
+        ];
+        let present = [
+            shell_bin.join(&cargo),
+            cargo_home.join("bin").join(&cargo),
+            home.join(".cargo").join("bin").join(&cargo),
+        ];
+        let (program, planned) =
+            plan_build_child("cargo", env.clone(), &home, &exists_in(&present))
+                .expect("a PATH hit resolves");
+        assert_eq!(program, "cargo", "a PATH hit spawns by name");
+        assert_eq!(planned, env, "…and leaves the curated env untouched");
+    }
+
+    /// Resolution order, leg 2: on a PATH miss, `$CARGO_HOME/bin`
+    /// outranks the home fallback; the direct spawn gets the absolute
+    /// path and the child PATH leads with the winning bin dir.
+    #[test]
+    fn build_toolchain_cargo_home_outranks_home_fallback() {
+        let cargo = cargo_file_name();
+        let shell_bin = PathBuf::from("shell").join("bin");
+        let cargo_home = PathBuf::from("cargo-home");
+        let home = PathBuf::from("home");
+        let path_value = std::env::join_paths([shell_bin.clone()])
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
+        let env = vec![
+            ("PATH".to_string(), path_value),
+            ("CARGO_HOME".to_string(), cargo_home.display().to_string()),
+        ];
+        let present = [
+            cargo_home.join("bin").join(&cargo),
+            home.join(".cargo").join("bin").join(&cargo),
+        ];
+        let (program, planned) = plan_build_child("cargo", env, &home, &exists_in(&present))
+            .expect("the CARGO_HOME fallback resolves");
+        assert_eq!(
+            program,
+            cargo_home.join("bin").join(&cargo).display().to_string(),
+            "the direct spawn uses the resolved absolute cargo"
+        );
+        let expected_path = std::env::join_paths([cargo_home.join("bin"), shell_bin])
+            .expect("join expected PATH")
+            .to_string_lossy()
+            .into_owned();
+        let path = planned
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_str())
+            .expect("PATH rides the plan");
+        assert_eq!(path, expected_path, "the winning bin dir leads the PATH");
+    }
+
+    /// The live defect's exact shape (unit-level simulation of the
+    /// launchd env — the box's app-born daemon carries this PATH
+    /// verbatim, no CARGO_HOME): resolution must land on
+    /// `$HOME/.cargo/bin/cargo`, and the bundle child (`bash`, whose
+    /// script says bare `cargo`) must get the same prepended PATH.
+    #[cfg(unix)]
+    #[test]
+    fn launchd_daemon_resolves_home_cargo_and_prepends_the_bin_dir() {
+        let launchd_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+        let env = env_of(&[("PATH", launchd_path), ("HOME", "/Users/owner")]);
+        let home = PathBuf::from("/Users/owner");
+        let present = [PathBuf::from("/Users/owner/.cargo/bin/cargo")];
+
+        let (program, planned) =
+            plan_build_child("cargo", env.clone(), &home, &exists_in(&present))
+                .expect("the home fallback resolves");
+        assert_eq!(program, "/Users/owner/.cargo/bin/cargo");
+        let path = planned
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_str())
+            .expect("PATH rides the plan");
+        assert_eq!(
+            path,
+            "/Users/owner/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+
+        let (program, planned) = plan_build_child("bash", env, &home, &exists_in(&present))
+            .expect("the bundle child resolves the same toolchain");
+        assert_eq!(program, "bash", "only direct cargo spawns are rewritten");
+        let path = planned
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_str())
+            .expect("PATH rides the plan");
+        assert!(
+            path.starts_with("/Users/owner/.cargo/bin:"),
+            "the bundle script's bare `cargo` resolves via the prepend: {path}"
+        );
+    }
+
+    /// The Windows twin: a schtasks/service-born daemon's PATH lacks
+    /// cargo identically; resolution lands on
+    /// `%USERPROFILE%\.cargo\bin\cargo.exe` via the platform home.
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_daemon_resolves_userprofile_cargo() {
+        let env = env_of(&[("PATH", "C:\\Windows\\system32;C:\\Windows")]);
+        let home = PathBuf::from("C:\\Users\\owner");
+        let present = [PathBuf::from("C:\\Users\\owner\\.cargo\\bin\\cargo.exe")];
+        let (program, planned) = plan_build_child("cargo", env, &home, &exists_in(&present))
+            .expect("the USERPROFILE fallback resolves");
+        assert_eq!(program, "C:\\Users\\owner\\.cargo\\bin\\cargo.exe");
+        let path = planned
+            .iter()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| value.as_str())
+            .expect("PATH rides the plan");
+        assert_eq!(
+            path,
+            "C:\\Users\\owner\\.cargo\\bin;C:\\Windows\\system32;C:\\Windows"
+        );
+    }
+
+    /// No toolchain anywhere = the NAMED refusal (string pinned here),
+    /// never the bare `bash exited exit status: 127` the owner saw.
+    #[test]
+    fn toolchainless_daemon_gets_the_named_refusal_not_a_bare_127() {
+        let path_value = std::env::join_paths([PathBuf::from("system").join("bin")])
+            .expect("join PATH")
+            .to_string_lossy()
+            .into_owned();
+        let env = vec![("PATH".to_string(), path_value)];
+        let err = plan_build_child("cargo", env, &PathBuf::from("home"), &exists_in(&[]))
+            .expect_err("nothing resolves");
+        assert_eq!(
+            err,
+            "cargo was not found on the daemon's PATH or in ~/.cargo/bin — install rustup, \
+             or launch the daemon from a shell that has the toolchain"
+        );
     }
 
     // ── The channel vocabulary (the front door) ──
