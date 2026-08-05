@@ -224,7 +224,8 @@
     flavorChip.className = 'update-lane-flavor';
     flavorChip.textContent = block.flavor === 'source'
       ? 'source install'
-      : block.flavor === 'consumer-app' ? 'release install' : 'unmanaged';
+      : (block.flavor === 'consumer-app' || block.flavor === 'consumer-binary')
+        ? 'release install' : 'unmanaged';
     head.appendChild(flavorChip);
     card.appendChild(head);
 
@@ -237,6 +238,8 @@
       line(body, 'update-lane-note', `Checkout: ${block.repo_root}${block.app_bundle ? ' (app bundle)' : ''}`);
     } else if (block.flavor === 'consumer-app' && block.app_root) {
       line(body, 'update-lane-note', `Installed app: ${block.app_root}`);
+    } else if (block.flavor === 'consumer-binary' && block.install_dir) {
+      line(body, 'update-lane-note', `Installed at: ${block.install_dir}`);
     }
     if (block.unavailable) {
       line(body, 'update-lane-note', block.unavailable);

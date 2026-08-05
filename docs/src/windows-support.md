@@ -289,15 +289,34 @@ from a compile-time OS check:
   image) so the fresh build lands at the vacated path, and restores it if the
   build fails. Unix needs none of this (the final step replaces the inode by
   unlink + relink) and is untouched.
-- **Releases channel** checks are honest data everywhere, but release
-  *install* refuses on Windows and Linux by name — "no Windows release assets
-  are published yet — rebuild from source on this platform" — because the
-  release lane publishes no daemon assets for them yet. The refusal, the
-  panel's availability catalog, and the chip's `one_click` fact all derive
-  from the asset table, so publishing assets for a platform ages the refusals
-  out by adding that platform's table row (plus its plain-binary install arm,
-  a prepared seam that today refuses cleanly) — there is no separate gate to
-  update.
+- **Releases channel** checks are honest data everywhere, and release
+  *install* works on Windows: the asset table carries a `windows-x86_64` row
+  for the `Intendant-<version>-windows-x86_64.zip` the release lane publishes
+  (both exes at their final sibling names at the zip root). An install whose
+  running binary sits beside its `intendant-runtime.exe` sibling — the
+  unzipped-release shape, outside any checkout — reads as the plain-binary
+  consumer install, and its one-click install runs the same fail-closed
+  verify chain as the macOS consumer lane: transparency-log ritual (inclusion
+  proof, signed tree head, append-only pin), download with sha256 checked
+  against the log, `gpg --verify` against the compiled-in release signing key
+  (gnupg must be on PATH — Gpg4win or Git for Windows' gpg; the lane refuses
+  without it). The verified pair then lands beside the watched binary —
+  runtime first, the watched daemon image last, through the same
+  set-aside-then-rename dance the Dev channel uses (Windows permits renaming
+  a running image, not overwriting it), so the update chip only fires on a
+  complete pair — and the shipped watch/chip/swap lane (successor-exec on a
+  CLI-launched daemon) performs the swap on its own explicit click, exactly
+  as for a produced dev build. The zip publishes without Authenticode
+  signing, so SmartScreen may interpose on a first manual run of a freshly
+  downloaded exe; the PGP + transparency-log chain above is what the update
+  lane trusts. Release *install* still refuses on Linux by name — "no Linux
+  release assets are published yet — rebuild from source on this platform" —
+  because the release lane publishes standalone Linux worker binaries, not
+  daemon zips. The refusals, the panel's availability catalog, and the chip's
+  `one_click` fact all derive from the asset table, so publishing daemon
+  assets for a platform ages its refusals out by adding that platform's
+  table row — the platform-generic plain-binary install arm lights up with
+  the row; there is no separate gate to update.
 
 ## Known Limitations
 

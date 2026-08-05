@@ -9192,6 +9192,146 @@ async fn release_availability_check_promotes_the_distinct_chip_block() {
     );
 }
 
+/// The Windows release-install circuit (the RELEASE_ASSET_LANES row +
+/// the plain-binary flavor): a daemon whose watched binary sits beside
+/// its `intendant-runtime` sibling — the unzipped-release shape — reads
+/// as the plain-binary consumer install on every OS, and the release
+/// gate derives per host from the one asset table: on Windows the
+/// availability chip is one-click and the catalog offers the release
+/// produce (asserted on the real Windows CI leg); on Linux the refusal
+/// names the missing platform; on macOS it names the asset-shape
+/// mismatch (the macOS asset is the app bundle). The check rides the
+/// mock-gated `INTENDANT_UPDATE_LANE_LATEST_RELEASE` knob like its
+/// sibling leg — the install path itself (verify → unpack → land) is
+/// pinned at the unit seams, and no produce click happens here (the
+/// consumer produce path would reach the real network ritual).
+#[tokio::test]
+async fn plain_binary_install_release_gate_lights_per_platform() {
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "")
+        .expect("mark the rig's project root");
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The unzipped-release shape: the watched binary with its runtime
+    // sibling at their final names, far from any checkout or bundle.
+    // Never probed (the image never changes), so plain files work on
+    // every platform.
+    let install = rig.home.path().join("install");
+    std::fs::create_dir_all(&install).expect("install dir");
+    let watched = install.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&watched, b"installed-daemon").expect("watched binary");
+    std::fs::write(
+        install.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX)),
+        b"installed-runtime",
+    )
+    .expect("runtime sibling");
+
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon.log",
+        &[
+            (
+                "INTENDANT_UPDATE_WATCH_PATH",
+                watched.to_str().expect("utf8 rig path"),
+            ),
+            ("INTENDANT_UPDATE_LANE_LATEST_RELEASE", "v9.9.9"),
+        ],
+        &[],
+    )
+    .await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, daemon.port)
+            .parse()
+            .expect("token header value"),
+    );
+    let authed = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("build token-authed client");
+    let base = format!("http://127.0.0.1:{}", daemon.port);
+    let status_url = format!("{base}/api/daemon/handover");
+
+    // The flavor reads plain-binary consumer everywhere, with the
+    // install dir named on the block.
+    let body = http_get_json(&authed, &status_url)
+        .await
+        .expect("handover status body");
+    assert_eq!(body["update_lane"]["flavor"], "consumer-binary", "{body}");
+    assert_eq!(
+        body["update_lane"]["install_dir"],
+        install.to_str().expect("utf8 rig path"),
+        "{body}"
+    );
+
+    // A releases check (the mock knob answers the network ritual)
+    // promotes the availability block with per-platform one-click
+    // honesty derived from the asset table.
+    let check: serde_json::Value = authed
+        .post(format!("{base}/api/daemon/update-lane/check"))
+        .json(&serde_json::json!({"channel": "releases"}))
+        .send()
+        .await
+        .expect("POST releases check")
+        .error_for_status()
+        .expect("check accepted")
+        .json()
+        .await
+        .expect("check body");
+    assert_eq!(check["started"], true, "{check}");
+    let body = poll_until(
+        "the release-availability block",
+        RUN_TIMEOUT,
+        || async {
+            let body = http_get_json(&authed, &status_url).await?;
+            body.get("release_update").is_some().then_some(body)
+        },
+        || {
+            std::fs::read_to_string(rig.home.path().join("daemon.log"))
+                .map(|log| tail(&log, 3000))
+                .unwrap_or_default()
+        },
+    )
+    .await;
+    let release = &body["release_update"];
+    assert_eq!(release["latest_tag"], "v9.9.9", "{body}");
+    let produce_offered = body["update_lane"]["channels"]["releases"]["produce"]
+        .as_bool()
+        .expect("catalog produce fact");
+    if cfg!(windows) {
+        // The circuit the Windows asset row closed: the chip is one
+        // click and the catalog offers the release install.
+        assert_eq!(release["one_click"], true, "{body}");
+        assert!(release.get("reason").is_none(), "{body}");
+        assert!(produce_offered, "{body}");
+    } else {
+        // No plain-binary asset for this host: the refusal names the
+        // platform (Linux: nothing published) or the asset-shape
+        // mismatch (macOS: the asset is the app bundle).
+        assert_eq!(release["one_click"], false, "{body}");
+        assert!(!produce_offered, "{body}");
+        let reason = release["reason"].as_str().unwrap_or_default();
+        if cfg!(target_os = "linux") {
+            assert!(
+                reason.contains("no Linux release assets are published yet"),
+                "{body}"
+            );
+        } else if cfg!(target_os = "macos") {
+            assert!(
+                reason.contains("does not install over a plain daemon binary"),
+                "{body}"
+            );
+        }
+    }
+    assert!(
+        body.get("update").is_none(),
+        "the availability fact never fabricates an on-disk chip: {body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Successor exec (the update-channels gate's ruled deferred question): the
 // CLI-launched daemon's own spawn → readiness → drain one-click, with the
