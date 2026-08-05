@@ -8984,10 +8984,7 @@ async fn plain_binary_install_release_gate_lights_per_platform() {
     let watched = install.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&watched, b"installed-daemon").expect("watched binary");
     std::fs::write(
-        install.join(format!(
-            "intendant-runtime{}",
-            std::env::consts::EXE_SUFFIX
-        )),
+        install.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX)),
         b"installed-runtime",
     )
     .expect("runtime sibling");

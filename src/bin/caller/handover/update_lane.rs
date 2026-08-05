@@ -501,10 +501,8 @@ pub(crate) fn detect_install_flavor(exe: &Path) -> InstallFlavor {
     // (the layout release.yml asserts before publish, and what sibling
     // resolution needs) marks the plain-binary consumer install.
     if let Some(dir) = exe.parent() {
-        let runtime_sibling = dir.join(format!(
-            "intendant-runtime{}",
-            std::env::consts::EXE_SUFFIX
-        ));
+        let runtime_sibling =
+            dir.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX));
         if runtime_sibling.is_file() {
             return InstallFlavor::ConsumerBinary {
                 install_dir: dir.to_path_buf(),
@@ -1532,10 +1530,7 @@ impl UpdateLane {
     /// The shared release download-and-verify lane; `app_root` is
     /// `Some` on an app-bundle install (its swap target) and `None` on
     /// a plain-binary install (which lands at the watched path).
-    async fn produce_consumer(
-        self: &Arc<Self>,
-        app_root: Option<&Path>,
-    ) -> Result<String, String> {
+    async fn produce_consumer(self: &Arc<Self>, app_root: Option<&Path>) -> Result<String, String> {
         let host = HostPlatform::current();
         let Some(lane) = release_asset_lane(host) else {
             // request_produce's gate refused already; fail closed for
@@ -1988,10 +1983,7 @@ fn unpack_release_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 /// and the daemon image is about to be `--version`-probed.
 fn locate_plain_binary_pair(unpack_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
     let daemon = unpack_dir.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
-    let runtime = unpack_dir.join(format!(
-        "intendant-runtime{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let runtime = unpack_dir.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX));
     for path in [&daemon, &runtime] {
         if !path.is_file() {
             return Err(format!(
@@ -2948,10 +2940,7 @@ mod tests {
             detect_install_flavor(&exe),
             InstallFlavor::Unmanaged { .. }
         ));
-        touch(&install.join(format!(
-            "intendant-runtime{}",
-            std::env::consts::EXE_SUFFIX
-        )));
+        touch(&install.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX)));
         assert_eq!(
             detect_install_flavor(&exe),
             InstallFlavor::ConsumerBinary {
@@ -2968,10 +2957,7 @@ mod tests {
         let release = repo.join("target").join("release");
         let checkout_exe = release.join(format!("intendant{}", std::env::consts::EXE_SUFFIX));
         touch(&checkout_exe);
-        touch(&release.join(format!(
-            "intendant-runtime{}",
-            std::env::consts::EXE_SUFFIX
-        )));
+        touch(&release.join(format!("intendant-runtime{}", std::env::consts::EXE_SUFFIX)));
         assert_eq!(
             detect_install_flavor(&checkout_exe),
             InstallFlavor::Source {
@@ -3005,7 +2991,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            missing.contains("Windows x86_64") && missing.contains("Intendant-…-windows-x86_64.zip"),
+            missing.contains("Windows x86_64")
+                && missing.contains("Intendant-…-windows-x86_64.zip"),
             "the refusal names the wanted shape: {missing}"
         );
     }
@@ -3061,7 +3048,10 @@ mod tests {
 
         // A zip missing the runtime refuses by the missing member's name.
         let bad_zip = dir.path().join("bad.zip");
-        write_fixture_zip(&bad_zip, &[(daemon_name.as_str(), b"only-daemon".as_slice())]);
+        write_fixture_zip(
+            &bad_zip,
+            &[(daemon_name.as_str(), b"only-daemon".as_slice())],
+        );
         let bad_unpack = dir.path().join("bad-unpacked");
         unpack_release_zip(&bad_zip, &bad_unpack).expect("unpack");
         let refusal = locate_plain_binary_pair(&bad_unpack).unwrap_err();
@@ -3111,12 +3101,15 @@ mod tests {
             .expect("the old runtime is kept as the rollback set-aside");
         assert_eq!(std::fs::read(runtime_aside.path()).unwrap(), b"old-runtime");
         let daemon_aside_prefix = build_output_aside_prefix(&daemon_name);
-        let daemon_aside = std::fs::read_dir(&install).unwrap().flatten().find(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(&daemon_aside_prefix))
-        });
+        let daemon_aside = std::fs::read_dir(&install)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&daemon_aside_prefix))
+            });
         assert_eq!(
             daemon_aside.is_some(),
             cfg!(windows),
