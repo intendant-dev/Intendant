@@ -7224,7 +7224,11 @@ async fn drainer_exits_at_last_session_end() {
 /// follow-ups session appears in the SUCCESSOR's catalog wearing
 /// `boot.held_by` — the drainer's boot/port, the R-A1 build compare
 /// (same binary here, so `same_build`), and the holdout phase — while
-/// the era/ghost vocabulary stays untouched beside it. The holder-side
+/// the era/ghost vocabulary rides well-formed beside it (mid-drain the
+/// VALUE of era is a transcript-mtime-vs-successor-boot compare, i.e.
+/// a timing accident; the strict current/not-ghost claim is pinned at
+/// drain-clear, once the composer round has moved the transcript
+/// within the successor's boot). The holder-side
 /// composer contract then runs end to end as the scripted tab: the
 /// sibling token map on the holder names the drainer's OWN admission
 /// token, a targeted `start_task` through the drainer's own gateway is
@@ -7323,7 +7327,19 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
     // (c) The successor's catalog carries the join while the drainer
     // still runs the session: held_by names the drainer, the R-A1
     // compare reads same-build (one binary in the rig), and the era
-    // vocabulary is untouched beside it.
+    // vocabulary rides WELL-FORMED beside it — but era's value is not
+    // pinned here. On the successor a non-live-wrapper row reads
+    // "current" iff the transcript moved at-or-after the successor's
+    // own presence registration (both truncated to epoch seconds), and
+    // this session last wrote at round one, BEFORE the successor
+    // spawned — so "current" holds only when those two instants alias
+    // into one epoch second. Pinning "current" made the leg a
+    // boot-speed coin toss (two merge-queue ejections in one night,
+    // mac + windows, 2026-08-05: era sat at "preboot"/ghost=true for
+    // the full 180s because the next transcript append — the composer
+    // round — is sequenced AFTER this poll). The strict era/ghost
+    // claim moves to the drain-clear poll below, where round two has
+    // provably moved the transcript within the successor's boot.
     let mut headers_b = reqwest::header::HeaderMap::new();
     headers_b.insert(
         "x-intendant-loopback-token",
@@ -7354,6 +7370,14 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
         .join(".intendant")
         .join("daemons")
         .join(format!("{holder_boot}.json"));
+    let transcript_path = daemon_a
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&sid)
+        .join("session.jsonl");
     let last_served_row = std::sync::Mutex::new(String::from("(row never served)"));
     poll_until(
         "the successor serving held_by on the drained row",
@@ -7367,20 +7391,52 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
             let row = held_row(&sessions, &sid)?;
             *last_served_row.lock().unwrap() = row.to_string();
             let held = row.pointer("/boot/held_by")?;
+            let era = row["boot"]["era"].as_str()?;
             (held["boot_id"] == holder_boot.as_str()
                 && held["port"] == port_a
                 && held["same_build"] == true
                 && held["phase"]
                     .as_str()
                     .is_some_and(|phase| !phase.is_empty())
-                && row["boot"]["era"] == "current"
-                && row["boot"]["ghost"] == false)
+                && row["boot"]["live_wrapper"] == false
+                && matches!(era, "current" | "preboot")
+                && row["boot"]["ghost"] == (era == "preboot"))
                 .then_some(())
         },
         || {
+            // The era watershed compare, spelled out: era reads
+            // "current" iff the transcript mtime (secs) is >= the
+            // successor's presence-registration instant (its record's
+            // updated_ms / 1000).
+            let transcript_mtime_secs = std::fs::metadata(&transcript_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let successor_presence = lease_sidecar(&daemon_a.rig)
+                .and_then(|sidecar| {
+                    let boot = sidecar["boot_id"].as_str()?.to_string();
+                    std::fs::read_to_string(
+                        daemon_a
+                            .rig
+                            .home
+                            .path()
+                            .join(".intendant")
+                            .join("daemons")
+                            .join(format!("{boot}.json")),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
             format!(
-                "--- drainer presence record ---\n{}\n--- last served row ---\n{}\n--- A tail ---\n{}",
+                "--- drainer presence record ---\n{}\n\
+                 --- successor presence record ---\n{}\n\
+                 --- transcript mtime secs (era watershed compare) ---\n{}\n\
+                 --- last served row ---\n{}\n--- A tail ---\n{}",
                 std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                successor_presence,
+                transcript_mtime_secs,
                 last_served_row.lock().unwrap(),
                 daemon_a.log_tail()
             )
@@ -7490,7 +7546,13 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
     );
 
     // The join self-clears: the drainer's boot lock freed, `live` reads
-    // false, and the successor's rows drop held_by.
+    // false, and the successor's rows drop held_by. The strict era
+    // claim lands HERE, where it is deterministic: round two appended
+    // to the transcript within the successor's boot, so a served boot
+    // block must read current/not-ghost — and requiring the block also
+    // keeps "held_by cleared" distinct from "boot block momentarily
+    // omitted" (the joins resolve per build; an unpublished registry
+    // omits the block entirely).
     poll_until(
         "held_by clearing after the drainer exits",
         RUN_TIMEOUT,
@@ -7501,7 +7563,10 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
             )
             .await?;
             let row = held_row(&sessions, &sid)?;
-            row.pointer("/boot/held_by").is_none().then_some(())
+            (row.pointer("/boot/held_by").is_none()
+                && row["boot"]["era"] == "current"
+                && row["boot"]["ghost"] == false)
+                .then_some(())
         },
         || daemon_a.log_tail(),
     )
