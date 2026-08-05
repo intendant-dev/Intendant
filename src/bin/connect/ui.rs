@@ -402,6 +402,12 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
           .advq button { background: transparent; border: 1px solid var(--line-strong); color: var(--muted); border-radius: 999px; padding: 5px 13px; font-size: 13px; cursor: pointer; }
           .advq button:hover { color: var(--text); border-color: var(--accent); }
           .advq button.on { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+          /* Two-line pills: options that carry a sub-description stack the
+             label over a muted explainer as left-aligned cards sharing the
+             row. The sub stays muted in every state — hover and selection
+             recolor the label line only. */
+          .advq.stacked button { flex: 1 1 220px; text-align: left; border-radius: var(--radius); padding: 7px 13px 8px; }
+          .advq.stacked button .sub { display: block; font-size: 12px; line-height: 1.45; color: var(--muted-2); margin-top: 2px; }
           .advout { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
           .advout ul { margin: 0; padding-left: 20px; font-size: 14px; color: var(--muted); display: grid; gap: 6px; }
           .advout ul b { color: var(--text); }
@@ -414,11 +420,11 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
             <button data-v="macos">macOS</button>
             <button data-v="windows">Windows</button>
           </div>
-          <div class="advq" data-q="box">
+          <div class="advq stacked" data-q="box">
             <span class="ql">What kind of machine?</span>
-            <button data-v="vps" class="on">A rented VPS</button>
-            <button data-v="server">My own always-on machine</button>
-            <button data-v="laptop">The machine I'm on now</button>
+            <button data-v="vps" class="on">A cloud server I rent<span class="sub">A VPS you reach over SSH.</span></button>
+            <button data-v="server">Another machine I own<span class="sub">A home server or spare box that stays on — set up to start at boot and run without you.</span></button>
+            <button data-v="laptop">This computer, right here<span class="sub">The one you're using now — you start and stop it yourself; no boot service.</span></button>
           </div>
           <div class="advq" data-q="fuel">
             <span class="ql">What will fuel it?</span>
@@ -455,7 +461,7 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
               ? '& ([scriptblock]::Create((irm https://github.com/intendant-dev/Intendant/releases/latest/download/install.ps1))) -Connect ' + location.origin + (svc ? ' -Service' : '')
               : 'curl -fsSL https://github.com/intendant-dev/Intendant/releases/latest/download/install.sh | sh -s -- --connect ' + location.origin + (svc ? ' --service' : '');
             document.getElementById('advps').textContent = pick.os === 'windows' ? 'PS> ' : '$ ';
-            document.getElementById('advtitle').textContent = pick.os === 'windows' ? 'fresh box — PowerShell' : 'fresh box — sh';
+            document.getElementById('advtitle').textContent = (pick.box === 'laptop' ? 'this computer' : 'fresh box') + (pick.os === 'windows' ? ' — PowerShell' : ' — sh');
             document.getElementById('advcmd').textContent = cmd;
             var plan = [];
             if (pick.box === 'laptop') {
@@ -2431,6 +2437,25 @@ mod tests {
         ] {
             assert!(html.contains(question), "advisor must ask: {question}");
         }
+        // The machine-choice pills answer in the visitor's own words, each
+        // carrying a sub-description line; copy only — option order, data-v
+        // values, and the default command below are unchanged.
+        for option in [
+            "A cloud server I rent",
+            "A VPS you reach over SSH.",
+            "Another machine I own",
+            "A home server or spare box that stays on",
+            "This computer, right here",
+            "The one you're using now",
+        ] {
+            assert!(
+                html.contains(option),
+                "advisor box option must say: {option}"
+            );
+        }
+        // The terminal title stays honest when the chosen box is the
+        // visitor's own computer rather than a fresh box.
+        assert!(html.contains("'this computer'"));
         // The default answers' command is server-rendered, so the page
         // shows a working one-liner (Linux VPS ⇒ --service) without JS.
         assert!(html.contains(&format!(

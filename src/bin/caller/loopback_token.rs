@@ -387,6 +387,36 @@ mod tests {
         assert!(message.contains("trust-architecture.md"));
     }
 
+    /// The dashboard's stale-token honesty surface: the served bundle
+    /// detects this refusal by a marker in its error text and raises a
+    /// named banner pointing at `intendant ctl dashboard-url`, so the
+    /// server copy and the SPA needle must not drift apart (the
+    /// `spa_offers_reload_on_boot_id_change` artifact-scan pattern).
+    #[test]
+    fn spa_surfaces_the_stale_token_refusal() {
+        let marker = "per-boot admission token";
+        assert!(
+            refusal_error_message().contains(marker),
+            "the refusal copy lost the marker the dashboard detects"
+        );
+        let app = include_str!("../../../static/app.html");
+        for needle in [
+            // The detection marker, at the shared fetch chokepoint…
+            "LOOPBACK_STALE_TOKEN_MARKER = 'per-boot admission token'",
+            "function observeOwnerLaneApiOutcome",
+            // …the banner element with its actionable reopen copy…
+            "ui-loopback-token-banner",
+            "intendant ctl dashboard-url",
+            // …and the lane-recovery re-arm of the empty-state probe.
+            "function noteOwnerLaneApiSuccess",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the stale-token banner wiring: {needle}"
+            );
+        }
+    }
+
     #[test]
     fn tokened_url_targets_loopback_and_carries_the_token() {
         let url = tokened_dashboard_url("https", 8765);
