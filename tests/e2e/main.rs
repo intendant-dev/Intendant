@@ -8838,7 +8838,7 @@ async fn update_lane_source_click_produces_artifact_and_chips() {
 /// miss (direct `cargo`). The sibling leg's mock_build_override stands
 /// in for the build child, which is exactly why CI never saw it; this
 /// leg drives the REAL (non-mock) build branch under that env shape —
-/// PATH scrubbed of every cargo-bearing dir, CARGO_HOME pointing
+/// a fixture PATH carrying git/bash but no cargo, CARGO_HOME pointing
 /// nowhere — so the lane must resolve `$HOME/.cargo/bin/cargo` and
 /// prepend its bin dir to the child PATH. Act one, before the fake
 /// toolchain exists, pins the NAMED refusal that replaces the bare
@@ -8879,17 +8879,22 @@ async fn update_lane_produce_resolves_cargo_for_bare_path_daemons() {
     std::fs::create_dir_all(watched.parent().expect("target dir")).expect("target dirs");
     write_fake_watched_binary(&watched, "fakesha1");
 
-    // The launchd/service shape, deterministically: drop every PATH dir
-    // holding a cargo (the test process runs under `cargo test`, so the
-    // inherited PATH has at least one) — git and bash keep resolving —
-    // and point CARGO_HOME at nothing.
-    let scrubbed_path = std::env::join_paths(
-        std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
-            .filter(|dir| !dir.join("cargo").is_file()),
-    )
-    .expect("join scrubbed PATH")
-    .to_string_lossy()
-    .into_owned();
+    // The launchd/service shape, deterministically: the daemon's PATH
+    // becomes a single fixture dir carrying exactly the tools this flow
+    // and its fakes need — git, bash, mkdir, cat, chmod — and no cargo.
+    // (Filtering cargo-bearing dirs out of the inherited PATH is not
+    // enough: a distro cargo in /usr/bin would drop git with it.)
+    // CARGO_HOME points at nothing.
+    let tool_bin = rig.home.path().join("tool-bin");
+    std::fs::create_dir_all(&tool_bin).expect("fixture tool bin");
+    for tool in ["git", "bash", "mkdir", "cat", "chmod"] {
+        let source = std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("{tool} not found on the test PATH"));
+        std::os::unix::fs::symlink(&source, tool_bin.join(tool)).expect("symlink fixture tool");
+    }
+    let bare_path = tool_bin.display().to_string();
     let no_cargo_home = rig.home.path().join("no-cargo-home");
 
     let daemon = spawn_co_daemon(
@@ -8902,7 +8907,7 @@ async fn update_lane_produce_resolves_cargo_for_bare_path_daemons() {
                 watched.to_str().expect("utf8 rig path"),
             ),
             ("INTENDANT_UPDATE_LANE_HEADROOM", "ok"),
-            ("PATH", scrubbed_path.as_str()),
+            ("PATH", bare_path.as_str()),
             ("CARGO_HOME", no_cargo_home.to_str().expect("utf8 rig path")),
         ],
         &[],
@@ -9048,14 +9053,18 @@ async fn update_lane_produce_resolves_cargo_for_bare_path_daemons() {
         "the direct spawn used the resolved absolute cargo: {log_tail}"
     );
     // …and its spawn env carried the prepended bin dir (what the bundle
-    // script's bare `cargo` and the rustup shims resolve with).
+    // script's bare `cargo` and the rustup shims resolve with),
+    // prepended to — not replacing — the curated PATH. The daemon's own
+    // boot prepends existing tool dirs (`ensure_tool_paths`: Homebrew
+    // prefixes on macOS — deliberately never `~/.cargo/bin`), so the
+    // pin is head + tail, not the exact middle.
     let child_path = std::fs::read_to_string(&path_dump).expect("fake cargo PATH dump");
     assert!(
         child_path.starts_with(&format!("{}:", cargo_bin.display())),
         "the build child's PATH leads with the resolved bin dir: {child_path}"
     );
     assert!(
-        child_path.ends_with(&scrubbed_path),
+        child_path.ends_with(&format!(":{bare_path}")),
         "…prepended to, not replacing, the curated PATH: {child_path}"
     );
 }
