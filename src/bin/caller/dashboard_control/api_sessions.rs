@@ -274,6 +274,7 @@ pub(crate) async fn control_request_frame(
         "api_daemon_handover" => api_daemon_handover_response(id, &runtime).await,
         "api_plugins_list" => api_plugins_list_response(id).await,
         "api_plugin_set_enabled" => api_plugin_set_enabled_response(id, params.as_ref()).await,
+        "api_skills_list" => api_skills_list_response(id).await,
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
@@ -1694,6 +1695,15 @@ pub(crate) async fn api_plugins_list_response(id: String) -> serde_json::Value {
         id,
         crate::web_gateway::plugins_list_api_response().await,
         "plugins list",
+    )
+}
+
+/// Tunnel twin of `GET /api/skills`.
+pub(crate) async fn api_skills_list_response(id: String) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::skills_list_api_response().await,
+        "skills list",
     )
 }
 

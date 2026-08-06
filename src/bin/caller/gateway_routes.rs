@@ -312,6 +312,10 @@ pub(crate) enum RouteHandlerId {
     /// Enable/disable one bundled plugin; reconciles skill
     /// materialization in the same request and reports the outcome.
     PluginSetEnabled,
+    /// Unified skill catalog: every skill the daemon manages (builtins ∪
+    /// bundled plugin payloads), with provenance, trust posture, and
+    /// per-root install facts as one derived body.
+    SkillsList,
     /// Tier-2 PR render join for one anchor (expand-time, cached).
     AgendaPrState,
     /// One agenda item, full + decorated, by id or unique prefix
@@ -1050,6 +1054,19 @@ pub(crate) static ROUTES: &[Route] = &[
         "Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome)",
     )
     .with_tunnel(tunnel_method("api_plugin_set_enabled")),
+    // The unified skill catalog (skills/plugins unification S1):
+    // registry-driven rows for every skill the daemon manages — builtins
+    // plus bundled plugin payloads, never a directory enumeration — with
+    // provenance, trust posture, and per-root install facts. Read-only.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/skills"),
+        PeerOperation::StatsRead,
+        BodyPolicy::None,
+        RouteHandlerId::SkillsList,
+        "Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts",
+    )
+    .with_tunnel(tunnel_method("api_skills_list")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),

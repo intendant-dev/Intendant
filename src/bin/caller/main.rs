@@ -106,6 +106,7 @@ mod session_vitals;
 mod session_vitals_restore;
 mod setup;
 mod shared_view_lifecycle;
+mod skill_catalog;
 mod skill_install;
 mod usage_rail;
 pub(crate) use intendant_core::skills;
