@@ -72,8 +72,10 @@ impl SessionSupervisor {
         if !slow_create {
             return Some((msg, reserved));
         }
+        // The pass variant boxes the (large) ControlMsg so the enum stays
+        // small; one allocation per admitted create is noise.
         enum Decision {
-            Pass(event::ControlMsg, Option<ReservedSessionLaunch>),
+            Pass(Box<event::ControlMsg>, Option<ReservedSessionLaunch>),
             Refuse(String),
             Queued(String),
         }
@@ -93,7 +95,7 @@ impl SessionSupervisor {
             }
             let resident = state.sessions.len();
             match controller.admission_check(resident) {
-                AdmissionCheck::Admit => Decision::Pass(msg, reserved),
+                AdmissionCheck::Admit => Decision::Pass(Box::new(msg), reserved),
                 AdmissionCheck::Gate {
                     stage,
                     bound,
@@ -142,7 +144,7 @@ impl SessionSupervisor {
             }
         };
         match decision {
-            Decision::Pass(msg, reserved) => Some((msg, reserved)),
+            Decision::Pass(msg, reserved) => Some((*msg, reserved)),
             Decision::Refuse(refusal) => {
                 self.loop_error(refusal);
                 self.publish_capacity_census().await;
