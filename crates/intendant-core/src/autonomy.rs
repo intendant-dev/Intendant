@@ -4,7 +4,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Global autonomy level controlling how much user approval is needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Serialized lowercase (`low`/`medium`/`high`/`full`) — the dial
+/// vocabulary's closed form; an unknown word refuses at deserialization.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum AutonomyLevel {
     /// Ask for every category except file reads; Deny rules still gate.
     Low,
@@ -137,7 +142,7 @@ impl fmt::Display for ActionCategory {
 }
 
 /// Per-category approval rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum ApprovalRule {
@@ -280,6 +285,234 @@ impl ApprovalConfig {
     }
 }
 
+/// Ask-propensity grade (Track AD, owner-ratified vocabulary). A TAUGHT
+/// posture, not a permission wall: the daemon's hard parts are recording,
+/// delivery, and routing — it cannot compel a model to ask. Each grade
+/// includes the previous grade's asking classes:
+/// `autopilot` — no discretionary questions, best-judgment throughout;
+/// `escalate` (default) — owner-only decision classes park a non-blocking
+/// question with a committed recommendation;
+/// `checkpoint` — escalate + park before sealing named direction choices;
+/// `confer` — checkpoint + a blocking ask (bounded wait) at direction
+/// choices. S1 records and carries the grade; the per-grade teaching
+/// assembly is S2.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AskGrade {
+    Autopilot,
+    #[default]
+    Escalate,
+    Checkpoint,
+    Confer,
+}
+
+impl AskGrade {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Autopilot => "autopilot",
+            Self::Escalate => "escalate",
+            Self::Checkpoint => "checkpoint",
+            Self::Confer => "confer",
+        }
+    }
+}
+
+/// Notification send-appetite (Track AD). A ceiling on the session's own
+/// `notify_user` loudness, always UNDER owner delivery policy (quiet
+/// hours, per-item reminder levels, nudge cooldowns stay owner-side):
+/// `quiet` clamps every notification to info (still delivered, still in
+/// the transcript — only loudness changes, and the clamp is named in the
+/// tool response); `normal` is today's behavior verbatim; `eager` adds no
+/// ceiling (its taught milestone-updates invitation is S2).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyAppetite {
+    Quiet,
+    #[default]
+    Normal,
+    Eager,
+}
+
+impl NotifyAppetite {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Normal => "normal",
+            Self::Eager => "eager",
+        }
+    }
+}
+
+/// Per-category approval-rule overrides for one session — the
+/// `ApprovalConfig` vocabulary with every field optional (`None` inherits
+/// the live global rule at decision time). Field names mirror
+/// `ApprovalConfig` exactly; `human_input` and `live_audio_spawn` remain
+/// hard gates with no backing field at any scope. Unknown keys refuse the
+/// whole dial (`deny_unknown_fields`): a declaration the daemon cannot
+/// enforce must not ride an owner approval.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_read: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_write: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_delete: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_exec: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_control: Option<ApprovalRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<ApprovalRule>,
+}
+
+impl ApprovalOverrides {
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            file_read,
+            file_write,
+            file_delete,
+            command_exec,
+            network,
+            destructive,
+            display_control,
+            tool_call,
+        } = self;
+        file_read.is_none()
+            && file_write.is_none()
+            && file_delete.is_none()
+            && command_exec.is_none()
+            && network.is_none()
+            && destructive.is_none()
+            && display_control.is_none()
+            && tool_call.is_none()
+    }
+}
+
+/// One field of the session-layer merge: the override wins over the live
+/// global rule EXCEPT across a live global `deny` — the deny floor is
+/// absolute and read at decision time, so a category deny the owner sets
+/// bites every running session, dial-bearing ones included. Tightening
+/// (any → deny, auto → ask) is always allowed.
+fn apply_rule_override(base: ApprovalRule, over: Option<ApprovalRule>) -> ApprovalRule {
+    match (base, over) {
+        (ApprovalRule::Deny, _) => ApprovalRule::Deny,
+        (base, None) => base,
+        (_, Some(rule)) => rule,
+    }
+}
+
+impl ApprovalConfig {
+    /// The live global rules with one session's overrides applied,
+    /// per-category most-specific-present, under the absolute deny floor
+    /// ([`apply_rule_override`]). Shell composition (`shell_rule`) then
+    /// runs over the MERGED per-category rules, so CommandExec's
+    /// strictest-reachable-effect law sees the session's effective world.
+    pub fn with_overrides(&self, overrides: &ApprovalOverrides) -> ApprovalConfig {
+        ApprovalConfig {
+            file_read: apply_rule_override(self.file_read, overrides.file_read),
+            file_write: apply_rule_override(self.file_write, overrides.file_write),
+            file_delete: apply_rule_override(self.file_delete, overrides.file_delete),
+            command_exec: apply_rule_override(self.command_exec, overrides.command_exec),
+            network: apply_rule_override(self.network, overrides.network),
+            destructive: apply_rule_override(self.destructive, overrides.destructive),
+            display_control: apply_rule_override(self.display_control, overrides.display_control),
+            tool_call: apply_rule_override(self.tool_call, overrides.tool_call),
+        }
+    }
+}
+
+/// The scoped session-dial carrier (Track AD S1): four optional knobs, each
+/// a closed typed vocabulary. `None` knobs inherit the LIVE global layer at
+/// decision time; `Some` knobs are owner-signed sticky overrides pinned for
+/// the session's life (mid-session re-dial is deliberately not vocabulary).
+/// Hard gates (HumanInput, LiveAudioSpawn, the display-request rail,
+/// question≠permission) stay outside the dial at every scope. TOML table
+/// name at every scope: `[dial]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DialConfig {
+    /// Autonomy-level override for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<AutonomyLevel>,
+    /// Ask-propensity grade. Recorded and carried in S1; taught in S2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<AskGrade>,
+    /// Per-category approval-rule overrides (the "per action" knob).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals: Option<ApprovalOverrides>,
+    /// Notification send-appetite ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyAppetite>,
+}
+
+impl DialConfig {
+    /// True when no knob carries a value (an all-`None` dial binds
+    /// nothing and is never recorded).
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            autonomy,
+            ask,
+            approvals,
+            notify,
+        } = self;
+        autonomy.is_none()
+            && ask.is_none()
+            && approvals.as_ref().is_none_or(|a| a.is_empty())
+            && notify.is_none()
+    }
+}
+
+/// Short human description of a dial's set knobs (for launch/re-attach
+/// log lines): `autonomy=full, approvals[network=deny], notify=quiet`.
+pub fn describe_dial(dial: &DialConfig) -> String {
+    let mut parts = Vec::new();
+    if let Some(level) = dial.autonomy {
+        parts.push(format!("autonomy={}", level.to_string().to_lowercase()));
+    }
+    if let Some(grade) = dial.ask {
+        parts.push(format!("ask={}", grade.as_str()));
+    }
+    if let Some(overrides) = dial.approvals.as_ref() {
+        let categories: [(&str, Option<ApprovalRule>); 8] = [
+            ("file_read", overrides.file_read),
+            ("file_write", overrides.file_write),
+            ("file_delete", overrides.file_delete),
+            ("command_exec", overrides.command_exec),
+            ("network", overrides.network),
+            ("destructive", overrides.destructive),
+            ("display_control", overrides.display_control),
+            ("tool_call", overrides.tool_call),
+        ];
+        let set: Vec<String> = categories
+            .into_iter()
+            .filter_map(|(name, rule)| rule.map(|rule| format!("{name}={}", rule.as_str())))
+            .collect();
+        if !set.is_empty() {
+            parts.push(format!("approvals[{}]", set.join(", ")));
+        }
+    }
+    if let Some(appetite) = dial.notify {
+        parts.push(format!("notify={}", appetite.as_str()));
+    }
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Combined autonomy state shared between the agent loop and TUI.
 #[derive(Debug, Clone)]
 pub struct AutonomyState {
@@ -297,6 +530,17 @@ pub struct AutonomyState {
     /// [`batch_dedup_source`]) carry a digest so changed content never
     /// rides an old approval.
     pub approved_commands: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Per-session dial overrides (Track AD S1), keyed by session id — the
+    /// session OVERRIDE layer of the two-layer cascade. `level`/`rules`
+    /// above remain the LIVE global layer: un-overridden knobs read them at
+    /// decision time, overridden knobs stay owner-signed-pinned for the
+    /// session's life. Recorded only from owner-signed gestures (an
+    /// approved manifest, the owner's own create, the card's
+    /// session-scoped approve-all) — sessions never write their own dial.
+    /// In-memory like every other field; the durable copy lives in the
+    /// session's `session_agent_config.json` overlay and re-attaches on
+    /// resume/readopt.
+    pub session_dials: std::collections::HashMap<String, DialConfig>,
 }
 
 impl Default for AutonomyState {
@@ -306,6 +550,7 @@ impl Default for AutonomyState {
             rules: ApprovalConfig::default(),
             user_display_granted: false,
             approved_commands: std::collections::HashMap::new(),
+            session_dials: std::collections::HashMap::new(),
         }
     }
 }
@@ -317,7 +562,85 @@ impl AutonomyState {
             rules,
             user_display_granted: false,
             approved_commands: std::collections::HashMap::new(),
+            session_dials: std::collections::HashMap::new(),
         }
+    }
+
+    /// The recorded dial override for `session`, if any. `None` session
+    /// ids (the single-session shapes) never carry a dial — they are the
+    /// whole daemon and read the global layer directly.
+    pub fn session_dial(&self, session: Option<&str>) -> Option<&DialConfig> {
+        self.session_dials.get(session?)
+    }
+
+    /// Record (or extend) a session's dial override layer. An empty dial
+    /// is never recorded — absence and emptiness must stay the same state
+    /// so dial-less sessions remain byte-identical to today.
+    pub fn set_session_dial(&mut self, session: &str, dial: DialConfig) {
+        if dial.is_empty() {
+            return;
+        }
+        self.session_dials.insert(session.to_string(), dial);
+    }
+
+    /// Escalate exactly one session's autonomy override to Full (the
+    /// session-scoped approve-all). Existing knobs on the session's dial
+    /// are preserved; the global level and every other session are
+    /// untouched.
+    pub fn set_session_autonomy_full(&mut self, session: &str) {
+        self.session_dials
+            .entry(session.to_string())
+            .or_default()
+            .autonomy = Some(AutonomyLevel::Full);
+    }
+
+    /// The session's effective autonomy level: its sticky override when
+    /// one was signed, else the LIVE global level. A live global tighten
+    /// deliberately does not bite an overridden session (priced in the AD
+    /// ruling — the owner's emergency lever is the per-category deny
+    /// floor, which always bites; recourse for level is stop/re-dial).
+    pub fn effective_level(&self, session: Option<&str>) -> AutonomyLevel {
+        self.session_dial(session)
+            .and_then(|dial| dial.autonomy)
+            .unwrap_or(self.level)
+    }
+
+    /// The session's effective per-category rules: the LIVE global rules
+    /// with the session's overrides applied under the absolute deny floor
+    /// (see [`ApprovalConfig::with_overrides`]).
+    pub fn effective_rules(&self, session: Option<&str>) -> ApprovalConfig {
+        match self
+            .session_dial(session)
+            .and_then(|d| d.approvals.as_ref())
+        {
+            Some(overrides) => self.rules.with_overrides(overrides),
+            None => self.rules.clone(),
+        }
+    }
+
+    /// Effective rule for one category in one session (the deny-precheck
+    /// form the consult sites read before [`Self::needs_approval`]).
+    pub fn effective_rule_for(
+        &self,
+        session: Option<&str>,
+        category: ActionCategory,
+    ) -> ApprovalRule {
+        self.effective_rules(session).rule_for(category)
+    }
+
+    /// The session's effective notify appetite (`normal` when un-dialed).
+    pub fn effective_notify(&self, session: Option<&str>) -> NotifyAppetite {
+        self.session_dial(session)
+            .and_then(|dial| dial.notify)
+            .unwrap_or_default()
+    }
+
+    /// The session's effective ask grade (`escalate` when un-dialed).
+    /// Recorded vocabulary in S1; the grade's taught posture rides S2.
+    pub fn effective_ask(&self, session: Option<&str>) -> AskGrade {
+        self.session_dial(session)
+            .and_then(|dial| dial.ask)
+            .unwrap_or_default()
     }
 
     /// Generate a dedup key for an action.
@@ -348,41 +671,49 @@ impl AutonomyState {
             .insert(Self::command_dedup_key(dedup_source));
     }
 
-    /// Determine whether approval is needed for a given action category.
-    /// Returns true if the user must be prompted.
-    pub fn needs_approval(&self, category: ActionCategory) -> bool {
-        // HumanInput and LiveAudioSpawn always require human regardless of autonomy level
+    /// Determine whether approval is needed for a given action category,
+    /// under `session`'s effective dial (session override layer over the
+    /// live global layer; `None` and un-dialed sessions read pure global —
+    /// today's exact behavior). Returns true if the user must be prompted.
+    pub fn needs_approval(&self, session: Option<&str>, category: ActionCategory) -> bool {
+        // HumanInput and LiveAudioSpawn always require human regardless of
+        // autonomy level — hard gates outside the dial at every scope.
         if category == ActionCategory::HumanInput || category == ActionCategory::LiveAudioSpawn {
             return true;
         }
 
+        let level = self.effective_level(session);
+
         // Full autonomy auto-approves everything except the hard gates above.
-        if self.level == AutonomyLevel::Full {
+        if level == AutonomyLevel::Full {
             return false;
         }
 
         // DisplayControl: ask on first use, then session-grant takes over
+        // (the grant is daemon-wide and not dial vocabulary).
         if category == ActionCategory::DisplayControl {
             return !self.user_display_granted;
         }
 
+        let rules = self.effective_rules(session);
+
         // Low autonomy asks for everything except FileRead (unless Deny overrides)
-        if self.level == AutonomyLevel::Low {
-            let rule = self.rules.rule_for(category);
+        if level == AutonomyLevel::Low {
+            let rule = rules.rule_for(category);
             if rule == ApprovalRule::Deny {
                 return true;
             }
             return category != ActionCategory::FileRead;
         }
 
-        // Check category-level rule (overrides global level)
-        let rule = self.rules.rule_for(category);
+        // Check category-level rule (overrides the level)
+        let rule = rules.rule_for(category);
         match rule {
             ApprovalRule::Auto => false,
             ApprovalRule::Deny => true, // deny acts like "ask" — will be denied
             ApprovalRule::Ask => {
-                // Apply global autonomy level
-                match self.level {
+                // Apply the effective autonomy level
+                match level {
                     AutonomyLevel::Medium => {
                         // Ask for shell execution and Ask-ruled effects,
                         // including controller/external-agent tool calls.
@@ -415,18 +746,27 @@ impl AutonomyState {
     /// (`CommandExec`/`NetworkRequest` default to `Auto`) — the request
     /// arriving at all is the signal that a human should decide.
     ///
-    /// Semantics:
+    /// Semantics (under `session`'s effective dial; `None` and un-dialed
+    /// sessions read pure global):
     /// - `Full` autonomy → auto-approve (no human in the loop at all).
     /// - An explicit category `Deny` rule → reject.
     /// - Everything else → surface to the frontend `y/s/a/n` gate.
-    pub fn external_approval_decision(&self, category: ActionCategory) -> ExternalApprovalDecision {
+    ///
+    /// The documented Full-before-deny caveat is inherited unchanged by
+    /// per-session Full: the bypass then reaches that session only, and
+    /// it remains the separately-tracked defect (docs/src/autonomy.md).
+    pub fn external_approval_decision(
+        &self,
+        session: Option<&str>,
+        category: ActionCategory,
+    ) -> ExternalApprovalDecision {
         // Full autonomy keeps the human entirely out of the loop.
-        if self.level == AutonomyLevel::Full {
+        if self.effective_level(session) == AutonomyLevel::Full {
             return ExternalApprovalDecision::AutoApprove;
         }
 
         // An explicit per-category Deny rule rejects outright.
-        let rule = self.rules.rule_for(category);
+        let rule = self.effective_rule_for(session, category);
         if rule == ApprovalRule::Deny {
             return ExternalApprovalDecision::Reject;
         }
@@ -456,12 +796,15 @@ impl AutonomyState {
     ///   Medium, High auto-approves ordinary Ask rules, and Full never asks.
     ///   Users who deliberately trust their configured servers can opt into
     ///   `tool_call = "auto"`.
-    pub fn controller_tool_decision(&self) -> ControllerToolDecision {
-        let rule = self.rules.rule_for(ActionCategory::ToolCall);
+    ///
+    /// Session-aware like the other decision fns: `session`'s effective
+    /// dial applies; `None` and un-dialed sessions read pure global.
+    pub fn controller_tool_decision(&self, session: Option<&str>) -> ControllerToolDecision {
+        let rule = self.effective_rule_for(session, ActionCategory::ToolCall);
         if rule == ApprovalRule::Deny {
             return ControllerToolDecision::Deny;
         }
-        if self.needs_approval(ActionCategory::ToolCall) {
+        if self.needs_approval(session, ActionCategory::ToolCall) {
             return ControllerToolDecision::Ask;
         }
         ControllerToolDecision::AutoApprove
@@ -909,53 +1252,53 @@ destructive = "deny"
     #[test]
     fn human_input_always_needs_approval() {
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
-        assert!(state.needs_approval(ActionCategory::HumanInput));
+        assert!(state.needs_approval(None, ActionCategory::HumanInput));
 
         let state = AutonomyState::new(AutonomyLevel::High, ApprovalConfig::default());
-        assert!(state.needs_approval(ActionCategory::HumanInput));
+        assert!(state.needs_approval(None, ActionCategory::HumanInput));
     }
 
     #[test]
     fn live_audio_always_needs_approval() {
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
-        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
+        assert!(state.needs_approval(None, ActionCategory::LiveAudioSpawn));
     }
 
     #[test]
     fn full_autonomy_approves_everything_except_hard_gates() {
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
-        assert!(!state.needs_approval(ActionCategory::FileRead));
-        assert!(!state.needs_approval(ActionCategory::FileWrite));
-        assert!(!state.needs_approval(ActionCategory::FileDelete));
-        assert!(!state.needs_approval(ActionCategory::CommandExec));
-        assert!(!state.needs_approval(ActionCategory::Destructive));
-        assert!(!state.needs_approval(ActionCategory::NetworkRequest));
-        assert!(state.needs_approval(ActionCategory::HumanInput));
-        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
+        assert!(!state.needs_approval(None, ActionCategory::FileRead));
+        assert!(!state.needs_approval(None, ActionCategory::FileWrite));
+        assert!(!state.needs_approval(None, ActionCategory::FileDelete));
+        assert!(!state.needs_approval(None, ActionCategory::CommandExec));
+        assert!(!state.needs_approval(None, ActionCategory::Destructive));
+        assert!(!state.needs_approval(None, ActionCategory::NetworkRequest));
+        assert!(state.needs_approval(None, ActionCategory::HumanInput));
+        assert!(state.needs_approval(None, ActionCategory::LiveAudioSpawn));
     }
 
     #[test]
     fn low_autonomy_asks_for_everything_except_file_read() {
         let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
         // FileRead is never gated even at Low
-        assert!(!state.needs_approval(ActionCategory::FileRead));
+        assert!(!state.needs_approval(None, ActionCategory::FileRead));
         // Everything else needs approval at Low, regardless of Auto rules
-        assert!(state.needs_approval(ActionCategory::CommandExec));
-        assert!(state.needs_approval(ActionCategory::FileWrite));
-        assert!(state.needs_approval(ActionCategory::Destructive));
-        assert!(state.needs_approval(ActionCategory::NetworkRequest));
-        assert!(state.needs_approval(ActionCategory::FileDelete));
+        assert!(state.needs_approval(None, ActionCategory::CommandExec));
+        assert!(state.needs_approval(None, ActionCategory::FileWrite));
+        assert!(state.needs_approval(None, ActionCategory::Destructive));
+        assert!(state.needs_approval(None, ActionCategory::NetworkRequest));
+        assert!(state.needs_approval(None, ActionCategory::FileDelete));
     }
 
     #[test]
     fn medium_autonomy_asks_for_shell_writes_and_destructive() {
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert!(!state.needs_approval(ActionCategory::FileRead));
-        assert!(state.needs_approval(ActionCategory::CommandExec));
-        assert!(!state.needs_approval(ActionCategory::NetworkRequest));
-        assert!(state.needs_approval(ActionCategory::FileWrite));
-        assert!(state.needs_approval(ActionCategory::FileDelete));
-        assert!(state.needs_approval(ActionCategory::Destructive));
+        assert!(!state.needs_approval(None, ActionCategory::FileRead));
+        assert!(state.needs_approval(None, ActionCategory::CommandExec));
+        assert!(!state.needs_approval(None, ActionCategory::NetworkRequest));
+        assert!(state.needs_approval(None, ActionCategory::FileWrite));
+        assert!(state.needs_approval(None, ActionCategory::FileDelete));
+        assert!(state.needs_approval(None, ActionCategory::Destructive));
     }
 
     #[test]
@@ -963,19 +1306,19 @@ destructive = "deny"
         let mut rules = ApprovalConfig::default();
         rules.network = ApprovalRule::Ask;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules);
-        assert!(state.needs_approval(ActionCategory::NetworkRequest));
+        assert!(state.needs_approval(None, ActionCategory::NetworkRequest));
     }
 
     #[test]
     fn high_autonomy_auto_approves_ordinary_categories() {
         let state = AutonomyState::new(AutonomyLevel::High, ApprovalConfig::default());
-        assert!(!state.needs_approval(ActionCategory::FileRead));
-        assert!(!state.needs_approval(ActionCategory::FileWrite));
-        assert!(!state.needs_approval(ActionCategory::FileDelete));
-        assert!(!state.needs_approval(ActionCategory::CommandExec));
-        assert!(!state.needs_approval(ActionCategory::Destructive));
-        assert!(state.needs_approval(ActionCategory::HumanInput));
-        assert!(state.needs_approval(ActionCategory::LiveAudioSpawn));
+        assert!(!state.needs_approval(None, ActionCategory::FileRead));
+        assert!(!state.needs_approval(None, ActionCategory::FileWrite));
+        assert!(!state.needs_approval(None, ActionCategory::FileDelete));
+        assert!(!state.needs_approval(None, ActionCategory::CommandExec));
+        assert!(!state.needs_approval(None, ActionCategory::Destructive));
+        assert!(state.needs_approval(None, ActionCategory::HumanInput));
+        assert!(state.needs_approval(None, ActionCategory::LiveAudioSpawn));
     }
 
     #[test]
@@ -983,7 +1326,7 @@ destructive = "deny"
         let mut rules = ApprovalConfig::default();
         rules.destructive = ApprovalRule::Deny;
         let state = AutonomyState::new(AutonomyLevel::High, rules);
-        assert!(state.needs_approval(ActionCategory::Destructive));
+        assert!(state.needs_approval(None, ActionCategory::Destructive));
     }
 
     #[test]
@@ -1091,21 +1434,21 @@ destructive = "deny"
         // or external-agent tool boundary.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert_eq!(
-            state.controller_tool_decision(),
+            state.controller_tool_decision(None),
             ControllerToolDecision::Ask
         );
 
         // Low also prompts.
         let state = AutonomyState::new(AutonomyLevel::Low, ApprovalConfig::default());
         assert_eq!(
-            state.controller_tool_decision(),
+            state.controller_tool_decision(None),
             ControllerToolDecision::Ask
         );
 
         // Full never asks.
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
         assert_eq!(
-            state.controller_tool_decision(),
+            state.controller_tool_decision(None),
             ControllerToolDecision::AutoApprove
         );
 
@@ -1114,7 +1457,7 @@ destructive = "deny"
         rules.tool_call = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules.clone());
         assert_eq!(
-            state.controller_tool_decision(),
+            state.controller_tool_decision(None),
             ControllerToolDecision::AutoApprove
         );
 
@@ -1122,7 +1465,7 @@ destructive = "deny"
         rules.tool_call = ApprovalRule::Ask;
         let state = AutonomyState::new(AutonomyLevel::High, rules);
         assert_eq!(
-            state.controller_tool_decision(),
+            state.controller_tool_decision(None),
             ControllerToolDecision::AutoApprove
         );
 
@@ -1138,7 +1481,7 @@ destructive = "deny"
         ] {
             let state = AutonomyState::new(level, rules.clone());
             assert_eq!(
-                state.controller_tool_decision(),
+                state.controller_tool_decision(None),
                 ControllerToolDecision::Deny,
                 "tool_call = deny must refuse at {:?}",
                 level
@@ -1209,12 +1552,12 @@ destructive = "deny"
     fn medium_asks_for_tool_call_by_default_and_auto_is_explicit() {
         // Default Ask: prompt at Medium.
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert!(state.needs_approval(ActionCategory::ToolCall));
+        assert!(state.needs_approval(None, ActionCategory::ToolCall));
         // Explicit auto rule: no prompt at Medium.
         let mut rules = ApprovalConfig::default();
         rules.tool_call = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules);
-        assert!(!state.needs_approval(ActionCategory::ToolCall));
+        assert!(!state.needs_approval(None, ActionCategory::ToolCall));
     }
 
     #[test]
@@ -1223,7 +1566,7 @@ destructive = "deny"
         rules.file_write = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Low, rules);
         // Low overrides Auto — still asks for file_write
-        assert!(state.needs_approval(ActionCategory::FileWrite));
+        assert!(state.needs_approval(None, ActionCategory::FileWrite));
     }
 
     #[test]
@@ -1249,7 +1592,7 @@ destructive = "deny"
         assert_eq!(cats, vec![ActionCategory::CommandExec]);
 
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
-        assert!(state.needs_approval(ActionCategory::CommandExec));
+        assert!(state.needs_approval(None, ActionCategory::CommandExec));
     }
 
     #[test]
@@ -1469,14 +1812,14 @@ destructive = "deny"
         ] {
             let state = AutonomyState::new(level, ApprovalConfig::default());
             assert!(
-                state.needs_approval(ActionCategory::DisplayControl),
+                state.needs_approval(None, ActionCategory::DisplayControl),
                 "DisplayControl should need approval at {:?} when not granted",
                 level
             );
         }
         // Full autonomy auto-approves everything including DisplayControl
         let full = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
-        assert!(!full.needs_approval(ActionCategory::DisplayControl));
+        assert!(!full.needs_approval(None, ActionCategory::DisplayControl));
     }
 
     #[test]
@@ -1491,7 +1834,7 @@ destructive = "deny"
             let mut state = AutonomyState::new(level, ApprovalConfig::default());
             state.user_display_granted = true;
             assert!(
-                !state.needs_approval(ActionCategory::DisplayControl),
+                !state.needs_approval(None, ActionCategory::DisplayControl),
                 "DisplayControl should NOT need approval at {:?} when granted",
                 level
             );
@@ -1555,11 +1898,11 @@ destructive = "deny"
         // even though CommandExec's intendant-side default rule is Auto.
         let state = AutonomyState::new(AutonomyLevel::High, ApprovalConfig::default());
         assert_eq!(
-            state.external_approval_decision(ActionCategory::CommandExec),
+            state.external_approval_decision(None, ActionCategory::CommandExec),
             ExternalApprovalDecision::Ask
         );
         assert_eq!(
-            state.external_approval_decision(ActionCategory::FileWrite),
+            state.external_approval_decision(None, ActionCategory::FileWrite),
             ExternalApprovalDecision::Ask
         );
     }
@@ -1569,7 +1912,7 @@ destructive = "deny"
         for level in [AutonomyLevel::Low, AutonomyLevel::Medium] {
             let state = AutonomyState::new(level, ApprovalConfig::default());
             assert_eq!(
-                state.external_approval_decision(ActionCategory::CommandExec),
+                state.external_approval_decision(None, ActionCategory::CommandExec),
                 ExternalApprovalDecision::Ask,
                 "level {:?} should surface external command approvals",
                 level
@@ -1581,11 +1924,11 @@ destructive = "deny"
     fn external_approval_full_auto_approves() {
         let state = AutonomyState::new(AutonomyLevel::Full, ApprovalConfig::default());
         assert_eq!(
-            state.external_approval_decision(ActionCategory::CommandExec),
+            state.external_approval_decision(None, ActionCategory::CommandExec),
             ExternalApprovalDecision::AutoApprove
         );
         assert_eq!(
-            state.external_approval_decision(ActionCategory::FileWrite),
+            state.external_approval_decision(None, ActionCategory::FileWrite),
             ExternalApprovalDecision::AutoApprove
         );
     }
@@ -1596,7 +1939,7 @@ destructive = "deny"
         rules.command_exec = ApprovalRule::Deny;
         let state = AutonomyState::new(AutonomyLevel::High, rules);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::CommandExec),
+            state.external_approval_decision(None, ActionCategory::CommandExec),
             ExternalApprovalDecision::Reject
         );
     }
@@ -1606,7 +1949,7 @@ destructive = "deny"
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert_eq!(state.rules.tool_call, ApprovalRule::Ask);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::ToolCall),
+            state.external_approval_decision(None, ActionCategory::ToolCall),
             ExternalApprovalDecision::Ask
         );
 
@@ -1614,7 +1957,7 @@ destructive = "deny"
         rules.tool_call = ApprovalRule::Auto;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::ToolCall),
+            state.external_approval_decision(None, ActionCategory::ToolCall),
             ExternalApprovalDecision::AutoApprove
         );
     }
@@ -1626,7 +1969,7 @@ destructive = "deny"
         let state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
         assert_eq!(state.rules.command_exec, ApprovalRule::Auto);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::CommandExec),
+            state.external_approval_decision(None, ActionCategory::CommandExec),
             ExternalApprovalDecision::Ask
         );
     }
@@ -1637,7 +1980,7 @@ destructive = "deny"
         rules.tool_call = ApprovalRule::Deny;
         let state = AutonomyState::new(AutonomyLevel::Medium, rules);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::ToolCall),
+            state.external_approval_decision(None, ActionCategory::ToolCall),
             ExternalApprovalDecision::Reject
         );
     }
@@ -1649,8 +1992,216 @@ destructive = "deny"
         rules.command_exec = ApprovalRule::Deny;
         let state = AutonomyState::new(AutonomyLevel::Full, rules);
         assert_eq!(
-            state.external_approval_decision(ActionCategory::CommandExec),
+            state.external_approval_decision(None, ActionCategory::CommandExec),
             ExternalApprovalDecision::AutoApprove
         );
+    }
+
+    const ALL_CATEGORIES: [ActionCategory; 10] = [
+        ActionCategory::FileRead,
+        ActionCategory::FileWrite,
+        ActionCategory::FileDelete,
+        ActionCategory::CommandExec,
+        ActionCategory::NetworkRequest,
+        ActionCategory::Destructive,
+        ActionCategory::HumanInput,
+        ActionCategory::LiveAudioSpawn,
+        ActionCategory::DisplayControl,
+        ActionCategory::ToolCall,
+    ];
+
+    /// AD S1 pin: with no dial recorded, a session id resolves every
+    /// decision exactly like the `None` single-session shape — the
+    /// pre-dial behavior — at every level, for every category. The
+    /// untouched legacy suite above (now threading `None`) is the
+    /// substance; this formalizes the equivalence for real session ids.
+    #[test]
+    fn dial_less_sessions_behave_byte_identically() {
+        for level in [
+            AutonomyLevel::Low,
+            AutonomyLevel::Medium,
+            AutonomyLevel::High,
+            AutonomyLevel::Full,
+        ] {
+            let state = AutonomyState::new(level, ApprovalConfig::default());
+            for cat in ALL_CATEGORIES {
+                assert_eq!(
+                    state.needs_approval(Some("s-undialed"), cat),
+                    state.needs_approval(None, cat),
+                    "needs_approval must ignore an un-dialed session id ({level}, {cat})"
+                );
+                assert_eq!(
+                    state.external_approval_decision(Some("s-undialed"), cat),
+                    state.external_approval_decision(None, cat),
+                    "external decision must ignore an un-dialed session id ({level}, {cat})"
+                );
+            }
+            assert_eq!(
+                state.controller_tool_decision(Some("s-undialed")),
+                state.controller_tool_decision(None)
+            );
+            assert_eq!(state.effective_level(Some("s-undialed")), level);
+            assert_eq!(
+                state.effective_notify(Some("s-undialed")),
+                NotifyAppetite::Normal
+            );
+            assert_eq!(state.effective_ask(Some("s-undialed")), AskGrade::Escalate);
+        }
+    }
+
+    /// AD S1 pin: a LIVE global per-category deny is an absolute floor —
+    /// an owner-signed session override never loosens it, it binds
+    /// dial-bearing sessions the moment it is set (the owner's emergency
+    /// lever), and overrides may always tighten. (The documented
+    /// Full-bypasses-explicit-deny caveat is a LEVEL behavior inherited
+    /// unchanged — see `external_approval_full_overrides_deny` — and is
+    /// deliberately outside this rules-layer pin.)
+    #[test]
+    fn deny_floor_is_live_and_absolute() {
+        let mut state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        state.set_session_dial(
+            "s-a",
+            DialConfig {
+                approvals: Some(ApprovalOverrides {
+                    network: Some(ApprovalRule::Auto),
+                    destructive: Some(ApprovalRule::Deny),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        // The override loosens network for its session (owner-signed lane)…
+        assert_eq!(
+            state.effective_rule_for(Some("s-a"), ActionCategory::NetworkRequest),
+            ApprovalRule::Auto
+        );
+        // …and tightens destructive (always allowed), without touching
+        // any other session or the global layer.
+        assert_eq!(
+            state.effective_rule_for(Some("s-a"), ActionCategory::Destructive),
+            ApprovalRule::Deny
+        );
+        assert_eq!(
+            state.effective_rule_for(Some("s-b"), ActionCategory::NetworkRequest),
+            ApprovalRule::Auto
+        );
+        assert_eq!(
+            state.effective_rule_for(None, ActionCategory::Destructive),
+            ApprovalRule::Ask
+        );
+
+        // The owner sets a live global deny AFTER the dial was signed:
+        // it bites the overridden session immediately.
+        state.rules.network = ApprovalRule::Deny;
+        assert_eq!(
+            state.effective_rule_for(Some("s-a"), ActionCategory::NetworkRequest),
+            ApprovalRule::Deny,
+            "a live global deny is never loosened by a session override"
+        );
+        assert!(state.needs_approval(Some("s-a"), ActionCategory::NetworkRequest));
+        assert_eq!(
+            state.external_approval_decision(Some("s-a"), ActionCategory::NetworkRequest),
+            ExternalApprovalDecision::Reject
+        );
+        // The floor also composes into the shell capability rule.
+        assert_eq!(
+            state.effective_rule_for(Some("s-a"), ActionCategory::CommandExec),
+            ApprovalRule::Deny
+        );
+    }
+
+    /// AD S1: the sticky-override / live-global split. An overridden
+    /// level stays pinned while un-overridden knobs (and un-dialed
+    /// sessions) follow live global writes; the session-scoped
+    /// approve-all escalates exactly one session.
+    #[test]
+    fn overridden_level_is_sticky_while_global_stays_live() {
+        let mut state = AutonomyState::new(AutonomyLevel::Medium, ApprovalConfig::default());
+        state.set_session_dial(
+            "s-batch",
+            DialConfig {
+                autonomy: Some(AutonomyLevel::Full),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.effective_level(Some("s-batch")), AutonomyLevel::Full);
+        assert!(!state.needs_approval(Some("s-batch"), ActionCategory::CommandExec));
+
+        // A live global tighten reaches every un-overridden session…
+        state.level = AutonomyLevel::Low;
+        assert_eq!(state.effective_level(Some("s-other")), AutonomyLevel::Low);
+        assert_eq!(state.effective_level(None), AutonomyLevel::Low);
+        // …while the signed override stays pinned (priced in the AD
+        // ruling: the level lever for overridden sessions is stop/re-dial;
+        // the category deny floor still bites them live).
+        assert_eq!(state.effective_level(Some("s-batch")), AutonomyLevel::Full);
+
+        // The scoped approve-all escalates exactly one session and
+        // preserves that session's other knobs.
+        state.set_session_dial(
+            "s-card",
+            DialConfig {
+                notify: Some(NotifyAppetite::Quiet),
+                ..Default::default()
+            },
+        );
+        state.set_session_autonomy_full("s-card");
+        assert_eq!(state.effective_level(Some("s-card")), AutonomyLevel::Full);
+        assert_eq!(
+            state.effective_notify(Some("s-card")),
+            NotifyAppetite::Quiet
+        );
+        assert_eq!(state.level, AutonomyLevel::Low, "global level untouched");
+        assert_eq!(state.effective_level(Some("s-other")), AutonomyLevel::Low);
+    }
+
+    /// AD S1: the dial vocabulary is closed and typed — unknown words and
+    /// unknown knobs refuse at deserialization (JSON wire and the
+    /// `[dial]` TOML table alike); an empty dial is empty; recording an
+    /// empty dial is a no-op so absence and emptiness stay one state.
+    #[test]
+    fn dial_vocabulary_is_closed_and_typed() {
+        let dial: DialConfig = serde_json::from_value(serde_json::json!({
+            "autonomy": "full",
+            "ask": "checkpoint",
+            "approvals": { "network": "deny" },
+            "notify": "quiet",
+        }))
+        .unwrap();
+        assert_eq!(dial.autonomy, Some(AutonomyLevel::Full));
+        assert_eq!(dial.ask, Some(AskGrade::Checkpoint));
+        assert_eq!(dial.approvals.unwrap().network, Some(ApprovalRule::Deny));
+        assert_eq!(dial.notify, Some(NotifyAppetite::Quiet));
+
+        // TOML `[dial]` table speaks the same vocabulary.
+        let toml_dial: DialConfig =
+            toml::from_str("autonomy = \"high\"\nask = \"confer\"\n").unwrap();
+        assert_eq!(toml_dial.autonomy, Some(AutonomyLevel::High));
+        assert_eq!(toml_dial.ask, Some(AskGrade::Confer));
+
+        // Unknown words refuse…
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "autonomy": "yolo" }))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "ask": "sometimes" }))
+                .is_err()
+        );
+        // …and so do unknown knobs, at both nesting levels.
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "budget": "low" })).is_err()
+        );
+        assert!(serde_json::from_value::<DialConfig>(
+            serde_json::json!({ "approvals": { "human_input": "auto" } })
+        )
+        .is_err());
+
+        let mut state = AutonomyState::default();
+        assert!(DialConfig::default().is_empty());
+        state.set_session_dial("s-a", DialConfig::default());
+        assert!(state.session_dial(Some("s-a")).is_none());
+        assert!(state.session_dial(None).is_none());
     }
 }

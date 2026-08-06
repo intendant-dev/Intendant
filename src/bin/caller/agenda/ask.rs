@@ -246,6 +246,7 @@ mod tests {
 
     fn question(text: &str, header: &str) -> crate::types::UserQuestion {
         crate::types::UserQuestion {
+            consequence: String::new(),
             question: text.to_string(),
             header: header.to_string(),
             options: Vec::new(),

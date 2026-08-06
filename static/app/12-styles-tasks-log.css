@@ -3021,6 +3021,11 @@ a.vx-pr-row:focus-visible { outline: 2px solid var(--lavender); outline-offset: 
   color: var(--blue);
   margin-bottom: 6px;
 }
+.question-consequence {
+  font-size: 12px;
+  color: var(--peach, var(--yellow));
+  margin: -2px 0 6px;
+}
 .question-previews {
   display: grid;
   grid-template-columns: 1fr;

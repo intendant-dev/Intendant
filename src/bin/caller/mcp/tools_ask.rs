@@ -439,7 +439,7 @@ pub(crate) type BuiltAskQuestion = (crate::types::UserQuestion, Vec<DecodedPrevi
 /// cards. `at` prefixes error messages ("" for the flat form,
 /// "questions[N]: " for the multi form); `preview_budget` is the per-ask
 /// running byte total shared across questions.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors the per-question wire vocabulary
 fn build_one_ask_question(
     at: &str,
     question_text: &str,
@@ -450,6 +450,7 @@ fn build_one_ask_question(
     pick_min: Option<u8>,
     pick_max: Option<u8>,
     free_text: Option<bool>,
+    consequence: Option<&str>,
     preview_budget: &mut usize,
 ) -> Result<BuiltAskQuestion, String> {
     let question = question_text.trim();
@@ -533,6 +534,13 @@ fn build_one_ask_question(
         .filter(|h| !h.is_empty())
         .map(|h| crate::types::truncate_str(h, 64).to_string())
         .unwrap_or_default();
+    // Consequence-on-silence is one card line, not a body: cap it like a
+    // long option description rather than a question.
+    let consequence = consequence
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| crate::types::truncate_str(c, 500).to_string())
+        .unwrap_or_default();
     let previews =
         decode_ask_previews(preview_params, preview_budget).map_err(|e| format!("{at}{e}"))?;
     Ok((
@@ -545,6 +553,7 @@ fn build_one_ask_question(
             pick_max,
             free_text,
             previews: Vec::new(),
+            consequence,
         },
         previews,
     ))
@@ -577,6 +586,7 @@ pub(crate) fn build_ask_user_questions(
             params.pick_min,
             params.pick_max,
             params.free_text,
+            params.consequence.as_deref(),
             &mut preview_budget,
         )?;
         return Ok((vec![built], wait_seconds));
@@ -600,6 +610,7 @@ pub(crate) fn build_ask_user_questions(
             q.pick_min,
             q.pick_max,
             q.free_text,
+            q.consequence.as_deref(),
             &mut preview_budget,
         )?);
     }
@@ -623,6 +634,34 @@ fn park_actor(
         actor.kind = Some("agent_session".to_string());
     }
     actor
+}
+
+/// The notify dial's hard ceiling (AD S1, M6): `quiet` clamps every
+/// notification to Info — still delivered, only loudness changes; the
+/// caller names the downgrade in its tool response so under-delivery is
+/// never silent. `normal`/`eager` add no ceiling in S1 (eager's taught
+/// milestone appetite is S2 vocabulary).
+pub(crate) fn clamp_notify_urgency(
+    appetite: crate::autonomy::NotifyAppetite,
+    requested: crate::types::NotificationUrgency,
+) -> crate::types::NotificationUrgency {
+    match appetite {
+        crate::autonomy::NotifyAppetite::Quiet => crate::types::NotificationUrgency::Info,
+        crate::autonomy::NotifyAppetite::Normal | crate::autonomy::NotifyAppetite::Eager => {
+            requested
+        }
+    }
+}
+
+/// Parse the ask-level `expiry` (decision-contract) into the parked
+/// item's due instant — the same WHEN vocabulary agenda due dates speak
+/// ([`crate::ctl::parse_due_ms`]; one parser, two lanes).
+pub(crate) fn parse_ask_expiry(expiry: Option<&str>) -> Result<Option<u64>, String> {
+    expiry
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| crate::ctl::parse_due_ms(raw).map_err(|e| format!("expiry: {e}")))
+        .transpose()
 }
 
 /// Map `ask_user` parameters (flat or multi form) into the per-question
@@ -653,6 +692,7 @@ pub(crate) fn park_questions(params: &AskUserParams) -> Result<Vec<AskUserQuesti
         pick_min,
         pick_max,
         free_text: params.free_text,
+        consequence: params.consequence.clone(),
     }])
 }
 
@@ -808,7 +848,7 @@ fn with_item_id(mut result: serde_json::Value, item_id: &str) -> serde_json::Val
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. On a daemon with the durable agenda (the default daemon shape), a timed-out or abandoned question does NOT evaporate: it stays open on the agenda — the result carries its item_id — and a later answer is delivered back into this session as a user message at a turn boundary. Set park: true to skip blocking entirely: the question files as a durable agenda item and {status:\"parked\", item_id, ask_id} returns immediately (don't combine with wait_seconds); the reply lands on the item and is delivered the same way. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. On a daemon with the durable agenda (the default daemon shape), a timed-out or abandoned question does NOT evaporate: it stays open on the agenda — the result carries its item_id — and a later answer is delivered back into this session as a user message at a turn boundary. Set park: true to skip blocking entirely: the question files as a durable agenda item and {status:\"parked\", item_id, ask_id} returns immediately (don't combine with wait_seconds); the reply lands on the item and is delivered the same way. The decision contract for owner asks: mark your committed recommendation by appending \" (Recommended)\" to that option's label, set consequence (per question) to what you will do — or what happens — if it lapses unanswered, and set expiry (\"+2h\", \"+3d\", RFC3339) to when silence starts to mean the consequence; on a park the expiry becomes the item's due date. Expiry is advisory — the question stays OPEN past it. Use park before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -893,9 +933,10 @@ impl IntendantServer {
                 );
             };
             let questions = park_questions(&params)?;
+            let due_ms = parse_ask_expiry(params.expiry.as_deref())?;
             let item = agenda
                 .apply(
-                    crate::agenda::AgendaCommand::ask(questions),
+                    crate::agenda::AgendaCommand::ask_with_due(questions, due_ms),
                     Some(park_actor(actor, &session_id)),
                 )
                 .map_err(|e| e.to_string())?;
@@ -1208,8 +1249,9 @@ impl IntendantServer {
         actor: &crate::access::actor::ActorBinding,
     ) -> Result<serde_json::Value, String> {
         let park = park_questions(params)?;
+        let due_ms = parse_ask_expiry(params.expiry.as_deref())?;
         let item = agenda
-            .park_ask_for_waiter(park, Some(park_actor(actor, &session_id)))
+            .park_ask_for_waiter(park, due_ms, Some(park_actor(actor, &session_id)))
             .map_err(|e| e.to_string())?;
         let ask = item
             .ask
@@ -1442,6 +1484,18 @@ impl IntendantServer {
             );
         };
 
+        // The session's notify dial (Track AD S1): `quiet` is a hard
+        // ceiling at info — the notification is still delivered and still
+        // lands in the transcript, only its loudness changes, and the
+        // downgrade is NAMED in the tool response so under-delivery is
+        // never silent. `normal`/`eager` add no ceiling in S1.
+        let requested_urgency = urgency;
+        let urgency = {
+            let autonomy = self.state.read().await.autonomy.clone();
+            let appetite = autonomy.read().await.effective_notify(Some(&session_id));
+            clamp_notify_urgency(appetite, requested_urgency)
+        };
+
         let id = format!("notif-{}", Uuid::new_v4().simple());
         self.bus.send(AppEvent::UserNotification {
             session_id: Some(session_id.clone()),
@@ -1452,12 +1506,21 @@ impl IntendantServer {
             ts: now_unix_ms(),
         });
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "sent",
             "id": id,
             "session_id": session_id,
             "urgency": urgency.as_str(),
-        }))
+        });
+        if urgency != requested_urgency {
+            result["requested_urgency"] =
+                serde_json::Value::String(requested_urgency.as_str().to_string());
+            result["note"] = serde_json::Value::String(format!(
+                "urgency clamped to {} by this session's notify dial (quiet)",
+                urgency.as_str()
+            ));
+        }
+        Ok(result)
     }
 }
 
@@ -1465,6 +1528,48 @@ impl IntendantServer {
 mod tests {
     use super::*;
     use crate::types::NotificationUrgency;
+
+    /// AD S1 pin half (the ceiling itself; the response-naming half lives
+    /// in `mcp::tests::notify_quiet_clamps_urgent_to_info`): quiet clamps
+    /// every request to info; normal and eager pass requests through.
+    #[test]
+    fn quiet_appetite_clamps_every_urgency_to_info() {
+        use crate::autonomy::NotifyAppetite;
+        for requested in [
+            NotificationUrgency::Info,
+            NotificationUrgency::Attention,
+            NotificationUrgency::Urgent,
+        ] {
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Quiet, requested),
+                NotificationUrgency::Info
+            );
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Normal, requested),
+                requested
+            );
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Eager, requested),
+                requested
+            );
+        }
+    }
+
+    /// The decision contract's expiry speaks the agenda due vocabulary —
+    /// one parser, two lanes — and refuses garbage by name.
+    #[test]
+    fn ask_expiry_parses_the_due_vocabulary() {
+        assert_eq!(parse_ask_expiry(None).unwrap(), None);
+        assert_eq!(parse_ask_expiry(Some("   ")).unwrap(), None);
+        let now = now_unix_ms();
+        let due = parse_ask_expiry(Some("+2h")).unwrap().unwrap();
+        assert!(
+            due > now + 110 * 60 * 1000 && due < now + 130 * 60 * 1000,
+            "+2h lands ~two hours out (got {due}, now {now})"
+        );
+        let err = parse_ask_expiry(Some("whenever")).unwrap_err();
+        assert!(err.starts_with("expiry: "), "named refusal: {err}");
+    }
 
     /// Hold suspends the deadline; resume re-arms it with exactly the time
     /// that remained at the moment of the hold — however long the hold
@@ -1525,6 +1630,7 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
         }
     }
 
@@ -1616,6 +1722,7 @@ mod tests {
     fn user_question_pick_bounds_derivation() {
         // Legacy default: exactly one.
         let mut q = crate::types::UserQuestion {
+            consequence: String::new(),
             question: "q".into(),
             header: String::new(),
             options: vec![],
@@ -1677,6 +1784,7 @@ mod tests {
     fn ask_result_followups_and_annotations_ride_their_questions() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which lineage?".into(),
                 header: "Lineage".into(),
                 options: vec![],
@@ -1687,6 +1795,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which headers?".into(),
                 header: "Headers".into(),
                 options: vec![],
@@ -1738,6 +1847,7 @@ mod tests {
     fn ask_result_carries_per_question_breakdown() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which lineage?".into(),
                 header: "Lineage".into(),
                 options: vec![],
@@ -1748,6 +1858,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which headers?".into(),
                 header: "Headers".into(),
                 options: vec![],
@@ -1809,10 +1920,12 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
             questions: vec![],
             wait_seconds: None,
             park: false,
             session_id: None,
+            expiry: None,
         }
     }
 
@@ -2046,6 +2159,7 @@ mod tests {
     #[test]
     fn question_preview_wire_shape_is_pinned() {
         let question = crate::types::UserQuestion {
+            consequence: String::new(),
             question: "Which?".into(),
             header: String::new(),
             options: Vec::new(),
@@ -2093,6 +2207,7 @@ mod tests {
         // older dashboards and the state-line replay cache see the exact
         // pre-preview wire shape.
         let bare = crate::types::UserQuestion {
+            consequence: String::new(),
             previews: Vec::new(),
             ..question
         };

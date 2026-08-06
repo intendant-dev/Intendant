@@ -74,6 +74,7 @@ mod mcp;
 mod mcp_client;
 mod memory;
 mod message_search;
+mod native_wakeup;
 mod openai_chatgpt_auth;
 mod peer;
 mod peer_file_transfer;
@@ -1404,14 +1405,19 @@ async fn start_external_display_recordings(
 /// controller-dispatched tool calls), applied identically by every surface
 /// (JSON stdin, web, MCP): Approve records the action's dedup source —
 /// scoped to `session_id` and content-aware for content-bearing actions
-/// (see `autonomy::batch_dedup_source`) — ApproveAll raises global
-/// autonomy to Full, DisplayControl grants user display access.
+/// (see `autonomy::batch_dedup_source`) — ApproveAll escalates autonomy to
+/// Full for exactly the card's session (its dial override; the owner's
+/// ratified session-scoped approve-all — daemon-wide Full moves only
+/// through Settings/`ctl settings autonomy`/`SetAutonomy`), and
+/// DisplayControl grants user display access. `session_id: None` — the
+/// single-session shapes sharing the `""` dedup bucket — keeps the global
+/// raise: those shapes ARE the whole daemon, and a pseudo-session there
+/// would lie.
 ///
 /// External-agent approvals deliberately do NOT route here: their
 /// "Approve all" is Intendant-enforced per external session
-/// (`approve_all_session` in the agent event loop) instead of flipping
-/// global autonomy — a button on one Codex/Claude/Kimi/Pi session must not
-/// escalate every other surface of the daemon.
+/// (`approve_all_session` in the agent event loop) — the same
+/// one-session blast radius this arm now gives native cards.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
     cat: autonomy::ActionCategory,
@@ -1423,7 +1429,10 @@ async fn apply_user_approval(
     let mut state = autonomy.write().await;
     match response {
         event::ApprovalResponse::Approve => state.record_approved_command(session_id, dedup_source),
-        event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
+        event::ApprovalResponse::ApproveAll => match session_id {
+            Some(session) => state.set_session_autonomy_full(session),
+            None => state.level = AutonomyLevel::Full,
+        },
         // Answer resolves question prompts; it grants nothing.
         event::ApprovalResponse::Skip
         | event::ApprovalResponse::Deny
@@ -1481,6 +1490,61 @@ fn format_command_preview(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AD S1 pin (M4, the ratified session-scoped approve-all): ApproveAll
+    /// on a card that carries a session id escalates exactly that
+    /// session's dial to Full — the global level and every other session
+    /// are untouched — while the `None` single-session shapes keep the
+    /// global raise (they ARE the whole daemon). The dedup bucket and the
+    /// display grant stay out of the dial entirely.
+    #[tokio::test]
+    async fn approve_all_scopes_to_the_card_session() {
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let bus = EventBus::new();
+
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            Some("s-card"),
+            "exec: cargo test",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        {
+            let state = autonomy.read().await;
+            assert_eq!(
+                state.level,
+                AutonomyLevel::Medium,
+                "the card's approve-all must not raise the daemon-wide level"
+            );
+            assert_eq!(state.effective_level(Some("s-card")), AutonomyLevel::Full);
+            assert_eq!(
+                state.effective_level(Some("s-other")),
+                AutonomyLevel::Medium,
+                "other sessions keep their effective level"
+            );
+            assert!(!state.needs_approval(Some("s-card"), autonomy::ActionCategory::CommandExec));
+            assert!(
+                state.approved_commands.is_empty(),
+                "approve-all is a level grant, not a dedup record"
+            );
+            assert!(!state.user_display_granted);
+        }
+
+        // The legacy single-session shapes (no session id) are the whole
+        // daemon: they keep the global raise.
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            None,
+            "exec: cargo test",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+    }
 
     /// The accessible-display memo must stop being trusted the moment the
     /// memoized X display's socket disappears (another session's XvfbGuard
@@ -2460,7 +2524,8 @@ Also: {"source": "bare"}"#;
         }
         assert!(saw_grant, "UserDisplayGranted must be announced");
 
-        // Approve-all escalates autonomy for the rest of the session.
+        // Approve-all escalates autonomy for the rest of THIS session —
+        // its dial override; the daemon-wide level stays put (AD S1 M4).
         apply_user_approval(
             event::ApprovalResponse::ApproveAll,
             autonomy::ActionCategory::CommandExec,
@@ -2470,7 +2535,11 @@ Also: {"source": "bare"}"#;
             &bus,
         )
         .await;
-        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+        {
+            let state = autonomy.read().await;
+            assert_eq!(state.level, AutonomyLevel::Medium);
+            assert_eq!(state.effective_level(Some("sess-1")), AutonomyLevel::Full);
+        }
 
         // Deny and skip carry no side effects.
         apply_user_approval(

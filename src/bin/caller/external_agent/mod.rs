@@ -1372,6 +1372,17 @@ pub enum AgentEvent {
     ConfigFacts {
         facts: crate::types::SessionConfigVitals,
     },
+    /// The adapter's statement of the session's pending native scheduled
+    /// wakeup (Claude Code's harness `ScheduleWakeup` timer), shaped as
+    /// the durable marker: `Some` on an observed arm or the adapter-level
+    /// takeover of an orphaned record, `None` when the model stopped its
+    /// loop (`stop: true`). Drains mirror it into
+    /// `SessionMeta::native_wakeup` — the marker the respawn seams, the
+    /// exit backstop, and the boot pass adjudicate. Ambient bookkeeping —
+    /// implies no turn.
+    NativeWakeupMarker {
+        marker: Option<crate::session_log::SessionNativeWakeupMeta>,
+    },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
     /// Latest external-agent goal state for a thread.

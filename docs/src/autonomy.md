@@ -1,8 +1,11 @@
 # Autonomy & Approvals
 
 Autonomy controls which actions require human approval
-(`crates/intendant-core/src/autonomy.rs`). It layers three mechanisms, enforced
-in the agent loop and surfaced identically by every frontend.
+(`crates/intendant-core/src/autonomy.rs`). Policy resolves across **two
+layers** — the live **global dial** (level + per-category rules, Layers 1–2
+below) and an optional owner-signed **per-session dial override** (Track AD)
+— then surfaces per-action approvals (Layer 3) identically on every
+frontend.
 
 > **Frontends are display-only clients of the control plane.** They render
 > state and emit [`ControlMsg`](./integrations.md) values onto the `EventBus`;
@@ -39,6 +42,62 @@ None of these rules bypasses the human-input/live-audio hard gates or the
 separate user-display grant. External-agent requests take a separate path,
 described below.
 
+## The session dial — per-session overrides (Track AD)
+
+The global layers above back every session of a daemon. A **session dial**
+(`DialConfig`) scopes them per session: four optional knobs, each a closed
+typed vocabulary that refuses unknown words at deserialization —
+
+| Knob | Values | S1 enforcement |
+|---|---|---|
+| `autonomy` | `low` / `medium` / `high` / `full` | Hard — the session's effective level at every decision point |
+| `approvals` | per-category `auto` / `ask` / `deny` (the `ApprovalConfig` field names) | Hard — per-category most-specific-present under the deny floor |
+| `notify` | `quiet` / `normal` / `eager` | Hard — `quiet` clamps `notify_user` to info (the downgrade is named in the tool response); owner delivery policy (quiet hours, reminder levels, nudge pacing) stays owner-side |
+| `ask` | `autopilot` / `escalate` / `checkpoint` / `confer` | Recorded and carried; the per-grade taught posture ships in the next slice — the ask knob is not live until then |
+
+**Carrier and signature.** The dial rides `AgentLaunchConfig` — the same
+one-shot launch vocabulary `CreateSession`, `StartTask`, and the agenda
+manifest's `agent_config` block speak — so every override layer is
+**owner-signed**: an approved manifest carries it digest-covered (adding a
+dial revises the digest; a dial-less config serializes byte-identically, so
+existing approvals stand), and a direct create is the owner's own gesture
+(`ctl agenda schedule/start --dial-autonomy/--dial-ask/--dial-notify/
+--dial-approve CATEGORY=RULE`). Hosted-control callers can set no dial: a
+dial-bearing config is non-empty at the action wall and refused fail-closed.
+Supervised agent sessions can write no dial — their `set_autonomy` remains
+refused, and agent-session approval resolution is scope-denied — and
+sub-agent spawns carry none.
+
+**Resolution: sticky overrides, live global, absolute deny floor.** At
+decision time exactly two layers are consulted. Overridden knobs are pinned
+for the session's life (mid-session re-dial is deliberately not vocabulary);
+un-overridden knobs read the **live** global layer, so `SetAutonomy` /
+`SetApprovalRule` keep governing everything without a dial. One exception in
+each direction, both deliberate:
+
+- **The deny floor is live and absolute.** A global per-category `deny`,
+  read at decision time, binds every session — dial-bearing ones included.
+  An override never loosens a live deny; scoped layers may always tighten.
+  This is the owner's emergency lever: setting a category to `deny` bites
+  running overridden sessions immediately.
+- **A live global *level* tighten does not bite an overridden level** (the
+  priced trade: global-Medium plus one owner-approved Full batch session is
+  a designed use). The recourse for an overridden session is stop — or the
+  category deny floor, which always reaches it.
+
+**Durability.** The dial is recorded at spawn in the session's
+`session_agent_config.json` overlay (native sessions persist a dial-only
+overlay) and re-attached from it when the session is resumed — the lane
+boot-readopt rides. An overlay that exists but cannot be read falls back to
+the pure-global layer with a log line naming the session, never a guessed
+override. Forks never inherit the parent's dial; restarts continuing a
+lineage keep it. The in-memory grant minted by a session-scoped approve-all
+(below) lapses at daemon restart, exactly like the pre-dial global Full.
+
+**Unchanged at every scope:** the `HumanInput` / `LiveAudioSpawn` hard
+gates, the display-request rail, the user-display grant (a daemon-wide
+flag, not dial vocabulary), and question ≠ permission.
+
 `CommandExec` is capability-composed rather than parser-composed. Its effective
 rule is the strictest of `command_exec`, `file_read`, `file_write`,
 `file_delete`, `network`, `destructive`, and `display_control` (`deny` >
@@ -52,11 +111,12 @@ auto-allow arbitrary shell execution, every reachable category must permit it.
 When a native approval is required, the agent loop pauses and the frontends
 surface the command preview and category — the dashboard shows an approval
 card, and MCP / `intendant ctl` expose the same choices
-([MCP Server](./mcp-server.md)): approve, skip (continue with the next command),
-approve-all (which also flips native autonomy to Full), or deny (and stop).
-External-agent approval cards use the same verbs, but their approve-all is
-session-scoped and does not change native autonomy; the scope table below
-spells out that asymmetry.
+([MCP Server](./mcp-server.md)): approve, skip (continue with the next
+command), approve-all — which escalates **that session** to Full autonomy
+via its dial override ("Approve all for this session"; daemon-wide Full
+moves only through Settings / `ctl settings autonomy`) — or deny (and
+stop). External-agent approval cards use the same verbs with the same
+one-session blast radius; the scope table below spells out the details.
 
 A pending request does not depend on someone happening to look at a
 dashboard: an open-but-hidden tab badges its title/favicon with the pending
@@ -87,7 +147,15 @@ attention chain) without being approvals:
   sandboxed opaque-origin iframe, raster images, or inline text snippets;
   blob kinds live in the session upload store and travel as references
   (see the `ask_user` row in the MCP chapter and `intendant ctl ask
-  --help` for caps and flags).
+  --help` for caps and flags). Owner asks additionally speak the
+  **decision contract**: options with the committed recommendation marked
+  by the `" (Recommended)"` label suffix, a per-question
+  **consequence-on-silence** ("If unanswered: …", rendered on the card),
+  and an **expiry** that lands as the parked item's due date — advisory
+  (the question stays open past it; timeout is not expiry), naming when
+  silence starts to mean the consequence. One ask shape throughout: these
+  are typed fields on the same structured-ask vocabulary, never a second
+  kind of question.
 - **Notifications** (`notify_user`) request *nothing*: fire-and-forget,
   display-only, never blocking. `urgency` picks the delivery escalation —
   `info` renders a dashboard toast plus a transcript row; `attention` also
@@ -115,7 +183,12 @@ auto-retried.
 
 ## How `needs_approval` actually resolves
 
-The precise logic (`AutonomyState::needs_approval`) has nuances worth knowing:
+The precise logic (`AutonomyState::needs_approval`) has nuances worth
+knowing. Every decision function is session-aware: "the level" and "the
+rules" below mean the session's **effective** ones — its dial override
+where signed, the live global layer everywhere else, with the live deny
+floor absolute (`effective_level` / `effective_rules`); sessions without a
+dial resolve to pure global, byte-identically to the pre-dial behavior.
 
 - **Always ask, regardless of level:** `HumanInput` and `LiveAudioSpawn` — these
   always require a human even at Full.
@@ -143,7 +216,7 @@ not re-prompt. Two properties bound that memory:
 - **Per session.** One autonomy state backs every native session of a daemon,
   but remembered approvals are bucketed by session id — an approval in one
   session never silences a prompt in another. (The approve-all **level**
-  escalation stays daemon-wide by design; see the table below.)
+  escalation is likewise session-scoped via the dial; see the table below.)
 - **Content-aware.** The dedup source is not the display preview. For
   `writeFile`/`editFile` it includes a digest of the full command (minus the
   per-call `nonce`), so approving one edit of a path never covers different
@@ -198,12 +271,14 @@ shown at Medium unless the owner opts into auto.
 At Full, the current implementation returns `AutoApprove` **before** reading
 the category rule, so an external approval request bypasses an explicit
 `deny`; the `external_approval_full_overrides_deny` test codifies that
-precedence. Separately, the external event drain consults its per-session
-approve-all flag before the current policy decision, so a category changed to
-`deny` after that grant is also auto-approved for the remainder of the
-session. External-agent denials are therefore not absolute under those two
-conditions. This differs from the native runtime/controller path and is a
-current implementation caveat, not an authority guarantee.
+precedence. A per-session dial at `autonomy = "full"` inherits the same
+caveat inside exactly that session. Separately, the external event drain
+consults its per-session approve-all flag before the current policy
+decision, so a category changed to `deny` after that grant is also
+auto-approved for the remainder of the session. External-agent denials are
+therefore not absolute under those two conditions. This differs from the
+native runtime/controller path and is a current implementation caveat, not
+an authority guarantee.
 
 ## Action classification
 
@@ -366,16 +441,18 @@ blast radii. What each one actually grants:
 
 | Surface | What "approve all" does | Scope | Lifetime |
 |---|---|---|---|
-| Native runtime approvals | Sets the autonomy level to **Full** (`apply_user_approval`) | **Daemon-wide for native sessions** — one shared autonomy state backs every native session | In-memory: until lowered again (autonomy control or restart, which returns to the configured level) |
+| Native session approvals | Escalates the card's session to **Full** via its dial override (`apply_user_approval` → `set_session_autonomy_full`); the daemon-wide level and every other session are untouched. Daemon-wide Full moves only through Settings / `ctl settings autonomy` / `SetAutonomy` | **That one native session** | In-memory: until the session ends or the daemon restarts (a restart re-attaches only spawn-signed dials, not this grant) |
+| Native single-session shapes (no session id — headless JSON stdin, standalone stdio MCP) | Sets the autonomy level to **Full** — those shapes ARE the whole daemon, so a pseudo-session scope would lie | Daemon-wide (= the one session) | In-memory: until lowered again or restart |
 | External agents (Codex / Claude Code / Kimi Code / Pi) | Auto-approves that backend's subsequent approval requests (`approve_all_session`) | **That one external session only** — deliberately never touches native autonomy | The external session's lifetime |
 | Live audio | Does not exist. Every live-audio spawn requires its own explicit human approval; with no approver surface the spawn is denied outright | Per spawn | One consent per spawn |
 | Questions (`ask_user` and kin) | Nothing. Questions are not permissions: no level or approve-all grant answers one, and an `Answer` aimed at a command approval fails closed (denied) | — | — |
 | Display requests (`user_session` rail) | Nothing. The rail lives outside the approval id space; approve/approve-all can never mint a display grant there. (Approving a **DisplayControl-category runtime action** is different: the first such approval grants agent-visible user-display access session-wide — that approval *is* the opt-in) | Rail: per request | Grant durations are the rail's own (this session / 15 min / until revoked) |
 
-The asymmetry between the first two rows is intentional: a native
-approve-all is the operator saying "run autonomously" to *their daemon*,
-while a button on one supervised Codex/Claude/Kimi/Pi session must not escalate
-every other surface of the daemon.
+The native and external rows now share the same one-session blast radius —
+the owner-ratified completion of what the external lane always did
+deliberately: a button on one session's card must not escalate every other
+surface of the daemon. "Run the whole daemon autonomously" remains a
+Settings-level act.
 
 Pi's private supervision extension lets its read-only `read`/`grep`/`find`/`ls`
 built-ins proceed unless they target Pi's credential/config home. Every

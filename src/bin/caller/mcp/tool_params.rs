@@ -340,6 +340,12 @@ pub struct AskUserParams {
     /// Whether a typed free-text answer is accepted (default true).
     #[serde(default)]
     pub free_text: Option<bool>,
+    /// Consequence-on-silence (the decision contract): what you will do —
+    /// or what happens — if this question lapses unanswered. Rendered on
+    /// the question card so the owner sees the cost of silence; pairs
+    /// with a committed recommendation in the options ("… (Recommended)").
+    #[serde(default)]
+    pub consequence: Option<String>,
     /// Multi-question form: up to 4 questions in one ask, each with its
     /// own options, previews, and pick bounds — the user answers them on
     /// one panel and every answer returns together. Mutually exclusive
@@ -359,6 +365,15 @@ pub struct AskUserParams {
     /// wait_seconds.
     #[serde(default)]
     pub park: bool,
+    /// Expiry (the decision contract): when the decision window closes and
+    /// the consequence-on-silence takes effect. Same vocabulary as agenda
+    /// due dates ("2h", "tomorrow 9am", RFC3339); lands as the created
+    /// agenda item's due date, so it renders as the item's due chip and
+    /// rides reminder policy. Advisory — a lapsed question stays OPEN
+    /// (timeout is not expiry); this names when silence starts to mean
+    /// the consequence.
+    #[serde(default)]
+    pub expiry: Option<String>,
     /// Optional target session id. Omit to ask as the calling session.
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
@@ -391,6 +406,10 @@ pub struct AskUserQuestionParams {
     /// Whether a typed free-text answer is accepted (default true).
     #[serde(default)]
     pub free_text: Option<bool>,
+    /// Consequence-on-silence for THIS question (see the flat form's
+    /// `consequence`).
+    #[serde(default)]
+    pub consequence: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

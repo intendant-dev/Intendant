@@ -1298,6 +1298,12 @@ pub(crate) fn effective_session_agent_config_from_project(
         if overrides.kimi_fork_expected_horizon.is_some() {
             config.kimi_fork_expected_horizon = overrides.kimi_fork_expected_horizon.clone();
         }
+        // The dial is a per-session owner-signed fact, never derivable
+        // from the project; dropping it here would silently shed the
+        // override layer across a resume rewrite.
+        if overrides.dial.is_some() {
+            config.dial = overrides.dial.clone();
+        }
     }
     config
 }
