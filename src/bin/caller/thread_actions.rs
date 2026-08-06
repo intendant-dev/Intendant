@@ -4603,12 +4603,15 @@ pub(crate) fn handle_idle_codex_subagent_event(
         external_agent::AgentEvent::GoalCleared => {
             emit_external_session_goal(config, Some(child_thread_id), None);
         }
+        // NativeWakeupMarker is emitted for the main thread only — a
+        // child-scoped copy would be an adapter bug, never marker truth.
         external_agent::AgentEvent::PlanUpdate { .. }
         | external_agent::AgentEvent::ApprovalRequest { .. }
         | external_agent::AgentEvent::FileApprovalRequest { .. }
         | external_agent::AgentEvent::UserQuestionRequest { .. }
         | external_agent::AgentEvent::DiffUpdated { .. }
         | external_agent::AgentEvent::Terminated { .. }
+        | external_agent::AgentEvent::NativeWakeupMarker { .. }
         | external_agent::AgentEvent::Scoped { .. } => {}
     }
 }

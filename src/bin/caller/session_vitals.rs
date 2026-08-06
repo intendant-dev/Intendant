@@ -3201,6 +3201,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         let meta_path = dir.join("session_meta.json");
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
