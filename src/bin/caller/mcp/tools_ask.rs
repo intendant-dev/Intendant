@@ -439,7 +439,6 @@ pub(crate) type BuiltAskQuestion = (crate::types::UserQuestion, Vec<DecodedPrevi
 /// cards. `at` prefixes error messages ("" for the flat form,
 /// "questions[N]: " for the multi form); `preview_budget` is the per-ask
 /// running byte total shared across questions.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)] // mirrors the per-question wire vocabulary
 fn build_one_ask_question(
     at: &str,

@@ -802,7 +802,6 @@ impl SessionSupervisor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     /// Re-attach a session's durable dial override (Track AD S1) from its
     /// log-dir overlay onto the live autonomy state — the resume /
     /// boot-readopt half of the override layer's durability. Fail-closed
@@ -834,6 +833,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn resume_session(
         &self,
         source: String,

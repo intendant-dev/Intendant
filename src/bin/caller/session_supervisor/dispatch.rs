@@ -2454,35 +2454,44 @@ mod tests {
         );
 
         // A daemon restart loses the in-memory layer but not the overlay.
-        supervisor
+        // The honest restart shape is a FRESH supervisor over the SAME
+        // logs home (empty registry, default autonomy state) — the shape
+        // boot-readopt's ResumeSession lands on.
+        let home = supervisor
             .config
-            .autonomy
-            .write()
-            .await
-            .session_dials
-            .clear();
-        supervisor
-            .handle_control_msg(event::ControlMsg::ResumeSession {
-                source: "claude-code".to_string(),
-                session_id: session_id.clone(),
-                resume_id: None,
-                project_root: None,
-                task: None,
-                direct: None,
-                attachments: vec![],
-                fork: false,
-                relationship_kind: None,
-                auto_attach: false,
-                agent_command: Some(UNSPAWNABLE.to_string()),
-                codex_sandbox: None,
-                codex_approval_policy: None,
-                codex_managed_context: None,
-                codex_context_archive: None,
-            })
-            .await;
+            .logs_home_override
+            .clone()
+            .expect("test supervisor has a hermetic logs home");
+        let restarted_supervisor = |home: std::path::PathBuf| {
+            let mut config = (*test_supervisor(project_dir.path().to_path_buf(), EventBus::new())
+                .config)
+                .clone();
+            config.logs_home_override = Some(home);
+            SessionSupervisor::new(config)
+        };
+        let resume_msg = || event::ControlMsg::ResumeSession {
+            source: "claude-code".to_string(),
+            session_id: session_id.clone(),
+            resume_id: None,
+            project_root: None,
+            task: None,
+            direct: None,
+            attachments: vec![],
+            fork: false,
+            relationship_kind: None,
+            auto_attach: false,
+            agent_command: Some(UNSPAWNABLE.to_string()),
+            codex_sandbox: None,
+            codex_approval_policy: None,
+            codex_managed_context: None,
+            codex_context_archive: None,
+        };
+
+        let restarted = restarted_supervisor(home.clone());
+        restarted.handle_control_msg(resume_msg()).await;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if supervisor
+            if restarted
                 .config
                 .autonomy
                 .read()
@@ -2499,7 +2508,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(
-            supervisor
+            restarted
                 .config
                 .autonomy
                 .read()
@@ -2510,46 +2519,35 @@ mod tests {
         );
 
         // The unrecoverable case: a corrupt overlay falls back to
-        // pure-global by name — no guessed override.
-        let home = supervisor
-            .config
-            .logs_home_override
-            .clone()
-            .expect("test supervisor has a hermetic logs home");
+        // pure-global by name — no guessed override. Another fresh
+        // restart over the same home, now with unreadable bytes.
         let overlay = crate::platform::intendant_home_in(&home)
             .join("logs")
             .join(&session_id)
             .join(crate::session_config::SESSION_AGENT_CONFIG_FILE);
         std::fs::write(&overlay, b"{ not json").unwrap();
-        supervisor
-            .config
-            .autonomy
-            .write()
-            .await
-            .session_dials
-            .clear();
-        supervisor
-            .handle_control_msg(event::ControlMsg::ResumeSession {
-                source: "claude-code".to_string(),
-                session_id: session_id.clone(),
-                resume_id: None,
-                project_root: None,
-                task: None,
-                direct: None,
-                attachments: vec![],
-                fork: false,
-                relationship_kind: None,
-                auto_attach: false,
-                agent_command: Some(UNSPAWNABLE.to_string()),
-                codex_sandbox: None,
-                codex_approval_policy: None,
-                codex_managed_context: None,
-                codex_context_archive: None,
-            })
-            .await;
-        // The resume completed without minting any override: global layer only.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let autonomy = supervisor.config.autonomy.read().await;
+        let restarted_again = restarted_supervisor(home.clone());
+        restarted_again.handle_control_msg(resume_msg()).await;
+        // Completion marker (non-vacuous negative): the resume rewrites
+        // the overlay with the effective config before spawning, so wait
+        // until the corrupt bytes were replaced by valid JSON, then
+        // assert no override was guessed — pure-global only.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let healed = std::fs::read_to_string(&overlay)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some();
+            if healed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the corrupt-overlay resume never completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let autonomy = restarted_again.config.autonomy.read().await;
         assert!(
             autonomy.session_dials.is_empty(),
             "an unreadable overlay must fall back to pure-global, never a guess"

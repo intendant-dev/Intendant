@@ -1563,6 +1563,9 @@ impl AgendaCommand {
     /// Questions-only ask park — the rail waiter's and `ctl ask --park`'s
     /// historic shape: no body/tags/due/source (those are the decision-card
     /// park fields the CLI/op lanes fill explicitly).
+    /// Test convenience: every production park now states its due
+    /// explicitly through [`Self::ask_with_due`].
+    #[cfg(test)]
     pub(crate) fn ask(questions: Vec<crate::mcp::AskUserQuestionParams>) -> Self {
         Self::ask_with_due(questions, None)
     }
