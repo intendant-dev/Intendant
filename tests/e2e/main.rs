@@ -10114,7 +10114,8 @@ async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() 
         RUN_TIMEOUT,
         || async {
             let logs = daemon.rig.session_logs();
-            logs.contains("Reload-credentials requested mid-turn").then_some(())
+            logs.contains("Reload-credentials requested mid-turn")
+                .then_some(())
         },
         || tail(&daemon.rig.session_logs(), 4000),
     )
