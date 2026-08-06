@@ -1083,9 +1083,7 @@ fn drain_holdout_rows(
     let mut rows: Vec<crate::handover::DrainHoldout> = holding
         .iter()
         .map(|(session_id, source, name, phase, session_dir)| {
-            let meta = std::fs::read_to_string(session_dir.join("session_meta.json"))
-                .ok()
-                .and_then(|raw| serde_json::from_str::<session_log::SessionMeta>(&raw).ok());
+            let meta = session_log::read_session_meta(session_dir);
             let (limit_park, bg_park) = meta
                 .map(|meta| (meta.limit_park, meta.bg_park))
                 .unwrap_or((None, None));
@@ -1190,6 +1188,46 @@ mod tests {
             .filter(|(phase, died)| session_holds_drain(phase, *died))
             .count();
         assert_eq!(holding, 2);
+    }
+
+    /// The seat-conclude terminal drops the row from the drain wait set
+    /// (respawn-after-close card 01KZ0PRYE7…): an idle external row
+    /// holds a drain; the conclude's `TaskComplete` success terminal
+    /// flips its phase to `done`, which `session_holds_drain` releases —
+    /// and the loop exit's `finish_session` then removes the row
+    /// entirely (pinned elsewhere). This is the wait-set half of the
+    /// terminal-goodbye acceptance.
+    #[tokio::test]
+    async fn seat_conclude_terminal_releases_the_drain_hold() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert("seat".to_string(), managed_session("seat", "claude-code"));
+        }
+        let phase_of = |state: &SupervisorState| state.sessions.get("seat").unwrap().phase.clone();
+        {
+            let state = supervisor.state.lock().await;
+            assert!(
+                session_holds_drain(&phase_of(&state), false),
+                "an idle external row holds the drain"
+            );
+        }
+        supervisor
+            .observe_lifecycle_event(&AppEvent::TaskComplete {
+                session_id: Some("seat".to_string()),
+                reason: crate::external_supervision::SEAT_CONCLUDED_TASK_REASON.to_string(),
+                summary: None,
+                outcome: event::TaskOutcome::Completed,
+            })
+            .await;
+        let state = supervisor.state.lock().await;
+        assert_eq!(phase_of(&state), "done");
+        assert!(
+            !session_holds_drain(&phase_of(&state), false),
+            "the concluded row no longer holds the drain"
+        );
     }
 
     /// Died-park membership follows the activity carrier: non-empty
@@ -1810,10 +1848,14 @@ mod tests {
     }
 
     /// Reload-all fans out over the supervisor's OWN live registry — the
-    /// exact set served as candidates: every row of the source is stamped
-    /// `requested` atomically with membership and gets its own
+    /// exact set served as candidates: every LIVE row of the source is
+    /// stamped `requested` atomically with membership and gets its own
     /// per-session reload event; other backends and native rows are
-    /// untouched, and a native/empty source is refused outright.
+    /// untouched, and a native/empty source is refused outright. A row
+    /// already at phase `done` (a concluded seat) is skipped by name —
+    /// the respawn-after-close pin: the fan-out mints neither a stamp
+    /// that can never advance nor an event that would resurrect a
+    /// concluded session into an idle row.
     #[tokio::test]
     async fn reload_all_rides_the_served_candidate_set() {
         let bus = EventBus::new();
@@ -1824,6 +1866,7 @@ mod tests {
             for (id, source) in [
                 ("ext-b", "claude-code"),
                 ("ext-a", "claude-code"),
+                ("ext-done", "claude-code"),
                 ("codex-1", "codex"),
                 ("native-1", "intendant"),
             ] {
@@ -1831,6 +1874,11 @@ mod tests {
                     .sessions
                     .insert(id.to_string(), managed_session(id, source));
             }
+            state
+                .sessions
+                .get_mut("ext-done")
+                .expect("inserted above")
+                .phase = "done".to_string();
         }
         supervisor
             .route_reload_credentials_all("claude-code".to_string())
@@ -1838,13 +1886,22 @@ mod tests {
 
         let registry = supervisor.live_session_registry();
         let claude = registry.reload_candidates_for_source("claude-code").await;
-        assert!(
-            claude.iter().all(|candidate| candidate
-                .reload
-                .as_ref()
-                .is_some_and(|reload| reload.state == ReloadLifecycleState::Requested)),
-            "every row of the source is stamped requested"
-        );
+        for candidate in &claude {
+            if candidate.session_id == "ext-done" {
+                assert_eq!(
+                    candidate.reload, None,
+                    "a concluded (done) row is never stamped requested"
+                );
+            } else {
+                assert!(
+                    candidate
+                        .reload
+                        .as_ref()
+                        .is_some_and(|reload| reload.state == ReloadLifecycleState::Requested),
+                    "every live row of the source is stamped requested"
+                );
+            }
+        }
         assert_eq!(
             registry.reload_candidates_for_source("codex").await[0].reload,
             None,
@@ -1860,7 +1917,8 @@ mod tests {
         assert_eq!(
             reloaded,
             vec!["ext-a".to_string(), "ext-b".to_string()],
-            "one per-session event per matching row, in stable order"
+            "one per-session event per LIVE matching row, in stable order — \
+             the concluded row gets no event"
         );
 
         // Native and empty sources are refused before any stamp or event.

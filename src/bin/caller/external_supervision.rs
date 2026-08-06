@@ -1905,6 +1905,82 @@ pub(crate) fn stamp_bg_park_marker_from_activity(
     }
 }
 
+/// The terminal-goodbye conclude shape (respawn-after-close card
+/// 01KZ0PRYE70R5ZYDKFEECE5MDW): the facts an external wrapper assembles
+/// at a safe point to decide whether its seat has HONESTLY finished — in
+/// which case the wrapper ends its own row instead of idling as a
+/// drain-holding husk the next credential respawn resurrects. Every
+/// conjunct is a separate field so tests can falsify each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeatConcludeFacts {
+    /// A round ran in THIS wrapper process — the goodbye itself. Guards
+    /// resume-attached rows: a freshly resumed wrapper must never
+    /// insta-conclude on a stale attestation before the owner can type,
+    /// and the loop's `round` counter starts at the resumed transcript's
+    /// turn count, so the wrapper tracks this bit separately.
+    pub(crate) round_ran_in_this_wrapper: bool,
+    /// Follow-ups parked in the wrapper's own queue.
+    pub(crate) parked_follow_ups: usize,
+    /// Follow-ups sitting undelivered in the supervisor channel.
+    pub(crate) channel_follow_ups: usize,
+    /// Steers queued for this session on the context-injection lane.
+    pub(crate) queued_steers: bool,
+    /// A rate-limit/service park is armed (its pending re-send is owed).
+    pub(crate) limit_park_armed: bool,
+    /// Open side threads (Codex forks, Kimi :btw agents) still live.
+    pub(crate) open_side_threads: usize,
+    /// The durable bg-park marker records LIVE parked-on tasks. A
+    /// died-with-restart marker does not block: nothing is running, and
+    /// the died statement is attention state, not pending work.
+    pub(crate) live_bg_task_park: bool,
+    /// The seat's fired occurrence carries an attestation (Track AO
+    /// self-report) for one of this wrapper's session ids.
+    pub(crate) occurrence_attested: bool,
+}
+
+impl SeatConcludeFacts {
+    /// True exactly when every conjunct of the terminal-goodbye shape
+    /// holds: done signal behind us (a round ran here and the loop is at
+    /// idle), no pending work anywhere, no live background tasks, and
+    /// the occurrence attested.
+    pub(crate) fn concluded(&self) -> bool {
+        self.round_ran_in_this_wrapper
+            && self.parked_follow_ups == 0
+            && self.channel_follow_ups == 0
+            && !self.queued_steers
+            && !self.limit_park_armed
+            && self.open_side_threads == 0
+            && !self.live_bg_task_park
+            && self.occurrence_attested
+    }
+}
+
+/// Whether a durable bg-park marker still names LIVE parked-on tasks —
+/// the conclude shape's "no background tasks" conjunct. The died form
+/// (died_cause set) is a statement about a predecessor process, not
+/// running work, so it never blocks a conclude.
+pub(crate) fn bg_park_is_live(park: Option<&session_log::SessionBgParkMeta>) -> bool {
+    park.is_some_and(|p| p.died_cause.is_none())
+}
+
+/// The `TaskComplete` reason a seat-conclude emits — the typed terminal
+/// the agenda scheduler journals as this occurrence's transport outcome.
+pub(crate) const SEAT_CONCLUDED_TASK_REASON: &str =
+    "seat concluded — occurrence attested; terminal goodbye left no pending work and no background tasks";
+
+/// The honest line for the goodbye-round conclude (site: idle entry).
+pub(crate) const SEAT_CONCLUDED_GOODBYE_LINE: &str =
+    "Seat concluded — the fired occurrence is attested and the terminal goodbye left no pending \
+     work and no background tasks; ending the session row (resume from the dashboard reopens the \
+     conversation)";
+
+/// The honest line for the credential-reload skip at a concluded seat
+/// (site: idle reload lane) — the respawn-after-close fix: the reload
+/// ends the husk instead of resurrecting it.
+pub(crate) const SEAT_CONCLUDED_RELOAD_SKIP_LINE: &str =
+    "Reload skipped — this seat already concluded (occurrence attested, nothing pending, no \
+     background tasks); ending the session row instead of respawning the backend";
+
 /// The named cause stamped on background tasks a service-condition
 /// round death took with the backend process (the error park's respawn
 /// class — the replacement process spawns at the park's wake).
@@ -2646,6 +2722,90 @@ mod tests {
         // …and clears on demonstrable work.
         stamp_bg_park_marker_from_activity(&log, &activity(S::AwaitingApi, Vec::new()));
         assert!(read_park().is_none(), "a turn state resolves the attention");
+    }
+
+    /// The terminal-goodbye conclude shape: every conjunct is required —
+    /// flipping ANY single fact away from the concluded shape refuses
+    /// the conclude, and the fully satisfied shape accepts it. This is
+    /// the acceptance pin for "terminal-goodbye concludes the row": a
+    /// seat with pending work, background tasks, or no attestation can
+    /// never self-conclude, and a freshly resumed wrapper (no round ran
+    /// here) can never insta-conclude on a stale attestation.
+    #[test]
+    fn seat_conclude_shape_requires_every_conjunct() {
+        let concluded = SeatConcludeFacts {
+            round_ran_in_this_wrapper: true,
+            parked_follow_ups: 0,
+            channel_follow_ups: 0,
+            queued_steers: false,
+            limit_park_armed: false,
+            open_side_threads: 0,
+            live_bg_task_park: false,
+            occurrence_attested: true,
+        };
+        assert!(concluded.concluded(), "the full shape concludes");
+
+        let refusals = [
+            SeatConcludeFacts {
+                round_ran_in_this_wrapper: false,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                parked_follow_ups: 1,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                channel_follow_ups: 1,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                queued_steers: true,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                limit_park_armed: true,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                open_side_threads: 1,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                live_bg_task_park: true,
+                ..concluded
+            },
+            SeatConcludeFacts {
+                occurrence_attested: false,
+                ..concluded
+            },
+        ];
+        for (i, facts) in refusals.iter().enumerate() {
+            assert!(
+                !facts.concluded(),
+                "conjunct {i} flipped away from the shape must refuse: {facts:?}"
+            );
+        }
+    }
+
+    /// The "no background tasks" conjunct reads the durable marker's
+    /// form: a live parked-on-tasks marker blocks the conclude; a
+    /// died-with-restart statement (nothing running) and an absent
+    /// marker do not.
+    #[test]
+    fn bg_park_liveness_reads_the_marker_form() {
+        assert!(!bg_park_is_live(None));
+        let live = session_log::SessionBgParkMeta {
+            tasks: vec!["cargo test".into()],
+            died_cause: None,
+            died_at_epoch: None,
+        };
+        assert!(bg_park_is_live(Some(&live)));
+        let died = session_log::SessionBgParkMeta {
+            tasks: vec!["cargo test".into()],
+            died_cause: Some(DAEMON_RESTART_CAUSE.to_string()),
+            died_at_epoch: Some(100),
+        };
+        assert!(!bg_park_is_live(Some(&died)));
     }
 
     fn rejected_park_message() -> FollowUpMessage {

@@ -118,6 +118,75 @@ pub(crate) fn idle_external_pr_published_event(
     })
 }
 
+/// Assemble the terminal-goodbye conclude facts at one of the loop's two
+/// safe points (idle entry after a round; the idle reload lane). Every
+/// input is the loop's own live state except two disk/store reads: the
+/// durable bg-park marker (the backend's own activity claims) and the
+/// agenda attestation lookup (freshened, so an attest applied through a
+/// co-homed daemon counts). No published agenda handle means no
+/// attestation and therefore never a conclude — foreground shapes keep
+/// today's semantics.
+#[allow(clippy::too_many_arguments)]
+fn assemble_seat_conclude_facts(
+    round_ran_in_this_wrapper: bool,
+    parked_follow_ups: &std::collections::VecDeque<FollowUpMessage>,
+    follow_up_rx: &FollowUpReceiver,
+    context_injection: &event::ContextInjectionQueue,
+    live_session_id: &Option<String>,
+    alias_session_id: Option<&str>,
+    limit_park_armed: bool,
+    open_side_threads: usize,
+    log_dir: &std::path::Path,
+    candidate_session_ids: &[&str],
+) -> SeatConcludeFacts {
+    let bg_park = crate::session_log::read_session_meta(log_dir).and_then(|meta| meta.bg_park);
+    let occurrence_attested = crate::agenda::published_agenda_handle()
+        .map(|handle| handle.session_occurrence_attested(candidate_session_ids))
+        .unwrap_or(false);
+    SeatConcludeFacts {
+        round_ran_in_this_wrapper,
+        parked_follow_ups: parked_follow_ups.len(),
+        channel_follow_ups: follow_up_rx.len(),
+        queued_steers: has_queued_steers_for_session(
+            context_injection,
+            live_session_id.as_deref(),
+            alias_session_id,
+        ),
+        limit_park_armed,
+        open_side_threads,
+        live_bg_task_park: bg_park_is_live(bg_park.as_ref()),
+        occurrence_attested,
+    }
+}
+
+/// The seat-conclude terminal emissions, shared by both conclude sites:
+/// the honest line (session log + dashboard), then the typed
+/// `TaskComplete` success terminal — the registry flips the row to
+/// `done` on it (dropping it from the drain wait set) and the agenda
+/// scheduler journals the occurrence's transport outcome; the caller
+/// breaks the loop and `finish_session` removes the row.
+fn emit_seat_conclude(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    live_session_id: &Option<String>,
+    line: &str,
+) {
+    slog(session_log, |l| l.info(line));
+    bus.send(AppEvent::LogEntry {
+        session_id: live_session_id.clone(),
+        level: "info".to_string(),
+        source: "Intendant".to_string(),
+        content: line.to_string(),
+        turn: None,
+    });
+    bus.send(AppEvent::TaskComplete {
+        session_id: live_session_id.clone(),
+        reason: SEAT_CONCLUDED_TASK_REASON.to_string(),
+        summary: None,
+        outcome: crate::event::TaskOutcome::Completed,
+    });
+}
+
 /// In-place backend respawn for reload-credentials (the dashboard's
 /// "Reload credentials" chip after a Claude sign-in): cancel a live
 /// rate-limit park PRESERVING its pending re-send (unlike an interrupt,
@@ -636,6 +705,13 @@ pub(crate) async fn run_external_agent_mode(
         _ => UserTurnRevisionState::default(),
     };
     let mut round = user_turn_revisions.active_count() as usize;
+    // Seat-conclude guard (terminal-goodbye shape): true once a round ran
+    // in THIS wrapper process. `round` itself starts at the resumed
+    // transcript's turn count, so it cannot distinguish "the seat said
+    // goodbye here" from "a fresh wrapper resume-attached to an old
+    // transcript" — and a freshly resumed wrapper must never
+    // insta-conclude on a stale attestation before the owner can type.
+    let mut round_ran_in_this_wrapper = false;
     let mut stats = LoopStats::default();
     if backend == external_agent::AgentBackend::Codex {
         stats.codex_subagent_parent_threads = codex_subagent_parent_threads_from_log(&log_dir);
@@ -854,6 +930,12 @@ pub(crate) async fn run_external_agent_mode(
                 });
             }
         }
+        // Seat-conclude runs once per idle entry (the first pass of the
+        // idle wait below), never per bus event: the terminal-goodbye
+        // shape is decided when the round that just ended left the loop
+        // idle, and later events either end the session themselves or
+        // queue work that breaks the shape's emptiness conjuncts.
+        let mut seat_conclude_checked = false;
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
@@ -885,6 +967,51 @@ pub(crate) async fn run_external_agent_mode(
                     )
                 {
                     break FollowUpMessage::text(String::new());
+                }
+                // Terminal-goodbye conclude (respawn-after-close card
+                // 01KZ0PRYE7…): at the first idle pass after a round, a
+                // seat that honestly finished — occurrence attested,
+                // nothing pending anywhere, no live background tasks —
+                // ends its own row instead of idling as a drain-holding
+                // husk nothing can wake.
+                if !seat_conclude_checked {
+                    seat_conclude_checked = true;
+                    let mut conclude_ids: Vec<&str> = Vec::new();
+                    for id in [
+                        intendant_session_id.as_deref(),
+                        live_session_id.as_deref(),
+                        drain_config.session_id.as_deref(),
+                        drain_config.alias_session_id.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if !conclude_ids.contains(&id) {
+                            conclude_ids.push(id);
+                        }
+                    }
+                    let facts = assemble_seat_conclude_facts(
+                        round_ran_in_this_wrapper,
+                        &parked_follow_ups,
+                        &follow_up_rx,
+                        &context_injection,
+                        &live_session_id,
+                        drain_config.alias_session_id.as_deref(),
+                        limit_park.is_some(),
+                        open_side_threads.len(),
+                        &log_dir,
+                        &conclude_ids,
+                    );
+                    if facts.concluded() {
+                        emit_seat_conclude(
+                            &bus,
+                            &session_log,
+                            &live_session_id,
+                            SEAT_CONCLUDED_GOODBYE_LINE,
+                        );
+                        stats.terminal_outcome = Some("completed".to_string());
+                        break 'outer;
+                    }
                 }
                 tokio::select! {
                     maybe_intent = external_intent_rx.recv(), if external_intent_open => {
@@ -1395,6 +1522,7 @@ pub(crate) async fn run_external_agent_mode(
                                             side_turn_revisions: &mut side_turn_revisions,
                                         };
                                         round += 1;
+                                        round_ran_in_this_wrapper = true;
                                         stats.turns = 0;
                                         emit_external_turn_status(
                                             &bus,
@@ -2545,6 +2673,55 @@ pub(crate) async fn run_external_agent_mode(
                                 // published — never a minted nudge.
                                 backend_credentials_reload
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                                // Respawn-after-close guard (card
+                                // 01KZ0PRYE7…): a reload landing at a
+                                // concluded seat must not resurrect it
+                                // into a fresh idle row — the specimen
+                                // fan-out minted a drain-holding husk
+                                // this way. End the row instead, stated
+                                // honestly. A parked seat with an owed
+                                // re-send, queued work, live background
+                                // tasks, or no attestation fails the
+                                // shape and reloads normally.
+                                {
+                                    let mut conclude_ids: Vec<&str> = Vec::new();
+                                    for id in [
+                                        intendant_session_id.as_deref(),
+                                        live_session_id.as_deref(),
+                                        drain_config.session_id.as_deref(),
+                                        drain_config.alias_session_id.as_deref(),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    {
+                                        if !conclude_ids.contains(&id) {
+                                            conclude_ids.push(id);
+                                        }
+                                    }
+                                    let facts = assemble_seat_conclude_facts(
+                                        round_ran_in_this_wrapper,
+                                        &parked_follow_ups,
+                                        &follow_up_rx,
+                                        &context_injection,
+                                        &live_session_id,
+                                        drain_config.alias_session_id.as_deref(),
+                                        limit_park.is_some(),
+                                        open_side_threads.len(),
+                                        &log_dir,
+                                        &conclude_ids,
+                                    );
+                                    if facts.concluded() {
+                                        emit_seat_conclude(
+                                            &bus,
+                                            &session_log,
+                                            &live_session_id,
+                                            SEAT_CONCLUDED_RELOAD_SKIP_LINE,
+                                        );
+                                        stats.terminal_outcome =
+                                            Some("completed".to_string());
+                                        break 'outer;
+                                    }
+                                }
                                 if apply_backend_credentials_reload(
                                     &backend,
                                     &project,
@@ -3659,6 +3836,7 @@ pub(crate) async fn run_external_agent_mode(
         }
 
         round += 1;
+        round_ran_in_this_wrapper = true;
         // The emitted turn index is the PROMPT ORDINAL from the revision
         // state — never `round`, which also counts spontaneous backend
         // rounds (and restarts on resume for backends without a seed), so

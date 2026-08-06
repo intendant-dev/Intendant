@@ -1494,6 +1494,30 @@ impl AgendaStore {
         self.items.get(item_id).cloned()
     }
 
+    /// Whether any effect's latest occurrence run was fired as one of
+    /// `session_ids` AND carries an attestation (Track AO self-report).
+    /// The external wrapper's seat-conclude check reads this: an attested
+    /// occurrence is the "this seat honestly finished" half of the
+    /// terminal-goodbye shape. Freshened first — the attest may have been
+    /// applied through a co-homed daemon (the drain/holder split), so the
+    /// in-memory fold alone could be stale.
+    pub(crate) fn session_occurrence_attested(&mut self, session_ids: &[&str]) -> bool {
+        if let Err(err) = self.refresh_if_stale() {
+            eprintln!("[agenda] refresh before attestation lookup failed: {err}");
+        }
+        self.items.values().any(|item| {
+            item.effects.iter().any(|effect| {
+                effect.last_run.as_ref().is_some_and(|run| {
+                    run.attestation.is_some()
+                        && run
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|sid| session_ids.contains(&sid))
+                })
+            })
+        })
+    }
+
     /// The item currently holding `ask_id` as an OPEN rich ask, if any.
     pub(crate) fn open_ask(&mut self, ask_id: u64) -> Option<AgendaItem> {
         if let Err(err) = self.refresh_if_stale() {
@@ -5510,6 +5534,76 @@ mod tests {
             trigger: None,
             project_root: None,
         }
+    }
+
+    /// The seat-conclude lookup: true exactly when an effect's latest
+    /// run was fired as one of the asked session ids AND carries an
+    /// attestation. A started-but-unattested run never matches (the
+    /// seat has not filed its self-report), and a foreign session id
+    /// never matches an attested run (the goodbye must be the fired
+    /// seat's own).
+    #[test]
+    fn session_occurrence_attested_requires_both_the_id_and_the_attestation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let _project = with_default_project(&mut store);
+        let id = store
+            .apply_command(add_cmd("fired seat"), owner(), 1000)
+            .unwrap()
+            .id;
+        let proposed = store
+            .apply_command(propose_one_shot(&id), session_actor(), 1001)
+            .unwrap();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        store
+            .record_occurrence(
+                OccurrenceWriteBack {
+                    item_id: &id,
+                    effect_id: &effect_id,
+                    occurrence_id: "occ-seat",
+                    state: "started",
+                    session_id: Some("sess-seat".into()),
+                    note: None,
+                },
+                1002,
+            )
+            .unwrap();
+        assert!(
+            !store.session_occurrence_attested(&["sess-seat"]),
+            "a started run without an attestation never satisfies the shape"
+        );
+
+        store
+            .apply_command(
+                AgendaCommand::Attest {
+                    id: id.clone(),
+                    occurrence: "occ-seat".into(),
+                    outcome: super::super::types::AttestationOutcome::Achieved,
+                    note: Some("landed".into()),
+                    refs: Vec::new(),
+                    source: None,
+                },
+                Some(AgendaActor {
+                    principal: None,
+                    session_id: Some("sess-seat".into()),
+                    kind: Some("agent_session".into()),
+                }),
+                1003,
+            )
+            .unwrap();
+        assert!(
+            store.session_occurrence_attested(&["sess-seat"]),
+            "the attested run matches its fired session id"
+        );
+        assert!(
+            store.session_occurrence_attested(&["other-alias", "sess-seat"]),
+            "any candidate id in the list may match (address-upgraded rows ask with every alias)"
+        );
+        assert!(
+            !store.session_occurrence_attested(&["sess-imposter"]),
+            "an attested run never matches a foreign session id"
+        );
+        assert!(!store.session_occurrence_attested(&[]));
     }
 
     fn session_actor() -> Option<AgendaActor> {

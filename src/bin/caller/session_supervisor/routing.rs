@@ -863,18 +863,31 @@ impl SessionSupervisor {
     /// (reload_all_rides_the_served_candidate_set). `source` is the
     /// `AgentBackend::as_short_str` vocabulary; native sessions have no
     /// backend process to respawn, so a native/empty source is refused.
+    /// Rows already at phase `done` are skipped by name (respawn-after-
+    /// close card 01KZ0PRYE7…): their loops are ending or gone, so a
+    /// `requested` stamp there is a lifecycle that can never advance and
+    /// an event nobody serves — never a respawn of a concluded seat.
     pub(crate) async fn route_reload_credentials_all(&self, source: String) {
         let source = source.trim();
         if source.is_empty() || source == "intendant" {
             self.warn("Reload-all-credentials dropped: not an external backend source");
             return;
         }
-        let mut target_ids: Vec<String> = {
+        let (mut target_ids, skipped_concluded) = {
             let mut state = self.state.lock().await;
+            let mut skipped_concluded = 0usize;
             let ids: Vec<String> = state
                 .sessions
                 .values()
                 .filter(|session| session.source == source)
+                .filter(|session| {
+                    if session.phase == "done" {
+                        skipped_concluded += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .map(|session| session.session_id.clone())
                 .collect();
             for id in &ids {
@@ -885,8 +898,14 @@ impl SessionSupervisor {
                     ));
                 }
             }
-            ids
+            (ids, skipped_concluded)
         };
+        if skipped_concluded > 0 {
+            self.warn(&format!(
+                "Reload-all-credentials: skipped {skipped_concluded} concluded {source} \
+                 session(s) — nothing to respawn"
+            ));
+        }
         if target_ids.is_empty() {
             self.warn(&format!(
                 "Reload-all-credentials: no live {source} sessions to reload"
