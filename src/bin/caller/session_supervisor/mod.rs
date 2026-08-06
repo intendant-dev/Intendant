@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+mod capacity_gate;
 mod exec;
 mod launch;
 pub(crate) use launch::*;
@@ -106,6 +107,12 @@ pub struct SessionSupervisorConfig {
     /// tests, shapes without a gateway) disables both — today's
     /// semantics.
     pub handover: Option<Arc<crate::handover::HandoverRuntime>>,
+    /// The capacity controller (memory-headroom stages + the resident
+    /// bound): the admission gate, the deferred-admission queue, the park
+    /// census, and the capacity monitor all read it. `None` (hermetic
+    /// tests, `[capacity] enabled = false`) disables all of them —
+    /// pre-slice behavior, the fail-open shape.
+    pub capacity: Option<Arc<crate::capacity::CapacityController>>,
 }
 
 #[derive(Clone)]
@@ -224,6 +231,14 @@ pub(crate) struct SupervisorState {
     /// any newer follow-up or deliberate resume for the id clears the mark
     /// (latest intent wins).
     unmanaged_user_halts: HashMap<String, std::time::Instant>,
+    /// Deferred admissions (capacity gate): create intents held FIFO with
+    /// their minted reservations until headroom returns. See
+    /// `capacity_gate.rs`.
+    capacity_queue: std::collections::VecDeque<capacity_gate::QueuedAdmission>,
+    /// Sessions carrying the honest capacity-park mark (park stage's
+    /// longest-idle census). A mark blocks nothing user-initiated; it
+    /// clears on activity, on session end, or when pressure eases.
+    capacity_parked: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]

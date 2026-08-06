@@ -987,6 +987,14 @@ pub enum AppEvent {
         autonomy: String,
     },
 
+    /// Emitted by the capacity monitor whenever the daemon-wide capacity
+    /// view changes (memory-pressure stage, probe health, or the
+    /// resident/queue/park census). Cached for late joiners: an idle
+    /// pressured daemon must still show its state to a fresh browser.
+    CapacityState {
+        view: crate::capacity::CapacityView,
+    },
+
     /// Emitted by the control plane when a `ControlMsg::CodexThreadAction`
     /// arrives, so the daemon-side action watcher (which owns the
     /// persistent agent) can pick it up. Carries the dispatched action and
@@ -2726,6 +2734,27 @@ impl ControlMsg {
                 | ControlMsg::ForkSessionAtAnchor { .. }
         )
     }
+
+    /// What the capacity admission gate governs: the strict subset of
+    /// [`ControlMsg::creates_session`] that mints an ADDITIONAL resident
+    /// session (create, untargeted start, fork). The resume family
+    /// (resume, restart) revives the owner's existing work and is
+    /// deliberately exempt in this slice — it still counts toward
+    /// residency once live, and refusing an owner's attach to their own
+    /// session is a hostility the bound does not need. The capacity
+    /// matrix test walks the pair of classifiers; a creator classified
+    /// here must also be in `creates_session`.
+    pub(crate) fn creates_additional_session(&self) -> bool {
+        matches!(
+            self,
+            ControlMsg::CreateSession { .. }
+                | ControlMsg::StartTask {
+                    session_id: None,
+                    ..
+                }
+                | ControlMsg::ForkSessionAtAnchor { .. }
+        )
+    }
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -3486,6 +3515,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         }),
         AppEvent::AutonomyChanged { autonomy } => Some(OutboundEvent::AutonomyChanged {
             autonomy: autonomy.clone(),
+        }),
+        AppEvent::CapacityState { view } => Some(OutboundEvent::CapacityState {
+            view: view.clone(),
         }),
         AppEvent::CodexThreadActionRequested {
             request_id,

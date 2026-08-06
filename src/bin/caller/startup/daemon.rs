@@ -234,11 +234,15 @@ pub(crate) async fn run_daemon(
             claude_rewind_capability_for_tests: None,
             agenda: gateway.agenda.clone(),
             handover: Some(gateway.handover.clone()),
+            capacity: crate::capacity::controller_from_config(&project.config.capacity),
         });
     // Publish the live registry for read-side lanes (the sign-in
     // ceremony status payloads' reload_candidates) — mirrors the
     // vitals-targets publish above.
     session_supervisor::publish_live_session_registry(supervisor.live_session_registry());
+    // Capacity monitor: probe → stage → park census → queue drain
+    // (no-op when [capacity] is disabled).
+    let _capacity_monitor = supervisor.spawn_capacity_monitor();
     let supervisor_handle = supervisor.spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed
     // above, before this send) resumes the target session — attach only,

@@ -1222,6 +1222,10 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // Cache standalone autonomy changes so reconnecting dashboards do not
     // fall back to the stale autonomy value in the latest status event.
     let last_autonomy_json = bootstrap_caches.last_autonomy_json.clone();
+    // Cache the latest capacity_state so a refreshed browser on a
+    // pressured daemon still renders the pressure chip (the event fires
+    // on change only).
+    let last_capacity_json = bootstrap_caches.last_capacity_json.clone();
     // Cache the latest external_agent_changed event so a refreshed
     // browser learns the current value without having to re-fetch
     // settings. Without this the dashboard dropdown snaps back to
@@ -1585,6 +1589,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
             let last_autonomy_json = last_autonomy_json.clone();
+            let last_capacity_json = last_capacity_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
             let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
@@ -2724,6 +2729,15 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         }
                     }
 
+                    // Send the cached capacity view so the pressure chip
+                    // reflects a pressured-but-quiet daemon on a fresh
+                    // connection.
+                    if let Ok(guard) = last_capacity_json.lock() {
+                        if let Some(ref capacity_json) = *guard {
+                            let _ = direct_tx.send(capacity_json.clone());
+                        }
+                    }
+
                     // Send cached external_agent_changed so the dropdown
                     // and status badge reflect the current value on a
                     // fresh browser connection.
@@ -3154,6 +3168,7 @@ impl BootstrapCacheMaintainer {
             E::LiveUsageUpdate { .. } => Self::set_latest(&self.caches.last_live_usage_json, event),
             E::StatusUpdate { .. } => Self::set_latest(&self.caches.last_status_json, event),
             E::AutonomyChanged { .. } => Self::set_latest(&self.caches.last_autonomy_json, event),
+            E::CapacityState { .. } => Self::set_latest(&self.caches.last_capacity_json, event),
             E::ExternalAgentChanged { .. } => {
                 Self::set_latest(&self.caches.last_external_agent_json, event)
             }
@@ -3276,6 +3291,7 @@ impl BootstrapCacheMaintainer {
             &self.caches.last_live_usage_json,
             &self.caches.last_status_json,
             &self.caches.last_autonomy_json,
+            &self.caches.last_capacity_json,
             &self.caches.last_external_agent_json,
             &self.caches.last_user_display_json,
         ] {

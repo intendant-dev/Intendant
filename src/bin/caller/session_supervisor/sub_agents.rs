@@ -210,6 +210,28 @@ impl SessionSupervisor {
                  (cap: [orchestrator] max_parallel_agents)."
             ));
         }
+        // Capacity gate: a sub-agent is an additional resident session,
+        // and this lane answers its caller synchronously — an honest
+        // refusal the parent can adapt to (do the work itself, wait, or
+        // retry when headroom returns), never a silent queue.
+        if let Some(controller) = self.config.capacity.as_ref() {
+            let resident = self.state.lock().await.sessions.len();
+            if let crate::capacity::AdmissionCheck::Gate {
+                stage,
+                bound,
+                resident,
+                queued,
+            } = controller.admission_check(resident)
+            {
+                return Err(crate::capacity::refusal_text(
+                    "sub-agent spawn",
+                    stage,
+                    resident,
+                    bound,
+                    queued,
+                ));
+            }
+        }
         if params.task.trim().is_empty() {
             return Err("sub-agent task must not be empty".to_string());
         }

@@ -412,6 +412,9 @@ impl SessionSupervisor {
                 reason,
                 error_kind,
             });
+            // A resident slot freed: a deferred admission may fire now
+            // (no-op without a capacity controller).
+            self.drain_capacity_queue().await;
         }
 
         for child_id in orphaned_children {

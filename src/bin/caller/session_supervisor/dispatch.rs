@@ -12,12 +12,12 @@ use super::*;
 /// which creates an idle Codex session — is a session-create body (slow).
 /// Mirrors the branch structure inside the arms exactly; the arms remain
 /// the single source of behavior, this only decides WHERE they run.
-enum CreateDisposition {
+pub(super) enum CreateDisposition {
     SlowCreate,
     FastFollowUp,
 }
 
-fn classify_create_task(task: &str) -> CreateDisposition {
+pub(super) fn classify_create_task(task: &str) -> CreateDisposition {
     match parse_codex_slash_command(task) {
         None => CreateDisposition::SlowCreate,
         Some(Ok(command)) if command.op == "fast" => CreateDisposition::SlowCreate,
@@ -379,6 +379,14 @@ impl SessionSupervisor {
                 return;
             }
         }
+        // The capacity admission gate (drain outranks it): additional-
+        // session creates queue or refuse honestly while admissions are
+        // deferred — over the resident bound, or under memory pressure.
+        // Everything else serves; see capacity_gate.rs.
+        let (msg, reserved) = match self.capacity_gate(msg, reserved).await {
+            Some(admitted) => admitted,
+            None => return,
+        };
         match msg {
             event::ControlMsg::CreateSession {
                 task,

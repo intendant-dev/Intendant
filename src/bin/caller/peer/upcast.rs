@@ -627,6 +627,9 @@ impl AppEventUpcaster {
             | AppEvent::AgendaChanged { .. }
             | AppEvent::AgendaAskOutcome { .. }
             | AppEvent::MemoryChanged { .. }
+            // A daemon's capacity pressure is box-local state: peers see
+            // its effects (refusals, queue receipts), never the gauge.
+            | AppEvent::CapacityState { .. }
             // Coordination-radar flags are box-local attention state
             // (the bus never leaves the box).
             | AppEvent::CoordinationRadar { .. } => vec![],
@@ -2133,6 +2136,9 @@ impl WireEventUpcaster {
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }
+            // A peer's capacity gauge is its own box-local state (same
+            // class as the AppEvent twin above).
+            | OutboundEvent::CapacityState { .. }
             // A peer's coordination-radar flags are its own box-local
             // attention state (same class as the AppEvent twin above).
             | OutboundEvent::CoordinationRadar { .. }

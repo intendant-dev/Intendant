@@ -289,6 +289,7 @@ pub(crate) fn bootstrap_cache_resync_lines(
         }
     }
     push_latest(&mut lines, &caches.last_autonomy_json);
+    push_latest(&mut lines, &caches.last_capacity_json);
     push_latest(&mut lines, &caches.last_external_agent_json);
     push_latest(&mut lines, &caches.last_user_display_json);
     lines

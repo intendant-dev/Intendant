@@ -89,6 +89,11 @@ const SPAWN_STAGGER_INTERVAL_MS: u64 = 30_000;
 /// spawns plus any governed start still inside the trailing interval.
 /// Below it — a SOLO fire — dispatch is immediate, always.
 const SPAWN_STAGGER_ENGAGE_AT: usize = 2;
+/// Re-check backstop while due occurrences are capacity-held (the
+/// level limiter above): the daemon's `capacity_state` bus event wakes
+/// the loop the moment the stage changes, so this only bounds a missed
+/// event.
+const CAPACITY_HOLD_RECHECK_MS: u64 = 30_000;
 
 /// A session's terminal event observed BEFORE its `TaskReceived` receipt
 /// — the fast-spawn inversion: `start_new_session` dispatches the child
@@ -847,7 +852,14 @@ async fn run_pass(
     if !planned.digest.is_empty() {
         deliver_digest(handle, journal, &planned.digest, now);
     }
-    let governor_wake = dispatch_governed(handle, journal, state, planned.spawn, now);
+    let governor_wake = dispatch_governed(
+        handle,
+        journal,
+        state,
+        planned.spawn,
+        now,
+        capacity_admissions_deferred(),
+    );
     for missed in planned.missed_sessions {
         // A standing series needs no ceremony to continue; a one-shot
         // needs a fresh approval (the pre-G3-pre message, unchanged).
@@ -904,7 +916,25 @@ fn dispatch_governed(
     state: &mut SchedulerState,
     mut due: Vec<SpawnOccurrence>,
     now: u64,
+    capacity_deferred: bool,
 ) -> Option<u64> {
+    // The capacity program's LEVEL limiter (the composition the burst
+    // governor below anticipates: headroom decides how much may run,
+    // the stagger decides how fast it may start). While the daemon
+    // defers admissions — memory-pressure stage, or residents at the
+    // bound — every due occurrence holds here exactly like a governor
+    // hold: un-journaled, still due, re-planned by the next pass, so
+    // the fire lands when headroom returns instead of dispatching into
+    // a capacity refusal.
+    if capacity_deferred && !due.is_empty() {
+        eprintln!(
+            "[agenda] capacity: holding {} due occurrence{} — the daemon is \
+             deferring session admissions; re-planning when headroom returns",
+            due.len(),
+            if due.len() == 1 { "" } else { "s" },
+        );
+        return Some(now + CAPACITY_HOLD_RECHECK_MS);
+    }
     due.sort_by(|a, b| {
         (a.fire_at_ms, a.approved_at_ms, &a.occurrence_id).cmp(&(
             b.fire_at_ms,
@@ -1112,6 +1142,20 @@ fn send_start_task(
                 .map(|config| *config)
                 .unwrap_or_default(),
         }));
+}
+
+/// The capacity level check for [`dispatch_governed`], read at the pass
+/// edge so the dispatch fn stays pure over it. Fail-open: no published
+/// controller (hermetic tests, `[capacity] enabled = false`) never
+/// holds. Deliberately NOT consulted by the re-send sweep below: an
+/// already-dispatched occurrence keeps its existing at-least-once →
+/// bounded-abandon custody (a capacity refusal at the supervisor gate
+/// just reads as another missing receipt), so pressure onset after
+/// dispatch cannot strand it forever.
+fn capacity_admissions_deferred() -> bool {
+    crate::capacity::published_capacity_controller()
+        .map(|controller| controller.view().admissions_deferred)
+        .unwrap_or(false)
 }
 
 /// At-least-once delivery for un-receipted dispatches: re-send stale

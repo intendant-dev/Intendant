@@ -557,11 +557,14 @@ pub(crate) async fn run_headless_mode(
                 claude_rewind_capability_for_tests: None,
                 agenda: headless_agenda.clone(),
                 handover: headless_handover.clone(),
+                capacity: crate::capacity::controller_from_config(&project.config.capacity),
             },
         );
         // Publish for read-side lanes (the sign-in ceremony status
         // payloads' reload_candidates), mirroring daemon boot.
         session_supervisor::publish_live_session_registry(supervisor.live_session_registry());
+        // Capacity monitor, mirroring daemon boot (no-op when disabled).
+        let _capacity_monitor = supervisor.spawn_capacity_monitor();
         Some(supervisor.spawn_foreground_listener(session_id.clone()))
     } else {
         None
