@@ -1547,7 +1547,11 @@ pub(crate) async fn run_external_agent_mode(
                                                     // store may cure). Stay
                                                     // resident; the idle
                                                     // wait bounces to the
-                                                    // safe-point respawn.
+                                                    // safe-point respawn,
+                                                    // and the continuation
+                                                    // re-drives the cut
+                                                    // observed turn.
+                                                    reload_interrupted_turn = true;
                                                     let line = reload_outranks_terminal_line(
                                                         "the observed round failed before any turn completed",
                                                         &reason,
@@ -2195,7 +2199,11 @@ pub(crate) async fn run_external_agent_mode(
                                                     // resident; the safe
                                                     // point swaps in the
                                                     // fresh receiver and
-                                                    // re-opens the gate.
+                                                    // re-opens the gate, and
+                                                    // the continuation
+                                                    // re-drives the cut
+                                                    // observed turn.
+                                                    reload_interrupted_turn = true;
                                                     event_channel_open = false;
                                                     let line = reload_outranks_terminal_line(
                                                         "the backend event channel closed",
