@@ -5,6 +5,7 @@
 //! leaf: things move *out* of the caller into here, never the other way.
 
 pub mod display_target;
+pub mod memory;
 pub mod platform;
 pub mod vision;
 

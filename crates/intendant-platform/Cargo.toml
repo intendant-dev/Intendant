@@ -33,6 +33,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
+    # GlobalMemoryStatusEx for `memory::sample_memory` (box-wide headroom).
+    "Win32_System_SystemInformation",
     "Wdk_System_Threading",
 ] }
 
