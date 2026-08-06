@@ -1014,8 +1014,11 @@ title riding `metadata.title` — and the markdown body declares one
 `## node: <id>` section per node. Each section opens with a fenced
 `toml` config block (the machine schema: `title`, executor prefills
 `agent`/`model`/`effort`, `relies_on` edges, and for single-node
-definitions a `[cadence]` or `[trigger]` default), parsed with
-deny-unknown rigor; the prose after the block is the node's mandate.
+definitions a `[cadence]` or `[trigger]` default plus declared
+stamp-time `[parameters.<name>]` sub-tables — label, `required`,
+optional hint, `kind = "annotation"`, and a `line` template carrying
+`<value>` exactly once), parsed with deny-unknown rigor; the prose
+after the block is the node's mandate.
 Shape is **derived from arity** — one node is an *action*, 2..=8 nodes a
 *workflow* whose orientation prose above the first heading is the hub
 body. A definition directory is a valid Agent Skill, readable and
@@ -1078,12 +1081,19 @@ states what will be sealed, parked, and proposed — including the
 executor pins that will actually record (the definition's node pins
 when no explicit pick is made; "daemon defaults" only when neither
 exists) — and the Stamp button fires the stamp op — the sheet
-neither proposes nor approves client-side. The sheet also carries a
-"Note to the stamped item" input riding the stamp op's `annotations`
-field; when the selected definition's text demands a spend cap (the
-`NS CAP: $` convention), the input relabels as the spend-cap field
-and a bare typed amount records as the canonical `NS CAP: $<amount>`
-line — no human hand-formats spend-authority bytes. After the stamp,
+neither proposes nor approves client-side. The sheet renders one
+labeled input per parameter the selected definition **declares**
+(required ones marked, the declared hint as the help line): the typed
+value substitutes into the declared `line` template client-side, the
+pre-stamp summary shows the exact line that will record, and the
+lines ride the stamp op's `annotations` beside a generic
+"Note to the stamped item" input — no human hand-formats
+spend-authority bytes like the narrative-backfill `NS CAP: $<amount>`
+cap. The daemon is the enforcer: a stamp missing a `required`
+parameter refuses with a remedy naming the field, the sheet, and the
+ctl line, whatever client sent it (an empty sheet field is caught
+client-side as convenience); arriving lines matching no declared
+template pass through as ordinary notes. After the stamp,
 the ordinary card (or the workflow approval sheet) carries the
 ceremony. Stamped manifests then render
 their sealed pins on the item panel: a refs strip (locator + pin chip +
@@ -1530,8 +1540,10 @@ interrupted arc resumes from the journal; the live arc's standing
 resurrection cadence deliberately did not carry over). Its spend
 bound is an owner-set parameter, fail-closed: the run digests
 nothing until the owner has annotated the stamped item
-`NS CAP: $<amount>` — the Automate sheet's spend-cap field records
-the annotation at stamp time, and it can be set or changed later in
+`NS CAP: $<amount>` — declared as the required `[parameters.cap]`
+stamp-time parameter, so the Automate sheet's spend-cap field records
+the annotation at stamp time (a stamp arriving without it refuses
+with the remedy), and it can be set or changed later in
 the item's THREAD section or via
 `intendant ctl agenda annotate <item-id> 'NS CAP: $60'`. A run that
 finds no cap refuses with an annotation naming both of those
