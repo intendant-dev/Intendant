@@ -36,7 +36,7 @@ const UI2_NAV_GROUPS = [
   ] },
   { label: 'System', items: [
     { tab: 'settings', label: 'Settings', icon: 'settings' },
-    { tab: 'plugins', label: 'Plugins', icon: 'plugins' },
+    { tab: 'plugins', label: 'Plugins & Skills', icon: 'plugins' },
     { tab: 'debug', label: 'Debug', icon: 'debug' },
   ] },
 ];

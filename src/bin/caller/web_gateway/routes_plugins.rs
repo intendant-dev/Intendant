@@ -18,6 +18,18 @@ pub(crate) async fn plugins_list_api_response() -> ApiResponse {
     }
 }
 
+/// Transport-neutral core of `GET /api/skills` (tunnel twin
+/// `api_skills_list`): the unified skill catalog — builtins plus bundled
+/// plugin payloads, registry-driven, with per-root install facts read
+/// fresh from disk. Read-only; a plugin payload's lifecycle lives on its
+/// plugin card, and the row links there.
+pub(crate) async fn skills_list_api_response() -> ApiResponse {
+    match tokio::task::spawn_blocking(crate::skill_catalog::skills_catalog_json).await {
+        Ok(catalog) => ApiResponse::json(200, JsonBody::Value(catalog)),
+        Err(error) => ApiResponse::json_error(500, format!("skill catalog: {error}")),
+    }
+}
+
 /// Body of `POST /api/plugins/{plugin_id}`. Unknown keys are ignored so
 /// the tunnel twin can pass its whole `params` object through.
 #[derive(serde::Deserialize)]
@@ -63,6 +75,15 @@ pub(crate) async fn handle_plugins_list(
     fleet_origin: Option<&str>,
 ) {
     let response = plugins_list_api_response().await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_skills_list(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = skills_list_api_response().await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 

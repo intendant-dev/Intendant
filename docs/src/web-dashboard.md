@@ -2050,6 +2050,7 @@ response omits the header.
 | POST | `/api/codex-cloud/enroll` | public | public | ≤ 8 KiB | Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out) |
 | GET | `/api/plugins` | StatsRead | own origin | none | Bundled-plugin catalog: enabled flags, derived lifecycle state, readiness layers, per-skill install facts |
 | POST | `/api/plugins/{plugin_id}` | Settings | own origin | ≤ 4 KiB | Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome) |
+| GET | `/api/skills` | StatsRead | own origin | none | Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search), window=live|archive (+before/before_id/limit paging) — the bare call serves the full ledger forever |
 | GET | `/api/agenda/items/{item_id}` | AgendaRead | own origin | none | One agenda item, full + decorated, by id or unique prefix (+ its sessions join) |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |
