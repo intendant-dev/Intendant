@@ -4065,7 +4065,7 @@ async fn resolve_idle_child_approval(
         .autonomy
         .read()
         .await
-        .external_approval_decision(category);
+        .external_approval_decision(child_session_id.as_deref(), category);
     let immediate = if policy == crate::autonomy::ExternalApprovalDecision::AutoApprove {
         config.bus.send(AppEvent::AutoApproved {
             preview: preview.clone(),
@@ -5342,6 +5342,7 @@ mod tests {
             pick_max: None,
             free_text: None,
             previews: Vec::new(),
+            consequence: String::new(),
         }];
         let mut question_events = bus.subscribe();
         let question_responder = async {

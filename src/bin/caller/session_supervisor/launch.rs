@@ -149,7 +149,11 @@ impl SessionSupervisor {
             codex_managed_context,
             codex_context_archive,
             codex_service_tier,
+            dial,
         } = launch;
+        // An all-None dial binds nothing; only a knob-bearing dial is
+        // recorded, so dial-less sessions stay byte-identical to today.
+        let dial = dial.filter(|dial| !dial.is_empty());
         self.wait_for_launch_gate_in_tests().await;
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
@@ -645,6 +649,7 @@ impl SessionSupervisor {
             if matches!(backend, external_agent::AgentBackend::Codex) {
                 codex_home = config.codex_home.clone();
             }
+            config.dial = dial.clone();
             if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
                 self.warn(&format!(
                     "Session launch config was not persisted for {}: {}",
@@ -652,6 +657,37 @@ impl SessionSupervisor {
                     e
                 ));
             }
+        } else if dial.is_some() {
+            // Native sessions write no backend overlay, but a dial still
+            // needs its durable record — the override layer readopt/resume
+            // re-attaches from (`attach_session_dial_from_log_dir`).
+            let config = crate::session_config::SessionAgentConfig {
+                dial: dial.clone(),
+                ..Default::default()
+            };
+            if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
+                self.warn(&format!(
+                    "Session dial was not persisted for {}: {}",
+                    short_session(&session_id),
+                    e
+                ));
+            }
+        }
+        // Record the owner-signed override layer on the live autonomy
+        // state: the decision chokepoints read it keyed by session id from
+        // here on. Global level/rules are untouched — un-overridden knobs
+        // keep reading the live global layer.
+        if let Some(dial) = dial.as_ref() {
+            self.config
+                .autonomy
+                .write()
+                .await
+                .set_session_dial(&session_id, dial.clone());
+            self.info(&format!(
+                "Session {} launches with a dial override ({})",
+                short_session(&session_id),
+                crate::autonomy::describe_dial(dial)
+            ));
         }
         let session_dir = session_log
             .lock()
@@ -763,6 +799,37 @@ impl SessionSupervisor {
         } else {
             state.clear_unmanaged_user_halts([session_id, resume_token]);
             false
+        }
+    }
+
+    /// Re-attach a session's durable dial override (Track AD S1) from its
+    /// log-dir overlay onto the live autonomy state — the resume /
+    /// boot-readopt half of the override layer's durability. Fail-closed
+    /// by name: an overlay that exists but cannot be read falls back to
+    /// the pure-global layer with a log line naming the session — never a
+    /// guessed override.
+    pub(crate) async fn attach_session_dial_from_log_dir(&self, session_id: &str, log_dir: &Path) {
+        match crate::session_config::read_log_dir_dial(log_dir) {
+            Ok(Some(dial)) => {
+                self.config
+                    .autonomy
+                    .write()
+                    .await
+                    .set_session_dial(session_id, dial.clone());
+                self.info(&format!(
+                    "Session {} re-attached its dial override ({})",
+                    short_session(session_id),
+                    crate::autonomy::describe_dial(&dial)
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.warn(&format!(
+                    "Session {} dial override is unrecoverable ({e}); falling back to the \
+                     global autonomy layer",
+                    short_session(session_id)
+                ));
+            }
         }
     }
 
@@ -888,6 +955,11 @@ impl SessionSupervisor {
             // lineage and drives the relationship emit (`fork`, or the
             // requested kind — `side` for /btw conversations).
             if let Some(config) = session_agent_config.as_mut() {
+                // `load_for_resume` above merged the PARENT's persisted
+                // overlay (a fork resumes the parent's token) — its dial
+                // must not ride into the child: the owner signed it for
+                // the parent session only.
+                config.dial = None;
                 config.forked_from = Some(resume_token.clone());
                 // Only vetted lineage kinds may ride the wire into persisted
                 // lineage: the kind drives frontend gating (side-window
@@ -1098,10 +1170,15 @@ impl SessionSupervisor {
                 });
             } else if external_backend.is_none() {
                 match session_log::SessionLog::find_session_by_id(&session_id) {
-                    Some(dir) => match session_log::SessionLog::open(dir) {
+                    Some(dir) => match session_log::SessionLog::open(dir.clone()) {
                         Ok(log) => {
                             self.activate_shared_session(Arc::new(Mutex::new(log)))
-                                .await
+                                .await;
+                            // Native resume keeps the session's identity and
+                            // log dir; its durable dial override re-attaches
+                            // here (boot readopt rides this same lane).
+                            self.attach_session_dial_from_log_dir(&session_id, &dir)
+                                .await;
                         }
                         Err(e) => {
                             self.loop_error(format!("Session open failed: {}", e));
@@ -1197,6 +1274,26 @@ impl SessionSupervisor {
                     .lock()
                     .map(|log| log.session_id().to_string())
                     .unwrap_or_else(|_| path_file_name(&log_dir));
+                // External resume re-attaches the durable dial from the
+                // effective config (persisted overlay merged at
+                // `load_for_resume`; forks stripped it above) onto the live
+                // wrapper's identity — the boot-readopt lane rides this.
+                if let Some(dial) = effective_session_agent_config
+                    .as_ref()
+                    .and_then(|config| config.dial.clone())
+                    .filter(|dial| !dial.is_empty())
+                {
+                    self.config
+                        .autonomy
+                        .write()
+                        .await
+                        .set_session_dial(&intendant_session_id, dial.clone());
+                    self.info(&format!(
+                        "Session {} re-attached its dial override ({})",
+                        short_session(&intendant_session_id),
+                        crate::autonomy::describe_dial(&dial)
+                    ));
+                }
                 self.activate_shared_session(session_log.clone()).await;
                 self.spawn_agent_session(
                     intendant_session_id,

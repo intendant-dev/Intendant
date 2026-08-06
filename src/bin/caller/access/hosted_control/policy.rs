@@ -361,6 +361,7 @@ pub fn hosted_control_msg_allowed(
             codex_managed_context,
             codex_context_archive,
             codex_service_tier,
+            dial,
             orchestrate,
             direct,
             reference_frame_ids,
@@ -395,6 +396,10 @@ pub fn hosted_control_msg_allowed(
                 && codex_managed_context.is_none()
                 && codex_context_archive.is_none()
                 && codex_service_tier.is_none()
+                // A hosted caller may not set a session dial: the dial is
+                // an owner-signed override layer, and hosted provenance is
+                // not the owner's signature.
+                && dial.is_none()
                 && orchestrate.is_none()
                 && direct.is_none()
                 && reference_frame_ids.is_empty()

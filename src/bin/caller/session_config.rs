@@ -129,6 +129,14 @@ pub struct SessionAgentConfig {
     /// Position for `codex_fork_rollback_item_id` (`before`/`after`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_fork_rollback_position: Option<String>,
+    /// The session's owner-signed dial override layer (Track AD S1) — the
+    /// DURABLE copy of `AutonomyState::session_dials[id]`, recorded at
+    /// spawn and re-attached on resume/boot-readopt. Backend-neutral
+    /// (native sessions persist an overlay bearing only this field).
+    /// Never inherited by forks: a fork is a new session the owner signed
+    /// no dial for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<crate::autonomy::DialConfig>,
 }
 
 impl SessionAgentConfig {
@@ -167,6 +175,7 @@ impl SessionAgentConfig {
             && self.codex_fork_rollback_turns.is_none()
             && self.codex_fork_rollback_item_id.is_none()
             && self.codex_fork_rollback_position.is_none()
+            && self.dial.is_none()
     }
 
     /// This config reduced to the launch pins a FORKED CHILD may
@@ -184,6 +193,9 @@ impl SessionAgentConfig {
         self.codex_fork_rollback_position = None;
         self.kimi_fork_rollback_turns = None;
         self.kimi_fork_expected_horizon = None;
+        // The dial is owner-signed for the PARENT session only; a fork is
+        // a new session that falls back to the live global layer.
+        self.dial = None;
         self
     }
 
@@ -289,6 +301,9 @@ impl SessionAgentConfig {
         }
         if self.codex_fork_rollback_position.is_none() {
             self.codex_fork_rollback_position = fallback.codex_fork_rollback_position;
+        }
+        if self.dial.is_none() {
+            self.dial = fallback.dial;
         }
     }
 }
@@ -655,6 +670,9 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
     SessionAgentConfig {
         source,
         project_root: None,
+        // The dial never enters via wire fields: it rides
+        // `AgentLaunchConfig.dial` (owner-signed launch lanes) only.
+        dial: None,
         agent_command,
         codex_model: is_codex
             .then(|| normalize_codex_model(fields.codex_model))
@@ -781,6 +799,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             codex_fork_rollback_turns: None,
             codex_fork_rollback_item_id: None,
             codex_fork_rollback_position: None,
+            dial: None,
         },
         AgentBackend::ClaudeCode => {
             let claude = &project.config.agent.claude_code;
@@ -824,6 +843,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 codex_fork_rollback_turns: None,
                 codex_fork_rollback_item_id: None,
                 codex_fork_rollback_position: None,
+                dial: None,
             }
         }
         AgentBackend::Kimi => {
@@ -865,6 +885,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 codex_fork_rollback_turns: None,
                 codex_fork_rollback_item_id: None,
                 codex_fork_rollback_position: None,
+                dial: None,
             }
         }
         AgentBackend::Pi => {
@@ -990,6 +1011,23 @@ pub fn write_log_dir_config(log_dir: &Path, config: &SessionAgentConfig) -> Resu
         serde_json::to_string_pretty(config).map_err(|e| format!("serialize config: {e}"))?;
     crate::file_watcher::atomic_write(&log_dir.join(SESSION_AGENT_CONFIG_FILE), json.as_bytes())
         .map_err(|e| format!("write session config: {e}"))
+}
+
+/// Read ONLY the dial from a session's overlay, distinguishing "absent"
+/// (no overlay file, or no dial recorded — `Ok(None)`) from "present but
+/// unreadable" (`Err`): the resume/readopt lane logs the unrecoverable
+/// case by name and falls back to the pure-global layer — never a guessed
+/// override.
+pub fn read_log_dir_dial(log_dir: &Path) -> Result<Option<crate::autonomy::DialConfig>, String> {
+    let path = log_dir.join(SESSION_AGENT_CONFIG_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let config: SessionAgentConfig =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    Ok(config.dial.filter(|dial| !dial.is_empty()))
 }
 
 pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
@@ -1721,6 +1759,43 @@ fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AD S1: the dial's durable reader distinguishes absent (no overlay,
+    /// or an overlay without a dial → `Ok(None)`) from present-but-
+    /// unreadable (`Err` — the resume lane's named pure-global fallback);
+    /// forks never inherit the parent's dial through the inheritable-pins
+    /// reduction.
+    #[test]
+    fn dial_overlay_reads_fail_closed_and_forks_never_inherit_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_log_dir_dial(dir.path()).unwrap(), None, "no overlay");
+
+        let dial = crate::autonomy::DialConfig {
+            autonomy: Some(crate::autonomy::AutonomyLevel::High),
+            ..Default::default()
+        };
+        let config = SessionAgentConfig {
+            dial: Some(dial.clone()),
+            ..Default::default()
+        };
+        write_log_dir_config(dir.path(), &config).unwrap();
+        assert_eq!(
+            read_log_dir_dial(dir.path()).unwrap(),
+            Some(dial.clone()),
+            "a dial-only native overlay round-trips"
+        );
+
+        // Corrupt bytes are an ERROR, never a silent None — the caller
+        // logs the named fallback instead of guessing.
+        std::fs::write(dir.path().join(SESSION_AGENT_CONFIG_FILE), b"{ nope").unwrap();
+        let err = read_log_dir_dial(dir.path()).unwrap_err();
+        assert!(err.contains("parse"), "named parse failure: {err}");
+
+        // The fork reduction strips the dial with the other
+        // parent-only facts.
+        let inheritable = config.into_inheritable_launch_pins();
+        assert_eq!(inheritable.dial, None);
+    }
 
     /// The commission's pin: a forked/branched child inherits the
     /// parent's persisted launch pins (model + effort — the 2026-07-27

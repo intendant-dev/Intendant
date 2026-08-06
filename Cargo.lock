@@ -2980,6 +2980,7 @@ dependencies = [
  "if-addrs",
  "presence-core",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "socket2 0.6.2",
