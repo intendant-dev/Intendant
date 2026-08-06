@@ -136,6 +136,7 @@ fn assemble_seat_conclude_facts(
     alias_session_id: Option<&str>,
     limit_park_armed: bool,
     open_side_threads: usize,
+    pending_native_wakeup: bool,
     log_dir: &std::path::Path,
     candidate_session_ids: &[&str],
 ) -> SeatConcludeFacts {
@@ -154,6 +155,7 @@ fn assemble_seat_conclude_facts(
         ),
         limit_park_armed,
         open_side_threads,
+        pending_native_wakeup,
         live_bg_task_park: bg_park_is_live(bg_park.as_ref()),
         occurrence_attested,
     }
@@ -201,7 +203,10 @@ fn emit_seat_conclude(
 /// killed (they were the old process's children —
 /// [`mark_parked_tasks_died_with_restart`] flipped their records and
 /// published the attention state before the shutdown), so the caller's
-/// continuation can carry the re-run offer.
+/// continuation can carry the re-run offer. The same call re-arms a
+/// pending native scheduled wakeup wrapper-side
+/// ([`take_over_native_wakeup_at_respawn`]) — the harness timer dies
+/// with the old process, and the resumed CLI restores none.
 #[allow(clippy::too_many_arguments)]
 async fn apply_backend_credentials_reload(
     backend: &external_agent::AgentBackend,
@@ -357,6 +362,56 @@ async fn respawn_external_backend_in_place(
 /// The named cause stamped on background tasks the credential-reload
 /// respawn kills (see [`mark_parked_tasks_died_with_restart`]).
 pub(crate) const CREDENTIAL_RELOAD_RESTART_CAUSE: &str = "the credential-reload restart";
+
+/// The wake message the supervising loop delivers when a re-armed native
+/// scheduled wakeup fires ([`crate::native_wakeup`]): honest about the
+/// mechanism — the harness's own `ScheduleWakeup` timer died with the
+/// named backend restart and Intendant re-armed it — and carrying the
+/// model's own wake prompt, so the loop the model was pacing continues
+/// as if the harness had fired. Pure; the clock is injected for tests.
+pub(crate) fn native_wakeup_delivery_message(
+    record: &crate::native_wakeup::NativeWakeupRecord,
+    now_epoch: u64,
+) -> FollowUpMessage {
+    let cause = record
+        .rearmed_cause
+        .as_deref()
+        .unwrap_or("a backend restart");
+    let reason = record
+        .reason
+        .as_deref()
+        .map(|r| format!(" Your stated reason for the delay: {r}."))
+        .unwrap_or_default();
+    let prompt = if record.prompt.trim().is_empty() {
+        "(the arm carried no prompt)".to_string()
+    } else {
+        record.prompt.clone()
+    };
+    FollowUpMessage::text(format!(
+        "⏰ Scheduled wakeup ({}). Your ScheduleWakeup timer did not survive {cause}, so \
+         Intendant re-armed it and is delivering the wake itself — re-arm your next wakeup \
+         as usual if you still want the cadence.{reason} Original wakeup prompt:\n{prompt}",
+        crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+    ))
+}
+
+/// Deadline instant for the idle select's native-wakeup arm: the due
+/// time as a tokio instant (an already-due record reads as "now" and the
+/// arm fires immediately). `now` when nothing pends — the arm is
+/// guard-disabled then and the value merely type-checks the disabled
+/// branch, the limit-park arm's exact pattern.
+fn native_wakeup_deadline(
+    pending: &Option<crate::native_wakeup::NativeWakeupRecord>,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    match pending {
+        Some(record) => {
+            let now_epoch = crate::session_activity::epoch_seconds();
+            now + std::time::Duration::from_secs(record.fire_at_epoch.saturating_sub(now_epoch))
+        }
+        None => now,
+    }
+}
 
 /// The follow-up text synthesized when a credential reload's own
 /// interrupt cut a live turn. Resume-attach keeps the conversation
@@ -968,12 +1023,26 @@ pub(crate) async fn run_external_agent_mode(
                 {
                     break FollowUpMessage::text(String::new());
                 }
+                // Pending native scheduled wakeup ([`crate::native_wakeup`]),
+                // peeked per iteration — every drained event re-enters this
+                // loop, so a fresh arm/replace/stop from the backend is
+                // re-read before the next wait. The deadline arm below
+                // retires a harness-owned record whose due time passes with
+                // the backend alive (the harness owns that fire) and
+                // delivers a wrapper-owned one.
+                let pending_native_wakeup = stats
+                    .announced_native_session_id
+                    .as_deref()
+                    .and_then(crate::native_wakeup::pending_for);
                 // Terminal-goodbye conclude (respawn-after-close card
                 // 01KZ0PRYE7…): at the first idle pass after a round, a
                 // seat that honestly finished — occurrence attested,
                 // nothing pending anywhere, no live background tasks —
                 // ends its own row instead of idling as a drain-holding
-                // husk nothing can wake.
+                // husk nothing can wake. A pending native scheduled
+                // wakeup is owed work (the peek above): concluding over
+                // it would kill the very fire the wakeup lane preserves
+                // across respawns, so it blocks the shape.
                 if !seat_conclude_checked {
                     seat_conclude_checked = true;
                     let mut conclude_ids: Vec<&str> = Vec::new();
@@ -999,6 +1068,7 @@ pub(crate) async fn run_external_agent_mode(
                         drain_config.alias_session_id.as_deref(),
                         limit_park.is_some(),
                         open_side_threads.len(),
+                        pending_native_wakeup.is_some(),
                         &log_dir,
                         &conclude_ids,
                     );
@@ -1205,6 +1275,139 @@ pub(crate) async fn run_external_agent_mode(
                             );
                         }
                     }
+                    // Native-wakeup deadline (see the peek above). A
+                    // harness-owned record whose due time passes with the
+                    // backend process alive is retired — the harness owns
+                    // that fire, and a record outliving its moment would
+                    // make a later respawn re-deliver a wake the model
+                    // already got. A wrapper-owned record delivers: the
+                    // wake respawns a confirmed-dead backend first (the
+                    // park-wake pattern above) and queues behind a live
+                    // limit park instead of burning against a rejected
+                    // backend.
+                    _ = tokio::time::sleep_until(
+                        native_wakeup_deadline(&pending_native_wakeup)
+                    ), if pending_native_wakeup.is_some() => {
+                        let record = pending_native_wakeup.expect("branch guarded by is_some");
+                        let session_key = stats
+                            .announced_native_session_id
+                            .clone()
+                            .unwrap_or_default();
+                        let now_epoch = crate::session_activity::epoch_seconds();
+                        if record.rearmed_cause.is_none() {
+                            if !agent.next_round_reads_fresh_credentials() {
+                                // Alive through the deadline: the harness
+                                // owns this fire (its wake turn, if any,
+                                // arrives as ordinary backend activity).
+                                crate::native_wakeup::consume(&session_key);
+                                slog(&session_log, |l| {
+                                    l.debug(
+                                        "Native scheduled wakeup deadline passed with the backend process alive — the harness owns that fire; the wrapper record is retired",
+                                    )
+                                });
+                                slog(&session_log, |l| l.set_native_wakeup(None));
+                                continue;
+                            }
+                            // Confirmed dead with the record still
+                            // harness-owned: this death reached no respawn
+                            // seam (the narrow idle-death window) — take
+                            // the timer over now and deliver below.
+                            take_over_native_wakeup_at_respawn(
+                                &bus,
+                                &session_log,
+                                &live_session_id,
+                                &session_key,
+                                "the backend exit",
+                                now_epoch,
+                            );
+                        }
+                        // Re-take from the registry: the takeover above
+                        // (or an earlier seam's) rewrote the record with
+                        // its wrapper-owned cause — the peeked copy is
+                        // stale.
+                        let Some(record) = crate::native_wakeup::consume(&session_key) else {
+                            continue;
+                        };
+                        if limit_park.is_some() {
+                            let line = format!(
+                                "⏰ The re-armed native scheduled wakeup fired during a park ({}) — queued; it delivers at the park's wake",
+                                crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+                            );
+                            slog(&session_log, |l| l.info(&line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "info".to_string(),
+                                source: "Intendant".to_string(),
+                                content: line,
+                                turn: None,
+                            });
+                            parked_follow_ups
+                                .push_back(native_wakeup_delivery_message(&record, now_epoch));
+                            slog(&session_log, |l| l.set_native_wakeup(None));
+                            continue;
+                        }
+                        if agent.next_round_reads_fresh_credentials() {
+                            match respawn_external_backend_in_place(
+                                &backend,
+                                &project,
+                                web_port,
+                                &intendant_session_id,
+                                &session_agent_config,
+                                &stats,
+                                &mut agent,
+                                &mut event_rx,
+                                &mut drain_config,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    event_channel_open = true;
+                                    let line = format!(
+                                        "The re-armed native wakeup elapsed with the backend gone — respawned {} resume-attached to deliver the wake",
+                                        backend
+                                    );
+                                    slog(&session_log, |l| l.info(&line));
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "info".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: line,
+                                        turn: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let line = format!(
+                                        "The re-armed native wakeup elapsed, but the dead backend could not be respawned: {e}"
+                                    );
+                                    slog(&session_log, |l| l.error(&line));
+                                    let mut died = record.to_meta();
+                                    died.died_cause =
+                                        Some("the failed respawn at the wake".to_string());
+                                    died.died_at_epoch = Some(now_epoch);
+                                    slog(&session_log, |l| {
+                                        l.set_native_wakeup(Some(died))
+                                    });
+                                    bus.send(AppEvent::LoopError(line.clone()));
+                                    stats.terminal_outcome = Some(line);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        let line = format!(
+                            "⏰ Delivering the re-armed native scheduled wakeup ({})",
+                            crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+                        );
+                        slog(&session_log, |l| l.info(&line));
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Intendant".to_string(),
+                            content: line,
+                            turn: None,
+                        });
+                        slog(&session_log, |l| l.set_native_wakeup(None));
+                        break native_wakeup_delivery_message(&record, now_epoch);
+                    }
                     maybe_event = event_rx.recv(), if event_channel_open => {
                         match maybe_event {
                             Some(event) => {
@@ -1396,6 +1599,17 @@ pub(crate) async fn run_external_agent_mode(
                                         bus.send(AppEvent::SessionConfigFacts {
                                             session_id: drain_config.session_id.clone(),
                                             facts,
+                                        });
+                                    }
+                                    // Ambient like ActivityUpdate: the
+                                    // adapter's pending-wakeup statement
+                                    // mirrors into the durable marker and
+                                    // must never open an observe round.
+                                    external_agent::AgentEvent::NativeWakeupMarker {
+                                        marker,
+                                    } => {
+                                        slog(&session_log, |l| {
+                                            l.set_native_wakeup(marker)
                                         });
                                     }
                                     external_agent::AgentEvent::CwdAnnounced { cwd } => {
@@ -2707,6 +2921,11 @@ pub(crate) async fn run_external_agent_mode(
                                         drain_config.alias_session_id.as_deref(),
                                         limit_park.is_some(),
                                         open_side_threads.len(),
+                                        stats
+                                            .announced_native_session_id
+                                            .as_deref()
+                                            .and_then(crate::native_wakeup::pending_for)
+                                            .is_some(),
                                         &log_dir,
                                         &conclude_ids,
                                     );
@@ -5297,6 +5516,46 @@ pub(crate) async fn run_external_agent_mode(
         }
     }
 
+    // The wakeup twin of the park backstop above: the loop is ending with
+    // the session's native scheduled wakeup still on record — the
+    // in-memory registry entry is about to lose the only lane that could
+    // deliver it. Flip the durable marker to its died form (the honest
+    // lost-timer statement: nothing will deliver it, and re-arming is the
+    // resumed session's decision) — except at the daemon-teardown exit,
+    // where the marker survives untouched as the boot pass's trace,
+    // exactly like the limit park's.
+    if let Some(record) = stats
+        .announced_native_session_id
+        .as_deref()
+        .and_then(crate::native_wakeup::consume)
+    {
+        let now_epoch = crate::session_activity::epoch_seconds();
+        let due = crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch);
+        let detail = stats
+            .terminal_outcome
+            .clone()
+            .unwrap_or_else(|| "the session ended".to_string());
+        if daemon_teardown_exit {
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "A native scheduled wakeup ({due}) is still pending at the \
+                     daemon-teardown exit — the durable marker survives for the boot pass"
+                ))
+            });
+        } else {
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "⚠ The session's native scheduled wakeup ({due}) was lost with the \
+                     session end ({detail}) — nothing will deliver it"
+                ))
+            });
+            let mut died = record.to_meta();
+            died.died_cause = Some("the session end".to_string());
+            died.died_at_epoch = Some(now_epoch);
+            slog(&session_log, |l| l.set_native_wakeup(Some(died)));
+        }
+    }
+
     // The supervised span is over: reconcile sub-agent children that never
     // reported a terminal (their processes die with the backend). The
     // reader's own EOF sweep cannot cover this — `shutdown()` below aborts
@@ -5316,6 +5575,105 @@ pub(crate) async fn run_external_agent_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delivered wake is honest about its mechanism and carries the
+    /// model's own prompt — plus the re-arm reminder, since the harness
+    /// timer the model thinks it holds is gone. Empty prompts are said,
+    /// not omitted; an unflipped record names the generic restart.
+    #[test]
+    fn native_wakeup_delivery_message_is_honest_and_carries_the_prompt() {
+        let record = crate::native_wakeup::NativeWakeupRecord {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("watching the queue".into()),
+            tool_use_id: "toolu_wk".into(),
+            rearmed_cause: Some(CREDENTIAL_RELOAD_RESTART_CAUSE.into()),
+        };
+        let message = native_wakeup_delivery_message(&record, 900);
+        assert!(
+            message.text.contains("Scheduled wakeup"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains(CREDENTIAL_RELOAD_RESTART_CAUSE),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("<<autonomous-loop-dynamic>>"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("watching the queue"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("re-arm your next wakeup"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.steer_id.is_none() && message.follow_up_id.is_none(),
+            "no id-keyed cancel matching can drop the wake"
+        );
+
+        let bare = crate::native_wakeup::NativeWakeupRecord {
+            prompt: String::new(),
+            reason: None,
+            rearmed_cause: None,
+            ..record
+        };
+        let message = native_wakeup_delivery_message(&bare, 900);
+        assert!(
+            message.text.contains("(the arm carried no prompt)"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("a backend restart"),
+            "{}",
+            message.text
+        );
+    }
+
+    /// The deadline arm's instant: a future due time sleeps toward it, a
+    /// past one fires immediately, and the disabled branch type-checks
+    /// on "now" (the limit-park arm's exact pattern).
+    #[test]
+    fn native_wakeup_deadline_maps_due_times_to_instants() {
+        let now_epoch = crate::session_activity::epoch_seconds();
+        let record = |fire_at: u64| {
+            Some(crate::native_wakeup::NativeWakeupRecord {
+                armed_at_epoch: now_epoch,
+                fire_at_epoch: fire_at,
+                prompt: "x".into(),
+                reason: None,
+                tool_use_id: "t".into(),
+                rearmed_cause: None,
+            })
+        };
+        let now = tokio::time::Instant::now();
+        let future = native_wakeup_deadline(&record(now_epoch + 600));
+        let remaining = future.duration_since(now);
+        assert!(
+            remaining >= std::time::Duration::from_secs(590)
+                && remaining <= std::time::Duration::from_secs(610),
+            "future due time sleeps toward it ({remaining:?})"
+        );
+        assert!(
+            native_wakeup_deadline(&record(now_epoch.saturating_sub(600))).duration_since(now)
+                < std::time::Duration::from_secs(2),
+            "past due time fires immediately"
+        );
+        assert!(
+            native_wakeup_deadline(&None).duration_since(now) < std::time::Duration::from_secs(2),
+            "disabled branch reads as now"
+        );
+    }
 
     #[test]
     fn idle_cwd_announcement_is_housekeeping_for_the_primary_session() {

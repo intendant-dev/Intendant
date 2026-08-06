@@ -2317,6 +2317,7 @@ mod tests {
                     pick_min: None,
                     pick_max: None,
                     free_text: None,
+                    consequence: None,
                 }]),
                 actor,
             )

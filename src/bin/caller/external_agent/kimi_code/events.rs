@@ -1344,6 +1344,7 @@ impl EventTranslator {
                     pick_max: None,
                     free_text: None,
                     previews: Vec::new(),
+                    consequence: String::new(),
                 })
             })
             .collect::<Vec<_>>();

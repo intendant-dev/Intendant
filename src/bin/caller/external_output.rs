@@ -945,6 +945,7 @@ mod tests {
     fn user_question_preview_inlines_options_and_counts_extras() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which DB?".into(),
                 header: "Database".into(),
                 options: vec![
@@ -964,6 +965,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Auth?".into(),
                 header: String::new(),
                 options: Vec::new(),
@@ -986,6 +988,7 @@ mod tests {
     fn unanswered_question_answers_cover_every_question() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Q1".into(),
                 header: String::new(),
                 options: Vec::new(),
@@ -996,6 +999,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Q2".into(),
                 header: String::new(),
                 options: Vec::new(),

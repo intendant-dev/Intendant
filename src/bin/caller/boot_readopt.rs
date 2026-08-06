@@ -419,21 +419,24 @@ fn scan_midwork_candidates(
     candidates
 }
 
-/// Daemon-restart honesty for parked background tasks (the fourth
+/// Daemon-restart honesty for a dead session's wake sources (the fourth
 /// respawn class): background tasks are OS children of the dead boot's
-/// backend processes, so every task a dead session was parked on died
-/// with that daemon — while the durable bg-park marker
-/// (`SessionMeta::bg_park`) survived, still claiming a live wait.
+/// backend processes and the harness `ScheduleWakeup` timer lived inside
+/// them, so every wake source a dead session was waiting on died with
+/// that daemon — while the durable markers (`SessionMeta::bg_park`,
+/// `SessionMeta::native_wakeup`) survived, still claiming a live wait.
 /// Flip each live marker to its died form under the named cause and
-/// publish the attention snapshot into THIS boot's vitals hub, so no
+/// publish the task attention snapshot into THIS boot's vitals hub, so no
 /// surface (grid chip, drain banner, session card) keeps waiting on a
-/// task that no longer exists. Same walk discipline as
+/// wake that no longer exists. Same walk discipline as
 /// [`scan_midwork_candidates`]: one era predicate parameter, live
 /// wrappers own their own state, unreadable metas skip. Nothing here
-/// re-runs a command — re-running is an owner decision (the session
-/// card's one-tap re-run; readopted candidates additionally get the
-/// offer on the continuation nudge they already receive).
-fn mark_dead_bg_parks(
+/// re-runs a command or re-delivers a wake — re-running is an owner
+/// decision, and the lost-timer note rides the continuation nudge
+/// readopted candidates already receive
+/// ([`readopt_continuation_with_died_wake_sources`]). Returns the count
+/// of sessions whose markers flipped.
+fn mark_dead_wake_sources(
     home: &Path,
     live_wrapper_ids: &HashSet<String>,
     era_keeps: impl Fn(u64) -> bool,
@@ -462,38 +465,62 @@ fn mark_dead_bg_parks(
         if !era_keeps(activity_mtime_secs(&dir)) {
             continue;
         }
-        let Some(park) = meta.bg_park.as_mut() else {
-            continue;
-        };
-        if park.died_cause.is_some() {
-            // Already stamped (an earlier boot's pass, or the wrapper's
-            // own respawn seam) — the first, most specific cause stands.
+        let now_epoch = crate::session_activity::epoch_seconds();
+        // Both wake sources flip in the one walk; an already-stamped
+        // marker (an earlier boot's pass, or the wrapper's own respawn
+        // seam) keeps its first, most specific cause.
+        let mut died_tasks: Option<Vec<String>> = None;
+        if let Some(park) = meta.bg_park.as_mut() {
+            if park.died_cause.is_none() {
+                park.died_cause =
+                    Some(crate::external_supervision::DAEMON_RESTART_CAUSE.to_string());
+                park.died_at_epoch = Some(now_epoch);
+                died_tasks = Some(park.tasks.clone());
+            }
+        }
+        let mut died_wakeup_fire_at: Option<u64> = None;
+        if let Some(wakeup) = meta.native_wakeup.as_mut() {
+            if wakeup.died_cause.is_none() {
+                wakeup.died_cause =
+                    Some(crate::external_supervision::DAEMON_RESTART_CAUSE.to_string());
+                wakeup.died_at_epoch = Some(now_epoch);
+                died_wakeup_fire_at = Some(wakeup.fire_at_epoch);
+            }
+        }
+        if died_tasks.is_none() && died_wakeup_fire_at.is_none() {
             continue;
         }
-        let now_epoch = crate::session_activity::epoch_seconds();
-        park.died_cause = Some(crate::external_supervision::DAEMON_RESTART_CAUSE.to_string());
-        park.died_at_epoch = Some(now_epoch);
-        let tasks = park.tasks.clone();
         let Ok(json) = serde_json::to_string_pretty(&meta) else {
             continue;
         };
         if crate::session_log::write_session_meta_atomic(&dir, &json).is_err() {
             continue;
         }
-        eprintln!(
-            "[readopt] {}: {} background task(s) the session was parked on died with the daemon \
-             restart — marked died-with-restart; nothing is re-run automatically",
-            short_id(&session_id),
-            tasks.len(),
-        );
-        bus.send(AppEvent::SessionActivity {
-            session_id: Some(session_id),
-            activity: crate::external_supervision::died_tasks_attention_activity(
-                tasks,
-                crate::external_supervision::DAEMON_RESTART_CAUSE,
-                now_epoch,
-            ),
-        });
+        if let Some(fire_at) = died_wakeup_fire_at {
+            eprintln!(
+                "[readopt] {}: the session's native scheduled wakeup ({}) died with the \
+                 daemon restart — marked; the readopt continuation carries the lost-timer \
+                 note",
+                short_id(&session_id),
+                crate::native_wakeup::due_phrase(fire_at, now_epoch),
+            );
+        }
+        if let Some(tasks) = died_tasks {
+            eprintln!(
+                "[readopt] {}: {} background task(s) the session was parked on died with the daemon \
+                 restart — marked died-with-restart; nothing is re-run automatically",
+                short_id(&session_id),
+                tasks.len(),
+            );
+            bus.send(AppEvent::SessionActivity {
+                session_id: Some(session_id),
+                activity: crate::external_supervision::died_tasks_attention_activity(
+                    tasks,
+                    crate::external_supervision::DAEMON_RESTART_CAUSE,
+                    now_epoch,
+                ),
+            });
+        }
         marked += 1;
     }
     marked
@@ -718,7 +745,7 @@ pub(crate) fn decide_candidate_with_lens(
         session_id: resume_conversation,
         resume_id: None,
         project_root: project_root.map(|root| root.to_string_lossy().to_string()),
-        task: Some(readopt_continuation_with_died_tasks(
+        task: Some(readopt_continuation_with_died_wake_sources(
             home,
             &candidate.session_id,
             lens,
@@ -737,24 +764,36 @@ pub(crate) fn decide_candidate_with_lens(
 }
 
 /// The lens's continuation nudge, extended with the died-task re-run
-/// OFFER when the restart killed background tasks the candidate was
-/// parked on ([`mark_dead_bg_parks`] stamped the durable marker before
-/// dispatch). The #644 composition law: the offer only ever rides a
-/// nudge the lane already sends — never a minted message — and nothing
-/// here re-executes a command.
-fn readopt_continuation_with_died_tasks(
+/// OFFER and/or the lost-wakeup note when the restart killed wake
+/// sources the candidate was waiting on ([`mark_dead_wake_sources`]
+/// stamped the durable markers before dispatch). The #644 composition
+/// law: the notes only ever ride a nudge the lane already sends — never
+/// a minted message — and nothing here re-executes a command or
+/// re-delivers a wake.
+fn readopt_continuation_with_died_wake_sources(
     home: &Path,
     candidate_id: &str,
     lens: ResumeLens,
 ) -> String {
     let mut text = lens.continuation_text().to_string();
-    if let Some(park) = session_meta_for(home, candidate_id).and_then(|meta| meta.bg_park) {
+    let Some(meta) = session_meta_for(home, candidate_id) else {
+        return text;
+    };
+    if let Some(park) = meta.bg_park {
         if let Some(cause) = park.died_cause.as_deref() {
             if let Some(addendum) =
                 crate::external_supervision::died_tasks_nudge_addendum(&park.tasks, cause)
             {
                 text.push_str(&addendum);
             }
+        }
+    }
+    if let Some(wakeup) = meta.native_wakeup.as_ref() {
+        if let Some(addendum) = crate::external_supervision::died_wakeup_nudge_addendum(
+            wakeup,
+            crate::session_activity::epoch_seconds(),
+        ) {
+            text.push_str(&addendum);
         }
     }
     text
@@ -961,6 +1000,131 @@ mod tests {
         .unwrap();
     }
 
+    fn write_meta_with_native_wakeup(
+        home: &Path,
+        session: &str,
+        status: &str,
+        native_wakeup: serde_json::Value,
+    ) {
+        let dir = logs_root(home).join(session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "session_id": session,
+            "created_at": "2026-07-28T00:00:00",
+            "status": status,
+            "native_wakeup": native_wakeup,
+        });
+        std::fs::write(
+            dir.join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The daemon-restart lost-timer pin (the "otherwise" branch of the
+    /// ScheduleWakeup respawn variant): a dead-boot session's pending
+    /// native-wakeup marker — live OR re-armed form — flips to its died
+    /// form under the daemon-restart cause; live wrappers, this boot's
+    /// era, and already-died markers stay untouched, and nothing
+    /// re-delivers a wake at boot (the lost-timer note rides the readopt
+    /// continuation instead).
+    #[test]
+    fn boot_pass_marks_dead_boot_native_wakeups_died() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-dead",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "<<autonomous-loop-dynamic>>",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-rearmed-dead",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "carry on",
+                "rearmed_cause": "the credential-reload restart",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-live-wrapper",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "still mine",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-already-died",
+            "idle",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "old wake",
+                "died_cause": "the session end",
+                "died_at_epoch": 200,
+            }),
+        );
+        let bus = crate::event::EventBus::new();
+        let mut events = bus.subscribe();
+        let mut live = HashSet::new();
+        live.insert("sess-wakeup-live-wrapper".to_string());
+
+        let marked = mark_dead_wake_sources(home.path(), &live, |_| true, &bus);
+        assert_eq!(marked, 2, "the two dead pending wakeups mark");
+
+        let wakeup_of = |session: &str| -> crate::session_log::SessionNativeWakeupMeta {
+            serde_json::from_str::<SessionMeta>(
+                &std::fs::read_to_string(
+                    logs_root(home.path())
+                        .join(session)
+                        .join("session_meta.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .native_wakeup
+            .expect("marker present")
+        };
+        assert_eq!(
+            wakeup_of("sess-wakeup-dead").died_cause.as_deref(),
+            Some(crate::external_supervision::DAEMON_RESTART_CAUSE)
+        );
+        let rearmed = wakeup_of("sess-wakeup-rearmed-dead");
+        assert_eq!(
+            rearmed.died_cause.as_deref(),
+            Some(crate::external_supervision::DAEMON_RESTART_CAUSE),
+            "a wrapper-owned re-arm dies with the daemon that owned it"
+        );
+        assert_eq!(
+            rearmed.rearmed_cause.as_deref(),
+            Some("the credential-reload restart"),
+            "the re-arm history stays readable"
+        );
+        assert!(
+            wakeup_of("sess-wakeup-live-wrapper").died_cause.is_none(),
+            "live wrappers own their own state"
+        );
+        assert_eq!(
+            wakeup_of("sess-wakeup-already-died").died_cause.as_deref(),
+            Some("the session end"),
+            "the first, most specific cause stands"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no bus emission for wakeup flips — the note rides the readopt nudge"
+        );
+    }
+
     /// The daemon-restart respawn class: a dead-boot session parked on
     /// background tasks (idle meta, live bg-park marker — NEVER a
     /// readopt candidate) gets its marker flipped to died-with-restart
@@ -996,7 +1160,7 @@ mod tests {
         let mut live = HashSet::new();
         live.insert("sess-live-wrapper".to_string());
 
-        let marked = mark_dead_bg_parks(home.path(), &live, |_| true, &bus);
+        let marked = mark_dead_wake_sources(home.path(), &live, |_| true, &bus);
         assert_eq!(marked, 1, "exactly the dead parked session marks");
 
         let park_of = |session: &str| -> crate::session_log::SessionBgParkMeta {
@@ -1059,7 +1223,7 @@ mod tests {
             serde_json::json!({ "tasks": ["fresh work"] }),
         );
         assert_eq!(
-            mark_dead_bg_parks(home.path(), &live, |_| false, &bus),
+            mark_dead_wake_sources(home.path(), &live, |_| false, &bus),
             0,
             "the era predicate gates everything"
         );
@@ -1082,7 +1246,7 @@ mod tests {
                 "died_at_epoch": 100,
             }),
         );
-        let text = readopt_continuation_with_died_tasks(
+        let text = readopt_continuation_with_died_wake_sources(
             home.path(),
             "sess-died-park",
             ResumeLens::MidWork,
@@ -1098,7 +1262,7 @@ mod tests {
             serde_json::json!({ "tasks": ["still running elsewhere"] }),
         );
         assert_eq!(
-            readopt_continuation_with_died_tasks(
+            readopt_continuation_with_died_wake_sources(
                 home.path(),
                 "sess-live-park",
                 ResumeLens::MidWork
@@ -1107,9 +1271,63 @@ mod tests {
             "a live park adds nothing"
         );
         assert_eq!(
-            readopt_continuation_with_died_tasks(home.path(), "sess-absent", ResumeLens::MidWork),
+            readopt_continuation_with_died_wake_sources(
+                home.path(),
+                "sess-absent",
+                ResumeLens::MidWork
+            ),
             READOPT_CONTINUATION_TEXT,
             "no meta, no addendum"
+        );
+    }
+
+    /// The lost-wakeup note rides the same nudge: a died native-wakeup
+    /// marker appends the honest lost-timer note with the model's own
+    /// wake prompt; a still-pending marker adds nothing (its wake is
+    /// owed, not lost).
+    #[test]
+    fn readopt_continuation_carries_the_lost_wakeup_note() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-died-wakeup",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "<<autonomous-loop-dynamic>>",
+                "died_cause": "the daemon restart",
+                "died_at_epoch": 900,
+            }),
+        );
+        let text = readopt_continuation_with_died_wake_sources(
+            home.path(),
+            "sess-died-wakeup",
+            ResumeLens::MidWork,
+        );
+        assert!(text.starts_with(READOPT_CONTINUATION_TEXT), "{text}");
+        assert!(text.contains("native scheduled wakeup"), "{text}");
+        assert!(text.contains("the daemon restart"), "{text}");
+        assert!(text.contains("<<autonomous-loop-dynamic>>"), "{text}");
+
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-pending-wakeup",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "still owed",
+            }),
+        );
+        assert_eq!(
+            readopt_continuation_with_died_wake_sources(
+                home.path(),
+                "sess-pending-wakeup",
+                ResumeLens::MidWork
+            ),
+            READOPT_CONTINUATION_TEXT,
+            "a pending wake is owed, not lost — no note"
         );
     }
 
@@ -2185,7 +2403,7 @@ pub(crate) async fn run_boot_readopt_pass(
     // tasks get their died-with-restart marking whether or not they
     // become candidates below (a parked-only session never does — its
     // meta reads idle — and exactly that shape was the forever-park).
-    mark_dead_bg_parks(
+    mark_dead_wake_sources(
         &home,
         &live,
         |activity_secs| activity_secs < watershed,
@@ -2659,7 +2877,7 @@ async fn run_released_readopt_pass(
     // predecessor's backend processes took their background children
     // with them, and a released parked-only session never becomes a
     // candidate below.
-    mark_dead_bg_parks(
+    mark_dead_wake_sources(
         home,
         live,
         |activity_secs| activity_secs <= released_before_secs,

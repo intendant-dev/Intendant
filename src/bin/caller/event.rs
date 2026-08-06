@@ -1500,6 +1500,14 @@ pub struct AgentLaunchConfig {
     pub codex_context_archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_service_tier: Option<String>,
+    /// Session-dial override layer (Track AD S1): typed, owner-signed,
+    /// sticky for the session's life. Backend-neutral — it governs the
+    /// daemon-side decision points (autonomy level, per-category approval
+    /// rules under the live global deny floor, notify ceiling, ask grade),
+    /// so it applies to internal and external sessions alike. `None`
+    /// inherits the live global layer per knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<crate::autonomy::DialConfig>,
 }
 
 impl AgentLaunchConfig {
@@ -1530,6 +1538,7 @@ impl AgentLaunchConfig {
             codex_managed_context,
             codex_context_archive,
             codex_service_tier,
+            dial,
         } = self;
         agent.is_none()
             && agent_command.is_none()
@@ -1552,6 +1561,10 @@ impl AgentLaunchConfig {
             && codex_managed_context.is_none()
             && codex_context_archive.is_none()
             && codex_service_tier.is_none()
+            // A dial-bearing config is NON-empty even when the dial itself
+            // is all-None: the hosted-control action wall keys on this, and
+            // an unexpected `dial` key must fail closed, not slip through.
+            && dial.is_none()
     }
 }
 
@@ -2112,6 +2125,11 @@ pub enum ControlMsg {
         /// normal. Only applies when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_service_tier: Option<String>,
+        /// Optional session-dial override layer (`AgentLaunchConfig::dial`):
+        /// typed autonomy/ask/approvals/notify knobs, owner-signed and
+        /// sticky for this session's life. Backend-neutral.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dial: Option<crate::autonomy::DialConfig>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.
@@ -5149,6 +5167,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             id: 5,
             questions: vec![crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which DB?".into(),
                 header: "Database".into(),
                 options: vec![crate::types::UserQuestionOption {
@@ -5414,6 +5433,7 @@ mod tests {
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_service_tier: Some("priority".to_string()),
+                dial: None,
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -5721,6 +5741,7 @@ mod tests {
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
+                dial,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -5731,6 +5752,7 @@ mod tests {
                 hosted_lease_id,
             } => {
                 assert_eq!(task, "fix bug");
+                assert!(dial.is_none());
                 assert!(claude_model.is_none());
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_effort.is_none());
@@ -6204,6 +6226,51 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["claude_effort"], "max", "flat on the wire: {json}");
         assert_eq!(value.get("launch_config"), None, "never nested: {json}");
+    }
+
+    /// AD S1 pin (M1's action-wall sub-ruling): a dial-bearing launch
+    /// config is NON-empty — even when the dial object itself carries no
+    /// knobs — so the hosted-control action wall's `is_empty` pins refuse
+    /// it fail-closed instead of letting an unexamined `dial` key slip
+    /// through. The dial's typed vocabulary also refuses unknown words on
+    /// the StartTask wire.
+    #[test]
+    fn dial_bearing_launch_config_is_nonempty() {
+        assert!(AgentLaunchConfig::default().is_empty());
+        let mut config = AgentLaunchConfig {
+            dial: Some(crate::autonomy::DialConfig::default()),
+            ..Default::default()
+        };
+        assert!(
+            !config.is_empty(),
+            "even an all-None dial makes the config non-empty at the wall"
+        );
+        config.dial = Some(crate::autonomy::DialConfig {
+            autonomy: Some(crate::autonomy::AutonomyLevel::Full),
+            ..Default::default()
+        });
+        assert!(!config.is_empty());
+
+        // The dial rides StartTask as one nested `dial` key beside the
+        // flat launch fields, with the closed typed vocabulary.
+        let framed = r#"{"action":"start_task","task":"run it","dial":{"autonomy":"full","notify":"quiet"}}"#;
+        let parsed: ControlMsg = serde_json::from_str(framed).unwrap();
+        let ControlMsg::StartTask { launch_config, .. } = &parsed else {
+            panic!("expected StartTask");
+        };
+        assert!(!launch_config.is_empty());
+        let dial = launch_config.dial.as_ref().unwrap();
+        assert_eq!(dial.autonomy, Some(crate::autonomy::AutonomyLevel::Full));
+        assert_eq!(dial.notify, Some(crate::autonomy::NotifyAppetite::Quiet));
+        // A dial-less frame re-serializes with no dial key (byte-stable
+        // legacy wire), and unknown dial words refuse the whole frame.
+        let legacy: ControlMsg =
+            serde_json::from_str(r#"{"action":"start_task","task":"run it"}"#).unwrap();
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("\"dial\""));
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"start_task","task":"run it","dial":{"autonomy":"maximum"}}"#
+        )
+        .is_err());
     }
 
     #[test]

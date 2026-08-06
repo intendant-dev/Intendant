@@ -405,6 +405,7 @@ impl SessionSupervisor {
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
+                dial,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -443,6 +444,7 @@ impl SessionSupervisor {
                     codex_managed_context,
                     codex_context_archive,
                     codex_service_tier,
+                    dial,
                 };
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
@@ -1284,6 +1286,7 @@ mod tests {
             codex_managed_context: None,
             codex_context_archive: None,
             codex_service_tier: None,
+            dial: None,
             orchestrate: None,
             direct: Some(true),
             reference_frame_ids: vec![],
@@ -2345,6 +2348,7 @@ mod tests {
                 codex_managed_context: None,
                 codex_context_archive: None,
                 codex_service_tier: None,
+                dial: None,
                 orchestrate: None,
                 direct: Some(true),
                 reference_frame_ids: vec![],
@@ -2385,6 +2389,173 @@ mod tests {
         assert_eq!(created.claude_model.as_deref(), Some("haiku"));
         assert_eq!(created.claude_permission_mode.as_deref(), Some("plan"));
         assert_eq!(created.claude_effort.as_deref(), Some("max"));
+    }
+
+    /// AD S1 pin (M3's durability): a spawn with a dial records the
+    /// override in the live autonomy map AND persists it in the session's
+    /// overlay; after the in-memory layer is wiped (a daemon restart),
+    /// resume re-attaches the dial from the durable overlay — the lane
+    /// boot-readopt rides — and an unrecoverable overlay falls back to
+    /// pure-global (never a guessed override).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readopted_session_keeps_its_dial() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(project_dir.path().to_path_buf(), bus.clone());
+        let dial = crate::autonomy::DialConfig {
+            autonomy: Some(crate::autonomy::AutonomyLevel::Full),
+            notify: Some(crate::autonomy::NotifyAppetite::Quiet),
+            ..Default::default()
+        };
+        supervisor
+            .handle_control_msg(event::ControlMsg::StartTask {
+                session_id: None,
+                task: "carry the dial".to_string(),
+                orchestrate: None,
+                direct: Some(true),
+                project_root: None,
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+                session_name: None,
+                launch_config: event::AgentLaunchConfig {
+                    agent: Some("claude-code".to_string()),
+                    agent_command: Some(UNSPAWNABLE.to_string()),
+                    dial: Some(dial.clone()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Spawn persisted the dial durably…
+        let persisted = sole_session_agent_config(&supervisor).await;
+        assert_eq!(
+            persisted.dial.as_ref(),
+            Some(&dial),
+            "the overlay is the dial's durable record"
+        );
+        // …and recorded it on the live autonomy state under the session id.
+        let session_id = {
+            let autonomy = supervisor.config.autonomy.read().await;
+            let mut ids: Vec<String> = autonomy.session_dials.keys().cloned().collect();
+            assert_eq!(ids.len(), 1, "exactly the launched session carries a dial");
+            ids.remove(0)
+        };
+        assert_eq!(
+            supervisor
+                .config
+                .autonomy
+                .read()
+                .await
+                .effective_level(Some(&session_id)),
+            crate::autonomy::AutonomyLevel::Full
+        );
+
+        // A daemon restart loses the in-memory layer but not the overlay.
+        // The honest restart shape is a FRESH supervisor over the SAME
+        // logs home (empty registry, default autonomy state) — the shape
+        // boot-readopt's ResumeSession lands on.
+        let home = supervisor
+            .config
+            .logs_home_override
+            .clone()
+            .expect("test supervisor has a hermetic logs home");
+        let restarted_supervisor = |home: std::path::PathBuf| {
+            let mut config = (*test_supervisor(project_dir.path().to_path_buf(), EventBus::new())
+                .config)
+                .clone();
+            config.logs_home_override = Some(home);
+            SessionSupervisor::new(config)
+        };
+        let resume_msg = || event::ControlMsg::ResumeSession {
+            source: "claude-code".to_string(),
+            session_id: session_id.clone(),
+            resume_id: None,
+            project_root: None,
+            task: None,
+            direct: None,
+            attachments: vec![],
+            fork: false,
+            relationship_kind: None,
+            auto_attach: false,
+            agent_command: Some(UNSPAWNABLE.to_string()),
+            codex_sandbox: None,
+            codex_approval_policy: None,
+            codex_managed_context: None,
+            codex_context_archive: None,
+        };
+
+        let restarted = restarted_supervisor(home.clone());
+        restarted.handle_control_msg(resume_msg()).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if restarted
+                .config
+                .autonomy
+                .read()
+                .await
+                .session_dial(Some(&session_id))
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the resumed session never re-attached its dial"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            restarted
+                .config
+                .autonomy
+                .read()
+                .await
+                .effective_notify(Some(&session_id)),
+            crate::autonomy::NotifyAppetite::Quiet,
+            "the whole dial re-attaches, not just the level"
+        );
+
+        // The unrecoverable case: a corrupt overlay falls back to
+        // pure-global by name — no guessed override. Another fresh
+        // restart over the same home, now with unreadable bytes.
+        let overlay = crate::platform::intendant_home_in(&home)
+            .join("logs")
+            .join(&session_id)
+            .join(crate::session_config::SESSION_AGENT_CONFIG_FILE);
+        std::fs::write(&overlay, b"{ not json").unwrap();
+        let restarted_again = restarted_supervisor(home.clone());
+        restarted_again.handle_control_msg(resume_msg()).await;
+        // Completion marker (non-vacuous negative): the resume rewrites
+        // the overlay with the effective config before spawning, so wait
+        // until the corrupt bytes were replaced by valid JSON, then
+        // assert no override was guessed — pure-global only.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let healed = std::fs::read_to_string(&overlay)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some();
+            if healed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the corrupt-overlay resume never completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let autonomy = restarted_again.config.autonomy.read().await;
+        assert!(
+            autonomy.session_dials.is_empty(),
+            "an unreadable overlay must fall back to pure-global, never a guess"
+        );
+        assert_eq!(
+            autonomy.effective_level(Some(&session_id)),
+            crate::autonomy::AutonomyLevel::Medium
+        );
     }
 
     /// The effort resolution chain at the shared launch path, per backend:
