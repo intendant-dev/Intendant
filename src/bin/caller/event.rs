@@ -6762,6 +6762,50 @@ mod tests {
     }
 
     #[test]
+    fn capacity_gate_matrix_is_the_strict_create_subset() {
+        // (wire json, creates_session, creates_additional_session):
+        // the capacity gate governs exactly the additional-session
+        // subset — the resume family stays exempt, in-flight work is
+        // never classified. An additional-creator must also be a
+        // creator (the subset invariant).
+        let matrix = [
+            (r#"{"action":"create_session","task":"t"}"#, true, true),
+            (r#"{"action":"start_task","task":"t"}"#, true, true),
+            (
+                r#"{"action":"fork_session_at_anchor","source":"intendant","session_id":"s","anchor":{"kind":"head"}}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+                true,
+                false,
+            ),
+            (
+                r#"{"action":"restart_session","source":"intendant","session_id":"s"}"#,
+                true,
+                false,
+            ),
+            (r#"{"action":"start_task","task":"t","session_id":"s"}"#, false, false),
+            (r#"{"action":"follow_up","session_id":"s","text":"t"}"#, false, false),
+            (r#"{"action":"interrupt","session_id":"s"}"#, false, false),
+        ];
+        for (json, creates, additional) in matrix {
+            let msg: ControlMsg = serde_json::from_str(json).unwrap();
+            assert_eq!(msg.creates_session(), creates, "creates_session: {json}");
+            assert_eq!(
+                msg.creates_additional_session(),
+                additional,
+                "creates_additional_session: {json}"
+            );
+            assert!(
+                !msg.creates_additional_session() || msg.creates_session(),
+                "additional ⊂ creates: {json}"
+            );
+        }
+    }
+
+    #[test]
     fn outbound_autonomy_changed() {
         let event = AppEvent::AutonomyChanged {
             autonomy: "High".to_string(),

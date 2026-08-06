@@ -2695,6 +2695,65 @@ mod tests {
     /// immediate — on a fresh governor and equally once the previous
     /// start's interval has fully elapsed.
     #[tokio::test]
+    async fn capacity_hold_keeps_due_occurrences_undispatched_and_unjournaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_project = tempfile::tempdir().unwrap();
+        let handle = handle_with_default_project(dir.path(), default_project.path());
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let now = now_ms();
+        let due = SpawnOccurrence {
+            occurrence_id: "occ-capacity-hold".to_string(),
+            item_id: "item-1".to_string(),
+            effect_id: "effect-1".to_string(),
+            goal: "held work".to_string(),
+            orchestrate: false,
+            fire_at_ms: now - 60_000,
+            approved_at_ms: now - 60_000,
+            recurring: false,
+            interactive: false,
+            attempt: 0,
+            project_root: None,
+            agent_config: None,
+            provenance_session_id: None,
+            matched_item_ids: Vec::new(),
+            binding_refs: Vec::new(),
+            session_name: None,
+        };
+
+        let mut rx = handle.bus().subscribe();
+        // The level limiter: while admissions defer, even a solo due
+        // holds — nothing dispatched, nothing journaled (it stays due
+        // for the next pass), and the wake is the hold re-check.
+        let wake = dispatch_governed(
+            &handle,
+            &mut journal,
+            &mut state,
+            vec![due.clone()],
+            now,
+            true,
+        );
+        assert_eq!(wake, Some(now + CAPACITY_HOLD_RECHECK_MS));
+        assert!(
+            drain_start_tasks(&mut rx).is_empty(),
+            "a capacity-held occurrence must not dispatch"
+        );
+        assert!(
+            state.awaiting.is_empty() && state.running.is_empty(),
+            "a held occurrence is not in flight"
+        );
+
+        // Headroom returns: the same occurrence dispatches normally.
+        let wake = dispatch_governed(&handle, &mut journal, &mut state, vec![due], now, false);
+        assert_eq!(wake, None, "a solo fire never waits once released");
+        assert_eq!(
+            drain_start_tasks(&mut rx).len(),
+            1,
+            "the held occurrence fires when headroom returns"
+        );
+    }
+
+    #[tokio::test]
     async fn solo_due_dispatches_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let default_project = tempfile::tempdir().unwrap();

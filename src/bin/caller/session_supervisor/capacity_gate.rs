@@ -346,3 +346,323 @@ fn epoch_ms_now() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::EventBus;
+    use crate::session_supervisor::tests::{managed_session, test_supervisor_config};
+
+    fn supervisor_with_bound(
+        project: &std::path::Path,
+        bus: EventBus,
+        bound: usize,
+    ) -> SessionSupervisor {
+        let mut config = test_supervisor_config(project.to_path_buf(), bus);
+        config.capacity = Some(capacity::CapacityController::new(bound));
+        SessionSupervisor::new(config)
+    }
+
+    async fn occupy_slot(supervisor: &SessionSupervisor, id: &str) {
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .insert(id.to_string(), managed_session(id, "intendant"));
+    }
+
+    /// Refusal/queue honesty at the funnel: at the bound, an undelegated
+    /// create queues with a named position; forks and delegation-tagged
+    /// fires refuse with the stable prefix naming the bound and count;
+    /// in-flight-work intents and the resume family pass the gate.
+    #[tokio::test]
+    async fn at_bound_creates_queue_and_forks_refuse_with_the_facts() {
+        let project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = supervisor_with_bound(project.path(), bus, 1);
+        occupy_slot(&supervisor, "s-holder").await;
+
+        supervisor
+            .handle_control_msg(
+                serde_json::from_str(r#"{"action":"create_session","task":"queued work"}"#)
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(
+            supervisor.state.lock().await.capacity_queue.len(),
+            1,
+            "an undelegated create at the bound queues"
+        );
+
+        let refusing = [
+            r#"{"action":"fork_session_at_anchor","source":"intendant","session_id":"s-holder","anchor":{"kind":"head"}}"#,
+            r#"{"action":"start_task","task":"t","delegation_id":"d-fresh"}"#,
+        ];
+        for json in refusing {
+            supervisor
+                .handle_control_msg(serde_json::from_str(json).unwrap())
+                .await;
+        }
+
+        let mut refusals = Vec::new();
+        let mut queued_notices = 0;
+        let mut capacity_events = 0;
+        while let Ok(event) = rx.try_recv() {
+            match &event {
+                AppEvent::LoopError(message) => refusals.push(message.clone()),
+                AppEvent::LogEntry { content, .. }
+                    if content.contains("queued at position 1") =>
+                {
+                    queued_notices += 1;
+                }
+                AppEvent::CapacityState { .. } => capacity_events += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(queued_notices, 1, "the queue notice names position 1");
+        assert!(capacity_events >= 1, "queue/refusal changes broadcast the view");
+        assert_eq!(refusals.len(), 2, "fork + delegated start refuse: {refusals:?}");
+        for refusal in &refusals {
+            assert!(
+                refusal.starts_with(capacity::CAPACITY_REFUSAL_PREFIX),
+                "stable refusal prefix: {refusal}"
+            );
+            assert!(refusal.contains("1 of 1"), "names the bound: {refusal}");
+        }
+
+        // The resume family and targeted work pass the gate (their arms
+        // then narrate unknown test sessions — never a capacity refusal).
+        let serving = [
+            r#"{"action":"resume_session","source":"intendant","session_id":"missing"}"#,
+            r#"{"action":"restart_session","source":"intendant","session_id":"missing"}"#,
+            r#"{"action":"start_task","task":"t","session_id":"missing"}"#,
+        ];
+        for json in serving {
+            supervisor
+                .handle_control_msg(serde_json::from_str(json).unwrap())
+                .await;
+        }
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::LoopError(message) = &event {
+                assert!(
+                    !message.starts_with(capacity::CAPACITY_REFUSAL_PREFIX),
+                    "resumes/targeted work must never hit the capacity gate: {message}"
+                );
+            }
+        }
+        assert_eq!(
+            supervisor.state.lock().await.capacity_queue.len(),
+            1,
+            "nothing else joined the queue"
+        );
+    }
+
+    /// The queued-fire arc: a create queued at the bound re-enters the
+    /// intake when the slot frees — deterministic via the launch gate
+    /// (the held body proves the admission fired without a provider).
+    #[tokio::test]
+    async fn queued_admission_fires_when_the_slot_frees() {
+        let project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let mut config = test_supervisor_config(project.path().to_path_buf(), bus.clone());
+        config.capacity = Some(capacity::CapacityController::new(1));
+        config.launch_gate_for_tests = Some(gate_rx);
+        let supervisor = SessionSupervisor::new(config);
+        occupy_slot(&supervisor, "s-holder").await;
+
+        supervisor
+            .handle_control_msg(
+                serde_json::from_str(r#"{"action":"create_session","task":"queued work"}"#)
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(supervisor.state.lock().await.capacity_queue.len(), 1);
+        assert_eq!(
+            supervisor.exec.pending_route_count(),
+            0,
+            "a queued admission holds in the capacity queue, not the intake"
+        );
+
+        // Slot frees; the drain re-enters the intake with the original
+        // reservation and the launch body holds at the test gate.
+        supervisor.state.lock().await.sessions.clear();
+        supervisor.drain_capacity_queue().await;
+        assert_eq!(
+            supervisor.state.lock().await.capacity_queue.len(),
+            0,
+            "headroom fires the queued admission"
+        );
+        assert_eq!(
+            supervisor.exec.pending_route_count(),
+            1,
+            "the released create is a live intake body"
+        );
+    }
+
+    /// Fail-open at the gate itself: without a controller every creating
+    /// intent passes untouched (pre-slice behavior).
+    #[tokio::test]
+    async fn gate_passes_everything_without_a_controller() {
+        let project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let supervisor = SessionSupervisor::new(test_supervisor_config(
+            project.path().to_path_buf(),
+            bus,
+        ));
+        occupy_slot(&supervisor, "s-1").await;
+        occupy_slot(&supervisor, "s-2").await;
+        let creating = [
+            r#"{"action":"create_session","task":"t"}"#,
+            r#"{"action":"start_task","task":"t"}"#,
+            r#"{"action":"fork_session_at_anchor","source":"intendant","session_id":"s-1","anchor":{"kind":"head"}}"#,
+        ];
+        for json in creating {
+            let msg: event::ControlMsg = serde_json::from_str(json).unwrap();
+            assert!(
+                supervisor.capacity_gate(msg, None).await.is_some(),
+                "no controller ⇒ no gate: {json}"
+            );
+        }
+    }
+
+    /// Sub-agent honesty: at the bound the spawn refuses synchronously
+    /// with the stable prefix (the parent adapts; nothing queues).
+    #[tokio::test]
+    async fn sub_agent_spawn_refuses_at_the_bound() {
+        let project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let supervisor = supervisor_with_bound(project.path(), bus, 1);
+        occupy_slot(&supervisor, "s-parent").await;
+        let parent_project = crate::project::Project::from_root(
+            project.path().to_path_buf(),
+        )
+        .expect("test project");
+        let result = supervisor
+            .start_sub_agent_session_inner(
+                "s-parent",
+                &parent_project,
+                0,
+                SubAgentSpawnParams {
+                    task: "child work".to_string(),
+                    role: crate::sub_agent::SubAgentRole::Implementation,
+                    system_prompt: None,
+                    backend: None,
+                    worktree: false,
+                    name: None,
+                },
+            )
+            .await;
+        let Err(refusal) = result else {
+            panic!("at the bound the spawn must refuse");
+        };
+        assert!(
+            refusal.starts_with(capacity::CAPACITY_REFUSAL_PREFIX),
+            "stable prefix: {refusal}"
+        );
+        assert!(refusal.contains("1 of 1"), "names the bound: {refusal}");
+    }
+
+    /// The park census: under the park stage the longest-idle idle root
+    /// gains the honest mark; activity (phase no longer idle) releases
+    /// it, and easing below park releases everything. Unix-gated only
+    /// for the directory-mtime backdating.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn park_census_marks_idle_roots_and_releases_on_activity_or_ease() {
+        let project = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let supervisor = supervisor_with_bound(project.path(), bus, 8);
+        let controller = supervisor.config.capacity.clone().unwrap();
+
+        // An idle root whose session dir last changed beyond the park
+        // idle floor.
+        let session_dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now()
+            - (capacity::PARK_IDLE_MIN + std::time::Duration::from_secs(60));
+        std::fs::File::open(session_dir.path())
+            .and_then(|dir| dir.set_modified(old))
+            .expect("backdate dir mtime");
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("s-idle", "intendant");
+            session.session_dir = session_dir.path().to_path_buf();
+            state.sessions.insert("s-idle".to_string(), session);
+        }
+
+        let t0 = std::time::Instant::now();
+        let pressured = intendant_platform::memory::MemorySample {
+            total_bytes: 16 * 1024 * 1024 * 1024,
+            available_bytes: None,
+            os_pressure_level: Some(4),
+            compressor_frac: None,
+            psi_some_avg10: None,
+            psi_full_avg10: None,
+            load_percent: None,
+        };
+        controller.observe(Some(pressured), t0);
+        supervisor.capacity_park_sweep().await;
+        assert!(
+            supervisor
+                .state
+                .lock()
+                .await
+                .capacity_parked
+                .contains("s-idle"),
+            "park stage marks the long-idle root"
+        );
+
+        // The owner speaks to it (phase leaves idle) — the mark releases
+        // even while the stage stays park.
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .get_mut("s-idle")
+            .unwrap()
+            .phase = "running".to_string();
+        supervisor.capacity_park_sweep().await;
+        assert!(
+            supervisor.state.lock().await.capacity_parked.is_empty(),
+            "activity releases the park mark"
+        );
+
+        // Back to idle: parked again while the stage holds.
+        supervisor
+            .state
+            .lock()
+            .await
+            .sessions
+            .get_mut("s-idle")
+            .unwrap()
+            .phase = String::new();
+        supervisor.capacity_park_sweep().await;
+        assert!(
+            supervisor
+                .state
+                .lock()
+                .await
+                .capacity_parked
+                .contains("s-idle")
+        );
+
+        // Ease past the dwell: everything releases.
+        let normal = intendant_platform::memory::MemorySample {
+            os_pressure_level: Some(1),
+            ..pressured
+        };
+        controller.observe(Some(normal), t0 + std::time::Duration::from_secs(1));
+        controller.observe(
+            Some(normal),
+            t0 + std::time::Duration::from_secs(1) + capacity::EASE_DWELL,
+        );
+        supervisor.capacity_park_sweep().await;
+        assert!(
+            supervisor.state.lock().await.capacity_parked.is_empty(),
+            "easing below park releases every mark"
+        );
+    }
+}

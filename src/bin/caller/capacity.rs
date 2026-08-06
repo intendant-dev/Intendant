@@ -652,7 +652,11 @@ mod tests {
     fn probe_unavailable_fails_open_and_keeps_the_count_bound() {
         let controller = CapacityController::new(2);
         let t0 = Instant::now();
-        let view = controller.observe(None, t0).expect("first observation publishes");
+        assert!(
+            controller.observe(None, t0).is_none(),
+            "probe-less normal is the initial view — no change to publish"
+        );
+        let view = controller.view();
         assert_eq!(view.stage, CapacityStage::Normal);
         assert!(!view.probe_ok);
         assert!(view.sample.is_none());

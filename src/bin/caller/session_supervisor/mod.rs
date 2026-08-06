@@ -1373,6 +1373,10 @@ mod tests {
             claude_rewind_capability_for_tests: None,
             agenda: None,
             handover: None,
+            // Hermetic fail-open default: no capacity controller — the
+            // gate, queue, park census, and monitor are all no-ops
+            // (every pre-slice supervisor test runs unchanged under it).
+            capacity: None,
         }
     }
 
