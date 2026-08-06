@@ -996,6 +996,58 @@ function ui2FuelChipSync() {
     + (best.kind ? ` (${best.kind})` : '') + '. Display only.';
 }
 
+// Capacity chip: the daemon's memory-headroom stage + admission census
+// (`capacity_state` events; cached for late joiners daemon-side). Shown
+// only while there is something to say — a stage above normal, queued
+// admissions, or parked sessions; a healthy daemon keeps the bar clean.
+// The probe-absent state rides the tooltip: stage stays normal by
+// fail-open, and pretending that is a measurement would be the lie.
+function applyCapacityState(d) {
+  if (!d || typeof d !== 'object' || !d.view) return;
+  globalThis.__capacityState = d.view;
+  try { ui2CapacityChipSync(); } catch { /* chrome not mounted yet */ }
+}
+
+function ui2CapacityChipSync() {
+  const bar = document.getElementById('ui2-oversight');
+  if (!bar) return;
+  let chip = document.getElementById('ui2-capacity-chip');
+  const view = globalThis.__capacityState;
+  const stage = view && typeof view.stage === 'string' ? view.stage : 'normal';
+  const queued = view ? Number(view.queued || 0) : 0;
+  const parked = view ? Number(view.parked_count || 0) : 0;
+  const show = !!view && (stage !== 'normal' || queued > 0 || parked > 0);
+  if (!show) {
+    if (chip) chip.hidden = true;
+    return;
+  }
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'ui2-capacity-chip';
+    chip.className = 'ui2-capacity-chip';
+    const conn = document.getElementById('ui2-conn');
+    if (conn && conn.parentElement === bar) bar.insertBefore(chip, conn);
+    else bar.appendChild(chip);
+  }
+  chip.hidden = false;
+  chip.dataset.stage = stage;
+  const parts = [`capacity · ${stage}`];
+  if (queued > 0) parts.push(`${queued} queued`);
+  if (parked > 0) parts.push(`${parked} parked`);
+  chip.textContent = parts.join(' · ');
+  const lines = [
+    stage === 'park'
+      ? 'Memory pressure: new session admissions are deferred and the longest-idle sessions are parked (never killed; they release when pressure eases or on activity).'
+      : stage === 'defer'
+        ? 'Memory pressure: new session admissions queue until headroom returns; resident work continues.'
+        : 'Sessions are at the resident bound: new admissions queue until a slot frees.',
+    `Residents ${view.resident} of ${view.bound}.`,
+  ];
+  if (queued > 0) lines.push(`${queued} admission(s) queued — they fire when headroom returns.`);
+  if (view.probe_ok === false) lines.push('No memory probe on this host: staging is fail-open; only the resident bound applies.');
+  chip.title = lines.join(' ');
+}
+
 function ui2WireComposerMech() {
   const bar = document.querySelector('.global-task-bar');
   if (!bar) return;
@@ -1188,6 +1240,7 @@ ui2BuildNav();
     ui2Mirror('sb-dashboard-transport', ui2FuelChipSync);
     setInterval(ui2FuelChipSync, 30000);
     ui2FuelChipSync();
+    ui2CapacityChipSync();
   };
   if (document.readyState === 'complete') wire();
   else document.addEventListener('DOMContentLoaded', wire, { once: true });

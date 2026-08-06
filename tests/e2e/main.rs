@@ -10158,3 +10158,220 @@ async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() 
 
     daemon.child.kill().await.ok();
 }
+
+/// Capacity slice-1 acceptance: with the resident bound pinned to 1, a
+/// second admission is honestly refused-or-queued and a queued admission
+/// fires when headroom returns. The holder session occupies the only
+/// slot on a mock-script barrier; a fork attempt refuses with the stable
+/// `capacity_deferred:` prefix naming the bound; an undelegated create
+/// queues with a visible position on the `capacity_state` view; stopping
+/// the holder frees the slot and the queued create starts and completes.
+#[tokio::test]
+async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
+    use futures_util::SinkExt;
+
+    let client = reqwest::Client::new();
+    let rig = TestRig::new();
+    // Project marker: the daemon roots itself in the rig project like
+    // spawn_daemon_on_rig's daemons.
+    std::fs::write(rig.project.path().join("intendant.toml"), "").expect("project marker");
+    let barrier = rig.home.path().join("release-holder");
+    rig.write_script(&serde_json::json!({
+        "profiles": [
+            { "match": "capacity-holder", "steps": [
+                { "content": "Holding the only capacity slot.",
+                  "wait_for_file": barrier },
+                { "content": "Done holding.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "holder complete" } }] }
+            ]},
+            { "match": "capacity-queued", "steps": [
+                { "content": "Admitted after the slot freed.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "queued admission complete" } }] }
+            ]},
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    }));
+    let daemon = spawn_co_daemon(
+        &client,
+        &rig,
+        "capacity-daemon.log",
+        &[("INTENDANT_CAPACITY_MAX_RESIDENT", "1")],
+        &[],
+    )
+    .await;
+    let log_path = rig.home.path().join("capacity-daemon.log");
+    let daemon_log = move || {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        tail(&contents, 4000)
+    };
+    let token = rig_loopback_token(&rig, daemon.port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={token}",
+        daemon.port
+    ))
+    .await
+    .expect("ws connect");
+
+    // The holder takes the only slot. The first control message can race
+    // the supervisor's bus subscription in the boot window — re-send
+    // after a quiet 30s (registration is subsecond once subscribed, so a
+    // quiet window means the send was lost, not slow).
+    let mut started = None;
+    for _ in 0..4 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "capacity-holder — occupy the only resident slot",
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send holder create");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("capacity-holder"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "holder session never started; daemon log:\n{}",
+            daemon_log()
+        )
+    });
+    let holder_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("holder session id")
+        .to_string();
+
+    // A fork is an additional resident session: at the bound it refuses
+    // with the stable prefix, naming the bound.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "fork_session_at_anchor",
+            "source": "intendant",
+            "session_id": holder_id,
+            "anchor": { "kind": "head" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send fork attempt");
+    let refusal = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("loop_error")
+            && json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|message| message.starts_with("capacity_deferred:"))
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "fork at the bound never refused with the capacity prefix; daemon log:\n{}",
+            daemon_log()
+        )
+    });
+    let refusal_message = refusal
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        refusal_message.contains("1 of 1"),
+        "the refusal names the bound: {refusal_message}"
+    );
+
+    // An undelegated create queues with an honest position on the view.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "create_session",
+            "task": "capacity-queued — wait for headroom",
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send queued create");
+    let queued_view = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("capacity_state")
+            && json
+                .get("view")
+                .and_then(|view| view.get("queued"))
+                .and_then(|v| v.as_u64())
+                == Some(1)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the queued create never surfaced on the capacity view; daemon log:\n{}",
+            daemon_log()
+        )
+    });
+    let position = queued_view
+        .get("view")
+        .and_then(|view| view.get("queue"))
+        .and_then(|rows| rows.get(0))
+        .and_then(|row| row.get("position"))
+        .and_then(|v| v.as_u64());
+    assert_eq!(
+        position,
+        Some(1),
+        "the queue row names position 1: {queued_view}"
+    );
+
+    // Release the holder and stop it: the slot frees, the queue drains
+    // (queued back to 0), and the held create starts and completes.
+    std::fs::write(&barrier, "go").expect("release barrier");
+    complete_and_stop_session(&mut ws, &holder_id, &daemon_log).await;
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("capacity_state")
+            && json
+                .get("view")
+                .and_then(|view| view.get("queued"))
+                .and_then(|v| v.as_u64())
+                == Some(0)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the queue never drained after the slot freed; daemon log:\n{}",
+            daemon_log()
+        )
+    });
+    let queued_started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+            && json
+                .get("task")
+                .and_then(|v| v.as_str())
+                .is_some_and(|task| task.contains("capacity-queued"))
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "the queued admission never fired after headroom returned; daemon log:\n{}",
+            daemon_log()
+        )
+    });
+    let queued_id = queued_started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("queued session id")
+        .to_string();
+    complete_and_stop_session(&mut ws, &queued_id, &daemon_log).await;
+}

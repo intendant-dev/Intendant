@@ -119,6 +119,36 @@ fn default_readopt_enabled() -> bool {
     true
 }
 
+/// `[capacity]` in intendant.toml: box-wide memory-headroom staging and
+/// the resident-session admission bound. See `capacity`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityConfig {
+    /// Default ON — resource awareness is the daemon's job. `enabled =
+    /// false` disables the capacity controller entirely (no probe, no
+    /// staging, no admission bound): pre-slice behavior.
+    #[serde(default = "default_capacity_enabled")]
+    pub enabled: bool,
+    /// Resident-session bound override. Default derives one session per
+    /// GiB of physical memory (clamped 8..=64; 32 when the box's memory
+    /// size is unreadable). The `INTENDANT_CAPACITY_MAX_RESIDENT` env
+    /// var overrides the derivation but not this key.
+    #[serde(default)]
+    pub max_resident_sessions: Option<usize>,
+}
+
+impl Default for CapacityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_capacity_enabled(),
+            max_resident_sessions: None,
+        }
+    }
+}
+
+fn default_capacity_enabled() -> bool {
+    true
+}
+
 /// `[landing_shepherd]` in intendant.toml: the daemon-side closed-loop
 /// watch over the fleet's open PRs (armed-DIRTY conflicts, queue
 /// ejections, auto-merge disarms, armed-but-never-queued stalls) that
@@ -949,6 +979,10 @@ pub struct ProjectConfig {
     /// configuration (watch lists, cadences). See [`IntegrationsConfig`].
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// `[capacity]` section — memory-headroom staging + the resident-
+    /// session admission bound (default ON). See [`CapacityConfig`].
+    #[serde(default)]
+    pub capacity: CapacityConfig,
     /// `[landing_shepherd]` section — the closed-loop watch over the
     /// fleet's open PRs (default ON). See [`LandingShepherdConfig`].
     #[serde(default)]

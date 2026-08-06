@@ -242,6 +242,7 @@ pub fn spawn_event_listener(
                     | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }
+                    | AppEvent::CapacityState { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::ExternalFollowUpRequested { .. }
                     | AppEvent::FollowUpCancelRequested { .. }

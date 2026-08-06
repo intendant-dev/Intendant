@@ -987,6 +987,14 @@ pub enum AppEvent {
         autonomy: String,
     },
 
+    /// Emitted by the capacity monitor whenever the daemon-wide capacity
+    /// view changes (memory-pressure stage, probe health, or the
+    /// resident/queue/park census). Cached for late joiners: an idle
+    /// pressured daemon must still show its state to a fresh browser.
+    CapacityState {
+        view: crate::capacity::CapacityView,
+    },
+
     /// Emitted by the control plane when a `ControlMsg::CodexThreadAction`
     /// arrives, so the daemon-side action watcher (which owns the
     /// persistent agent) can pick it up. Carries the dispatched action and
@@ -2744,6 +2752,27 @@ impl ControlMsg {
                 | ControlMsg::ForkSessionAtAnchor { .. }
         )
     }
+
+    /// What the capacity admission gate governs: the strict subset of
+    /// [`ControlMsg::creates_session`] that mints an ADDITIONAL resident
+    /// session (create, untargeted start, fork). The resume family
+    /// (resume, restart) revives the owner's existing work and is
+    /// deliberately exempt in this slice — it still counts toward
+    /// residency once live, and refusing an owner's attach to their own
+    /// session is a hostility the bound does not need. The capacity
+    /// matrix test walks the pair of classifiers; a creator classified
+    /// here must also be in `creates_session`.
+    pub(crate) fn creates_additional_session(&self) -> bool {
+        matches!(
+            self,
+            ControlMsg::CreateSession { .. }
+                | ControlMsg::StartTask {
+                    session_id: None,
+                    ..
+                }
+                | ControlMsg::ForkSessionAtAnchor { .. }
+        )
+    }
 }
 
 /// The event bus sender. Cloneable for use in multiple tasks.
@@ -3505,6 +3534,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AutonomyChanged { autonomy } => Some(OutboundEvent::AutonomyChanged {
             autonomy: autonomy.clone(),
         }),
+        AppEvent::CapacityState { view } => {
+            Some(OutboundEvent::CapacityState { view: view.clone() })
+        }
         AppEvent::CodexThreadActionRequested {
             request_id,
             session_id,
@@ -6794,6 +6826,58 @@ mod tests {
         // the broadcast ring only. A cu_action in session.jsonl (and hence
         // in log_replay) would violate the no-replay contract.
         assert!(!app_event_writes_to_session_log(&sample_cu_action_event()));
+    }
+
+    #[test]
+    fn capacity_gate_matrix_is_the_strict_create_subset() {
+        // (wire json, creates_session, creates_additional_session):
+        // the capacity gate governs exactly the additional-session
+        // subset — the resume family stays exempt, in-flight work is
+        // never classified. An additional-creator must also be a
+        // creator (the subset invariant).
+        let matrix = [
+            (r#"{"action":"create_session","task":"t"}"#, true, true),
+            (r#"{"action":"start_task","task":"t"}"#, true, true),
+            (
+                r#"{"action":"fork_session_at_anchor","source":"intendant","session_id":"s","anchor":{"kind":"head"}}"#,
+                true,
+                true,
+            ),
+            (
+                r#"{"action":"resume_session","source":"intendant","session_id":"s"}"#,
+                true,
+                false,
+            ),
+            (
+                r#"{"action":"restart_session","source":"intendant","session_id":"s"}"#,
+                true,
+                false,
+            ),
+            (
+                r#"{"action":"start_task","task":"t","session_id":"s"}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"action":"follow_up","session_id":"s","text":"t"}"#,
+                false,
+                false,
+            ),
+            (r#"{"action":"interrupt","session_id":"s"}"#, false, false),
+        ];
+        for (json, creates, additional) in matrix {
+            let msg: ControlMsg = serde_json::from_str(json).unwrap();
+            assert_eq!(msg.creates_session(), creates, "creates_session: {json}");
+            assert_eq!(
+                msg.creates_additional_session(),
+                additional,
+                "creates_additional_session: {json}"
+            );
+            assert!(
+                !msg.creates_additional_session() || msg.creates_session(),
+                "additional ⊂ creates: {json}"
+            );
+        }
     }
 
     #[test]

@@ -765,6 +765,25 @@ html.ui-v2 .ui2-fuel-chip {
   white-space: nowrap;
 }
 
+/* ── capacity chip (oversight bar): memory-headroom stage + admission
+   census. Amber while deferring/at-bound, red under the park stage. ── */
+html.ui-v2 .ui2-capacity-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--amber);
+  border: 1px solid rgba(var(--amber-rgb), .28);
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-capacity-chip[data-stage="park"] {
+  background: rgba(var(--rose-rgb), .12);
+  color: var(--rose);
+  border-color: rgba(var(--rose-rgb), .28);
+}
+
 /* ── touch behavior ──
    The viewport meta no longer carries user-scalable=no (pinch-zoom is an
    accessibility escape hatch and the recovery gesture when a layout goes

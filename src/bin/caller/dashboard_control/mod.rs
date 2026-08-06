@@ -1411,6 +1411,10 @@ pub struct DashboardBootstrapCaches {
     pub(crate) last_live_usage_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_status_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_autonomy_json: Arc<std::sync::Mutex<Option<String>>>,
+    /// Latest `capacity_state` event: emitted on change only, so a fresh
+    /// browser on a pressured-but-idle daemon must get it replayed or the
+    /// pressure chip renders nothing.
+    pub(crate) last_capacity_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_external_agent_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_user_display_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) attached_external_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,

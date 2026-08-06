@@ -1702,6 +1702,15 @@ impl IntendantServer {
             if let Some(handover) = &s.handover {
                 obj.insert("scheduler_lease".to_string(), handover.status_json());
             }
+            // The daemon-wide capacity view (memory-headroom stage +
+            // admission census) — absent when [capacity] is disabled.
+            if let Some(controller) = crate::capacity::published_capacity_controller() {
+                obj.insert(
+                    "capacity".to_string(),
+                    serde_json::to_value(controller.view())
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                );
+            }
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
@@ -2212,6 +2221,23 @@ impl IntendantServer {
                     session_name: None,
                     launch_config: Default::default(),
                 }));
+            // Honesty twin of the supervisor's capacity gate: this lane
+            // acks optimistically, so when admissions are deferred, say
+            // where the dispatch actually lands — the capacity queue.
+            if let Some(controller) = crate::capacity::published_capacity_controller() {
+                let view = controller.view();
+                if view.admissions_deferred {
+                    return format!(
+                        "ok (new session dispatched — capacity is deferring admissions \
+                         (stage {}, {} of {} resident, {} queued): it queues and fires \
+                         when headroom returns; see `capacity` in get_status)",
+                        view.stage.as_str(),
+                        view.resident,
+                        view.bound,
+                        view.queued,
+                    );
+                }
+            }
             return "ok (new session dispatched)".to_string();
         }
         match self

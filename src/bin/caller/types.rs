@@ -778,6 +778,12 @@ pub enum OutboundEvent {
     AutonomyChanged {
         autonomy: String,
     },
+    /// Daemon-wide capacity view: memory-pressure stage, probe health,
+    /// and the resident/queue/park census. Emitted on change; cached and
+    /// replayed to late joiners like autonomy.
+    CapacityState {
+        view: crate::capacity::CapacityView,
+    },
     /// Delivered to browsers as soon as a Codex thread-level action is
     /// accepted for dispatch, so long-running actions remain visible.
     CodexThreadActionRequested {
