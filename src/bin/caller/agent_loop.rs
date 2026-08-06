@@ -921,7 +921,10 @@ async fn gate_controller_tool_call(
     local_session_id: &Option<String>,
 ) -> ControllerToolGate {
     let category = autonomy::ActionCategory::ToolCall;
-    let decision = autonomy.read().await.controller_tool_decision();
+    let decision = autonomy
+        .read()
+        .await
+        .controller_tool_decision(local_session_id.as_deref());
     match decision {
         autonomy::ControllerToolDecision::AutoApprove => {
             // Same visibility signal the runtime path emits for
@@ -2463,6 +2466,7 @@ pub(crate) async fn run_agent_loop(
                         pick_max: None,
                         free_text: None,
                         previews: Vec::new(),
+                        consequence: String::new(),
                     }],
                     // The native waiter blocks on its oneshot without a
                     // deadline — no expiry to show or hold.
@@ -2531,12 +2535,13 @@ pub(crate) async fn run_agent_loop(
                         if cat == autonomy::ActionCategory::HumanInput {
                             continue;
                         }
-                        let rule = autonomy_state.rules.rule_for(cat);
+                        let rule =
+                            autonomy_state.effective_rule_for(local_session_id.as_deref(), cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
-                        } else if autonomy_state.needs_approval(cat)
+                        } else if autonomy_state.needs_approval(local_session_id.as_deref(), cat)
                             && need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
                             })
@@ -3081,6 +3086,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         pick_max: None,
                         free_text: None,
                         previews: Vec::new(),
+                        consequence: String::new(),
                     }],
                     // The native waiter blocks on its oneshot without a
                     // deadline — no expiry to show or hold.
@@ -3133,12 +3139,13 @@ Proceed with explicit assumptions and continue without additional questions."
                         if cat == autonomy::ActionCategory::HumanInput {
                             continue;
                         }
-                        let rule = autonomy_state.rules.rule_for(cat);
+                        let rule =
+                            autonomy_state.effective_rule_for(local_session_id.as_deref(), cat);
                         if matches!(rule, autonomy::ApprovalRule::Deny) {
                             if need.is_none_or(|(prev, _)| cat.severity() > prev.severity()) {
                                 need = Some((cat, true));
                             }
-                        } else if autonomy_state.needs_approval(cat)
+                        } else if autonomy_state.needs_approval(local_session_id.as_deref(), cat)
                             && need.is_none_or(|(prev, was_deny)| {
                                 !was_deny && cat.severity() > prev.severity()
                             })
@@ -4418,6 +4425,7 @@ fn raise_sandbox_consent_cards(
                 pick_max: None,
                 free_text: None,
                 previews: Vec::new(),
+                consequence: String::new(),
             }],
             expires_at_ms: None,
             held: false,

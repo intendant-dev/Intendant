@@ -266,6 +266,13 @@ pub struct UserQuestion {
     /// (prototype variants, before/after states). See [`QuestionPreview`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previews: Vec<QuestionPreview>,
+    /// Consequence-on-silence (the decision contract): what the asker
+    /// will do — or what happens — if this question lapses unanswered.
+    /// Rendered on the question card beside the options; empty on plain
+    /// questions and on questions from backends without the vocabulary.
+    /// Additive: older logs deserialize with the empty default.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequence: String,
 }
 
 impl UserQuestion {

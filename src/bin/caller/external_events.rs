@@ -1573,6 +1573,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     facts,
                 });
             }
+            external_agent::AgentEvent::NativeWakeupMarker { marker } => {
+                // The adapter's wire-proven pending-wakeup statement →
+                // the durable marker the respawn seams, the exit
+                // backstop, and the boot pass adjudicate. Pure
+                // bookkeeping.
+                slog(config.session_log, |l| l.set_native_wakeup(marker));
+            }
             external_agent::AgentEvent::GoalUpdated { goal } => {
                 emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }
@@ -2094,7 +2101,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     }
                     external_agent::ApprovalCategory::McpTool => autonomy::ActionCategory::ToolCall,
                 };
-                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                let decision = {
+                    config
+                        .autonomy
+                        .read()
+                        .await
+                        .external_approval_decision(config.session_id.as_deref(), cat)
+                };
                 if approve_all_session
                     || decision == autonomy::ExternalApprovalDecision::AutoApprove
                 {
@@ -2470,7 +2483,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 diff,
             } => {
                 let cat = autonomy::ActionCategory::FileWrite;
-                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                let decision = {
+                    config
+                        .autonomy
+                        .read()
+                        .await
+                        .external_approval_decision(config.session_id.as_deref(), cat)
+                };
                 let preview = format!("file change: {}", path);
 
                 if approve_all_session

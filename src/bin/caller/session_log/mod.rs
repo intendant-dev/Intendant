@@ -138,6 +138,18 @@ pub struct SessionMeta {
     /// lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_park: Option<SessionBgParkMeta>,
+    /// Durable trace of a pending backend-native scheduled wakeup (the
+    /// Claude Code harness `ScheduleWakeup` timer): stamped while the
+    /// model's self-scheduled wake is pending, updated to its re-armed
+    /// form when a respawn seam hands delivery to the supervising
+    /// wrapper, flipped to its died form when nothing can deliver it
+    /// (session end, daemon restart), and cleared when it fires or the
+    /// model stops its loop. The timer lives inside the backend process
+    /// and dies with EVERY respawn while this marker survives — it is
+    /// how the boot pass tells a wakeup the daemon restart killed from
+    /// plain idleness. Additive: metas written before 2026-08 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_wakeup: Option<SessionNativeWakeupMeta>,
 }
 
 /// A provider-safeguards flag recorded durably (see
@@ -165,6 +177,38 @@ pub struct SessionBgParkMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub died_cause: Option<String>,
     /// Epoch seconds the tasks died, present with `died_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_at_epoch: Option<u64>,
+}
+
+/// A pending backend-native scheduled wakeup recorded durably (see
+/// [`SessionMeta::native_wakeup`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionNativeWakeupMeta {
+    /// Epoch seconds the arm was observed on the wire.
+    pub armed_at_epoch: u64,
+    /// Epoch seconds the wake is due.
+    pub fire_at_epoch: u64,
+    /// The wake prompt the model asked to receive (bounded by the
+    /// producer — display and re-delivery data, never a command).
+    pub prompt: String,
+    /// The model's stated reason for the chosen delay, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The named restart the timer did not survive in its harness form —
+    /// `Some` means the supervising wrapper re-armed it and owns
+    /// delivery at the due time. `None` = the backend harness still owns
+    /// the fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rearmed_cause: Option<String>,
+    /// The named end that killed the wakeup with no re-arm possible —
+    /// `Some` flips the marker from "pending" to the honest lost-timer
+    /// statement (nothing will deliver it; re-arming is the model's or
+    /// owner's decision on resume). `None` = the wake is still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_cause: Option<String>,
+    /// Epoch seconds the timer was declared lost, present with
+    /// `died_cause`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub died_at_epoch: Option<u64>,
 }
@@ -701,6 +745,7 @@ impl SessionLog {
             existing_limit_park,
             existing_safeguards_flag,
             existing_bg_park,
+            existing_native_wakeup,
         ) = existing
             .map(|meta| {
                 (
@@ -709,9 +754,10 @@ impl SessionLog {
                     meta.limit_park,
                     meta.safeguards_flag,
                     meta.bg_park,
+                    meta.native_wakeup,
                 )
             })
-            .unwrap_or((None, None, None, None, None));
+            .unwrap_or((None, None, None, None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -737,6 +783,11 @@ impl SessionLog {
             // limit_park): a respawn's meta rewrite must not silently
             // release a wait — or erase a died-with-restart statement.
             bg_park: existing_bg_park,
+            // Same law: only the wakeup lanes (arm/stop/deliver/retire,
+            // the respawn takeover, the exit backstop, the boot pass)
+            // touch the marker — a meta rewrite must not drop a pending
+            // wake or erase a lost-timer statement.
+            native_wakeup: existing_native_wakeup,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -832,6 +883,28 @@ impl SessionLog {
             return;
         }
         meta.bg_park = None;
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record (or clear) the durable native-wakeup marker in
+    /// `session_meta.json` (see [`SessionMeta::native_wakeup`]). Missing
+    /// or unreadable meta is a quiet no-op, like [`Self::set_limit_park`].
+    pub fn set_native_wakeup(&self, wakeup: Option<SessionNativeWakeupMeta>) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta.native_wakeup == wakeup {
+            return;
+        }
+        meta.native_wakeup = wakeup;
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);
@@ -1951,6 +2024,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -2004,6 +2078,54 @@ mod tests {
 
         log.set_bg_park(None);
         assert!(read().bg_park.is_none(), "real work clears everything");
+    }
+
+    /// The native-wakeup marker obeys the bg-park law: it survives every
+    /// meta rewrite (a respawn's `write_meta` mid-pend must not drop a
+    /// pending wake or erase a lost-timer statement); only the wakeup
+    /// lanes touch it, via `set_native_wakeup`.
+    #[test]
+    fn native_wakeup_marker_survives_meta_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let read = || -> SessionMeta {
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap()
+        };
+
+        log.set_native_wakeup(Some(SessionNativeWakeupMeta {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("queue watch".into()),
+            rearmed_cause: None,
+            died_cause: None,
+            died_at_epoch: None,
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task again"));
+        let marker = read()
+            .native_wakeup
+            .expect("a meta rewrite must not drop the pending wake");
+        assert_eq!(marker.fire_at_epoch, 880);
+        assert_eq!(marker.prompt, "<<autonomous-loop-dynamic>>");
+
+        // The died statement also survives rewrites, until a lane clears it.
+        log.set_native_wakeup(Some(SessionNativeWakeupMeta {
+            died_cause: Some("the daemon restart".into()),
+            died_at_epoch: Some(900),
+            ..marker
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let died = read().native_wakeup.expect("died statement survives");
+        assert_eq!(died.died_cause.as_deref(), Some("the daemon restart"));
+
+        log.set_native_wakeup(None);
+        assert!(
+            read().native_wakeup.is_none(),
+            "delivery/retirement clears it"
+        );
     }
 
     #[test]
@@ -2107,6 +2229,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -2131,6 +2254,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -2196,6 +2320,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

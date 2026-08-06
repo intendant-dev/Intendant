@@ -6755,6 +6755,11 @@ a.vx-pr-row:focus-visible { outline: 2px solid var(--lavender); outline-offset: 
   color: var(--blue);
   margin-bottom: 6px;
 }
+.question-consequence {
+  font-size: 12px;
+  color: var(--peach, var(--yellow));
+  margin: -2px 0 6px;
+}
 .question-previews {
   display: grid;
   grid-template-columns: 1fr;
@@ -33001,7 +33006,7 @@ html.ui-v2 .daemon-relay-note {
                   <div class="approval-actions">
                     <button class="approve" onclick="sendApproval('approve')">Approve <kbd>y</kbd></button>
                     <button onclick="sendApproval('skip')">Skip <kbd>s</kbd></button>
-                    <button onclick="sendApproval('approve_all')">Approve all <kbd>a</kbd></button>
+                    <button onclick="sendApproval('approve_all')">Approve all for this session <kbd>a</kbd></button>
                     <button class="deny" onclick="sendApproval('deny')">Deny <kbd>n</kbd></button>
                   </div>
                 </div>
@@ -37981,8 +37986,8 @@ function ui2AugmentApprovalPanel() {
 
   if (allBtn) {
     allBtn.classList.add('ui2-full-escape');
-    allBtn.innerHTML = 'Switch to Full autonomy';
-    allBtn.title = 'The previous "Approve all": flips daemon autonomy to Full. Native explicit Deny rules and hard consent gates remain; external-agent policy has separate caveats.';
+    allBtn.innerHTML = 'Full autonomy for this session';
+    allBtn.title = 'Approve all for this session: escalates only this session to Full autonomy (its dial override). Other sessions and the daemon-wide level are untouched — daemon-wide Full lives in Settings. Explicit Deny rules and hard consent gates remain.';
   }
 
   // `a` follows the category semantics under the flag. Capture phase so
@@ -39106,7 +39111,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '2d0af741f29c239c';
+const INTENDANT_APP_BUILD = '1664b843e058093a';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -78253,6 +78258,15 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
     text.className = 'question-text';
     text.textContent = q.question;
     block.appendChild(text);
+
+    // The decision contract's consequence-on-silence: what the asker will
+    // do (or what happens) if this lapses unanswered.
+    if (q.consequence) {
+      const consequence = document.createElement('div');
+      consequence.className = 'question-consequence';
+      consequence.textContent = `If unanswered: ${q.consequence}`;
+      block.appendChild(consequence);
+    }
 
     appendQuestionPreviews(block, q, qIndex, archive);
 

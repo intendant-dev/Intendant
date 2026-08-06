@@ -4065,7 +4065,7 @@ async fn resolve_idle_child_approval(
         .autonomy
         .read()
         .await
-        .external_approval_decision(category);
+        .external_approval_decision(child_session_id.as_deref(), category);
     let immediate = if policy == crate::autonomy::ExternalApprovalDecision::AutoApprove {
         config.bus.send(AppEvent::AutoApproved {
             preview: preview.clone(),
@@ -4603,12 +4603,15 @@ pub(crate) fn handle_idle_codex_subagent_event(
         external_agent::AgentEvent::GoalCleared => {
             emit_external_session_goal(config, Some(child_thread_id), None);
         }
+        // NativeWakeupMarker is emitted for the main thread only — a
+        // child-scoped copy would be an adapter bug, never marker truth.
         external_agent::AgentEvent::PlanUpdate { .. }
         | external_agent::AgentEvent::ApprovalRequest { .. }
         | external_agent::AgentEvent::FileApprovalRequest { .. }
         | external_agent::AgentEvent::UserQuestionRequest { .. }
         | external_agent::AgentEvent::DiffUpdated { .. }
         | external_agent::AgentEvent::Terminated { .. }
+        | external_agent::AgentEvent::NativeWakeupMarker { .. }
         | external_agent::AgentEvent::Scoped { .. } => {}
     }
 }
@@ -5339,6 +5342,7 @@ mod tests {
             pick_max: None,
             free_text: None,
             previews: Vec::new(),
+            consequence: String::new(),
         }];
         let mut question_events = bus.subscribe();
         let question_responder = async {

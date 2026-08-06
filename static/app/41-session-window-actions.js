@@ -5192,6 +5192,15 @@ function showUserQuestion(id, questions, sessionId, expiresAtMs, held, opts) {
     text.textContent = q.question;
     block.appendChild(text);
 
+    // The decision contract's consequence-on-silence: what the asker will
+    // do (or what happens) if this lapses unanswered.
+    if (q.consequence) {
+      const consequence = document.createElement('div');
+      consequence.className = 'question-consequence';
+      consequence.textContent = `If unanswered: ${q.consequence}`;
+      block.appendChild(consequence);
+    }
+
     appendQuestionPreviews(block, q, qIndex, archive);
 
     const recordedPicks = archive ? questionArchiveSelections(archive, q) : [];

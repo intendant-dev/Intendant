@@ -124,7 +124,11 @@ pub(crate) fn idle_external_pr_published_event(
 /// which drops it — the reload wants the work to continue on the fresh
 /// account), shut the old process down, and re-create the agent
 /// resume-attached to the same backend session id so the new process
-/// reads the fresh credential store. Queued `parked_follow_ups` stay in
+/// reads the fresh credential store. The park-cancel is also what heals
+/// a deferral swallowed by the turn's limit exit: the idle wait bounces
+/// the still-set flag here, so a park armed on the OLD account's window
+/// after a mid-turn reload is cancelled with its pending intact instead
+/// of waiting out the stale reset (card 01KZ0HVNCM). Queued `parked_follow_ups` stay in
 /// the loop untouched and flush through the normal preamble after the
 /// respawn. Returns `None` when the respawn failed — the old process is
 /// already gone, so the caller exits the loop honestly; on success,
@@ -132,7 +136,10 @@ pub(crate) fn idle_external_pr_published_event(
 /// killed (they were the old process's children —
 /// [`mark_parked_tasks_died_with_restart`] flipped their records and
 /// published the attention state before the shutdown), so the caller's
-/// continuation can carry the re-run offer.
+/// continuation can carry the re-run offer. The same call re-arms a
+/// pending native scheduled wakeup wrapper-side
+/// ([`take_over_native_wakeup_at_respawn`]) — the harness timer dies
+/// with the old process, and the resumed CLI restores none.
 #[allow(clippy::too_many_arguments)]
 async fn apply_backend_credentials_reload(
     backend: &external_agent::AgentBackend,
@@ -289,6 +296,56 @@ async fn respawn_external_backend_in_place(
 /// respawn kills (see [`mark_parked_tasks_died_with_restart`]).
 pub(crate) const CREDENTIAL_RELOAD_RESTART_CAUSE: &str = "the credential-reload restart";
 
+/// The wake message the supervising loop delivers when a re-armed native
+/// scheduled wakeup fires ([`crate::native_wakeup`]): honest about the
+/// mechanism — the harness's own `ScheduleWakeup` timer died with the
+/// named backend restart and Intendant re-armed it — and carrying the
+/// model's own wake prompt, so the loop the model was pacing continues
+/// as if the harness had fired. Pure; the clock is injected for tests.
+pub(crate) fn native_wakeup_delivery_message(
+    record: &crate::native_wakeup::NativeWakeupRecord,
+    now_epoch: u64,
+) -> FollowUpMessage {
+    let cause = record
+        .rearmed_cause
+        .as_deref()
+        .unwrap_or("a backend restart");
+    let reason = record
+        .reason
+        .as_deref()
+        .map(|r| format!(" Your stated reason for the delay: {r}."))
+        .unwrap_or_default();
+    let prompt = if record.prompt.trim().is_empty() {
+        "(the arm carried no prompt)".to_string()
+    } else {
+        record.prompt.clone()
+    };
+    FollowUpMessage::text(format!(
+        "⏰ Scheduled wakeup ({}). Your ScheduleWakeup timer did not survive {cause}, so \
+         Intendant re-armed it and is delivering the wake itself — re-arm your next wakeup \
+         as usual if you still want the cadence.{reason} Original wakeup prompt:\n{prompt}",
+        crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+    ))
+}
+
+/// Deadline instant for the idle select's native-wakeup arm: the due
+/// time as a tokio instant (an already-due record reads as "now" and the
+/// arm fires immediately). `now` when nothing pends — the arm is
+/// guard-disabled then and the value merely type-checks the disabled
+/// branch, the limit-park arm's exact pattern.
+fn native_wakeup_deadline(
+    pending: &Option<crate::native_wakeup::NativeWakeupRecord>,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    match pending {
+        Some(record) => {
+            let now_epoch = crate::session_activity::epoch_seconds();
+            now + std::time::Duration::from_secs(record.fire_at_epoch.saturating_sub(now_epoch))
+        }
+        None => now,
+    }
+}
+
 /// The follow-up text synthesized when a credential reload's own
 /// interrupt cut a live turn. Resume-attach keeps the conversation
 /// context, so a nudge — never a re-send of the original prompt, which
@@ -300,11 +357,14 @@ pub(crate) const RELOAD_MIDTURN_CONTINUATION_TEXT: &str =
 /// Synthesized continuation after a credential-reload respawn:
 /// `Some(..)` only when the reload's own interrupt cut a live turn (the
 /// turn drain returned `Interrupted` with
-/// [`RELOAD_CREDENTIALS_INTERRUPT_REASON`]). The interrupted turn's
-/// driving message was already consumed mid-delivery, so nothing else
-/// re-drives the work after the respawn — the session would idle on the
-/// fresh account with the task half-done. Idle and between-turn reloads
-/// pass `false` (idle in, idle out), as does a turn that completed
+/// [`RELOAD_CREDENTIALS_INTERRUPT_REASON`] — primary or idle-observed;
+/// the cut turn owes, not the lane that observed it) or the deferral's
+/// turn died into a rescued terminal (round death / channel close with
+/// the flag still set). The interrupted turn's driving message was
+/// already consumed mid-delivery, so nothing else re-drives the work
+/// after the respawn — the session would idle on the fresh account with
+/// the task half-done. Truly idle and between-turn reloads pass `false`
+/// (nothing was cut — idle in, idle out), as does a turn that completed
 /// normally despite the request, or one whose interrupt belonged to the
 /// user (their stop wins). The message carries no steer/follow-up id, so
 /// id-keyed cancel matching can never drop it. Rides the shared
@@ -738,13 +798,22 @@ pub(crate) async fn run_external_agent_mode(
     // Reload-credentials handshake: the drain raises this when the request
     // arrives mid-turn (after interrupting the backend); the loop applies
     // the in-place respawn at the next safe point. Idle requests apply
-    // immediately in the idle listener below.
+    // immediately in the idle listener below. The idle wait bounces a
+    // still-set flag back to the safe point, and the terminal arms that
+    // bypass the drain's interrupt resolution (round death, channel
+    // close) stay resident instead of breaking — so a deferral swallowed
+    // by the turn's limit/terminal exit can never strand a session parked
+    // on the OLD account's window or die with the reload owed (the
+    // 2026-08-02 limit-exit race, card 01KZ0HVNCM).
     let backend_credentials_reload = std::sync::atomic::AtomicBool::new(false);
-    // Companion marker: the reload's own interrupt cut a live primary
-    // turn (the turn drain returned `Interrupted` with the reload
-    // reason), so the safe-point respawn must front-queue a synthesized
-    // continuation to re-drive the dropped work. Never set on the idle
-    // lane — idle in, idle out.
+    // Companion marker: the reload's own interrupt cut a live turn —
+    // primary or idle-observed (the turn drain returned `Interrupted`
+    // with the reload reason), or the deferral's turn died into a
+    // rescued terminal (round death / channel close with the flag still
+    // set) — so the safe-point respawn must front-queue a synthesized
+    // continuation to re-drive the dropped work. The cut turn owes, not
+    // the lane that observed it. Never set by the truly-idle listener
+    // (nothing was cut — idle in, idle out).
     let mut reload_interrupted_turn = false;
     let mut drain_config = DrainConfig {
         bus: &bus,
@@ -857,6 +926,20 @@ pub(crate) async fn run_external_agent_mode(
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
+                // A reload deferral raised mid-drain whose turn exited into
+                // a park or a rescued terminal lands here with the flag
+                // still set — the drain outcome that was supposed to carry
+                // it (`Interrupted` with the reload reason) was swallowed
+                // by the exit. Left unconsumed, a parked session waits out
+                // the OLD account's window while the fresh store sits
+                // unread (the 2026-08-02 limit-exit race, specimen
+                // 2c6ea80d, card 01KZ0HVNCM). Bounce to the loop's single
+                // safe point: it cancels a live park PRESERVING its
+                // pending re-send, respawns onto the fresh credentials,
+                // and the flush below delivers the owed work.
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue 'outer;
+                }
                 if limit_park.is_none() {
                     // Flush messages queued during a rate-limit park,
                     // oldest first, honoring cancels recorded while they
@@ -886,6 +969,17 @@ pub(crate) async fn run_external_agent_mode(
                 {
                     break FollowUpMessage::text(String::new());
                 }
+                // Pending native scheduled wakeup ([`crate::native_wakeup`]),
+                // peeked per iteration — every drained event re-enters this
+                // loop, so a fresh arm/replace/stop from the backend is
+                // re-read before the next wait. The deadline arm below
+                // retires a harness-owned record whose due time passes with
+                // the backend alive (the harness owns that fire) and
+                // delivers a wrapper-owned one.
+                let pending_native_wakeup = stats
+                    .announced_native_session_id
+                    .as_deref()
+                    .and_then(crate::native_wakeup::pending_for);
                 tokio::select! {
                     maybe_intent = external_intent_rx.recv(), if external_intent_open => {
                         match maybe_intent {
@@ -1078,6 +1172,139 @@ pub(crate) async fn run_external_agent_mode(
                             );
                         }
                     }
+                    // Native-wakeup deadline (see the peek above). A
+                    // harness-owned record whose due time passes with the
+                    // backend process alive is retired — the harness owns
+                    // that fire, and a record outliving its moment would
+                    // make a later respawn re-deliver a wake the model
+                    // already got. A wrapper-owned record delivers: the
+                    // wake respawns a confirmed-dead backend first (the
+                    // park-wake pattern above) and queues behind a live
+                    // limit park instead of burning against a rejected
+                    // backend.
+                    _ = tokio::time::sleep_until(
+                        native_wakeup_deadline(&pending_native_wakeup)
+                    ), if pending_native_wakeup.is_some() => {
+                        let record = pending_native_wakeup.expect("branch guarded by is_some");
+                        let session_key = stats
+                            .announced_native_session_id
+                            .clone()
+                            .unwrap_or_default();
+                        let now_epoch = crate::session_activity::epoch_seconds();
+                        if record.rearmed_cause.is_none() {
+                            if !agent.next_round_reads_fresh_credentials() {
+                                // Alive through the deadline: the harness
+                                // owns this fire (its wake turn, if any,
+                                // arrives as ordinary backend activity).
+                                crate::native_wakeup::consume(&session_key);
+                                slog(&session_log, |l| {
+                                    l.debug(
+                                        "Native scheduled wakeup deadline passed with the backend process alive — the harness owns that fire; the wrapper record is retired",
+                                    )
+                                });
+                                slog(&session_log, |l| l.set_native_wakeup(None));
+                                continue;
+                            }
+                            // Confirmed dead with the record still
+                            // harness-owned: this death reached no respawn
+                            // seam (the narrow idle-death window) — take
+                            // the timer over now and deliver below.
+                            take_over_native_wakeup_at_respawn(
+                                &bus,
+                                &session_log,
+                                &live_session_id,
+                                &session_key,
+                                "the backend exit",
+                                now_epoch,
+                            );
+                        }
+                        // Re-take from the registry: the takeover above
+                        // (or an earlier seam's) rewrote the record with
+                        // its wrapper-owned cause — the peeked copy is
+                        // stale.
+                        let Some(record) = crate::native_wakeup::consume(&session_key) else {
+                            continue;
+                        };
+                        if limit_park.is_some() {
+                            let line = format!(
+                                "⏰ The re-armed native scheduled wakeup fired during a park ({}) — queued; it delivers at the park's wake",
+                                crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+                            );
+                            slog(&session_log, |l| l.info(&line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "info".to_string(),
+                                source: "Intendant".to_string(),
+                                content: line,
+                                turn: None,
+                            });
+                            parked_follow_ups
+                                .push_back(native_wakeup_delivery_message(&record, now_epoch));
+                            slog(&session_log, |l| l.set_native_wakeup(None));
+                            continue;
+                        }
+                        if agent.next_round_reads_fresh_credentials() {
+                            match respawn_external_backend_in_place(
+                                &backend,
+                                &project,
+                                web_port,
+                                &intendant_session_id,
+                                &session_agent_config,
+                                &stats,
+                                &mut agent,
+                                &mut event_rx,
+                                &mut drain_config,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    event_channel_open = true;
+                                    let line = format!(
+                                        "The re-armed native wakeup elapsed with the backend gone — respawned {} resume-attached to deliver the wake",
+                                        backend
+                                    );
+                                    slog(&session_log, |l| l.info(&line));
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "info".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: line,
+                                        turn: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let line = format!(
+                                        "The re-armed native wakeup elapsed, but the dead backend could not be respawned: {e}"
+                                    );
+                                    slog(&session_log, |l| l.error(&line));
+                                    let mut died = record.to_meta();
+                                    died.died_cause =
+                                        Some("the failed respawn at the wake".to_string());
+                                    died.died_at_epoch = Some(now_epoch);
+                                    slog(&session_log, |l| {
+                                        l.set_native_wakeup(Some(died))
+                                    });
+                                    bus.send(AppEvent::LoopError(line.clone()));
+                                    stats.terminal_outcome = Some(line);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        let line = format!(
+                            "⏰ Delivering the re-armed native scheduled wakeup ({})",
+                            crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch),
+                        );
+                        slog(&session_log, |l| l.info(&line));
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Intendant".to_string(),
+                            content: line,
+                            turn: None,
+                        });
+                        slog(&session_log, |l| l.set_native_wakeup(None));
+                        break native_wakeup_delivery_message(&record, now_epoch);
+                    }
                     maybe_event = event_rx.recv(), if event_channel_open => {
                         match maybe_event {
                             Some(event) => {
@@ -1269,6 +1496,17 @@ pub(crate) async fn run_external_agent_mode(
                                         bus.send(AppEvent::SessionConfigFacts {
                                             session_id: drain_config.session_id.clone(),
                                             facts,
+                                        });
+                                    }
+                                    // Ambient like ActivityUpdate: the
+                                    // adapter's pending-wakeup statement
+                                    // mirrors into the durable marker and
+                                    // must never open an observe round.
+                                    external_agent::AgentEvent::NativeWakeupMarker {
+                                        marker,
+                                    } => {
+                                        slog(&session_log, |l| {
+                                            l.set_native_wakeup(marker)
                                         });
                                     }
                                     external_agent::AgentEvent::CwdAnnounced { cwd } => {
@@ -1504,6 +1742,37 @@ pub(crate) async fn run_external_agent_mode(
                                                     )
                                                     .await;
                                                     round = round.saturating_sub(1);
+                                                } else if backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    // A deferred credential
+                                                    // reload outranks the
+                                                    // round-death terminal:
+                                                    // the pending respawn IS
+                                                    // the recovery (an
+                                                    // auth-shaped refusal is
+                                                    // exactly what the fresh
+                                                    // store may cure). Stay
+                                                    // resident; the idle
+                                                    // wait bounces to the
+                                                    // safe-point respawn,
+                                                    // and the continuation
+                                                    // re-drives the cut
+                                                    // observed turn.
+                                                    reload_interrupted_turn = true;
+                                                    let line = reload_outranks_terminal_line(
+                                                        "the observed round failed before any turn completed",
+                                                        &reason,
+                                                    );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
+                                                    round = round.saturating_sub(1);
                                                 } else {
                                                     // A backend-started round
                                                     // observed from idle died on
@@ -1692,6 +1961,13 @@ pub(crate) async fn run_external_agent_mode(
                                                 // honest terminal, never
                                                 // a park — mechanical
                                                 // retry re-flags forever.
+                                                // A pending credential
+                                                // reload does not rescue
+                                                // it either: respawn-and-
+                                                // redeliver into flagged
+                                                // bytes is the re-flag
+                                                // loop; the deferral dies
+                                                // with the loop.
                                                 stats.rounds = round;
                                                 let entry =
                                                     crate::safeguards_recast::RecastRef {
@@ -1776,7 +2052,20 @@ pub(crate) async fn run_external_agent_mode(
                                                 // is exhausted.
                                                 error_park_streak =
                                                     error_park_streak.saturating_add(1);
-                                                if error_park_attempts_exhausted(error_park_streak)
+                                                // A pending credential reload
+                                                // holds the suspension
+                                                // terminal open: park
+                                                // normally instead — the
+                                                // safe-point respawn cancels
+                                                // it preserving the
+                                                // delivery-aware pending and
+                                                // resets the streak like any
+                                                // explicit intervention.
+                                                if !backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                    && error_park_attempts_exhausted(
+                                                        error_park_streak,
+                                                    )
                                                 {
                                                     stats.rounds = round;
                                                     let line = error_park_exhausted_line(
@@ -1961,6 +2250,26 @@ pub(crate) async fn run_external_agent_mode(
                                             }
                                             DrainOutcome::Interrupted { reason } => {
                                                 stats.rounds = round;
+                                                // The reload's own interrupt
+                                                // cutting a LIVE observed
+                                                // round owes the same
+                                                // synthesized continuation
+                                                // as the primary lane — the
+                                                // cut turn owes, not the
+                                                // lane that observed it
+                                                // ("idle in, idle out"
+                                                // covers reloads landing on
+                                                // a truly idle session,
+                                                // where nothing was cut).
+                                                // The idle wait bounces the
+                                                // still-set flag to the
+                                                // safe point, which
+                                                // consumes this marker.
+                                                if reason
+                                                    == RELOAD_CREDENTIALS_INTERRUPT_REASON
+                                                {
+                                                    reload_interrupted_turn = true;
+                                                }
                                                 slog(&session_log, |l| {
                                                     l.info(&format!(
                                                         "External agent interrupted while observed from idle: {}",
@@ -2021,6 +2330,19 @@ pub(crate) async fn run_external_agent_mode(
                                                     .await;
                                                     round = round.saturating_sub(1);
                                                 } else {
+                                                    // A pending credential
+                                                    // reload deliberately
+                                                    // does NOT rescue this
+                                                    // arm: a Terminated that
+                                                    // reaches it with the
+                                                    // flag set can only be a
+                                                    // requested stop (the
+                                                    // drain converts a
+                                                    // backend death under a
+                                                    // pending interrupt to
+                                                    // `Interrupted`), and
+                                                    // the stop wins the
+                                                    // reload.
                                                     stats.rounds = round;
                                                     slog(&session_log, |l| {
                                                         l.info(&format!(
@@ -2073,6 +2395,36 @@ pub(crate) async fn run_external_agent_mode(
                                                             .waiting_turn_detail(agent.name()),
                                                     )
                                                     .await;
+                                                    round = round.saturating_sub(1);
+                                                } else if backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    // Hard process death with
+                                                    // the reload deferral
+                                                    // pending: the respawn IS
+                                                    // the recovery. Gate the
+                                                    // closed channel and stay
+                                                    // resident; the safe
+                                                    // point swaps in the
+                                                    // fresh receiver and
+                                                    // re-opens the gate, and
+                                                    // the continuation
+                                                    // re-drives the cut
+                                                    // observed turn.
+                                                    reload_interrupted_turn = true;
+                                                    event_channel_open = false;
+                                                    let line = reload_outranks_terminal_line(
+                                                        "the backend event channel closed",
+                                                        "",
+                                                    );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
                                                     round = round.saturating_sub(1);
                                                 } else {
                                                     slog(&session_log, |l| {
@@ -3831,7 +4183,10 @@ pub(crate) async fn run_external_agent_mode(
                 // 2026-07-31 specimen 69c8535e COMPLETED at 95 turns and
                 // the death was invisible). The honest terminal is FAILED
                 // plus the safeguards attention surfaces; the remedy is
-                // the owner's fresh-session recast.
+                // the owner's fresh-session recast. A pending credential
+                // reload does not rescue it either: respawn-and-redeliver
+                // into flagged bytes is the re-flag loop; the deferral
+                // dies with the loop.
                 stats.rounds = round;
                 let entry = crate::safeguards_recast::RecastRef {
                     session_id: live_session_id.clone().unwrap_or_default(),
@@ -3896,6 +4251,34 @@ pub(crate) async fn run_external_agent_mode(
                 reason,
                 turns_in_round,
             } => {
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A deferred mid-turn credential reload outranks the
+                    // round-death terminal (the round-death classification
+                    // bypasses the drain's interrupt resolution, so the
+                    // deferral survives to here): the pending respawn IS
+                    // the recovery — an auth refusal is exactly what the
+                    // fresh store may cure. Roll the burned round back
+                    // like the limit arm and let the safe point respawn;
+                    // the synthesized continuation re-drives the cut work
+                    // (nudge shape — `turns_in_round` counts COMPLETED
+                    // turns, so the round may hold a STARTED turn a
+                    // verbatim re-send would double-run).
+                    reload_interrupted_turn = true;
+                    let line = reload_outranks_terminal_line(
+                        "the round failed before any turn completed",
+                        &reason,
+                    );
+                    slog(&session_log, |l| l.warn(&line));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content: line,
+                        turn: None,
+                    });
+                    round = round.saturating_sub(1);
+                    continue 'outer;
+                }
                 // The launch-refusal class: a fatal backend error ended the
                 // round before any turn ran (an invalid model pin, an auth
                 // refusal at spawn). The honest terminal is FAILED — the
@@ -4416,7 +4799,13 @@ pub(crate) async fn run_external_agent_mode(
                 // occurrences journal `failed` and count on the
                 // suspension streak) instead of waiting unattended.
                 error_park_streak = error_park_streak.saturating_add(1);
-                if error_park_attempts_exhausted(error_park_streak) {
+                // A pending credential reload holds the suspension terminal
+                // open: park normally instead — the safe-point respawn
+                // cancels the park preserving the delivery-aware pending
+                // and resets the streak like any explicit intervention.
+                if !backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst)
+                    && error_park_attempts_exhausted(error_park_streak)
+                {
                     stats.rounds = round;
                     let line =
                         error_park_exhausted_line(&reason, error_park_streak.saturating_sub(1));
@@ -4970,6 +5359,11 @@ pub(crate) async fn run_external_agent_mode(
                 }
             }
             DrainOutcome::Terminated { reason, exit_code } => {
+                // A pending credential reload deliberately does NOT rescue
+                // this arm: a Terminated that reaches it with the flag set
+                // can only be a requested stop (the drain converts a
+                // backend death under a pending interrupt to
+                // `Interrupted`), and the stop wins the reload.
                 stats.rounds = round;
                 let user_requested_stop =
                     matches!(reason.as_str(), "stopped by user" | "restarting session")
@@ -5043,6 +5437,27 @@ pub(crate) async fn run_external_agent_mode(
                 break;
             }
             DrainOutcome::ChannelClosed => {
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Hard process death with the reload deferral pending
+                    // (the channel-closed return bypasses the drain's
+                    // interrupt resolution): the respawn IS the recovery.
+                    // Roll the burned round back and let the safe point
+                    // respawn; the synthesized continuation re-drives the
+                    // cut work.
+                    reload_interrupted_turn = true;
+                    let line =
+                        reload_outranks_terminal_line("the backend event channel closed", "");
+                    slog(&session_log, |l| l.warn(&line));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content: line,
+                        turn: None,
+                    });
+                    round = round.saturating_sub(1);
+                    continue 'outer;
+                }
                 slog(&session_log, |l| {
                     l.info("External agent event channel closed")
                 });
@@ -5119,6 +5534,46 @@ pub(crate) async fn run_external_agent_mode(
         }
     }
 
+    // The wakeup twin of the park backstop above: the loop is ending with
+    // the session's native scheduled wakeup still on record — the
+    // in-memory registry entry is about to lose the only lane that could
+    // deliver it. Flip the durable marker to its died form (the honest
+    // lost-timer statement: nothing will deliver it, and re-arming is the
+    // resumed session's decision) — except at the daemon-teardown exit,
+    // where the marker survives untouched as the boot pass's trace,
+    // exactly like the limit park's.
+    if let Some(record) = stats
+        .announced_native_session_id
+        .as_deref()
+        .and_then(crate::native_wakeup::consume)
+    {
+        let now_epoch = crate::session_activity::epoch_seconds();
+        let due = crate::native_wakeup::due_phrase(record.fire_at_epoch, now_epoch);
+        let detail = stats
+            .terminal_outcome
+            .clone()
+            .unwrap_or_else(|| "the session ended".to_string());
+        if daemon_teardown_exit {
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "A native scheduled wakeup ({due}) is still pending at the \
+                     daemon-teardown exit — the durable marker survives for the boot pass"
+                ))
+            });
+        } else {
+            slog(&session_log, |l| {
+                l.warn(&format!(
+                    "⚠ The session's native scheduled wakeup ({due}) was lost with the \
+                     session end ({detail}) — nothing will deliver it"
+                ))
+            });
+            let mut died = record.to_meta();
+            died.died_cause = Some("the session end".to_string());
+            died.died_at_epoch = Some(now_epoch);
+            slog(&session_log, |l| l.set_native_wakeup(Some(died)));
+        }
+    }
+
     // The supervised span is over: reconcile sub-agent children that never
     // reported a terminal (their processes die with the backend). The
     // reader's own EOF sweep cannot cover this — `shutdown()` below aborts
@@ -5138,6 +5593,105 @@ pub(crate) async fn run_external_agent_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delivered wake is honest about its mechanism and carries the
+    /// model's own prompt — plus the re-arm reminder, since the harness
+    /// timer the model thinks it holds is gone. Empty prompts are said,
+    /// not omitted; an unflipped record names the generic restart.
+    #[test]
+    fn native_wakeup_delivery_message_is_honest_and_carries_the_prompt() {
+        let record = crate::native_wakeup::NativeWakeupRecord {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("watching the queue".into()),
+            tool_use_id: "toolu_wk".into(),
+            rearmed_cause: Some(CREDENTIAL_RELOAD_RESTART_CAUSE.into()),
+        };
+        let message = native_wakeup_delivery_message(&record, 900);
+        assert!(
+            message.text.contains("Scheduled wakeup"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains(CREDENTIAL_RELOAD_RESTART_CAUSE),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("<<autonomous-loop-dynamic>>"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("watching the queue"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("re-arm your next wakeup"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.steer_id.is_none() && message.follow_up_id.is_none(),
+            "no id-keyed cancel matching can drop the wake"
+        );
+
+        let bare = crate::native_wakeup::NativeWakeupRecord {
+            prompt: String::new(),
+            reason: None,
+            rearmed_cause: None,
+            ..record
+        };
+        let message = native_wakeup_delivery_message(&bare, 900);
+        assert!(
+            message.text.contains("(the arm carried no prompt)"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("a backend restart"),
+            "{}",
+            message.text
+        );
+    }
+
+    /// The deadline arm's instant: a future due time sleeps toward it, a
+    /// past one fires immediately, and the disabled branch type-checks
+    /// on "now" (the limit-park arm's exact pattern).
+    #[test]
+    fn native_wakeup_deadline_maps_due_times_to_instants() {
+        let now_epoch = crate::session_activity::epoch_seconds();
+        let record = |fire_at: u64| {
+            Some(crate::native_wakeup::NativeWakeupRecord {
+                armed_at_epoch: now_epoch,
+                fire_at_epoch: fire_at,
+                prompt: "x".into(),
+                reason: None,
+                tool_use_id: "t".into(),
+                rearmed_cause: None,
+            })
+        };
+        let now = tokio::time::Instant::now();
+        let future = native_wakeup_deadline(&record(now_epoch + 600));
+        let remaining = future.duration_since(now);
+        assert!(
+            remaining >= std::time::Duration::from_secs(590)
+                && remaining <= std::time::Duration::from_secs(610),
+            "future due time sleeps toward it ({remaining:?})"
+        );
+        assert!(
+            native_wakeup_deadline(&record(now_epoch.saturating_sub(600))).duration_since(now)
+                < std::time::Duration::from_secs(2),
+            "past due time fires immediately"
+        );
+        assert!(
+            native_wakeup_deadline(&None).duration_since(now) < std::time::Duration::from_secs(2),
+            "disabled branch reads as now"
+        );
+    }
 
     #[test]
     fn idle_cwd_announcement_is_housekeeping_for_the_primary_session() {
@@ -5247,9 +5801,11 @@ mod tests {
 
     #[test]
     fn idle_sessions_get_no_synthesized_message() {
-        // Idle and between-turn reloads never arm the marker (the idle
-        // listener applies the respawn directly; no drain returned
-        // `Interrupted` with the reload reason): idle in, idle out.
+        // TRULY idle and between-turn reloads never arm the marker (the
+        // idle listener applies the respawn directly; nothing was cut).
+        // A reload whose interrupt cut a live OBSERVED round arms it like
+        // the primary lane — the cut turn owes, not the lane — but with
+        // no cut turn: idle in, idle out.
         assert!(synthesized_reload_continuation(false).is_none());
 
         // Adjacent interrupt reasons must not collide with the
