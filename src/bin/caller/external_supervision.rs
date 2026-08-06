@@ -1879,9 +1879,7 @@ pub(crate) fn take_over_native_wakeup_at_respawn(
         content: line,
         turn: None,
     });
-    slog(session_log, |l| {
-        l.set_native_wakeup(Some(taken.to_meta()))
-    });
+    slog(session_log, |l| l.set_native_wakeup(Some(taken.to_meta())));
     Some(taken)
 }
 
@@ -2737,7 +2735,10 @@ mod tests {
                 AppEvent::LogEntry { content, level, .. } => {
                     assert_eq!(level, "info");
                     assert!(content.contains("re-armed"), "{content}");
-                    assert!(content.contains(SERVICE_RECOVERY_RESTART_CAUSE), "{content}");
+                    assert!(
+                        content.contains(SERVICE_RECOVERY_RESTART_CAUSE),
+                        "{content}"
+                    );
                     saw_rearm_line = true;
                 }
                 other => panic!("wakeup takeover emitted a non-surface event: {other:?}"),
@@ -2792,11 +2793,9 @@ mod tests {
 
         // An empty prompt is said, not omitted.
         meta.prompt = String::new();
-        assert!(
-            died_wakeup_nudge_addendum(&meta, 900)
-                .unwrap()
-                .contains("(empty)")
-        );
+        assert!(died_wakeup_nudge_addendum(&meta, 900)
+            .unwrap()
+            .contains("(empty)"));
     }
 
     /// The durable bg-park marker follows the activity claims: parked

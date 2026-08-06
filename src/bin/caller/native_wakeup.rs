@@ -320,7 +320,9 @@ mod tests {
     #[test]
     fn take_over_flips_once_and_first_cause_stands() {
         let mut reg = Registry::new();
-        assert!(reg.take_over_at_respawn("s1", "the daemon restart").is_none());
+        assert!(reg
+            .take_over_at_respawn("s1", "the daemon restart")
+            .is_none());
         reg.record_armed("s1", record(1000));
         let flipped = reg
             .take_over_at_respawn("s1", "the credential-reload restart")
@@ -331,7 +333,9 @@ mod tests {
         );
         // Second seam finds it already wrapper-owned: no re-announce, the
         // first, most specific cause stands.
-        assert!(reg.take_over_at_respawn("s1", "the rate-limit restart").is_none());
+        assert!(reg
+            .take_over_at_respawn("s1", "the rate-limit restart")
+            .is_none());
         assert_eq!(
             reg.pending_for("s1").unwrap().rearmed_cause.as_deref(),
             Some("the credential-reload restart")

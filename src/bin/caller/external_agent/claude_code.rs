@@ -1875,7 +1875,8 @@ impl CcReader {
             // rotated. Follow it, unlike the background-task records
             // above, whose OS children genuinely do not survive.
             crate::native_wakeup::migrate(previous, id);
-        } else if let Some(taken) = crate::native_wakeup::take_over_at_respawn(id, "a backend restart")
+        } else if let Some(taken) =
+            crate::native_wakeup::take_over_at_respawn(id, "a backend restart")
         {
             // Fresh adoption of the id by THIS reader with a pending
             // harness-owned wakeup still on record: the process that
@@ -5345,17 +5346,16 @@ mod tests {
         let sid2 = "cc-swk-parser-0001-rotated";
         crate::native_wakeup::consume(sid);
         crate::native_wakeup::consume(sid2);
-        let markers = |out: &CcLineOutcome| -> Vec<
-            Option<crate::session_log::SessionNativeWakeupMeta>,
-        > {
-            out.events
-                .iter()
-                .filter_map(|e| match e {
-                    AgentEvent::NativeWakeupMarker { marker } => Some(marker.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
+        let markers =
+            |out: &CcLineOutcome| -> Vec<Option<crate::session_log::SessionNativeWakeupMeta>> {
+                out.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        AgentEvent::NativeWakeupMarker { marker } => Some(marker.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
         let mut reader = test_reader();
 
         // Arm: registry + marker event + the ordinary tool row.

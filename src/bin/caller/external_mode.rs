@@ -5402,7 +5402,11 @@ mod tests {
             rearmed_cause: Some(CREDENTIAL_RELOAD_RESTART_CAUSE.into()),
         };
         let message = native_wakeup_delivery_message(&record, 900);
-        assert!(message.text.contains("Scheduled wakeup"), "{}", message.text);
+        assert!(
+            message.text.contains("Scheduled wakeup"),
+            "{}",
+            message.text
+        );
         assert!(
             message.text.contains(CREDENTIAL_RELOAD_RESTART_CAUSE),
             "{}",
@@ -5440,7 +5444,11 @@ mod tests {
             "{}",
             message.text
         );
-        assert!(message.text.contains("a backend restart"), "{}", message.text);
+        assert!(
+            message.text.contains("a backend restart"),
+            "{}",
+            message.text
+        );
     }
 
     /// The deadline arm's instant: a future due time sleeps toward it, a
@@ -5468,14 +5476,12 @@ mod tests {
             "future due time sleeps toward it ({remaining:?})"
         );
         assert!(
-            native_wakeup_deadline(&record(now_epoch.saturating_sub(600)))
-                .duration_since(now)
+            native_wakeup_deadline(&record(now_epoch.saturating_sub(600))).duration_since(now)
                 < std::time::Duration::from_secs(2),
             "past due time fires immediately"
         );
         assert!(
-            native_wakeup_deadline(&None).duration_since(now)
-                < std::time::Duration::from_secs(2),
+            native_wakeup_deadline(&None).duration_since(now) < std::time::Duration::from_secs(2),
             "disabled branch reads as now"
         );
     }

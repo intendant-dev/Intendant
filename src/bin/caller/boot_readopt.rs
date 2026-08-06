@@ -1271,7 +1271,11 @@ mod tests {
             "a live park adds nothing"
         );
         assert_eq!(
-            readopt_continuation_with_died_wake_sources(home.path(), "sess-absent", ResumeLens::MidWork),
+            readopt_continuation_with_died_wake_sources(
+                home.path(),
+                "sess-absent",
+                ResumeLens::MidWork
+            ),
             READOPT_CONTINUATION_TEXT,
             "no meta, no addendum"
         );
