@@ -60,17 +60,12 @@ pub(crate) async fn start_task_with_state(
     // classification the supervisor funnel enforces and refuse
     // SYNCHRONOUSLY while draining, instead of acking a dispatch the
     // funnel will refuse a beat later.
-    if let Some(runtime) = s.handover.as_ref().filter(|rt| rt.is_draining()) {
-        return Err(match runtime.successor_port() {
-            Some(port) => format!(
-                "daemon_draining: this daemon is draining — in-flight sessions \
-                 finish here; start new work on the successor daemon (:{port})"
-            ),
-            None => "daemon_draining: this daemon is draining — the successor has \
-                     not acquired yet; retry shortly, or start another daemon \
-                     with --takeover"
-                .to_string(),
-        });
+    if let Some(refusal) = s
+        .handover
+        .as_ref()
+        .and_then(|runtime| runtime.drain_refusal_message())
+    {
+        return Err(refusal);
     }
 
     match s.phase {

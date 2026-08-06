@@ -517,24 +517,13 @@ impl SessionSupervisor {
     }
 
     /// Track HS3: the structured drain refusal for session-creating
-    /// intents, `None` while not draining. Stable `daemon_draining`
-    /// prefix (surfaces and tests key on it); carries the successor
-    /// pointer once the sidecar names one.
+    /// intents, `None` while not draining. The text is the handover
+    /// runtime's canonical builder
+    /// ([`crate::handover::HandoverRuntime::drain_refusal_message`]),
+    /// shared with the MCP layer's gate-before-ack refusals so every
+    /// surface names the drain identically.
     pub(crate) fn drain_refusal_message(&self) -> Option<String> {
-        let runtime = self.config.handover.as_ref()?;
-        if !runtime.is_draining() {
-            return None;
-        }
-        Some(match runtime.successor_port() {
-            Some(port) => format!(
-                "daemon_draining: this daemon is draining — in-flight sessions \
-                 finish here; start new work on the successor daemon (:{port})"
-            ),
-            None => "daemon_draining: this daemon is draining — in-flight sessions \
-                     finish here; the successor has not acquired yet (retry \
-                     shortly, or start another daemon with --takeover)"
-                .to_string(),
-        })
+        self.config.handover.as_ref()?.drain_refusal_message()
     }
 
     pub(crate) fn warn(&self, message: &str) {

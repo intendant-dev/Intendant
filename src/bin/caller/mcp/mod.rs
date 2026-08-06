@@ -2088,6 +2088,22 @@ impl IntendantServer {
                 let logs_home = mcp_state_session_logs_home(&*self.state.read().await);
                 match resolve_persisted_start_target(&logs_home, &session_id) {
                     PersistedStartTarget::External(target) => {
+                        // Gate-before-ack (the drainer resume lying-ack):
+                        // resuming a persisted wrapper is
+                        // `ControlMsg::creates_session`, which the funnel
+                        // refuses while draining — AFTER this branch has
+                        // already acked "ok (session resume dispatched…)".
+                        // Refuse synchronously instead, naming the drain
+                        // and what still serves.
+                        if let Some(refusal) = self.drain_refusal().await {
+                            return format!(
+                                "Cannot start task: {refusal}; session {session_id} is not \
+                                 live here, so this would resume it into a NEW resident \
+                                 session. Targeted follow-ups to live sessions still serve \
+                                 on this daemon — resume this session on the successor \
+                                 instead."
+                            );
+                        }
                         self.bus
                             .send(AppEvent::ControlCommand(ControlMsg::ResumeSession {
                                 source: target.source.clone(),
@@ -2183,6 +2199,15 @@ impl IntendantServer {
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
+            // Gate-before-ack: an untargeted CU task is
+            // `ControlMsg::creates_session` (StartTask without a session
+            // id) — refuse while draining instead of acking a dispatch
+            // the funnel refuses a beat later.
+            if let Some(refusal) = self.drain_refusal().await {
+                return format!(
+                    "Cannot start task: {refusal} (a computer-use task mints a new session)"
+                );
+            }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
                     session_id: None,
@@ -2206,6 +2231,13 @@ impl IntendantServer {
         // control-plane primitive as the dashboard instead of falling into
         // the standalone MCP launcher's "not configured" error.
         if self.http_control_plane_facade {
+            // Gate-before-ack: the same synchronous drain refusal as the
+            // standalone launcher lane (`start_task_with_state`) — this
+            // untargeted lane creates a session, and the funnel would
+            // refuse it a beat after the "ok (new session dispatched)".
+            if let Some(refusal) = self.drain_refusal().await {
+                return format!("Cannot start task: {refusal}");
+            }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
                     session_id: None,
@@ -2247,6 +2279,22 @@ impl IntendantServer {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("Cannot start task: {}", e),
         }
+    }
+
+    /// The drain gate consulted BEFORE acking any session-creating
+    /// dispatch (`ControlMsg::creates_session`): the supervisor funnel
+    /// refuses those intents while draining, so an optimistic
+    /// "ok (… dispatched)" from this layer would precede that refusal and
+    /// teach the caller the dispatch landed when it never did. `None`
+    /// when this server shape carries no handover runtime (bare stdio)
+    /// or the daemon is not draining.
+    async fn drain_refusal(&self) -> Option<String> {
+        self.state
+            .read()
+            .await
+            .handover
+            .as_ref()
+            .and_then(|runtime| runtime.drain_refusal_message())
     }
 
     async fn target_session_phase(&self, session_id: &str) -> Option<Phase> {
