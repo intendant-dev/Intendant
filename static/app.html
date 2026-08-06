@@ -39088,7 +39088,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '6b7fd38a5801bf0e';
+const INTENDANT_APP_BUILD = 'e9352fb7fc8c615f';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -97668,8 +97668,8 @@ function agendaStampNoteText(entry, raw) {
   return /^\d+(\.\d+)?$/.test(bare) ? `NS CAP: $${bare}` : text;
 }
 
-// `preselect` (optional) names a definition to open on — the Templates
-// section's Automate… deep link. Selection falls back to the first
+// `preselect` (optional) names a definition to open on — the Plugins &
+// Skills tab's Automate… deep link. Selection falls back to the first
 // stampable entry exactly as before when the name is absent or not
 // stampable; a shadowed house name resolves to its effective personal
 // twin because the picker matches selectable entries by name.

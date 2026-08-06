@@ -2295,8 +2295,8 @@ function agendaStampNoteText(entry, raw) {
   return /^\d+(\.\d+)?$/.test(bare) ? `NS CAP: $${bare}` : text;
 }
 
-// `preselect` (optional) names a definition to open on — the Templates
-// section's Automate… deep link. Selection falls back to the first
+// `preselect` (optional) names a definition to open on — the Plugins &
+// Skills tab's Automate… deep link. Selection falls back to the first
 // stampable entry exactly as before when the name is absent or not
 // stampable; a shadowed house name resolves to its effective personal
 // twin because the picker matches selectable entries by name.
