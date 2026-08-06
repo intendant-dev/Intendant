@@ -5167,6 +5167,7 @@ mod tests {
             session_id: Some("sess-1".into()),
             id: 5,
             questions: vec![crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which DB?".into(),
                 header: "Database".into(),
                 options: vec![crate::types::UserQuestionOption {

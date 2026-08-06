@@ -1723,6 +1723,7 @@ mod tests {
     fn user_question_pick_bounds_derivation() {
         // Legacy default: exactly one.
         let mut q = crate::types::UserQuestion {
+            consequence: String::new(),
             question: "q".into(),
             header: String::new(),
             options: vec![],
@@ -1784,6 +1785,7 @@ mod tests {
     fn ask_result_followups_and_annotations_ride_their_questions() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which lineage?".into(),
                 header: "Lineage".into(),
                 options: vec![],
@@ -1794,6 +1796,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which headers?".into(),
                 header: "Headers".into(),
                 options: vec![],
@@ -1845,6 +1848,7 @@ mod tests {
     fn ask_result_carries_per_question_breakdown() {
         let questions = vec![
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which lineage?".into(),
                 header: "Lineage".into(),
                 options: vec![],
@@ -1855,6 +1859,7 @@ mod tests {
                 previews: Vec::new(),
             },
             crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which headers?".into(),
                 header: "Headers".into(),
                 options: vec![],
@@ -1916,10 +1921,12 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
             questions: vec![],
             wait_seconds: None,
             park: false,
             session_id: None,
+            expiry: None,
         }
     }
 
@@ -2153,6 +2160,7 @@ mod tests {
     #[test]
     fn question_preview_wire_shape_is_pinned() {
         let question = crate::types::UserQuestion {
+            consequence: String::new(),
             question: "Which?".into(),
             header: String::new(),
             options: Vec::new(),
@@ -2200,6 +2208,7 @@ mod tests {
         // older dashboards and the state-line replay cache see the exact
         // pre-preview wire shape.
         let bare = crate::types::UserQuestion {
+            consequence: String::new(),
             previews: Vec::new(),
             ..question
         };

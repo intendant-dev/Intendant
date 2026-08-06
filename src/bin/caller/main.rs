@@ -2522,7 +2522,8 @@ Also: {"source": "bare"}"#;
         }
         assert!(saw_grant, "UserDisplayGranted must be announced");
 
-        // Approve-all escalates autonomy for the rest of the session.
+        // Approve-all escalates autonomy for the rest of THIS session —
+        // its dial override; the daemon-wide level stays put (AD S1 M4).
         apply_user_approval(
             event::ApprovalResponse::ApproveAll,
             autonomy::ActionCategory::CommandExec,
@@ -2532,7 +2533,11 @@ Also: {"source": "bare"}"#;
             &bus,
         )
         .await;
-        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+        {
+            let state = autonomy.read().await;
+            assert_eq!(state.level, AutonomyLevel::Medium);
+            assert_eq!(state.effective_level(Some("sess-1")), AutonomyLevel::Full);
+        }
 
         // Deny and skip carry no side effects.
         apply_user_approval(

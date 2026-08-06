@@ -4355,6 +4355,7 @@ mod tests {
         AgendaAsk {
             ask_id: 17_592_186_044_423, // (1 << 44) + 7
             questions: vec![crate::types::UserQuestion {
+                consequence: String::new(),
                 question: "Which grid?".into(),
                 header: "Grid".into(),
                 options: vec![crate::types::UserQuestionOption {

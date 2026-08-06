@@ -5173,7 +5173,7 @@ pub(crate) mod tests {
                         level: "full".to_string(),
                     },
                     McpToolScope::AgentSession {
-                        session_id: "s-agent",
+                        session_id: Some("s-agent"),
                     },
                 )
                 .await;
@@ -5184,7 +5184,7 @@ pub(crate) mod tests {
                 .approve_all_scoped(
                     ApproveAllParams { id: 7 },
                     McpToolScope::AgentSession {
-                        session_id: "s-agent",
+                        session_id: Some("s-agent"),
                     },
                 )
                 .await;

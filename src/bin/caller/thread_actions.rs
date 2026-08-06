@@ -5339,6 +5339,7 @@ mod tests {
             pick_max: None,
             free_text: None,
             previews: Vec::new(),
+            consequence: String::new(),
         }];
         let mut question_events = bus.subscribe();
         let question_responder = async {
