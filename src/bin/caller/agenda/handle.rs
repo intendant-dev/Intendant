@@ -911,6 +911,16 @@ impl AgendaHandle {
         }
     }
 
+    /// Whether one of `session_ids` fired an occurrence whose latest run
+    /// carries an attestation — the "this seat honestly finished" half
+    /// of the external wrapper's terminal-goodbye conclude shape (see
+    /// [`AgendaStore::session_occurrence_attested`]; the store freshens
+    /// from disk first, so an attest applied through a co-homed daemon
+    /// counts).
+    pub(crate) fn session_occurrence_attested(&self, session_ids: &[&str]) -> bool {
+        self.lock().session_occurrence_attested(session_ids)
+    }
+
     /// One page of the raw op log (read-only; the `GET /api/agenda/ops`
     /// surface). Holds the same store lock every append completes under,
     /// so a page can never contain a torn in-process line — see

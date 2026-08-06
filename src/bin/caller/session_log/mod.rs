@@ -385,6 +385,16 @@ pub(crate) fn write_session_meta_atomic(dir: &Path, json: &str) -> std::io::Resu
     crate::file_watcher::persist_tempfile(tmp, &dir.join("session_meta.json"))
 }
 
+/// Read `session_meta.json` from a session directory. Missing or
+/// unreadable meta is `None` — the same quiet degradation every marker
+/// writer above applies. The read is safe against writers because every
+/// production write goes through [`write_session_meta_atomic`].
+pub(crate) fn read_session_meta(dir: &Path) -> Option<SessionMeta> {
+    fs::read_to_string(dir.join("session_meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+}
+
 fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
     let meta_path = dir.join("session_meta.json");
     if let Ok(meta_str) = fs::read_to_string(&meta_path) {
