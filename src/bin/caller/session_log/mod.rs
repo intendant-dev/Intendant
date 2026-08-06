@@ -745,6 +745,7 @@ impl SessionLog {
             existing_limit_park,
             existing_safeguards_flag,
             existing_bg_park,
+            existing_native_wakeup,
         ) = existing
             .map(|meta| {
                 (
@@ -753,9 +754,10 @@ impl SessionLog {
                     meta.limit_park,
                     meta.safeguards_flag,
                     meta.bg_park,
+                    meta.native_wakeup,
                 )
             })
-            .unwrap_or((None, None, None, None, None));
+            .unwrap_or((None, None, None, None, None, None));
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -781,6 +783,11 @@ impl SessionLog {
             // limit_park): a respawn's meta rewrite must not silently
             // release a wait — or erase a died-with-restart statement.
             bg_park: existing_bg_park,
+            // Same law: only the wakeup lanes (arm/stop/deliver/retire,
+            // the respawn takeover, the exit backstop, the boot pass)
+            // touch the marker — a meta rewrite must not drop a pending
+            // wake or erase a lost-timer statement.
+            native_wakeup: existing_native_wakeup,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
@@ -2017,6 +2024,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),
@@ -2173,6 +2181,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             s1_dir.join("session_meta.json"),
@@ -2197,6 +2206,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             s2_dir.join("session_meta.json"),
@@ -2262,6 +2272,7 @@ mod tests {
             limit_park: None,
             safeguards_flag: None,
             bg_park: None,
+            native_wakeup: None,
         };
         fs::write(
             log_dir.join("session_meta.json"),

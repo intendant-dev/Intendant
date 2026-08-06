@@ -85,6 +85,59 @@ pub(crate) fn clamp_delay_seconds(delay: u64) -> u64 {
     delay.clamp(MIN_DELAY_SECONDS, MAX_DELAY_SECONDS)
 }
 
+/// Human phrase for a wakeup's due time: the shared reset-phrase shape
+/// while the wake is still ahead ("due 4:00 PM (in ~2h 5m)"), an honest
+/// past form once it isn't ("was due 4:00 PM (~13m ago)" — a wake being
+/// delivered late because the backend was down at the due time).
+pub(crate) fn due_phrase(fire_at_epoch: u64, now_epoch: u64) -> String {
+    if fire_at_epoch > now_epoch {
+        return crate::external_agent::limit_reset_phrase_verb(
+            "due",
+            Some(fire_at_epoch),
+            now_epoch,
+        );
+    }
+    let overdue = now_epoch - fire_at_epoch;
+    let ago = if overdue < 60 {
+        format!("~{overdue}s ago")
+    } else if overdue < 3600 {
+        format!("~{}m ago", overdue.div_ceil(60))
+    } else {
+        format!("~{}h {}m ago", overdue / 3600, (overdue % 3600) / 60)
+    };
+    use chrono::TimeZone;
+    let absolute = chrono::Local
+        .timestamp_opt(fire_at_epoch as i64, 0)
+        .single()
+        .map(|dt| {
+            if overdue >= 24 * 3600 {
+                dt.format("%b %-d, %-I:%M %p").to_string()
+            } else {
+                dt.format("%-I:%M %p").to_string()
+            }
+        });
+    match absolute {
+        Some(absolute) => format!("was due {absolute} ({ago})"),
+        None => format!("was due {ago}"),
+    }
+}
+
+impl NativeWakeupRecord {
+    /// The durable-marker form of this record (pending — the died fields
+    /// are the exit/boot lanes' statements, never the registry's).
+    pub(crate) fn to_meta(&self) -> crate::session_log::SessionNativeWakeupMeta {
+        crate::session_log::SessionNativeWakeupMeta {
+            armed_at_epoch: self.armed_at_epoch,
+            fire_at_epoch: self.fire_at_epoch,
+            prompt: self.prompt.clone(),
+            reason: self.reason.clone(),
+            rearmed_cause: self.rearmed_cause.clone(),
+            died_cause: None,
+            died_at_epoch: None,
+        }
+    }
+}
+
 /// Bound a wake prompt for retention (registry and durable marker).
 pub(crate) fn bounded_prompt(prompt: &str) -> String {
     if prompt.chars().count() <= PROMPT_RETAINED_CHARS {

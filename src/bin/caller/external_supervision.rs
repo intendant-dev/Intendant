@@ -1771,6 +1771,11 @@ pub(crate) fn delivery_aware_park_pending(
 /// re-arms delivery: commands are not known idempotent, so re-running is
 /// an owner decision — the session card's one-tap re-run, or the model
 /// deciding after an owner-visible nudge.
+///
+/// The same confirmed death also reconciles the session's pending native
+/// scheduled wakeup ([`take_over_native_wakeup_at_respawn`]) — the one
+/// wake source that IS re-armed across the respawn, because delivering a
+/// recorded wake prompt executes nothing.
 pub(crate) fn mark_parked_tasks_died_with_restart(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -1783,6 +1788,17 @@ pub(crate) fn mark_parked_tasks_died_with_restart(
         return Vec::new();
     };
     let now_epoch = crate::session_activity::epoch_seconds();
+    // The same confirmed death also killed the harness's own ScheduleWakeup
+    // timer — reconcile it BEFORE the task early-return: the wakeup class's
+    // specimen was parked on nothing but its timer (zero background tasks).
+    take_over_native_wakeup_at_respawn(
+        bus,
+        session_log,
+        live_session_id,
+        backend_session_id,
+        cause,
+        now_epoch,
+    );
     let died = crate::background_tasks::mark_running_died_with_restart(
         backend_session_id,
         cause,
@@ -1828,6 +1844,73 @@ pub(crate) fn mark_parked_tasks_died_with_restart(
         activity: died_tasks_attention_activity(descs.clone(), cause, now_epoch),
     });
     descs
+}
+
+/// The respawn-seam half of the native-wakeup takeover
+/// ([`crate::native_wakeup`]): the confirmed backend death that killed
+/// the parked background tasks above also killed the harness's own
+/// `ScheduleWakeup` timer, so a still-pending record flips wrapper-owned
+/// here under the named cause — the supervising loop's idle deadline arm
+/// then delivers the wake at its due time. Announces the re-arm and
+/// stamps the durable marker's re-armed form. Unlike background tasks —
+/// commands, never re-run automatically — re-arming a timer is safe:
+/// delivering the recorded wake prompt executes nothing. Idempotent: the
+/// first seam to flip announces; later seams find the record already
+/// wrapper-owned and say nothing.
+pub(crate) fn take_over_native_wakeup_at_respawn(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    live_session_id: &Option<String>,
+    backend_session_id: &str,
+    cause: &str,
+    now_epoch: u64,
+) -> Option<crate::native_wakeup::NativeWakeupRecord> {
+    let taken = crate::native_wakeup::take_over_at_respawn(backend_session_id, cause)?;
+    let line = format!(
+        "⏰ The backend's native scheduled wakeup ({}) survived {cause}: Intendant re-armed \
+         it and delivers the wake at its due time",
+        crate::native_wakeup::due_phrase(taken.fire_at_epoch, now_epoch),
+    );
+    slog(session_log, |l| l.info(&line));
+    bus.send(AppEvent::LogEntry {
+        session_id: live_session_id.clone(),
+        level: "info".to_string(),
+        source: "Intendant".to_string(),
+        content: line,
+        turn: None,
+    });
+    slog(session_log, |l| {
+        l.set_native_wakeup(Some(taken.to_meta()))
+    });
+    Some(taken)
+}
+
+/// The lost-timer note a delivery lane appends to a continuation it
+/// ALREADY sends (the #644 composition law — never a minted message):
+/// the session's native scheduled wakeup died with no re-arm possible
+/// (`died_cause` set — daemon restart, session end), so the model must
+/// re-arm its own cadence if it still wants one. Carries the original
+/// wake prompt (bounded at record time) so nothing is silently lost.
+pub(crate) fn died_wakeup_nudge_addendum(
+    meta: &crate::session_log::SessionNativeWakeupMeta,
+    now_epoch: u64,
+) -> Option<String> {
+    let cause = meta.died_cause.as_deref()?;
+    let reason = meta
+        .reason
+        .as_deref()
+        .map(|r| format!(" (reason: {r})"))
+        .unwrap_or_default();
+    let prompt = if meta.prompt.trim().is_empty() {
+        "(empty)".to_string()
+    } else {
+        meta.prompt.clone()
+    };
+    Some(format!(
+        " Note: your native scheduled wakeup ({}){reason} died with {cause} and was NOT \
+         re-armed — re-arm it if you still need the cadence. Its wake prompt was: {prompt}",
+        crate::native_wakeup::due_phrase(meta.fire_at_epoch, now_epoch),
+    ))
 }
 
 /// The honest between-turn snapshot after a respawn killed the parked

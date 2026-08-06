@@ -2120,6 +2120,14 @@ pub(crate) async fn run_with_presence(
                             activity,
                         });
                     }
+                    // Ambient: the durable pending-wakeup marker stays
+                    // honest in this lane too, though wrapper-side
+                    // re-delivery is the supervised external-mode loop's
+                    // lane — a wakeup lost here surfaces through the
+                    // exit backstop and the boot pass instead.
+                    external_agent::AgentEvent::NativeWakeupMarker { marker } => {
+                        slog(&session_log, |l| l.set_native_wakeup(marker));
+                    }
                     external_agent::AgentEvent::ConfigFacts { facts } => {
                         bus.send(AppEvent::SessionConfigFacts {
                             session_id: session_log_id(&session_log),

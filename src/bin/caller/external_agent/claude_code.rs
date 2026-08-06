@@ -496,6 +496,52 @@ impl CcShared {
 /// `notebook_path`. Feeds `AgentEvent::FileActivity` for the git-vitals
 /// activity-locus tracker (the Codex `fileChange` twin) — structural wire
 /// fields only, never derived from a rendered preview.
+/// Observe a main-thread `ScheduleWakeup` tool_use — the Claude Code
+/// harness's self-pacing loop timer, which lives inside the CC process
+/// and dies with every backend respawn. Records the wire-proven pending
+/// state in the [`crate::native_wakeup`] registry and returns the
+/// durable-marker statement to emit (`Some(Some(_))` = armed/replaced,
+/// `Some(None)` = the model stopped its loop, `None` = nothing
+/// observable: no announced session id yet or an unparseable input).
+/// Observation only — the call still renders as an ordinary tool row.
+fn schedule_wakeup_marker_observation(
+    session_id: Option<&str>,
+    tool_use_id: &str,
+    input: &serde_json::Value,
+) -> Option<Option<crate::session_log::SessionNativeWakeupMeta>> {
+    let session_id = session_id.map(str::trim).filter(|s| !s.is_empty())?;
+    if input.get("stop").and_then(|v| v.as_bool()) == Some(true) {
+        crate::native_wakeup::record_stopped(session_id);
+        return Some(None);
+    }
+    // The wire schema says number; accept a float and round rather than
+    // discarding a real arm over a fractional delay.
+    let delay = input
+        .get("delaySeconds")
+        .and_then(|v| v.as_f64())
+        .filter(|d| d.is_finite() && *d > 0.0)?;
+    let delay = crate::native_wakeup::clamp_delay_seconds(delay.round() as u64);
+    let now_epoch = crate::session_activity::epoch_seconds();
+    let record = crate::native_wakeup::NativeWakeupRecord {
+        armed_at_epoch: now_epoch,
+        fire_at_epoch: now_epoch + delay,
+        prompt: crate::native_wakeup::bounded_prompt(
+            input.get("prompt").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+        reason: input
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        tool_use_id: tool_use_id.to_string(),
+        rearmed_cause: None,
+    };
+    let meta = record.to_meta();
+    crate::native_wakeup::record_armed(session_id, record);
+    Some(Some(meta))
+}
+
 fn cc_write_tool_paths(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
     if !matches!(tool_name, "Write" | "Edit" | "NotebookEdit") {
         return Vec::new();
@@ -1824,6 +1870,33 @@ impl CcReader {
                 "a backend restart",
                 now_epoch,
             );
+            // An id CHANGE on this live reader: the arming process (and
+            // its harness ScheduleWakeup timer) continues — only the key
+            // rotated. Follow it, unlike the background-task records
+            // above, whose OS children genuinely do not survive.
+            crate::native_wakeup::migrate(previous, id);
+        } else if let Some(taken) = crate::native_wakeup::take_over_at_respawn(id, "a backend restart")
+        {
+            // Fresh adoption of the id by THIS reader with a pending
+            // harness-owned wakeup still on record: the process that
+            // armed it is gone (a resumed CLI restores no timers), and
+            // no supervision seam claimed the record first — the orphan
+            // case (a re-dispatched session whose previous wrapper died
+            // un-seamed). Take delivery over here, exactly like the
+            // seams do, so the wake is re-armed instead of silently
+            // lost.
+            out.events.push(AgentEvent::Log {
+                level: "info".to_string(),
+                message: format!(
+                    "⏰ A pending native scheduled wakeup from the previous backend process \
+                     was re-armed by Intendant ({}) — the fresh process restores no \
+                     harness timers",
+                    crate::native_wakeup::due_phrase(taken.fire_at_epoch, now_epoch),
+                ),
+            });
+            out.events.push(AgentEvent::NativeWakeupMarker {
+                marker: Some(taken.to_meta()),
+            });
         }
         crate::background_tasks::mark_running_died_with_restart(id, "a backend restart", now_epoch);
         self.announced_session_id = Some(id.to_string());
@@ -2598,6 +2671,21 @@ impl CcReader {
                                 entries: fold.entries(),
                             });
                             continue;
+                        }
+                    }
+                    // A main-thread ScheduleWakeup is the harness's loop
+                    // timer: record its pending state (arm / replace /
+                    // stop) so the respawn seams can tell a killed timer
+                    // from plain idleness, and mirror the durable marker
+                    // through the drain. Observation only — the call
+                    // falls through and renders as a normal tool row.
+                    if tool_name == "ScheduleWakeup" && child_scope.is_none() {
+                        if let Some(marker) = schedule_wakeup_marker_observation(
+                            self.announced_session_id.as_deref(),
+                            &tool_id,
+                            &input,
+                        ) {
+                            out.events.push(AgentEvent::NativeWakeupMarker { marker });
                         }
                     }
                     if !tool_id.is_empty() {
