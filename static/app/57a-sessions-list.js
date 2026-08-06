@@ -678,10 +678,21 @@ function buildSessionCard(m, derived, ctx) {
   // Safeguards terminals get their own honest face — never the generic
   // interrupted/failed chip: this class needs a recast, not a retry.
   const safeguardsFlagged = !!(s.terminal && s.terminal.class === 'safeguards_flagged');
+  // Capacity park (live daemon state, not a terminal): the honest census
+  // chip for a session the daemon will not auto-wake under memory
+  // pressure. Releases on activity or when pressure eases.
+  const capacityParked = !!(globalThis.__capacityState
+    && Array.isArray(globalThis.__capacityState.parked)
+    && s.session_id
+    && globalThis.__capacityState.parked.includes(s.session_id));
   if (safeguardsFlagged) {
     statusEl.className = 'ui-chip err sc-status safeguards-flagged';
     statusEl.textContent = 'safeguards-flagged';
     statusEl.title = 'Provider safeguards flagged this conversation and it ended. Never auto-retried and never switched to another model — recast the task in a fresh session.';
+  } else if (capacityParked) {
+    statusEl.className = 'ui-chip warn sc-status capacity-parked';
+    statusEl.textContent = 'parked · capacity';
+    statusEl.title = 'Parked under memory pressure: the daemon will not auto-wake this idle session while pressure holds. Nothing was killed — it unparks on activity or when headroom returns.';
   } else {
     statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
     statusEl.textContent = displayStatus.replace('_', ' ');

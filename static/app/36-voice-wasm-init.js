@@ -718,6 +718,9 @@ async function main() {
       if (d.event === 'session_vitals') {
         serverMsgStep(d, 'session_vitals', () => applySessionVitals(d));
       }
+      if (d.event === 'capacity_state') {
+        serverMsgStep(d, 'capacity_state', () => applyCapacityState(d));
+      }
       if (d.event === 'session_agent_config_result') {
         serverMsgStep(d, 'session_agent_config_result', () => handleSessionConfigResult(d));
       }

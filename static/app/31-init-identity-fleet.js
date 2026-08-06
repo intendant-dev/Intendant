@@ -1395,6 +1395,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'peer_added',
   'peer_removed',
   'peer_state_changed',
+  'capacity_state',
 ]);
 const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_autonomy',

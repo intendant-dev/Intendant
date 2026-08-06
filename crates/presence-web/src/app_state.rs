@@ -1159,6 +1159,7 @@ const MAX_TOKEN_HISTORY: usize = 120;
 /// so a daemon-side rename can't silently turn a swallow back into
 /// debug-row noise.
 pub const JS_HANDLED_EVENTS: &[&str] = &[
+    "capacity_state",
     "session_vitals",
     "session_goal",
     "session_relationship",

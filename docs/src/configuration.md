@@ -335,6 +335,29 @@ production behavior must not depend on them.
 |-----|------|---------|-------------|
 | `cu_first_routing` | bool | `false` | Intercept every non-direct task with a fast CU model that completes it on the display or escalates to the main agent (vaulted 2026-07-04: adds a model hop to every task and, under subscription-based external agents, an API-key model dependency) |
 
+### `[capacity]`
+
+Box-wide memory-headroom staging and the bounded resident-session
+budget. The daemon polls physical-memory occupancy (macOS
+`sysctlbyname`: memorystatus level + compressor occupancy; Linux
+`MemAvailable` + PSI; Windows `GlobalMemoryStatusEx`) and stages
+backpressure before the freeze point: under the **defer** stage — or
+with residents at the bound — new session admissions queue FIFO with
+honest named positions (forks, delegation-tagged scheduled fires, and
+sub-agent spawns refuse with the bound named; their retry custody stays
+with the caller) and fire when headroom returns; under the **park**
+stage the longest-idle root sessions additionally carry a visible
+parked chip — a census, never a kill. The current view rides
+`get_status` (`capacity`) and the dashboard's oversight-bar chip.
+Fail-open: a missing or failing probe reads as "no signal" (staging
+idles; the count bound still applies), and disabling the section is
+exactly pre-slice behavior.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | `false` disables the capacity controller entirely: no probe, no staging, no admission bound |
+| `max_resident_sessions` | int | derived | Resident-session bound. Default derives one session per GiB of physical memory, clamped 8..=64 (32 when memory size is unreadable). `INTENDANT_CAPACITY_MAX_RESIDENT` overrides the derivation (not this key) |
+
 ### `[readopt]`
 
 The boot auto-readopt pass: at daemon boot, the dead boot's mid-work
