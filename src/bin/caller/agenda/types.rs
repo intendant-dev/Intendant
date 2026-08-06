@@ -3063,7 +3063,10 @@ mod tests {
         // Digest-visible verbatim: the dial is nested inside agent_config.
         let value = serde_json::to_value(&dialed).unwrap();
         assert_eq!(value["agent_config"]["dial"]["autonomy"], "full");
-        assert_eq!(value["agent_config"]["dial"]["approvals"]["network"], "deny");
+        assert_eq!(
+            value["agent_config"]["dial"]["approvals"]["network"],
+            "deny"
+        );
         // Round-trip preserves it.
         let round: SessionManifest =
             serde_json::from_str(&serde_json::to_string(&dialed).unwrap()).unwrap();

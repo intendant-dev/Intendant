@@ -809,11 +809,7 @@ impl SessionSupervisor {
     /// by name: an overlay that exists but cannot be read falls back to
     /// the pure-global layer with a log line naming the session — never a
     /// guessed override.
-    pub(crate) async fn attach_session_dial_from_log_dir(
-        &self,
-        session_id: &str,
-        log_dir: &Path,
-    ) {
+    pub(crate) async fn attach_session_dial_from_log_dir(&self, session_id: &str, log_dir: &Path) {
         match crate::session_config::read_log_dir_dial(log_dir) {
             Ok(Some(dial)) => {
                 self.config

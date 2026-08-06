@@ -3187,8 +3187,16 @@ fn agenda_ask_args(raw: &[String]) -> Result<Value, String> {
     let args = parse_command_args(
         raw,
         &[
-            "--body", "--tag", "--due", "--source", "--ref", "--label", "--option", "--pick",
-            "--header", "--consequence",
+            "--body",
+            "--tag",
+            "--due",
+            "--source",
+            "--ref",
+            "--label",
+            "--option",
+            "--pick",
+            "--header",
+            "--consequence",
         ],
         &["--multi", "--must-read"],
     )?;

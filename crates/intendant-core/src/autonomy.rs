@@ -440,9 +440,7 @@ impl ApprovalConfig {
 /// Hard gates (HumanInput, LiveAudioSpawn, the display-request rail,
 /// question≠permission) stay outside the dial at every scope. TOML table
 /// name at every scope: `[dial]`.
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DialConfig {
     /// Autonomy-level override for this session.
@@ -611,7 +609,10 @@ impl AutonomyState {
     /// with the session's overrides applied under the absolute deny floor
     /// (see [`ApprovalConfig::with_overrides`]).
     pub fn effective_rules(&self, session: Option<&str>) -> ApprovalConfig {
-        match self.session_dial(session).and_then(|d| d.approvals.as_ref()) {
+        match self
+            .session_dial(session)
+            .and_then(|d| d.approvals.as_ref())
+        {
             Some(overrides) => self.rules.with_overrides(overrides),
             None => self.rules.clone(),
         }
@@ -619,7 +620,11 @@ impl AutonomyState {
 
     /// Effective rule for one category in one session (the deny-precheck
     /// form the consult sites read before [`Self::needs_approval`]).
-    pub fn effective_rule_for(&self, session: Option<&str>, category: ActionCategory) -> ApprovalRule {
+    pub fn effective_rule_for(
+        &self,
+        session: Option<&str>,
+        category: ActionCategory,
+    ) -> ApprovalRule {
         self.effective_rules(session).rule_for(category)
     }
 
@@ -2036,7 +2041,10 @@ destructive = "deny"
                 state.controller_tool_decision(None)
             );
             assert_eq!(state.effective_level(Some("s-undialed")), level);
-            assert_eq!(state.effective_notify(Some("s-undialed")), NotifyAppetite::Normal);
+            assert_eq!(
+                state.effective_notify(Some("s-undialed")),
+                NotifyAppetite::Normal
+            );
             assert_eq!(state.effective_ask(Some("s-undialed")), AskGrade::Escalate);
         }
     }
@@ -2140,7 +2148,10 @@ destructive = "deny"
         );
         state.set_session_autonomy_full("s-card");
         assert_eq!(state.effective_level(Some("s-card")), AutonomyLevel::Full);
-        assert_eq!(state.effective_notify(Some("s-card")), NotifyAppetite::Quiet);
+        assert_eq!(
+            state.effective_notify(Some("s-card")),
+            NotifyAppetite::Quiet
+        );
         assert_eq!(state.level, AutonomyLevel::Low, "global level untouched");
         assert_eq!(state.effective_level(Some("s-other")), AutonomyLevel::Low);
     }
@@ -2160,10 +2171,7 @@ destructive = "deny"
         .unwrap();
         assert_eq!(dial.autonomy, Some(AutonomyLevel::Full));
         assert_eq!(dial.ask, Some(AskGrade::Checkpoint));
-        assert_eq!(
-            dial.approvals.unwrap().network,
-            Some(ApprovalRule::Deny)
-        );
+        assert_eq!(dial.approvals.unwrap().network, Some(ApprovalRule::Deny));
         assert_eq!(dial.notify, Some(NotifyAppetite::Quiet));
 
         // TOML `[dial]` table speaks the same vocabulary.
@@ -2173,19 +2181,18 @@ destructive = "deny"
         assert_eq!(toml_dial.ask, Some(AskGrade::Confer));
 
         // Unknown words refuse…
-        assert!(serde_json::from_value::<DialConfig>(
-            serde_json::json!({ "autonomy": "yolo" })
-        )
-        .is_err());
-        assert!(serde_json::from_value::<DialConfig>(
-            serde_json::json!({ "ask": "sometimes" })
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "autonomy": "yolo" }))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "ask": "sometimes" }))
+                .is_err()
+        );
         // …and so do unknown knobs, at both nesting levels.
-        assert!(serde_json::from_value::<DialConfig>(
-            serde_json::json!({ "budget": "low" })
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<DialConfig>(serde_json::json!({ "budget": "low" })).is_err()
+        );
         assert!(serde_json::from_value::<DialConfig>(
             serde_json::json!({ "approvals": { "human_input": "auto" } })
         )

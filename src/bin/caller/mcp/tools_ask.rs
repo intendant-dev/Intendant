@@ -1545,8 +1545,14 @@ mod tests {
                 clamp_notify_urgency(NotifyAppetite::Quiet, requested),
                 NotificationUrgency::Info
             );
-            assert_eq!(clamp_notify_urgency(NotifyAppetite::Normal, requested), requested);
-            assert_eq!(clamp_notify_urgency(NotifyAppetite::Eager, requested), requested);
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Normal, requested),
+                requested
+            );
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Eager, requested),
+                requested
+            );
         }
     }
 

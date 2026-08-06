@@ -6260,10 +6260,7 @@ mod tests {
         assert!(!launch_config.is_empty());
         let dial = launch_config.dial.as_ref().unwrap();
         assert_eq!(dial.autonomy, Some(crate::autonomy::AutonomyLevel::Full));
-        assert_eq!(
-            dial.notify,
-            Some(crate::autonomy::NotifyAppetite::Quiet)
-        );
+        assert_eq!(dial.notify, Some(crate::autonomy::NotifyAppetite::Quiet));
         // A dial-less frame re-serializes with no dial key (byte-stable
         // legacy wire), and unknown dial words refuse the whole frame.
         let legacy: ControlMsg =

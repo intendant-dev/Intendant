@@ -4271,15 +4271,17 @@ mod tests {
         // read) carries the whole contract.
         let served = serde_json::to_value(&item).unwrap();
         assert_eq!(
-            served["ask"]["questions"][0]["options"][0]["label"],
-            "Yes, ship it (Recommended)",
+            served["ask"]["questions"][0]["options"][0]["label"], "Yes, ship it (Recommended)",
             "options + the recommendation label convention"
         );
         assert_eq!(
             served["ask"]["questions"][0]["consequence"],
             "I will ship the recommended design and note the choice on the item"
         );
-        assert_eq!(served["due_ms"], 1_754_000_000_000u64, "expiry = the item's due");
+        assert_eq!(
+            served["due_ms"], 1_754_000_000_000u64,
+            "expiry = the item's due"
+        );
 
         // Durable: the contract survives a reopen byte-for-byte.
         let reopened = AgendaStore::open(dir.path()).unwrap();
