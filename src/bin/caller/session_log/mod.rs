@@ -138,6 +138,18 @@ pub struct SessionMeta {
     /// lack it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg_park: Option<SessionBgParkMeta>,
+    /// Durable trace of a pending backend-native scheduled wakeup (the
+    /// Claude Code harness `ScheduleWakeup` timer): stamped while the
+    /// model's self-scheduled wake is pending, updated to its re-armed
+    /// form when a respawn seam hands delivery to the supervising
+    /// wrapper, flipped to its died form when nothing can deliver it
+    /// (session end, daemon restart), and cleared when it fires or the
+    /// model stops its loop. The timer lives inside the backend process
+    /// and dies with EVERY respawn while this marker survives — it is
+    /// how the boot pass tells a wakeup the daemon restart killed from
+    /// plain idleness. Additive: metas written before 2026-08 lack it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_wakeup: Option<SessionNativeWakeupMeta>,
 }
 
 /// A provider-safeguards flag recorded durably (see
@@ -165,6 +177,38 @@ pub struct SessionBgParkMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub died_cause: Option<String>,
     /// Epoch seconds the tasks died, present with `died_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_at_epoch: Option<u64>,
+}
+
+/// A pending backend-native scheduled wakeup recorded durably (see
+/// [`SessionMeta::native_wakeup`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SessionNativeWakeupMeta {
+    /// Epoch seconds the arm was observed on the wire.
+    pub armed_at_epoch: u64,
+    /// Epoch seconds the wake is due.
+    pub fire_at_epoch: u64,
+    /// The wake prompt the model asked to receive (bounded by the
+    /// producer — display and re-delivery data, never a command).
+    pub prompt: String,
+    /// The model's stated reason for the chosen delay, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The named restart the timer did not survive in its harness form —
+    /// `Some` means the supervising wrapper re-armed it and owns
+    /// delivery at the due time. `None` = the backend harness still owns
+    /// the fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rearmed_cause: Option<String>,
+    /// The named end that killed the wakeup with no re-arm possible —
+    /// `Some` flips the marker from "pending" to the honest lost-timer
+    /// statement (nothing will deliver it; re-arming is the model's or
+    /// owner's decision on resume). `None` = the wake is still owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub died_cause: Option<String>,
+    /// Epoch seconds the timer was declared lost, present with
+    /// `died_cause`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub died_at_epoch: Option<u64>,
 }
@@ -832,6 +876,28 @@ impl SessionLog {
             return;
         }
         meta.bg_park = None;
+        if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
+                eprintln!("session_log: failed to write session_meta.json: {}", e);
+            }
+        }
+    }
+
+    /// Record (or clear) the durable native-wakeup marker in
+    /// `session_meta.json` (see [`SessionMeta::native_wakeup`]). Missing
+    /// or unreadable meta is a quiet no-op, like [`Self::set_limit_park`].
+    pub fn set_native_wakeup(&self, wakeup: Option<SessionNativeWakeupMeta>) {
+        let meta_path = self.dir.join("session_meta.json");
+        let Some(mut meta) = fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+        else {
+            return;
+        };
+        if meta.native_wakeup == wakeup {
+            return;
+        }
+        meta.native_wakeup = wakeup;
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
             if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                 eprintln!("session_log: failed to write session_meta.json: {}", e);

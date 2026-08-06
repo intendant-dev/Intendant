@@ -74,6 +74,7 @@ mod mcp;
 mod mcp_client;
 mod memory;
 mod message_search;
+mod native_wakeup;
 mod openai_chatgpt_auth;
 mod peer;
 mod peer_file_transfer;
