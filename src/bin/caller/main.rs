@@ -1403,14 +1403,19 @@ async fn start_external_display_recordings(
 /// controller-dispatched tool calls), applied identically by every surface
 /// (JSON stdin, web, MCP): Approve records the action's dedup source —
 /// scoped to `session_id` and content-aware for content-bearing actions
-/// (see `autonomy::batch_dedup_source`) — ApproveAll raises global
-/// autonomy to Full, DisplayControl grants user display access.
+/// (see `autonomy::batch_dedup_source`) — ApproveAll escalates autonomy to
+/// Full for exactly the card's session (its dial override; the owner's
+/// ratified session-scoped approve-all — daemon-wide Full moves only
+/// through Settings/`ctl settings autonomy`/`SetAutonomy`), and
+/// DisplayControl grants user display access. `session_id: None` — the
+/// single-session shapes sharing the `""` dedup bucket — keeps the global
+/// raise: those shapes ARE the whole daemon, and a pseudo-session there
+/// would lie.
 ///
 /// External-agent approvals deliberately do NOT route here: their
 /// "Approve all" is Intendant-enforced per external session
-/// (`approve_all_session` in the agent event loop) instead of flipping
-/// global autonomy — a button on one Codex/Claude/Kimi/Pi session must not
-/// escalate every other surface of the daemon.
+/// (`approve_all_session` in the agent event loop) — the same
+/// one-session blast radius this arm now gives native cards.
 async fn apply_user_approval(
     response: event::ApprovalResponse,
     cat: autonomy::ActionCategory,
@@ -1422,7 +1427,10 @@ async fn apply_user_approval(
     let mut state = autonomy.write().await;
     match response {
         event::ApprovalResponse::Approve => state.record_approved_command(session_id, dedup_source),
-        event::ApprovalResponse::ApproveAll => state.level = AutonomyLevel::Full,
+        event::ApprovalResponse::ApproveAll => match session_id {
+            Some(session) => state.set_session_autonomy_full(session),
+            None => state.level = AutonomyLevel::Full,
+        },
         // Answer resolves question prompts; it grants nothing.
         event::ApprovalResponse::Skip
         | event::ApprovalResponse::Deny

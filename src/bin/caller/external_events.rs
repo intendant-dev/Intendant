@@ -2094,7 +2094,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     }
                     external_agent::ApprovalCategory::McpTool => autonomy::ActionCategory::ToolCall,
                 };
-                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                let decision = {
+                    config
+                        .autonomy
+                        .read()
+                        .await
+                        .external_approval_decision(config.session_id.as_deref(), cat)
+                };
                 if approve_all_session
                     || decision == autonomy::ExternalApprovalDecision::AutoApprove
                 {
@@ -2470,7 +2476,13 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 diff,
             } => {
                 let cat = autonomy::ActionCategory::FileWrite;
-                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                let decision = {
+                    config
+                        .autonomy
+                        .read()
+                        .await
+                        .external_approval_decision(config.session_id.as_deref(), cat)
+                };
                 let preview = format!("file change: {}", path);
 
                 if approve_all_session

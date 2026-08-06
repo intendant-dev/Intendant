@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 presence-core = { path = "../presence-core" }
 serde = { version = "1.0", features = ["derive"] }
+# The session-dial vocabulary (DialConfig) rides AgentLaunchConfig, whose
+# wire schema derives schemars; same major as the caller's.
+schemars = "1"
 # skills discovery walks the home skills dir.
 dirs = "6"
 serde_json = "1.0"

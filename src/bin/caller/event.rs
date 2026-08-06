@@ -1500,6 +1500,14 @@ pub struct AgentLaunchConfig {
     pub codex_context_archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_service_tier: Option<String>,
+    /// Session-dial override layer (Track AD S1): typed, owner-signed,
+    /// sticky for the session's life. Backend-neutral — it governs the
+    /// daemon-side decision points (autonomy level, per-category approval
+    /// rules under the live global deny floor, notify ceiling, ask grade),
+    /// so it applies to internal and external sessions alike. `None`
+    /// inherits the live global layer per knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dial: Option<crate::autonomy::DialConfig>,
 }
 
 impl AgentLaunchConfig {
@@ -1530,6 +1538,7 @@ impl AgentLaunchConfig {
             codex_managed_context,
             codex_context_archive,
             codex_service_tier,
+            dial,
         } = self;
         agent.is_none()
             && agent_command.is_none()
@@ -1552,6 +1561,10 @@ impl AgentLaunchConfig {
             && codex_managed_context.is_none()
             && codex_context_archive.is_none()
             && codex_service_tier.is_none()
+            // A dial-bearing config is NON-empty even when the dial itself
+            // is all-None: the hosted-control action wall keys on this, and
+            // an unexpected `dial` key must fail closed, not slip through.
+            && dial.is_none()
     }
 }
 
@@ -2112,6 +2125,11 @@ pub enum ControlMsg {
         /// normal. Only applies when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_service_tier: Option<String>,
+        /// Optional session-dial override layer (`AgentLaunchConfig::dial`):
+        /// typed autonomy/ask/approvals/notify knobs, owner-signed and
+        /// sticky for this session's life. Backend-neutral.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dial: Option<crate::autonomy::DialConfig>,
         #[serde(default)]
         orchestrate: Option<bool>,
         /// Bypass presence/orchestration, matching StartTask.direct.

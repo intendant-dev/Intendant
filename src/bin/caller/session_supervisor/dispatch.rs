@@ -405,6 +405,7 @@ impl SessionSupervisor {
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
+                dial,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -443,6 +444,7 @@ impl SessionSupervisor {
                     codex_managed_context,
                     codex_context_archive,
                     codex_service_tier,
+                    dial,
                 };
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {

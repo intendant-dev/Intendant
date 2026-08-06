@@ -1970,6 +1970,11 @@ impl IntendantServer {
                 id: params.id,
                 action: "approve_all".to_string(),
             });
+            // Standalone stdio is a single-session shape: this MCP state
+            // fronts exactly one session, so its approve-all IS the whole
+            // daemon and keeps the global raise (the session-scoped
+            // approve-all lives in `apply_user_approval`, which daemon
+            // cards route through with their session id).
             let autonomy = self.state.read().await.autonomy.clone();
             let mut a = autonomy.write().await;
             a.level = AutonomyLevel::Full;

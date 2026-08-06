@@ -1442,6 +1442,22 @@ impl IntendantServer {
             );
         };
 
+        // The session's notify dial (Track AD S1): `quiet` is a hard
+        // ceiling at info — the notification is still delivered and still
+        // lands in the transcript, only its loudness changes, and the
+        // downgrade is NAMED in the tool response so under-delivery is
+        // never silent. `normal`/`eager` add no ceiling in S1.
+        let requested_urgency = urgency;
+        let urgency = {
+            let autonomy = self.state.read().await.autonomy.clone();
+            let appetite = autonomy.read().await.effective_notify(Some(&session_id));
+            match appetite {
+                crate::autonomy::NotifyAppetite::Quiet => crate::types::NotificationUrgency::Info,
+                crate::autonomy::NotifyAppetite::Normal
+                | crate::autonomy::NotifyAppetite::Eager => requested_urgency,
+            }
+        };
+
         let id = format!("notif-{}", Uuid::new_v4().simple());
         self.bus.send(AppEvent::UserNotification {
             session_id: Some(session_id.clone()),
@@ -1452,12 +1468,21 @@ impl IntendantServer {
             ts: now_unix_ms(),
         });
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "sent",
             "id": id,
             "session_id": session_id,
             "urgency": urgency.as_str(),
-        }))
+        });
+        if urgency != requested_urgency {
+            result["requested_urgency"] =
+                serde_json::Value::String(requested_urgency.as_str().to_string());
+            result["note"] = serde_json::Value::String(format!(
+                "urgency clamped to {} by this session's notify dial (quiet)",
+                urgency.as_str()
+            ));
+        }
+        Ok(result)
     }
 }
 
