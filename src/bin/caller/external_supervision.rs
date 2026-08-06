@@ -2670,6 +2670,135 @@ mod tests {
         crate::background_tasks::clear_session(sid);
     }
 
+    /// THE re-arm pin for the ScheduleWakeup respawn variant (the
+    /// 2026-08-01 specimen: a session parked on NOTHING but its harness
+    /// timer): the marking seam takes a pending native wakeup over even
+    /// when zero background tasks died — the registry record flips
+    /// wrapper-owned under the named cause, the durable marker mirrors
+    /// the re-armed form, and the one surface is a log row. No delivery
+    /// is armed here: the supervising loop's deadline arm owns the wake.
+    /// Later seams find the record already wrapper-owned and stay silent
+    /// (the first, most specific cause stands).
+    #[test]
+    fn native_wakeup_takeover_rearms_without_died_tasks() {
+        let sid = "cc-wakeup-takeover-session";
+        crate::native_wakeup::record_armed(
+            sid,
+            crate::native_wakeup::NativeWakeupRecord {
+                armed_at_epoch: 100,
+                fire_at_epoch: 880,
+                prompt: "<<autonomous-loop-dynamic>>".into(),
+                reason: Some("watching the merge queue".into()),
+                tool_use_id: "toolu_wk1".into(),
+                rearmed_cause: None,
+            },
+        );
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("s")).unwrap(),
+        ));
+        slog(&log, |l| l.write_meta(None, Some("seat")));
+
+        let descs = mark_parked_tasks_died_with_restart(
+            &bus,
+            &log,
+            &Some("wrapper-wk".to_string()),
+            Some(sid),
+            SERVICE_RECOVERY_RESTART_CAUSE,
+        );
+        assert!(descs.is_empty(), "no background tasks died");
+
+        let record = crate::native_wakeup::pending_for(sid).expect("record retained");
+        assert_eq!(
+            record.rearmed_cause.as_deref(),
+            Some(SERVICE_RECOVERY_RESTART_CAUSE)
+        );
+
+        let meta_path = log.lock().unwrap().dir().join("session_meta.json");
+        let meta: session_log::SessionMeta =
+            serde_json::from_str(&std::fs::read_to_string(meta_path).unwrap()).unwrap();
+        let marker = meta.native_wakeup.expect("re-armed marker stamped");
+        assert_eq!(
+            marker.rearmed_cause.as_deref(),
+            Some(SERVICE_RECOVERY_RESTART_CAUSE)
+        );
+        assert!(marker.died_cause.is_none(), "re-armed, not lost");
+        assert_eq!(marker.fire_at_epoch, 880);
+        assert_eq!(marker.prompt, "<<autonomous-loop-dynamic>>");
+
+        // Surfaces only: exactly the one info row, nothing
+        // dispatch-shaped (the no-auto-delivery law shared with the
+        // died-tasks pin above — delivery belongs to the loop's arm).
+        let mut saw_rearm_line = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::LogEntry { content, level, .. } => {
+                    assert_eq!(level, "info");
+                    assert!(content.contains("re-armed"), "{content}");
+                    assert!(content.contains(SERVICE_RECOVERY_RESTART_CAUSE), "{content}");
+                    saw_rearm_line = true;
+                }
+                other => panic!("wakeup takeover emitted a non-surface event: {other:?}"),
+            }
+        }
+        assert!(saw_rearm_line, "the re-arm announces itself");
+
+        // Idempotent across later seams: first cause stands, no
+        // re-announce.
+        let again = mark_parked_tasks_died_with_restart(
+            &bus,
+            &log,
+            &Some("wrapper-wk".to_string()),
+            Some(sid),
+            RATE_LIMIT_RESTART_CAUSE,
+        );
+        assert!(again.is_empty());
+        assert!(rx.try_recv().is_err(), "already wrapper-owned: silent");
+        assert_eq!(
+            crate::native_wakeup::pending_for(sid)
+                .unwrap()
+                .rearmed_cause
+                .as_deref(),
+            Some(SERVICE_RECOVERY_RESTART_CAUSE)
+        );
+        crate::native_wakeup::consume(sid);
+    }
+
+    /// The lost-timer note composes like the died-task offer: nothing
+    /// without a died cause (a pending or re-armed wake is not lost),
+    /// text-only with one — carrying the cause, the model's own wake
+    /// prompt, and the stated reason.
+    #[test]
+    fn died_wakeup_addendum_only_speaks_for_lost_timers() {
+        let mut meta = session_log::SessionNativeWakeupMeta {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("queue watch".into()),
+            rearmed_cause: None,
+            died_cause: None,
+            died_at_epoch: None,
+        };
+        assert!(died_wakeup_nudge_addendum(&meta, 900).is_none());
+
+        meta.died_cause = Some(DAEMON_RESTART_CAUSE.into());
+        let note = died_wakeup_nudge_addendum(&meta, 900).expect("note");
+        assert!(note.contains(DAEMON_RESTART_CAUSE), "{note}");
+        assert!(note.contains("<<autonomous-loop-dynamic>>"), "{note}");
+        assert!(note.contains("NOT re-armed"), "{note}");
+        assert!(note.contains("(reason: queue watch)"), "{note}");
+
+        // An empty prompt is said, not omitted.
+        meta.prompt = String::new();
+        assert!(
+            died_wakeup_nudge_addendum(&meta, 900)
+                .unwrap()
+                .contains("(empty)")
+        );
+    }
+
     /// The durable bg-park marker follows the activity claims: parked
     /// stamps the live form, quiet idle clears only a live marker (a
     /// died statement survives a respawned backend settling), and any

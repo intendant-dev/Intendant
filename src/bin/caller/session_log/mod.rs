@@ -2080,6 +2080,54 @@ mod tests {
         assert!(read().bg_park.is_none(), "real work clears everything");
     }
 
+    /// The native-wakeup marker obeys the bg-park law: it survives every
+    /// meta rewrite (a respawn's `write_meta` mid-pend must not drop a
+    /// pending wake or erase a lost-timer statement); only the wakeup
+    /// lanes touch it, via `set_native_wakeup`.
+    #[test]
+    fn native_wakeup_marker_survives_meta_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let read = || -> SessionMeta {
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap()
+        };
+
+        log.set_native_wakeup(Some(SessionNativeWakeupMeta {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("queue watch".into()),
+            rearmed_cause: None,
+            died_cause: None,
+            died_at_epoch: None,
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task again"));
+        let marker = read()
+            .native_wakeup
+            .expect("a meta rewrite must not drop the pending wake");
+        assert_eq!(marker.fire_at_epoch, 880);
+        assert_eq!(marker.prompt, "<<autonomous-loop-dynamic>>");
+
+        // The died statement also survives rewrites, until a lane clears it.
+        log.set_native_wakeup(Some(SessionNativeWakeupMeta {
+            died_cause: Some("the daemon restart".into()),
+            died_at_epoch: Some(900),
+            ..marker
+        }));
+        log.write_meta(Some(Path::new("/tmp/project")), Some("task"));
+        let died = read().native_wakeup.expect("died statement survives");
+        assert_eq!(died.died_cause.as_deref(), Some("the daemon restart"));
+
+        log.set_native_wakeup(None);
+        assert!(
+            read().native_wakeup.is_none(),
+            "delivery/retirement clears it"
+        );
+    }
+
     #[test]
     fn write_meta_creates_file() {
         let dir = tempfile::tempdir().unwrap();

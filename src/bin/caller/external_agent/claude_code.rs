@@ -5328,6 +5328,155 @@ mod tests {
         assert_eq!(last_activity(&out).unwrap().state, S::Idle);
     }
 
+    /// The wakeup registry (`crate::native_wakeup`) mirrors the harness
+    /// `ScheduleWakeup` lifecycle from the wire: a main-thread arm
+    /// records (and re-records — the harness keeps one timer) with the
+    /// durable-marker event alongside the ordinary tool row; `stop:
+    /// true` clears both; child-scoped and unparseable calls say
+    /// nothing; a live reader's id rotation migrates the record with the
+    /// process. A FRESH reader adopting an id with a harness-owned
+    /// record still pending takes delivery over (the orphan case: the
+    /// arming process is gone and no supervision seam claimed it), and a
+    /// later fresh adoption leaves the wrapper-owned record alone.
+    /// Session ids unique to this test: the registry is process-global.
+    #[test]
+    fn schedule_wakeup_registry_mirrors_arm_stop_rotation_and_orphan_adoption() {
+        let sid = "cc-swk-parser-0001";
+        let sid2 = "cc-swk-parser-0001-rotated";
+        crate::native_wakeup::consume(sid);
+        crate::native_wakeup::consume(sid2);
+        let markers = |out: &CcLineOutcome| -> Vec<
+            Option<crate::session_log::SessionNativeWakeupMeta>,
+        > {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::NativeWakeupMarker { marker } => Some(marker.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut reader = test_reader();
+
+        // Arm: registry + marker event + the ordinary tool row.
+        let out = reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_swk1","name":"ScheduleWakeup","input":{{"delaySeconds":780,"prompt":"<<autonomous-loop-dynamic>>","reason":"pace the loop"}}}}]}},"session_id":"{sid}"}}"#
+        ));
+        let record = crate::native_wakeup::pending_for(sid).expect("armed");
+        assert_eq!(record.fire_at_epoch - record.armed_at_epoch, 780);
+        assert_eq!(record.prompt, "<<autonomous-loop-dynamic>>");
+        assert_eq!(record.reason.as_deref(), Some("pace the loop"));
+        assert!(record.rearmed_cause.is_none(), "harness-owned while alive");
+        let armed_markers = markers(&out);
+        assert_eq!(armed_markers.len(), 1);
+        assert_eq!(
+            armed_markers[0].as_ref().expect("armed form").fire_at_epoch,
+            record.fire_at_epoch
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolStarted { tool_name, .. } if tool_name == "ScheduleWakeup"
+            )),
+            "observation only — the call still renders as a tool row"
+        );
+
+        // Replace: the harness keeps one timer.
+        let out = reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_swk2","name":"ScheduleWakeup","input":{{"delaySeconds":1200,"prompt":"next pass"}}}}]}},"session_id":"{sid}"}}"#
+        ));
+        assert_eq!(markers(&out).len(), 1);
+        let record = crate::native_wakeup::pending_for(sid).expect("replaced");
+        assert_eq!(record.fire_at_epoch - record.armed_at_epoch, 1200);
+        assert_eq!(record.prompt, "next pass");
+
+        // Child-scoped and unparseable arms say nothing.
+        let out = reader.process_line(&format!(
+            r#"{{"type":"assistant","parent_tool_use_id":"spawn-1","message":{{"content":[{{"type":"tool_use","id":"toolu_swk3","name":"ScheduleWakeup","input":{{"delaySeconds":60,"prompt":"child"}}}}]}},"session_id":"{sid}"}}"#
+        ));
+        assert!(
+            markers(&out).is_empty(),
+            "child-scoped: not the main thread's timer"
+        );
+        let out = reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_swk4","name":"ScheduleWakeup","input":{{"prompt":"no delay"}}}}]}},"session_id":"{sid}"}}"#
+        ));
+        assert!(markers(&out).is_empty(), "no delay, no stop: unparseable");
+        assert_eq!(
+            crate::native_wakeup::pending_for(sid).unwrap().prompt,
+            "next pass",
+            "the record is untouched"
+        );
+
+        // A live reader's id rotation migrates the record with the
+        // process — the timer lives in the process, not the key.
+        reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[]}},"session_id":"{sid2}"}}"#
+        ));
+        assert!(
+            crate::native_wakeup::pending_for(sid).is_none(),
+            "followed the rotation"
+        );
+        assert_eq!(
+            crate::native_wakeup::pending_for(sid2).unwrap().prompt,
+            "next pass"
+        );
+
+        // Stop clears registry and marker (under the rotated id).
+        let out = reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_swk5","name":"ScheduleWakeup","input":{{"stop":true}}}}]}},"session_id":"{sid2}"}}"#
+        ));
+        assert_eq!(markers(&out), vec![None]);
+        assert!(crate::native_wakeup::pending_for(sid2).is_none());
+
+        // Orphan adoption: a fresh reader adopting the id with a
+        // harness-owned record pending takes delivery over.
+        crate::native_wakeup::record_armed(
+            sid,
+            crate::native_wakeup::NativeWakeupRecord {
+                armed_at_epoch: 100,
+                fire_at_epoch: 880,
+                prompt: "orphaned wake".into(),
+                reason: None,
+                tool_use_id: "toolu_prev".into(),
+                rearmed_cause: None,
+            },
+        );
+        let mut fresh = test_reader();
+        let out = fresh.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[]}},"session_id":"{sid}"}}"#
+        ));
+        let taken = crate::native_wakeup::pending_for(sid).expect("record survives adoption");
+        assert_eq!(taken.rearmed_cause.as_deref(), Some("a backend restart"));
+        let adoption_markers = markers(&out);
+        assert_eq!(adoption_markers.len(), 1);
+        assert_eq!(
+            adoption_markers[0]
+                .as_ref()
+                .unwrap()
+                .rearmed_cause
+                .as_deref(),
+            Some("a backend restart")
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Log { message, .. } if message.contains("re-armed by Intendant")
+            )),
+            "the takeover announces"
+        );
+
+        // A wrapper-owned record is left alone by yet another fresh
+        // adoption — the supervising loop owns delivery now.
+        let mut third = test_reader();
+        let out = third.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[]}},"session_id":"{sid}"}}"#
+        ));
+        assert!(markers(&out).is_empty(), "already wrapper-owned: silent");
+        assert!(crate::native_wakeup::pending_for(sid).is_some());
+        crate::native_wakeup::consume(sid);
+    }
+
     /// The inspector registry (`crate::background_tasks`) mirrors the
     /// armed lifecycle with the wire's output-path statements: the
     /// launch-ack TEXT announces the path while running (the probed

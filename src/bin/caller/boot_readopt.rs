@@ -1000,6 +1000,131 @@ mod tests {
         .unwrap();
     }
 
+    fn write_meta_with_native_wakeup(
+        home: &Path,
+        session: &str,
+        status: &str,
+        native_wakeup: serde_json::Value,
+    ) {
+        let dir = logs_root(home).join(session);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({
+            "session_id": session,
+            "created_at": "2026-07-28T00:00:00",
+            "status": status,
+            "native_wakeup": native_wakeup,
+        });
+        std::fs::write(
+            dir.join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The daemon-restart lost-timer pin (the "otherwise" branch of the
+    /// ScheduleWakeup respawn variant): a dead-boot session's pending
+    /// native-wakeup marker — live OR re-armed form — flips to its died
+    /// form under the daemon-restart cause; live wrappers, this boot's
+    /// era, and already-died markers stay untouched, and nothing
+    /// re-delivers a wake at boot (the lost-timer note rides the readopt
+    /// continuation instead).
+    #[test]
+    fn boot_pass_marks_dead_boot_native_wakeups_died() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-dead",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "<<autonomous-loop-dynamic>>",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-rearmed-dead",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "carry on",
+                "rearmed_cause": "the credential-reload restart",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-live-wrapper",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "still mine",
+            }),
+        );
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-wakeup-already-died",
+            "idle",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "old wake",
+                "died_cause": "the session end",
+                "died_at_epoch": 200,
+            }),
+        );
+        let bus = crate::event::EventBus::new();
+        let mut events = bus.subscribe();
+        let mut live = HashSet::new();
+        live.insert("sess-wakeup-live-wrapper".to_string());
+
+        let marked = mark_dead_wake_sources(home.path(), &live, |_| true, &bus);
+        assert_eq!(marked, 2, "the two dead pending wakeups mark");
+
+        let wakeup_of = |session: &str| -> crate::session_log::SessionNativeWakeupMeta {
+            serde_json::from_str::<SessionMeta>(
+                &std::fs::read_to_string(
+                    logs_root(home.path())
+                        .join(session)
+                        .join("session_meta.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .native_wakeup
+            .expect("marker present")
+        };
+        assert_eq!(
+            wakeup_of("sess-wakeup-dead").died_cause.as_deref(),
+            Some(crate::external_supervision::DAEMON_RESTART_CAUSE)
+        );
+        let rearmed = wakeup_of("sess-wakeup-rearmed-dead");
+        assert_eq!(
+            rearmed.died_cause.as_deref(),
+            Some(crate::external_supervision::DAEMON_RESTART_CAUSE),
+            "a wrapper-owned re-arm dies with the daemon that owned it"
+        );
+        assert_eq!(
+            rearmed.rearmed_cause.as_deref(),
+            Some("the credential-reload restart"),
+            "the re-arm history stays readable"
+        );
+        assert!(
+            wakeup_of("sess-wakeup-live-wrapper").died_cause.is_none(),
+            "live wrappers own their own state"
+        );
+        assert_eq!(
+            wakeup_of("sess-wakeup-already-died").died_cause.as_deref(),
+            Some("the session end"),
+            "the first, most specific cause stands"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no bus emission for wakeup flips — the note rides the readopt nudge"
+        );
+    }
+
     /// The daemon-restart respawn class: a dead-boot session parked on
     /// background tasks (idle meta, live bg-park marker — NEVER a
     /// readopt candidate) gets its marker flipped to died-with-restart
@@ -1149,6 +1274,56 @@ mod tests {
             readopt_continuation_with_died_wake_sources(home.path(), "sess-absent", ResumeLens::MidWork),
             READOPT_CONTINUATION_TEXT,
             "no meta, no addendum"
+        );
+    }
+
+    /// The lost-wakeup note rides the same nudge: a died native-wakeup
+    /// marker appends the honest lost-timer note with the model's own
+    /// wake prompt; a still-pending marker adds nothing (its wake is
+    /// owed, not lost).
+    #[test]
+    fn readopt_continuation_carries_the_lost_wakeup_note() {
+        let home = tempfile::tempdir().unwrap();
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-died-wakeup",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "<<autonomous-loop-dynamic>>",
+                "died_cause": "the daemon restart",
+                "died_at_epoch": 900,
+            }),
+        );
+        let text = readopt_continuation_with_died_wake_sources(
+            home.path(),
+            "sess-died-wakeup",
+            ResumeLens::MidWork,
+        );
+        assert!(text.starts_with(READOPT_CONTINUATION_TEXT), "{text}");
+        assert!(text.contains("native scheduled wakeup"), "{text}");
+        assert!(text.contains("the daemon restart"), "{text}");
+        assert!(text.contains("<<autonomous-loop-dynamic>>"), "{text}");
+
+        write_meta_with_native_wakeup(
+            home.path(),
+            "sess-pending-wakeup",
+            "running",
+            serde_json::json!({
+                "armed_at_epoch": 100,
+                "fire_at_epoch": 880,
+                "prompt": "still owed",
+            }),
+        );
+        assert_eq!(
+            readopt_continuation_with_died_wake_sources(
+                home.path(),
+                "sess-pending-wakeup",
+                ResumeLens::MidWork
+            ),
+            READOPT_CONTINUATION_TEXT,
+            "a pending wake is owed, not lost — no note"
         );
     }
 

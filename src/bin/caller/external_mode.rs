@@ -5387,6 +5387,99 @@ pub(crate) async fn run_external_agent_mode(
 mod tests {
     use super::*;
 
+    /// The delivered wake is honest about its mechanism and carries the
+    /// model's own prompt — plus the re-arm reminder, since the harness
+    /// timer the model thinks it holds is gone. Empty prompts are said,
+    /// not omitted; an unflipped record names the generic restart.
+    #[test]
+    fn native_wakeup_delivery_message_is_honest_and_carries_the_prompt() {
+        let record = crate::native_wakeup::NativeWakeupRecord {
+            armed_at_epoch: 100,
+            fire_at_epoch: 880,
+            prompt: "<<autonomous-loop-dynamic>>".into(),
+            reason: Some("watching the queue".into()),
+            tool_use_id: "toolu_wk".into(),
+            rearmed_cause: Some(CREDENTIAL_RELOAD_RESTART_CAUSE.into()),
+        };
+        let message = native_wakeup_delivery_message(&record, 900);
+        assert!(message.text.contains("Scheduled wakeup"), "{}", message.text);
+        assert!(
+            message.text.contains(CREDENTIAL_RELOAD_RESTART_CAUSE),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("<<autonomous-loop-dynamic>>"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("watching the queue"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("re-arm your next wakeup"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.steer_id.is_none() && message.follow_up_id.is_none(),
+            "no id-keyed cancel matching can drop the wake"
+        );
+
+        let bare = crate::native_wakeup::NativeWakeupRecord {
+            prompt: String::new(),
+            reason: None,
+            rearmed_cause: None,
+            ..record
+        };
+        let message = native_wakeup_delivery_message(&bare, 900);
+        assert!(
+            message.text.contains("(the arm carried no prompt)"),
+            "{}",
+            message.text
+        );
+        assert!(message.text.contains("a backend restart"), "{}", message.text);
+    }
+
+    /// The deadline arm's instant: a future due time sleeps toward it, a
+    /// past one fires immediately, and the disabled branch type-checks
+    /// on "now" (the limit-park arm's exact pattern).
+    #[test]
+    fn native_wakeup_deadline_maps_due_times_to_instants() {
+        let now_epoch = crate::session_activity::epoch_seconds();
+        let record = |fire_at: u64| {
+            Some(crate::native_wakeup::NativeWakeupRecord {
+                armed_at_epoch: now_epoch,
+                fire_at_epoch: fire_at,
+                prompt: "x".into(),
+                reason: None,
+                tool_use_id: "t".into(),
+                rearmed_cause: None,
+            })
+        };
+        let now = tokio::time::Instant::now();
+        let future = native_wakeup_deadline(&record(now_epoch + 600));
+        let remaining = future.duration_since(now);
+        assert!(
+            remaining >= std::time::Duration::from_secs(590)
+                && remaining <= std::time::Duration::from_secs(610),
+            "future due time sleeps toward it ({remaining:?})"
+        );
+        assert!(
+            native_wakeup_deadline(&record(now_epoch.saturating_sub(600)))
+                .duration_since(now)
+                < std::time::Duration::from_secs(2),
+            "past due time fires immediately"
+        );
+        assert!(
+            native_wakeup_deadline(&None).duration_since(now)
+                < std::time::Duration::from_secs(2),
+            "disabled branch reads as now"
+        );
+    }
+
     #[test]
     fn idle_cwd_announcement_is_housekeeping_for_the_primary_session() {
         let session_id = Some("session-main".to_string());
