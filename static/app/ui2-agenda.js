@@ -2286,7 +2286,7 @@ function agendaStampDeclaredParams(entry) {
 }
 
 // The exact annotation line a typed parameter value records: the
-// declared template with its one `<value>` slot substituted verbatim
+// declared line with its one `<value>` slot substituted verbatim
 // (function replacement so `$`-patterns in the value never expand) —
 // the machine writes the canonical bytes, no human hand-formats
 // spend-authority lines like `NS CAP: $<amount>`.
@@ -2463,7 +2463,7 @@ function agendaOpenAutomationSheet(anchor, preselect) {
   // Declared parameters (skills/plugins S2): one labeled input per
   // parameter the selected definition declares in its node config block
   // — required ones marked, the declared hint as the help line. Typed
-  // values substitute into the declared line templates and ride the
+  // values substitute into the declared line shapes and ride the
   // stamp op's annotations beside the generic note; the daemon refuses
   // a stamp missing a required parameter, so the sheet's empty-required
   // gate below is convenience, never the wall.
@@ -2471,6 +2471,11 @@ function agendaOpenAutomationSheet(anchor, preselect) {
   panel.appendChild(paramsBox);
   const paramInputs = new Map(); // parameter name -> its input element
   const renderParamRows = () => {
+    // Re-renders ride selection changes AND the catalog-refresh
+    // callback — carry typed values across by name so a refresh never
+    // eats a half-filled field.
+    const prior = new Map();
+    for (const [name, input] of paramInputs) prior.set(name, input.value);
     paramsBox.textContent = '';
     paramInputs.clear();
     for (const param of agendaStampDeclaredParams(entry)) {
@@ -2482,6 +2487,7 @@ function agendaOpenAutomationSheet(anchor, preselect) {
       const input = document.createElement('input');
       input.type = 'text';
       input.id = `agsx-param-${param.name}`;
+      if (prior.has(param.name)) input.value = prior.get(param.name);
       input.addEventListener('input', renderSummary);
       row.appendChild(input);
       row.appendChild(agendaStartSheetEl('div', 'ags-hint', param.hint
@@ -2789,7 +2795,7 @@ async function agendaAutomationSheetSubmit(form) {
   // annotations: the daemon records each line on the annotation surface
   // the fired mandates read (a workflow's hub, an action's item),
   // attributed to whoever stamps. A parameter value substitutes into
-  // its declared template client-side — the machine writes the
+  // its declared line client-side — the machine writes the
   // canonical bytes, never a hand-formatted authority line. The
   // empty-required check here is convenience only; the daemon refuses a
   // stamp missing a required parameter either way.

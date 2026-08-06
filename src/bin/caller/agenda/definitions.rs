@@ -863,14 +863,15 @@ pub(crate) fn parse_definition(
                 section.id
             ));
         }
-        let mut parameters: Vec<DefinitionParameter> = Vec::new();
-        for (param_name, param) in config.parameters.unwrap_or_default() {
-            if parameters.len() == MAX_NODE_PARAMETERS {
-                return Err(format!(
-                    "node `{}` declares more than {MAX_NODE_PARAMETERS} parameters",
-                    section.id
-                ));
-            }
+        let declared = config.parameters.unwrap_or_default();
+        if declared.len() > MAX_NODE_PARAMETERS {
+            return Err(format!(
+                "node `{}` declares more than {MAX_NODE_PARAMETERS} parameters",
+                section.id
+            ));
+        }
+        let mut parameters: Vec<DefinitionParameter> = Vec::with_capacity(declared.len());
+        for (param_name, param) in declared {
             if !valid_slug(&param_name) {
                 return Err(format!(
                     "parameter name {param_name:?} violates the slug grammar (lowercase \
@@ -1547,10 +1548,14 @@ mod tests {
                  [parameters.two]\nlabel = \"Two\"\nkind = \"annotation\"\nline = \"{b}\"\n"
             );
             let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
-            assert!(err.contains("overlapping line templates"), "{a:?}/{b:?}: {err}");
+            assert!(
+                err.contains("overlapping line templates"),
+                "{a:?}/{b:?}: {err}"
+            );
             assert!(err.contains("`one`") && err.contains("`two`"), "{err}");
         }
-        let disjoint = "[parameters.one]\nlabel = \"One\"\nkind = \"annotation\"\nline = \"A: <value>\"\n\
+        let disjoint =
+            "[parameters.one]\nlabel = \"One\"\nkind = \"annotation\"\nline = \"A: <value>\"\n\
              [parameters.two]\nlabel = \"Two\"\nkind = \"annotation\"\nline = \"B: <value>\"\n";
         let def = parse_definition(&action(disjoint, "P."), "sample").unwrap();
         assert_eq!(def.nodes[0].parameters.len(), 2);

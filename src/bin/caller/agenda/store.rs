@@ -7921,7 +7921,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["NS CAP: $60", "context: adoption bootstrap"]
         );
-        assert!(item.annotations.iter().all(|a| a.principal.as_deref() == Some("owner")));
+        assert!(item
+            .annotations
+            .iter()
+            .all(|a| a.principal.as_deref() == Some("owner")));
         let effect = item.effects.first().expect("proposed manifest");
         assert!(effect.approval.is_none(), "stamping approves nothing");
         assert_eq!(effect.manifest.binding_refs.len(), 1);
