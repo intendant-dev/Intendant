@@ -87,8 +87,7 @@ fn sample_memory_impl() -> Option<MemorySample> {
             .checked_add(sysctl_u64("vm.page_pageable_external_count")?)?;
         pages.checked_mul(page_size)
     })();
-    let os_pressure_level =
-        sysctl_u64("kern.memorystatus_vm_pressure_level").map(|v| v as u32);
+    let os_pressure_level = sysctl_u64("kern.memorystatus_vm_pressure_level").map(|v| v as u32);
     let compressor_frac = sysctl_u64("vm.compressor_bytes_used")
         .map(|used| (used as f64 / total_bytes as f64).clamp(0.0, 1.0));
     Some(MemorySample {
@@ -137,11 +136,10 @@ fn sysctl_u64(name: &str) -> Option<u64> {
 fn sample_memory_impl() -> Option<MemorySample> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let (total_bytes, available_bytes) = fold_meminfo(&meminfo)?;
-    let (psi_some_avg10, psi_full_avg10) =
-        match std::fs::read_to_string("/proc/pressure/memory") {
-            Ok(psi) => fold_psi_memory(&psi),
-            Err(_) => (None, None),
-        };
+    let (psi_some_avg10, psi_full_avg10) = match std::fs::read_to_string("/proc/pressure/memory") {
+        Ok(psi) => fold_psi_memory(&psi),
+        Err(_) => (None, None),
+    };
     Some(MemorySample {
         total_bytes,
         available_bytes,
@@ -155,9 +153,7 @@ fn sample_memory_impl() -> Option<MemorySample> {
 
 #[cfg(windows)]
 fn sample_memory_impl() -> Option<MemorySample> {
-    use windows_sys::Win32::System::SystemInformation::{
-        GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: MEMORYSTATUSEX is a plain-data out-struct; zeroed is a valid
     // initial state for it.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };

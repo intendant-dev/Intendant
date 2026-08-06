@@ -483,8 +483,7 @@ fn epoch_ms() -> u64 {
 // registry: last publisher wins, absence means fail-open.
 // ---------------------------------------------------------------------
 
-static PUBLISHED: std::sync::RwLock<Option<Arc<CapacityController>>> =
-    std::sync::RwLock::new(None);
+static PUBLISHED: std::sync::RwLock<Option<Arc<CapacityController>>> = std::sync::RwLock::new(None);
 
 pub(crate) fn publish_capacity_controller(controller: Arc<CapacityController>) {
     *PUBLISHED.write().expect("capacity publish lock") = Some(controller);
@@ -594,9 +593,18 @@ mod tests {
     fn tracker_worsens_immediately_and_walks_the_stages_in_order() {
         let mut tracker = StageTracker::default();
         let t0 = Instant::now();
-        assert_eq!(tracker.observe(CapacityStage::Normal, t0), CapacityStage::Normal);
-        assert_eq!(tracker.observe(CapacityStage::Defer, t0), CapacityStage::Defer);
-        assert_eq!(tracker.observe(CapacityStage::Park, t0), CapacityStage::Park);
+        assert_eq!(
+            tracker.observe(CapacityStage::Normal, t0),
+            CapacityStage::Normal
+        );
+        assert_eq!(
+            tracker.observe(CapacityStage::Defer, t0),
+            CapacityStage::Defer
+        );
+        assert_eq!(
+            tracker.observe(CapacityStage::Park, t0),
+            CapacityStage::Park
+        );
     }
 
     #[test]
@@ -604,9 +612,15 @@ mod tests {
         let mut tracker = StageTracker::default();
         let t0 = Instant::now();
         tracker.observe(CapacityStage::Park, t0);
-        assert_eq!(tracker.observe(CapacityStage::Normal, t0), CapacityStage::Park);
         assert_eq!(
-            tracker.observe(CapacityStage::Normal, t0 + EASE_DWELL - Duration::from_secs(1)),
+            tracker.observe(CapacityStage::Normal, t0),
+            CapacityStage::Park
+        );
+        assert_eq!(
+            tracker.observe(
+                CapacityStage::Normal,
+                t0 + EASE_DWELL - Duration::from_secs(1)
+            ),
             CapacityStage::Park,
             "an ease inside the dwell must not apply"
         );
@@ -688,14 +702,19 @@ mod tests {
         let view = controller.observe(Some(pressured), t0).expect("changed");
         assert_eq!(view.stage, CapacityStage::Park);
         // Probe dies. The stage must not pin at park forever.
-        let view = controller.observe(None, t0 + Duration::from_secs(5)).expect("probe_ok flips");
+        let view = controller
+            .observe(None, t0 + Duration::from_secs(5))
+            .expect("probe_ok flips");
         assert_eq!(view.stage, CapacityStage::Park, "inside the dwell");
         assert!(!view.probe_ok);
         let view = controller
             .observe(None, t0 + Duration::from_secs(5) + EASE_DWELL)
             .expect("stage eases");
         assert_eq!(view.stage, CapacityStage::Normal);
-        assert!(matches!(controller.admission_check(0), AdmissionCheck::Admit));
+        assert!(matches!(
+            controller.admission_check(0),
+            AdmissionCheck::Admit
+        ));
     }
 
     #[test]
@@ -723,10 +742,19 @@ mod tests {
         assert_eq!(resolve_max_resident(None, Some("nope"), Some(64 * gib)), 64);
         // RAM-derived: one per GiB, clamped.
         assert_eq!(resolve_max_resident(None, None, Some(16 * gib)), 16);
-        assert_eq!(resolve_max_resident(None, None, Some(2 * gib)), DERIVED_BOUND_MIN);
-        assert_eq!(resolve_max_resident(None, None, Some(256 * gib)), DERIVED_BOUND_MAX);
+        assert_eq!(
+            resolve_max_resident(None, None, Some(2 * gib)),
+            DERIVED_BOUND_MIN
+        );
+        assert_eq!(
+            resolve_max_resident(None, None, Some(256 * gib)),
+            DERIVED_BOUND_MAX
+        );
         // Probe-less default.
-        assert_eq!(resolve_max_resident(None, None, None), PROBELESS_DEFAULT_MAX_RESIDENT);
+        assert_eq!(
+            resolve_max_resident(None, None, None),
+            PROBELESS_DEFAULT_MAX_RESIDENT
+        );
     }
 
     // Refusal/queue honesty: the messages name the bound, the count, the
@@ -756,7 +784,9 @@ mod tests {
                 enqueued_ms: 7,
             }]
         };
-        let view = controller.update_census(2, row(), &parked).expect("changed");
+        let view = controller
+            .update_census(2, row(), &parked)
+            .expect("changed");
         assert_eq!(view.resident, 2);
         assert_eq!(view.queued, 1);
         assert_eq!(view.queue, row());
@@ -766,7 +796,12 @@ mod tests {
             controller.update_census(2, row(), &parked).is_none(),
             "no change, no publish"
         );
-        let view = controller.update_census(4, row(), &parked).expect("at bound");
-        assert!(view.admissions_deferred, "at-bound census defers admissions");
+        let view = controller
+            .update_census(4, row(), &parked)
+            .expect("at bound");
+        assert!(
+            view.admissions_deferred,
+            "at-bound census defers admissions"
+        );
     }
 }

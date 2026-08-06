@@ -10042,7 +10042,10 @@ async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
         }
     }
     let started = started.unwrap_or_else(|| {
-        panic!("holder session never started; daemon log:\n{}", daemon_log())
+        panic!(
+            "holder session never started; daemon log:\n{}",
+            daemon_log()
+        )
     });
     let holder_id = started
         .get("session_id")
@@ -10120,7 +10123,11 @@ async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
         .and_then(|rows| rows.get(0))
         .and_then(|row| row.get("position"))
         .and_then(|v| v.as_u64());
-    assert_eq!(position, Some(1), "the queue row names position 1: {queued_view}");
+    assert_eq!(
+        position,
+        Some(1),
+        "the queue row names position 1: {queued_view}"
+    );
 
     // Release the holder and stop it: the slot frees, the queue drains
     // (queued back to 0), and the held create starts and completes.

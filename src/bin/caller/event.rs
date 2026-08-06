@@ -3516,9 +3516,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AutonomyChanged { autonomy } => Some(OutboundEvent::AutonomyChanged {
             autonomy: autonomy.clone(),
         }),
-        AppEvent::CapacityState { view } => Some(OutboundEvent::CapacityState {
-            view: view.clone(),
-        }),
+        AppEvent::CapacityState { view } => {
+            Some(OutboundEvent::CapacityState { view: view.clone() })
+        }
         AppEvent::CodexThreadActionRequested {
             request_id,
             session_id,
@@ -6786,8 +6786,16 @@ mod tests {
                 true,
                 false,
             ),
-            (r#"{"action":"start_task","task":"t","session_id":"s"}"#, false, false),
-            (r#"{"action":"follow_up","session_id":"s","text":"t"}"#, false, false),
+            (
+                r#"{"action":"start_task","task":"t","session_id":"s"}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"action":"follow_up","session_id":"s","text":"t"}"#,
+                false,
+                false,
+            ),
             (r#"{"action":"interrupt","session_id":"s"}"#, false, false),
         ];
         for (json, creates, additional) in matrix {

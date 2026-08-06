@@ -184,7 +184,8 @@ impl SessionSupervisor {
                 "capacity: headroom returned — firing queued session admission \
                  (waited {waited_s}s)"
             ));
-            self.enqueue_reserved_create(entry.msg, entry.reserved).await;
+            self.enqueue_reserved_create(entry.msg, entry.reserved)
+                .await;
         }
         self.publish_capacity_census().await;
     }
@@ -250,9 +251,8 @@ impl SessionSupervisor {
                     if normalize_supervisor_phase(&session.phase) != "idle" {
                         continue;
                     }
-                    let last_activity = crate::boot_readopt::activity_mtime_secs(
-                        &session.session_dir,
-                    );
+                    let last_activity =
+                        crate::boot_readopt::activity_mtime_secs(&session.session_dir);
                     let idle_for = now_s.saturating_sub(last_activity);
                     if state.capacity_parked.contains(id) {
                         keep.insert(id.clone());
@@ -412,9 +412,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match &event {
                 AppEvent::LoopError(message) => refusals.push(message.clone()),
-                AppEvent::LogEntry { content, .. }
-                    if content.contains("queued at position 1") =>
-                {
+                AppEvent::LogEntry { content, .. } if content.contains("queued at position 1") => {
                     queued_notices += 1;
                 }
                 AppEvent::CapacityState { .. } => capacity_events += 1,
@@ -422,8 +420,15 @@ mod tests {
             }
         }
         assert_eq!(queued_notices, 1, "the queue notice names position 1");
-        assert!(capacity_events >= 1, "queue/refusal changes broadcast the view");
-        assert_eq!(refusals.len(), 2, "fork + delegated start refuse: {refusals:?}");
+        assert!(
+            capacity_events >= 1,
+            "queue/refusal changes broadcast the view"
+        );
+        assert_eq!(
+            refusals.len(),
+            2,
+            "fork + delegated start refuse: {refusals:?}"
+        );
         for refusal in &refusals {
             assert!(
                 refusal.starts_with(capacity::CAPACITY_REFUSAL_PREFIX),
@@ -508,10 +513,8 @@ mod tests {
     async fn gate_passes_everything_without_a_controller() {
         let project = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
-        let supervisor = SessionSupervisor::new(test_supervisor_config(
-            project.path().to_path_buf(),
-            bus,
-        ));
+        let supervisor =
+            SessionSupervisor::new(test_supervisor_config(project.path().to_path_buf(), bus));
         occupy_slot(&supervisor, "s-1").await;
         occupy_slot(&supervisor, "s-2").await;
         let creating = [
@@ -536,10 +539,8 @@ mod tests {
         let bus = EventBus::new();
         let supervisor = supervisor_with_bound(project.path(), bus, 1);
         occupy_slot(&supervisor, "s-parent").await;
-        let parent_project = crate::project::Project::from_root(
-            project.path().to_path_buf(),
-        )
-        .expect("test project");
+        let parent_project =
+            crate::project::Project::from_root(project.path().to_path_buf()).expect("test project");
         let result = supervisor
             .start_sub_agent_session_inner(
                 "s-parent",
@@ -640,14 +641,12 @@ mod tests {
             .unwrap()
             .phase = String::new();
         supervisor.capacity_park_sweep().await;
-        assert!(
-            supervisor
-                .state
-                .lock()
-                .await
-                .capacity_parked
-                .contains("s-idle")
-        );
+        assert!(supervisor
+            .state
+            .lock()
+            .await
+            .capacity_parked
+            .contains("s-idle"));
 
         // Ease past the dwell: everything releases.
         let normal = intendant_platform::memory::MemorySample {
