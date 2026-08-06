@@ -2362,6 +2362,7 @@ mod tests {
                     pick_min: None,
                     pick_max: None,
                     free_text: None,
+                    consequence: None,
                 }]),
                 actor("agent_session", Some("sess-park")),
             )
@@ -2507,6 +2508,7 @@ mod tests {
                         pick_min: None,
                         pick_max: None,
                         free_text: None,
+                        consequence: None,
                     }]),
                     None,
                 )
@@ -2585,6 +2587,7 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
         }])
     }
 
@@ -2768,7 +2771,9 @@ mod tests {
                     pick_min: None,
                     pick_max: None,
                     free_text: None,
+                    consequence: None,
                 }],
+                None,
                 actor("agent_session", Some("sess-block")),
             )
             .unwrap();

@@ -5074,6 +5074,130 @@ pub(crate) mod tests {
         });
     }
 
+    /// AD S1 pin (M6, the response-naming half): a quiet-dialed session's
+    /// `urgent` notify lands as info, the emitted event carries the
+    /// clamped urgency, and the tool response NAMES the downgrade so
+    /// under-delivery is never silent. Un-dialed sessions pass through.
+    #[test]
+    fn notify_quiet_clamps_urgent_to_info() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut events = bus.subscribe();
+            let home = tempdir().unwrap();
+            let server = IntendantServer::new_http_with_home(
+                state.clone(),
+                bus.clone(),
+                home.path().to_path_buf(),
+            );
+            {
+                let autonomy = state.read().await.autonomy.clone();
+                autonomy.write().await.set_session_dial(
+                    "s-quiet",
+                    crate::autonomy::DialConfig {
+                        notify: Some(crate::autonomy::NotifyAppetite::Quiet),
+                        ..Default::default()
+                    },
+                );
+            }
+
+            let result = server
+                .notify_user_inner(NotifyUserParams {
+                    text: "batch finished".to_string(),
+                    title: None,
+                    urgency: Some("urgent".to_string()),
+                    session_id: Some("s-quiet".to_string()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["urgency"], "info");
+            assert_eq!(result["requested_urgency"], "urgent");
+            assert!(
+                result["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("clamped to info by this session's notify dial"),
+                "the downgrade is named: {result}"
+            );
+            match timeout(Duration::from_secs(2), events.recv()).await {
+                Ok(Ok(AppEvent::UserNotification { urgency, .. })) => {
+                    assert_eq!(urgency, crate::types::NotificationUrgency::Info)
+                }
+                other => panic!("expected the clamped notification, got {other:?}"),
+            }
+
+            // An un-dialed session keeps its requested urgency, no note.
+            let result = server
+                .notify_user_inner(NotifyUserParams {
+                    text: "blocked on review".to_string(),
+                    title: None,
+                    urgency: Some("urgent".to_string()),
+                    session_id: Some("s-normal".to_string()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["urgency"], "urgent");
+            assert!(result.get("note").is_none());
+        });
+    }
+
+    /// AD S1 pin: supervised agent sessions can write no session dial —
+    /// the `set_autonomy` refusal (the global layer) extends to every
+    /// dial-writing lane an agent session could reach: approval
+    /// resolution (the ApproveAll→dial escalation) is scope-denied, so no
+    /// dial entry can appear from an agent-session actor.
+    #[test]
+    fn session_dial_writes_refused_for_agent_sessions() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let home = tempdir().unwrap();
+            let server = IntendantServer::new_http_with_home(
+                state.clone(),
+                bus.clone(),
+                home.path().to_path_buf(),
+            );
+            let autonomy = state.read().await.autonomy.clone();
+
+            let reply = server
+                .set_autonomy_scoped(
+                    SetAutonomyParams {
+                        level: "full".to_string(),
+                    },
+                    McpToolScope::AgentSession {
+                        session_id: "s-agent",
+                    },
+                )
+                .await;
+            assert!(reply.starts_with("Denied"), "set_autonomy refusal: {reply}");
+            assert_eq!(autonomy.read().await.level, AutonomyLevel::Medium);
+
+            let reply = server
+                .approve_all_scoped(
+                    ApproveAllParams { id: 7 },
+                    McpToolScope::AgentSession {
+                        session_id: "s-agent",
+                    },
+                )
+                .await;
+            assert!(
+                reply.starts_with("Denied"),
+                "agent-session approve-all refusal: {reply}"
+            );
+            let state = autonomy.read().await;
+            assert!(state.session_dials.is_empty(), "no dial minted");
+            assert_eq!(state.level, AutonomyLevel::Medium);
+        });
+    }
+
     #[test]
     fn resolve_pending_approval_without_pending() {
         let rt = tokio::runtime::Builder::new_current_thread()

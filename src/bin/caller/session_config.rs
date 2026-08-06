@@ -1760,6 +1760,43 @@ fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[Stri
 mod tests {
     use super::*;
 
+    /// AD S1: the dial's durable reader distinguishes absent (no overlay,
+    /// or an overlay without a dial → `Ok(None)`) from present-but-
+    /// unreadable (`Err` — the resume lane's named pure-global fallback);
+    /// forks never inherit the parent's dial through the inheritable-pins
+    /// reduction.
+    #[test]
+    fn dial_overlay_reads_fail_closed_and_forks_never_inherit_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_log_dir_dial(dir.path()).unwrap(), None, "no overlay");
+
+        let dial = crate::autonomy::DialConfig {
+            autonomy: Some(crate::autonomy::AutonomyLevel::High),
+            ..Default::default()
+        };
+        let config = SessionAgentConfig {
+            dial: Some(dial.clone()),
+            ..Default::default()
+        };
+        write_log_dir_config(dir.path(), &config).unwrap();
+        assert_eq!(
+            read_log_dir_dial(dir.path()).unwrap(),
+            Some(dial.clone()),
+            "a dial-only native overlay round-trips"
+        );
+
+        // Corrupt bytes are an ERROR, never a silent None — the caller
+        // logs the named fallback instead of guessing.
+        std::fs::write(dir.path().join(SESSION_AGENT_CONFIG_FILE), b"{ nope").unwrap();
+        let err = read_log_dir_dial(dir.path()).unwrap_err();
+        assert!(err.contains("parse"), "named parse failure: {err}");
+
+        // The fork reduction strips the dial with the other
+        // parent-only facts.
+        let inheritable = config.into_inheritable_launch_pins();
+        assert_eq!(inheritable.dial, None);
+    }
+
     /// The commission's pin: a forked/branched child inherits the
     /// parent's persisted launch pins (model + effort — the 2026-07-27
     /// incident's edit fork ran the daemon-global `fable` instead of the

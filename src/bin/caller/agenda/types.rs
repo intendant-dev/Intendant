@@ -3014,6 +3014,62 @@ mod tests {
         assert_eq!(value["agent_config"]["claude_effort"], "xhigh");
     }
 
+    /// AD S1 pin: the session dial rides the manifest's `agent_config`
+    /// block digest-covered — a dial-less config serializes byte-identically
+    /// to the pre-dial shape (every existing digest and approval stands),
+    /// and adding a dial revises the digest so the owner approves exactly
+    /// the override they reviewed.
+    #[test]
+    fn manifest_dial_rides_the_digest() {
+        let base = SessionManifest {
+            goal: "run the sweep".into(),
+            fire_at_ms: 1234,
+            orchestrate: false,
+            interactive: false,
+            project_root: None,
+            agent_config: Some(Box::new(crate::event::AgentLaunchConfig {
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            })),
+            recurrence: None,
+            trigger: None,
+            binding_refs: Vec::new(),
+        };
+        let base_json = serde_json::to_string(&base).unwrap();
+        assert!(
+            !base_json.contains("\"dial\""),
+            "a dial-less config emits no dial key: {base_json}"
+        );
+        let base_digest = manifest_digest("item-1", "ef-1", &base);
+
+        let mut dialed = base.clone();
+        dialed.agent_config = Some(Box::new(crate::event::AgentLaunchConfig {
+            agent: Some("claude-code".into()),
+            dial: Some(crate::autonomy::DialConfig {
+                autonomy: Some(crate::autonomy::AutonomyLevel::Full),
+                approvals: Some(crate::autonomy::ApprovalOverrides {
+                    network: Some(crate::autonomy::ApprovalRule::Deny),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_ne!(
+            manifest_digest("item-1", "ef-1", &dialed),
+            base_digest,
+            "a dial revises the digest — the approval signs the override layer"
+        );
+        // Digest-visible verbatim: the dial is nested inside agent_config.
+        let value = serde_json::to_value(&dialed).unwrap();
+        assert_eq!(value["agent_config"]["dial"]["autonomy"], "full");
+        assert_eq!(value["agent_config"]["dial"]["approvals"]["network"], "deny");
+        // Round-trip preserves it.
+        let round: SessionManifest =
+            serde_json::from_str(&serde_json::to_string(&dialed).unwrap()).unwrap();
+        assert_eq!(round, dialed);
+    }
+
     /// The approval-time editor's derive law: `SessionManifest`'s own
     /// schema is the source of truth for the manifest vocabulary, and
     /// the propose command — the ONE mint/edit lane — exposes every

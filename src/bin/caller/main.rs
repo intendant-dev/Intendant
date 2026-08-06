@@ -1489,6 +1489,61 @@ fn format_command_preview(json_str: &str) -> String {
 mod tests {
     use super::*;
 
+    /// AD S1 pin (M4, the ratified session-scoped approve-all): ApproveAll
+    /// on a card that carries a session id escalates exactly that
+    /// session's dial to Full — the global level and every other session
+    /// are untouched — while the `None` single-session shapes keep the
+    /// global raise (they ARE the whole daemon). The dedup bucket and the
+    /// display grant stay out of the dial entirely.
+    #[tokio::test]
+    async fn approve_all_scopes_to_the_card_session() {
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let bus = EventBus::new();
+
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            Some("s-card"),
+            "exec: cargo test",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        {
+            let state = autonomy.read().await;
+            assert_eq!(
+                state.level,
+                AutonomyLevel::Medium,
+                "the card's approve-all must not raise the daemon-wide level"
+            );
+            assert_eq!(state.effective_level(Some("s-card")), AutonomyLevel::Full);
+            assert_eq!(
+                state.effective_level(Some("s-other")),
+                AutonomyLevel::Medium,
+                "other sessions keep their effective level"
+            );
+            assert!(!state.needs_approval(Some("s-card"), autonomy::ActionCategory::CommandExec));
+            assert!(
+                state.approved_commands.is_empty(),
+                "approve-all is a level grant, not a dedup record"
+            );
+            assert!(!state.user_display_granted);
+        }
+
+        // The legacy single-session shapes (no session id) are the whole
+        // daemon: they keep the global raise.
+        apply_user_approval(
+            event::ApprovalResponse::ApproveAll,
+            autonomy::ActionCategory::CommandExec,
+            None,
+            "exec: cargo test",
+            &autonomy,
+            &bus,
+        )
+        .await;
+        assert_eq!(autonomy.read().await.level, AutonomyLevel::Full);
+    }
+
     /// The accessible-display memo must stop being trusted the moment the
     /// memoized X display's socket disappears (another session's XvfbGuard
     /// killing its server), so the probe path is re-entered and auto-launch

@@ -637,6 +637,23 @@ fn park_actor(
     actor
 }
 
+/// The notify dial's hard ceiling (AD S1, M6): `quiet` clamps every
+/// notification to Info — still delivered, only loudness changes; the
+/// caller names the downgrade in its tool response so under-delivery is
+/// never silent. `normal`/`eager` add no ceiling in S1 (eager's taught
+/// milestone appetite is S2 vocabulary).
+pub(crate) fn clamp_notify_urgency(
+    appetite: crate::autonomy::NotifyAppetite,
+    requested: crate::types::NotificationUrgency,
+) -> crate::types::NotificationUrgency {
+    match appetite {
+        crate::autonomy::NotifyAppetite::Quiet => crate::types::NotificationUrgency::Info,
+        crate::autonomy::NotifyAppetite::Normal | crate::autonomy::NotifyAppetite::Eager => {
+            requested
+        }
+    }
+}
+
 /// Parse the ask-level `expiry` (decision-contract) into the parked
 /// item's due instant — the same WHEN vocabulary agenda due dates speak
 /// ([`crate::ctl::parse_due_ms`]; one parser, two lanes).
@@ -1477,11 +1494,7 @@ impl IntendantServer {
         let urgency = {
             let autonomy = self.state.read().await.autonomy.clone();
             let appetite = autonomy.read().await.effective_notify(Some(&session_id));
-            match appetite {
-                crate::autonomy::NotifyAppetite::Quiet => crate::types::NotificationUrgency::Info,
-                crate::autonomy::NotifyAppetite::Normal
-                | crate::autonomy::NotifyAppetite::Eager => requested_urgency,
-            }
+            clamp_notify_urgency(appetite, requested_urgency)
         };
 
         let id = format!("notif-{}", Uuid::new_v4().simple());
@@ -1516,6 +1529,42 @@ impl IntendantServer {
 mod tests {
     use super::*;
     use crate::types::NotificationUrgency;
+
+    /// AD S1 pin half (the ceiling itself; the response-naming half lives
+    /// in `mcp::tests::notify_quiet_clamps_urgent_to_info`): quiet clamps
+    /// every request to info; normal and eager pass requests through.
+    #[test]
+    fn quiet_appetite_clamps_every_urgency_to_info() {
+        use crate::autonomy::NotifyAppetite;
+        for requested in [
+            NotificationUrgency::Info,
+            NotificationUrgency::Attention,
+            NotificationUrgency::Urgent,
+        ] {
+            assert_eq!(
+                clamp_notify_urgency(NotifyAppetite::Quiet, requested),
+                NotificationUrgency::Info
+            );
+            assert_eq!(clamp_notify_urgency(NotifyAppetite::Normal, requested), requested);
+            assert_eq!(clamp_notify_urgency(NotifyAppetite::Eager, requested), requested);
+        }
+    }
+
+    /// The decision contract's expiry speaks the agenda due vocabulary —
+    /// one parser, two lanes — and refuses garbage by name.
+    #[test]
+    fn ask_expiry_parses_the_due_vocabulary() {
+        assert_eq!(parse_ask_expiry(None).unwrap(), None);
+        assert_eq!(parse_ask_expiry(Some("   ")).unwrap(), None);
+        let now = now_unix_ms();
+        let due = parse_ask_expiry(Some("+2h")).unwrap().unwrap();
+        assert!(
+            due > now + 110 * 60 * 1000 && due < now + 130 * 60 * 1000,
+            "+2h lands ~two hours out (got {due}, now {now})"
+        );
+        let err = parse_ask_expiry(Some("whenever")).unwrap_err();
+        assert!(err.starts_with("expiry: "), "named refusal: {err}");
+    }
 
     /// Hold suspends the deadline; resume re-arms it with exactly the time
     /// that remained at the moment of the hold — however long the hold
@@ -1576,6 +1625,7 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
         }
     }
 

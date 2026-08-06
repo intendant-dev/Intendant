@@ -4152,6 +4152,7 @@ mod tests {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            consequence: None,
         }
     }
 
@@ -4232,6 +4233,69 @@ mod tests {
             refs: Vec::new(),
         };
         assert!(store.apply_command(refused, None, 6).is_err());
+    }
+
+    /// The decision-contract serving pin (AD S1): a parked owner decision
+    /// serves all four typed facets — options, the committed
+    /// recommendation label, consequence-on-silence, and expiry (the
+    /// item's due) — on the durable item the dashboard reads, stable
+    /// across a store reopen. One ask shape: the same vocabulary as every
+    /// other rich ask, extended, never forked.
+    #[test]
+    fn parked_decision_serves_options_recommendation_consequence_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+
+        let mut question = ask_question("Adopt the two-layer cascade?");
+        question.options = vec![
+            crate::mcp::AskUserOptionParams {
+                label: "Yes, ship it (Recommended)".into(),
+                description: Some("the ruled design".into()),
+            },
+            crate::mcp::AskUserOptionParams {
+                label: "Hold for v2".into(),
+                description: None,
+            },
+        ];
+        question.consequence =
+            Some("I will ship the recommended design and note the choice on the item".into());
+        let item = store
+            .apply_command(
+                AgendaCommand::ask_with_due(vec![question], Some(1_754_000_000_000)),
+                None,
+                7,
+            )
+            .unwrap();
+
+        // The served item (the exact serde shape the dashboard and ctl
+        // read) carries the whole contract.
+        let served = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            served["ask"]["questions"][0]["options"][0]["label"],
+            "Yes, ship it (Recommended)",
+            "options + the recommendation label convention"
+        );
+        assert_eq!(
+            served["ask"]["questions"][0]["consequence"],
+            "I will ship the recommended design and note the choice on the item"
+        );
+        assert_eq!(served["due_ms"], 1_754_000_000_000u64, "expiry = the item's due");
+
+        // Durable: the contract survives a reopen byte-for-byte.
+        let reopened = AgendaStore::open(dir.path()).unwrap();
+        let back = reopened.get(&item.id).unwrap();
+        assert_eq!(back.due_ms, Some(1_754_000_000_000));
+        assert_eq!(
+            back.ask.as_ref().unwrap().questions[0].consequence,
+            "I will ship the recommended design and note the choice on the item"
+        );
+        // A consequence-less question serves an ABSENT field (additive
+        // wire: older readers and plain questions see no new key).
+        let plain = store
+            .apply_command(ask_cmd(vec![ask_question("Plain?")]), None, 8)
+            .unwrap();
+        let served = serde_json::to_value(&plain).unwrap();
+        assert!(served["ask"]["questions"][0].get("consequence").is_none());
     }
 
     /// Slice 1's park path end to end at store level: validation rides the

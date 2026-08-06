@@ -5432,6 +5432,7 @@ mod tests {
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_service_tier: Some("priority".to_string()),
+                dial: None,
                 orchestrate: Some(false),
                 direct: Some(true),
                 reference_frame_ids: vec!["display_99-f00001".to_string()],
@@ -5739,6 +5740,7 @@ mod tests {
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
+                dial,
                 orchestrate,
                 direct,
                 reference_frame_ids,
@@ -5749,6 +5751,7 @@ mod tests {
                 hosted_lease_id,
             } => {
                 assert_eq!(task, "fix bug");
+                assert!(dial.is_none());
                 assert!(claude_model.is_none());
                 assert!(claude_permission_mode.is_none());
                 assert!(claude_effort.is_none());
@@ -6222,6 +6225,54 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["claude_effort"], "max", "flat on the wire: {json}");
         assert_eq!(value.get("launch_config"), None, "never nested: {json}");
+    }
+
+    /// AD S1 pin (M1's action-wall sub-ruling): a dial-bearing launch
+    /// config is NON-empty — even when the dial object itself carries no
+    /// knobs — so the hosted-control action wall's `is_empty` pins refuse
+    /// it fail-closed instead of letting an unexamined `dial` key slip
+    /// through. The dial's typed vocabulary also refuses unknown words on
+    /// the StartTask wire.
+    #[test]
+    fn dial_bearing_launch_config_is_nonempty() {
+        assert!(AgentLaunchConfig::default().is_empty());
+        let mut config = AgentLaunchConfig {
+            dial: Some(crate::autonomy::DialConfig::default()),
+            ..Default::default()
+        };
+        assert!(
+            !config.is_empty(),
+            "even an all-None dial makes the config non-empty at the wall"
+        );
+        config.dial = Some(crate::autonomy::DialConfig {
+            autonomy: Some(crate::autonomy::AutonomyLevel::Full),
+            ..Default::default()
+        });
+        assert!(!config.is_empty());
+
+        // The dial rides StartTask as one nested `dial` key beside the
+        // flat launch fields, with the closed typed vocabulary.
+        let framed = r#"{"action":"start_task","task":"run it","dial":{"autonomy":"full","notify":"quiet"}}"#;
+        let parsed: ControlMsg = serde_json::from_str(framed).unwrap();
+        let ControlMsg::StartTask { launch_config, .. } = &parsed else {
+            panic!("expected StartTask");
+        };
+        assert!(!launch_config.is_empty());
+        let dial = launch_config.dial.as_ref().unwrap();
+        assert_eq!(dial.autonomy, Some(crate::autonomy::AutonomyLevel::Full));
+        assert_eq!(
+            dial.notify,
+            Some(crate::autonomy::NotifyAppetite::Quiet)
+        );
+        // A dial-less frame re-serializes with no dial key (byte-stable
+        // legacy wire), and unknown dial words refuse the whole frame.
+        let legacy: ControlMsg =
+            serde_json::from_str(r#"{"action":"start_task","task":"run it"}"#).unwrap();
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("\"dial\""));
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"start_task","task":"run it","dial":{"autonomy":"maximum"}}"#
+        )
+        .is_err());
     }
 
     #[test]
