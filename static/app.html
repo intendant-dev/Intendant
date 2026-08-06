@@ -39165,7 +39165,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5bd060172a081bb9';
+const INTENDANT_APP_BUILD = 'c690396905cbab70';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -97738,24 +97738,25 @@ const AGENDA_AUTOMATION_CADENCES = [
   { label: 'Every 30 days', ms: 30 * 24 * 60 * 60 * 1000 },
 ];
 
-// Cap-demanding definitions (the narrative-backfill class): the
-// definition's own text carries the owner-cap annotation convention,
-// so the sheet's note input doubles as the spend-cap lane for it.
-function agendaStampCapDemanded(entry) {
-  return !!(entry && typeof entry.text === 'string' && entry.text.includes('NS CAP: $'));
+// The declared stamp-time parameters of the selected entry (the catalog
+// serves them on the node, skip-if-empty): the sheet renders exactly
+// what the daemon declared — no client-side parameter vocabulary, no
+// prose sniffing. Parameters are action-only in v1, so at most the
+// single node carries them.
+function agendaStampDeclaredParams(entry) {
+  const node = entry && entry.nodes && entry.nodes[0];
+  return (node && Array.isArray(node.parameters)) ? node.parameters : [];
 }
 
-// Spend-authority bytes are exact: a bare amount typed into the cap
-// field canonicalizes to `NS CAP: $<amount>` here, so no human ever
-// hand-formats the line the mandate greps for. Anything else passes
-// through verbatim — an already-canonical line stays untouched, and
-// free text stays an ordinary note (the mandate's near-miss refusal
-// quotes it back kindly instead of parsing amounts out of prose).
-function agendaStampNoteText(entry, raw) {
-  const text = String(raw || '').trim();
-  if (!text || !agendaStampCapDemanded(entry)) return text;
-  const bare = text.startsWith('$') ? text.slice(1).trim() : text;
-  return /^\d+(\.\d+)?$/.test(bare) ? `NS CAP: $${bare}` : text;
+// The exact annotation line a typed parameter value records: the
+// declared template with its one `<value>` slot substituted verbatim
+// (function replacement so `$`-patterns in the value never expand) —
+// the machine writes the canonical bytes, no human hand-formats
+// spend-authority lines like `NS CAP: $<amount>`.
+function agendaStampParamLine(param, raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  return String(param.line || '').replace('<value>', () => value);
 }
 
 // `preselect` (optional) names a definition to open on — the Plugins &
@@ -97922,13 +97923,42 @@ function agendaOpenAutomationSheet(anchor, preselect) {
       });
   }
 
+  // Declared parameters (skills/plugins S2): one labeled input per
+  // parameter the selected definition declares in its node config block
+  // — required ones marked, the declared hint as the help line. Typed
+  // values substitute into the declared line templates and ride the
+  // stamp op's annotations beside the generic note; the daemon refuses
+  // a stamp missing a required parameter, so the sheet's empty-required
+  // gate below is convenience, never the wall.
+  const paramsBox = agendaStartSheetEl('div', 'agsx-params');
+  panel.appendChild(paramsBox);
+  const paramInputs = new Map(); // parameter name -> its input element
+  const renderParamRows = () => {
+    paramsBox.textContent = '';
+    paramInputs.clear();
+    for (const param of agendaStampDeclaredParams(entry)) {
+      const row = agendaStartSheetEl('div', 'ags-config-row');
+      const label = agendaStartSheetEl('label', 'ags-label',
+        `${param.label || param.name}${param.required ? ' (required)' : ''}`);
+      label.setAttribute('for', `agsx-param-${param.name}`);
+      row.appendChild(label);
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = `agsx-param-${param.name}`;
+      input.addEventListener('input', renderSummary);
+      row.appendChild(input);
+      row.appendChild(agendaStartSheetEl('div', 'ags-hint', param.hint
+        || `recorded as ${param.line} in the stamped item’s THREAD section`));
+      paramsBox.appendChild(row);
+      paramInputs.set(param.name, input);
+    }
+  };
+
   // Note to the stamped item: one optional owner note recorded AT PARK
   // on the annotation surface the fired mandates read (a workflow's
-  // hub, an action's item), attributed to whoever stamps. When the
-  // selected definition demands a spend cap, this input IS the cap
-  // lane — a bare amount canonicalizes to `NS CAP: $<amount>` at
-  // submit (agendaStampNoteText), so nobody hand-formats authority
-  // bytes; renderSelection relabels the row per definition.
+  // hub, an action's item), attributed to whoever stamps. Always the
+  // generic lane — a definition that wants a formatted value declares a
+  // parameter for it, rendered above.
   const noteRow = agendaStartSheetEl('div', 'ags-config-row');
   const noteLabel = agendaStartSheetEl('label', 'ags-label', 'Note');
   noteLabel.setAttribute('for', 'agsx-note');
@@ -97936,9 +97966,10 @@ function agendaOpenAutomationSheet(anchor, preselect) {
   const note = document.createElement('input');
   note.type = 'text';
   note.id = 'agsx-note';
+  note.placeholder = 'optional note to the stamped item';
   noteRow.appendChild(note);
-  const noteHint = agendaStartSheetEl('div', 'ags-hint', '');
-  noteRow.appendChild(noteHint);
+  noteRow.appendChild(agendaStartSheetEl('div', 'ags-hint',
+    'optional — recorded with your attribution in the stamped item’s THREAD section'));
   panel.appendChild(noteRow);
 
   // Pre-stamp summary: exactly what the Stamp gesture will seal, park,
@@ -97963,7 +97994,7 @@ function agendaOpenAutomationSheet(anchor, preselect) {
   stampBtn.type = 'button';
   stampBtn.title = 'Seals the definition, parks the item(s), proposes the manifest(s) — approves nothing';
   stampBtn.addEventListener('click', () => agendaAutomationSheetSubmit(
-    { entry: () => entry, cadence, fire, suspend, project, note, configState, error, stampBtn }));
+    { entry: () => entry, cadence, fire, suspend, project, note, paramInputs, configState, error, stampBtn }));
   foot.appendChild(cancel);
   foot.appendChild(stampBtn);
   panel.appendChild(foot);
@@ -98068,7 +98099,23 @@ function agendaOpenAutomationSheet(anchor, preselect) {
         .map((n) => `${n.title || n.id}: ${nodeExecutorLabel(n)}`).join('; ');
       add(`per-node executors are the definition’s pins — ${rows} · project: ${project.value.trim() || 'daemon default'}`);
     }
-    const noteText = agendaStampNoteText(entry, note.value);
+    // Declared parameters: the EXACT substituted line each value will
+    // record — the gesture is never a surprise — and the empty-required
+    // gate mirrored onto the button (convenience; the daemon op is the
+    // wall).
+    let requiredEmpty = false;
+    for (const param of agendaStampDeclaredParams(entry)) {
+      const input = paramInputs.get(param.name);
+      const line = agendaStampParamLine(param, input ? input.value : '');
+      if (line) {
+        add(`record ${param.label || param.name} in the item’s THREAD: ${line}`);
+      } else if (param.required) {
+        requiredEmpty = true;
+        add(`required: fill the ${param.label || param.name} field to stamp`);
+      }
+    }
+    stampBtn.disabled = !entry || requiredEmpty;
+    const noteText = String(note.value || '').trim();
     if (noteText) {
       add(`annotate the stamped ${kind === 'workflow' ? 'hub' : 'item'} with your note: ${noteText}`);
     }
@@ -98087,15 +98134,9 @@ function agendaOpenAutomationSheet(anchor, preselect) {
     suspendRow.hidden = kind !== 'action';
     config.hidden = !kind || kind === 'workflow';
     noteRow.hidden = !kind;
-    // The note input is definition-aware: for a cap-demanding
-    // definition it is the spend-cap field — labeled as such, hinting
-    // the canonical form, canonicalizing a bare amount at submit.
-    const capField = agendaStampCapDemanded(entry);
-    noteLabel.textContent = capField ? 'Spend cap' : 'Note';
-    note.placeholder = capField ? '60' : 'optional note to the stamped item';
-    noteHint.textContent = capField
-      ? 'this definition reads an owner-set cap from the stamped item — type the amount; recorded as the canonical annotation NS CAP: $<amount> in the item’s THREAD section'
-      : 'optional — recorded with your attribution in the stamped item’s THREAD section';
+    // Parameter fields are the daemon's declarations, re-rendered per
+    // selection; the note input stays the generic lane for every kind.
+    renderParamRows();
     stampBtn.disabled = !entry;
     if (entry && kind === 'action') {
       const prefill = (entry.nodes && entry.nodes[0]) || {};
@@ -98207,13 +98248,29 @@ async function agendaAutomationSheetSubmit(form) {
     const everyMs = Number(form.cadence.value);
     if (Number.isFinite(everyMs) && everyMs > 0) overrides.every_ms = everyMs;
   }
-  // The stamp-time note rides the stamp op for every kind: the daemon
-  // records it owner-attributed on the annotation surface the fired
-  // mandates read (a workflow's hub, an action's item). A bare amount
-  // in a cap-demanding definition's field was canonicalized to the
-  // exact `NS CAP: $<amount>` bytes above the wire, never by hand.
-  const noteText = form.note ? agendaStampNoteText(entry, form.note.value) : '';
-  if (noteText) overrides.annotations = [noteText];
+  // Declared parameters + the stamp-time note ride the stamp op's
+  // annotations: the daemon records each line on the annotation surface
+  // the fired mandates read (a workflow's hub, an action's item),
+  // attributed to whoever stamps. A parameter value substitutes into
+  // its declared template client-side — the machine writes the
+  // canonical bytes, never a hand-formatted authority line. The
+  // empty-required check here is convenience only; the daemon refuses a
+  // stamp missing a required parameter either way.
+  const annotations = [];
+  for (const param of agendaStampDeclaredParams(entry)) {
+    const input = form.paramInputs && form.paramInputs.get(param.name);
+    const line = agendaStampParamLine(param, input ? input.value : '');
+    if (line) {
+      annotations.push(line);
+    } else if (param.required) {
+      showError(`Fill the required ${param.label || param.name} field before stamping.`);
+      if (input) input.focus();
+      return;
+    }
+  }
+  const noteText = form.note ? String(form.note.value || '').trim() : '';
+  if (noteText) annotations.push(noteText);
+  if (annotations.length) overrides.annotations = annotations;
   form.stampBtn.disabled = true;
   try {
     // THE stamp gesture — the only place this sheet stamps. One

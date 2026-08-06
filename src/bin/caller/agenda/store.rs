@@ -1118,6 +1118,34 @@ impl AgendaStore {
                 )));
             }
         }
+        // Declared-parameter enforcement (skills/plugins S2, refinement
+        // R1): a required parameter is satisfied only by an arriving
+        // stamp-time line that exactly matches its template with
+        // `<value>` replaced by a NON-EMPTY segment — the raw template
+        // with the literal placeholder satisfies nothing. Lines matching
+        // no declared template pass through as ordinary notes, never
+        // refused (v0's generic note lane survives byte-unchanged).
+        // Parameters are action-only, so the nodes' declarations are the
+        // definition's; the client-side sheet check is convenience — this
+        // refusal is the wall.
+        for param in def.nodes.iter().flat_map(|n| n.parameters.iter()) {
+            if !param.required
+                || stamp
+                    .annotations
+                    .iter()
+                    .any(|note| param.matches(note.trim()))
+            {
+                continue;
+            }
+            return Err(AgendaError::Invalid(format!(
+                "definition {}: required parameter `{}` ({:?}) is missing — fill the \
+                 {:?} field on the Automate sheet, or stamp from a shell: intendant \
+                 ctl agenda stamp {} --note '{}' with your value in place of <value>. \
+                 The stamp records that exact line, attributed to you, in the stamped \
+                 item's THREAD section — the surface this definition's mandate reads",
+                def.name, param.name, param.label, param.label, stamp.definition, param.line
+            )));
+        }
         let fire_at_ms = stamp.fire_at_ms.unwrap_or(now_ms);
 
         // Park the instance graph (today's stamp topologies, verbatim):
@@ -7826,6 +7854,108 @@ mod tests {
         );
     }
 
+    /// Skills/plugins S2, refinement R1: `apply_stamp` enforces declared
+    /// parameters on the v0 annotation-lines lane. A required parameter
+    /// with no satisfying line refuses the whole stamp BEFORE anything
+    /// parks, naming the field, the sheet, and the THREAD/ctl remedy;
+    /// the raw template with the literal `<value>` placeholder is NOT
+    /// satisfaction; and lines matching no declared template pass
+    /// through as ordinary notes, never refused.
+    #[test]
+    fn stamp_enforces_required_declared_parameters() {
+        // Empty-cap stamp: the two-surfaces refusal, nothing parked.
+        let (_root, mut store) = stamp_rig();
+        let err = store
+            .apply_stamp_command(stamp_cmd("narrative-backfill"), owner(), 5000)
+            .unwrap_err();
+        let msg = err.to_string();
+        for fragment in [
+            "required parameter `cap`",
+            "\"Spend cap\"",
+            "Automate sheet",
+            "intendant ctl agenda stamp narrative-backfill --note 'NS CAP: $<value>'",
+            "THREAD section",
+        ] {
+            assert!(msg.contains(fragment), "refusal lost {fragment:?}: {msg}");
+        }
+        assert!(
+            store.snapshot().is_empty(),
+            "nothing parks on a refused required parameter"
+        );
+
+        // The raw template satisfies nothing (R1a): the literal
+        // placeholder is not a value.
+        let (_root2, mut store2) = stamp_rig();
+        let err = store2
+            .apply_stamp_command(
+                stamp_cmd_with_notes("narrative-backfill", &["NS CAP: $<value>"]),
+                owner(),
+                5000,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("required parameter `cap`"),
+            "{err}"
+        );
+
+        // A satisfying line stamps; a free-form note beside it passes
+        // through as an ordinary v0 note (R1b) — and the instance is
+        // armable: the manifest is proposed with the definition sealed,
+        // so a fired run reads the exact cap bytes from the THREAD.
+        let (_root3, mut store3) = stamp_rig();
+        let outcome = store3
+            .apply_stamp_command(
+                stamp_cmd_with_notes(
+                    "narrative-backfill",
+                    &["NS CAP: $60", "context: adoption bootstrap"],
+                ),
+                owner(),
+                5000,
+            )
+            .unwrap();
+        let item = &outcome.nodes[0].item;
+        assert_eq!(
+            item.annotations
+                .iter()
+                .map(|a| a.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["NS CAP: $60", "context: adoption bootstrap"]
+        );
+        assert!(item.annotations.iter().all(|a| a.principal.as_deref() == Some("owner")));
+        let effect = item.effects.first().expect("proposed manifest");
+        assert!(effect.approval.is_none(), "stamping approves nothing");
+        assert_eq!(effect.manifest.binding_refs.len(), 1);
+    }
+
+    /// Skills/plugins S2, refinement R2: recorded parameter annotations
+    /// carry the STAMP'S gate-resolved attribution, never a synthesized
+    /// owner — a non-owner principal stamping via an agent lane records
+    /// non-owner attribution, so the cap mandate's owner-written-only
+    /// read keeps refusing, fail-closed.
+    #[test]
+    fn stamp_parameter_annotations_carry_the_stamp_actor_attribution() {
+        let (_root, mut store) = stamp_rig();
+        let agent = Some(AgendaActor {
+            principal: Some("principal:agent-session:sess-7".into()),
+            session_id: Some("sess-7".into()),
+            kind: Some("agent_session".into()),
+        });
+        let outcome = store
+            .apply_stamp_command(
+                stamp_cmd_with_notes("narrative-backfill", &["NS CAP: $60"]),
+                agent,
+                5000,
+            )
+            .unwrap();
+        let note = &outcome.nodes[0].item.annotations[0];
+        assert_eq!(note.text, "NS CAP: $60");
+        assert_eq!(
+            note.principal.as_deref(),
+            Some("principal:agent-session:sess-7"),
+            "the recorded attribution is the stamp actor's, never synthesized"
+        );
+    }
+
     /// Steward N1 (slice-1 gate): the deleted registry invariants used
     /// to check at CI time that shipped defaults respect the intake
     /// floors; under one-authority that check moved to stamp time — so
@@ -7834,10 +7964,22 @@ mod tests {
     /// again instead of failing at the owner's first stamp.
     #[test]
     fn house_definitions_stamp_through_the_real_intake() {
-        for (name, _) in super::super::definitions::HOUSE_DEFINITIONS {
+        for (name, content) in super::super::definitions::HOUSE_DEFINITIONS {
             let (_root, mut store) = stamp_rig();
+            // A required declared parameter refuses a bare stamp by
+            // design (skills/plugins S2), so satisfy each with a
+            // specimen line — the same substitution the sheet performs.
+            let def = super::super::definitions::parse_definition(content, name).unwrap();
+            let notes: Vec<String> = def
+                .nodes
+                .iter()
+                .flat_map(|n| n.parameters.iter())
+                .filter(|p| p.required)
+                .map(|p| p.line.replace("<value>", "60"))
+                .collect();
+            let notes: Vec<&str> = notes.iter().map(String::as_str).collect();
             let outcome = store
-                .apply_stamp_command(stamp_cmd(name), owner(), 5000)
+                .apply_stamp_command(stamp_cmd_with_notes(name, &notes), owner(), 5000)
                 .unwrap_or_else(|err| panic!("house definition {name} refused at stamp: {err}"));
             assert!(!outcome.nodes.is_empty(), "{name} stamped no nodes");
             for node in &outcome.nodes {
@@ -7858,7 +8000,11 @@ mod tests {
         // three-lane weekly chain with the owner-directed executor stack.
         let (_root, mut store) = stamp_rig();
         let outcome = store
-            .apply_stamp_command(stamp_cmd("narrative-backfill"), owner(), 5000)
+            .apply_stamp_command(
+                stamp_cmd_with_notes("narrative-backfill", &["NS CAP: $60"]),
+                owner(),
+                5000,
+            )
             .unwrap();
         assert!(outcome.hub.is_none(), "the bootstrap is an action");
         let effect = &outcome.nodes[0].item.effects[0];
