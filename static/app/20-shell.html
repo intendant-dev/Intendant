@@ -82,12 +82,31 @@
        carry the .tab-btn class the router binds. -->
   <div class="tab-content">
 
-    <!-- Plugins Tab -->
+    <!-- Plugins & Skills Tab (tab id #plugins is permanent — deep links
+         and the manifest TDZ rule key on it; only the visible label moved
+         to "Plugins & Skills"). Three daemon-derived sections: bundled
+         plugins (/api/plugins), the unified skill catalog (/api/skills),
+         and the automation-template catalog (/api/agenda/definitions). -->
     <div id="tab-plugins" class="tab-pane">
       <div class="plugins-wrap">
         <div class="plugins-intro">Optional bundled capabilities. Enabling a plugin activates its agent skill for every backend on this machine; nothing here installs or runs third-party code.</div>
-        <div id="plugins-status" class="plugins-status"></div>
-        <div id="plugins-list"></div>
+        <section class="plugins-section">
+          <h3 class="ui-section-title">Plugins</h3>
+          <div id="plugins-status" class="plugins-status"></div>
+          <div id="plugins-list"></div>
+        </section>
+        <section class="plugins-section">
+          <h3 class="ui-section-title">Skills</h3>
+          <div class="plugins-section-sub">Every agent skill this daemon manages — shipped in the binary or carried by a bundled plugin — with its install state in both machine-wide roots.</div>
+          <div id="skills-status" class="plugins-status"></div>
+          <div id="skills-list"></div>
+        </section>
+        <section class="plugins-section">
+          <h3 class="ui-section-title">Automation templates</h3>
+          <div class="plugins-section-sub">Sealed automation definitions. Stamping seals the file — firings execute the sealed bytes, and nothing runs until each proposed manifest is approved on its card.</div>
+          <div id="templates-status" class="plugins-status"></div>
+          <div id="templates-list"></div>
+        </section>
       </div>
     </div>
 

@@ -2295,13 +2295,18 @@ function agendaStampNoteText(entry, raw) {
   return /^\d+(\.\d+)?$/.test(bare) ? `NS CAP: $${bare}` : text;
 }
 
-function agendaOpenAutomationSheet(anchor) {
+// `preselect` (optional) names a definition to open on — the Templates
+// section's Automate… deep link. Selection falls back to the first
+// stampable entry exactly as before when the name is absent or not
+// stampable; a shadowed house name resolves to its effective personal
+// twin because the picker matches selectable entries by name.
+function agendaOpenAutomationSheet(anchor, preselect) {
   const host = agendaEnsureAutomationSheet();
   const panel = host.querySelector('.ags-panel');
   panel.textContent = '';
   agendaAutomationSheetOpen = true;
   let entry = null; // the selected catalog entry, any kind
-  let selectedName = '';
+  let selectedName = typeof preselect === 'string' ? preselect : '';
 
   const head = agendaStartSheetEl('div', 'ags-head');
   head.appendChild(agendaStartSheetEl('span', 'ags-title', 'New automation'));

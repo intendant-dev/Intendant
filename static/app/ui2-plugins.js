@@ -1,14 +1,26 @@
-// ── Plugins (System → Plugins) ─────────────────────────────────────────
+// ── Plugins & Skills (System → Plugins; tab id #plugins is permanent) ──
 //
-// The bundled-plugin catalog: host-owned cards over GET /api/plugins
-// (tunnel twin api_plugins_list) and POST /api/plugins/{plugin_id}
-// (api_plugin_set_enabled). Everything on a card derives from the daemon
-// body — lifecycle state, readiness layers, per-skill install facts —
-// and the toggle's response carries the refreshed entry plus the
-// installer's per-root report, so there is no second fetch and no
-// pretending: the card says what the installer actually did. Plugins
-// here are declarative bundles (skills + readiness); they ship no code,
-// hooks, or frames, so this surface renders daemon data only.
+// The unified surface: three daemon-derived sections, presentation-only
+// grouping with no vocabulary of its own.
+//   1. Plugins — host-owned cards over GET /api/plugins (tunnel twin
+//      api_plugins_list) and POST /api/plugins/{plugin_id}
+//      (api_plugin_set_enabled). Everything on a card derives from the
+//      daemon body — lifecycle state, readiness layers, per-skill install
+//      facts — and the toggle's response carries the refreshed entry plus
+//      the installer's per-root report, so there is no second fetch and
+//      no pretending: the card says what the installer actually did.
+//      Plugins here are declarative bundles (skills + readiness); they
+//      ship no code, hooks, or frames, so this surface renders daemon
+//      data only.
+//   2. Skills — the unified skill catalog over GET /api/skills (tunnel
+//      twin api_skills_list): every skill the daemon manages, one row
+//      each, rendered verbatim (provenance, trust posture, per-root
+//      install facts). Plugin-provenance rows deep-link their plugin
+//      card — the plugin toggle is the one lifecycle authority.
+//   3. Automation templates — the served definition catalog
+//      (api_agenda_definitions) read-first: provenance/shadowed/invalid
+//      state verbatim, with Automate… opening the EXISTING agenda stamp
+//      sheet preselected — no second stamp lane.
 //
 // Deep-link TDZ rule: evaluates BEFORE the router (48) because a
 // #plugins deep link makes the router's eval-time boot call
@@ -21,10 +33,20 @@ let pluginsLoaded = false;
 let pluginsFetchInFlight = null;
 let pluginsBusy = {};        // plugin id -> true while a toggle runs
 let pluginsLastInstall = {}; // plugin id -> install report from the last toggle
+let skillsRows = null;       // null until the catalog loads
+let skillsError = '';
+let skillsFetchInFlight = null;
+let templatesRows = null;    // null until the catalog loads
+let templatesError = '';
+let templatesFetchInFlight = null;
 
 function pluginsOnTabShown() {
   if (pluginsLoaded) renderPlugins();
   else loadPlugins();
+  if (skillsRows) renderSkillsSection();
+  else loadSkillsSection();
+  if (templatesRows) renderTemplatesSection();
+  else loadTemplatesSection();
 }
 
 async function loadPlugins() {
@@ -200,5 +222,201 @@ function renderPlugins() {
   list.innerHTML = pluginsRows.map(pluginCardHtml).join('');
   list.querySelectorAll('button[data-plugin-toggle]').forEach(btn => {
     btn.onclick = () => pluginSetEnabled(btn.dataset.pluginToggle, btn.dataset.enable === '1');
+  });
+}
+
+// ── Skills section (GET /api/skills) ───────────────────────────────────
+
+async function loadSkillsSection() {
+  if (skillsFetchInFlight) return skillsFetchInFlight;
+  skillsFetchInFlight = (async () => {
+    const avail = daemonApi.availability('api_skills_list');
+    if (!avail.ok) {
+      skillsError = avail.reason === 'denied'
+        ? "This session's role can't read the skill catalog."
+        : avail.reason === 'unsupported'
+          ? 'This daemon predates the skill catalog — upgrade it to see skills here.'
+          : 'Daemon connection not ready yet.';
+      skillsFetchInFlight = null;
+      renderSkillsSection();
+      return;
+    }
+    try {
+      const resp = await daemonApi.request('api_skills_list', {});
+      if (resp.ok && resp.body && Array.isArray(resp.body.skills)) {
+        skillsRows = resp.body.skills;
+        skillsError = '';
+      } else {
+        skillsError = (resp.body && resp.body.error) || `skill catalog unavailable (${resp.status})`;
+      }
+    } catch (e) {
+      skillsError = String((e && e.message) || e);
+    } finally {
+      skillsFetchInFlight = null;
+    }
+    renderSkillsSection();
+  })();
+  return skillsFetchInFlight;
+}
+
+// Scroll-and-flash the plugin card that owns a plugin-provenance skill
+// row (R5: the one-authority rule made visible — the row itself carries
+// no second lifecycle switch).
+function skillsRevealPluginCard(pluginId) {
+  const card = document.querySelector(`.plugin-card[data-plugin-id="${CSS.escape(pluginId)}"]`);
+  if (!card) return;
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.remove('plugin-card-flash');
+  void card.offsetWidth; // restart the animation on repeat clicks
+  card.classList.add('plugin-card-flash');
+  setTimeout(() => card.classList.remove('plugin-card-flash'), 1800);
+}
+
+// Per-root install chips, the same status vocabulary the plugin cards
+// render: the daemon's strings pass through verbatim, tone only.
+function skillRootChipsHtml(roots) {
+  if (!roots || typeof roots !== 'object') return '';
+  return Object.entries(roots).map(([root, st]) => {
+    const cls = st === 'installed' ? 'ok' : (st === 'absent' ? '' : 'warn');
+    return `<span class="ui-chip ${cls}">${escapeHtml(root)}: ${escapeHtml(String(st))}</span>`;
+  }).join(' ');
+}
+
+function skillRowHtml(s) {
+  if (!s || !s.name) return '';
+  const pluginLink = s.plugin_id
+    ? `<button type="button" class="ui-btn skill-plugin-link" data-skill-plugin="${escapeHtml(s.plugin_id)}">View plugin</button>`
+    : '';
+  const desc = s.description
+    ? `<div class="skill-row-desc">${escapeHtml(s.description)}</div>`
+    : '';
+  const trust = s.trust_posture
+    ? `<div class="skill-row-trust">${escapeHtml(s.trust_posture)}</div>`
+    : '';
+  return `<div class="ui-card skill-row">
+    <div class="skill-row-head">
+      <code class="skill-row-name">${escapeHtml(s.name)}</code>
+      <span class="ui-chip">${escapeHtml(String(s.provenance || ''))}</span>
+      ${pluginLink}
+    </div>
+    ${desc}
+    ${trust}
+    <div class="skill-row-roots">${skillRootChipsHtml(s.roots)}</div>
+  </div>`;
+}
+
+function renderSkillsSection() {
+  const status = document.getElementById('skills-status');
+  if (status) {
+    status.textContent = skillsError ? `Error: ${skillsError}` : '';
+    status.classList.toggle('plugins-status-error', Boolean(skillsError));
+  }
+  const list = document.getElementById('skills-list');
+  if (!list) return;
+  if (!skillsRows && !skillsError) {
+    list.innerHTML = '<div class="ui-explainer">Loading skill catalog…</div>';
+    return;
+  }
+  if (!skillsRows || !skillsRows.length) {
+    list.innerHTML = skillsError ? '' : '<div class="ui-empty"><div class="ui-empty-title">No managed skills</div><div class="ui-empty-hint">This daemon manages no skills.</div></div>';
+    return;
+  }
+  list.innerHTML = skillsRows.map(skillRowHtml).join('');
+  list.querySelectorAll('button[data-skill-plugin]').forEach(btn => {
+    btn.onclick = () => skillsRevealPluginCard(btn.dataset.skillPlugin);
+  });
+}
+
+// ── Automation templates section (api_agenda_definitions) ──────────────
+
+async function loadTemplatesSection() {
+  if (templatesFetchInFlight) return templatesFetchInFlight;
+  templatesFetchInFlight = (async () => {
+    const avail = daemonApi.availability('api_agenda_definitions');
+    if (!avail.ok) {
+      templatesError = avail.reason === 'denied'
+        ? "This session's role can't read the automation-template catalog."
+        : avail.reason === 'unsupported'
+          ? 'This daemon predates the automation-template catalog.'
+          : 'Daemon connection not ready yet.';
+      templatesFetchInFlight = null;
+      renderTemplatesSection();
+      return;
+    }
+    try {
+      const resp = await daemonApi.request('api_agenda_definitions', {});
+      if (resp.ok && resp.body && Array.isArray(resp.body.definitions)) {
+        templatesRows = resp.body.definitions;
+        templatesError = '';
+      } else {
+        templatesError = (resp.body && resp.body.error) || `template catalog unavailable (${resp.status})`;
+      }
+    } catch (e) {
+      templatesError = String((e && e.message) || e);
+    } finally {
+      templatesFetchInFlight = null;
+    }
+    renderTemplatesSection();
+  })();
+  return templatesFetchInFlight;
+}
+
+function templateRowHtml(d) {
+  if (!d || !d.name) return '';
+  // Provenance / shadowed / invalid chips render the served values
+  // verbatim; the stampability rule mirrors the Automate sheet's picker
+  // (valid && !shadowed) so this section never promises a stamp the
+  // sheet would refuse.
+  const chips = [`<span class="ui-chip">${escapeHtml(String(d.provenance || ''))}</span>`];
+  if (d.shadowed) chips.push('<span class="ui-chip warn">shadowed</span>');
+  if (!d.valid) chips.push('<span class="ui-chip warn">invalid</span>');
+  const usable = Boolean(d.valid && !d.shadowed);
+  const automateTitle = usable
+    ? 'Open the Automate sheet with this definition selected'
+    : (d.shadowed
+      ? 'shadowed by a personal definition of the same name'
+      : (d.reason || 'invalid definition'));
+  const kindLine = typeof agendaDefinitionKindLine === 'function' ? agendaDefinitionKindLine(d) : '';
+  const desc = d.description
+    ? `<div class="template-row-desc">${escapeHtml(d.description)}</div>`
+    : '';
+  const reason = !d.valid && d.reason
+    ? `<div class="template-row-reason">${escapeHtml(d.reason)}</div>`
+    : '';
+  return `<div class="ui-card template-row">
+    <div class="template-row-head">
+      <span class="template-row-title">${escapeHtml(d.title || d.name)}</span>
+      ${chips.join(' ')}
+      <button type="button" class="ui-btn template-automate" data-template="${escapeHtml(d.name)}" title="${escapeHtml(automateTitle)}"${usable ? '' : ' disabled'}>Automate…</button>
+    </div>
+    ${kindLine ? `<div class="template-row-kind">${escapeHtml(kindLine)}</div>` : ''}
+    ${desc}
+    ${reason}
+  </div>`;
+}
+
+function renderTemplatesSection() {
+  const status = document.getElementById('templates-status');
+  if (status) {
+    status.textContent = templatesError ? `Error: ${templatesError}` : '';
+    status.classList.toggle('plugins-status-error', Boolean(templatesError));
+  }
+  const list = document.getElementById('templates-list');
+  if (!list) return;
+  if (!templatesRows && !templatesError) {
+    list.innerHTML = '<div class="ui-explainer">Loading template catalog…</div>';
+    return;
+  }
+  if (!templatesRows || !templatesRows.length) {
+    list.innerHTML = templatesError ? '' : '<div class="ui-empty"><div class="ui-empty-title">No automation templates</div><div class="ui-empty-hint">This daemon serves no definitions.</div></div>';
+    return;
+  }
+  list.innerHTML = templatesRows.map(templateRowHtml).join('');
+  list.querySelectorAll('button.template-automate').forEach(btn => {
+    btn.onclick = () => {
+      if (typeof agendaOpenAutomationSheet === 'function') {
+        agendaOpenAutomationSheet(btn, btn.dataset.template);
+      }
+    };
   });
 }
