@@ -124,7 +124,11 @@ pub(crate) fn idle_external_pr_published_event(
 /// which drops it — the reload wants the work to continue on the fresh
 /// account), shut the old process down, and re-create the agent
 /// resume-attached to the same backend session id so the new process
-/// reads the fresh credential store. Queued `parked_follow_ups` stay in
+/// reads the fresh credential store. The park-cancel is also what heals
+/// a deferral swallowed by the turn's limit exit: the idle wait bounces
+/// the still-set flag here, so a park armed on the OLD account's window
+/// after a mid-turn reload is cancelled with its pending intact instead
+/// of waiting out the stale reset (card 01KZ0HVNCM). Queued `parked_follow_ups` stay in
 /// the loop untouched and flush through the normal preamble after the
 /// respawn. Returns `None` when the respawn failed — the old process is
 /// already gone, so the caller exits the loop honestly; on success,
@@ -300,11 +304,14 @@ pub(crate) const RELOAD_MIDTURN_CONTINUATION_TEXT: &str =
 /// Synthesized continuation after a credential-reload respawn:
 /// `Some(..)` only when the reload's own interrupt cut a live turn (the
 /// turn drain returned `Interrupted` with
-/// [`RELOAD_CREDENTIALS_INTERRUPT_REASON`]). The interrupted turn's
-/// driving message was already consumed mid-delivery, so nothing else
-/// re-drives the work after the respawn — the session would idle on the
-/// fresh account with the task half-done. Idle and between-turn reloads
-/// pass `false` (idle in, idle out), as does a turn that completed
+/// [`RELOAD_CREDENTIALS_INTERRUPT_REASON`] — primary or idle-observed;
+/// the cut turn owes, not the lane that observed it) or the deferral's
+/// turn died into a rescued terminal (round death / channel close with
+/// the flag still set). The interrupted turn's driving message was
+/// already consumed mid-delivery, so nothing else re-drives the work
+/// after the respawn — the session would idle on the fresh account with
+/// the task half-done. Truly idle and between-turn reloads pass `false`
+/// (nothing was cut — idle in, idle out), as does a turn that completed
 /// normally despite the request, or one whose interrupt belonged to the
 /// user (their stop wins). The message carries no steer/follow-up id, so
 /// id-keyed cancel matching can never drop it. Rides the shared
@@ -738,13 +745,22 @@ pub(crate) async fn run_external_agent_mode(
     // Reload-credentials handshake: the drain raises this when the request
     // arrives mid-turn (after interrupting the backend); the loop applies
     // the in-place respawn at the next safe point. Idle requests apply
-    // immediately in the idle listener below.
+    // immediately in the idle listener below. The idle wait bounces a
+    // still-set flag back to the safe point, and the terminal arms that
+    // bypass the drain's interrupt resolution (round death, channel
+    // close) stay resident instead of breaking — so a deferral swallowed
+    // by the turn's limit/terminal exit can never strand a session parked
+    // on the OLD account's window or die with the reload owed (the
+    // 2026-08-02 limit-exit race, card 01KZ0HVNCM).
     let backend_credentials_reload = std::sync::atomic::AtomicBool::new(false);
-    // Companion marker: the reload's own interrupt cut a live primary
-    // turn (the turn drain returned `Interrupted` with the reload
-    // reason), so the safe-point respawn must front-queue a synthesized
-    // continuation to re-drive the dropped work. Never set on the idle
-    // lane — idle in, idle out.
+    // Companion marker: the reload's own interrupt cut a live turn —
+    // primary or idle-observed (the turn drain returned `Interrupted`
+    // with the reload reason), or the deferral's turn died into a
+    // rescued terminal (round death / channel close with the flag still
+    // set) — so the safe-point respawn must front-queue a synthesized
+    // continuation to re-drive the dropped work. The cut turn owes, not
+    // the lane that observed it. Never set by the truly-idle listener
+    // (nothing was cut — idle in, idle out).
     let mut reload_interrupted_turn = false;
     let mut drain_config = DrainConfig {
         bus: &bus,
@@ -857,6 +873,20 @@ pub(crate) async fn run_external_agent_mode(
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
+                // A reload deferral raised mid-drain whose turn exited into
+                // a park or a rescued terminal lands here with the flag
+                // still set — the drain outcome that was supposed to carry
+                // it (`Interrupted` with the reload reason) was swallowed
+                // by the exit. Left unconsumed, a parked session waits out
+                // the OLD account's window while the fresh store sits
+                // unread (the 2026-08-02 limit-exit race, specimen
+                // 2c6ea80d, card 01KZ0HVNCM). Bounce to the loop's single
+                // safe point: it cancels a live park PRESERVING its
+                // pending re-send, respawns onto the fresh credentials,
+                // and the flush below delivers the owed work.
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue 'outer;
+                }
                 if limit_park.is_none() {
                     // Flush messages queued during a rate-limit park,
                     // oldest first, honoring cancels recorded while they
@@ -1504,6 +1534,33 @@ pub(crate) async fn run_external_agent_mode(
                                                     )
                                                     .await;
                                                     round = round.saturating_sub(1);
+                                                } else if backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    // A deferred credential
+                                                    // reload outranks the
+                                                    // round-death terminal:
+                                                    // the pending respawn IS
+                                                    // the recovery (an
+                                                    // auth-shaped refusal is
+                                                    // exactly what the fresh
+                                                    // store may cure). Stay
+                                                    // resident; the idle
+                                                    // wait bounces to the
+                                                    // safe-point respawn.
+                                                    let line = reload_outranks_terminal_line(
+                                                        "the observed round failed before any turn completed",
+                                                        &reason,
+                                                    );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
+                                                    round = round.saturating_sub(1);
                                                 } else {
                                                     // A backend-started round
                                                     // observed from idle died on
@@ -1692,6 +1749,13 @@ pub(crate) async fn run_external_agent_mode(
                                                 // honest terminal, never
                                                 // a park — mechanical
                                                 // retry re-flags forever.
+                                                // A pending credential
+                                                // reload does not rescue
+                                                // it either: respawn-and-
+                                                // redeliver into flagged
+                                                // bytes is the re-flag
+                                                // loop; the deferral dies
+                                                // with the loop.
                                                 stats.rounds = round;
                                                 let entry =
                                                     crate::safeguards_recast::RecastRef {
@@ -1776,7 +1840,20 @@ pub(crate) async fn run_external_agent_mode(
                                                 // is exhausted.
                                                 error_park_streak =
                                                     error_park_streak.saturating_add(1);
-                                                if error_park_attempts_exhausted(error_park_streak)
+                                                // A pending credential reload
+                                                // holds the suspension
+                                                // terminal open: park
+                                                // normally instead — the
+                                                // safe-point respawn cancels
+                                                // it preserving the
+                                                // delivery-aware pending and
+                                                // resets the streak like any
+                                                // explicit intervention.
+                                                if !backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                    && error_park_attempts_exhausted(
+                                                        error_park_streak,
+                                                    )
                                                 {
                                                     stats.rounds = round;
                                                     let line = error_park_exhausted_line(
@@ -1961,6 +2038,26 @@ pub(crate) async fn run_external_agent_mode(
                                             }
                                             DrainOutcome::Interrupted { reason } => {
                                                 stats.rounds = round;
+                                                // The reload's own interrupt
+                                                // cutting a LIVE observed
+                                                // round owes the same
+                                                // synthesized continuation
+                                                // as the primary lane — the
+                                                // cut turn owes, not the
+                                                // lane that observed it
+                                                // ("idle in, idle out"
+                                                // covers reloads landing on
+                                                // a truly idle session,
+                                                // where nothing was cut).
+                                                // The idle wait bounces the
+                                                // still-set flag to the
+                                                // safe point, which
+                                                // consumes this marker.
+                                                if reason
+                                                    == RELOAD_CREDENTIALS_INTERRUPT_REASON
+                                                {
+                                                    reload_interrupted_turn = true;
+                                                }
                                                 slog(&session_log, |l| {
                                                     l.info(&format!(
                                                         "External agent interrupted while observed from idle: {}",
@@ -2021,6 +2118,19 @@ pub(crate) async fn run_external_agent_mode(
                                                     .await;
                                                     round = round.saturating_sub(1);
                                                 } else {
+                                                    // A pending credential
+                                                    // reload deliberately
+                                                    // does NOT rescue this
+                                                    // arm: a Terminated that
+                                                    // reaches it with the
+                                                    // flag set can only be a
+                                                    // requested stop (the
+                                                    // drain converts a
+                                                    // backend death under a
+                                                    // pending interrupt to
+                                                    // `Interrupted`), and
+                                                    // the stop wins the
+                                                    // reload.
                                                     stats.rounds = round;
                                                     slog(&session_log, |l| {
                                                         l.info(&format!(
@@ -2073,6 +2183,32 @@ pub(crate) async fn run_external_agent_mode(
                                                             .waiting_turn_detail(agent.name()),
                                                     )
                                                     .await;
+                                                    round = round.saturating_sub(1);
+                                                } else if backend_credentials_reload
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    // Hard process death with
+                                                    // the reload deferral
+                                                    // pending: the respawn IS
+                                                    // the recovery. Gate the
+                                                    // closed channel and stay
+                                                    // resident; the safe
+                                                    // point swaps in the
+                                                    // fresh receiver and
+                                                    // re-opens the gate.
+                                                    event_channel_open = false;
+                                                    let line = reload_outranks_terminal_line(
+                                                        "the backend event channel closed",
+                                                        "",
+                                                    );
+                                                    slog(&session_log, |l| l.warn(&line));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: live_session_id.clone(),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content: line,
+                                                        turn: None,
+                                                    });
                                                     round = round.saturating_sub(1);
                                                 } else {
                                                     slog(&session_log, |l| {
@@ -3831,7 +3967,10 @@ pub(crate) async fn run_external_agent_mode(
                 // 2026-07-31 specimen 69c8535e COMPLETED at 95 turns and
                 // the death was invisible). The honest terminal is FAILED
                 // plus the safeguards attention surfaces; the remedy is
-                // the owner's fresh-session recast.
+                // the owner's fresh-session recast. A pending credential
+                // reload does not rescue it either: respawn-and-redeliver
+                // into flagged bytes is the re-flag loop; the deferral
+                // dies with the loop.
                 stats.rounds = round;
                 let entry = crate::safeguards_recast::RecastRef {
                     session_id: live_session_id.clone().unwrap_or_default(),
@@ -3896,6 +4035,34 @@ pub(crate) async fn run_external_agent_mode(
                 reason,
                 turns_in_round,
             } => {
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A deferred mid-turn credential reload outranks the
+                    // round-death terminal (the round-death classification
+                    // bypasses the drain's interrupt resolution, so the
+                    // deferral survives to here): the pending respawn IS
+                    // the recovery — an auth refusal is exactly what the
+                    // fresh store may cure. Roll the burned round back
+                    // like the limit arm and let the safe point respawn;
+                    // the synthesized continuation re-drives the cut work
+                    // (nudge shape — `turns_in_round` counts COMPLETED
+                    // turns, so the round may hold a STARTED turn a
+                    // verbatim re-send would double-run).
+                    reload_interrupted_turn = true;
+                    let line = reload_outranks_terminal_line(
+                        "the round failed before any turn completed",
+                        &reason,
+                    );
+                    slog(&session_log, |l| l.warn(&line));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content: line,
+                        turn: None,
+                    });
+                    round = round.saturating_sub(1);
+                    continue 'outer;
+                }
                 // The launch-refusal class: a fatal backend error ended the
                 // round before any turn ran (an invalid model pin, an auth
                 // refusal at spawn). The honest terminal is FAILED — the
@@ -4416,7 +4583,13 @@ pub(crate) async fn run_external_agent_mode(
                 // occurrences journal `failed` and count on the
                 // suspension streak) instead of waiting unattended.
                 error_park_streak = error_park_streak.saturating_add(1);
-                if error_park_attempts_exhausted(error_park_streak) {
+                // A pending credential reload holds the suspension terminal
+                // open: park normally instead — the safe-point respawn
+                // cancels the park preserving the delivery-aware pending
+                // and resets the streak like any explicit intervention.
+                if !backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst)
+                    && error_park_attempts_exhausted(error_park_streak)
+                {
                     stats.rounds = round;
                     let line =
                         error_park_exhausted_line(&reason, error_park_streak.saturating_sub(1));
@@ -4970,6 +5143,11 @@ pub(crate) async fn run_external_agent_mode(
                 }
             }
             DrainOutcome::Terminated { reason, exit_code } => {
+                // A pending credential reload deliberately does NOT rescue
+                // this arm: a Terminated that reaches it with the flag set
+                // can only be a requested stop (the drain converts a
+                // backend death under a pending interrupt to
+                // `Interrupted`), and the stop wins the reload.
                 stats.rounds = round;
                 let user_requested_stop =
                     matches!(reason.as_str(), "stopped by user" | "restarting session")
@@ -5043,6 +5221,27 @@ pub(crate) async fn run_external_agent_mode(
                 break;
             }
             DrainOutcome::ChannelClosed => {
+                if backend_credentials_reload.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Hard process death with the reload deferral pending
+                    // (the channel-closed return bypasses the drain's
+                    // interrupt resolution): the respawn IS the recovery.
+                    // Roll the burned round back and let the safe point
+                    // respawn; the synthesized continuation re-drives the
+                    // cut work.
+                    reload_interrupted_turn = true;
+                    let line =
+                        reload_outranks_terminal_line("the backend event channel closed", "");
+                    slog(&session_log, |l| l.warn(&line));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content: line,
+                        turn: None,
+                    });
+                    round = round.saturating_sub(1);
+                    continue 'outer;
+                }
                 slog(&session_log, |l| {
                     l.info("External agent event channel closed")
                 });
@@ -5247,9 +5446,11 @@ mod tests {
 
     #[test]
     fn idle_sessions_get_no_synthesized_message() {
-        // Idle and between-turn reloads never arm the marker (the idle
-        // listener applies the respawn directly; no drain returned
-        // `Interrupted` with the reload reason): idle in, idle out.
+        // TRULY idle and between-turn reloads never arm the marker (the
+        // idle listener applies the respawn directly; nothing was cut).
+        // A reload whose interrupt cut a live OBSERVED round arms it like
+        // the primary lane — the cut turn owes, not the lane — but with
+        // no cut turn: idle in, idle out.
         assert!(synthesized_reload_continuation(false).is_none());
 
         // Adjacent interrupt reasons must not collide with the
