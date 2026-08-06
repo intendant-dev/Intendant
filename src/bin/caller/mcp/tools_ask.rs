@@ -440,6 +440,7 @@ pub(crate) type BuiltAskQuestion = (crate::types::UserQuestion, Vec<DecodedPrevi
 /// "questions[N]: " for the multi form); `preview_budget` is the per-ask
 /// running byte total shared across questions.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors the per-question wire vocabulary
 fn build_one_ask_question(
     at: &str,
     question_text: &str,
@@ -450,6 +451,7 @@ fn build_one_ask_question(
     pick_min: Option<u8>,
     pick_max: Option<u8>,
     free_text: Option<bool>,
+    consequence: Option<&str>,
     preview_budget: &mut usize,
 ) -> Result<BuiltAskQuestion, String> {
     let question = question_text.trim();
@@ -533,6 +535,13 @@ fn build_one_ask_question(
         .filter(|h| !h.is_empty())
         .map(|h| crate::types::truncate_str(h, 64).to_string())
         .unwrap_or_default();
+    // Consequence-on-silence is one card line, not a body: cap it like a
+    // long option description rather than a question.
+    let consequence = consequence
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| crate::types::truncate_str(c, 500).to_string())
+        .unwrap_or_default();
     let previews =
         decode_ask_previews(preview_params, preview_budget).map_err(|e| format!("{at}{e}"))?;
     Ok((
@@ -545,6 +554,7 @@ fn build_one_ask_question(
             pick_max,
             free_text,
             previews: Vec::new(),
+            consequence,
         },
         previews,
     ))
@@ -577,6 +587,7 @@ pub(crate) fn build_ask_user_questions(
             params.pick_min,
             params.pick_max,
             params.free_text,
+            params.consequence.as_deref(),
             &mut preview_budget,
         )?;
         return Ok((vec![built], wait_seconds));
@@ -600,6 +611,7 @@ pub(crate) fn build_ask_user_questions(
             q.pick_min,
             q.pick_max,
             q.free_text,
+            q.consequence.as_deref(),
             &mut preview_budget,
         )?);
     }
@@ -623,6 +635,17 @@ fn park_actor(
         actor.kind = Some("agent_session".to_string());
     }
     actor
+}
+
+/// Parse the ask-level `expiry` (decision-contract) into the parked
+/// item's due instant — the same WHEN vocabulary agenda due dates speak
+/// ([`crate::ctl::parse_due_ms`]; one parser, two lanes).
+pub(crate) fn parse_ask_expiry(expiry: Option<&str>) -> Result<Option<u64>, String> {
+    expiry
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| crate::ctl::parse_due_ms(raw).map_err(|e| format!("expiry: {e}")))
+        .transpose()
 }
 
 /// Map `ask_user` parameters (flat or multi form) into the per-question
@@ -653,6 +676,7 @@ pub(crate) fn park_questions(params: &AskUserParams) -> Result<Vec<AskUserQuesti
         pick_min,
         pick_max,
         free_text: params.free_text,
+        consequence: params.consequence.clone(),
     }])
 }
 
@@ -808,7 +832,7 @@ fn with_item_id(mut result: serde_json::Value, item_id: &str) -> serde_json::Val
 
 impl IntendantServer {
     #[tool(
-        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. On a daemon with the durable agenda (the default daemon shape), a timed-out or abandoned question does NOT evaporate: it stays open on the agenda — the result carries its item_id — and a later answer is delivered back into this session as a user message at a turn boundary. Set park: true to skip blocking entirely: the question files as a durable agenda item and {status:\"parked\", item_id, ask_id} returns immediately (don't combine with wait_seconds); the reply lands on the item and is delivered the same way. Use it before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
+        description = "Ask the user one structured question on the dashboard question rail and BLOCK until they answer (or the wait times out). A question requests input, never permission: it is never auto-approved and answering it never widens autonomy. Provide 0-4 options ({label, description?}); with zero options the user types a free-text answer (free text is always allowed on top of options). Optionally attach up to 4 preview cards (previews: [{label, html | image+media_type | text}]) rendered above the options — show, then ask: prototype variants to pick between, or before/after states to judge. html must be one self-contained document (rendered in a locked-down sandboxed frame — external fetches will not resolve; inline CSS/JS, use data: URLs for images); image is base64. Caps: 2 MB per html, 4 MB per image, 4 KB per text, 8 MB total per ask. Or ask up to 4 questions on ONE panel via questions: [{question, header?, options?, pick_min?, pick_max?, free_text?, previews?}] — pick_min/pick_max bound how many options may be selected (minimum 0 = optional question; default exactly one), free_text: false disables typed answers, and every answer returns together. The user can also attach a follow-up per question and anchored preview notes; a follow-up may STAND IN for an answer — address it (reply in conversation or raise a narrowed re-ask) before treating that part as settled. Returns {status, answer, answers, questions: [{question, header, answer, selected?, followup?, annotations?: [{preview, note}]}]}: status \"answered\" carries the user's choice(s); \"timeout\"/\"dismissed\"/\"pass\" carry best-judgment guidance instead — proceed on your own judgment then. Default wait 300s, max 900; the dashboard shows the expiry as a live countdown, and the user may hold the question open — a held ask blocks past the wait until answered or dismissed. On a daemon with the durable agenda (the default daemon shape), a timed-out or abandoned question does NOT evaporate: it stays open on the agenda — the result carries its item_id — and a later answer is delivered back into this session as a user message at a turn boundary. Set park: true to skip blocking entirely: the question files as a durable agenda item and {status:\"parked\", item_id, ask_id} returns immediately (don't combine with wait_seconds); the reply lands on the item and is delivered the same way. The decision contract for owner asks: mark your committed recommendation by appending \" (Recommended)\" to that option's label, set consequence (per question) to what you will do — or what happens — if it lapses unanswered, and set expiry (\"+2h\", \"+3d\", RFC3339) to when silence starts to mean the consequence; on a park the expiry becomes the item's due date. Expiry is advisory — the question stays OPEN past it. Use park before destructive or hard-to-reverse choices; prefer notify_user when you only need to inform."
     )]
     pub(crate) async fn ask_user(&self, Parameters(params): Parameters<AskUserParams>) -> String {
         match self.ask_user_inner(params).await {
@@ -893,9 +917,10 @@ impl IntendantServer {
                 );
             };
             let questions = park_questions(&params)?;
+            let due_ms = parse_ask_expiry(params.expiry.as_deref())?;
             let item = agenda
                 .apply(
-                    crate::agenda::AgendaCommand::ask(questions),
+                    crate::agenda::AgendaCommand::ask_with_due(questions, due_ms),
                     Some(park_actor(actor, &session_id)),
                 )
                 .map_err(|e| e.to_string())?;
@@ -1208,8 +1233,9 @@ impl IntendantServer {
         actor: &crate::access::actor::ActorBinding,
     ) -> Result<serde_json::Value, String> {
         let park = park_questions(params)?;
+        let due_ms = parse_ask_expiry(params.expiry.as_deref())?;
         let item = agenda
-            .park_ask_for_waiter(park, Some(park_actor(actor, &session_id)))
+            .park_ask_for_waiter(park, due_ms, Some(park_actor(actor, &session_id)))
             .map_err(|e| e.to_string())?;
         let ask = item
             .ask

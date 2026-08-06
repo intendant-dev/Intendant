@@ -667,11 +667,13 @@ impl AgendaHandle {
     pub(crate) fn park_ask_for_waiter(
         &self,
         questions: Vec<crate::mcp::AskUserQuestionParams>,
+        due_ms: Option<u64>,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
         let (mut item, counts, seq) = {
             let mut store = self.lock();
-            let item = store.apply_command(AgendaCommand::ask(questions), actor, now_ms())?;
+            let item =
+                store.apply_command(AgendaCommand::ask_with_due(questions, due_ms), actor, now_ms())?;
             if let Some(ask) = &item.ask {
                 crate::mcp::register_pending_ask(ask.ask_id);
             }

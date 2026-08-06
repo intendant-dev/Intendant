@@ -1746,6 +1746,8 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
             "--preview-html",
             "--preview-image",
             "--preview-text",
+            "--consequence",
+            "--expires",
         ],
         &["--multi", "--free-text", "--park"],
     )?;
@@ -1787,6 +1789,14 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
         }
         let mut map = ask_schema_args(schema)?;
         insert_string(&mut map, "session_id", args.one("--session"));
+        if args.one("--consequence").is_some() {
+            return Err(
+                "--consequence cannot be combined with --schema (declare consequence per \
+                 question inside the schema)"
+                    .into(),
+            );
+        }
+        insert_ask_expiry(&mut map, &args)?;
         if let Some(wait) = args.one("--wait") {
             let seconds: u64 = wait
                 .parse()
@@ -1854,6 +1864,8 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
             Value::Array(ask_option_entries(&options)),
         );
     }
+    insert_string(&mut map, "consequence", args.one("--consequence"));
+    insert_ask_expiry(&mut map, &args)?;
     let previews = collect_preview_args(&args)?;
     if !previews.is_empty() {
         map.insert("previews".to_string(), Value::Array(previews));
@@ -1862,6 +1874,24 @@ fn ask_args(raw: &[String]) -> Result<Value, String> {
         return Ok(ask_park_command(map));
     }
     Ok(Value::Object(map))
+}
+
+/// Map `--expires WHEN` (the decision contract's expiry) onto the lane's
+/// wire spelling: the park command speaks the agenda's typed `due_ms`
+/// (parsed client-side like every other ctl WHEN), while the blocking
+/// `ask_user` wire speaks the raw `expiry` string the daemon parses with
+/// the same vocabulary. Both validate here so a typo fails before
+/// anything is filed.
+fn insert_ask_expiry(map: &mut Map<String, Value>, args: &CommandArgs) -> Result<(), String> {
+    if let Some(expires) = args.one("--expires") {
+        let due = parse_due_ms(expires)?;
+        if args.has("--park") {
+            map.insert("due_ms".to_string(), Value::from(due));
+        } else {
+            map.insert("expiry".to_string(), Value::String(expires.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// Parse repeatable `--option "Label[:desc]"` values into the ask-rail
@@ -1908,6 +1938,7 @@ fn ask_park_command(mut map: Map<String, Value>) -> Value {
                 "pick_min",
                 "pick_max",
                 "free_text",
+                "consequence",
             ] {
                 if let Some(value) = map.remove(key) {
                     question.insert(key.to_string(), value);
@@ -1934,6 +1965,11 @@ fn ask_park_command(mut map: Map<String, Value>) -> Value {
     let mut command = Map::new();
     command.insert("op".to_string(), Value::String("ask".to_string()));
     command.insert("questions".to_string(), Value::Array(questions));
+    // The decision contract's expiry rides the park as the item's typed
+    // due date (already parsed client-side by `insert_ask_expiry`).
+    if let Some(due) = map.remove("due_ms") {
+        command.insert("due_ms".to_string(), due);
+    }
     Value::Object(command)
 }
 
@@ -2367,7 +2403,7 @@ async fn run_agenda(
             // Executor pins (Track AU): the same launch vocabulary the
             // start-now sheet records, digest-bound on the standing
             // manifest — the owner approves WHO runs the goal.
-            insert_agenda_launch_config(&mut map, &args);
+            insert_agenda_launch_config(&mut map, &args)?;
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             let proposed_item = agenda_response_item(&response);
             print_tool_response(response, config, None)?;
@@ -2466,7 +2502,7 @@ async fn run_agenda(
             }
             insert_string(&mut map, "project_root", args.one("--project"));
             insert_string(&mut map, "source", args.one("--source"));
-            insert_agenda_launch_config(&mut map, &args);
+            insert_agenda_launch_config(&mut map, &args)?;
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
             println!(
@@ -2582,7 +2618,7 @@ async fn run_agenda(
             if goal_run {
                 map.insert("interactive".to_string(), Value::Bool(false));
             }
-            insert_agenda_launch_config(&mut map, &args);
+            insert_agenda_launch_config(&mut map, &args)?;
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
             if goal_run {
@@ -3152,7 +3188,7 @@ fn agenda_ask_args(raw: &[String]) -> Result<Value, String> {
         raw,
         &[
             "--body", "--tag", "--due", "--source", "--ref", "--label", "--option", "--pick",
-            "--header",
+            "--header", "--consequence",
         ],
         &["--multi", "--must-read"],
     )?;
@@ -3193,6 +3229,7 @@ fn agenda_ask_args(raw: &[String]) -> Result<Value, String> {
         question.insert("pick_min".to_string(), Value::from(1));
         question.insert("pick_max".to_string(), Value::from(options.len()));
     }
+    insert_string(&mut question, "consequence", args.one("--consequence"));
     let mut map = Map::new();
     map.insert("op".to_string(), Value::String("ask".to_string()));
     map.insert(
@@ -3724,7 +3761,7 @@ async fn agenda_transition(
 /// [`insert_agenda_launch_config`]. One list, two verbs: the standing
 /// lane must express the same executor vocabulary the start-now lane
 /// records (Track AU).
-const AGENDA_LAUNCH_FLAGS: [&str; 7] = [
+const AGENDA_LAUNCH_FLAGS: [&str; 11] = [
     "--agent",
     "--claude-model",
     "--claude-effort",
@@ -3732,12 +3769,22 @@ const AGENDA_LAUNCH_FLAGS: [&str; 7] = [
     "--codex-reasoning-effort",
     "--kimi-model",
     "--kimi-thinking",
+    // The session-dial knobs (Track AD S1): typed values the manifest
+    // intake validates (unknown words refuse by name). --dial-approve is
+    // repeatable CATEGORY=RULE (e.g. network=deny).
+    "--dial-autonomy",
+    "--dial-ask",
+    "--dial-notify",
+    "--dial-approve",
 ];
 
 /// Assemble the [`AGENDA_LAUNCH_FLAGS`] values into the command's
 /// `agent_config` object (omitted entirely when no pin was passed, so a
 /// flag-less invocation stays byte-identical to the legacy wire shape).
-fn insert_agenda_launch_config(map: &mut Map<String, Value>, args: &CommandArgs) {
+fn insert_agenda_launch_config(
+    map: &mut Map<String, Value>,
+    args: &CommandArgs,
+) -> Result<(), String> {
     let mut agent_config = Map::new();
     insert_string(&mut agent_config, "agent", args.one("--agent"));
     insert_string(
@@ -3762,9 +3809,48 @@ fn insert_agenda_launch_config(map: &mut Map<String, Value>, args: &CommandArgs)
         "kimi_thinking",
         args.one("--kimi-thinking"),
     );
+    if let Some(dial) = build_dial_object(args)? {
+        agent_config.insert("dial".to_string(), dial);
+    }
     if !agent_config.is_empty() {
         map.insert("agent_config".to_string(), Value::Object(agent_config));
     }
+    Ok(())
+}
+
+/// Assemble the `--dial-*` flags into the wire `dial` object. Values ride
+/// raw — the daemon's typed intake is the one refusal authority (an
+/// unknown word refuses the manifest by name) — but the CATEGORY=RULE
+/// shape of `--dial-approve` is parsed here because it is ctl syntax,
+/// not vocabulary.
+fn build_dial_object(args: &CommandArgs) -> Result<Option<Value>, String> {
+    let mut dial = Map::new();
+    insert_string(&mut dial, "autonomy", args.one("--dial-autonomy"));
+    insert_string(&mut dial, "ask", args.one("--dial-ask"));
+    insert_string(&mut dial, "notify", args.one("--dial-notify"));
+    let mut approvals = Map::new();
+    for spec in args.all("--dial-approve") {
+        let Some((category, rule)) = spec.split_once('=') else {
+            return Err(format!(
+                "--dial-approve wants CATEGORY=RULE (e.g. network=deny), got '{spec}'"
+            ));
+        };
+        let category = category.trim();
+        let rule = rule.trim();
+        if category.is_empty() || rule.is_empty() {
+            return Err(format!(
+                "--dial-approve wants CATEGORY=RULE (e.g. network=deny), got '{spec}'"
+            ));
+        }
+        approvals.insert(category.to_string(), Value::String(rule.to_string()));
+    }
+    if !approvals.is_empty() {
+        dial.insert("approvals".to_string(), Value::Object(approvals));
+    }
+    if dial.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Value::Object(dial)))
 }
 
 /// Resolve the first positional as an agenda item id, accepting any
@@ -4338,8 +4424,10 @@ fn agenda_occurrences_render_row(entry: &Value) -> String {
 
 /// Parse a human due-time into epoch ms: `+45m`/`+2h`/`+3d`/`+1w`
 /// relative offsets, epoch seconds/ms, RFC3339, `YYYY-MM-DD`, or
-/// `YYYY-MM-DD HH:MM` (naive forms in local time).
-fn parse_due_ms(raw: &str) -> Result<u64, String> {
+/// `YYYY-MM-DD HH:MM` (naive forms in local time). `pub(crate)`: the MCP
+/// `ask_user` expiry parameter speaks the same vocabulary daemon-side —
+/// one parser, two lanes.
+pub(crate) fn parse_due_ms(raw: &str) -> Result<u64, String> {
     let raw = raw.trim();
     if let Some(offset) = raw.strip_prefix('+') {
         let (amount, unit) = offset.split_at(offset.len().saturating_sub(1));
@@ -5768,9 +5856,10 @@ fn help_ask() {
     println!(
         "Usage: intendant ctl ask \"QUESTION\" [--option \"Label[:desc]\"]... [--multi | --pick MIN[-MAX]] \\\n\
 \x20                          [--header TEXT] [--free-text] [--wait SECONDS] [--park] [--json] \\\n\
+\x20                          [--consequence TEXT] [--expires WHEN] \\\n\
 \x20                          [--preview-html LABEL=FILE]... [--preview-image LABEL=FILE]... \\\n\
 \x20                          [--preview-text LABEL=TEXT]...\n\
-\x20      intendant ctl ask --schema FILE|- [--wait SECONDS] [--park] [--json]\n\
+\x20      intendant ctl ask --schema FILE|- [--wait SECONDS] [--park] [--expires WHEN] [--json]\n\
 \n\
 --park makes the question DURABLE instead of blocking: it becomes an agenda\n\
 question item carrying the full payload (options, pick bounds, previews),\n\
@@ -5780,10 +5869,19 @@ daemon restarts. Dismissal hides it from the rails but keeps it open; read\n\
 the reply later via `intendant ctl agenda list --all`. --wait and --session\n\
 don't combine with --park.\n\
 \n\
+The decision contract: --consequence names what you will do (or what\n\
+happens) if the question lapses unanswered — rendered on the card so the\n\
+owner sees the cost of silence; mark your committed recommendation by\n\
+appending \" (Recommended)\" to that option's label. --expires WHEN\n\
+(+2h/+3d, epoch, RFC3339, YYYY-MM-DD [HH:MM]) names when silence starts to\n\
+mean the consequence — on a park it becomes the item's due date (due chip,\n\
+reminder policy); advisory, the question stays OPEN past it. With --schema,\n\
+declare consequence per question inside the JSON.\n\
+\n\
 --pick constrains selections (\"1\" exactly one, \"0-3\" up to three; 0 minimum\n\
 makes the question optional). --schema takes the multi-question JSON form —\n\
 {{\"questions\":[{{question, header?, options?:[{{label,description?}}],\n\
-pick?:{{min,max}}, free_text?, previews?:[{{label, html|image: FILE | text}}]}}]}}\n\
+pick?:{{min,max}}, free_text?, consequence?, previews?:[{{label, html|image: FILE | text}}]}}]}}\n\
 (up to 4 questions on one panel; every answer returns together, per-question\n\
 lines on stdout, full structure under --json). Users may attach a follow-up\n\
 per question and anchored preview notes — printed as suffixed lines, and a\n\
@@ -5847,10 +5945,12 @@ fn help_agenda() {
       [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT] [--source LABEL]\n\
   intendant ctl agenda ask QUESTION... [--body TEXT] [--tag TAG]... [--due WHEN] [--source LABEL]\n\
       [--option \"Label[:desc]\"]... [--multi | --pick MIN[-MAX]] [--header TEXT]\n\
-      [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT]\n\
+      [--consequence TEXT] [--ref [TYPE:]LOCATOR]... [--must-read] [--label TEXT]\n\
       # --option parks a STRUCTURED question (the ask-rail vocabulary): the dashboard\n\
       # renders the choices as one-click answers; append \" (Recommended)\" to the label\n\
-      # you endorse and the detail panel highlights it\n\
+      # you endorse and the detail panel highlights it. The decision contract:\n\
+      # --consequence names what happens if the question lapses unanswered, and\n\
+      # --due doubles as its expiry (when silence starts to mean the consequence)\n\
   intendant ctl agenda answer ID_PREFIX REPLY... [--source LABEL]\n\
   intendant ctl agenda list [--all|--open|--done|--retired] [--blocked] [--json]\n\
   intendant ctl agenda show ID_PREFIX [--json]   # ONE item, full detail — never fetches the ledger\n\
@@ -5981,7 +6081,14 @@ launch flags (--agent, --claude-model/--claude-effort,\n\
 pin the executor on the digest-bound manifest — the approval covers WHO\n\
 runs the goal (backend/model/effort), and editing the executor voids it\n\
 like any other revision; omitted fields inherit the daemon defaults\n\
-(explicit pin → daemon default → backend default). On a\n\
+(explicit pin → daemon default → backend default). The dial flags\n\
+(--dial-autonomy low|medium|high|full, --dial-ask\n\
+autopilot|escalate|checkpoint|confer, --dial-notify quiet|normal|eager,\n\
+--dial-approve CATEGORY=auto|ask|deny, repeatable) pin the session's\n\
+dial override on the same manifest: overridden knobs are owner-signed\n\
+sticky for the fired session's life, un-overridden knobs follow the live\n\
+global layer, and a live global category deny is an absolute floor no\n\
+override loosens. On a\n\
 standing approved item, `start` fires one extra occurrence of the approved\n\
 manifest immediately without touching the approval. --binding-ref file:PATH\n\
 (repeatable) SEALS content the goal depends on: the file is sha256-pinned\n\
@@ -6008,7 +6115,8 @@ root, else the daemon default — refused with a named error when none\n\
 exists (never a project-less spawn). The launch flags (--agent,\n\
 --claude-model/--claude-effort, --codex-model/--codex-reasoning-effort,\n\
 --kimi-model/--kimi-thinking) pin the spawn's agent config on the\n\
-manifest; omitted fields inherit the daemon defaults (explicit pin →\n\
+manifest, and the --dial-* flags (see `schedule` above) pin its session\n\
+dial; omitted fields inherit the daemon defaults (explicit pin →\n\
 daemon default → backend default). Owner surfaces only (dashboard or\n\
 an owner shell); agent and peer callers are refused. Revises the item's\n\
 pending schedule if one exists (fresh digest, prior approval void)."

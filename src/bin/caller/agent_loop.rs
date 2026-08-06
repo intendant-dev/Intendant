@@ -2466,6 +2466,7 @@ pub(crate) async fn run_agent_loop(
                         pick_max: None,
                         free_text: None,
                         previews: Vec::new(),
+                        consequence: String::new(),
                     }],
                     // The native waiter blocks on its oneshot without a
                     // deadline — no expiry to show or hold.
@@ -3085,6 +3086,7 @@ Proceed with explicit assumptions and continue without additional questions."
                         pick_max: None,
                         free_text: None,
                         previews: Vec::new(),
+                        consequence: String::new(),
                     }],
                     // The native waiter blocks on its oneshot without a
                     // deadline — no expiry to show or hold.
@@ -4423,6 +4425,7 @@ fn raise_sandbox_consent_cards(
                 pick_max: None,
                 free_text: None,
                 previews: Vec::new(),
+                consequence: String::new(),
             }],
             expires_at_ms: None,
             held: false,

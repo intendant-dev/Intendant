@@ -1564,11 +1564,21 @@ impl AgendaCommand {
     /// historic shape: no body/tags/due/source (those are the decision-card
     /// park fields the CLI/op lanes fill explicitly).
     pub(crate) fn ask(questions: Vec<crate::mcp::AskUserQuestionParams>) -> Self {
+        Self::ask_with_due(questions, None)
+    }
+
+    /// A park carrying the decision contract's expiry: `due_ms` lands as
+    /// the item's due date (the existing typed field), so the decision
+    /// window renders as the ordinary due chip and rides reminder policy.
+    pub(crate) fn ask_with_due(
+        questions: Vec<crate::mcp::AskUserQuestionParams>,
+        due_ms: Option<u64>,
+    ) -> Self {
         AgendaCommand::Ask {
             questions,
             body: String::new(),
             tags: Vec::new(),
-            due_ms: None,
+            due_ms,
             source: None,
             refs: Vec::new(),
         }

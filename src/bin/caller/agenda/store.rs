@@ -1342,10 +1342,15 @@ impl AgendaStore {
             pick_min: None,
             pick_max: None,
             free_text: None,
+            // Call-level decision-contract fields never reach this arm:
+            // consequence rides per question, and expiry landed as the
+            // command's typed `due_ms` before the park was applied.
+            consequence: None,
             questions,
             wait_seconds: None,
             park: false,
             session_id: None,
+            expiry: None,
         };
         let (built, _wait) =
             crate::mcp::build_ask_user_questions(&params).map_err(AgendaError::Invalid)?;
