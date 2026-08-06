@@ -1649,6 +1649,28 @@ pub(crate) fn park_holds_through_terminal_line(
     )
 }
 
+/// The honest log row when a terminal classification lands while a
+/// deferred mid-turn credential reload is still pending and the reload
+/// outranks it (the 2026-08-02 limit-exit race, specimen 2c6ea80d: the
+/// reload's deferral was swallowed by the turn's exit and the session
+/// parked until the OLD account's 05:20 reset while the fresh store sat
+/// unread). The pending respawn IS the recovery — an auth-shaped round
+/// death is exactly what the fresh credentials may cure — so the session
+/// stays resident and the loop's safe point applies the reload instead
+/// of exiting.
+pub(crate) fn reload_outranks_terminal_line(classification: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    let cause = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({reason})")
+    };
+    format!(
+        "Deferred credential reload outranks a backend terminal — {classification}{cause}; \
+         the session stays resident and respawns on the fresh credential store"
+    )
+}
+
 /// Re-arming a park over an already-armed one (a second rejection or
 /// round death while parked — the dying backend's death-rattle class)
 /// must not clobber the owed work: while parked nothing delivers user
@@ -2470,6 +2492,30 @@ mod tests {
             "Service-recovery pause holds through a backend terminal while parked — the \
              backend event channel closed; the session stays resident and resumes at the \
              park's wake"
+        );
+    }
+
+    /// The reload-outranks-terminal line: honest, greppable, and
+    /// truthful with and without a carried reason (the limit-exit race
+    /// rescue's log row, card 01KZ0HVNCM).
+    #[test]
+    fn reload_outranks_terminal_line_is_honest() {
+        let line = reload_outranks_terminal_line(
+            "the round failed before any turn completed",
+            "Claude Code auth refused",
+        );
+        assert_eq!(
+            line,
+            "Deferred credential reload outranks a backend terminal — the round failed \
+             before any turn completed (Claude Code auth refused); the session stays \
+             resident and respawns on the fresh credential store"
+        );
+        let quiet = reload_outranks_terminal_line("the backend event channel closed", "");
+        assert_eq!(
+            quiet,
+            "Deferred credential reload outranks a backend terminal — the backend event \
+             channel closed; the session stays resident and respawns on the fresh \
+             credential store"
         );
     }
 

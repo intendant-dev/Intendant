@@ -9952,3 +9952,209 @@ async fn limit_park_survives_backend_death_and_resumes_at_reset() {
 
     child.kill().await.ok();
 }
+
+/// The mid-turn-reload swallowed-by-limit-exit race end to end (card
+/// 01KZ0HVNCM, specimen 2c6ea80d 2026-08-02): a reload-credentials
+/// request lands MID-TURN on a daemon-supervised claude-code session —
+/// the deferral lane interrupts the backend and defers the respawn to
+/// the turn's end — and the turn then exits on a rate-limit rejection
+/// whose reset sits an hour out (the OLD account's window). The deferred
+/// reload must survive that exit: the wrapper respawns resume-attached
+/// on the fresh credential store and the synthesized continuation
+/// re-drives the cut work immediately, instead of parking until the
+/// stale reset (the specimen parked 3h46m on an account the owner had
+/// already rotated away from, with the fresh store sitting unread).
+/// The turn is a backend-started round observed from idle — the exact
+/// specimen lane, where the pre-fix loop swallowed the deferral because
+/// only the top of the outer loop consumed it. Unix-only for the /bin/sh
+/// fake; run 2 is discriminated by `--resume` argv keying like the
+/// park-then-die e2e above.
+#[cfg(unix)]
+#[tokio::test]
+async fn midturn_reload_survives_limit_exit_and_respawns_on_fresh_credentials() {
+    use futures_util::SinkExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = TestRig::new();
+    let script = serde_json::json!({ "profiles": [] });
+
+    // The fake claude. Run 1 (no `--resume`): answer the task turn
+    // cleanly, then start a SPONTANEOUS round (an assistant event while
+    // the wrapper idles — enters the observe drain and marks the round
+    // started), hold that turn open until the test's go-marker appears
+    // (the test writes it only after the reload deferral armed
+    // mid-turn), then exit the turn on a five_hour rejection resetting
+    // an hour out. Stays alive reading stdin — the specimen's backend
+    // survived its rejection; dying here would smear this into the
+    // park-then-die class instead. The `claimed` mkdir is a first-spawn
+    // mutex: create_session retries on a saturated boot could spawn a
+    // twin, and an unclaimed twin running the choreography would arm an
+    // honest park that breaks the no-park asserts — losers idle inert.
+    // Run 2 (`--resume`, the reload's respawn by construction): answer
+    // whatever arrives first — the synthesized continuation — with the
+    // proof text and stay alive.
+    let fake = rig.home.path().join("fake-claude.sh");
+    let go_marker = rig.home.path().join("reload-go");
+    let claim = rig.home.path().join("choreography-claim");
+    std::fs::write(
+        &fake,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "SID=\"21111111-2222-4333-8444-555555555555\"\n",
+                "resumed=0\n",
+                "for a in \"$@\"; do\n",
+                "  [ \"$a\" = \"--resume\" ] && resumed=1\n",
+                "done\n",
+                "read -r _line || exit 1\n",
+                "printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}}\\n' \"$SID\"\n",
+                "if [ \"$resumed\" = \"0\" ]; then\n",
+                "  printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"turn one done\",\"session_id\":\"%s\"}}\\n' \"$SID\"\n",
+                "  /bin/sleep 1\n",
+                "  if ! /bin/mkdir {claim} 2>/dev/null; then\n",
+                "    while read -r _line; do :; done\n",
+                "    exit 0\n",
+                "  fi\n",
+                "  printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"observed work in flight\"}}]}},\"session_id\":\"%s\"}}\\n' \"$SID\"\n",
+                "  while [ ! -e {go} ]; do /bin/sleep 0.1; done\n",
+                "  RESET=$(( $(/bin/date +%s) + 3600 ))\n",
+                "  printf '{{\"type\":\"rate_limit_event\",\"rate_limit_info\":{{\"status\":\"rejected\",\"rateLimitType\":\"five_hour\",\"resetsAt\":%d}},\"session_id\":\"%s\"}}\\n' \"$RESET\" \"$SID\"\n",
+                "  printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"You have hit your session limit\",\"session_id\":\"%s\"}}\\n' \"$SID\"\n",
+                "  while read -r _line; do :; done\n",
+                "  exit 0\n",
+                "fi\n",
+                "printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"resumed on fresh credentials after the swallowed reload\",\"session_id\":\"%s\"}}\\n' \"$SID\"\n",
+                "while read -r _line; do :; done\n",
+            ),
+            claim = claim.display(),
+            go = go_marker.display(),
+        ),
+    )
+    .expect("write fake claude");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+
+    let client = reqwest::Client::new();
+    let mut daemon = spawn_daemon_on_rig(&client, rig, &script, false).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        daemon.port,
+        daemon.loopback_token()
+    ))
+    .await
+    .expect("connect /ws");
+
+    // The very first control message can race daemon startup on a
+    // saturated box, so retry until session_started (the mkdir claim in
+    // the fake keeps a retry-spawned twin inert).
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "midturn reload race task",
+                "agent": "claude-code",
+                "agent_command": daemon.rig.home.path().join("fake-claude.sh").to_string_lossy(),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send claude-code create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("midturn reload race"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "claude-code create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+
+    // Phase 1: the spontaneous round is live in the observe drain.
+    poll_until(
+        "the backend-started round observed from idle",
+        RUN_TIMEOUT,
+        || async {
+            let logs = daemon.rig.session_logs();
+            logs.contains("observed work in flight").then_some(())
+        },
+        || tail(&daemon.rig.session_logs(), 4000),
+    )
+    .await;
+
+    // Phase 2: the reload lands MID-TURN — the deferral lane interrupts
+    // the backend and parks the respawn on the turn's end.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "reload_credentials",
+            "session_id": session_id,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send reload_credentials");
+    poll_until(
+        "the mid-turn reload deferral",
+        RUN_TIMEOUT,
+        || async {
+            let logs = daemon.rig.session_logs();
+            logs.contains("Reload-credentials requested mid-turn")
+                .then_some(())
+        },
+        || tail(&daemon.rig.session_logs(), 4000),
+    )
+    .await;
+
+    // Phase 3: release the fake — the deferred turn now exits on the
+    // OLD account's five_hour rejection (reset an hour out).
+    std::fs::write(&go_marker, b"go").expect("write go marker");
+
+    // Phase 4: the deferral survives the limit exit — the wrapper
+    // respawns on the fresh store and the synthesized continuation
+    // re-drives the cut work to completion on run 2.
+    let logs = poll_until(
+        "the reload respawn and the delivered continuation",
+        RUN_TIMEOUT,
+        || async {
+            let logs = daemon.rig.session_logs();
+            (logs.contains("Credential reload complete")
+                && logs.contains("queued a continuation")
+                && logs.contains("resumed on fresh credentials after the swallowed reload"))
+            .then_some(logs)
+        },
+        || tail(&daemon.rig.session_logs(), 4000),
+    )
+    .await;
+
+    // The race's losing outcome never happens: no park on the old
+    // account's window — neither the in-memory arm's log row nor the
+    // durable meta marker the boot sweep would readopt.
+    assert!(
+        !logs.contains("Rate-limited — parked"),
+        "the deferred reload must preempt the stale-window park:\n{}",
+        tail(&logs, 4000)
+    );
+    let meta = park_meta_of(&daemon.rig);
+    assert!(
+        meta.is_none(),
+        "no durable park marker may survive the rescued exit: {meta:?}"
+    );
+
+    daemon.child.kill().await.ok();
+}
