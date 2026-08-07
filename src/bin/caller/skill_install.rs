@@ -17,14 +17,19 @@
 //! ([`crate::plugin_registry::active_plugin_skills`]): those materialize
 //! with `source: plugin:<id>` provenance while their plugin stays enabled
 //! and ready, and are swept like retired builtins the moment it is not.
+//! Dashboard-added user skills materialize the same way from the
+//! daemon-owned library ([`crate::user_skills`]) with `source: user`
+//! provenance — the third marker class — and are swept when their record
+//! is removed or their library copy stops verifying.
 //!
 //! Each pass also subtracts the persisted disabled-set
-//! ([`crate::skill_state`]) from the BUILTIN half of the desired set —
-//! the set outranks the sweep: startup installs, plugin toggles, and the
-//! skill toggle all reconcile through here, so a re-materialization can
-//! never resurrect a deactivated builtin. Plugin payloads are deliberately
-//! NOT per-skill subtractable — their one lifecycle authority is the
-//! plugin's own toggle (the intake's per-kind law).
+//! ([`crate::skill_state`]) from the BUILTIN and USER halves of the
+//! desired set — the set outranks the sweep: startup installs, plugin
+//! toggles, and the skill toggle all reconcile through here, so a
+//! re-materialization can never resurrect a deactivated skill. Plugin
+//! payloads are deliberately NOT per-skill subtractable — their one
+//! lifecycle authority is the plugin's own toggle (the intake's per-kind
+//! law).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -34,9 +39,46 @@ use std::path::{Path, PathBuf};
 const INSTALL_MARKER: &str = ".intendant-installed";
 
 /// Marker content for skills sourced from the unconditional builtin
-/// catalog. Plugin-sourced skills carry `source: plugin:<id> …` instead,
-/// so an installed directory names where it came from.
+/// catalog. Plugin-sourced skills carry `source: plugin:<id> …` and
+/// dashboard-added skills [`USER_MARKER_CONTENT`] instead, so an
+/// installed directory names where it came from.
 const BUILTIN_MARKER_CONTENT: &str = "source: builtin (daemon-installed)\n";
+
+/// Marker content for dashboard-added user skills materialized from the
+/// daemon-owned library (the S4 third marker class).
+const USER_MARKER_CONTENT: &str = "source: user (dashboard-added)\n";
+
+/// Borrowed view over one installable skill payload — the shape the
+/// installer consumes. Builtins and plugin payloads borrow the 'static
+/// embeds; user skills borrow the library's owned strings (S4's pure
+/// widening — behavior for the embedded kinds is unchanged, which the
+/// pre-widening tests below prove verbatim).
+#[derive(Clone, Copy)]
+pub(crate) struct SkillPayloadRef<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) skill_md: &'a str,
+    pub(crate) support_files: &'a [(&'static str, &'static [u8])],
+}
+
+impl<'a> From<&'a crate::builtin_skills::BuiltinSkill> for SkillPayloadRef<'a> {
+    fn from(skill: &'a crate::builtin_skills::BuiltinSkill) -> Self {
+        Self {
+            name: skill.name,
+            skill_md: skill.skill_md,
+            support_files: skill.support_files,
+        }
+    }
+}
+
+impl<'a> From<&'a crate::user_skills::UserSkillPayload> for SkillPayloadRef<'a> {
+    fn from(payload: &'a crate::user_skills::UserSkillPayload) -> Self {
+        Self {
+            name: &payload.name,
+            skill_md: &payload.skill_md,
+            support_files: &[],
+        }
+    }
+}
 
 /// Report from one directly managed skill root.
 #[derive(Debug, Default)]
@@ -105,18 +147,32 @@ impl GlobalInstallReport {
 /// (`~/.agents/skills/`) and Claude Code (`~/.claude/skills/`).
 fn install_global_skills(
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    user_skills: &[crate::user_skills::UserSkillPayload],
     disabled: &BTreeSet<String>,
 ) -> GlobalInstallReport {
     let Some(home) = dirs::home_dir() else {
         return GlobalInstallReport::default();
     };
-    install_global_skills_in(&home, plugin_skills, disabled)
+    install_global_skill_set_in(&home, plugin_skills, user_skills, disabled)
 }
 
-/// Home-injectable core of [`install_global_skills`].
+/// The S3-era builtin+plugin entry, kept verbatim for the pre-widening
+/// tests below: their staying green unmodified is the proof that the S4
+/// payload-view widening changed nothing for the embedded kinds.
+#[cfg(test)]
 fn install_global_skills_in(
     home: &Path,
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    disabled: &BTreeSet<String>,
+) -> GlobalInstallReport {
+    install_global_skill_set_in(home, plugin_skills, &[], disabled)
+}
+
+/// Home-injectable core of [`install_global_skills`].
+fn install_global_skill_set_in(
+    home: &Path,
+    plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    user_skills: &[crate::user_skills::UserSkillPayload],
     disabled: &BTreeSet<String>,
 ) -> GlobalInstallReport {
     let targets = [
@@ -126,11 +182,12 @@ fn install_global_skills_in(
     let roots = targets
         .into_iter()
         .map(|(display_path, target_dir)| {
-            let outcome = match install_skills_in_root(&target_dir, plugin_skills, disabled) {
-                Ok(Some(report)) => SkillRootInstallOutcome::Installed(report),
-                Ok(None) => SkillRootInstallOutcome::SkippedUserOwnedRoot,
-                Err(error) => SkillRootInstallOutcome::Failed(error.to_string()),
-            };
+            let outcome =
+                match install_skills_in_root(&target_dir, plugin_skills, user_skills, disabled) {
+                    Ok(Some(report)) => SkillRootInstallOutcome::Installed(report),
+                    Ok(None) => SkillRootInstallOutcome::SkippedUserOwnedRoot,
+                    Err(error) => SkillRootInstallOutcome::Failed(error.to_string()),
+                };
             SkillRootInstallReport {
                 display_path,
                 outcome,
@@ -148,6 +205,7 @@ fn install_global_skills_in(
 fn install_skills_in_root(
     target_dir: &Path,
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    user_skills: &[crate::user_skills::UserSkillPayload],
     disabled: &BTreeSet<String>,
 ) -> io::Result<Option<SkillInstallReport>> {
     match std::fs::symlink_metadata(target_dir) {
@@ -158,17 +216,17 @@ fn install_skills_in_root(
     }
 
     let mut report = SkillInstallReport::default();
-    // The disabled-set subtracts BUILTINS only: a deactivated builtin
-    // leaves the desired set, so the sweep below removes its marked
-    // copies exactly like a retired builtin. Plugin payloads are never
-    // per-skill subtractable (their lifecycle is the plugin's toggle), so
-    // a stray or foreign entry naming one cannot sweep it from here.
-    let mut desired: Vec<(&crate::builtin_skills::BuiltinSkill, String)> =
-        crate::builtin_skills::BUILTIN_SKILLS
-            .iter()
-            .filter(|skill| !disabled.contains(skill.name))
-            .map(|skill| (skill, BUILTIN_MARKER_CONTENT.to_string()))
-            .collect();
+    // The disabled-set subtracts the BUILTIN and USER halves: a
+    // deactivated skill leaves the desired set, so the sweep below
+    // removes its marked copies exactly like a retired builtin. Plugin
+    // payloads are never per-skill subtractable (their lifecycle is the
+    // plugin's toggle), so a stray or foreign entry naming one cannot
+    // sweep it from here.
+    let mut desired: Vec<(SkillPayloadRef<'_>, String)> = crate::builtin_skills::BUILTIN_SKILLS
+        .iter()
+        .filter(|skill| !disabled.contains(skill.name))
+        .map(|skill| (skill.into(), BUILTIN_MARKER_CONTENT.to_string()))
+        .collect();
     for (plugin_id, skill) in plugin_skills {
         // Collisions are forbidden by the registry parity tests; if one
         // ever slips through, the builtin wins and the plugin copy is
@@ -180,9 +238,23 @@ fn install_skills_in_root(
             continue;
         }
         desired.push((
-            skill,
+            (*skill).into(),
             format!("source: plugin:{plugin_id} (daemon-installed)\n"),
         ));
+    }
+    for payload in user_skills {
+        // Shipped names win (the add lane refuses these collisions; a
+        // record shadowed by a later-shipping builtin or plugin payload
+        // simply stops materializing) — and the disabled-set subtracts
+        // user skills exactly like builtins.
+        if disabled.contains(payload.name.as_str())
+            || desired
+                .iter()
+                .any(|(existing, _)| existing.name == payload.name)
+        {
+            continue;
+        }
+        desired.push((payload.into(), USER_MARKER_CONTENT.to_string()));
     }
 
     // Sweep marked dirs that are no longer shipped. Renames and removals
@@ -224,7 +296,7 @@ fn install_skills_in_root(
             report.skipped_user_owned.push(skill.name.to_string());
             continue;
         }
-        if installed_skill_is_current(&dest, skill, marker_content) {
+        if installed_skill_is_current(&dest, *skill, marker_content) {
             report.unchanged += 1;
             continue;
         }
@@ -250,21 +322,17 @@ fn is_direct_directory(path: &Path, metadata: &std::fs::Metadata) -> bool {
     metadata.is_dir() && !metadata.file_type().is_symlink() && std::fs::read_link(path).is_err()
 }
 
-fn installed_skill_is_current(
-    dest: &Path,
-    skill: &crate::builtin_skills::BuiltinSkill,
-    marker_content: &str,
-) -> bool {
+fn installed_skill_is_current(dest: &Path, skill: SkillPayloadRef<'_>, marker_content: &str) -> bool {
     std::fs::read_to_string(dest.join(INSTALL_MARKER))
         .is_ok_and(|current| current == marker_content)
         && installed_payload_is_current(dest, skill)
 }
 
 /// Marker-agnostic payload currency: SKILL.md and every support file match
-/// the embedded bytes, and no extra files ride along. Shared by the
+/// the payload bytes, and no extra files ride along. Shared by the
 /// installer (which adds a marker-content check on top) and the read-only
 /// status helper (which cannot know the expected provenance line).
-fn installed_payload_is_current(dest: &Path, skill: &crate::builtin_skills::BuiltinSkill) -> bool {
+fn installed_payload_is_current(dest: &Path, skill: SkillPayloadRef<'_>) -> bool {
     if !dest.join(INSTALL_MARKER).is_file()
         || !std::fs::read_to_string(dest.join("SKILL.md"))
             .is_ok_and(|current| current == skill.skill_md)
@@ -318,10 +386,11 @@ fn collect_installed_files(
 /// (marked, payload drifted), `user_owned` (unmarked collision), `absent`,
 /// or `root_user_owned` (the whole root is a link or non-directory the
 /// installer never touches).
-pub(crate) fn skill_install_status_in(
+pub(crate) fn skill_install_status_in<'a>(
     home: &Path,
-    skill: &crate::builtin_skills::BuiltinSkill,
+    skill: impl Into<SkillPayloadRef<'a>>,
 ) -> Vec<(&'static str, &'static str)> {
+    let skill = skill.into();
     [
         ("~/.agents/skills", home.join(".agents").join("skills")),
         ("~/.claude/skills", home.join(".claude").join("skills")),
@@ -353,13 +422,15 @@ pub(crate) fn skill_install_status_in(
 }
 
 /// Re-run the global install against the current builtin + active-plugin
-/// set minus the persisted disabled-set. The plugin and skill toggle
-/// handlers call this right after a state write so materialization and
-/// sweep land in the same request; because the disabled-set is re-read
-/// here on every pass, the set outranks the sweep at every call site.
+/// + verified-user-library set minus the persisted disabled-set. The
+/// plugin and skill mutation handlers call this right after a state write
+/// so materialization and sweep land in the same request; because the
+/// disabled-set is re-read here on every pass, the set outranks the sweep
+/// at every call site.
 pub(crate) fn reconcile_global_skills() -> GlobalInstallReport {
     install_global_skills(
         &crate::plugin_registry::active_plugin_skills(),
+        &crate::user_skills::active_user_skill_payloads(),
         &crate::skill_state::disabled_skill_names(),
     )
 }
@@ -369,6 +440,7 @@ pub(crate) fn reconcile_global_skills() -> GlobalInstallReport {
 pub(crate) fn install_global_skills_at_startup() {
     for root in install_global_skills(
         &crate::plugin_registry::active_plugin_skills(),
+        &crate::user_skills::active_user_skill_payloads(),
         &crate::skill_state::disabled_skill_names(),
     )
     .roots
@@ -765,6 +837,155 @@ mod tests {
                 "a disabled-set entry must not sweep a plugin payload"
             );
         }
+    }
+
+    /// The S4 library round-trip at the installer layer: a user payload
+    /// materializes into BOTH discovery roots under the `source: user`
+    /// marker class, repeat passes are no-ops, and dropping the payload
+    /// (the remove lane's registry deletion) sweeps both roots.
+    #[test]
+    fn user_skills_materialize_with_user_marker_and_sweep_on_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let payload = crate::user_skills::UserSkillPayload {
+            name: "user-notes".to_string(),
+            skill_md: "---\nname: user-notes\ndescription: d\n---\nbody\n".to_string(),
+        };
+        let user = [payload.clone()];
+
+        install_global_skill_set_in(home, &[], &user, &BTreeSet::new());
+        for root in [
+            home.join(".agents").join("skills"),
+            home.join(".claude").join("skills"),
+        ] {
+            let dest = root.join("user-notes");
+            assert_eq!(
+                std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+                payload.skill_md
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join(INSTALL_MARKER)).unwrap(),
+                USER_MARKER_CONTENT
+            );
+        }
+        assert_eq!(
+            skill_install_status_in(home, &payload),
+            vec![
+                ("~/.agents/skills", "installed"),
+                ("~/.claude/skills", "installed")
+            ]
+        );
+
+        // Repeat pass: pure no-op (marker + payload currency both hold).
+        let second = install_global_skill_set_in(home, &[], &user, &BTreeSet::new());
+        assert!(installed_report(&second, "~/.claude/skills")
+            .installed
+            .is_empty());
+
+        // Payload gone (record removed / library failed verification):
+        // swept from both roots exactly like a retired builtin.
+        let swept = install_global_skill_set_in(home, &[], &[], &BTreeSet::new());
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert_eq!(
+                installed_report(&swept, display).removed_stale,
+                vec!["user-notes".to_string()]
+            );
+        }
+        assert_eq!(
+            skill_install_status_in(home, &payload),
+            vec![
+                ("~/.agents/skills", "absent"),
+                ("~/.claude/skills", "absent")
+            ]
+        );
+    }
+
+    /// The set outranks the sweep for USER skills too (the S3 invariant
+    /// extended): a disabled user skill is subtracted from the desired
+    /// set and swept from both roots, a re-materialized marked copy (the
+    /// resurrection simulation) is swept again on the next pass, and an
+    /// unmarked user-owned twin is never replaced on install nor removed
+    /// on sweep.
+    #[test]
+    fn disabled_user_skills_never_resurrect_and_unmarked_twins_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let payload = crate::user_skills::UserSkillPayload {
+            name: "user-notes".to_string(),
+            skill_md: "---\nname: user-notes\ndescription: d\n---\nbody\n".to_string(),
+        };
+        let user = [payload.clone()];
+        let roots = [
+            home.join(".agents").join("skills"),
+            home.join(".claude").join("skills"),
+        ];
+
+        // Baseline install, then deactivate: swept from both roots.
+        install_global_skill_set_in(home, &[], &user, &BTreeSet::new());
+        let disabled = BTreeSet::from(["user-notes".to_string()]);
+        let swept = install_global_skill_set_in(home, &[], &user, &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert_eq!(
+                installed_report(&swept, display).removed_stale,
+                vec!["user-notes".to_string()]
+            );
+        }
+
+        // Resurrection simulation: a marked copy reappears behind the
+        // daemon's back — the next pass under the set removes it again.
+        for root in &roots {
+            let dest = root.join("user-notes");
+            std::fs::create_dir_all(&dest).unwrap();
+            std::fs::write(dest.join(INSTALL_MARKER), USER_MARKER_CONTENT).unwrap();
+            std::fs::write(dest.join("SKILL.md"), &payload.skill_md).unwrap();
+        }
+        let re_swept = install_global_skill_set_in(home, &[], &user, &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert_eq!(
+                installed_report(&re_swept, display).removed_stale,
+                vec!["user-notes".to_string()],
+                "a re-materialized disabled user skill must be swept again"
+            );
+        }
+
+        // Re-enable restores byte-identical installs with the user marker.
+        install_global_skill_set_in(home, &[], &user, &BTreeSet::new());
+        for root in &roots {
+            let dest = root.join("user-notes");
+            assert_eq!(
+                std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+                payload.skill_md
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join(INSTALL_MARKER)).unwrap(),
+                USER_MARKER_CONTENT
+            );
+        }
+
+        // The ownership law holds for the user kind: an unmarked twin is
+        // never replaced on install and never removed on sweep.
+        let user_owned = roots[0].join("hand-made");
+        std::fs::create_dir_all(&user_owned).unwrap();
+        std::fs::write(user_owned.join("SKILL.md"), "hand copy").unwrap();
+        let hand_payload = crate::user_skills::UserSkillPayload {
+            name: "hand-made".to_string(),
+            skill_md: "---\nname: hand-made\ndescription: d\n---\nbody\n".to_string(),
+        };
+        let materialized =
+            install_global_skill_set_in(home, &[], &[hand_payload.clone()], &BTreeSet::new());
+        assert!(installed_report(&materialized, "~/.agents/skills")
+            .skipped_user_owned
+            .contains(&"hand-made".to_string()));
+        assert_eq!(
+            skill_install_status_in(home, &hand_payload)[0],
+            ("~/.agents/skills", "user_owned")
+        );
+        install_global_skill_set_in(home, &[], &[], &BTreeSet::new());
+        assert_eq!(
+            std::fs::read_to_string(user_owned.join("SKILL.md")).unwrap(),
+            "hand copy",
+            "an unmarked user-owned twin must never be swept"
+        );
     }
 
     fn outcome<'a>(

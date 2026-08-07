@@ -313,13 +313,21 @@ pub(crate) enum RouteHandlerId {
     /// materialization in the same request and reports the outcome.
     PluginSetEnabled,
     /// Unified skill catalog: every skill the daemon manages (builtins ∪
-    /// bundled plugin payloads), with provenance, trust posture, and
-    /// per-root install facts as one derived body.
+    /// bundled plugin payloads ∪ user-added skills), with provenance,
+    /// trust posture, and per-root install facts as one derived body.
     SkillsList,
     /// Deactivate/re-enable one skill via the persisted disabled-set;
     /// reconciles both install roots in the same request and refuses
     /// per-kind (plugin payloads toward their plugin's toggle).
     SkillSetEnabled,
+    /// Add one user skill from pasted/uploaded SKILL.md bytes into the
+    /// daemon-owned library; validates fail-closed, records gate-resolved
+    /// attribution + sha256, and materializes both roots in-request.
+    SkillAdd,
+    /// Remove one user skill: delete the library entry + registry record
+    /// and sweep the marked copies from both roots in-request; builtin
+    /// and plugin names refuse toward their own lifecycle door.
+    SkillRemove,
     /// Tier-2 PR render join for one anchor (expand-time, cached).
     AgendaPrState,
     /// One agenda item, full + decorated, by id or unique prefix
@@ -1060,26 +1068,29 @@ pub(crate) static ROUTES: &[Route] = &[
     .with_tunnel(tunnel_method("api_plugin_set_enabled")),
     // The unified skill catalog (skills/plugins unification S1):
     // registry-driven rows for every skill the daemon manages — builtins
-    // plus bundled plugin payloads, never a directory enumeration — with
-    // provenance, trust posture, and per-root install facts. Read-only.
+    // plus bundled plugin payloads plus dashboard-added user skills,
+    // never a directory enumeration — with provenance, trust posture,
+    // and per-root install facts. Read-only.
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/skills"),
         PeerOperation::StatsRead,
         BodyPolicy::None,
         RouteHandlerId::SkillsList,
-        "Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts",
+        "Unified skill catalog: builtins + bundled plugin payloads + user-added skills with provenance, trust posture, per-root install facts",
     )
     .with_tunnel(tunnel_method("api_skills_list")),
     // Deactivate / re-enable one skill by name (skills/plugins
     // unification S3). Settings-grade like the plugin toggle — hosted
     // provenance (`role:none`) never reaches it. The per-kind law holds
-    // at this wall: builtins flip the persisted disabled-set and the
-    // sweep applies it over BOTH discovery roots in-request (the set
-    // outranks the sweep); plugin-materialized skills refuse by name
-    // toward their plugin's toggle; unknown names refuse. The flip
-    // records the gate-resolved actor, and the response carries the
-    // refreshed row plus the per-root installer report.
+    // at this wall: builtins and user skills flip the persisted
+    // disabled-set and the sweep applies it over BOTH discovery roots
+    // in-request (the set outranks the sweep); re-enabling a user skill
+    // first re-verifies its library bytes against the recorded sha256;
+    // plugin-materialized skills refuse by name toward their plugin's
+    // toggle; unknown names refuse. The flip records the gate-resolved
+    // actor, and the response carries the refreshed row plus the
+    // per-root installer report.
     op_route(
         RouteMethod::Post,
         PathPattern::Segments("/api/skills", &[SegmentSpec::Capture("name")]),
@@ -1089,6 +1100,42 @@ pub(crate) static ROUTES: &[Route] = &[
         "Deactivate or re-enable one skill via the persisted disabled-set (sweeps both roots in-request; plugin payloads refuse toward their plugin's toggle)",
     )
     .with_tunnel(tunnel_method("api_skill_set_enabled")),
+    // Add one user skill (skills/plugins unification S4). An
+    // authority-bearing act over every future session of every backend on
+    // this machine — Settings-grade like the other skill mutations, so
+    // hosted provenance (`role:none`) never reaches it. The ONLY input
+    // lanes are the request body's SKILL.md bytes (paste and upload land
+    // the same field); there is deliberately no URL-fetch and no
+    // local-path import lane. Validation is fail-closed with named
+    // refusals (frontmatter parse, name==slug, slug grammar, non-empty
+    // description, collision with any builtin/plugin/user name); accepted
+    // bytes land in the daemon-owned library under the state root with
+    // the caller's gate-resolved attribution + sha256 recorded, then
+    // materialize into both discovery roots marked `source: user`.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/skills"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(crate::user_skills::ADD_BODY_CAP_BYTES),
+        RouteHandlerId::SkillAdd,
+        "Add one user skill from pasted/uploaded SKILL.md bytes (validates fail-closed; records attribution + sha256; installs to both roots marked source: user)",
+    )
+    .with_tunnel(tunnel_method("api_skill_add")),
+    // Remove one user skill (S4): deletes the library entry + registry
+    // record, then the same-request sweep clears the marked copies from
+    // both discovery roots — never an unmarked user-owned twin (the
+    // installer's ownership law). Per-kind refusals: builtins refuse
+    // toward deactivate (their bytes ship in the binary), plugin payloads
+    // toward their plugin's toggle, unknown names 404.
+    op_route(
+        RouteMethod::Delete,
+        PathPattern::Segments("/api/skills", &[SegmentSpec::Capture("name")]),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::SkillRemove,
+        "Remove one user skill (deletes the library entry + record; sweeps both roots in-request; builtin/plugin names refuse toward their own lifecycle door)",
+    )
+    .with_tunnel(tunnel_method("api_skill_remove")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),
@@ -3449,6 +3496,19 @@ mod tests {
         assert_eq!(
             policy("POST", "/api/skills/intendant-cli"),
             BodyPolicy::Capped(4 * 1024)
+        );
+        // The user-skill add carries a whole pasted/uploaded SKILL.md —
+        // 64 KiB, generous for prose (intake §3a; the library re-checks
+        // the same constant so the tunnel lane is equally bounded).
+        assert_eq!(
+            policy("POST", "/api/skills"),
+            BodyPolicy::Capped(crate::user_skills::ADD_BODY_CAP_BYTES)
+        );
+        assert_eq!(crate::user_skills::ADD_BODY_CAP_BYTES, 64 * 1024);
+        // The remove carries no body at all.
+        assert_eq!(
+            policy("DELETE", "/api/skills/some-user-skill"),
+            BodyPolicy::None
         );
         // The update-lane actions carry at most a small JSON body.
         assert_eq!(

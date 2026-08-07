@@ -109,6 +109,7 @@ mod shared_view_lifecycle;
 mod skill_catalog;
 mod skill_install;
 mod skill_state;
+mod user_skills;
 mod usage_rail;
 pub(crate) use intendant_core::skills;
 mod sub_agent;

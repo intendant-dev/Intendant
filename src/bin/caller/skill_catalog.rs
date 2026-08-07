@@ -2,24 +2,28 @@
 //! (tunnel twin `api_skills_list`) serves.
 //!
 //! Registry-driven by construction — rows come from
-//! [`crate::builtin_skills::BUILTIN_SKILLS`] and the payloads of
-//! [`crate::plugin_registry::BUNDLED_PLUGINS`], never from enumerating the
-//! installed roots: on-disk directories the registries do not know
-//! (user-owned copies, dev-tier symlinks) are structurally out of frame,
-//! exactly as they are for the plugin catalog. Per-root install facts are
-//! per-entry reads ([`crate::skill_install::skill_install_status_in`]).
-//! Everything the dashboard renders derives from this body; the frontend
-//! holds no skill vocabulary of its own.
+//! [`crate::builtin_skills::BUILTIN_SKILLS`], the payloads of
+//! [`crate::plugin_registry::BUNDLED_PLUGINS`], and the user-skill
+//! registry ([`crate::skill_state`] records over the
+//! [`crate::user_skills`] library), never from enumerating the installed
+//! roots: on-disk directories the registries do not know (user-owned
+//! copies, dev-tier symlinks) are structurally out of frame, exactly as
+//! they are for the plugin catalog. Per-root install facts are per-entry
+//! reads ([`crate::skill_install::skill_install_status_in`]). Everything
+//! the dashboard renders derives from this body; the frontend holds no
+//! skill vocabulary of its own.
 //!
 //! Each row's `lifecycle` body (S3) is derived by
 //! [`crate::skill_state::skill_lifecycle_json`] — the SAME classification
 //! the toggle mutation gates on — so a row's toggle availability and the
-//! daemon's accept/refuse can never skew, and a deactivated row carries
-//! the flip's gate-resolved attribution for the dashboard to render.
+//! daemon's accept/refuse can never skew; a deactivated row carries the
+//! flip's gate-resolved attribution, and a user row the add's (plus the
+//! recorded sha256 and the `removable` door — ruling R3).
 
 use std::path::Path;
 
 use crate::builtin_skills::BuiltinSkill;
+use crate::skill_state::UserSkillRecord;
 
 /// One catalog row: identity, kind, provenance, ambient description,
 /// trust-posture line (derived from provenance, never free text),
@@ -33,6 +37,7 @@ fn skill_row_json(
     plugin: Option<&'static crate::plugin_registry::BundledPlugin>,
     skill: &'static BuiltinSkill,
     disabled: &std::collections::BTreeMap<String, crate::skill_state::DisabledRecord>,
+    user: &[UserSkillRecord],
     home: &Path,
 ) -> serde_json::Value {
     let description = intendant_core::skills::parse_skill_md(skill.skill_md, Path::new(skill.name))
@@ -58,7 +63,7 @@ fn skill_row_json(
         "description": description,
         "trust_posture": trust_posture,
         "roots": roots,
-        "lifecycle": crate::skill_state::skill_lifecycle_json(skill.name, disabled),
+        "lifecycle": crate::skill_state::skill_lifecycle_json(skill.name, disabled, user),
     });
     if let Some(plugin) = plugin {
         row["plugin_id"] = serde_json::json!(plugin.id);
@@ -66,16 +71,61 @@ fn skill_row_json(
     row
 }
 
+/// One dashboard-added user skill's catalog row (S4): provenance `user`,
+/// the library's own description, an owner-added trust-posture line, the
+/// per-root install facts computed against the CURRENT library bytes,
+/// and a `library` verification status (`ok`/`stale`/`missing`) so a
+/// drifted copy — excluded fail-closed from materialization — is visible
+/// instead of a mystery. Attribution + sha256 ride the lifecycle body.
+fn user_skill_row_json(
+    record: &UserSkillRecord,
+    disabled: &std::collections::BTreeMap<String, crate::skill_state::DisabledRecord>,
+    user: &[UserSkillRecord],
+    state_root: &Path,
+    home: &Path,
+) -> serde_json::Value {
+    let skill_md =
+        crate::user_skills::user_skill_library_bytes_in(state_root, &record.name).unwrap_or_default();
+    let description = intendant_core::skills::parse_skill_md(&skill_md, Path::new(record.name.as_str()))
+        .map(|(config, _)| config.description)
+        .unwrap_or_default();
+    let payload = crate::skill_install::SkillPayloadRef {
+        name: &record.name,
+        skill_md: &skill_md,
+        support_files: &[],
+    };
+    let roots: serde_json::Map<String, serde_json::Value> =
+        crate::skill_install::skill_install_status_in(home, payload)
+            .into_iter()
+            .map(|(root, status)| (root.to_string(), serde_json::json!(status)))
+            .collect();
+    serde_json::json!({
+        "name": record.name,
+        "kind": "skill",
+        "provenance": "user",
+        "description": description,
+        "trust_posture": "Owner-added instructions, attributed on this row; installed \
+                          machine-wide for every backend until deactivated or removed here.",
+        "roots": roots,
+        "library": crate::user_skills::user_library_status_in(state_root, record),
+        "lifecycle": crate::skill_state::skill_lifecycle_json(&record.name, disabled, user),
+    })
+}
+
 /// The full catalog as one JSON body: every skill the daemon manages, one
 /// row each — builtins in table order, then every bundled plugin's
 /// payloads in registry order (listed whether or not the plugin is
 /// currently enabled: the row's install facts and its plugin card carry
-/// the live state; the registry is what exists).
+/// the live state; the registry is what exists), then the user-skill
+/// registry in record order. A user record shadowed by a shipped name
+/// serves no row of its own — the shipped row is THE row (one name, one
+/// row; the orphaned record stays removable through the remove lane).
 pub(crate) fn skills_catalog_json_in(state_root: &Path, home: &Path) -> serde_json::Value {
     let disabled = crate::skill_state::disabled_skills_in(state_root);
+    let user = crate::skill_state::user_skill_records_in(state_root);
     let mut rows: Vec<serde_json::Value> = crate::builtin_skills::BUILTIN_SKILLS
         .iter()
-        .map(|skill| skill_row_json("builtin".to_string(), None, skill, &disabled, home))
+        .map(|skill| skill_row_json("builtin".to_string(), None, skill, &disabled, &user, home))
         .collect();
     for plugin in crate::plugin_registry::BUNDLED_PLUGINS {
         for skill in plugin.skills {
@@ -84,29 +134,40 @@ pub(crate) fn skills_catalog_json_in(state_root: &Path, home: &Path) -> serde_js
                 Some(plugin),
                 skill,
                 &disabled,
+                &user,
                 home,
             ));
+        }
+    }
+    for record in &user {
+        if matches!(
+            crate::skill_state::skill_lifecycle_with(&record.name, &user),
+            crate::skill_state::SkillLifecycle::User(_)
+        ) {
+            rows.push(user_skill_row_json(record, &disabled, &user, state_root, home));
         }
     }
     serde_json::json!({ "skills": rows })
 }
 
 /// One skill's catalog row (the same shape the list serves), or `None`
-/// for a name the registries do not know. The toggle handler re-derives
-/// the flipped row from this so its response reflects what the installer
-/// actually did.
+/// for a name the registries do not know. The mutation handlers re-derive
+/// the changed row from this so their responses reflect what the
+/// installer actually did.
 pub(crate) fn skill_entry_json_in(
     state_root: &Path,
     home: &Path,
     name: &str,
 ) -> Option<serde_json::Value> {
     let disabled = crate::skill_state::disabled_skills_in(state_root);
-    match crate::skill_state::skill_lifecycle(name) {
+    let user = crate::skill_state::user_skill_records_in(state_root);
+    match crate::skill_state::skill_lifecycle_with(name, &user) {
         crate::skill_state::SkillLifecycle::Builtin(skill) => Some(skill_row_json(
             "builtin".to_string(),
             None,
             skill,
             &disabled,
+            &user,
             home,
         )),
         crate::skill_state::SkillLifecycle::PluginManaged(plugin) => {
@@ -116,9 +177,13 @@ pub(crate) fn skill_entry_json_in(
                 Some(plugin),
                 skill,
                 &disabled,
+                &user,
                 home,
             ))
         }
+        crate::skill_state::SkillLifecycle::User(record) => Some(user_skill_row_json(
+            &record, &disabled, &user, state_root, home,
+        )),
         crate::skill_state::SkillLifecycle::Unknown => None,
     }
 }
@@ -140,16 +205,29 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// The S1 parity pin: the served row id set is exactly
-    /// `BUILTIN_SKILLS` ∪ the bundled plugins' payloads — nothing
-    /// enumerated from disk, nothing dropped, nothing duplicated — and
-    /// every row carries the §2a facts (kind, provenance, description,
-    /// trust posture, both install roots) plus the S3 lifecycle body in
-    /// its per-kind shape.
+    /// The S1 parity pin, S4-extended: the served row id set is exactly
+    /// `BUILTIN_SKILLS` ∪ the bundled plugins' payloads ∪ the user-skill
+    /// registry — nothing enumerated from disk, nothing dropped, nothing
+    /// duplicated — and every row carries the §2a facts (kind,
+    /// provenance, description, trust posture, both install roots) plus
+    /// the S3 lifecycle body in its per-kind shape (user rows: toggle +
+    /// removable + attribution + sha256 + library status).
     #[test]
     fn served_row_id_set_is_builtins_union_plugin_payloads() {
         let state_root = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
+        let added = crate::user_skills::add_user_skill_in(
+            state_root.path(),
+            "catalog-user-skill",
+            "---\nname: catalog-user-skill\ndescription: a user-added probe\n---\nbody\n",
+            crate::skill_state::DisabledRecord {
+                principal: Some("principal:owner".to_string()),
+                kind: Some("dashboard".to_string()),
+                at_ms: 4321,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let body = skills_catalog_json_in(state_root.path(), home.path());
         let rows = body["skills"].as_array().expect("skills array");
 
@@ -162,6 +240,7 @@ mod tests {
                 expected.insert(skill.name.to_string());
             }
         }
+        expected.insert("catalog-user-skill".to_string());
         let served: BTreeSet<String> = rows
             .iter()
             .map(|row| row["name"].as_str().expect("row name").to_string())
@@ -221,6 +300,21 @@ mod tests {
                 // no toggle here, the managing plugin named.
                 assert_eq!(row["lifecycle"]["control"], "plugin");
                 assert_eq!(row["lifecycle"]["plugin_id"], plugin_id);
+            } else if name == "catalog-user-skill" {
+                // The user kind's full row: provenance, attribution as
+                // served data (the dashboard renders, never claims),
+                // recorded sha256 (ruling R3), the removable door, and
+                // the library verification status.
+                assert_eq!(row["provenance"], "user");
+                assert_eq!(row["description"], "a user-added probe");
+                assert_eq!(row["library"], "ok");
+                assert_eq!(row["lifecycle"]["control"], "toggle");
+                assert_eq!(row["lifecycle"]["enabled"], true);
+                assert_eq!(row["lifecycle"]["removable"], true);
+                assert_eq!(row["lifecycle"]["added_by"]["principal"], "principal:owner");
+                assert_eq!(row["lifecycle"]["added_by"]["kind"], "dashboard");
+                assert_eq!(row["lifecycle"]["added_by"]["at_ms"], 4321);
+                assert_eq!(row["lifecycle"]["sha256"], added.sha256);
             } else {
                 assert_eq!(row["provenance"], "builtin");
                 assert!(
@@ -233,6 +327,25 @@ mod tests {
                 assert_eq!(row["lifecycle"]["enabled"], true);
             }
         }
+
+        // The entry derivation serves the identical user row (the
+        // mutation-response contract), and a drifted library copy
+        // surfaces as `stale` instead of silently listing as teachable.
+        let entry =
+            skill_entry_json_in(state_root.path(), home.path(), "catalog-user-skill").unwrap();
+        let listed = rows
+            .iter()
+            .find(|row| row["name"] == "catalog-user-skill")
+            .unwrap();
+        assert_eq!(&entry, listed);
+        std::fs::write(
+            crate::user_skills::user_skill_md_path_in(state_root.path(), "catalog-user-skill"),
+            "---\nname: catalog-user-skill\ndescription: edited\n---\nbody\n",
+        )
+        .unwrap();
+        let entry =
+            skill_entry_json_in(state_root.path(), home.path(), "catalog-user-skill").unwrap();
+        assert_eq!(entry["library"], "stale");
     }
 
     /// A deactivated builtin's row: enabled=false with the flip's
@@ -277,12 +390,15 @@ mod tests {
         );
     }
 
-    /// The dashboard fragment wires the S3 gestures to the daemon body
+    /// The dashboard fragment wires the S3/S4 gestures to the daemon body
     /// and nothing else: the per-row toggle rides the served lifecycle
     /// (`control === 'toggle'`), calls the twinned mutation method, and
-    /// renders the served attribution ("Disabled by …"); plugin-managed
-    /// rows keep their one door (the plugin deep-link) and grow no
-    /// second switch.
+    /// renders the served attribution ("Disabled by …" / "Added by …" +
+    /// the recorded sha256 — ruling R3); the remove door renders only
+    /// where the daemon declares `removable`; the add sheet's ONLY input
+    /// lanes are the pasted/uploaded SKILL.md bytes; plugin-managed rows
+    /// keep their one door (the plugin deep-link) and grow no second
+    /// switch.
     #[test]
     fn dashboard_fragment_wires_toggle_attribution_and_perkind_doors() {
         let fragment = include_str!("../../../static/app/ui2-plugins.js");
@@ -303,16 +419,31 @@ mod tests {
             // The plugin-managed door survives as the ONLY lane for
             // plugin rows.
             "data-skill-plugin",
+            // S4: the add sheet (paste + upload landing one body field),
+            // availability-gated so an older daemon shows no dead door.
+            "api_skill_add",
+            "skill_md",
+            "type=\"file\"",
+            // S4: the remove door, rendered from the served declaration.
+            "api_skill_remove",
+            "data-skill-remove",
+            "lc.removable",
+            // S4: the add's served attribution + byte-deep provenance.
+            "Added by",
+            "added_by",
+            "sha256",
         ] {
             assert!(
                 fragment.contains(needle),
-                "ui2-plugins.js lost the S3 needle {needle:?}"
+                "ui2-plugins.js lost the S3/S4 needle {needle:?}"
             );
         }
         let descriptor = include_str!("../../../static/app/32-daemon-api.js");
-        assert!(
-            descriptor.contains("api_skill_set_enabled"),
-            "the daemon-api facade must map the skill toggle twin"
-        );
+        for twin in ["api_skill_set_enabled", "api_skill_add", "api_skill_remove"] {
+            assert!(
+                descriptor.contains(twin),
+                "the daemon-api facade must map the {twin} twin"
+            );
+        }
     }
 }
