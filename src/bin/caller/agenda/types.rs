@@ -817,6 +817,21 @@ pub struct AgendaItem {
     /// in the fold product, never folded from ops, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) blocked_on: Option<Vec<AgendaBlockedOn>>,
+    /// Display-only serving-seam decoration (the `next_fire_ms`
+    /// pattern): the OWED-COMPLETION classification
+    /// ([`super::summary::item_owed_completion`]) — this open item's
+    /// work is fully finished (a one-shot effect ran to terminal
+    /// completion and the fired session self-reported achieved, nothing
+    /// is pending review or standing watch, no open question references
+    /// it, nothing blocks it) and only the owner's Complete tap
+    /// remains. Drives the needs-you rail's Complete class and its
+    /// badge count — one daemon-side classification, derived everywhere
+    /// else. VISIBILITY ONLY by scope: no machinery completes on it —
+    /// the tap stays the owner's. Absent-on-the-wire when false; always
+    /// `false` in the fold product, never folded from ops, never
+    /// stored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) completable: bool,
 }
 
 /// The automation claiming an open item (the `watched_by` decoration):
@@ -866,6 +881,15 @@ pub struct AgendaBlockedOn {
     /// blocker lane: the uncleared blocker's stable id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) blocker_id: Option<String>,
+    /// relies_on lane: the open target is itself in the OWED-COMPLETION
+    /// state ([`super::summary::item_owed_completion`] — finished and
+    /// awaiting the owner's Complete tap), so the dependent's blocked
+    /// chip can say so and name the tap as the unblocking gesture. The
+    /// SAME classification that drives the needs-you rail's Complete
+    /// class — derived once at the serving seam, never a second
+    /// predicate. Absent-on-the-wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) target_completable: bool,
 }
 
 /// One attributed note on an item (F2 `annotate` fold view). Attribution
@@ -1955,6 +1979,7 @@ pub(crate) fn apply_op(
                     deferred_until: None,
                     watched_by: None,
                     blocked_on: None,
+                    completable: false,
                 },
             );
             None

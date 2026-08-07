@@ -727,20 +727,24 @@ function agendaInspGatesHtml(item) {
     </div>`;
   });
   // The shared per-prerequisite judgment (ui2-agenda.js): live status
-  // on every link — the delivered-awaiting-Complete distinction, the
-  // in-flight word, and the honest out-of-window degrade (an absent
-  // target on an unblocked item is provably done, never "missing").
+  // on every link — the served finished-and-awaiting-Complete
+  // distinction, the in-flight word, the named unblocking gesture, and
+  // the honest out-of-window degrade (an absent target on an unblocked
+  // item is provably done, never "missing").
   const deps = agendaPrereqStates(item).map((p) => {
-    const go = p.kind === 'delivered'
+    const go = p.kind === 'delivered' && p.target
       ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
-          title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+          title="Opens the finished prerequisite — its Mark done (Complete) is the tap that releases this wait">Review &amp; complete ›</button>`
+      : '';
+    const remedy = p.kind === 'waiting' && p.remedy
+      ? '<span class="ag2-hint">— complete it to proceed</span>'
       : '';
     return `<div class="ag2-insp-dep${p.kind === 'delivered' ? ' delivered' : ''}">
       ${agendaChipHtml(p.status, p.tone, p.detail)}
       ${p.target
-    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
-    : `<span class="ag2-insp-deplink">waits on ${escapeHtml(p.title)}</span>`}
-      ${go}
+    ? `<a class="ag2-insp-deplink" data-open-item="${escapeHtml(p.id)}">waiting on: “${escapeHtml(p.title)}”</a>`
+    : `<span class="ag2-insp-deplink">waiting on: ${escapeHtml(p.title)}</span>`}
+      ${remedy}${go}
       <button type="button" class="ag2-x" data-remove-dep="${escapeHtml(p.id)}" title="Drop the link (the log keeps history)">×</button>
     </div>`;
   });

@@ -497,6 +497,13 @@ function agendaLensGroupsNow() {
     const st = agendaEffectState(x);
     return x.status === 'open' && st && st.kind === 'pending';
   }));
+  // OWED COMPLETIONS (owner finding #10): the daemon-served
+  // classification (`completable` — one predicate drives this class,
+  // the lens badge, and the blocked chips' target state; the client
+  // never re-derives it). Freshest finished-work first.
+  const complete = take(pool
+    .filter((x) => x.completable === true)
+    .sort((a, b) => (b.updated_ms || 0) - (a.updated_ms || 0)));
   const suspended = take(pool.filter((x) => {
     const st = agendaEffectState(x);
     return st && st.kind === 'suspended';
@@ -524,6 +531,13 @@ function agendaLensGroupsNow() {
       label: 'Approve',
       hint: 'proposed session manifests — nothing fires without you; approval binds the exact digest',
       rows: approve.map((x) => ({ item: x })),
+    });
+  }
+  if (complete.length) {
+    groups.push({
+      label: 'Complete',
+      hint: 'finished — every planned run completed and self-reported achieved; only your Complete tap remains, and anything waiting on these cards unblocks when it lands',
+      rows: complete.map((x) => ({ item: x })),
     });
   }
   if (suspended.length) {
@@ -754,6 +768,8 @@ function agendaLensGroupsArchive() {
 // Distinct items the "Needs you" lens would show — the lens badge.
 // Watched questions (an armed automation covers them — daemon-derived
 // watched_by) are machinery's inbox and never count as needing you.
+// Owed completions ride the served `completable` classification — the
+// same daemon predicate that builds the Complete rail class.
 function agendaNeedsYouCount() {
   const needs = new Set();
   (agendaItems || []).forEach((x) => {
@@ -761,6 +777,7 @@ function agendaNeedsYouCount() {
     if (x.kind === 'question' && x.status === 'open' && !x.dismissed
       && !x.watched_by) needs.add(x.id);
     if (x.status === 'open' && st && st.kind === 'pending') needs.add(x.id);
+    if (x.completable === true) needs.add(x.id);
     if (st && st.kind === 'suspended') needs.add(x.id);
     if (x.status === 'open' && x.due_ms && x.due_ms < Date.now()) needs.add(x.id);
     if (x.status === 'open' && agendaTriageInfo(x)) needs.add(x.id);
@@ -792,8 +809,8 @@ const agendaBlockedOpen = new Set();
 // The blocked chip is a BUTTON (house law: every symbol self-explains
 // on tap — no hover-only): the tip names each gate, the tap unfolds
 // the per-gate rows under the card at any depth. When every
-// unsatisfied prerequisite is delivered-and-attested the face stops
-// crying wolf: 'delivered · awaiting Complete' (sky), nothing is
+// unsatisfied prerequisite is served owed-completion the face stops
+// crying wolf: 'finished · awaiting Complete' (sky), nothing is
 // stuck — only Complete taps are missing.
 function agendaBlockedChipHtml(item) {
   const explain = agendaBlockedExplain(item);
@@ -802,17 +819,26 @@ function agendaBlockedChipHtml(item) {
     title="${escapeHtml(agendaBlockedTip(explain))}">${escapeHtml(spec.label)}</button>`;
 }
 
+// One prerequisite gate row: the linked target ("waiting on: <title>" —
+// the link opens that card's pane), its live-status chip, and its named
+// unblocking gesture — "complete it to proceed" on waits whose release
+// is the target's completion, the Review-and-complete door on targets
+// the daemon serves as finished-and-awaiting-Complete. In-flight waits
+// name no gesture: the run is already doing the work.
 function agendaBlockedPrereqRowHtml(p) {
   const chip = agendaChipHtml(p.status, p.tone,
     p.detail || 'Live status, derived at render — advisory; it gates nothing');
   const name = p.target
-    ? `<a class="ag2-blk-link" data-open-item="${escapeHtml(p.id)}">waits on “${escapeHtml(p.title)}”</a>`
-    : `<span>waits on ${escapeHtml(p.title)}</span>`;
-  const go = p.kind === 'delivered'
-    ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
-        title="Opens the delivered prerequisite — its Mark done is the tap that releases this wait">Review &amp; complete ›</button>`
+    ? `<a class="ag2-blk-link" data-open-item="${escapeHtml(p.id)}">waiting on: “${escapeHtml(p.title)}”</a>`
+    : `<span>waiting on: ${escapeHtml(p.title)}</span>`;
+  const remedy = p.kind === 'waiting' && p.remedy
+    ? '<span class="ag2-blk-hint">— complete it to proceed</span>'
     : '';
-  return `<div class="ag2-blk-row${p.kind === 'delivered' ? ' delivered' : ''}">${chip}${name}${go}</div>`;
+  const go = p.kind === 'delivered' && p.target
+    ? `<button type="button" class="ag2-btn ghost ag2-blk-go" data-open-item="${escapeHtml(p.id)}"
+        title="Opens the finished prerequisite — its Mark done (Complete) is the tap that releases this wait">Review &amp; complete ›</button>`
+    : '';
+  return `<div class="ag2-blk-row${p.kind === 'delivered' ? ' delivered' : ''}">${chip}${name}${remedy}${go}</div>`;
 }
 
 // The card's per-gate rows (replacing the old single-line first-gate
@@ -897,6 +923,14 @@ function agendaCardChips(item) {
   }
   if (agendaItemIsBlocked(item)) {
     chips.push(agendaBlockedChipHtml(item));
+  }
+  // OWED COMPLETION (served classification, finding #10 — mutually
+  // exclusive with blocked by construction): the work is fully
+  // finished; only your Complete tap remains. The status circle is the
+  // tap; dependents waiting on this card unblock when it lands.
+  if (item.status === 'open' && item.completable === true) {
+    chips.push(agendaChipHtml('finished — tap Complete', 'sky',
+      'Every planned run completed and the session self-reported achieved (not verified). Mark done — the status circle — completes it; anything waiting on this card unblocks.'));
   }
   // Tier-1 PR join chips (render-time only — never stored, never ops):
   // draft state and rename divergence come from the scanner's last

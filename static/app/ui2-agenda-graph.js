@@ -1126,6 +1126,7 @@ function agendaGraphBuild() {
       const st = agendaEffectState(x);
       const attn = x.status === 'open' && (
         agendaItemIsBlocked(x)
+        || x.completable === true
         || (x.kind === 'question' && !x.answer && !x.dismissed)
         || (st && (st.kind === 'pending' || st.kind === 'suspended'))
         || (x.due_ms && x.due_ms < now));

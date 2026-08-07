@@ -1271,15 +1271,22 @@ mod tests {
             !cards.contains("agendaChipHtml('blocked'"),
             "no surface renders the old say-nothing blocked chip"
         );
-        // The delivered derivation reads the served run + attestation
-        // truth (summary.rs serves both at list grain).
+        // The delivered judgment reads the SERVED owed-completion
+        // classification (summary.rs `item_owed_completion`, served as
+        // the target row's `completable` flag and the blocked_on
+        // causes' `target_completable`) — the old client re-derivation
+        // from run + attestation is deleted (derive-don't-mirror).
         assert!(
-            shared.contains("run.state === 'completed' && run.attestation")
-                && shared.contains("run.attestation.outcome === 'achieved'"),
-            "delivered-awaiting-Complete = completed AND self-reported achieved"
+            shared.contains("target.completable === true")
+                && shared.contains("served.target_completable === true"),
+            "delivered-awaiting-Complete reads the served classification"
         );
         assert!(
-            shared.contains("'delivered · awaiting Complete'"),
+            !shared.contains("&& run.attestation.outcome === 'achieved'"),
+            "no client-side re-derivation of the owed-completion predicate"
+        );
+        assert!(
+            shared.contains("'finished · awaiting Complete'"),
             "the all-delivered chip face names the actionable wait"
         );
         // Both the card rows and the inspector's Blocked-on section read

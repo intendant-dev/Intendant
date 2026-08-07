@@ -255,17 +255,23 @@ function agendaFullItemFor(id) {
 // Adopt a FULL item arriving outside the summary feed (the
 // `agenda_changed` event lane, op-response merges): file it in the
 // full-item cache, and shape a summary-compatible row for the list —
-// slim derivations only (counts), never predicate re-derivation. The
-// served flags (blocked/frontier/triage) carry over from the replaced
-// summary row and AGE until the next summary pull refreshes them — the
-// ruled Q4 decoration-freshness contract; a brand-new item wears no
-// flags until first summarized.
+// slim derivations only (counts), never predicate re-derivation.
+// Blocked and owed-completion arrive FRESH on every decorated full
+// copy — `blocked_on` is present exactly when the daemon judges the
+// open item blocked, and `completable` rides the DTO — so the row
+// adopts them instead of aging the replaced summary's flags. The
+// remaining served flags (frontier/triage) need the fold watermark the
+// full grain doesn't carry: they carry over and AGE until the next
+// summary pull refreshes them — the ruled Q4 decoration-freshness
+// contract; a brand-new item wears none until first summarized.
 function agendaAdoptFullItem(full) {
   agendaFullItems.set(full.id, full);
   const prior = agendaFindItem(full.id);
   const row = Object.assign({}, full, {
     annotations_count: Array.isArray(full.annotations) ? full.annotations.length : 0,
-    blocked: prior ? prior.blocked : undefined,
+    blocked: full.status === 'open'
+      && Array.isArray(full.blocked_on) && full.blocked_on.length > 0,
+    completable: full.completable === true,
     frontier: prior ? prior.frontier : undefined,
     triage: prior ? prior.triage : undefined,
   });
@@ -446,14 +452,18 @@ window.qa = Object.assign(window.qa || {}, {
   },
   // The synthetic depth × derivation matrix: fixture prerequisites in a
   // local fold (never the live store) driven through the exact renderer
-  // derivations — the delivered distinction, the fold matrix, the
-  // honest out-of-window degrade, and the chip face for each shape.
+  // derivations — the SERVED owed-completion adoption (a target reads
+  // delivered from its served `completable` flag or the dependent's
+  // served `blocked_on` cause, never a client re-derivation: the
+  // partial/unattested fixtures carry runs but no flag and stay
+  // waiting), the fold matrix, the honest out-of-window degrades, and
+  // the chip face for each shape.
   agendaBlockedVectors() {
     const fold = new Map();
     const put = (it) => fold.set(it.id, it);
     put({ id: 'P-run', title: 'running prerequisite', status: 'open',
       effects: [{ manifest: { fire_at_ms: 1 }, last_run: { state: 'started', at_ms: 1 } }] });
-    put({ id: 'P-delivered', title: 'delivered prerequisite', status: 'open',
+    put({ id: 'P-delivered', title: 'delivered prerequisite', status: 'open', completable: true,
       effects: [{ manifest: { fire_at_ms: 1 }, approval: { digest: 'd', at_ms: 1 },
         last_run: { state: 'completed', at_ms: 1, attestation: { outcome: 'achieved' } } }] });
     put({ id: 'P-partial', title: 'partially delivered prerequisite', status: 'open',
@@ -479,6 +489,10 @@ window.qa = Object.assign(window.qa || {}, {
       retired_prereq: item({ relies_on: [{ target_id: 'P-retired' }] }),
       outside_window_while_blocked: item({ relies_on: [{ target_id: '01GONE' }] }),
       outside_window_unblocked: item({ blocked: false, relies_on: [{ target_id: '01GONE' }] }),
+      outside_window_served_completable: item({
+        relies_on: [{ target_id: '01GONE2' }],
+        blocked_on: [{ cause: 'relies_on', target_id: '01GONE2',
+          title: 'archived but finished', target_status: 'open', target_completable: true }] }),
       served_flag_without_visible_gate: item({}),
     };
     return Object.fromEntries(Object.entries(cases).map(([name, fixture]) => {
@@ -628,10 +642,12 @@ function agendaObserveServerMessage(d) {
     if (document.getElementById('ui2-agenda-card') || agendaTabVisible()) agendaRefresh();
     return;
   }
+  const prior = agendaFindItem(d.item.id);
   const row = agendaAdoptFullItem(d.item);
   const at = agendaItems.findIndex((item) => item.id === d.item.id);
   if (at >= 0) agendaItems[at] = row;
   else agendaItems.push(row);
+  agendaDependentsRepull(prior, row);
   if (d.counts) agendaCounts = d.counts;
   // Track AS S3: the event names its producing op — advance the resume
   // cursor past it. max() because a delta pull may already sit ahead.
@@ -645,6 +661,34 @@ function agendaObserveServerMessage(d) {
     (id) => !(id in agendaSessions) && !agendaSessionLookupsAttempted.has(id));
   if (unresolved) agendaRefresh();
   agendaRenderAll();
+}
+
+// The live-repaint lane for DEPENDENTS (owner finding #10 family): an
+// `agenda_changed` event carries only the changed item, but that item's
+// status and owed-completion state feed OTHER rows' served verdicts —
+// a dependent's blocked chip, its Complete rail class. The since_seq
+// heal can't refresh those rows (their ops never moved), so a change
+// that can move a dependent's verdict schedules ONE coalesced full
+// summary re-pull: the whole visible list repaints from fresh served
+// flags. Whole-list by choice — per-row surgery would mean re-deriving
+// the daemon's predicates client-side, and the summary pull is the
+// blessed freshness affordance (the ruled Q4 contract).
+let agendaDepsRepullTimer = null;
+function agendaDependentsRepull(prior, next) {
+  if (!next || !Array.isArray(agendaItems)) return;
+  const moved = !prior
+    || prior.status !== next.status
+    || (prior.completable === true) !== (next.completable === true);
+  if (!moved) return;
+  const hasDependents = agendaItems.some((row) => row.id !== next.id
+    && (row.relies_on || []).some((link) => link.target_id === next.id));
+  if (!hasDependents) return;
+  if (agendaDepsRepullTimer) return;
+  agendaDepsRepullTimer = setTimeout(() => {
+    agendaDepsRepullTimer = null;
+    agendaLastFullPullAt = Date.now();
+    agendaRefresh().catch((e) => console.warn('[agenda] dependents re-pull failed', e));
+  }, 250);
 }
 
 // Every session id an item's attribution views reference (provenance,
@@ -840,18 +884,27 @@ function agendaBlockedLine(item) {
 // per-gate rows, and the inspector's Blocked-on section: each
 // `relies_on` link joined client-side against the loaded window
 // (summaries already serve `relies_on[].target_id`, uncleared
-// `blockers`, and `effects[].last_run.attestation` — no second
-// server-side join). `kind` vocabulary:
+// `blockers`, and `effects[].last_run` for the live-status garnish),
+// with the SERVED facts as the authority: the target row's
+// `completable` flag (the daemon's owed-completion classification —
+// never re-derived here) and, when the target sits outside the live
+// window, the item's own served `blocked_on` decoration (title,
+// status, completable per cause, computed against the full ledger).
+// `kind` vocabulary:
 //   'satisfied'  target done — the link no longer waits
-//   'delivered'  target open, but its effect's last run COMPLETED and
-//                the session self-reported achieved — everything ran;
-//                only the owner's Complete tap is missing (an
-//                actionable wait, distinct from in-flight work)
+//   'delivered'  target open but SERVED completable — everything ran
+//                and self-reported achieved; only the owner's Complete
+//                tap is missing (an actionable wait, distinct from
+//                in-flight work)
 //   'waiting'    target open — genuinely in flight or parked; `status`
-//                carries the live word from the effect derivation
+//                carries the live word from the effect derivation, and
+//                `remedy` marks the rows whose unblocking gesture is
+//                completing the target (in-flight rows carry none —
+//                the run is already doing the work)
 //   'retired'    target retired — the link needs review
 //   'unknown'    target outside the live window while the served
-//                verdict says blocked — id-only, degrade honestly
+//                verdict says blocked and no served cause names it —
+//                id-only, degrade honestly
 // A target absent from the window on an UNBLOCKED item is provably
 // done (the daemon's verdict is computed against the full ledger), so
 // it reads satisfied — never the old "missing — review" lie.
@@ -863,9 +916,34 @@ function agendaPrereqStates(item, findItem) {
   const blocked = item.blocked !== undefined
     ? item.blocked === true
     : ((find(item.id) || {}).blocked === true);
+  const servedCauses = Array.isArray(item.blocked_on) ? item.blocked_on : [];
+  const servedCause = (id) => servedCauses.find(
+    (c) => c.cause === 'relies_on' && c.target_id === id) || null;
   return (item.relies_on || []).map((link) => {
     const target = find(link.target_id) || null;
+    const served = servedCause(link.target_id);
     if (!target) {
+      if (served) {
+        // Outside the live window, but the served decoration names it:
+        // render the daemon's title/status/completable — never id-only
+        // when served facts exist.
+        const base = { id: link.target_id, target: null, title: served.title || link.target_id };
+        if (served.target_completable === true) {
+          return { ...base, kind: 'delivered', status: 'finished and awaiting Complete',
+            tone: 'sky',
+            detail: 'It ran to completion and self-reported achieved (not verified) — open it and Mark done (Complete) to release this wait.' };
+        }
+        if (served.target_status === 'retired') {
+          return { ...base, kind: 'retired', status: 'retired — review', tone: 'amber',
+            detail: 'A retired prerequisite never silently satisfies the link — drop it or reopen the target.' };
+        }
+        if (served.target_status === 'missing') {
+          return { ...base, kind: 'unknown', tone: 'neutral', status: 'missing from the ledger',
+            detail: 'The daemon finds no item with this id — drop the link or restore the target.' };
+        }
+        return { ...base, kind: 'waiting', status: 'still open', tone: 'neutral', remedy: true,
+          detail: 'Open beyond this live window — completing it releases this wait.' };
+      }
       const short = `${String(link.target_id).slice(0, 10)}…`;
       return blocked
         ? { id: link.target_id, target: null, title: short, kind: 'unknown',
@@ -884,18 +962,22 @@ function agendaPrereqStates(item, findItem) {
         detail: 'A retired prerequisite never silently satisfies the link — drop it or reopen the target.' };
     }
     const run = ((target.effects || [])[0] || {}).last_run || null;
-    if (run && run.state === 'completed' && run.attestation
-      && run.attestation.outcome === 'achieved') {
-      return { ...base, kind: 'delivered', status: 'delivered — awaiting Complete',
+    // OWED COMPLETION is SERVED (the daemon's one classification —
+    // derive-don't-mirror): the target row's flag, or the served cause
+    // when the row's copy predates the flag. The old client re-derivation
+    // (completed run + achieved attestation) is deleted.
+    if (target.completable === true || (served && served.target_completable === true)) {
+      return { ...base, kind: 'delivered', status: 'finished and awaiting Complete',
         tone: 'sky',
-        detail: `Ran ${agendaRelTime(run.at_ms)}, completed, self-reported achieved (not verified) — open it and Mark done to release this wait.` };
+        detail: `${run ? `Ran ${agendaRelTime(run.at_ms)}, completed, ` : 'It ran to completion and '}self-reported achieved (not verified) — open it and Mark done (Complete) to release this wait.` };
     }
     const st = agendaEffectState(target);
     let status = 'still open';
     let tone = 'neutral';
+    let inFlight = false;
     if (st) {
-      if (st.kind === 'running') { status = 'running now'; tone = 'iris'; }
-      else if (st.kind === 'ready') { status = 'fires momentarily'; tone = 'iris'; }
+      if (st.kind === 'running') { status = 'running now'; tone = 'iris'; inFlight = true; }
+      else if (st.kind === 'ready') { status = 'fires momentarily'; tone = 'iris'; inFlight = true; }
       else if (st.kind === 'waiting') status = 'waiting on its own prerequisites';
       else if (st.kind === 'watching') status = 'watching for matches';
       else if (st.kind === 'pending') { status = 'awaiting approval'; tone = 'amber'; }
@@ -909,7 +991,7 @@ function agendaPrereqStates(item, findItem) {
           ? `ran — self-reported ${run.attestation.outcome}` : 'ran — no self-report yet';
       } else if (run && run.state === 'failed') { status = 'last run failed'; tone = 'amber'; }
     }
-    return { ...base, kind: 'waiting', status, tone };
+    return { ...base, kind: 'waiting', status, tone, remedy: !inFlight };
   });
 }
 
@@ -940,22 +1022,24 @@ function agendaBlockedExplain(item, findItem) {
 }
 
 // The chip face: 'blocked' (rose) — or, when every unsatisfied
-// prerequisite is delivered-and-attested and no blocker is stated,
-// 'delivered · awaiting Complete' (sky, the achieved self-report hue —
+// prerequisite is served owed-completion and no blocker is stated,
+// 'finished · awaiting Complete' (sky, the achieved self-report hue —
 // never transport green; the 'answered · awaiting pickup' twin). Pure
 // spec; the cards render it.
 function agendaBlockedChipSpec(explain) {
   return explain.allDelivered
-    ? { label: 'delivered · awaiting Complete', tone: 'sky' }
+    ? { label: 'finished · awaiting Complete', tone: 'sky' }
     : { label: 'blocked', tone: 'rose' };
 }
 
 // The chip's hover lane (the tap reveal is the primary — no
-// hover-only): one line per gate, every depth.
+// hover-only): one line per gate, every depth, each naming its
+// unblocking gesture where one exists.
 function agendaBlockedTip(explain) {
   const lines = [];
   explain.blockers.forEach((b) => lines.push(`waiting on: “${b.criterion}”`));
-  explain.prereqs.forEach((p) => lines.push(`waits on “${p.title}” — ${p.status}`));
+  explain.prereqs.forEach((p) => lines.push(
+    `waiting on: “${p.title}” — ${p.status}${p.remedy ? ' — complete it to proceed' : ''}`));
   if (explain.unexplained) {
     lines.push('The daemon judges this blocked, but no gate is visible in this window — it may have just changed.');
   }

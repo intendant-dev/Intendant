@@ -217,19 +217,42 @@ ruling below) — never stored in the ledger, and never a notification
 trigger: the reminder lane remains the only thing that fires. The chip
 explains itself at every depth: its tip and its tap name each gate —
 every uncleared blocker, every unsatisfied prerequisite by title with
-live status — and each named prerequisite is a door to its own card.
-A prerequisite that is still open but whose scheduled session's last
-run **completed with a self-reported `achieved`** renders as the
-actionable wait it is — "delivered · awaiting Complete" (sky, the
+live status ("waiting on: *title*") and, where the release is the
+target's completion, the named gesture ("complete it to proceed") —
+and each named prerequisite is a door to its own card. A prerequisite
+the daemon serves as **owed completion** (below) renders as the
+actionable wait it is — "finished and awaiting Complete" (sky, the
 self-report hue) — distinct from genuinely in-flight work; calm depth
 folds only the in-flight waits (a chip tap unfolds them), while stated
-blockers and delivered waits always render. All of it stays advisory:
+blockers and finished waits always render. All of it stays advisory:
 blocked gates neither approval nor firing. Beside the flag, both
 serving grains carry the **`blocked_on` decoration**: the named causes
 (each uncleared blocker's criterion; each unsatisfied prerequisite's
-live title and status), stamped at the serving seam beside the effects'
-fireability verdicts like `next_fire_ms`, never folded from ops — the
-served truth the approve-surface confirms below derive from.
+live title and status, plus `target_completable` when the open target
+itself only awaits the owner's tap), stamped at the serving seam beside
+the effects' fireability verdicts like `next_fire_ms`, never folded
+from ops — the served truth the approve-surface confirms below derive
+from.
+
+**Owed completions surface on the needs-you rail.** The complement of
+blocked (owner finding #10): a card whose work fully finished but whose
+Complete tap never landed used to sit invisible — approvals and
+questions surfaced, finished-awaiting-Complete never did — while its
+`relies_on` dependents stayed silently blocked. The daemon now serves
+one **`completable`** classification (summary flag + full-grain
+decoration, `item_owed_completion` at the serving seam): the item is
+open and not a question, some live effect's latest occurrence reached
+terminal `completed` with a self-reported `achieved` (unattested or
+partial never counts), every effect is settled (nothing pending review,
+nothing standing — a recurrence or trigger manifest is a live
+automation, never "finished" — nothing armed or in flight), no open
+question references it over the `relates_to` union (the steward-gate
+shape), and nothing blocks it. Those cards join the dashboard's
+needs-you lens as their own **Complete** class ("finished — tap
+Complete"), count into the lens badge, and mark dependents' blocked
+chips — one served classification behind all three, never a client
+re-derivation. Visibility only, by scope: the Complete tap stays the
+owner's; no machinery completes on the verdict.
 
 **Blocked never gates approval — advisory plus confirm.** Blocked-state
 is bookkeeping that lags reality in both directions (a finished
