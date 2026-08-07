@@ -670,9 +670,26 @@ window.focusSettingsApiKeys = focusSettingsApiKeys;
 // coding-agent CLI into its subscription account is a first-class
 // alternative to adding a provider API key. Bridged onto window like
 // focusSettingsApiKeys, for inline handlers and the validate harness.
-function focusVaultAgentSignin() {
+// `backendId` (optional) is the daemon's canonical backend id ("codex",
+// "claude-code", "kimi") — resolved to the matching sign-in card via
+// each provider spec's own `sessionKind` (derive-don't-mirror; the
+// signed-out attention state passes `authFailureBackend` through here).
+// Unknown/absent ids keep the section-head landing.
+function focusVaultAgentSignin(backendId) {
   routeTo('vault');
   requestAnimationFrame(() => {
+    // Resolve inside the rAF: the pane is display:none until switchTab
+    // runs, and the cards rebuild on every render.
+    if (backendId && typeof AGENT_SIGNIN_PROVIDERS === 'object') {
+      const provider = Object.keys(AGENT_SIGNIN_PROVIDERS).find(
+        key => AGENT_SIGNIN_PROVIDERS[key]?.sessionKind === backendId,
+      );
+      const card = provider && document.getElementById(`agent-signin-card-${provider}`);
+      if (card?.scrollIntoView) {
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+    }
     // Scroll to the section head so its title stays visible (the head is
     // the sign-in mount's previous sibling after the ui-v2 adoption).
     const section = document.getElementById('agent-signin-section');

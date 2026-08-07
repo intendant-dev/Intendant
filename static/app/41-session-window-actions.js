@@ -572,6 +572,12 @@ function sessionWindowPhaseDisplayLabel(sessionId, phase) {
         const died = sessionDiedTasksPillLabel(act);
         if (died) return died;
       }
+      // The classified auth failure: "Signed out" instead of a bare
+      // "Idle" — the Vault sign-in remedy is one tap away on the chip.
+      if (typeof sessionSignedOutPillLabel === 'function') {
+        const signedOut = sessionSignedOutPillLabel(act);
+        if (signedOut) return signedOut;
+      }
     }
   }
   if (isAgentActivePhase(p) && canDerive) {

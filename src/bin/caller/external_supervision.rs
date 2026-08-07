@@ -1951,7 +1951,94 @@ pub(crate) fn died_tasks_attention_activity(
         background_tasks: Vec::new(),
         died_background_tasks,
         died_tasks_cause: Some(cause.to_string()),
+        auth_failure: None,
+        auth_failure_backend: None,
     }
+}
+
+/// The auth-failure attention snapshot — `died_tasks_attention_activity`'s
+/// auth twin: `Idle` is the honest machine-free state claim (this seam
+/// observed classified failure lines, not wire activity), and the auth
+/// fields are what make it an attention state on every vitals mirror.
+/// Carried across later machine publishes by
+/// `session_activity::fold_backend_auth_attention` until the backend
+/// demonstrably streams work again.
+pub(crate) fn backend_auth_failure_attention_activity(
+    copy: String,
+    backend_id: Option<String>,
+    now_epoch: u64,
+) -> crate::types::SessionActivityVitals {
+    crate::types::SessionActivityVitals {
+        state: crate::types::SessionActivityState::Idle,
+        since_epoch: now_epoch,
+        last_stream_byte_epoch: now_epoch,
+        stalled_after_seconds: None,
+        resets_at_epoch: None,
+        background_tasks: Vec::new(),
+        died_background_tasks: Vec::new(),
+        died_tasks_cause: None,
+        auth_failure: Some(copy),
+        auth_failure_backend: backend_id,
+    }
+}
+
+/// Classify-once emitter for the backend auth-failure family (the
+/// 2026-08-07T00:00Z nightly's fix): the raw 401/credential lines keep
+/// flowing to the session LOG untouched — log truth — while the
+/// user-facing surfaces get ONE named honest state ("Codex is signed out
+/// — sign in from the Vault tab"; credential-file-missing flavor when the
+/// probe can prove absence). Emits one error log row in Intendant's
+/// voice plus the sticky attention snapshot for the session chip, and
+/// latches the copy in `noticed` — the caller's per-lane dedup — so a
+/// reconnect storm classifies exactly once. Returns the latched copy for
+/// callers that also carry it into the round outcome.
+pub(crate) fn note_backend_auth_failure(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    live_session_id: &Option<String>,
+    backend: Option<&crate::external_agent::AgentBackend>,
+    display_name: &str,
+    noticed: &mut Option<String>,
+) -> String {
+    if let Some(copy) = noticed.as_ref() {
+        return copy.clone();
+    }
+    // Transport edge: the probe stats the daemon's view of the home; the
+    // classifier and copy stay pure and hermetically tested.
+    let credential_file_missing = backend
+        .and_then(|backend| {
+            crate::external_agent::backend_local_login(backend, &platform::home_dir())
+        })
+        .map(|present| !present);
+    // The copy speaks in the backend's display vocabulary ("Codex",
+    // "Claude Code"), not the wire id — `display_name` is the fallback
+    // for lanes whose source never resolved to a known backend.
+    let display_name = backend
+        .map(|backend| backend.to_string())
+        .unwrap_or_else(|| display_name.to_string());
+    let copy =
+        crate::external_agent::backend_auth_failure_copy(&display_name, credential_file_missing);
+    *noticed = Some(copy.clone());
+    slog(session_log, |l| l.error(&copy));
+    bus.send(AppEvent::LogEntry {
+        session_id: live_session_id.clone(),
+        level: "error".to_string(),
+        source: "Intendant".to_string(),
+        content: copy.clone(),
+        turn: None,
+    });
+    bus.send(AppEvent::SessionActivity {
+        session_id: live_session_id.clone(),
+        activity: backend_auth_failure_attention_activity(
+            copy.clone(),
+            backend.map(|backend| backend.as_short_str().to_string()),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ),
+    });
+    copy
 }
 
 /// The re-run OFFER a respawn lane appends to a continuation nudge it
@@ -2341,6 +2428,29 @@ pub(crate) struct FatalRoundError {
     pub(crate) raw_message: String,
 }
 
+/// Whether a REAL turn completion arriving inside the post-turn grace
+/// window supersedes a buffered fatal cause. Two shapes must leave the
+/// cause standing: the error's OWN synthesized completion (Claude Code
+/// restates the fatal result text as `TurnCompleted`, one wire line —
+/// the 2026-07-29 specimens), and a completion that landed NOTHING (no
+/// message text, zero completed turns) — the backend giving the turn up,
+/// not recovering from it. The codex 401 reconnect storm is the second
+/// shape live: the app-server exhausts its retries and emits a plain
+/// empty `turn/completed`, which used to wash out the fatal and end the
+/// round "Round 1 complete (0 turns)" — a success-shaped terminal over a
+/// signed-out backend (the 2026-08-07T00:00Z nightly). Real work — any
+/// message text or a completed turn — supersedes as before.
+pub(crate) fn real_completion_supersedes_fatal(
+    fatal: &FatalRoundError,
+    message: Option<&str>,
+    turns_in_round: usize,
+) -> bool {
+    let completion_is_the_error_itself = message == Some(fatal.raw_message.as_str());
+    let landed_nothing =
+        turns_in_round == 0 && message.is_none_or(|message| message.trim().is_empty());
+    !completion_is_the_error_itself && !landed_nothing
+}
+
 /// First line of a (possibly multi-line, JSON-bearing) backend error,
 /// truncated for one-row announcements. The full cause is already in the
 /// session log as the drain's own error row.
@@ -2547,6 +2657,43 @@ pub(crate) fn shared_codex_config_from_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The grace-window supersede rule: which REAL turn completions wash
+    /// out a buffered fatal cause. The two keep-the-cause shapes are the
+    /// CC error echo (same text restated as the completion) and the
+    /// landed-nothing giving-up completion (the codex 401-storm shape:
+    /// empty `turn/completed`, zero turns — previously "Round 1 complete
+    /// (0 turns)" over a signed-out backend).
+    #[test]
+    fn real_completion_supersede_rule_keeps_echoes_and_empty_giveups() {
+        let fatal = FatalRoundError {
+            reason: "Codex is signed out — sign in from the Vault tab".to_string(),
+            raw_message: "unexpected status 401 Unauthorized: Missing bearer or basic \
+                          authentication in header"
+                .to_string(),
+        };
+        // The error's own synthesized completion (CC restates the text).
+        assert!(!real_completion_supersedes_fatal(
+            &fatal,
+            Some(
+                "unexpected status 401 Unauthorized: Missing bearer or basic authentication \
+                 in header"
+            ),
+            0
+        ));
+        // The landed-nothing shapes: no message at zero turns (codex's
+        // empty giving-up completion), and a whitespace-only message.
+        assert!(!real_completion_supersedes_fatal(&fatal, None, 0));
+        assert!(!real_completion_supersedes_fatal(&fatal, Some("  "), 0));
+        // Real work supersedes: message text, or completed turns even
+        // without one (tool-only rounds report no closing message).
+        assert!(real_completion_supersedes_fatal(
+            &fatal,
+            Some("recovered and answered"),
+            0
+        ));
+        assert!(real_completion_supersedes_fatal(&fatal, None, 3));
+    }
 
     /// The park-then-die hold line: honest, greppable, and truthful with
     /// and without a carried reason.

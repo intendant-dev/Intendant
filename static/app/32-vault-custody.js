@@ -2285,6 +2285,9 @@ function agentSigninProviderCard(provider) {
   const state = agentSigninState[provider];
   const card = document.createElement('div');
   card.className = `vault-card agent-signin agent-signin-${provider}`;
+  // Deep-link anchor: the signed-out attention state's "Sign in from the
+  // Vault tab" action (focusVaultAgentSignin) scrolls to this exact card.
+  card.id = `agent-signin-card-${provider}`;
 
   const note = (text, cls = 'vault-note') => {
     const el = document.createElement('div');

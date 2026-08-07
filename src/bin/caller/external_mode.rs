@@ -819,6 +819,14 @@ pub(crate) async fn run_external_agent_mode(
     // past the bounded widening schedule the session suspends visibly
     // instead of parking again.
     let mut error_park_streak: u32 = 0;
+    // Classify-once latch for auth-shaped failure lines observed on the
+    // IDLE lane (the between-rounds twin of the drain's own per-round
+    // latch): a signed-out backend's stderr keeps arriving after the
+    // round ends — an app-server respawn re-prints its 401s — and the
+    // named honest state is published once per supervised session from
+    // this lane, not per line. The sticky vitals chip carries the state
+    // regardless; re-emission would add rows, not truth.
+    let mut idle_backend_auth_noticed: Option<String> = None;
     let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
@@ -1581,6 +1589,14 @@ pub(crate) async fn run_external_agent_mode(
                                     // tools, plan/diff updates, turn completion) may fall
                                     // through to the observe drain below.
                                     external_agent::AgentEvent::Log { level, message } => {
+                                        // Log truth first (raw line kept),
+                                        // then the auth-family
+                                        // classification — the one named
+                                        // honest state instead of letting
+                                        // an idle 401 storm speak only in
+                                        // raw stderr rows.
+                                        let auth_shaped =
+                                            external_agent::backend_auth_failure_line(&message);
                                         slog(&session_log, |l| match level.as_str() {
                                             "warn" => l.warn(&message),
                                             "error" => l.error(&message),
@@ -1596,6 +1612,16 @@ pub(crate) async fn run_external_agent_mode(
                                             content: message,
                                             turn: None,
                                         });
+                                        if auth_shaped {
+                                            note_backend_auth_failure(
+                                                &bus,
+                                                &session_log,
+                                                &drain_config.session_id,
+                                                Some(&backend),
+                                                agent.name(),
+                                                &mut idle_backend_auth_noticed,
+                                            );
+                                        }
                                     }
                                     external_agent::AgentEvent::Usage { usage } => {
                                         bus.send(AppEvent::UsageSnapshot {
@@ -1736,6 +1762,16 @@ pub(crate) async fn run_external_agent_mode(
                                             content,
                                             turn: None,
                                         });
+                                        if external_agent::backend_auth_failure_line(&message) {
+                                            note_backend_auth_failure(
+                                                &bus,
+                                                &session_log,
+                                                &drain_config.session_id,
+                                                Some(&backend),
+                                                agent.name(),
+                                                &mut idle_backend_auth_noticed,
+                                            );
+                                        }
                                     }
                                     other => {
                                         let event_targets_primary = scoped_event_targets_config(
