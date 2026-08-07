@@ -46,8 +46,9 @@ pub(crate) const BUNDLED_PLUGINS: &[BundledPlugin] = &[BundledPlugin {
     display_name: "Codex Cloud Remote Compute",
     summary: "Offload heavy platform-neutral development work (builds, broad \
               tests, lint, benchmarks, codegen) to Codex Cloud workers through \
-              the provider-neutral remote_command lane. Enabling activates a \
-              shared agent skill for every supervised backend.",
+              the provider-neutral remote-compute lane (`intendant ctl \
+              remote`). Enabling activates a shared agent skill for every \
+              session kind on this machine.",
     skills: &[BuiltinSkill {
         name: "intendant-remote-compute",
         skill_md: include_str!(

@@ -155,10 +155,19 @@ pub(crate) fn tool_allowed_for_profile(
                     | "take_screenshot"
                     | "read_screen"
                     | "execute_cu_actions"
-                    // Heavy build/test work should leave the daemon host.
-                    // This one provider-neutral job vocabulary is compact
-                    // enough to advertise to every supervised backend.
-                    | "remote_command"
+                    // remote_command deliberately does NOT ride here
+                    // (2026-08-07 ratification): its schema was the
+                    // largest single item in this bootstrap set while the
+                    // lifetime consumer count stayed near zero — context
+                    // rent, the house doctrine (prefer `intendant ctl` to
+                    // keep model context small). Supervised backends reach
+                    // the same lane, with the same session-bound identity,
+                    // through `"$INTENDANT" ctl remote …`; the daemon MCP
+                    // surface still serves the tool by name (profile
+                    // shaping never gates calls — see mcp_tool_operation's
+                    // doc), and the `intendant-remote-compute` skill is
+                    // the delivery that teaches when to offload.
+                    //
                     // The per-layer CU diagnosis for when those calls fail
                     // (grant held but an OS permission still blocking).
                     | "display_readiness"
@@ -844,39 +853,54 @@ mod tests {
         );
     }
 
+    /// The 2026-08-07 ratification: the remote-compute lane's delivery is
+    /// SKILL + `intendant ctl remote`, so the `remote_command` schema stops
+    /// riding supervised session toolsets (context rent) while the daemon
+    /// tool surface stays — ctl discovery (unprofiled tools/list) and
+    /// call-by-name keep answering, the IAM class is unchanged, and native
+    /// sessions keep their built-in tool (a native built-in is not an MCP
+    /// schema in a backend's context).
     #[test]
-    fn remote_command_is_core_provider_neutral_and_shell_gated() {
+    fn remote_command_stays_off_session_toolsets_but_on_the_daemon_surface() {
         use crate::peer::access_policy::PeerOperation;
 
+        // Every supervised-backend profile hides the schema now…
         for profile in [
-            None,
-            Some("full"),
             Some("core"),
             Some("codex-core"),
             Some("cli"),
             Some("minimal"),
+            Some("screen"),
+            Some("display"),
+            Some("managed"),
+            Some("managed-context"),
         ] {
             assert!(
-                tool_allowed_for_profile("remote_command", false, profile),
-                "remote_command must be available to every supervised-agent profile ({profile:?})"
+                !tool_allowed_for_profile("remote_command", true, profile),
+                "remote_command must stay out of supervised session toolsets ({profile:?}); \
+                 supervised backends reach the lane through `intendant ctl remote`"
             );
         }
-        assert!(!tool_allowed_for_profile(
-            "remote_command",
-            false,
-            Some("display")
-        ));
+        // …while the unprofiled listing (the `intendant ctl tools` discovery
+        // surface) and the explicit full profile keep serving it.
+        for profile in [None, Some("full")] {
+            assert!(
+                tool_allowed_for_profile("remote_command", false, profile),
+                "remote_command must stay on the daemon surface ({profile:?}) so \
+                 `ctl tools schema remote_command` and `ctl remote` keep answering"
+            );
+        }
         assert_eq!(
             mcp_tool_operation("remote_command"),
             PeerOperation::ShellSpawn
         );
 
-        let mut core = Vec::new();
-        append_manual_http_tool_definitions(&mut core, false, Some("core"));
-        let definition = core
+        let mut unprofiled = Vec::new();
+        append_manual_http_tool_definitions(&mut unprofiled, false, None);
+        let definition = unprofiled
             .iter()
             .find(|tool| tool["name"] == "remote_command")
-            .expect("remote_command must have a core HTTP definition");
+            .expect("remote_command must keep its HTTP definition for ctl discovery");
         assert_eq!(
             definition["description"].as_str(),
             IntendantServer::remote_command_tool_attr()
@@ -884,10 +908,16 @@ mod tests {
                 .as_deref(),
             "remote_command manual HTTP description drifted from its #[tool] attribute"
         );
+        let mut core = Vec::new();
+        append_manual_http_tool_definitions(&mut core, true, Some("core"));
+        assert!(
+            !core.iter().any(|tool| tool["name"] == "remote_command"),
+            "the core profile's tools/list must not carry the remote_command schema"
+        );
         let native = crate::tools::all_tools()
             .into_iter()
             .find(|tool| tool.name == "remote_command")
-            .expect("native agents must receive remote_command");
+            .expect("native sessions keep the built-in remote_command tool");
         assert_eq!(
             Some(native.description.as_str()),
             IntendantServer::remote_command_tool_attr()

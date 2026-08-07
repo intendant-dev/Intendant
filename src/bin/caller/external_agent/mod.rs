@@ -459,12 +459,16 @@ pub(crate) fn backend_auth_failure_line(line: &str) -> bool {
     //   the 2026-08-07T00:00Z nightly, wss://…/v1/responses reconnect
     //   storm ending "Round 1 complete (0 turns)").
     // - codex CLI login status: "Not logged in".
+    // - codex CLI cloud-tasks refusal: "Not signed in. Please run 'codex
+    //   login'" (specimen: the 2026-08-06 remote_command acquisition
+    //   failure — job remote-83075e26 — after the boot lease sweep).
     // - Claude Code signed-out/expired: "Invalid API key · Please run
     //   /login", "OAuth token has expired", and the Anthropic API's
     //   "authentication_error" type.
     lowered.contains("401 unauthorized")
         || lowered.contains("missing bearer")
         || lowered.contains("not logged in")
+        || lowered.contains("not signed in")
         || lowered.contains("please run /login")
         || lowered.contains("oauth token has expired")
         || lowered.contains("invalid api key")
@@ -2708,6 +2712,12 @@ mod tests {
         ));
         // Codex login-status vocabulary.
         assert!(backend_auth_failure_line("Not logged in"));
+        // Codex cloud-tasks refusal — the remote-compute acquisition
+        // failure shape after a boot lease sweep (job remote-83075e26).
+        assert!(backend_auth_failure_line(
+            "\"codex\" exited with exit status: 1: Not signed in. Please run 'codex login' \
+             to authenticate."
+        ));
         // Claude Code signed-out/expired vocabularies.
         assert!(backend_auth_failure_line(
             "Invalid API key \u{b7} Please run /login"
