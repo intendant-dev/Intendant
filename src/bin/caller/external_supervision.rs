@@ -2010,8 +2010,14 @@ pub(crate) fn note_backend_auth_failure(
             crate::external_agent::backend_local_login(backend, &platform::home_dir())
         })
         .map(|present| !present);
+    // The copy speaks in the backend's display vocabulary ("Codex",
+    // "Claude Code"), not the wire id — `display_name` is the fallback
+    // for lanes whose source never resolved to a known backend.
+    let display_name = backend
+        .map(|backend| backend.to_string())
+        .unwrap_or_else(|| display_name.to_string());
     let copy =
-        crate::external_agent::backend_auth_failure_copy(display_name, credential_file_missing);
+        crate::external_agent::backend_auth_failure_copy(&display_name, credential_file_missing);
     *noticed = Some(copy.clone());
     slog(session_log, |l| l.error(&copy));
     bus.send(AppEvent::LogEntry {

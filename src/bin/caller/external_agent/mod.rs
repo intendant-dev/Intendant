@@ -3078,6 +3078,40 @@ mod tests {
         }
     }
 
+    /// The classified auth-failure surface, daemon → dashboard: the wire
+    /// fields this module's classifier feeds (`authFailure` /
+    /// `authFailureBackend` via the activity attention), the derived
+    /// `signed-out` display state, and the Vault routing — the per-card
+    /// deep-link anchor plus the `focusVaultAgentSignin(backendId)`
+    /// resolver that maps a canonical backend id to its sign-in card
+    /// through each provider spec's own `sessionKind` (derive-don't-
+    /// mirror). A bundle that loses any of these strands the named
+    /// state or dead-ends its button.
+    #[test]
+    fn spa_signed_out_state_routes_to_the_vault_signin_card() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // The derive + display state.
+            "activity.authFailure",
+            "activity.authFailureBackend",
+            "'signed-out'",
+            "⚠ Signed out",
+            // The one-tap remedy on the chip.
+            "label: 'Sign in from the Vault tab'",
+            "focusVaultAgentSignin(v.authBackend",
+            // The routing: backend id → provider card via sessionKind,
+            // and the per-card anchor the resolver scrolls to.
+            "function focusVaultAgentSignin(backendId)",
+            ".sessionKind === backendId",
+            "agent-signin-card-${provider}",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the signed-out state wiring: {needle}"
+            );
+        }
+    }
+
     #[test]
     fn canonical_thread_ids_match_backend_capabilities() {
         assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));

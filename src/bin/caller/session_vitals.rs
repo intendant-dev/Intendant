@@ -4872,6 +4872,10 @@ mod tests {
             "stalledAfterSeconds",
             "effort",
             "backgroundTasks",
+            // The classified backend auth-failure attention (the named
+            // "signed out — sign in from the Vault tab" state).
+            "authFailure",
+            "authFailureBackend",
             "model",
             "permissionMode",
             "permissionKind",
@@ -4902,7 +4906,8 @@ mod tests {
             );
         }
         // The wire spellings of the activity states the catalog renders —
-        // and the derived-only `stalled` — must all be explained.
+        // and the derived-only `stalled` / `died-tasks` / `signed-out` —
+        // must all be explained.
         for state in [
             "reasoning",
             "responding",
@@ -4911,6 +4916,8 @@ mod tests {
             "parked-on-tasks",
             "rate-limited",
             "stalled",
+            "died-tasks",
+            "signed-out",
         ] {
             assert!(
                 catalog.contains(state),
