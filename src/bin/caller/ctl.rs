@@ -2267,21 +2267,7 @@ async fn run_agenda(
             print_tool_response(response, config, None)?;
         }
         "schedule" => {
-            let mut value_flags = vec![
-                "--goal",
-                "--at",
-                "--every",
-                "--until",
-                "--max-occurrences",
-                "--suspend-after",
-                "--on-item-match",
-                "--project",
-                "--binding-ref",
-                "--source",
-            ];
-            value_flags.extend(AGENDA_LAUNCH_FLAGS);
-            let args =
-                parse_command_args(&raw[1..], &value_flags, &["--orchestrate", "--on-unblock"])?;
+            let args = agenda_schedule_parse(&raw[1..])?;
             let id = agenda_resolve_id(
                 client,
                 config,
@@ -2289,121 +2275,8 @@ async fn run_agenda(
                 "agenda schedule requires an item id (a unique prefix is enough)",
             )
             .await?;
-            let goal = args
-                .one("--goal")
-                .map(str::trim)
-                .filter(|g| !g.is_empty())
-                .ok_or_else(|| "agenda schedule requires --goal TEXT".to_string())?;
-            // Event triggers (Track T): fire on state, not at an instant.
-            let trigger = match (args.has("--on-unblock"), args.one("--on-item-match")) {
-                (true, Some(_)) => {
-                    return Err("pass --on-unblock OR --on-item-match, not both".to_string())
-                }
-                (true, None) => Some(serde_json::json!({ "kind": "on_unblock" })),
-                (false, Some(spec)) => {
-                    let (kind, tags) = spec.split_once(':').ok_or_else(|| {
-                        "--on-item-match takes KIND:TAG[,TAG...] (e.g. question:gate)".to_string()
-                    })?;
-                    let tags: Vec<Value> = tags
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|tag| !tag.is_empty())
-                        .map(|tag| Value::String(tag.to_string()))
-                        .collect();
-                    Some(serde_json::json!({
-                        "kind": "on_item_match",
-                        "item_kind": kind.trim(),
-                        "tags": tags,
-                    }))
-                }
-                (false, None) => None,
-            };
-            if trigger.is_some() && args.one("--every").is_some() {
-                return Err(
-                    "a manifest is cadenced OR triggered: pass --every or a trigger flag, \
-                     not both"
-                        .to_string(),
-                );
-            }
-            let fire_at_ms = match args.one("--at") {
-                Some(at) => parse_due_ms(at)?,
-                // A triggered manifest's fire_at_ms is the ARM FLOOR —
-                // omitted means armed on approval.
-                None if trigger.is_some() => std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|err| err.to_string())?
-                    .as_millis() as u64,
-                None => return Err("agenda schedule requires --at WHEN".to_string()),
-            };
-            let mut map = Map::new();
-            map.insert(
-                "op".to_string(),
-                Value::String("propose_effect".to_string()),
-            );
-            map.insert("id".to_string(), Value::String(id));
-            map.insert("goal".to_string(), Value::String(goal.to_string()));
-            map.insert("fire_at_ms".to_string(), Value::from(fire_at_ms));
-            if args.has("--orchestrate") {
-                map.insert("orchestrate".to_string(), Value::Bool(true));
-            }
-            // Standing cadence (G3-pre): declared INSIDE the digest-bound
-            // manifest, so one approval covers the series.
-            if let Some(every) = args.one("--every") {
-                let mut rec = Map::new();
-                rec.insert(
-                    "every_ms".to_string(),
-                    Value::from(parse_duration_ms(every)?),
-                );
-                if let Some(until) = args.one("--until") {
-                    rec.insert("until_ms".to_string(), Value::from(parse_due_ms(until)?));
-                }
-                if let Some(max) = args.one("--max-occurrences") {
-                    let max: u32 = max
-                        .parse()
-                        .map_err(|_| format!("--max-occurrences {max:?} is not a number"))?;
-                    rec.insert("max_occurrences".to_string(), Value::from(max));
-                }
-                if let Some(n) = args.one("--suspend-after") {
-                    let n: u32 = n
-                        .parse()
-                        .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
-                    rec.insert("suspend_after_failures".to_string(), Value::from(n));
-                }
-                map.insert("recurrence".to_string(), Value::Object(rec));
-            } else if args.one("--until").is_some()
-                || args.one("--max-occurrences").is_some()
-                || args.one("--suspend-after").is_some()
-            {
-                return Err(
-                    "--until/--max-occurrences/--suspend-after describe a standing cadence: \
-                     pass --every too"
-                        .to_string(),
-                );
-            }
-            let triggered = trigger.is_some();
-            if let Some(trigger) = trigger {
-                map.insert("trigger".to_string(), trigger);
-            }
-            // Explicit project pin (T3c): digest-bound on the manifest,
-            // so the approval covers WHERE the sessions run.
-            insert_string(&mut map, "project_root", args.one("--project"));
-            // Sealed refs: hash each --binding-ref at propose time — the
-            // pin states what THIS process read; the daemon verifies its
-            // own view at intake and re-verifies at every fire, so the
-            // approval digest covers the referenced content, not just
-            // the goal text.
-            let binding_refs = args
-                .all("--binding-ref")
-                .map(binding_ref_propose_value)
-                .collect::<Result<Vec<Value>, String>>()?;
-            if !binding_refs.is_empty() {
-                map.insert("binding_refs".to_string(), Value::Array(binding_refs));
-            }
-            insert_string(&mut map, "source", args.one("--source"));
-            // Executor pins (Track AU): the same launch vocabulary the
-            // start-now sheet records, digest-bound on the standing
-            // manifest — the owner approves WHO runs the goal.
-            insert_agenda_launch_config(&mut map, &args)?;
+            let map = agenda_schedule_propose_map(id, &args)?;
+            let triggered = map.contains_key("trigger");
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             let proposed_item = agenda_response_item(&response);
             print_tool_response(response, config, None)?;
@@ -3859,6 +3732,165 @@ fn build_dial_object(args: &CommandArgs) -> Result<Option<Value>, String> {
         return Ok(None);
     }
     Ok(Some(Value::Object(dial)))
+}
+
+/// Parse the `agenda schedule` argv — the verb's whole flag vocabulary
+/// in one place, so the flag→op tests exercise exactly the wiring the
+/// command uses.
+fn agenda_schedule_parse(raw: &[String]) -> Result<CommandArgs, String> {
+    let mut value_flags = vec![
+        "--goal",
+        "--at",
+        "--every",
+        "--until",
+        "--max-occurrences",
+        "--suspend-after",
+        "--on-item-match",
+        "--project",
+        "--binding-ref",
+        "--source",
+    ];
+    value_flags.extend(AGENDA_LAUNCH_FLAGS);
+    parse_command_args(
+        raw,
+        &value_flags,
+        &["--orchestrate", "--interactive", "--on-unblock"],
+    )
+}
+
+/// Build the `propose_effect` op body from the parsed `agenda schedule`
+/// flags — the flag→op mapping, extracted so the tests pin it. Only
+/// ctl-syntax contradictions (flag shapes, this-or-that flags that can't
+/// both serialize) are refused here; the daemon's intake owns the
+/// manifest grammar (cadence bounds, cadence-vs-trigger exclusivity,
+/// fireability) and its named refusals surface verbatim.
+fn agenda_schedule_propose_map(
+    id: String,
+    args: &CommandArgs,
+) -> Result<Map<String, Value>, String> {
+    let goal = args
+        .one("--goal")
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| "agenda schedule requires --goal TEXT".to_string())?;
+    // Event triggers (Track T): fire on state, not at an instant.
+    let trigger = match (args.has("--on-unblock"), args.one("--on-item-match")) {
+        (true, Some(_)) => {
+            return Err("pass --on-unblock OR --on-item-match, not both".to_string());
+        }
+        (true, None) => Some(serde_json::json!({ "kind": "on_unblock" })),
+        (false, Some(spec)) => {
+            let (kind, tags) = spec.split_once(':').ok_or_else(|| {
+                "--on-item-match takes KIND:TAG[,TAG...] (e.g. question:gate)".to_string()
+            })?;
+            let tags: Vec<Value> = tags
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| Value::String(tag.to_string()))
+                .collect();
+            Some(serde_json::json!({
+                "kind": "on_item_match",
+                "item_kind": kind.trim(),
+                "tags": tags,
+            }))
+        }
+        (false, None) => None,
+    };
+    if trigger.is_some() && args.one("--every").is_some() {
+        return Err(
+            "a manifest is cadenced OR triggered: pass --every or a trigger flag, \
+             not both"
+                .to_string(),
+        );
+    }
+    let fire_at_ms = match args.one("--at") {
+        Some(at) => parse_due_ms(at)?,
+        // A triggered manifest's fire_at_ms is the ARM FLOOR —
+        // omitted means armed on approval.
+        None if trigger.is_some() => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| err.to_string())?
+            .as_millis() as u64,
+        None => return Err("agenda schedule requires --at WHEN".to_string()),
+    };
+    let mut map = Map::new();
+    map.insert(
+        "op".to_string(),
+        Value::String("propose_effect".to_string()),
+    );
+    map.insert("id".to_string(), Value::String(id));
+    map.insert("goal".to_string(), Value::String(goal.to_string()));
+    map.insert("fire_at_ms".to_string(), Value::from(fire_at_ms));
+    if args.has("--orchestrate") {
+        map.insert("orchestrate".to_string(), Value::Bool(true));
+    }
+    // Session shape (the approval-time editor's toggle, PR #664): present
+    // rides `interactive: true` — the fired session opens with the goal
+    // as the owner's message and waits for them. Absent stays absent on
+    // the wire: the daemon defaults the legacy autonomous goal run, and
+    // the manifest keeps its absent-when-false byte shape.
+    if args.has("--interactive") {
+        map.insert("interactive".to_string(), Value::Bool(true));
+    }
+    // Standing cadence (G3-pre): declared INSIDE the digest-bound
+    // manifest, so one approval covers the series.
+    if let Some(every) = args.one("--every") {
+        let mut rec = Map::new();
+        rec.insert(
+            "every_ms".to_string(),
+            Value::from(parse_duration_ms(every)?),
+        );
+        if let Some(until) = args.one("--until") {
+            rec.insert("until_ms".to_string(), Value::from(parse_due_ms(until)?));
+        }
+        if let Some(max) = args.one("--max-occurrences") {
+            let max: u32 = max
+                .parse()
+                .map_err(|_| format!("--max-occurrences {max:?} is not a number"))?;
+            rec.insert("max_occurrences".to_string(), Value::from(max));
+        }
+        if let Some(n) = args.one("--suspend-after") {
+            let n: u32 = n
+                .parse()
+                .map_err(|_| format!("--suspend-after {n:?} is not a number"))?;
+            rec.insert("suspend_after_failures".to_string(), Value::from(n));
+        }
+        map.insert("recurrence".to_string(), Value::Object(rec));
+    } else if args.one("--until").is_some()
+        || args.one("--max-occurrences").is_some()
+        || args.one("--suspend-after").is_some()
+    {
+        return Err(
+            "--until/--max-occurrences/--suspend-after describe a standing cadence: \
+             pass --every too"
+                .to_string(),
+        );
+    }
+    if let Some(trigger) = trigger {
+        map.insert("trigger".to_string(), trigger);
+    }
+    // Explicit project pin (T3c): digest-bound on the manifest,
+    // so the approval covers WHERE the sessions run.
+    insert_string(&mut map, "project_root", args.one("--project"));
+    // Sealed refs: hash each --binding-ref at propose time — the
+    // pin states what THIS process read; the daemon verifies its
+    // own view at intake and re-verifies at every fire, so the
+    // approval digest covers the referenced content, not just
+    // the goal text.
+    let binding_refs = args
+        .all("--binding-ref")
+        .map(binding_ref_propose_value)
+        .collect::<Result<Vec<Value>, String>>()?;
+    if !binding_refs.is_empty() {
+        map.insert("binding_refs".to_string(), Value::Array(binding_refs));
+    }
+    insert_string(&mut map, "source", args.one("--source"));
+    // Executor pins (Track AU): the same launch vocabulary the
+    // start-now sheet records, digest-bound on the standing
+    // manifest — the owner approves WHO runs the goal.
+    insert_agenda_launch_config(&mut map, args)?;
+    Ok(map)
 }
 
 /// Resolve the first positional as an agenda item id, accepting any
@@ -5981,7 +6013,10 @@ fn help_agenda() {
   intendant ctl agenda reopen ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda retire ID_PREFIX [--source LABEL]\n\
   intendant ctl agenda patch ID_PREFIX [--title TEXT] [--body TEXT] [--tag TAG]... [--clear-tags] [--due WHEN|--clear-due] [--source LABEL]\n\
-  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate]\n\
+  intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--interactive]\n\
+      # --interactive fires the owner-sitting shape: the session opens with the goal as the\n\
+      # owner's message and WAITS for them — e.g. --goal \"Sit with me on the release board\"\n\
+      # --at 07:30 --interactive; omitted = the autonomous goal run with write-back\n\
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
       [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
       # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor).\n\
@@ -6078,7 +6113,11 @@ Typed or not, nothing derives or fires from adjacency. `list\n\
 derived at print time.\n\
 \n\
 `schedule` proposes a session manifest on an item: at WHEN, spawn a normal\n\
-supervised session with that goal (never raw actions). --every INTERVAL\n\
+supervised session with that goal (never raw actions). --interactive pins\n\
+the session SHAPE on the digest-bound manifest: the fired session opens\n\
+with the goal as the owner's message and waits for them (omitted = the\n\
+autonomous goal run) — the approval covers HOW it runs, so flipping the\n\
+shape voids it like any other revision. --every INTERVAL\n\
 (45m/2h/7d/1w; floor 15m) declares a STANDING cadence inside the\n\
 digest-bound manifest: ONE approval covers every occurrence until revoked,\n\
 --until/--max-occurrences end the series, and --suspend-after N (default 3)\n\
@@ -6354,6 +6393,56 @@ mod tests {
             binding_ref_propose_value(&format!("file:{}", dir.path().join("missing.md").display()))
                 .unwrap_err();
         assert!(err.contains("not readable"), "{err}");
+    }
+
+    /// `schedule --interactive` → `propose_effect.interactive: true` (the
+    /// owner-sitting shape the manifest has carried since PR #664); absent
+    /// stays absent-on-the-wire, so a shape-less propose keeps the legacy
+    /// autonomous byte shape and the daemon's goal-run default applies.
+    /// The shape composes with the standing-cadence flags — the daemon's
+    /// intake is the one manifest-grammar authority and it accepts an
+    /// interactive series — so the CLI invents no exclusivity here.
+    #[test]
+    fn schedule_interactive_flag_maps_to_propose_effect_shape() {
+        let parsed = agenda_schedule_parse(&args(&[
+            "01KX",
+            "--goal",
+            "Sit with the owner on the release board",
+            "--at",
+            "1800000000000",
+            "--interactive",
+            "--every",
+            "7d",
+        ]))
+        .unwrap();
+        let map = agenda_schedule_propose_map("01KX".into(), &parsed).unwrap();
+        assert_eq!(
+            map.get("op").and_then(Value::as_str),
+            Some("propose_effect")
+        );
+        assert_eq!(map.get("interactive"), Some(&Value::Bool(true)));
+        assert!(
+            map.get("recurrence").is_some(),
+            "the shape composes with a standing cadence"
+        );
+
+        let legacy = agenda_schedule_parse(&args(&[
+            "01KX",
+            "--goal",
+            "Run the soak checks",
+            "--at",
+            "1800000000000",
+        ]))
+        .unwrap();
+        let map = agenda_schedule_propose_map("01KX".into(), &legacy).unwrap();
+        assert!(
+            !map.contains_key("interactive"),
+            "absent flag stays absent on the wire (legacy goal-run bytes)"
+        );
+        assert_eq!(
+            map.get("fire_at_ms"),
+            Some(&Value::from(1_800_000_000_000u64))
+        );
     }
 
     /// The read verbs' `/api` URL assembly: origin derived from the

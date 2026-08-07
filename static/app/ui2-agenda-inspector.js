@@ -602,7 +602,8 @@ function agendaInspEffectHtml(item) {
     if (st.kind === 'pending') {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
-      A('Edit schedule…', 'sched');
+      A('Edit plan…', 'sched', '',
+        'The full plan — goal, schedule, shape, executor, project, sealed refs. Saving mints a new digest for you to approve');
       A('Decline', 'eff-withdraw', 'danger',
         'Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {
