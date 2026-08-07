@@ -39165,7 +39165,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'fbefe0551640bc87';
+const INTENDANT_APP_BUILD = 'cdbf8e9731861dc4';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -40452,6 +40452,12 @@ const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
 let dashboardControlAutoFallback = false;
 let dashboardLegacyWsConnected = false;
 let dashboardLegacyWsEverConnected = false;
+// Deep-link TDZ rule, #access/daemons instance: fragment 48's route apply
+// runs switchTab('access') → renderDaemonsList() → renderDaemonsListTail()
+// during script evaluation, before fragment 50's top-level declarations
+// initialize. The host-options render signature (see renderDaemonsListTail
+// in 50-control-transport.js) therefore lives here with the early state.
+let daemonsListHostOptionsSig = null;
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
@@ -118075,7 +118081,9 @@ async function fetchRemoteAgentCard(baseUrl) {
 // its own signature for the list; the pickers' inputs (id/label/connected)
 // get a dedicated one so a mid-row change (e.g. version skew) doesn't churn
 // the selects.
-let daemonsListHostOptionsSig = null;
+// (daemonsListHostOptionsSig is declared in 31-init-identity-fleet.js with
+// the early state: an #access deep link reaches renderDaemonsListTail during
+// script evaluation — the deep-link TDZ rule.)
 
 function daemonsListHostOptionsSignature() {
   return JSON.stringify([
