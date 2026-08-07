@@ -77,13 +77,17 @@ pub(crate) struct GridEnvelopeJoins {
     /// Update-abstraction §3 (residual R4): session id → the draining
     /// co-homed sibling still RUNNING it, resolved once per build from
     /// presence (see [`resolve_drain_map`]). Empty when no live sibling
-    /// drains — the common case costs one directory read.
+    /// drains — the common case costs one directory read. Feeds both
+    /// the `boot.held_by` wire block and — the 01KZ8X8DWK amendment —
+    /// the era computation: a held row is never a ghost.
     drain_map: HashMap<String, DrainHold>,
 }
 
 /// One draining LIVE co-homed sibling's holdout claim on a session row —
-/// the `boot.held_by` wire block's source. Presence-derived and
-/// read-only (the F1 watershed law: this join never writes presence).
+/// the `boot.held_by` wire block's source and, per the 01KZ8X8DWK
+/// amendment, a current-era input in [`GridEnvelopeJoins::attach`].
+/// Presence-derived and read-only (the F1 watershed law: this join
+/// never writes presence).
 pub(crate) struct DrainHold {
     boot_id: String,
     port: u16,
@@ -296,15 +300,36 @@ impl GridEnvelopeJoins {
             return;
         };
         let live_wrapper = live.contains(session_id);
+        // A locally live wrapper outranks any sibling claim: double
+        // supervision never happens by design, so the local wrapper is
+        // the stronger truth and a sibling row is debris — only
+        // non-live rows consult the drain map.
+        let drain_hold = if live_wrapper {
+            None
+        } else {
+            self.drain_map.get(session_id)
+        };
         // Era: a live wrapper IS current-boot (a resumed pre-outage
-        // session belongs to the daemon driving it now); otherwise the
-        // transcript decides. `session.jsonl` mtime is rename-immune
-        // (meta rewrites don't touch it); the dir-mtime fallback for
+        // session belongs to the daemon driving it now) — and a session
+        // held by a provably live draining sibling counts the same way
+        // (card 01KZ8X8DWKS5EX69X3DZ585VWC, its gate-endorsed
+        // amendment of the slice-3 "join never touches era" doctrine):
+        // the drainer is the daemon driving it now, so the row is never
+        // a ghost however far its transcript predates this boot — the
+        // common takeover shape otherwise read a LIVE held session as
+        // preboot+ghost by arithmetic, and every ghost consumer folded
+        // it away as safe to close. The widening rides the SAME
+        // provable-liveness gate as the join itself (draining state,
+        // boot lock HELD — [`resolve_drain_map`]), so a stale sibling
+        // claim never suppresses ghost. Otherwise the transcript
+        // decides. `session.jsonl` mtime is rename-immune (meta
+        // rewrites don't touch it); the dir-mtime fallback for
         // transcript-less dirs can over-claim currency after any file
         // lands in the dir — the fail direction that never wrongly
         // claims safe-to-close.
-        let current =
-            live_wrapper || super::caches::session_activity_mtime_secs(dir) >= boot.start_secs;
+        let current = live_wrapper
+            || drain_hold.is_some()
+            || super::caches::session_activity_mtime_secs(dir) >= boot.start_secs;
         let ghost = !current && !live_wrapper;
         let mut boot_block = serde_json::json!({
             "era": if current { "current" } else { "preboot" },
@@ -323,27 +348,26 @@ impl GridEnvelopeJoins {
         // Update-abstraction §3 (residual R4): a session still RUNNING on
         // a draining live sibling carries `held_by` BESIDE the era
         // vocabulary (old SPAs ignore the field; `normalizeSessionBootEra`
-        // stays strict) — era/ghost above are untouched by this join. A
-        // locally live wrapper outranks any stale sibling claim: double
-        // supervision never happens by design, so the local wrapper is
-        // the stronger truth and the sibling row is debris.
-        if !live_wrapper {
-            if let Some(hold) = self.drain_map.get(session_id) {
-                let mut held_by = serde_json::json!({
-                    "boot_id": hold.boot_id,
-                    "port": hold.port,
-                    "version": serde_json::to_value(&hold.version)
-                        .unwrap_or(serde_json::Value::Null),
-                    "same_build": hold.same_build,
-                    "phase": hold.phase,
-                });
-                if let Some(park) = hold.limit_park.as_ref() {
-                    if let Ok(park) = serde_json::to_value(park) {
-                        held_by["limit_park"] = park;
-                    }
+        // stays two-value strict) — and since the 01KZ8X8DWK amendment
+        // the same provably live hold also feeds the era computation
+        // above (held ⇒ current/never-ghost), so the ghost-keyed
+        // dashboard folds and the "safe to close" copy can never hit a
+        // session a live drainer still runs.
+        if let Some(hold) = drain_hold {
+            let mut held_by = serde_json::json!({
+                "boot_id": hold.boot_id,
+                "port": hold.port,
+                "version": serde_json::to_value(&hold.version)
+                    .unwrap_or(serde_json::Value::Null),
+                "same_build": hold.same_build,
+                "phase": hold.phase,
+            });
+            if let Some(park) = hold.limit_park.as_ref() {
+                if let Ok(park) = serde_json::to_value(park) {
+                    held_by["limit_park"] = park;
                 }
-                boot_block["held_by"] = held_by;
             }
+            boot_block["held_by"] = held_by;
         }
         if ghost {
             match dead_row_lineage_tip(self.home.as_deref(), session_id, dir, self.lineage_epoch) {
@@ -696,9 +720,11 @@ mod tests {
     /// whose boot lock is HELD joins `boot.held_by` onto its holdout
     /// rows (port/phase/limit_park + the R-A1 build-stamp compare); a
     /// non-draining, non-live, exited, or own-pid record joins nothing;
-    /// a locally live wrapper outranks any sibling claim; and the
-    /// era/ghost vocabulary is byte-identical with and without the join
-    /// (the map only READS presence — F1 untouched).
+    /// and a locally live wrapper outranks any sibling claim. The map
+    /// only READS presence (F1 untouched); since the 01KZ8X8DWK
+    /// amendment the hold also feeds the era computation — that
+    /// invariant is pinned by `held_by_live_drainer_row_is_never_ghost`
+    /// below.
     #[test]
     fn held_by_matrix_joins_only_draining_live_siblings() {
         let sessions = tempfile::tempdir().unwrap();
@@ -749,21 +775,19 @@ mod tests {
         assert_eq!(row["boot"]["era"], "current");
         assert_eq!(row["boot"]["ghost"], false);
 
-        // Era honesty: strip held_by and the joined row is byte-identical
-        // to an un-joined attach — the field rides BESIDE the era
-        // vocabulary, never inside it.
-        let mut baseline = serde_json::json!({});
-        joins(Some(watershed), Some(&[]), None).attach(&mut baseline, "s1", &dir);
-        let mut joined = row.clone();
-        joined["boot"]
-            .as_object_mut()
-            .unwrap()
-            .remove("held_by")
-            .expect("held_by was attached");
-        assert_eq!(
-            joined, baseline,
-            "era/ghost outputs byte-identical; held_by is the only addition"
-        );
+        // RETIRED WITH CAUSE (2026-08-06): the slice-3 byte-identity pin
+        // stood here — strip held_by and the joined row had to be
+        // byte-identical to an un-joined attach ("the held_by join never
+        // touches era/ghost"). That doctrine is deliberately amended
+        // through gate 01KZ8X8DWZ's endorsement of card
+        // 01KZ8X8DWKS5EX69X3DZ585VWC: on a successor, a session a live
+        // drainer still runs read preboot+ghost — "safe to close" — by
+        // transcript arithmetic (the COMMON takeover shape), so the
+        // provably live hold now feeds the era computation on purpose.
+        // The amended invariant (held-by-live-drainer ⇒ current, never
+        // ghost) is pinned by `held_by_live_drainer_row_is_never_ghost`
+        // below, alongside the preserved fail direction: a hold that
+        // fails the liveness gate never suppresses ghost.
 
         // A session outside the holdout rows joins nothing.
         let other = attach_with(root.path(), &[], "s2");
@@ -853,6 +877,133 @@ mod tests {
         assert!(attach_with(root.path(), &[], "s1")["boot"]
             .get("held_by")
             .is_none());
+    }
+
+    /// The 01KZ8X8DWK amendment (endorsed through gate 01KZ8X8DWZ),
+    /// pinned: a session actively held by a PROVABLY LIVE draining
+    /// sibling is never a ghost, however far its transcript predates
+    /// this daemon's boot — the drainer is the daemon driving it now,
+    /// so the successor serves era:"current"/ghost:false with `held_by`
+    /// beside them (the common takeover shape: an idle parked session
+    /// across a hotswap). Every ghost consumer — the grid fold that hid
+    /// 17 of 22 held rows on a real hotswap, the "safe to close" brief
+    /// — keys on that served bit, so a held row can no longer fold away
+    /// or read safe to close. The fail direction survives the widening:
+    /// the era input rides the SAME provable-liveness gate as the join
+    /// (draining state + boot lock HELD), so a claim that fails the
+    /// gate never suppresses ghost.
+    #[test]
+    fn held_by_live_drainer_row_is_never_ghost() {
+        let sessions = tempfile::tempdir().unwrap();
+        let dir = session_dir_with_transcript(sessions.path(), "s1");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The transcript predates the successor's boot — the shape that
+        // read preboot+ghost by arithmetic before the amendment.
+        let preboot_watershed = now_secs + 3_600;
+        let foreign_pid = std::process::id() + 1;
+        let elder_build =
+            serde_json::json!({"pkg": "0.0.0", "git_sha": "elder", "built_at": "elder-ts"});
+        let attach_with = |state_root: &Path, session_id: &str| {
+            let mut row = serde_json::json!({});
+            joins(Some(preboot_watershed), Some(&[]), None)
+                .with_drain_map_from(state_root)
+                .attach(&mut row, session_id, &dir);
+            row
+        };
+
+        // Held by a draining + provably live sibling → current, never
+        // ghost, the hold beside it — a normal held_by row the grid
+        // renders (chips + affordance gating key on held_by; the fold
+        // and the safe-to-close copy key on ghost).
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-drainer",
+            foreign_pid,
+            8770,
+            "draining",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        let _drainer_lock = hold_boot_lock(root.path(), "boot-drainer");
+        let row = attach_with(root.path(), "s1");
+        assert_eq!(
+            row["boot"]["era"], "current",
+            "a held row belongs to the daemon driving it now"
+        );
+        assert_eq!(
+            row["boot"]["ghost"], false,
+            "held-by-live-drainer is never ghost — the grid must not fold it"
+        );
+        assert_eq!(
+            row["boot"]["live_wrapper"], false,
+            "the hold is a sibling claim, not a local wrapper"
+        );
+        assert_eq!(row["boot"]["held_by"]["boot_id"], "boot-drainer");
+        assert!(
+            row["boot"].get("lineage_tip").is_none(),
+            "a held row is not a dead row — the ghost-only lineage join stays off it"
+        );
+
+        // The same row WITHOUT the hold still reads preboot+ghost — the
+        // amendment widened exactly one input, not the arithmetic.
+        let bare = tempfile::tempdir().unwrap();
+        let row = attach_with(bare.path(), "s1");
+        assert_eq!(row["boot"]["era"], "preboot");
+        assert_eq!(row["boot"]["ghost"], true);
+
+        // Fail direction: the identical draining record whose boot lock
+        // is FREE (drainer dead) is a stale claim — it never suppresses
+        // ghost, and it joins no held_by.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-dead",
+            foreign_pid,
+            8771,
+            "draining",
+            elder_build.clone(),
+            parked_holdout_rows("s1"),
+        );
+        let row = attach_with(root.path(), "s1");
+        assert_eq!(
+            row["boot"]["era"], "preboot",
+            "a dead drainer's claim must not widen the era"
+        );
+        assert_eq!(
+            row["boot"]["ghost"], true,
+            "a stale sibling claim never suppresses ghost"
+        );
+        assert!(row["boot"].get("held_by").is_none());
+
+        // A live but NON-draining sibling likewise leaves the era alone.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record(
+            root.path(),
+            "boot-running",
+            foreign_pid,
+            8772,
+            "running",
+            elder_build,
+            parked_holdout_rows("s1"),
+        );
+        let _running_lock = hold_boot_lock(root.path(), "boot-running");
+        let row = attach_with(root.path(), "s1");
+        assert_eq!(row["boot"]["era"], "preboot");
+        assert_eq!(row["boot"]["ghost"], true);
+
+        // The SPA needle half of the acceptance: the safe-to-close brief
+        // stays keyed on the served ghost bit — held rows (never ghost)
+        // can therefore never wear that copy.
+        let fragment = include_str!("../../../../../static/app/39-session-windows.js");
+        assert!(
+            fragment
+                .contains("(v.ghost ? 'Ghost — pre-boot, nothing behind it; safe to close' : '')"),
+            "the safe-to-close brief must stay keyed on the served ghost bit"
+        );
     }
 
     fn envelope(
