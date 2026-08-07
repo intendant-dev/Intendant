@@ -15,8 +15,15 @@
 //   2. Skills — the unified skill catalog over GET /api/skills (tunnel
 //      twin api_skills_list): every skill the daemon manages, one row
 //      each, rendered verbatim (provenance, trust posture, per-root
-//      install facts). Plugin-provenance rows deep-link their plugin
-//      card — the plugin toggle is the one lifecycle authority.
+//      install facts). Each row's served `lifecycle` body decides its
+//      gesture — one daemon classification, no client kind table:
+//      control 'toggle' rows deactivate/re-enable via POST
+//      /api/skills/{name} (api_skill_set_enabled; the daemon flips the
+//      persisted disabled-set and sweeps BOTH install roots in-request,
+//      the response carrying the refreshed row + installer report, and a
+//      deactivated row renders the served gate-resolved attribution);
+//      control 'plugin' rows deep-link their plugin card — the plugin
+//      toggle is the one lifecycle authority, no second switch here.
 //   3. Automation templates — the served definition catalog
 //      (api_agenda_definitions) read-first: provenance/shadowed/invalid
 //      state verbatim, with Automate… opening the EXISTING agenda stamp
@@ -36,6 +43,8 @@ let pluginsLastInstall = {}; // plugin id -> install report from the last toggle
 let skillsRows = null;       // null until the catalog loads
 let skillsError = '';
 let skillsFetchInFlight = null;
+let skillsBusy = {};         // skill name -> true while a toggle runs
+let skillsLastInstall = {};  // skill name -> install report from the last toggle
 let templatesRows = null;    // null until the catalog loads
 let templatesError = '';
 let templatesFetchInFlight = null;
@@ -272,6 +281,51 @@ function skillsRevealPluginCard(pluginId) {
   setTimeout(() => card.classList.remove('plugin-card-flash'), 1800);
 }
 
+// Deactivate / re-enable one toggle-controlled skill. The daemon is the
+// wall: it flips the persisted disabled-set, sweeps both install roots
+// in the same request, and replies with the refreshed row plus the
+// installer's per-root report — or a named per-kind refusal (plugin
+// payloads refuse toward their plugin's toggle) rendered verbatim.
+async function skillSetEnabled(name, enabled) {
+  if (skillsBusy[name]) return;
+  const avail = daemonApi.availability('api_skill_set_enabled');
+  if (!avail.ok) {
+    skillsError = avail.reason === 'denied'
+      ? "This session's role can't manage skills."
+      : 'Skill management is unavailable on this daemon.';
+    renderSkillsSection();
+    return;
+  }
+  skillsBusy[name] = true;
+  renderSkillsSection();
+  try {
+    const resp = await daemonApi.request('api_skill_set_enabled', { name, enabled });
+    if (resp.ok && resp.body && resp.body.skill) {
+      skillsRows = (skillsRows || []).map(s => (s && s.name === name) ? resp.body.skill : s);
+      skillsLastInstall[name] = resp.body.install || null;
+      skillsError = '';
+    } else {
+      skillsError = (resp.body && resp.body.error) || `skill toggle failed (${resp.status})`;
+    }
+  } catch (e) {
+    skillsError = String((e && e.message) || e);
+  } finally {
+    delete skillsBusy[name];
+  }
+  renderSkillsSection();
+}
+
+// "Disabled by you · <when>" from the served gate-resolved record —
+// never a client-side claim. Plain TEXT only — callers escape.
+function skillAttributionText(rec) {
+  if (!rec || typeof rec !== 'object') return 'Disabled';
+  const who = rec.kind === 'dashboard' ? 'you'
+    : rec.kind === 'local_process' ? 'local ctl'
+      : (rec.principal || 'unknown');
+  const when = rec.at_ms ? new Date(rec.at_ms).toLocaleString() : '';
+  return `Disabled by ${who}${when ? ` · ${when}` : ''}`;
+}
+
 // Per-root install chips, the same status vocabulary the plugin cards
 // render: the daemon's strings pass through verbatim, tone only.
 function skillRootChipsHtml(roots) {
@@ -284,8 +338,25 @@ function skillRootChipsHtml(roots) {
 
 function skillRowHtml(s) {
   if (!s || !s.name) return '';
+  // The served lifecycle body is the one gesture authority: 'toggle'
+  // rows get the deactivate/re-enable button (state + attribution from
+  // the same body), 'plugin' rows keep the plugin deep-link as their
+  // only door, and anything this frontend does not know renders no
+  // gesture at all (an older daemon serves none — same outcome).
+  const lc = (s.lifecycle && typeof s.lifecycle === 'object') ? s.lifecycle : null;
+  const disabled = Boolean(lc && lc.control === 'toggle' && lc.enabled === false);
+  const busy = Boolean(skillsBusy[s.name]);
+  let gesture = '';
+  if (lc && lc.control === 'toggle') {
+    const label = busy ? 'Working…' : (disabled ? 'Re-enable' : 'Deactivate');
+    gesture = `<button type="button" class="${disabled ? 'ui-btn primary' : 'ui-btn'} skill-toggle" data-skill-toggle="${escapeHtml(s.name)}" data-enable="${disabled ? '1' : '0'}"${busy ? ' disabled' : ''}>${label}</button>`;
+  }
   const pluginLink = s.plugin_id
-    ? `<button type="button" class="ui-btn skill-plugin-link" data-skill-plugin="${escapeHtml(s.plugin_id)}">View plugin</button>`
+    ? `<button type="button" class="ui-btn skill-plugin-link" data-skill-plugin="${escapeHtml(s.plugin_id)}" title="This skill's lifecycle is its plugin's toggle — there is no per-skill switch">View plugin</button>`
+    : '';
+  const stateChip = disabled ? '<span class="ui-chip warn">deactivated</span>' : '';
+  const attribution = disabled
+    ? `<div class="skill-row-attribution">${escapeHtml(skillAttributionText(lc.disabled_by))} — the bytes stay in the binary; re-enable restores the install.</div>`
     : '';
   const desc = s.description
     ? `<div class="skill-row-desc">${escapeHtml(s.description)}</div>`
@@ -293,15 +364,20 @@ function skillRowHtml(s) {
   const trust = s.trust_posture
     ? `<div class="skill-row-trust">${escapeHtml(s.trust_posture)}</div>`
     : '';
-  return `<div class="ui-card skill-row">
+  const installNote = pluginInstallNoteHtml(skillsLastInstall[s.name]);
+  return `<div class="ui-card skill-row${disabled ? ' skill-row-deactivated' : ''}">
     <div class="skill-row-head">
       <code class="skill-row-name">${escapeHtml(s.name)}</code>
       <span class="ui-chip">${escapeHtml(String(s.provenance || ''))}</span>
+      ${stateChip}
       ${pluginLink}
+      ${gesture}
     </div>
+    ${attribution}
     ${desc}
     ${trust}
     <div class="skill-row-roots">${skillRootChipsHtml(s.roots)}</div>
+    ${installNote}
   </div>`;
 }
 
@@ -324,6 +400,9 @@ function renderSkillsSection() {
   list.innerHTML = skillsRows.map(skillRowHtml).join('');
   list.querySelectorAll('button[data-skill-plugin]').forEach(btn => {
     btn.onclick = () => skillsRevealPluginCard(btn.dataset.skillPlugin);
+  });
+  list.querySelectorAll('button[data-skill-toggle]').forEach(btn => {
+    btn.onclick = () => skillSetEnabled(btn.dataset.skillToggle, btn.dataset.enable === '1');
   });
 }
 

@@ -115,7 +115,14 @@ skill for every supervised backend and the response reports exactly what the
 installer did; disabling removes only Intendant-managed copies. Plugins here
 ship no dashboard code, hooks, or frames (a plugin ecosystem is the stated
 direction, but today's catalog is bundled first-party only) — see the
-Remote Compute plugin section of the Codex Cloud workers chapter.
+Remote Compute plugin section of the Codex Cloud workers chapter. The tab also
+renders the unified skill catalog (`GET /api/skills`): builtin rows carry a
+deactivate/re-enable toggle (`POST /api/skills/{name}`) backed by a persisted
+disabled-set the installer re-applies on every materialization pass over both
+global roots — a deactivated skill cannot resurrect on restart or rebuild, its
+row shows the gate-resolved attribution of the flip, and plugin-materialized
+rows refuse the toggle by name toward their plugin's card, the one lifecycle
+authority.
 
 On content-heavy destinations the composer can collapse to a compact pill and
 expand in place; each tab remembers its own state. Its target switcher can move
@@ -2051,6 +2058,7 @@ response omits the header.
 | GET | `/api/plugins` | StatsRead | own origin | none | Bundled-plugin catalog: enabled flags, derived lifecycle state, readiness layers, per-skill install facts |
 | POST | `/api/plugins/{plugin_id}` | Settings | own origin | ≤ 4 KiB | Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome) |
 | GET | `/api/skills` | StatsRead | own origin | none | Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts |
+| POST | `/api/skills/{name}` | Settings | own origin | ≤ 4 KiB | Deactivate or re-enable one skill via the persisted disabled-set (sweeps both roots in-request; plugin payloads refuse toward their plugin's toggle) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search), window=live|archive (+before/before_id/limit paging) — the bare call serves the full ledger forever |
 | GET | `/api/agenda/items/{item_id}` | AgendaRead | own origin | none | One agenda item, full + decorated, by id or unique prefix (+ its sessions join) |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |

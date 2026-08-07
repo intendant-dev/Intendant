@@ -17,6 +17,14 @@
 //! ([`crate::plugin_registry::active_plugin_skills`]): those materialize
 //! with `source: plugin:<id>` provenance while their plugin stays enabled
 //! and ready, and are swept like retired builtins the moment it is not.
+//!
+//! Each pass also subtracts the persisted disabled-set
+//! ([`crate::skill_state`]) from the BUILTIN half of the desired set —
+//! the set outranks the sweep: startup installs, plugin toggles, and the
+//! skill toggle all reconcile through here, so a re-materialization can
+//! never resurrect a deactivated builtin. Plugin payloads are deliberately
+//! NOT per-skill subtractable — their one lifecycle authority is the
+//! plugin's own toggle (the intake's per-kind law).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -97,17 +105,19 @@ impl GlobalInstallReport {
 /// (`~/.agents/skills/`) and Claude Code (`~/.claude/skills/`).
 fn install_global_skills(
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    disabled: &BTreeSet<String>,
 ) -> GlobalInstallReport {
     let Some(home) = dirs::home_dir() else {
         return GlobalInstallReport::default();
     };
-    install_global_skills_in(&home, plugin_skills)
+    install_global_skills_in(&home, plugin_skills, disabled)
 }
 
 /// Home-injectable core of [`install_global_skills`].
 fn install_global_skills_in(
     home: &Path,
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    disabled: &BTreeSet<String>,
 ) -> GlobalInstallReport {
     let targets = [
         ("~/.agents/skills", home.join(".agents").join("skills")),
@@ -116,7 +126,7 @@ fn install_global_skills_in(
     let roots = targets
         .into_iter()
         .map(|(display_path, target_dir)| {
-            let outcome = match install_skills_in_root(&target_dir, plugin_skills) {
+            let outcome = match install_skills_in_root(&target_dir, plugin_skills, disabled) {
                 Ok(Some(report)) => SkillRootInstallOutcome::Installed(report),
                 Ok(None) => SkillRootInstallOutcome::SkippedUserOwnedRoot,
                 Err(error) => SkillRootInstallOutcome::Failed(error.to_string()),
@@ -138,6 +148,7 @@ fn install_global_skills_in(
 fn install_skills_in_root(
     target_dir: &Path,
     plugin_skills: &[(&str, &crate::builtin_skills::BuiltinSkill)],
+    disabled: &BTreeSet<String>,
 ) -> io::Result<Option<SkillInstallReport>> {
     match std::fs::symlink_metadata(target_dir) {
         Ok(metadata) if !is_direct_directory(target_dir, &metadata) => return Ok(None),
@@ -147,9 +158,15 @@ fn install_skills_in_root(
     }
 
     let mut report = SkillInstallReport::default();
+    // The disabled-set subtracts BUILTINS only: a deactivated builtin
+    // leaves the desired set, so the sweep below removes its marked
+    // copies exactly like a retired builtin. Plugin payloads are never
+    // per-skill subtractable (their lifecycle is the plugin's toggle), so
+    // a stray or foreign entry naming one cannot sweep it from here.
     let mut desired: Vec<(&crate::builtin_skills::BuiltinSkill, String)> =
         crate::builtin_skills::BUILTIN_SKILLS
             .iter()
+            .filter(|skill| !disabled.contains(skill.name))
             .map(|skill| (skill, BUILTIN_MARKER_CONTENT.to_string()))
             .collect();
     for (plugin_id, skill) in plugin_skills {
@@ -336,16 +353,26 @@ pub(crate) fn skill_install_status_in(
 }
 
 /// Re-run the global install against the current builtin + active-plugin
-/// set. The plugin enable/disable handlers call this right after a state
-/// write so materialization and sweep land in the same request.
+/// set minus the persisted disabled-set. The plugin and skill toggle
+/// handlers call this right after a state write so materialization and
+/// sweep land in the same request; because the disabled-set is re-read
+/// here on every pass, the set outranks the sweep at every call site.
 pub(crate) fn reconcile_global_skills() -> GlobalInstallReport {
-    install_global_skills(&crate::plugin_registry::active_plugin_skills())
+    install_global_skills(
+        &crate::plugin_registry::active_plugin_skills(),
+        &crate::skill_state::disabled_skill_names(),
+    )
 }
 
 /// Startup wrapper for session-serving modes: run the install and log one
 /// line for changes, collisions, skipped roots, or failures.
 pub(crate) fn install_global_skills_at_startup() {
-    for root in install_global_skills(&crate::plugin_registry::active_plugin_skills()).roots {
+    for root in install_global_skills(
+        &crate::plugin_registry::active_plugin_skills(),
+        &crate::skill_state::disabled_skill_names(),
+    )
+    .roots
+    {
         match root.outcome {
             SkillRootInstallOutcome::Installed(report)
                 if !report.installed.is_empty()
@@ -400,7 +427,7 @@ mod tests {
             std::fs::write(stale.join(INSTALL_MARKER), "old").unwrap();
         }
 
-        let first = install_global_skills_in(home, &[]);
+        let first = install_global_skills_in(home, &[], &BTreeSet::new());
         let agents = installed_report(&first, "~/.agents/skills");
         let claude = installed_report(&first, "~/.claude/skills");
         assert_eq!(agents.installed.len(), expected.len() - 1);
@@ -448,7 +475,7 @@ mod tests {
         let (support_path, support_bytes) = with_support.support_files[0];
         std::fs::write(managed.join(support_path), "stale").unwrap();
         std::fs::write(managed.join("unexpected.txt"), "stale").unwrap();
-        let refreshed = install_global_skills_in(home, &[]);
+        let refreshed = install_global_skills_in(home, &[], &BTreeSet::new());
         assert!(installed_report(&refreshed, "~/.agents/skills")
             .installed
             .is_empty());
@@ -463,7 +490,7 @@ mod tests {
         assert!(!managed.join("unexpected.txt").exists());
 
         // The following run is a pure no-op.
-        let unchanged = install_global_skills_in(home, &[]);
+        let unchanged = install_global_skills_in(home, &[], &BTreeSet::new());
         let agents = installed_report(&unchanged, "~/.agents/skills");
         let claude = installed_report(&unchanged, "~/.claude/skills");
         assert!(agents.installed.is_empty(), "{unchanged:?}");
@@ -482,7 +509,7 @@ mod tests {
         std::fs::create_dir_all(claude_root.parent().unwrap()).unwrap();
         std::fs::write(&claude_root, "user-owned").unwrap();
 
-        let report = install_global_skills_in(home, &[]);
+        let report = install_global_skills_in(home, &[], &BTreeSet::new());
         assert!(matches!(
             outcome(&report, "~/.claude/skills"),
             SkillRootInstallOutcome::SkippedUserOwnedRoot
@@ -507,7 +534,7 @@ mod tests {
         std::fs::create_dir_all(claude_root.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&linked_target, &claude_root).unwrap();
 
-        let report = install_global_skills_in(home, &[]);
+        let report = install_global_skills_in(home, &[], &BTreeSet::new());
         assert!(matches!(
             outcome(&report, "~/.claude/skills"),
             SkillRootInstallOutcome::SkippedUserOwnedRoot
@@ -529,7 +556,7 @@ mod tests {
         let payload = [("test-plugin", &PLUGIN_SKILL)];
 
         // Active plugin: materializes in both roots with plugin provenance.
-        install_global_skills_in(home, &payload);
+        install_global_skills_in(home, &payload, &BTreeSet::new());
         for root in [
             home.join(".agents").join("skills"),
             home.join(".claude").join("skills"),
@@ -554,7 +581,7 @@ mod tests {
 
         // A repeat pass with the same payload is a pure no-op — the
         // marker-content check must not churn plugin provenance.
-        let second = install_global_skills_in(home, &payload);
+        let second = install_global_skills_in(home, &payload, &BTreeSet::new());
         assert!(installed_report(&second, "~/.claude/skills")
             .installed
             .is_empty());
@@ -574,7 +601,7 @@ mod tests {
         );
 
         // Deactivated: swept exactly like a retired builtin.
-        let swept = install_global_skills_in(home, &[]);
+        let swept = install_global_skills_in(home, &[], &BTreeSet::new());
         for display in ["~/.agents/skills", "~/.claude/skills"] {
             assert_eq!(
                 installed_report(&swept, display).removed_stale,
@@ -594,7 +621,7 @@ mod tests {
         let user_copy = home.join(".agents").join("skills").join(PLUGIN_SKILL.name);
         std::fs::create_dir_all(&user_copy).unwrap();
         std::fs::write(user_copy.join("SKILL.md"), "user copy").unwrap();
-        let materialized = install_global_skills_in(home, &payload);
+        let materialized = install_global_skills_in(home, &payload, &BTreeSet::new());
         assert_eq!(
             installed_report(&materialized, "~/.agents/skills").skipped_user_owned,
             vec![PLUGIN_SKILL.name.to_string()]
@@ -603,11 +630,141 @@ mod tests {
             skill_install_status_in(home, &PLUGIN_SKILL)[0],
             ("~/.agents/skills", "user_owned")
         );
-        install_global_skills_in(home, &[]);
+        install_global_skills_in(home, &[], &BTreeSet::new());
         assert_eq!(
             std::fs::read_to_string(user_copy.join("SKILL.md")).unwrap(),
             "user copy"
         );
+    }
+
+    /// The S3 invariant: THE SET OUTRANKS THE SWEEP. A deactivated
+    /// builtin is swept from BOTH discovery roots, stays absent across
+    /// repeat passes, and — the resurrection simulation — even a copy
+    /// re-materialized behind the daemon's back (a rebuild, an older
+    /// binary's install pass) is swept again on the next reconcile, from
+    /// every call site, because each pass re-reads the set. Re-enable
+    /// restores byte-identical installs.
+    #[test]
+    fn disabled_builtins_are_swept_from_both_roots_and_never_resurrect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let skill = crate::builtin_skills::BUILTIN_SKILLS
+            .iter()
+            .find(|skill| !skill.support_files.is_empty())
+            .expect("at least one shipped skill has support files");
+        let roots = [
+            home.join(".agents").join("skills"),
+            home.join(".claude").join("skills"),
+        ];
+
+        // Baseline install, then deactivate: swept from both roots
+        // in one pass, reported as removed.
+        install_global_skills_in(home, &[], &BTreeSet::new());
+        let disabled = BTreeSet::from([skill.name.to_string()]);
+        let swept = install_global_skills_in(home, &[], &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert_eq!(
+                installed_report(&swept, display).removed_stale,
+                vec![skill.name.to_string()]
+            );
+        }
+        assert_eq!(
+            skill_install_status_in(home, skill),
+            vec![
+                ("~/.agents/skills", "absent"),
+                ("~/.claude/skills", "absent")
+            ]
+        );
+
+        // A repeat pass with the set neither reinstalls nor re-sweeps.
+        let repeat = install_global_skills_in(home, &[], &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            let report = installed_report(&repeat, display);
+            assert!(report.installed.is_empty());
+            assert!(report.removed_stale.is_empty());
+        }
+
+        // Resurrection simulation: a marked copy reappears (as a rebuild
+        // or an older binary's pass would leave it) — the next sweep
+        // under the set removes it again.
+        for root in &roots {
+            let dest = root.join(skill.name);
+            std::fs::create_dir_all(&dest).unwrap();
+            std::fs::write(dest.join(INSTALL_MARKER), BUILTIN_MARKER_CONTENT).unwrap();
+            std::fs::write(dest.join("SKILL.md"), skill.skill_md).unwrap();
+        }
+        let re_swept = install_global_skills_in(home, &[], &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert_eq!(
+                installed_report(&re_swept, display).removed_stale,
+                vec![skill.name.to_string()],
+                "a re-materialized disabled skill must be swept again"
+            );
+        }
+        for root in &roots {
+            assert!(!root.join(skill.name).exists());
+        }
+
+        // Re-enable: the next pass restores byte-identical installs.
+        install_global_skills_in(home, &[], &BTreeSet::new());
+        for root in &roots {
+            let dest = root.join(skill.name);
+            assert_eq!(
+                std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+                skill.skill_md
+            );
+            assert_eq!(
+                std::fs::read_to_string(dest.join(INSTALL_MARKER)).unwrap(),
+                BUILTIN_MARKER_CONTENT
+            );
+            for (relative, bytes) in skill.support_files {
+                assert_eq!(std::fs::read(dest.join(relative)).unwrap(), *bytes);
+            }
+        }
+        assert_eq!(
+            skill_install_status_in(home, skill),
+            vec![
+                ("~/.agents/skills", "installed"),
+                ("~/.claude/skills", "installed")
+            ]
+        );
+    }
+
+    /// The per-kind law at the installer layer: the disabled-set
+    /// subtracts builtins only. An entry naming a plugin payload (stray
+    /// or foreign) neither blocks its materialization nor sweeps it —
+    /// plugin payloads have exactly one lifecycle authority, the plugin
+    /// toggle.
+    #[test]
+    fn disabled_set_never_touches_plugin_payloads() {
+        static PLUGIN_SKILL: crate::builtin_skills::BuiltinSkill =
+            crate::builtin_skills::BuiltinSkill {
+                name: "test-plugin-skill",
+                skill_md: "---\nname: test-plugin-skill\ndescription: test\n---\nbody\n",
+                support_files: &[],
+            };
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let payload = [("test-plugin", &PLUGIN_SKILL)];
+        let disabled = BTreeSet::from([PLUGIN_SKILL.name.to_string()]);
+
+        install_global_skills_in(home, &payload, &disabled);
+        assert_eq!(
+            skill_install_status_in(home, &PLUGIN_SKILL),
+            vec![
+                ("~/.agents/skills", "installed"),
+                ("~/.claude/skills", "installed")
+            ],
+            "a disabled-set entry must not suppress a plugin payload"
+        );
+
+        let repeat = install_global_skills_in(home, &payload, &disabled);
+        for display in ["~/.agents/skills", "~/.claude/skills"] {
+            assert!(
+                installed_report(&repeat, display).removed_stale.is_empty(),
+                "a disabled-set entry must not sweep a plugin payload"
+            );
+        }
     }
 
     fn outcome<'a>(

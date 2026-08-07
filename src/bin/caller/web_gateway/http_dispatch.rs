@@ -1294,6 +1294,28 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::SkillsList => {
                 return handle_skills_list(stream, route.cors, fleet_cors_origin.as_deref()).await;
             }
+            RouteHandlerId::SkillSetEnabled => {
+                // The row's `{name}` capture; the actor is gate-resolved
+                // at this authenticated edge (the pre-dispatch IAM gate
+                // bound the principal), never parsed from the body.
+                let name = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_skill_set_enabled(
+                    stream,
+                    name,
+                    route_body,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::PluginSetEnabled => {
                 // The row's `{plugin_id}` capture.
                 let plugin_id = route_captures
