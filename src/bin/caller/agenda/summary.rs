@@ -187,6 +187,11 @@ pub(crate) struct AgendaItemSummary {
     /// Cross-item serving-seam flag: the un-triaged frontier (the
     /// triage mandate's declared scope; see [`item_in_frontier`]).
     pub(crate) frontier: bool,
+    /// Cross-item serving-seam flag: OWED COMPLETION
+    /// ([`item_owed_completion`]) — the work is fully finished and only
+    /// the owner's Complete tap remains. Drives the needs-you rail's
+    /// Complete class and its badge count; the SPA never re-derives it.
+    pub(crate) completable: bool,
     /// The triage mandate's rank/note convention, derived once here
     /// (newest `triage`-source annotation; "rank N" names the rank).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -526,6 +531,7 @@ fn summarize_one(all: &[AgendaItem], item: &AgendaItem, watermark: u64) -> Agend
         blocked: !blocked_causes.is_empty(),
         blocked_on: (!blocked_causes.is_empty()).then_some(blocked_causes),
         frontier: item_in_frontier(item, watermark),
+        completable: item_owed_completion(all, item),
         triage: triage_info(item),
         children: None,
     }
@@ -591,10 +597,27 @@ pub(crate) fn item_is_blocked(all: &[AgendaItem], item: &AgendaItem) -> bool {
 /// name, they never gate). Empty exactly when the item is not blocked.
 /// Blocker entries name the uncleared criterion; dependency entries name
 /// the target's live title and status (`open`, `retired` — which does
-/// not satisfy, `missing` — absent from the fold, named by id).
+/// not satisfy, `missing` — absent from the fold, named by id) plus the
+/// owed-completion marker (`target_completable`) when the open target
+/// itself only awaits the owner's Complete tap — the remedy the blocked
+/// chip names.
 pub(crate) fn blocked_on(
     all: &[AgendaItem],
     item: &AgendaItem,
+) -> Vec<super::types::AgendaBlockedOn> {
+    blocked_causes(all, item, true)
+}
+
+/// The shared core behind [`blocked_on`] and the owed-completion
+/// predicate's not-blocked clause. `mark_completable` stamps each open
+/// dependency target's [`item_owed_completion`] verdict onto the cause;
+/// the predicate itself passes `false`, which is what keeps the mutual
+/// derivation finite (a dependency cycle would otherwise recurse: cause
+/// → target completable? → target blocked? → target's causes → …).
+fn blocked_causes(
+    all: &[AgendaItem],
+    item: &AgendaItem,
+    mark_completable: bool,
 ) -> Vec<super::types::AgendaBlockedOn> {
     if item.status != AgendaStatus::Open {
         return Vec::new();
@@ -607,16 +630,21 @@ pub(crate) fn blocked_on(
             target_id: None,
             target_status: None,
             blocker_id: Some(blocker.blocker_id.clone()),
+            target_completable: false,
         });
     }
     for edge in &item.relies_on {
         let target = all.iter().find(|candidate| candidate.id == edge.target_id);
-        let (title, status) = match target {
-            None => (edge.target_id.clone(), "missing"),
+        let (title, status, target_completable) = match target {
+            None => (edge.target_id.clone(), "missing", false),
             Some(target) => match target.status {
                 AgendaStatus::Done => continue,
-                AgendaStatus::Retired => (target.title.clone(), "retired"),
-                AgendaStatus::Open => (target.title.clone(), "open"),
+                AgendaStatus::Retired => (target.title.clone(), "retired", false),
+                AgendaStatus::Open => (
+                    target.title.clone(),
+                    "open",
+                    mark_completable && item_owed_completion(all, target),
+                ),
             },
         };
         causes.push(super::types::AgendaBlockedOn {
@@ -625,9 +653,90 @@ pub(crate) fn blocked_on(
             target_id: Some(edge.target_id.clone()),
             target_status: Some(status.to_string()),
             blocker_id: None,
+            target_completable,
         });
     }
     causes
+}
+
+/// OWED COMPLETION — the one daemon-side classification behind the
+/// needs-you rail's "finished — tap Complete" class, its badge count,
+/// and the blocked chip's "finished and awaiting Complete" target
+/// state (owner finding #10 family). True exactly when the item's work
+/// is fully finished and only the owner's Complete tap remains, derived
+/// from served facts alone:
+///
+/// - the item is OPEN and not a question (a question's owner gesture is
+///   Answer — it already has its own rail class);
+/// - some live (non-withdrawn) effect's latest occurrence ran to
+///   terminal `completed` AND the fired session self-reported
+///   `achieved` (unattested or partial never counts as finished — the
+///   Track AO absence law);
+/// - every effect is SETTLED: withdrawn husks aside, each is an
+///   approved ONE-SHOT whose firing reached terminal `completed` —
+///   nothing pending review (a live unapproved revision is an Approve
+///   decision, not a finished card), nothing standing (a recurrence or
+///   trigger manifest keeps watch; its item is a live automation, never
+///   "finished"), nothing still armed or in flight;
+/// - no OPEN question references the item over the undirected
+///   `relates_to` union (the steward-gate shape: a pending gate
+///   question means the verdict — and possibly a fix — is still owed;
+///   display-only, adjacency still evaluates/blocks/fires nothing);
+/// - nothing blocks the item itself (an uncleared blocker or unmet
+///   prerequisite contradicts "fully finished" — the blocked chip owns
+///   that story).
+///
+/// VISIBILITY ONLY: no machinery completes on this verdict — the tap
+/// stays the owner's. Effects-less items never qualify: the only
+/// terminal-success evidence in served data is an attested occurrence.
+pub(crate) fn item_owed_completion(all: &[AgendaItem], item: &AgendaItem) -> bool {
+    if item.status != AgendaStatus::Open || item.kind == AgendaKind::Question {
+        return false;
+    }
+    let achieved = item.effects.iter().any(|effect| {
+        effect.withdrawn.is_none()
+            && effect.last_run.as_ref().is_some_and(|run| {
+                run.state == "completed"
+                    && run.attestation.as_ref().is_some_and(|att| {
+                        att.outcome == super::types::AttestationOutcome::Achieved
+                    })
+            })
+    });
+    if !achieved {
+        return false;
+    }
+    let all_settled = item.effects.iter().all(|effect| {
+        if effect.withdrawn.is_some() {
+            return true; // fired-history husk — never pending, never planned
+        }
+        effect.approval.is_some()
+            && effect.manifest.recurrence.is_none()
+            && effect.manifest.trigger.is_none()
+            && effect
+                .last_run
+                .as_ref()
+                .is_some_and(|run| run.state == "completed")
+    });
+    if !all_settled {
+        return false;
+    }
+    let gated = all.iter().any(|other| {
+        other.id != item.id
+            && other.kind == AgendaKind::Question
+            && other.status == AgendaStatus::Open
+            && (other
+                .relates_to
+                .iter()
+                .any(|edge| edge.target_id == item.id)
+                || item
+                    .relates_to
+                    .iter()
+                    .any(|edge| edge.target_id == other.id))
+    });
+    if gated {
+        return false;
+    }
+    blocked_causes(all, item, false).is_empty()
 }
 
 /// The triage rank/note convention (the mandate's declared "rank N"
@@ -1135,6 +1244,7 @@ mod tests {
             deferred_until: None,
             watched_by: None,
             blocked_on: None,
+            completable: false,
         }
     }
 
@@ -1216,5 +1326,306 @@ mod tests {
             blocked_on(&all, &done_item).is_empty(),
             "non-open items never derive blocked causes"
         );
+    }
+
+    /// One settled ONE-SHOT effect whose firing completed and
+    /// self-reported achieved — the qualifying shape behind
+    /// [`item_owed_completion`].
+    fn achieved_effect() -> super::super::types::AgendaEffect {
+        super::super::types::AgendaEffect {
+            effect_id: "ef-1".into(),
+            manifest: super::super::types::SessionManifest {
+                goal: "do the thing".into(),
+                fire_at_ms: 1,
+                orchestrate: false,
+                interactive: false,
+                project_root: None,
+                agent_config: None,
+                recurrence: None,
+                trigger: None,
+                binding_refs: Vec::new(),
+            },
+            digest: "d1".into(),
+            proposed_ms: 1,
+            proposed_principal: None,
+            proposed_session_id: None,
+            proposed_kind: None,
+            approval: Some(super::super::types::AgendaApproval {
+                digest: "d1".into(),
+                at_ms: 2,
+                principal: None,
+                kind: None,
+            }),
+            withdrawn: None,
+            last_run: Some(super::super::types::AgendaRun {
+                occurrence_id: "occ-1".into(),
+                state: "completed".into(),
+                session_id: Some("sess-1".into()),
+                at_ms: 3,
+                note: None,
+                attestation: Some(super::super::types::AgendaAttestation {
+                    outcome: super::super::types::AttestationOutcome::Achieved,
+                    note: None,
+                    refs: Vec::new(),
+                    at_ms: 3,
+                    session_id: Some("sess-1".into()),
+                }),
+            }),
+            consecutive_failures: 0,
+            requested: Vec::new(),
+            next_fire_ms: None,
+            last_run_attempt: None,
+            fireability_refusal: None,
+        }
+    }
+
+    fn rel(target_id: &str) -> super::super::types::AgendaRelation {
+        super::super::types::AgendaRelation {
+            target_id: target_id.into(),
+            link_kind: None,
+            added_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+        }
+    }
+
+    /// The OWED-COMPLETION predicate (owner finding #10 family): the
+    /// one daemon-side classification behind the needs-you rail's
+    /// Complete class, its badge count, and the blocked chip's
+    /// finished-target state. The qualifying shape passes; every named
+    /// disqualifier — non-open, question kind, no effects, unattested
+    /// or partial outcomes, a pending approvable revision, a standing
+    /// recurrence/trigger manifest, an in-flight run, a withdrawn-only
+    /// history, an open gate question on the relates_to union (either
+    /// side), an uncleared blocker, an unmet prerequisite — flips it
+    /// off. The served summary flag IS the predicate.
+    #[test]
+    fn owed_completion_predicate_names_its_disqualifiers() {
+        let mut finished = bare("01FINISHED", "seat card", AgendaStatus::Open);
+        finished.effects = vec![achieved_effect()];
+        let all = vec![finished.clone()];
+        assert!(
+            item_owed_completion(&all, &finished),
+            "open task + settled achieved one-shot = owed completion"
+        );
+        let summary = &summarize(&all, &all)[0];
+        assert!(
+            summary.completable,
+            "the served summary flag IS the predicate"
+        );
+
+        // Lifecycle and kind disqualifiers.
+        let mut done = finished.clone();
+        done.status = AgendaStatus::Done;
+        assert!(!item_owed_completion(&all, &done), "done needs no tap");
+        let mut question = finished.clone();
+        question.kind = AgendaKind::Question;
+        assert!(
+            !item_owed_completion(&all, &question),
+            "a question's owner gesture is Answer, not Complete"
+        );
+        let mut effectless = finished.clone();
+        effectless.effects = Vec::new();
+        assert!(
+            !item_owed_completion(&all, &effectless),
+            "no occurrence evidence — never classified finished"
+        );
+
+        // Run-outcome disqualifiers (the Track AO absence law).
+        let mut unattested = finished.clone();
+        unattested.effects[0].last_run.as_mut().unwrap().attestation = None;
+        assert!(
+            !item_owed_completion(&all, &unattested),
+            "unattested is never synthesized into achieved"
+        );
+        let mut partial = finished.clone();
+        partial.effects[0]
+            .last_run
+            .as_mut()
+            .unwrap()
+            .attestation
+            .as_mut()
+            .unwrap()
+            .outcome = super::super::types::AttestationOutcome::Partial;
+        assert!(!item_owed_completion(&all, &partial), "partial is not done");
+        let mut running = finished.clone();
+        running.effects[0].last_run.as_mut().unwrap().state = "started".into();
+        assert!(
+            !item_owed_completion(&all, &running),
+            "an in-flight run is not finished"
+        );
+
+        // Effect-shape disqualifiers.
+        let mut pending = finished.clone();
+        pending.effects[0].approval = None;
+        assert!(
+            !item_owed_completion(&all, &pending),
+            "a pending approvable revision is an Approve decision, not a finished card"
+        );
+        let mut standing = finished.clone();
+        standing.effects[0].manifest.recurrence = Some(super::super::types::RecurrenceSpec {
+            every_ms: 86_400_000,
+            until_ms: None,
+            max_occurrences: None,
+            suspend_after_failures: None,
+        });
+        assert!(
+            !item_owed_completion(&all, &standing),
+            "a standing series is a live automation, never finished"
+        );
+        let mut triggered = finished.clone();
+        triggered.effects[0].manifest.trigger = Some(super::super::types::TriggerSpec::OnUnblock);
+        assert!(
+            !item_owed_completion(&all, &triggered),
+            "a trigger manifest keeps watch — not finished"
+        );
+        let mut husk_only = finished.clone();
+        husk_only.effects[0].withdrawn = Some(super::super::types::AgendaWithdrawal {
+            at_ms: 9,
+            principal: None,
+            session_id: None,
+            kind: None,
+            reason: None,
+        });
+        assert!(
+            !item_owed_completion(&all, &husk_only),
+            "a withdrawn husk's history is not live finished work"
+        );
+
+        // Gate questions on the undirected relates_to union.
+        let mut gate = bare("01GATE", "Gate: seat verification", AgendaStatus::Open);
+        gate.kind = AgendaKind::Question;
+        gate.relates_to = vec![rel("01FINISHED")];
+        let gated = vec![finished.clone(), gate.clone()];
+        assert!(
+            !item_owed_completion(&gated, &finished),
+            "an open gate question referencing the item keeps it out"
+        );
+        let mut ruled = gate.clone();
+        ruled.status = AgendaStatus::Done;
+        let ruled_all = vec![finished.clone(), ruled];
+        assert!(
+            item_owed_completion(&ruled_all, &finished),
+            "an answered gate releases the classification"
+        );
+        let mut pointing = finished.clone();
+        pointing.relates_to = vec![rel("01GATE2")];
+        let mut gate2 = bare("01GATE2", "Gate: other side", AgendaStatus::Open);
+        gate2.kind = AgendaKind::Question;
+        let gated2 = vec![pointing.clone(), gate2];
+        assert!(
+            !item_owed_completion(&gated2, &pointing),
+            "the union covers edges stored on the item's side too"
+        );
+
+        // Blocked contradicts finished.
+        let mut blocked_item = finished.clone();
+        blocked_item.blockers = vec![super::super::types::AgendaBlocker {
+            blocker_id: "bk-1".into(),
+            criterion: "owner sign-off".into(),
+            set_ms: 1,
+            principal: None,
+            session_id: None,
+            kind: None,
+            source: None,
+            cleared: None,
+        }];
+        assert!(
+            !item_owed_completion(&all, &blocked_item),
+            "an uncleared blocker contradicts fully-finished"
+        );
+        let mut dependent_shape = finished.clone();
+        dependent_shape.relies_on = vec![dep("01PREREQ")];
+        let prereq = bare("01PREREQ", "prerequisite", AgendaStatus::Open);
+        let dep_all = vec![dependent_shape.clone(), prereq];
+        assert!(
+            !item_owed_completion(&dep_all, &dependent_shape),
+            "an unmet prerequisite contradicts fully-finished"
+        );
+    }
+
+    /// The blocked chip's remedy state ([b] of the finding): a
+    /// dependent's `blocked_on` cause carries `target_completable`
+    /// exactly when the open target satisfies [`item_owed_completion`]
+    /// — one classification, stamped at the serving seam. A dependency
+    /// cycle stays finite: the predicate's own not-blocked clause never
+    /// re-stamps.
+    #[test]
+    fn blocked_on_marks_completable_targets() {
+        let mut target = bare("01TARGET", "finished prerequisite", AgendaStatus::Open);
+        target.effects = vec![achieved_effect()];
+        let plain = bare("01PLAIN", "still open prerequisite", AgendaStatus::Open);
+        let mut dependent = bare("01DEP", "dependent", AgendaStatus::Open);
+        dependent.relies_on = vec![dep("01TARGET"), dep("01PLAIN")];
+        let all = vec![target, plain, dependent.clone()];
+
+        let causes = blocked_on(&all, &dependent);
+        assert_eq!(causes.len(), 2);
+        assert_eq!(causes[0].target_id.as_deref(), Some("01TARGET"));
+        assert!(
+            causes[0].target_completable,
+            "a finished-awaiting-Complete target is marked on the cause"
+        );
+        assert_eq!(causes[1].target_id.as_deref(), Some("01PLAIN"));
+        assert!(!causes[1].target_completable);
+        let wire = serde_json::to_value(&causes).unwrap();
+        assert_eq!(wire[0]["target_completable"], true);
+        assert!(
+            wire[1].get("target_completable").is_none(),
+            "absent-on-the-wire when false (additive field)"
+        );
+
+        // Cycle safety: mutually dependent achieved items derive without
+        // recursion and neither reads completable (both stay blocked).
+        let mut a = bare("01CYCA", "a", AgendaStatus::Open);
+        a.effects = vec![achieved_effect()];
+        a.relies_on = vec![dep("01CYCB")];
+        let mut b = bare("01CYCB", "b", AgendaStatus::Open);
+        b.effects = vec![achieved_effect()];
+        b.relies_on = vec![dep("01CYCA")];
+        let cyc = vec![a.clone(), b];
+        let causes = blocked_on(&cyc, &a);
+        assert_eq!(causes.len(), 1);
+        assert!(
+            !causes[0].target_completable,
+            "a blocked target is not owed completion"
+        );
+        assert!(!item_owed_completion(&cyc, &a));
+    }
+
+    /// Rail-class parity (derive-don't-mirror, the awaiting-pickup
+    /// pattern): the dashboard's Complete class, its badge count, the
+    /// card chip, the blocked-row remedy copy, and the dependents
+    /// live-repaint wiring all render from the SERVED classification —
+    /// pinned against the built SPA so a vocabulary change that forgets
+    /// the frontend fails here instead of shipping as drift.
+    #[test]
+    fn owed_completion_surfaces_are_pinned_in_app_html() {
+        let app = include_str!("../../../../static/app.html");
+        for marker in [
+            // The Now-lens class + badge derive from the served flag.
+            ".filter((x) => x.completable === true)",
+            "label: 'Complete',",
+            "if (x.completable === true) needs.add(x.id);",
+            // The card chip names the finding's gesture.
+            "'finished — tap Complete'",
+            // The blocked chip: remedy copy + served target state.
+            "— complete it to proceed",
+            "'finished and awaiting Complete'",
+            "'finished · awaiting Complete'",
+            "served.target_completable === true",
+            // The [c] dependents repaint lane is wired into the event
+            // path, and adoption reads the served decoration fresh.
+            "agendaDependentsRepull(prior, row);",
+            "function agendaDependentsRepull",
+            "completable: full.completable === true,",
+        ] {
+            assert!(
+                app.contains(marker),
+                "app.html lost the owed-completion marker {marker:?}"
+            );
+        }
     }
 }

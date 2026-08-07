@@ -170,6 +170,7 @@ mod tests {
             deferred_until: None,
             watched_by: None,
             blocked_on: None,
+            completable: false,
         }
     }
 

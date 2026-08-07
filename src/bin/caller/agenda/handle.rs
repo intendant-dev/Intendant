@@ -1129,20 +1129,28 @@ impl AgendaHandle {
         // confirm from this, never from a client-side join. Advisory by
         // doctrine: it names, it never gates (the fireability stamp is
         // what withholds Approve; this one only makes the confirm
-        // honest). Compute-then-stamp like the planner views: the
-        // universe borrow ends before the mutable pass.
-        let blocked_views: Vec<Option<Vec<super::types::AgendaBlockedOn>>> = {
+        // honest). The same pass stamps the OWED-COMPLETION verdict
+        // (`completable` — [`super::summary::item_owed_completion`]),
+        // so event-lane copies carry the needs-you rail's Complete
+        // classification as fresh as their blocked causes. Compute-
+        // then-stamp like the planner views: the universe borrow ends
+        // before the mutable pass.
+        let blocked_views: Vec<(Option<Vec<super::types::AgendaBlockedOn>>, bool)> = {
             let universe: &[AgendaItem] = context.unwrap_or(items);
             items
                 .iter()
                 .map(|item| {
                     let causes = super::summary::blocked_on(universe, item);
-                    (!causes.is_empty()).then_some(causes)
+                    (
+                        (!causes.is_empty()).then_some(causes),
+                        super::summary::item_owed_completion(universe, item),
+                    )
                 })
                 .collect()
         };
-        for (item, causes) in items.iter_mut().zip(blocked_views) {
+        for (item, (causes, completable)) in items.iter_mut().zip(blocked_views) {
             item.blocked_on = causes;
+            item.completable = completable;
         }
     }
 
