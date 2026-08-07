@@ -26,18 +26,23 @@ one in Intendant gives you:
   MCP server over the running gateway. Pi receives the same session-scoped
   authority through `$INTENDANT ctl`; this preserves Pi's intentionally small
   core instead of inventing a fake MCP integration.
-- **Provider-neutral remote compute.** The compact bootstrap advertises
-  `remote_command` to Codex, Claude Code, and Kimi Code; Pi reaches the same
-  job vocabulary through `$INTENDANT ctl tools call remote_command`. Host
-  `auto` reuses or acquires a matching Codex Cloud Linux worker, while
-  `source: working_tree` sends the backend's explicit uncommitted snapshot.
+- **Provider-neutral remote compute.** Every supervised backend reaches the
+  daemon's `remote_command` job vocabulary through
+  `"$INTENDANT" ctl remote start|status|wait|cancel` — the injected
+  session-scoped `INTENDANT_MCP_URL` binds the call to the session, so job
+  ownership and cache namespacing follow the session's recorded project
+  root. The schema deliberately no longer rides the compact MCP bootstrap
+  (context rent; ratified 2026-08-07): the daemon surface still serves the
+  tool by name, and native sessions keep their built-in twin. Host `auto`
+  reuses or acquires a matching Codex Cloud Linux worker, while
+  `--source working_tree` sends the backend's explicit uncommitted snapshot.
   Heavy platform-neutral builds and tests therefore move off the supervisor
   without changing which backend does the reasoning. Platform-specific CI
   remains authoritative, and the backend never silently falls back to a
   heavy local build when acquisition fails. The workflow *teaching* lives in
   the shared `intendant-remote-compute` agent skill, materialized for every
   backend only while the **Codex Cloud Remote Compute** plugin (dashboard →
-  Plugins; default off) is enabled and ready — the tool itself stays
+  Plugins; default off) is enabled and ready — the ctl lane itself stays
   available and self-describing either way.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
@@ -333,12 +338,13 @@ own native capabilities where the upstream CLIs provide them.
   core profile keeps a small bootstrap surface: `get_status`, the shared-view
   tools, and the minimal display/CU path (`list_displays`, `grant_user_display`,
   `revoke_user_display`, `read_screen`, `take_screenshot`,
-  `execute_cu_actions`), plus `remote_command` for heavy platform-neutral
-  compute on an attached host, for managed **and** vanilla sessions; managed
-  context additionally exposes the managed-context/fission tools. Broad or
-  rare Intendant operations should be discovered lazily through
-  `intendant ctl --help`, `intendant ctl tools list`, and focused subcommand
-  help. Supervised Codex sessions receive
+  `execute_cu_actions`), for managed **and** vanilla sessions; managed
+  context additionally exposes the managed-context/fission tools. Heavy
+  platform-neutral compute rides `"$INTENDANT" ctl remote` rather than an
+  advertised MCP schema (the `remote_command` tool stays daemon-side and
+  callable by name). Broad or rare Intendant operations should be discovered
+  lazily through `intendant ctl --help`, `intendant ctl tools list`, and
+  focused subcommand help. Supervised Codex sessions receive
   `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
   `INTENDANT_SESSION_ID`, and `INTENDANT_MANAGED_CONTEXT`, so agent shells can
   run `"$INTENDANT" ctl ...` without relying on user PATH setup. Claude Code

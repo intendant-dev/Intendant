@@ -72,6 +72,7 @@ Useful groups:
 - `"$INTENDANT" ctl approval --help` and `"$INTENDANT" ctl input --help` for pending approval/input flows.
 - `"$INTENDANT" ctl context --help` for managed-context rewind/backout.
 - `"$INTENDANT" ctl controller --help` for controller-loop and restart controls.
+- `"$INTENDANT" ctl remote --help` for the **remote-compute lane** — offload heavy platform-neutral commands (workspace builds, broad tests, clippy sweeps) to an acquired remote worker: `ctl remote start [flags] -- CMD…`, then `wait|status|cancel`. When to offload, the honest carve-outs, and failure conduct live in the `intendant-remote-compute` skill.
 - `"$INTENDANT" ctl tools schema TOOL` and `"$INTENDANT" ctl tools call TOOL --args JSON` for rare or newly-added MCP tools.
 
 Prefer `--json` when the output will be inspected by an agent. Use `--session ID` when operating on a specific session. Use `--managed-context managed` for rewind/backout commands.

@@ -413,19 +413,37 @@ resolver rather than guessing.
 ## Provider-neutral remote commands
 
 An acquired or explicitly attached worker can run a bounded, non-interactive
-command for any supervised agent backend. The public tool is named
-`remote_command`, not
-`codex_cloud_shell`: Codex, Claude Code, Kimi Code, Pi, and native Intendant
-sessions all receive the same job vocabulary in their compact/core tool
-profile. Codex Cloud is only the first host adapter.
+command for any session on the daemon's machine. The implementation is one
+daemon-side tool named `remote_command`, not `codex_cloud_shell` — Codex
+Cloud is only the first host adapter — and its delivery is the
+`intendant ctl remote` verb family plus the `intendant-remote-compute`
+skill: native Intendant sessions keep the built-in tool, while external
+supervised backends and unsupervised harness shells reach the same lane
+through ctl. The schema deliberately does not ride supervised MCP session
+toolsets (context rent; ratified 2026-08-07) — profile shaping only hides
+the listing, so the daemon surface keeps answering `tools/call` by name and
+`intendant ctl tools schema remote_command` still serves the contract.
 
-The tool has four operations: `start`, `status`, `wait`, and `cancel`.
-`start` returns immediately with a daemon-local job id; `status` polls it,
-`wait` waits for at most 60 seconds, and `cancel` terminates the worker
-process tree. Omitted `host` (or `host: "auto"`) reuses a live worker whose
-environment and exact Git revision match, or submits and enrolls one. An
-operator can still select an already-connected lease with
-`host: "cloud:<task-id>"`:
+The job vocabulary has four operations: `start`, `status`, `wait`, and
+`cancel`. `start` returns immediately with a daemon-local job id; `status`
+polls it, one `wait` operation waits for at most 60 seconds, and `cancel`
+terminates the worker process tree. Omitted host (`auto`) reuses a live
+worker whose environment and exact Git revision match, or submits and
+enrolls one. An operator can still select an already-connected lease with
+`--host cloud:<task-id>`:
+
+```bash
+git push origin feature/example
+intendant ctl remote start --branch feature/example --revision 0123456789abcdef \
+    -- cargo test -p intendant-core
+intendant ctl remote wait remote-<id> --for 1800
+```
+
+`ctl remote wait` chunks bounded server-side waits until the job is
+terminal or its `--for` budget is spent, prints the bounded remote
+stdout/stderr, and exits 0 only for a succeeded job; daemon refusals
+surface verbatim. The generic raw form remains for scripting the tool
+directly:
 
 ```bash
 intendant ctl tools call remote_command --args '{
@@ -436,9 +454,6 @@ intendant ctl tools call remote_command --args '{
   "require_clean": true,
   "timeout_s": 900
 }'
-
-intendant ctl tools call remote_command \
-  --args '{"op":"wait","job_id":"remote-...","wait_s":30}'
 ```
 
 An automatically acquired job remains in `acquiring` while a cold provider
@@ -454,13 +469,8 @@ the leader's task and deadline.
 Uncommitted or not-yet-pushed source uses an explicit working-tree snapshot:
 
 ```bash
-intendant ctl tools call remote_command --args '{
-  "op": "start",
-  "source": "working_tree",
-  "argv": ["cargo", "check", "--workspace"],
-  "cache": "durable_sccache",
-  "timeout_s": 900
-}'
+intendant ctl remote start --source working_tree --cache durable_sccache \
+    -- cargo check --workspace
 ```
 
 The contract is intentionally stricter than an interactive terminal:
@@ -634,13 +644,15 @@ enabling it does two bounded things.
    lane's own job.
 2. **Skill materialization.** While enabled AND ready, the shared
    `intendant-remote-compute` agent skill — the workflow teaching that used
-   to live in system prompts: prefer `remote_command` for heavy
-   platform-neutral work, never silently fall back to heavy local work,
+   to live in system prompts: route heavy platform-neutral work through
+   `intendant ctl remote`, never silently fall back to heavy local work,
    `working_tree` snapshots for iteration vs pushed `git_revision` for
    authoritative validation, honest cache expectations — is installed into
    `~/.agents/skills/` and `~/.claude/skills/` with plugin provenance
-   markers, so native, Codex, Claude Code, Kimi Code, and Pi sessions all
-   see it. Disabling (or losing readiness) sweeps exactly the
+   markers. Its description triggers on the WORK (a heavy platform-neutral
+   build/test/lint sweep about to run locally), not on tool possession, so
+   supervised backends, native sessions, and plain coding-harness sessions
+   all route through it. Disabling (or losing readiness) sweeps exactly the
    Intendant-managed copies; a user's same-named skill directory is never
    touched. Enable state lives under the daemon state root, survives
    restarts, and reconciles at every boot.
@@ -670,10 +682,14 @@ follow-up tool returns the acceptance receipt (parent turn, new turn ids)
 under the same fail-closed contract as the CLI verb.
 
 `remote_command` is different: it does not create provider work or ask Codex
-to reason. It spends shell authority on an attached compute host, so it is in
-the compact/core profile used by every supervised backend and is IAM-classed
-as `shell.spawn`. Claude Code, Kimi Code, Pi, and Codex therefore use the same
-attached Linux worker without changing which model is doing the reasoning.
+to reason. It spends shell authority on an attached compute host and is
+IAM-classed as `shell.spawn`. Since 2026-08-07 its schema no longer rides
+the compact/core profile either — supervised backends reach the lane through
+`"$INTENDANT" ctl remote` (their injected session token binds the call to
+their session, so job ownership and cache namespacing are unchanged), and
+the unprofiled daemon listing keeps serving the schema for ctl discovery.
+Claude Code, Kimi Code, Pi, and Codex therefore use the same attached Linux
+worker without changing which model is doing the reasoning.
 
 ## Environment bootstrap
 

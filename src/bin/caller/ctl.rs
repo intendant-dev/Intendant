@@ -44,6 +44,8 @@ struct CommandArgs {
     bools: BTreeSet<String>,
 }
 
+mod remote;
+
 pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
     let (config, command) = parse_global_args(raw_args)?;
     let (mut config, command) = parse_output_flags(config, command);
@@ -116,6 +118,7 @@ pub async fn run(raw_args: Vec<String>) -> Result<(), String> {
         "settings" | "set" => run_settings(&client, &config, &command[1..]).await?,
         "session" | "sessions" => run_session(&client, &config, &command[1..]).await?,
         "task" => run_task(&client, &config, &command[1..]).await?,
+        "remote" => remote::run_remote(&client, &config, &command[1..]).await?,
         "agenda" => run_agenda(&client, &config, &command[1..]).await?,
         "memory" => run_memory(&client, &config, &command[1..]).await?,
         "controller" => run_controller(&client, &config, &command[1..]).await?,
@@ -5603,6 +5606,7 @@ Commands:\n\
   settings                  Autonomy and verbosity\n\
   session                   Session transcript notes (display-only, optional images)\n\
   task                      Start tasks\n\
+  remote                    Offload heavy platform-neutral commands to a remote worker\n\
   agenda                    The daemon's agenda: park, list, and resolve durable intent\n\
   memory                    Memory claims: propose, search, read\n\
   controller                Controller loop and restart controls\n\

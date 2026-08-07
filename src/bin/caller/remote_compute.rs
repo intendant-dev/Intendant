@@ -635,6 +635,12 @@ async fn start_remote_command(
         )
         .await
         {
+            // Lease-death visibility: a signed-out provider fails every
+            // acquisition after a daemon boot (the custody startup sweep
+            // removes leases), and before 2026-08-07 that death was
+            // visible only inside the one session that tried. Alarm ONCE
+            // per boot, never per attempt.
+            note_remote_command_failure(&error);
             update_home_job(&job_id, |job| {
                 if !job.state.is_terminal() {
                     job.state = RemoteCommandState::Failed;
@@ -969,6 +975,173 @@ async fn send_home_frame(sender: &mpsc::Sender<String>, frame: String) -> Result
     .await
     .map_err(|_| ())?
     .map_err(|_| ())
+}
+
+// ── Lane-down visibility ─────────────────────────────────────────────
+//
+// The custody startup sweep removes provider leases at every daemon boot
+// (`lease_home_removed`), so a lane that was healthy yesterday fails every
+// acquisition today with the signed-out shape — and until 2026-08-07 that
+// death surfaced nowhere but the failing caller's own tool result (the
+// 08-06 specimen: a seat got "Not signed in", then silently ran 43 minutes
+// of local battery). On the FIRST auth-shaped failure per boot the daemon
+// parks one durable agenda note and sends one attention-class
+// notification; classification and copy ride the shared #809 auth-family
+// register (`external_agent::backend_auth_failure_line` / `_copy`).
+
+/// Tag on THE durable lane-down agenda item (find-or-create, like the
+/// safeguards needs-recast anchor — restarts annotate one item instead of
+/// stacking new ones).
+const LANE_DOWN_TAG: &str = "remote-compute-lane";
+const LANE_DOWN_SOURCE: &str = "remote-compute lane";
+const LANE_DOWN_TITLE: &str = "Remote-compute lane down: provider signed out";
+const LANE_DOWN_BODY: &str = "remote_command acquisition failed because the provider CLI is \
+     signed out. Leases do not survive daemon restarts (custody startup sweep), so after every \
+     boot the lane stays down — and every remote_command job fails at acquisition — until the \
+     provider is signed in again or its lease is re-armed from the Vault tab. Each boot's first \
+     signed-out acquisition failure is annotated here.";
+
+/// One alarm per daemon boot (process lifetime), never per attempt.
+static LANE_AUTH_ALARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Decide whether `error` is the auth family AND this boot has not alarmed
+/// yet. Non-auth failures (no worker available, detached host, timeout)
+/// never latch — the first *signed-out* failure must still alarm even if
+/// an unrelated failure came earlier.
+fn should_alarm_lane_auth_failure(
+    error: &str,
+    latch: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if !crate::external_agent::backend_auth_failure_line(error) {
+        return false;
+    }
+    !latch.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The one named honest copy for the lane, composed from the #809
+/// auth-family register: Codex is the lane's host-adapter CLI, and the
+/// credential-file probe picks the sharper "no credentials" flavor when it
+/// can prove absence.
+fn lane_down_copy(credential_file_missing: Option<bool>) -> String {
+    crate::external_agent::backend_auth_failure_copy("Codex", credential_file_missing)
+}
+
+/// The durable annotation for THE lane-down item: named state, standing
+/// consequence, and the daemon's error verbatim.
+fn lane_down_annotation(copy: &str, error: &str) -> String {
+    format!(
+        "{copy}. First signed-out remote_command acquisition failure since this daemon booted; \
+         every remote_command job fails at acquisition until the lane is re-armed. Error: {error}"
+    )
+}
+
+/// The attention-class notification (dashboard toast + tab badge + hidden-tab
+/// browser notification) for the same state.
+fn lane_down_notification(copy: &str, now_ms: u64) -> crate::event::AppEvent {
+    crate::event::AppEvent::UserNotification {
+        session_id: None,
+        id: "remote-compute-lane-auth".to_string(),
+        title: Some(LANE_DOWN_TITLE.to_string()),
+        text: format!(
+            "{copy}. Remote-compute jobs fail at acquisition until it is re-armed — provider \
+             leases do not survive daemon restarts."
+        ),
+        urgency: crate::types::NotificationUrgency::Attention,
+        ts: now_ms,
+    }
+}
+
+/// Find or create THE lane-down item (oldest open item carrying the tag —
+/// ULID order) and append `text`, skipping an identical consecutive
+/// annotation so a crash-looping daemon never stacks copies of the same
+/// facts. Mirrors the safeguards needs-recast parking contract.
+fn park_lane_down(
+    handle: &crate::agenda::AgendaHandle,
+    text: String,
+) -> Result<String, String> {
+    use crate::agenda::{AgendaActor, AgendaCommand, AgendaItem, AgendaKind, AgendaStatus};
+    let snapshot = handle.snapshot();
+    let mut anchors: Vec<&AgendaItem> = snapshot
+        .iter()
+        .filter(|item| {
+            item.status == AgendaStatus::Open && item.tags.iter().any(|tag| tag == LANE_DOWN_TAG)
+        })
+        .collect();
+    anchors.sort_by(|a, b| a.id.cmp(&b.id));
+    let item_id = match anchors.first() {
+        Some(item) => {
+            if item
+                .annotations
+                .last()
+                .is_some_and(|note| note.text == text)
+            {
+                return Ok(item.id.clone());
+            }
+            item.id.clone()
+        }
+        None => {
+            handle
+                .apply(
+                    AgendaCommand::Add {
+                        kind: AgendaKind::Note,
+                        title: LANE_DOWN_TITLE.to_string(),
+                        body: LANE_DOWN_BODY.to_string(),
+                        tags: vec![LANE_DOWN_TAG.to_string()],
+                        due_ms: None,
+                        source: Some(LANE_DOWN_SOURCE.to_string()),
+                        refs: Vec::new(),
+                    },
+                    Some(AgendaActor::daemon()),
+                )
+                .map_err(|err| format!("park remote-compute lane-down note: {err}"))?
+                .id
+        }
+    };
+    handle
+        .apply(
+            AgendaCommand::Annotate {
+                id: item_id.clone(),
+                text,
+                source: Some(LANE_DOWN_SOURCE.to_string()),
+            },
+            Some(AgendaActor::daemon()),
+        )
+        .map_err(|err| format!("annotate remote-compute lane-down note: {err}"))?;
+    Ok(item_id)
+}
+
+/// Boot-once alarm entry, called from the acquisition failure record. The
+/// durable agenda note plus the attention notification are the whole
+/// visible surface; a missing agenda handle degrades to stderr, and a
+/// parking failure never swallows the notification (the safeguards-lane
+/// degradation contract).
+fn note_remote_command_failure(error: &str) {
+    if !should_alarm_lane_auth_failure(error, &LANE_AUTH_ALARMED) {
+        return;
+    }
+    // Transport edge: the probe stats the daemon's view of the home; the
+    // classifier and copy stay pure and hermetically tested.
+    let credential_file_missing = crate::external_agent::backend_local_login(
+        &crate::external_agent::AgentBackend::Codex,
+        &crate::platform::home_dir(),
+    )
+    .map(|present| !present);
+    let copy = lane_down_copy(credential_file_missing);
+    match crate::agenda::published_agenda_handle() {
+        Some(handle) => {
+            if let Err(err) = park_lane_down(&handle, lane_down_annotation(&copy, error)) {
+                eprintln!("[remote-compute] {err} — the notification carries the facts");
+            }
+            handle
+                .bus()
+                .send(lane_down_notification(&copy, crate::codex_cloud::now_unix_ms()));
+        }
+        None => eprintln!(
+            "[remote-compute] lane down ({copy}) but no agenda handle is published — \
+             not parked. Error: {error}"
+        ),
+    }
 }
 
 pub(crate) async fn execute_remote_command_operation(
@@ -2027,6 +2200,112 @@ fn elapsed_ms(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Lane-down visibility pins ──
+
+    /// The per-boot latch: only the auth family alarms, exactly once, and
+    /// an earlier non-auth failure must not consume the boot's one alarm.
+    #[test]
+    fn lane_auth_alarm_fires_once_per_boot_for_the_auth_family_only() {
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        // Non-auth acquisition failures never alarm and never latch.
+        assert!(!should_alarm_lane_auth_failure(
+            "remote host cloud:x has no live attachment",
+            &latch
+        ));
+        assert!(!should_alarm_lane_auth_failure(
+            "acquisition timed out after 3600s",
+            &latch
+        ));
+        // The 08-06 specimen (job remote-83075e26) alarms — once.
+        let specimen = "\"codex\" exited with exit status: 1: Not signed in. Please run \
+                        'codex login' to authenticate.";
+        assert!(should_alarm_lane_auth_failure(specimen, &latch));
+        assert!(
+            !should_alarm_lane_auth_failure(specimen, &latch),
+            "the second attempt of the boot must stay silent"
+        );
+        assert!(!should_alarm_lane_auth_failure(
+            "401 Unauthorized: Missing bearer or basic authentication in header",
+            &latch
+        ));
+    }
+
+    /// The composed surfaces: named honest copy (the shared #809
+    /// register), verbatim error in the durable annotation, attention
+    /// urgency and a stable id on the notification.
+    #[test]
+    fn lane_down_surfaces_carry_the_named_state_and_the_verbatim_error() {
+        assert_eq!(
+            lane_down_copy(Some(false)),
+            "Codex is signed out — sign in from the Vault tab"
+        );
+        assert_eq!(
+            lane_down_copy(Some(true)),
+            "Codex has no credentials on this daemon — sign in from the Vault tab, or renew \
+             its vault lease"
+        );
+
+        let error = "\"codex\" exited with exit status: 1: Not signed in.";
+        let annotation = lane_down_annotation(&lane_down_copy(None), error);
+        assert!(annotation.contains("Codex is signed out"), "{annotation}");
+        assert!(annotation.contains(error), "{annotation}");
+        assert!(
+            annotation.contains("until the lane is re-armed"),
+            "{annotation}"
+        );
+
+        let crate::event::AppEvent::UserNotification {
+            session_id,
+            id,
+            title,
+            text,
+            urgency,
+            ts,
+        } = lane_down_notification(&lane_down_copy(None), 1234)
+        else {
+            panic!("notification shape");
+        };
+        assert_eq!(session_id, None);
+        assert_eq!(id, "remote-compute-lane-auth");
+        assert_eq!(title.as_deref(), Some(LANE_DOWN_TITLE));
+        assert!(text.contains("Codex is signed out"), "{text}");
+        assert!(
+            text.contains("leases do not survive daemon restarts"),
+            "{text}"
+        );
+        assert_eq!(urgency, crate::types::NotificationUrgency::Attention);
+        assert_eq!(ts, 1234);
+    }
+
+    /// The durable note is find-or-create: one tagged item across boots,
+    /// identical consecutive annotations collapse, and a distinct
+    /// annotation appends to the SAME item instead of minting a sibling.
+    #[test]
+    fn lane_down_parks_one_item_and_deduplicates_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::agenda::AgendaStore::open(dir.path()).expect("open store");
+        let handle =
+            crate::agenda::AgendaHandle::new(store, crate::event::EventBus::new(), dir.path());
+
+        let first = park_lane_down(&handle, "boot one: signed out".to_string()).unwrap();
+        let again = park_lane_down(&handle, "boot one: signed out".to_string()).unwrap();
+        assert_eq!(first, again, "identical consecutive annotation collapses");
+        let second = park_lane_down(&handle, "boot two: signed out".to_string()).unwrap();
+        assert_eq!(first, second, "later boots annotate the same open item");
+
+        let snapshot = handle.snapshot();
+        let items: Vec<_> = snapshot
+            .iter()
+            .filter(|item| item.tags.iter().any(|tag| tag == LANE_DOWN_TAG))
+            .collect();
+        assert_eq!(items.len(), 1, "exactly one lane-down item exists");
+        let item = items[0];
+        assert_eq!(item.title, LANE_DOWN_TITLE);
+        assert_eq!(item.annotations.len(), 2, "{:#?}", item.annotations);
+        assert_eq!(item.annotations[0].text, "boot one: signed out");
+        assert_eq!(item.annotations[1].text, "boot two: signed out");
+    }
 
     fn git(repo: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
