@@ -6016,7 +6016,7 @@ fn help_agenda() {
   intendant ctl agenda schedule ID_PREFIX --goal TEXT --at WHEN [--orchestrate] [--interactive]\n\
       # --interactive fires the owner-sitting shape: the session opens with the goal as the\n\
       # owner's message and WAITS for them — e.g. --goal \"Sit with me on the release board\"\n\
-      # --at 07:30 --interactive; omitted = the autonomous goal run with write-back\n\
+      # --at +1d --interactive; omitted = the autonomous goal run with write-back\n\
       [--every INTERVAL [--until WHEN] [--max-occurrences N] [--suspend-after N]] [--source LABEL]\n\
       [--on-unblock | --on-item-match KIND:TAG[,TAG...]]   # event trigger: fires on state, not\n\
       # at an instant — cadence OR trigger, never both; --at then defaults to now (the arm floor).\n\
