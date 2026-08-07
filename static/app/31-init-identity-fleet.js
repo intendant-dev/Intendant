@@ -1300,6 +1300,12 @@ const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
 let dashboardControlAutoFallback = false;
 let dashboardLegacyWsConnected = false;
 let dashboardLegacyWsEverConnected = false;
+// Deep-link TDZ rule, #access/daemons instance: fragment 48's route apply
+// runs switchTab('access') → renderDaemonsList() → renderDaemonsListTail()
+// during script evaluation, before fragment 50's top-level declarations
+// initialize. The host-options render signature (see renderDaemonsListTail
+// in 50-control-transport.js) therefore lives here with the early state.
+let daemonsListHostOptionsSig = null;
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';

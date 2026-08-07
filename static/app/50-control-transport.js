@@ -2896,7 +2896,9 @@ async function fetchRemoteAgentCard(baseUrl) {
 // its own signature for the list; the pickers' inputs (id/label/connected)
 // get a dedicated one so a mid-row change (e.g. version skew) doesn't churn
 // the selects.
-let daemonsListHostOptionsSig = null;
+// (daemonsListHostOptionsSig is declared in 31-init-identity-fleet.js with
+// the early state: an #access deep link reaches renderDaemonsListTail during
+// script evaluation — the deep-link TDZ rule.)
 
 function daemonsListHostOptionsSignature() {
   return JSON.stringify([
