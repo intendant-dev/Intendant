@@ -278,6 +278,8 @@ pub(crate) async fn control_request_frame(
         "api_skill_set_enabled" => {
             api_skill_set_enabled_response(id, params.as_ref(), &runtime).await
         }
+        "api_skill_add" => api_skill_add_response(id, params.as_ref(), &runtime).await,
+        "api_skill_remove" => api_skill_remove_response(id, params.as_ref()).await,
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
@@ -1757,6 +1759,47 @@ pub(crate) async fn api_skill_set_enabled_response(
         id,
         crate::web_gateway::skill_set_enabled_api_response(&name, &body, &actor).await,
         "skill set-enabled",
+    )
+}
+
+/// Tunnel twin of `POST /api/skills` (the S4 user-skill add) — `name` and
+/// `skill_md` ride `params`; the whole params object doubles as the body
+/// (the core ignores unknown keys and re-checks the byte cap). The
+/// recorded attribution is the tunnel grant's gate-resolved principal,
+/// never a params claim.
+pub(crate) async fn api_skill_add_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body = params
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+        .to_string();
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
+    frame_api_response(
+        id,
+        crate::web_gateway::skill_add_api_response(&body, &actor).await,
+        "skill add",
+    )
+}
+
+/// Tunnel twin of `DELETE /api/skills/{name}` (the S4 user-skill remove)
+/// — `name` rides `params`.
+pub(crate) async fn api_skill_remove_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let name = params
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::skill_remove_api_response(&name).await,
+        "skill remove",
     )
 }
 

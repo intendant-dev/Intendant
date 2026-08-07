@@ -1316,6 +1316,31 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::SkillAdd => {
+                // The recorded attribution is the gate-resolved
+                // principal, never a request-body claim (intake §3a).
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_skill_add(
+                    stream,
+                    route_body,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::SkillRemove => {
+                // The row's `{name}` capture.
+                let name = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return handle_skill_remove(stream, name, route.cors, fleet_cors_origin.as_deref())
+                    .await;
+            }
             RouteHandlerId::PluginSetEnabled => {
                 // The row's `{plugin_id}` capture.
                 let plugin_id = route_captures
