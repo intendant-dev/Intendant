@@ -28,6 +28,18 @@ use std::path::{Path, PathBuf};
 /// registry bound, promoted).
 pub(crate) const MAX_DEFINITION_NODES: usize = 8;
 
+/// Declared-parameter rails (skills/plugins unification §4b): at most 8
+/// parameters per definition, labels ≤80 chars, line templates ≤240
+/// chars (the annotation-quote convention's scale).
+const MAX_NODE_PARAMETERS: usize = 8;
+const MAX_PARAMETER_LABEL_CHARS: usize = 80;
+const MAX_PARAMETER_LINE_CHARS: usize = 240;
+
+/// The substitution slot a parameter's line template carries exactly
+/// once — the sheet and ctl replace it with the typed value; the raw
+/// template with the literal placeholder substitutes nothing.
+pub(crate) const PARAMETER_VALUE_PLACEHOLDER: &str = "<value>";
+
 /// The agentskills.io spec's frontmatter vocabulary — the ONLY top-level
 /// keys a definition may carry (Amendment A1: spec fields only).
 const SPEC_FRONTMATTER_KEYS: &[&str] = &[
@@ -123,6 +135,55 @@ pub(crate) struct DefinitionTrigger {
     pub(crate) tags: Vec<String>,
 }
 
+/// One declared stamp-time parameter (`[parameters.<name>]` in an
+/// action's node config block): a *guaranteed, canonically-formatted,
+/// owner-attributed annotation at stamp time* — nothing more. The value
+/// rides the stamp op's `annotations` lines; what it MEANS is decided by
+/// the sealed mandate's own prose (e.g. the narrative-backfill cap law),
+/// and execution authority still flows only from the per-effect
+/// approval digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefinitionParameter {
+    /// The `[parameters.<name>]` key — slug grammar, name-sorted.
+    pub(crate) name: String,
+    /// The Automate sheet's field label.
+    pub(crate) label: String,
+    /// Refuse the stamp when no arriving line satisfies this parameter.
+    pub(crate) required: bool,
+    /// The field's help line on the sheet.
+    pub(crate) hint: Option<String>,
+    /// The annotation line template, carrying `<value>` exactly once.
+    pub(crate) line: String,
+}
+
+impl DefinitionParameter {
+    /// The fixed-string anchors around the template's one `<value>`
+    /// slot — validation guarantees exactly one occurrence, so matching
+    /// is deterministic by construction (refinement R1).
+    pub(crate) fn anchors(&self) -> (&str, &str) {
+        let at = self
+            .line
+            .find(PARAMETER_VALUE_PLACEHOLDER)
+            .expect("validated: template carries the placeholder exactly once");
+        (
+            &self.line[..at],
+            &self.line[at + PARAMETER_VALUE_PLACEHOLDER.len()..],
+        )
+    }
+
+    /// R1 satisfaction: the line exactly matches the template with
+    /// `<value>` replaced by a NON-EMPTY segment. The raw template with
+    /// the literal placeholder is NOT satisfaction, and a line matching
+    /// no template is an ordinary note — callers never refuse it.
+    pub(crate) fn matches(&self, line: &str) -> bool {
+        let (prefix, suffix) = self.anchors();
+        line.len() > prefix.len() + suffix.len()
+            && line.starts_with(prefix)
+            && line.ends_with(suffix)
+            && line != self.line
+    }
+}
+
 /// One parsed node: id from its `## node: <id>` heading, machine config
 /// from the fenced toml block opening the section, goal prose after it.
 #[derive(Debug, Clone)]
@@ -137,6 +198,9 @@ pub(crate) struct DefinitionNode {
     pub(crate) project_root: Option<String>,
     pub(crate) cadence: Option<DefinitionCadence>,
     pub(crate) trigger: Option<DefinitionTrigger>,
+    /// Declared stamp-time parameters, name-sorted (action-only in v1;
+    /// the parser refuses `[parameters.*]` on workflow nodes).
+    pub(crate) parameters: Vec<DefinitionParameter>,
 }
 
 impl DefinitionNode {
@@ -329,6 +393,22 @@ pub(crate) fn resolve_definition(
 
 // ---- The served catalog (slice 2) ----
 
+/// One declared parameter's catalog surface — everything the Automate
+/// sheet needs to render the field, substitute the typed value into the
+/// line template, and show the exact line the stamp will record.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CatalogParameter {
+    pub(crate) name: String,
+    pub(crate) label: String,
+    pub(crate) required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hint: Option<String>,
+    /// v1's one kind, `"annotation"` — served so a future kind is wire
+    /// vocabulary a sheet can dispatch on, never a silent guess.
+    pub(crate) kind: &'static str,
+    pub(crate) line: String,
+}
+
 /// One node's catalog surface — the Automate sheet's prefill material.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct CatalogNode {
@@ -350,6 +430,8 @@ pub(crate) struct CatalogNode {
     pub(crate) trigger_kind: Option<super::types::AgendaKind>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) trigger_tags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) parameters: Vec<CatalogParameter>,
 }
 
 /// One catalog entry: a discovered definition with its validation state.
@@ -501,6 +583,18 @@ fn catalog_entry(
                         .as_ref()
                         .map(|t| t.tags.clone())
                         .unwrap_or_default(),
+                    parameters: node
+                        .parameters
+                        .iter()
+                        .map(|p| CatalogParameter {
+                            name: p.name.clone(),
+                            label: p.label.clone(),
+                            required: p.required,
+                            hint: p.hint.clone(),
+                            kind: "annotation",
+                            line: p.line.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
             text,
@@ -527,6 +621,24 @@ struct NodeConfigToml {
     project_root: Option<String>,
     cadence: Option<CadenceToml>,
     trigger: Option<TriggerToml>,
+    parameters: Option<std::collections::BTreeMap<String, ParameterToml>>,
+}
+
+/// One `[parameters.<name>]` sub-table (skills/plugins unification §4b).
+/// Deny-unknown like every config shape: an unknown key refuses the
+/// definition by name instead of silently riding as prose.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParameterToml {
+    label: String,
+    #[serde(default)]
+    required: bool,
+    hint: Option<String>,
+    /// v1 accepts exactly `"annotation"`; unknown kinds refuse by name —
+    /// future kinds are new vocabulary, never silent passthrough.
+    kind: String,
+    /// The annotation line template; must carry `<value>` exactly once.
+    line: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -751,6 +863,77 @@ pub(crate) fn parse_definition(
                 section.id
             ));
         }
+        let declared = config.parameters.unwrap_or_default();
+        if declared.len() > MAX_NODE_PARAMETERS {
+            return Err(format!(
+                "node `{}` declares more than {MAX_NODE_PARAMETERS} parameters",
+                section.id
+            ));
+        }
+        let mut parameters: Vec<DefinitionParameter> = Vec::with_capacity(declared.len());
+        for (param_name, param) in declared {
+            if !valid_slug(&param_name) {
+                return Err(format!(
+                    "parameter name {param_name:?} violates the slug grammar (lowercase \
+                     alphanumerics, single interior hyphens)"
+                ));
+            }
+            let label_chars = param.label.trim().chars().count();
+            if label_chars == 0 || param.label.chars().count() > MAX_PARAMETER_LABEL_CHARS {
+                return Err(format!(
+                    "parameter `{param_name}` label must be 1..={MAX_PARAMETER_LABEL_CHARS} \
+                     characters"
+                ));
+            }
+            if param.kind != "annotation" {
+                return Err(format!(
+                    "parameter `{param_name}` kind {:?} is not v1 vocabulary — the one \
+                     kind is \"annotation\" (future kinds are new vocabulary, never \
+                     silent passthrough)",
+                    param.kind
+                ));
+            }
+            let line = param.line.trim().to_string();
+            if line.matches(PARAMETER_VALUE_PLACEHOLDER).count() != 1 {
+                return Err(format!(
+                    "parameter `{param_name}` line template must contain \
+                     {PARAMETER_VALUE_PLACEHOLDER} exactly once (got {:?})",
+                    param.line
+                ));
+            }
+            if line.chars().count() > MAX_PARAMETER_LINE_CHARS {
+                return Err(format!(
+                    "parameter `{param_name}` line template exceeds \
+                     {MAX_PARAMETER_LINE_CHARS} characters"
+                ));
+            }
+            parameters.push(DefinitionParameter {
+                name: param_name,
+                label: param.label,
+                required: param.required,
+                hint: param.hint,
+                line,
+            });
+        }
+        // Refinement R1(c): matching stays deterministic by construction —
+        // two templates one line could satisfy simultaneously (identical,
+        // or one's anchors subsuming the other's) refuse at validation.
+        for i in 0..parameters.len() {
+            for j in (i + 1)..parameters.len() {
+                let (a, b) = (&parameters[i], &parameters[j]);
+                let ((ap, asx), (bp, bsx)) = (a.anchors(), b.anchors());
+                if (ap.starts_with(bp) || bp.starts_with(ap))
+                    && (asx.ends_with(bsx) || bsx.ends_with(asx))
+                {
+                    return Err(format!(
+                        "node `{}`: parameters `{}` and `{}` have overlapping line \
+                         templates — one arriving line could satisfy both, so \
+                         matching would not be deterministic",
+                        section.id, a.name, b.name
+                    ));
+                }
+            }
+        }
         nodes.push(DefinitionNode {
             title: config
                 .title
@@ -765,6 +948,7 @@ pub(crate) fn parse_definition(
             project_root: config.project_root,
             cadence,
             trigger,
+            parameters,
         });
     }
 
@@ -786,6 +970,17 @@ pub(crate) fn parse_definition(
                 return Err(format!(
                     "workflow node `{}` declares cadence/trigger — workflow nodes fire \
                      on_unblock; entry triggers are future vocabulary",
+                    node.id
+                ));
+            }
+            // Same ruled-absence pattern for declared parameters: every
+            // named use case is an action, and workflow-level parameter
+            // routing (which node's item carries the annotation? the
+            // hub?) deserves its own ruling rather than a guess.
+            if !node.parameters.is_empty() {
+                return Err(format!(
+                    "workflow node `{}` declares [parameters.*] — v1 parameters are \
+                     action-only; workflow parameter routing is future vocabulary",
                     node.id
                 ));
             }
@@ -1230,6 +1425,203 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("claude-code and codex"), "{err}");
+    }
+
+    /// Skills/plugins S2 (§4b): `[parameters.<name>]` sub-tables parse
+    /// with the house deny-unknown rigor and every stated rail — slug
+    /// names, label 1..=80, kind exactly "annotation" (unknown kinds
+    /// refuse BY NAME), `<value>` exactly once, line ≤240, at most 8 per
+    /// definition — and an old-format definition parses unchanged.
+    #[test]
+    fn declared_parameters_validate_with_deny_unknown_rigor() {
+        let cap = "[parameters.cap]\nlabel = \"Spend cap\"\nrequired = true\nhint = \"ceiling\"\nkind = \"annotation\"\nline = \"NS CAP: $<value>\"\n";
+        let def = parse_definition(&action(cap, "P."), "sample").unwrap();
+        assert_eq!(
+            def.nodes[0].parameters,
+            vec![DefinitionParameter {
+                name: "cap".into(),
+                label: "Spend cap".into(),
+                required: true,
+                hint: Some("ceiling".into()),
+                line: "NS CAP: $<value>".into(),
+            }]
+        );
+
+        // Old format: no `parameters` key parses exactly as before.
+        let def = parse_definition(&action("", "P."), "sample").unwrap();
+        assert!(def.nodes[0].parameters.is_empty());
+
+        // `required` defaults false; `hint` is optional.
+        let minimal = "[parameters.scope]\nlabel = \"Scope\"\nkind = \"annotation\"\nline = \"SCOPE: <value>\"\n";
+        let def = parse_definition(&action(minimal, "P."), "sample").unwrap();
+        assert!(!def.nodes[0].parameters[0].required);
+        assert!(def.nodes[0].parameters[0].hint.is_none());
+
+        // Unknown kinds refuse by name — future kinds are new
+        // vocabulary, never silent passthrough.
+        let err = parse_definition(
+            &action(
+                "[parameters.x]\nlabel = \"X\"\nkind = \"wire-field\"\nline = \"X: <value>\"\n",
+                "P.",
+            ),
+            "sample",
+        )
+        .unwrap_err();
+        assert!(err.contains("\"wire-field\""), "{err}");
+        assert!(err.contains("annotation"), "{err}");
+
+        // Unknown keys inside the sub-table refuse by name.
+        let err = parse_definition(
+            &action(
+                "[parameters.x]\nlabel = \"X\"\nkind = \"annotation\"\nline = \"X: <value>\"\ndefault = \"60\"\n",
+                "P.",
+            ),
+            "sample",
+        )
+        .unwrap_err();
+        assert!(err.contains("default"), "{err}");
+
+        // The placeholder appears exactly once — zero or two refuse.
+        for line in ["X: value", "X: <value> <value>"] {
+            let config = format!(
+                "[parameters.x]\nlabel = \"X\"\nkind = \"annotation\"\nline = \"{line}\"\n"
+            );
+            let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
+            assert!(err.contains("exactly once"), "{line:?}: {err}");
+        }
+
+        // Label bounds: empty and >80 chars refuse.
+        for label in [String::from(" "), "x".repeat(81)] {
+            let config = format!(
+                "[parameters.x]\nlabel = \"{label}\"\nkind = \"annotation\"\nline = \"X: <value>\"\n"
+            );
+            let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
+            assert!(err.contains("label must be 1..=80"), "{err}");
+        }
+
+        // Line template bound: >240 chars refuse.
+        let config = format!(
+            "[parameters.x]\nlabel = \"X\"\nkind = \"annotation\"\nline = \"{}<value>\"\n",
+            "x".repeat(241)
+        );
+        let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
+        assert!(err.contains("exceeds 240"), "{err}");
+
+        // Parameter names obey the slug grammar.
+        let err = parse_definition(
+            &action(
+                "[parameters.\"Bad Name\"]\nlabel = \"X\"\nkind = \"annotation\"\nline = \"X: <value>\"\n",
+                "P.",
+            ),
+            "sample",
+        )
+        .unwrap_err();
+        assert!(err.contains("slug grammar"), "{err}");
+
+        // At most 8 parameters per definition.
+        let mut config = String::new();
+        for i in 0..9 {
+            config.push_str(&format!(
+                "[parameters.p{i}]\nlabel = \"P{i}\"\nkind = \"annotation\"\nline = \"P{i}: <value>\"\n"
+            ));
+        }
+        let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
+        assert!(err.contains("more than 8 parameters"), "{err}");
+
+        // The action-only rail (the R3 ruled-absence pattern): a
+        // workflow node declaring [parameters.*] refuses by name.
+        let doc = "---\nname: x\ndescription: d\n---\n\nO.\n\n## node: a\n\n```toml\n[parameters.cap]\nlabel = \"Cap\"\nkind = \"annotation\"\nline = \"CAP: <value>\"\n```\n\nA.\n\n## node: b\n\n```toml\n```\n\nB.\n";
+        let err = parse_definition(doc, "x").unwrap_err();
+        assert!(err.contains("workflow node `a`"), "{err}");
+        assert!(err.contains("action-only"), "{err}");
+
+        // Refinement R1(c): templates one line could satisfy
+        // simultaneously refuse at validation — identical, and
+        // anchor-subsuming pairs alike; disjoint anchors coexist.
+        for (a, b) in [
+            ("CAP: $<value>", "CAP: $<value>"),
+            ("CAP: $<value>", "CAP: <value>"),
+            ("NS CAP: $<value>", "NS <value> extra"),
+        ] {
+            let config = format!(
+                "[parameters.one]\nlabel = \"One\"\nkind = \"annotation\"\nline = \"{a}\"\n\
+                 [parameters.two]\nlabel = \"Two\"\nkind = \"annotation\"\nline = \"{b}\"\n"
+            );
+            let err = parse_definition(&action(&config, "P."), "sample").unwrap_err();
+            assert!(
+                err.contains("overlapping line templates"),
+                "{a:?}/{b:?}: {err}"
+            );
+            assert!(err.contains("`one`") && err.contains("`two`"), "{err}");
+        }
+        let disjoint =
+            "[parameters.one]\nlabel = \"One\"\nkind = \"annotation\"\nline = \"A: <value>\"\n\
+             [parameters.two]\nlabel = \"Two\"\nkind = \"annotation\"\nline = \"B: <value>\"\n";
+        let def = parse_definition(&action(disjoint, "P."), "sample").unwrap();
+        assert_eq!(def.nodes[0].parameters.len(), 2);
+    }
+
+    /// Refinement R1(a): satisfaction is the template with `<value>`
+    /// replaced by a NON-EMPTY segment — fixed-string anchors on both
+    /// sides, and the raw template with the literal placeholder
+    /// satisfies nothing.
+    #[test]
+    fn parameter_matching_is_anchored_and_deterministic() {
+        let param = DefinitionParameter {
+            name: "cap".into(),
+            label: "Spend cap".into(),
+            required: true,
+            hint: None,
+            line: "NS CAP: $<value>".into(),
+        };
+        assert!(param.matches("NS CAP: $60"));
+        assert!(param.matches("NS CAP: $60.50"));
+        // The literal placeholder substitutes nothing.
+        assert!(!param.matches("NS CAP: $<value>"));
+        // An empty segment satisfies nothing.
+        assert!(!param.matches("NS CAP: $"));
+        // Anchors are exact — prefix and suffix both bind.
+        assert!(!param.matches("CAP: $60"));
+        assert!(!param.matches("ns cap: $60"));
+        assert!(!param.matches("a NS CAP: $60"));
+
+        let suffixed = DefinitionParameter {
+            line: "cap <value> end".into(),
+            ..param
+        };
+        assert!(suffixed.matches("cap 60 end"));
+        assert!(!suffixed.matches("cap  end"));
+        assert!(!suffixed.matches("cap 60 end."));
+    }
+
+    /// §4c: the catalog serves declared parameters on the node,
+    /// skip-if-empty — the Automate sheet renders served data only.
+    #[test]
+    fn catalog_serves_declared_parameters_skip_if_empty() {
+        let root = tempfile::tempdir().unwrap();
+        materialize_house_definitions(root.path()).unwrap();
+        let catalog = definition_catalog(root.path());
+        let backfill = catalog
+            .iter()
+            .find(|e| e.name == "narrative-backfill")
+            .unwrap();
+        let node = serde_json::to_value(&backfill.nodes[0]).unwrap();
+        assert_eq!(
+            node["parameters"],
+            serde_json::json!([{
+                "name": "cap",
+                "label": "Spend cap",
+                "required": true,
+                "hint": "Cumulative cost ceiling for this arc; estimates, never billed \
+                         dollars. Re-annotate the THREAD to steer it mid-arc.",
+                "kind": "annotation",
+                "line": "NS CAP: $<value>",
+            }])
+        );
+        // Skip-if-empty: a parameterless node serializes no key at all.
+        let triage = catalog.iter().find(|e| e.name == "triage").unwrap();
+        let node = serde_json::to_value(&triage.nodes[0]).unwrap();
+        assert!(node.get("parameters").is_none(), "{node}");
     }
 
     #[test]

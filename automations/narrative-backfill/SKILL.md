@@ -31,6 +31,13 @@ subscription OAuth are ESTIMATES, never billed dollars.
 agent = "codex"
 model = "gpt-5.6-sol"
 effort = "xhigh"
+
+[parameters.cap]
+label = "Spend cap"
+required = true
+hint = "Cumulative cost ceiling for this arc; estimates, never billed dollars. Re-annotate the THREAD to steer it mid-arc."
+kind = "annotation"
+line = "NS CAP: $<value>"
 ```
 
 Narrative backfill run. MISSION: digest this machine's session

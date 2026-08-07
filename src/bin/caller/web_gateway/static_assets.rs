@@ -893,28 +893,45 @@ mod tests {
         assert!(sheet.contains("shadowed by a personal definition of the same name"));
     }
 
-    /// Card 01KZ8PK1FD: the automate sheet's stamp-time note lane. The
-    /// note input rides the stamp op's `annotations`; for a
-    /// cap-demanding definition it is the spend-cap field whose bare
-    /// typed amount canonicalizes client-side to the exact
-    /// `NS CAP: $<amount>` bytes the mandate greps for — no human
-    /// hand-formats spend authority. And the executor summary stays
-    /// honest: it names the definition's node pins instead of claiming
-    /// "daemon defaults" when pins exist.
+    /// Skills/plugins S2 (sealed intake d56f4ebf, §4c): the automate
+    /// sheet renders DECLARED parameters served on the catalog node —
+    /// v0's prose-sniffing cap heuristic (card 01KZ8PK1FD) is replaced
+    /// by declared data. The typed value substitutes into the declared
+    /// line template client-side (the machine writes the canonical
+    /// bytes), the pre-stamp summary shows the exact substituted line,
+    /// the empty-required gate is client convenience beside the daemon's
+    /// refusal, and every line rides the stamp op's `annotations` beside
+    /// the surviving generic note lane. The v0 copy laws carry over: the
+    /// annotation surface is named THREAD, and the executor summary
+    /// names the definition's node pins instead of claiming "daemon
+    /// defaults" when pins exist.
     #[test]
-    fn automate_sheet_note_field_canonicalizes_spend_caps() {
+    fn automate_sheet_renders_declared_parameters() {
         let sheet = include_str!("../../../../static/app/ui2-agenda.js");
         assert!(
-            sheet.contains("function agendaStampCapDemanded"),
-            "the sheet must detect cap-demanding definitions from their served text"
+            sheet.contains("function agendaStampDeclaredParams"),
+            "the sheet must render the parameters the catalog declares"
         );
         assert!(
-            sheet.contains("NS CAP: $${bare}"),
-            "a bare typed amount must canonicalize to the exact NS CAP: $<amount> bytes"
+            !sheet.contains("agendaStampCapDemanded"),
+            "the v0 prose-sniffing cap heuristic is replaced by declared data (S2)"
         );
         assert!(
-            sheet.contains("overrides.annotations = [noteText]"),
-            "the note must ride the stamp op's annotations field"
+            sheet.contains(".replace('<value>', () => value)"),
+            "the typed value must substitute into the declared template verbatim"
+        );
+        assert!(
+            sheet.contains("record ${param.label || param.name} in the item’s THREAD: ${line}"),
+            "the pre-stamp summary must show the exact substituted line"
+        );
+        assert!(
+            sheet.contains("Fill the required ${param.label || param.name} field"),
+            "an empty required parameter must refuse client-side (convenience; \
+             the daemon op is the wall)"
+        );
+        assert!(
+            sheet.contains("overrides.annotations = annotations"),
+            "parameter lines and the note must ride the stamp op's annotations field"
         );
         // Copy law: the user-facing name for the annotation surface is
         // THREAD (the UI's label), never the internal inspector name.
@@ -922,8 +939,8 @@ mod tests {
             sheet.contains("THREAD section"),
             "note copy must name the THREAD section"
         );
-        // Executor honesty (the sheet-summary half of the card): the
-        // definition's node pins are named when no explicit pick is
+        // Executor honesty (the sheet-summary half of card 01KZ8PK1FD):
+        // the definition's node pins are named when no explicit pick is
         // made — the stamp lane's actual fallback.
         assert!(
             sheet.contains("the definition’s node pins, recorded on the manifest"),
