@@ -303,4 +303,22 @@ mod tests {
         assert!(serde_json::from_str::<AddSkillBody>(r#"{"name":"x","path":"/tmp/s"}"#).is_err());
         assert!(serde_json::from_str::<AddSkillBody>(r#"{"skill_md":"---"}"#).is_err());
     }
+
+    /// The add core re-checks the byte cap before touching anything, so
+    /// the tunnel lane (params-as-body, no HTTP BodyPolicy in front) is
+    /// bounded by the same constant the route row pins. The refusal fires
+    /// before any parse or state access — hermetic by construction.
+    #[tokio::test]
+    async fn add_core_refuses_oversized_bodies_on_any_transport() {
+        let body = "x".repeat(crate::user_skills::ADD_BODY_CAP_BYTES + 1);
+        let actor = crate::access::actor::ActorBinding::from_principal(
+            &crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http"),
+            None,
+        );
+        let response = super::skill_add_api_response(&body, &actor).await;
+        match response {
+            super::ApiResponse::Json { status, .. } => assert_eq!(status, 413),
+            _ => panic!("expected a JSON refusal"),
+        }
+    }
 }

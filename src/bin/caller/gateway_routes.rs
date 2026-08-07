@@ -3510,6 +3510,24 @@ mod tests {
             policy("DELETE", "/api/skills/some-user-skill"),
             BodyPolicy::None
         );
+        // The S4 role wall: every user-skill mutation lane classifies as
+        // a Settings-grade operation — the class the compiled hosted
+        // ceiling can never satisfy (`role:none` denies Settings; pinned
+        // in access::iam's hosted-immutability tests) — so
+        // hosted-provenance principals cannot reach add, remove, or the
+        // toggle by construction.
+        for (method, path) in [
+            ("POST", "/api/skills"),
+            ("DELETE", "/api/skills/some-user-skill"),
+            ("POST", "/api/skills/intendant-cli"),
+        ] {
+            let (route, _) = match_route(method, path).unwrap();
+            assert_eq!(
+                route.authz,
+                RouteAuthz::Operation(PeerOperation::Settings),
+                "{method} {path} must stay Settings-grade"
+            );
+        }
         // The update-lane actions carry at most a small JSON body.
         assert_eq!(
             policy("POST", "/api/daemon/update-lane/check"),
