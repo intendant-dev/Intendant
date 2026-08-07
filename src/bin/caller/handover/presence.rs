@@ -61,8 +61,27 @@ pub(crate) struct DrainHoldout {
 /// Presence-record cap on mirrored holdout rows: the record is a small
 /// display file read by every co-homed boot's status pass, and
 /// `session_count` carries the full truth — truncated renders say "and
-/// N more" from the difference.
+/// N more" from the difference. Successors widen past the cap through
+/// the sibling doorway ([`super::sibling_wait_set`]); the record itself
+/// crosses the handover wire and never grows.
 pub(crate) const PRESENCE_HOLDOUT_ROWS_CAP: usize = 16;
+
+/// The ONE holdout ordering rule, shared by every producer of a holdout
+/// row list (the supervisor's wait-set report, the sibling-doorway
+/// widening): parked rows first with the earliest reset leading — capped
+/// renders keep the decisive parked-until facts — then id order for
+/// stable rendering.
+pub(crate) fn sort_drain_holdout_rows(rows: &mut [DrainHoldout]) {
+    let park_key = |row: &DrainHoldout| match &row.limit_park {
+        Some(park) => (0u8, park.resets_at_epoch.unwrap_or(u64::MAX)),
+        None => (1u8, 0),
+    };
+    rows.sort_by(|a, b| {
+        park_key(a)
+            .cmp(&park_key(b))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+}
 
 /// `<boot_id>.json` — one daemon boot's self-description.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
