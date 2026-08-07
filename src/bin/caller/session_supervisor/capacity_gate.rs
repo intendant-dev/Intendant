@@ -316,7 +316,11 @@ impl SessionSupervisor {
         let Some(controller) = self.config.capacity.as_ref() else {
             return;
         };
-        let sample = intendant_platform::memory::sample_memory();
+        let sample = if mock_memory_probe_disabled() {
+            None
+        } else {
+            intendant_platform::memory::sample_memory()
+        };
         if let Some(view) = controller.observe(sample, std::time::Instant::now()) {
             self.config.bus.send(AppEvent::CapacityState { view });
         }
@@ -349,11 +353,60 @@ fn epoch_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Hermetic-rig knob: `INTENDANT_MOCK_MEMORY=nominal` — honored only
+/// alongside `PROVIDER=mock`, fail-closed like the synthetic display
+/// backend — makes the capacity monitor skip the HOST memory probe.
+/// The mock-provider e2e daemons otherwise inherit the box's real
+/// pressure stage: a loaded CI Mac flips stage defer at zero residents,
+/// which suffixes every untargeted dispatch ack and breaks exact-ack
+/// e2e pins (observed live across three merge groups, 2026-08-07).
+/// Skipping the probe rides `observe(None)`'s fail-open no-signal path:
+/// stage decays to Normal and the view says `probe_ok: false` — honest,
+/// because the rig really did disable the probe. A stray or planted env
+/// var on a real-provider daemon changes nothing.
+fn mock_memory_probe_disabled() -> bool {
+    std::env::var("INTENDANT_MOCK_MEMORY").as_deref() == Ok("nominal")
+        && std::env::var("PROVIDER").as_deref() == Ok("mock")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::EventBus;
     use crate::session_supervisor::tests::{managed_session, test_supervisor_config};
+
+    /// The mock-memory knob fails closed exactly like the synthetic
+    /// display: it disables the host probe only when the scripted mock
+    /// provider is explicitly selected too.
+    #[tokio::test]
+    async fn mock_memory_probe_gate_requires_the_mock_provider() {
+        let _guard = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let saved_provider = std::env::var("PROVIDER").ok();
+        let saved_knob = std::env::var("INTENDANT_MOCK_MEMORY").ok();
+
+        std::env::remove_var("PROVIDER");
+        std::env::set_var("INTENDANT_MOCK_MEMORY", "nominal");
+        assert!(
+            !mock_memory_probe_disabled(),
+            "the knob alone must never disarm the probe"
+        );
+        std::env::set_var("PROVIDER", "mock");
+        assert!(mock_memory_probe_disabled());
+        std::env::set_var("INTENDANT_MOCK_MEMORY", "defer");
+        assert!(
+            !mock_memory_probe_disabled(),
+            "an unrecognized value must not half-arm anything"
+        );
+
+        match saved_provider {
+            Some(value) => std::env::set_var("PROVIDER", value),
+            None => std::env::remove_var("PROVIDER"),
+        }
+        match saved_knob {
+            Some(value) => std::env::set_var("INTENDANT_MOCK_MEMORY", value),
+            None => std::env::remove_var("INTENDANT_MOCK_MEMORY"),
+        }
+    }
 
     fn supervisor_with_bound(
         project: &std::path::Path,
