@@ -316,6 +316,10 @@ pub(crate) enum RouteHandlerId {
     /// bundled plugin payloads), with provenance, trust posture, and
     /// per-root install facts as one derived body.
     SkillsList,
+    /// Deactivate/re-enable one skill via the persisted disabled-set;
+    /// reconciles both install roots in the same request and refuses
+    /// per-kind (plugin payloads toward their plugin's toggle).
+    SkillSetEnabled,
     /// Tier-2 PR render join for one anchor (expand-time, cached).
     AgendaPrState,
     /// One agenda item, full + decorated, by id or unique prefix
@@ -1067,6 +1071,24 @@ pub(crate) static ROUTES: &[Route] = &[
         "Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts",
     )
     .with_tunnel(tunnel_method("api_skills_list")),
+    // Deactivate / re-enable one skill by name (skills/plugins
+    // unification S3). Settings-grade like the plugin toggle — hosted
+    // provenance (`role:none`) never reaches it. The per-kind law holds
+    // at this wall: builtins flip the persisted disabled-set and the
+    // sweep applies it over BOTH discovery roots in-request (the set
+    // outranks the sweep); plugin-materialized skills refuse by name
+    // toward their plugin's toggle; unknown names refuse. The flip
+    // records the gate-resolved actor, and the response carries the
+    // refreshed row plus the per-root installer report.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Segments("/api/skills", &[SegmentSpec::Capture("name")]),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(4 * 1024),
+        RouteHandlerId::SkillSetEnabled,
+        "Deactivate or re-enable one skill via the persisted disabled-set (sweeps both roots in-request; plugin payloads refuse toward their plugin's toggle)",
+    )
+    .with_tunnel(tunnel_method("api_skill_set_enabled")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/agenda"),
@@ -3421,6 +3443,11 @@ mod tests {
         // A plugin toggle carries only {"enabled": bool}.
         assert_eq!(
             policy("POST", "/api/plugins/codex-cloud-remote-compute"),
+            BodyPolicy::Capped(4 * 1024)
+        );
+        // The skill toggle likewise.
+        assert_eq!(
+            policy("POST", "/api/skills/intendant-cli"),
             BodyPolicy::Capped(4 * 1024)
         );
         // The update-lane actions carry at most a small JSON body.

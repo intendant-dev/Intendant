@@ -69,6 +69,50 @@ pub(crate) async fn plugin_set_enabled_api_response(plugin_id: &str, body: &str)
     }
 }
 
+/// Transport-neutral core of `POST /api/skills/{name}` (tunnel twin
+/// `api_skill_set_enabled`): flip one skill's enable state in the
+/// persisted disabled-set, reconcile skill materialization in the same
+/// request (the set outranks the sweep — both roots settle before the
+/// response), then re-derive the catalog row. Refusals are per-kind and
+/// named: a plugin-materialized skill refuses toward its plugin's toggle
+/// (409), an unknown name refuses by name (404). `actor` is the caller's
+/// gate-resolved attribution, mapped at the authenticated edge — never
+/// request-body claims — and recorded on the disabling flip.
+pub(crate) async fn skill_set_enabled_api_response(
+    name: &str,
+    body: &str,
+    actor: &crate::access::actor::ActorBinding,
+) -> ApiResponse {
+    let request: SetEnabledBody = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiResponse::json_error(400, format!("invalid skill request: {error}"))
+        }
+    };
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let record = crate::skill_state::DisabledRecord::from_actor(actor, at_ms);
+    let name = name.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::skill_state::set_skill_enabled(&name, request.enabled, record)?;
+        let install = crate::skill_install::reconcile_global_skills().to_json();
+        let skill = crate::skill_catalog::skill_entry_json(&name).ok_or_else(|| {
+            crate::skill_state::SkillToggleRefusal::io(format!("skill '{name}' vanished mid-request"))
+        })?;
+        Ok::<_, crate::skill_state::SkillToggleRefusal>(
+            serde_json::json!({ "skill": skill, "install": install }),
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(body)) => ApiResponse::json(200, JsonBody::Value(body)),
+        Ok(Err(refusal)) => ApiResponse::json_error(refusal.http_status(), refusal.message()),
+        Err(error) => ApiResponse::json_error(500, format!("skill toggle: {error}")),
+    }
+}
+
 pub(crate) async fn handle_plugins_list(
     stream: DemuxStream,
     cors: crate::gateway_routes::CorsPosture,
@@ -95,6 +139,18 @@ pub(crate) async fn handle_plugin_set_enabled(
     fleet_origin: Option<&str>,
 ) {
     let response = plugin_set_enabled_api_response(&plugin_id, &body).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_skill_set_enabled(
+    stream: DemuxStream,
+    name: String,
+    body: String,
+    actor: crate::access::actor::ActorBinding,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = skill_set_enabled_api_response(&name, &body, &actor).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 

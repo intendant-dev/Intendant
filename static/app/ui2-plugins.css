@@ -57,15 +57,21 @@ html.ui-v2 .plugins-section { display: flex; flex-direction: column; gap: 10px; 
 html.ui-v2 .plugins-section .ui-section-title { margin: 6px 0 0; }
 html.ui-v2 .plugins-section-sub { color: var(--text-3); font-size: 12.5px; line-height: 1.5; }
 
-/* Skill rows: name + provenance chip (+ plugin link), description,
-   trust-posture line, per-root install chips. */
+/* Skill rows: name + provenance chip (+ state chip, plugin link, or
+   deactivate/re-enable toggle per the served lifecycle), attribution
+   line when deactivated, description, trust-posture line, per-root
+   install chips, and the last toggle's installer report. */
 html.ui-v2 .skill-row { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; }
 html.ui-v2 .skill-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 html.ui-v2 .skill-row-name { font-size: 13px; font-weight: 600; margin-right: auto; }
-html.ui-v2 .skill-plugin-link { font-size: 12px; padding: 2px 10px; }
+html.ui-v2 .skill-plugin-link,
+html.ui-v2 .skill-toggle { font-size: 12px; padding: 2px 10px; }
 html.ui-v2 .skill-row-desc { color: var(--text-2); font-size: 12.5px; line-height: 1.45; }
 html.ui-v2 .skill-row-trust { color: var(--text-3); font-size: 12px; }
 html.ui-v2 .skill-row-roots { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+html.ui-v2 .skill-row-attribution { color: var(--text-3); font-size: 12px; }
+html.ui-v2 .skill-row-deactivated .skill-row-desc,
+html.ui-v2 .skill-row-deactivated .skill-row-trust { opacity: 0.75; }
 
 /* Deep-link target flash: the plugin card that owns a skill row. */
 html.ui-v2 .plugin-card-flash { animation: plugin-card-flash 1.6s ease-out; }
