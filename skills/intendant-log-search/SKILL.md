@@ -101,3 +101,10 @@ For Codex, inspect `session_agent_config.json` for `codex_home`; otherwise use `
 - Do not search only `session_meta.json` or summaries. Dashboard deep search scans full log files and full JSON string fields because useful evidence often lives in `message`, `data`, or backend-native JSONL.
 - For exact context, prefer `context_snapshot` files over dashboard previews. Large raw context can be summarized or omitted from replay. Only the LATEST sidecar per (source, session id) stream is retained on disk (rotation; `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1` archives all) — historical `context_snapshot` rows keep their metadata but their files are gone, and `exact_replay_available` on replayed rows reflects disk truth. Selecting the newest `context_snapshot` row (`... | tail -1`) still resolves to a real file.
 - `turns/turn_NNN_messages.json` is debug-only (`INTENDANT_LOG_MESSAGES_JSON=1`); expect it to be absent in normal sessions except where the provider produced no context snapshot (then it is written as the only exact input record).
+- Codex Cloud remote-compute tasks: the state root and `intendant codex-cloud
+  status` carry only the local lease and terminal job state. The provider-side
+  assistant/tool output is NOT on disk, and a raw authenticated task-detail
+  response embeds the task prompt — which can carry a one-time worker
+  enrollment secret. Do not hand-roll that request during log investigation;
+  report the terminal state and the task URL instead (a redacted recovery
+  verb is a named product gap).
