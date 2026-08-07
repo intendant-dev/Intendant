@@ -573,17 +573,38 @@ jobs:
       # Deep-link boots evaluate later-fragment code during script
       # evaluation (the deep-link TDZ class — a let/const declared in a
       # late fragment but reached from the fragment-48 route apply dies
-      # with "Cannot access before initialization"). #stats and #files
-      # are the two tabs that have regressed this way; boot each one.
+      # with "Cannot access before initialization"). #stats, #files, and
+      # #access/daemons are the tabs that have regressed this way; boot
+      # each one. The last leg additionally rides a follow-carry blob
+      # (`&carry=<base64 json>` — the drain auto-follow's cross-origin
+      # state handoff, 31-init-identity-fleet.js): a hotswap lands the
+      # successor tab on the predecessor's route at module-eval time, so
+      # the carry parse + strip + route apply must boot clean too (the
+      # 2026-08-07 owner-reported module death arrived on exactly this
+      # vector).
       - name: dashboard-boot smoke (deep links)
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
         shell: bash
         run: |
-          for hash in stats files; do
+          for hash in stats files access/daemons; do
             node scripts/smoke-dashboard-boot.cjs \
               --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}#$hash" \
               --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
           done
+          carry=$(node -e 'console.log(Buffer.from(JSON.stringify({
+            v: 1,
+            route: "access/daemons",
+            windows: [],
+            subtabs: { access: "daemons" },
+            stamps: {
+              pred_boot: "ci-boot-probe",
+              pred: { git_sha: "0000000000000000", built_at: "1970-01-01T00:00:00Z" },
+              on_disk: { git_sha: "1111111111111111", built_at: "1970-01-01T00:00:01Z" },
+            },
+          })).toString("base64"))')
+          node scripts/smoke-dashboard-boot.cjs \
+            --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/?token=${{ steps.daemon.outputs.token }}#access/daemons&carry=$carry" \
+            --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
 
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
