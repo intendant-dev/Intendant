@@ -190,9 +190,7 @@ fn remote_start_args(raw: &[String]) -> Result<Value, String> {
         ],
         &["--allow-dirty"],
     )
-    .map_err(|error| {
-        format!("{error} (the remote command and its own flags go after `--`)")
-    })?;
+    .map_err(|error| format!("{error} (the remote command and its own flags go after `--`)"))?;
     if args.positional.is_empty() {
         return Err(
             "remote start requires the command after `--`, e.g. `intendant ctl remote start \
@@ -316,7 +314,10 @@ fn job_field<'a>(job: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn progress_line(job: &Value, state: &str) -> String {
-    let mut line = format!("remote job {} {state}", job_field(job, "job_id").unwrap_or("?"));
+    let mut line = format!(
+        "remote job {} {state}",
+        job_field(job, "job_id").unwrap_or("?")
+    );
     if let Some(acquisition) = job.get("acquisition") {
         if let Some(stage) = acquisition.get("stage").and_then(Value::as_str) {
             line.push_str(&format!(" ({stage}"));
@@ -384,8 +385,10 @@ fn print_job_report(job: &Value) {
                     .unwrap_or(0),
             );
         }
-        for (name, truncated_key) in [("stdout", "stdout_truncated"), ("stderr", "stderr_truncated")]
-        {
+        for (name, truncated_key) in [
+            ("stdout", "stdout_truncated"),
+            ("stderr", "stderr_truncated"),
+        ] {
             let text = result.get(name).and_then(Value::as_str).unwrap_or("");
             if !text.is_empty() {
                 let truncated = result
@@ -538,9 +541,8 @@ mod tests {
 
     #[test]
     fn start_omits_absent_flags_so_daemon_defaults_stay_authoritative() {
-        let value =
-            remote_start_args(&strings(&["--revision", "0123abc", "--", "cargo", "check"]))
-                .expect("minimal start parses");
+        let value = remote_start_args(&strings(&["--revision", "0123abc", "--", "cargo", "check"]))
+            .expect("minimal start parses");
         let object = value.as_object().expect("object");
         for absent in [
             "host",
@@ -598,8 +600,8 @@ mod tests {
         );
         let error = remote_job_id(&[], "status", &[]).expect_err("missing id refuses");
         assert!(error.contains("requires the job id"), "{error}");
-        let error = remote_job_id(&strings(&["a", "b"]), "cancel", &[])
-            .expect_err("two ids refuse");
+        let error =
+            remote_job_id(&strings(&["a", "b"]), "cancel", &[]).expect_err("two ids refuse");
         assert!(error.contains("exactly one job id"), "{error}");
     }
 
@@ -666,7 +668,8 @@ mod tests {
         let job = remote_job_from_response(&response).expect("job unwraps");
         assert_eq!(job["job_id"], "remote-1");
 
-        let error_response = serde_json::json!({ "error": { "code": -32603, "message": "denied" } });
+        let error_response =
+            serde_json::json!({ "error": { "code": -32603, "message": "denied" } });
         let error = remote_job_from_response(&error_response).expect_err("MCP error surfaces");
         assert!(error.contains("denied"), "{error}");
 

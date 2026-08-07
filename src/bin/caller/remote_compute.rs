@@ -1002,17 +1002,13 @@ const LANE_DOWN_BODY: &str = "remote_command acquisition failed because the prov
      signed-out acquisition failure is annotated here.";
 
 /// One alarm per daemon boot (process lifetime), never per attempt.
-static LANE_AUTH_ALARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static LANE_AUTH_ALARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Decide whether `error` is the auth family AND this boot has not alarmed
 /// yet. Non-auth failures (no worker available, detached host, timeout)
 /// never latch — the first *signed-out* failure must still alarm even if
 /// an unrelated failure came earlier.
-fn should_alarm_lane_auth_failure(
-    error: &str,
-    latch: &std::sync::atomic::AtomicBool,
-) -> bool {
+fn should_alarm_lane_auth_failure(error: &str, latch: &std::sync::atomic::AtomicBool) -> bool {
     if !crate::external_agent::backend_auth_failure_line(error) {
         return false;
     }
@@ -1056,10 +1052,7 @@ fn lane_down_notification(copy: &str, now_ms: u64) -> crate::event::AppEvent {
 /// ULID order) and append `text`, skipping an identical consecutive
 /// annotation so a crash-looping daemon never stacks copies of the same
 /// facts. Mirrors the safeguards needs-recast parking contract.
-fn park_lane_down(
-    handle: &crate::agenda::AgendaHandle,
-    text: String,
-) -> Result<String, String> {
+fn park_lane_down(handle: &crate::agenda::AgendaHandle, text: String) -> Result<String, String> {
     use crate::agenda::{AgendaActor, AgendaCommand, AgendaItem, AgendaKind, AgendaStatus};
     let snapshot = handle.snapshot();
     let mut anchors: Vec<&AgendaItem> = snapshot
@@ -1133,9 +1126,10 @@ fn note_remote_command_failure(error: &str) {
             if let Err(err) = park_lane_down(&handle, lane_down_annotation(&copy, error)) {
                 eprintln!("[remote-compute] {err} — the notification carries the facts");
             }
-            handle
-                .bus()
-                .send(lane_down_notification(&copy, crate::codex_cloud::now_unix_ms()));
+            handle.bus().send(lane_down_notification(
+                &copy,
+                crate::codex_cloud::now_unix_ms(),
+            ));
         }
         None => eprintln!(
             "[remote-compute] lane down ({copy}) but no agenda handle is published — \
