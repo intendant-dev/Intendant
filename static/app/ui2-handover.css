@@ -109,6 +109,44 @@ html.ui-v2 .handover-holdout-list li {
   font-size: 12px;
   line-height: 1.45;
 }
+/* Each row is a real doorway into its session: a button styled as the
+   row text, leading with the grid convention's short-id chip. */
+html.ui-v2 .handover-holdout-row {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 0 4px 0 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-name,
+html.ui-v2 button.handover-holdout-row:focus-visible .handover-holdout-name,
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-id,
+html.ui-v2 button.handover-holdout-row:focus-visible .handover-holdout-id {
+  color: var(--accent, #62a0ea);
+}
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-name {
+  text-decoration: underline;
+}
+html.ui-v2 .handover-holdout-row-inert {
+  cursor: default;
+}
+html.ui-v2 .handover-holdout-id {
+  flex-shrink: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+  color: var(--text, #e6e6e6);
+}
 html.ui-v2 .handover-holdout-name {
   font-weight: 600;
 }
@@ -118,7 +156,25 @@ html.ui-v2 .handover-holdout-state {
 html.ui-v2 .handover-holdout-state.parked {
   color: var(--warning, #e5a50a);
 }
-html.ui-v2 .handover-holdout-more {
+/* "…and N more" is a DOOR — a real button that widens the list to
+   every row in hand; the -note form covers only a remainder the
+   daemon never itemized (its door is the daemon link above). */
+html.ui-v2 button.handover-holdout-more {
+  display: block;
+  margin-top: 2px;
+  padding: 0 4px 0 0;
+  border: none;
+  background: transparent;
+  font-size: 11px;
+  color: var(--accent, #62a0ea);
+  cursor: pointer;
+}
+html.ui-v2 button.handover-holdout-more:hover,
+html.ui-v2 button.handover-holdout-more:focus-visible {
+  text-decoration: underline;
+}
+html.ui-v2 .handover-holdout-more-note {
+  margin-top: 2px;
   font-size: 11px;
   color: var(--muted, #7e8896);
 }
