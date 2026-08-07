@@ -3126,6 +3126,108 @@ mod tests {
         }
     }
 
+    /// The `<option value="…">` values of one `<select id="…">` in the
+    /// bundled dashboard markup, for the picker-parity pins below.
+    fn spa_select_option_values(app: &str, select_id: &str) -> Vec<String> {
+        let marker = format!("id=\"{select_id}\"");
+        let start = app
+            .find(&marker)
+            .unwrap_or_else(|| panic!("select #{select_id} not found in static/app.html"));
+        let body = &app[start..];
+        let end = body
+            .find("</select>")
+            .unwrap_or_else(|| panic!("select #{select_id} is never closed"));
+        let body = &body[..end];
+        let mut values = Vec::new();
+        let mut rest = body;
+        while let Some(option_at) = rest.find("<option") {
+            rest = &rest[option_at..];
+            let tag_end = rest.find('>').expect("unterminated <option tag");
+            let tag = &rest[..tag_end];
+            if let Some(value_at) = tag.find("value=\"") {
+                let value = &tag[value_at + "value=\"".len()..];
+                let close = value.find('"').expect("unterminated option value");
+                values.push(value[..close].to_string());
+            }
+            rest = &rest[tag_end..];
+        }
+        values
+    }
+
+    /// Every dashboard surface that offers a *backend* choice — the New
+    /// Session Agent picker, the Delegate dialog, and Settings' External
+    /// Agent dropdown — is static fallback markup mirroring the daemon
+    /// catalog (`AgentBackend` / `backend_availability_json`), so this
+    /// parity test pins each option set to the source (the CLAUDE.md
+    /// "derive, don't mirror" carve-out). A retired backend surviving in
+    /// any picker (the Gemini CLI, retired 2026-07-03, was reported as an
+    /// installed agent on the 2026-08-07 wrapper e2e) or a new backend
+    /// missing from one ships as silent drift without this.
+    #[test]
+    fn spa_backend_pickers_match_the_backend_catalog() {
+        let app = include_str!("../../../../static/app.html");
+        let canonical: Vec<&str> = [
+            AgentBackend::Codex,
+            AgentBackend::ClaudeCode,
+            AgentBackend::Kimi,
+            AgentBackend::Pi,
+        ]
+        .iter()
+        .map(AgentBackend::as_short_str)
+        .collect();
+        for select_id in ["new-session-agent", "session-delegate-agent", "set-external-agent"] {
+            let backend_ids: Vec<String> = spa_select_option_values(app, select_id)
+                .into_iter()
+                // Non-backend rows: "" (inherit / internal placeholder)
+                // and the New Session picker's explicit internal row.
+                .filter(|value| !value.is_empty() && value != "internal")
+                .collect();
+            assert_eq!(
+                backend_ids, canonical,
+                "#{select_id} backend options drifted from the AgentBackend catalog"
+            );
+            for id in &backend_ids {
+                assert!(
+                    AgentBackend::from_str_loose(id).is_some(),
+                    "#{select_id} offers '{id}', which no live backend resolves"
+                );
+            }
+        }
+    }
+
+    /// The New Session fueled banner names PROVIDER-KEY fuel (Anthropic /
+    /// OpenAI / Gemini booleans from api_key_status) directly under the
+    /// Agent picker, so its copy must speak provider language — "provider
+    /// API key(s)" — never bare company names that read as installed
+    /// agents ("Fueled — Gemini credentials" was reported as "Gemini
+    /// installed" on the 2026-08-07 wrapper e2e; Gemini exists only as a
+    /// native provider, provider/gemini.rs, not as an agent backend).
+    #[test]
+    fn spa_new_session_fuel_note_speaks_provider_language() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // The name list derives from the per-provider key-status
+            // booleans — provider names only, never backend labels.
+            "d.anthropic ? 'Anthropic' : ''",
+            "d.openai ? 'OpenAI' : ''",
+            "d.gemini ? 'Gemini' : ''",
+            // The named and generic templates, provider-qualified.
+            "`Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`",
+            "'Fueled — provider credentials active for the internal agent, ready to launch.'",
+            // The pre-JS static default carries the same generic copy.
+            "Fueled &mdash; provider credentials active for the internal agent, ready to launch.",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the provider-language fueled banner: {needle}"
+            );
+        }
+        assert!(
+            !app.contains("${names} credentials active"),
+            "the fueled banner regressed to bare provider names, which read as installed agents"
+        );
+    }
+
     #[test]
     fn canonical_thread_ids_match_backend_capabilities() {
         assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));
