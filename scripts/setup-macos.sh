@@ -572,9 +572,19 @@ run_install() {
         echo ""
     fi
 
+    # The launch instruction must work from any cwd — owners copy-paste it
+    # into a fresh shell long after this run (a relative target/ path fails
+    # from anywhere but the repo root). `open -b` resolves the installed
+    # bundle through LaunchServices; bundle-macos.sh installed it to
+    # /Applications above. No launch flags: the app wrapper always starts
+    # the daemon with the web dashboard on.
     echo "  IMPORTANT: Launch from the macOS GUI for audio to work:"
     echo ""
-    echo "    open target/Intendant.app --args --web"
+    echo "    open -b com.intendant.app"
+    echo ""
+    echo "  This works from any directory — the app is installed in"
+    echo "  /Applications and starts the daemon and web dashboard"
+    echo "  itself (no flags needed)."
     echo ""
     echo "  macOS requires GUI session for audio input. Do NOT run"
     echo "  from SSH — use the app bundle, Finder, or Terminal.app"
