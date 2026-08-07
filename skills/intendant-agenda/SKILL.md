@@ -112,7 +112,16 @@ dashboard, attributed to your session.
   thread), leaves fired history untouched, and refuses on an approved
   manifest. Approval binds the exact manifest
   digest, so revising the manifest (re-running `schedule`) voids any
-  approval. The outcome writes back to the item (`effects[].last_run`
+  approval. Manifests are floor-checked fail-closed at BOTH propose
+  and approve (fire time plus a 12h staleness bound): once a
+  manifest's window has passed, its old digest can never be
+  (re-)approved. So when one needs re-review or restoration — a
+  crash-stranded approved manifest, a stale pending card — check the
+  floor FIRST: if it is past, re-run `schedule` with a fresh `--at`
+  and let the owner approve the NEW digest. Never rely on a
+  revoke-then-re-approve pair against the old digest; the approve leg
+  refuses on the stale floor and strands the effect unapproved
+  mid-pair. The outcome writes back to the item (`effects[].last_run`
   in `list --json`: state, session id, note) — check it next session.
   If the goal depends on a file (a brief, a rider), seal it:
   `--binding-ref file:PATH` (repeatable) sha256-pins the content at

@@ -40,7 +40,12 @@ description: In any Intendant-supervised native, Codex, Claude Code, Kimi Code, 
   the requested `expected_revision`; a branch name never weakens that guard.
 - For Rust work that should reuse compile outputs after worker replacement,
   request `cache: "durable_sccache"`. The default authenticated relay needs no
-  cloud credentials; the job fails early if sccache or the relay is unavailable.
+  cloud credentials, but it namespaces its cache repository by the supervised
+  session's project root — an unsupervised call (e.g. an owner-shell acceptance
+  run) has none and fails early with "durable_sccache through home requires a
+  supervised project root". Run such calls from a supervised session, or omit
+  `cache` (the `none` default) and accept a cold build. The job also fails
+  early if sccache or the relay is unavailable.
 
 ## Waiting for an acquired worker
 
