@@ -2730,8 +2730,12 @@ mod tests {
              www_authenticate_header: \"Bearer realm=\\\"OAuth\\\"\" })"
         ));
         // Generic transport failures are not the auth family.
-        assert!(!backend_auth_failure_line("failed to connect: connection refused"));
-        assert!(!backend_auth_failure_line("stream error: stream closed unexpectedly"));
+        assert!(!backend_auth_failure_line(
+            "failed to connect: connection refused"
+        ));
+        assert!(!backend_auth_failure_line(
+            "stream error: stream closed unexpectedly"
+        ));
         assert!(!backend_auth_failure_line("Round 1 complete (0 turns)"));
         // A 403 quota refusal is not a sign-in problem.
         assert!(!backend_auth_failure_line("HTTP error: 403 Forbidden"));

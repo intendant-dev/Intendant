@@ -1390,10 +1390,11 @@ pub(crate) fn spawn_cache_vitals_listener(
                             vitals.activity.as_ref(),
                             activity,
                         );
-                        vitals.activity = Some(crate::session_activity::fold_backend_auth_attention(
-                            vitals.activity.as_ref(),
-                            folded,
-                        ));
+                        vitals.activity =
+                            Some(crate::session_activity::fold_backend_auth_attention(
+                                vitals.activity.as_ref(),
+                                folded,
+                            ));
                     });
                 }
                 Ok(AppEvent::SessionConfigFacts {

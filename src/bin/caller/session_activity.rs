@@ -873,9 +873,11 @@ mod tests {
         // A fresh claim in `next` wins over the carried one.
         let refreshed = SessionActivityVitals {
             state: SessionActivityState::Idle,
-            auth_failure: Some("Codex has no credentials on this daemon — sign in from the \
+            auth_failure: Some(
+                "Codex has no credentials on this daemon — sign in from the \
                                 Vault tab, or renew its vault lease"
-                .into()),
+                    .into(),
+            ),
             auth_failure_backend: Some("codex".into()),
             ..Default::default()
         };
