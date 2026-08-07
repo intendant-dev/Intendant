@@ -320,8 +320,13 @@ mod tests {
         );
 
         let name = builtin_name(0);
-        set_skill_enabled_in(root, name, false, record("principal:dash", "dashboard", 1234))
-            .unwrap();
+        set_skill_enabled_in(
+            root,
+            name,
+            false,
+            record("principal:dash", "dashboard", 1234),
+        )
+        .unwrap();
         let disabled = disabled_skills_in(root);
         let entry = disabled.get(name).expect("entry recorded");
         assert_eq!(entry.principal.as_deref(), Some("principal:dash"));
@@ -375,9 +380,8 @@ mod tests {
         assert_eq!(refusal.http_status(), 409);
 
         // Unknown name: refused by name, 404.
-        let refusal =
-            set_skill_enabled_in(root, "no-such-skill", false, DisabledRecord::default())
-                .unwrap_err();
+        let refusal = set_skill_enabled_in(root, "no-such-skill", false, DisabledRecord::default())
+            .unwrap_err();
         assert_eq!(
             refusal.message(),
             "unknown skill 'no-such-skill' — not a builtin or bundled plugin payload"

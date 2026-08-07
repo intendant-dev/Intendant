@@ -99,7 +99,9 @@ pub(crate) async fn skill_set_enabled_api_response(
         crate::skill_state::set_skill_enabled(&name, request.enabled, record)?;
         let install = crate::skill_install::reconcile_global_skills().to_json();
         let skill = crate::skill_catalog::skill_entry_json(&name).ok_or_else(|| {
-            crate::skill_state::SkillToggleRefusal::io(format!("skill '{name}' vanished mid-request"))
+            crate::skill_state::SkillToggleRefusal::io(format!(
+                "skill '{name}' vanished mid-request"
+            ))
         })?;
         Ok::<_, crate::skill_state::SkillToggleRefusal>(
             serde_json::json!({ "skill": skill, "install": install }),
