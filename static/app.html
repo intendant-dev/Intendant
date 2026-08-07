@@ -39221,7 +39221,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4b5e84982dc7341e';
+const INTENDANT_APP_BUILD = 'bff6d9658cdb5b01';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -101138,7 +101138,8 @@ function agendaInspEffectHtml(item) {
     if (st.kind === 'pending') {
       A('Approve this exact plan', 'eff-approve', 'prim',
         `Binds digest ${agendaShortDigest(e.digest)} — any edit voids it`);
-      A('Edit schedule…', 'sched');
+      A('Edit plan…', 'sched', '',
+        'The full plan — goal, schedule, shape, executor, project, sealed refs. Saving mints a new digest for you to approve');
       A('Decline', 'eff-withdraw', 'danger',
         'Withdraws this proposal — it stops asking for approval; the item and its history stay. Propose again anytime');
     } else if (['armed', 'watching', 'waiting', 'ready'].includes(st.kind)) {

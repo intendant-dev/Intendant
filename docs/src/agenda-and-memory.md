@@ -600,7 +600,8 @@ root, first-run time, and cadence for standing effects. Saving mints the
 revised manifest **through the one re-propose lane** (`propose_effect`,
 which now carries `interactive` like the other manifest fields — absent
 keeps the legacy autonomous bytes; older daemons refuse the new field by
-name): same effect lineage, new digest, prior approval void, and the
+name; `ctl agenda schedule --interactive` states the same shape from the
+CLI): same effect lineage, new digest, prior approval void, and the
 card's digest chip updates in place — an amber **revised** chip marks a
 digest that changed since the owner last looked (their own edits are
 pre-acknowledged; a stale Approve is refused by the daemon regardless,

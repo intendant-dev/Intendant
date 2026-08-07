@@ -51,6 +51,7 @@ dashboard, attributed to your session.
 "$INTENDANT" ctl agenda patch 01KX --due +3d   # presentation edits (title/body/tags/due)
 "$INTENDANT" ctl agenda schedule 01KX --goal "Run the soak checks and summarize" --at +2d
 "$INTENDANT" ctl agenda schedule 01KX --goal "Weekly housekeeping pass" --at "+1d" --every 7d   # STANDING: one approval covers the series
+"$INTENDANT" ctl agenda schedule 01KX --goal "Sit with the owner on the release board" --at +1d --interactive   # owner-sitting: fires, opens with the goal, waits for the owner
 "$INTENDANT" ctl agenda withdraw 01KX --reason "superseded by the rewrite"   # take back a PENDING unapproved proposal (yours included); approved = owner's revoke-schedule
 "$INTENDANT" ctl agenda annotate 01KX "Tried the vendor API — still 403; evidence in run 88."
 "$INTENDANT" ctl agenda attest 01KX --occurrence 98eb14c2... --outcome partial --note "3 of 5 slices landed" --ref file:$HOME/handoff.md   # fired sessions: self-report your occurrence (rider names its id)
@@ -101,7 +102,9 @@ dashboard, attributed to your session.
 - **Scheduled sessions**: `schedule` proposes a session manifest on an
   item — at `--at`, the daemon spawns a normal supervised session with
   `--goal` as its task (never raw actions; add `--orchestrate` for the
-  orchestration shape). **Nothing fires until the owner approves the
+  orchestration shape, `--interactive` for the owner-sitting shape —
+  the fired session opens with the goal as the owner's message and
+  waits for them). **Nothing fires until the owner approves the
   manifest**, so propose and move on; the item badges the owner's
   attention rail. Approval is the owner's act alone (dashboard or an
   owner shell) — you may propose, but never attempt `approve` or
