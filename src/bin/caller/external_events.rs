@@ -332,6 +332,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     // condition → `TransientRoundDeath`; permanent at zero turns →
     // `TurnFailed`; permanent after real work → the completion shape.
     let mut pending_fatal_round_error: Option<FatalRoundError> = None;
+    // Classify-once latch for the backend auth-failure family (the named
+    // "signed out — sign in from the Vault tab" state): a 401 reconnect
+    // storm spans many Log/BackendError events but the honest state is
+    // published exactly once per round; the latched copy also names the
+    // round outcome when the fatal cause is auth-shaped.
+    let mut backend_auth_noticed: Option<String> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
     let managed_context_density_steer_suppressed = managed_context_recovery_kickstart
@@ -1607,6 +1613,10 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 emit_external_session_goal(config, event_thread_id.clone(), None);
             }
             external_agent::AgentEvent::Log { level, message } => {
+                // Log truth first: every raw line (the 401 storms
+                // included) flows to the session log untouched…
+                let auth_shaped =
+                    event_is_primary && external_agent::backend_auth_failure_line(&message);
                 slog(config.session_log, |l| match level.as_str() {
                     "warn" => l.warn(&message),
                     "error" => l.error(&message),
@@ -1622,6 +1632,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     content: message,
                     turn: None,
                 });
+                // …then the classification changes only the user-facing
+                // state: one named honest row + the sticky signed-out
+                // attention chip, per round.
+                if auth_shaped {
+                    note_backend_auth_failure(
+                        config.bus,
+                        config.session_log,
+                        &config.session_id,
+                        external_backend_of_config(config).as_ref(),
+                        agent.name(),
+                        &mut backend_auth_noticed,
+                    );
+                }
             }
             external_agent::AgentEvent::BackendError {
                 message,
@@ -1663,15 +1686,37 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         l.error(&content);
                     }
                 });
+                // The auth family (401 / missing credentials) classifies
+                // to the ONE named honest state — emitted once per round,
+                // and it becomes the round's cause instead of the raw
+                // provider refusal, so the terminal reads "Codex is
+                // signed out — sign in from the Vault tab" rather than a
+                // reconnect-counter line. The raw content is already in
+                // the log rows above.
+                if event_is_primary && external_agent::backend_auth_failure_line(&message) {
+                    note_backend_auth_failure(
+                        config.bus,
+                        config.session_log,
+                        &config.session_id,
+                        external_backend_of_config(config).as_ref(),
+                        agent.name(),
+                        &mut backend_auth_noticed,
+                    );
+                }
                 // A fatal error the wrapper deems unrecoverable is the
                 // round's honest cause; recoverable ones resolve through
-                // the recovery precedence at the exit instead. The raw
-                // adapter message rides along so the error's own
-                // synthesized turn completion can be told apart from a
-                // real one.
+                // the recovery precedence at the exit instead. When the
+                // round already classified an auth failure, the latched
+                // named state IS the cause — the storm's final line (an
+                // `(other)` giving-up error) is its tail, not a new
+                // story. The raw adapter message rides along so the
+                // error's own synthesized turn completion can be told
+                // apart from a real one.
                 let fatal_round_error = (!will_retry && event_is_primary && !recovery_required)
                     .then(|| FatalRoundError {
-                        reason: content.clone(),
+                        reason: backend_auth_noticed
+                            .clone()
+                            .unwrap_or_else(|| content.clone()),
                         raw_message: message.clone(),
                     });
                 config.bus.send(AppEvent::LogEntry {
@@ -2752,20 +2797,22 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     });
                 }
                 // A REAL completion inside the grace window supersedes a
-                // buffered fatal cause — the turn did land after all. The
-                // guard: an error result's own synthesized completion
-                // (Claude Code pushes `TurnCompleted` carrying the SAME
-                // result text right after the fatal `BackendError`, one
-                // wire line) is the error restated, not a recovery — it
-                // must leave the cause standing or the round-outcome
-                // classification never sees it (the 2026-07-29 specimens'
-                // exact silent path) and the zero-turn TurnFailed pin
-                // stays unreachable on the CC wire.
-                let completion_is_the_error_itself = pending_fatal_round_error
-                    .as_ref()
-                    .is_some_and(|fatal| message.as_deref() == Some(fatal.raw_message.as_str()));
+                // buffered fatal cause — the turn did land after all.
+                // Two shapes leave the cause standing (the rule is
+                // `real_completion_supersedes_fatal`, pinned in
+                // external_supervision's tests): the error's own
+                // synthesized completion (Claude Code restates the fatal
+                // result text as `TurnCompleted` — the 2026-07-29
+                // specimens' silent path), and a completion that landed
+                // NOTHING (codex's app-server exhausting its 401 retries
+                // and emitting a plain empty `turn/completed` — the
+                // 2026-08-07T00:00Z nightly's success-shaped terminal
+                // over a signed-out backend).
+                let fatal_superseded = pending_fatal_round_error.as_ref().is_none_or(|fatal| {
+                    real_completion_supersedes_fatal(fatal, message.as_deref(), turns_in_round)
+                });
                 pending_turn_completion = Some((message, turns_in_round));
-                if !completion_is_the_error_itself {
+                if fatal_superseded {
                     pending_fatal_round_error = None;
                 }
                 if active_side_turns.is_empty() {

@@ -233,6 +233,23 @@ pub struct SessionActivityVitals {
     /// exactly when that list is non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub died_tasks_cause: Option<String>,
+    /// The named backend auth-failure state ("Codex is signed out — sign
+    /// in from the Vault tab"): published by the supervision seam when
+    /// the backend's own reported failure is auth-shaped (the 401 /
+    /// missing-credential family), never inferred from timing. Present
+    /// is an attention state — the raw failure lines stay in the
+    /// session log untouched; this is the one honest classification the
+    /// user-facing surfaces render instead. Cleared once the backend
+    /// demonstrably streams work again (the hub-side fold mirrors the
+    /// died-tasks rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_failure: Option<String>,
+    /// Canonical backend id (`"codex"`, `"claude-code"`, `"kimi"`,
+    /// `"pi"`) of the auth failure, so frontends can deep-link the
+    /// matching Vault sign-in card. Present exactly when `auth_failure`
+    /// is; absent when the failing backend could not be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_failure_backend: Option<String>,
 }
 
 /// Session configuration facts — model, reasoning effort, permission

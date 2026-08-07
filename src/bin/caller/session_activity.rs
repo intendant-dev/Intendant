@@ -268,6 +268,12 @@ impl ActivityMachine {
             // and any later publish from a live machine clears it.
             died_background_tasks: Vec::new(),
             died_tasks_cause: None,
+            // Same doctrine for the auth-failure attention: published by
+            // the supervision drain that classified the backend's own
+            // failure lines (`external_supervision::note_backend_auth_failure`),
+            // carried hub-side by `fold_backend_auth_attention`.
+            auth_failure: None,
+            auth_failure_backend: None,
         }
     }
 
@@ -308,6 +314,40 @@ pub(crate) fn fold_died_tasks_attention(
             if !prev.died_background_tasks.is_empty() {
                 next.died_background_tasks = prev.died_background_tasks.clone();
                 next.died_tasks_cause = prev.died_tasks_cause.clone();
+            }
+        }
+    }
+    next
+}
+
+/// Hub-side sticky fold for the backend auth-failure attention fields
+/// (`auth_failure` / `auth_failure_backend`), the died-tasks fold's auth
+/// twin with one deliberate difference: the failing round itself keeps
+/// publishing turn states (`awaiting-api` while the CLI retries its 401s,
+/// then `idle` when the empty round settles), so quiet turn phases must
+/// not erase the claim either — only STREAMED work does. Response or
+/// reasoning bytes and running tools are possible only past the
+/// provider's auth gate, so those states are the demonstrable-recovery
+/// evidence; `awaiting-api`/`rate-limited`/`idle`/`stalled` publishes
+/// carry the attention forward. A retried sign-in shows as one honest
+/// signed-out chip until the backend actually streams again.
+pub(crate) fn fold_backend_auth_attention(
+    prev: Option<&SessionActivityVitals>,
+    mut next: SessionActivityVitals,
+) -> SessionActivityVitals {
+    if next.auth_failure.is_none()
+        && !matches!(
+            next.state,
+            SessionActivityState::Reasoning
+                | SessionActivityState::Responding
+                | SessionActivityState::ToolRunning
+                | SessionActivityState::ParkedOnTasks
+        )
+    {
+        if let Some(prev) = prev {
+            if prev.auth_failure.is_some() {
+                next.auth_failure = prev.auth_failure.clone();
+                next.auth_failure_backend = prev.auth_failure_backend.clone();
             }
         }
     }
@@ -775,6 +815,79 @@ mod tests {
         assert_eq!(folded, idle2);
     }
 
+    /// The auth twin's fold: the signed-out attention survives the
+    /// failing round's own quiet phases (awaiting-api while the CLI
+    /// retries its 401s, the idle settle, a rate-limit claim) and clears
+    /// only on STREAMED work — bytes past the provider's auth gate.
+    #[test]
+    fn auth_attention_folds_sticky_through_quiet_phases_and_clears_on_streamed_work() {
+        let signed_out = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            since_epoch: 100,
+            auth_failure: Some("Codex is signed out — sign in from the Vault tab".into()),
+            auth_failure_backend: Some("codex".into()),
+            ..Default::default()
+        };
+        // Quiet phases carry the claim: idle, stalled, awaiting-api (a
+        // retry round that has not proven auth yet).
+        for state in [
+            SessionActivityState::Idle,
+            SessionActivityState::Stalled,
+            SessionActivityState::AwaitingApi,
+            SessionActivityState::RateLimited,
+        ] {
+            let next = SessionActivityVitals {
+                state,
+                since_epoch: 200,
+                ..Default::default()
+            };
+            let folded = fold_backend_auth_attention(Some(&signed_out), next);
+            assert_eq!(
+                folded.auth_failure.as_deref(),
+                Some("Codex is signed out — sign in from the Vault tab"),
+                "{state:?} must carry the auth attention"
+            );
+            assert_eq!(folded.auth_failure_backend.as_deref(), Some("codex"));
+        }
+
+        // Streamed work — possible only past the auth gate — clears it.
+        for state in [
+            SessionActivityState::Reasoning,
+            SessionActivityState::Responding,
+            SessionActivityState::ToolRunning,
+            SessionActivityState::ParkedOnTasks,
+        ] {
+            let next = SessionActivityVitals {
+                state,
+                since_epoch: 300,
+                ..Default::default()
+            };
+            let folded = fold_backend_auth_attention(Some(&signed_out), next);
+            assert!(
+                folded.auth_failure.is_none(),
+                "{state:?} is demonstrable recovery"
+            );
+            assert!(folded.auth_failure_backend.is_none());
+        }
+
+        // A fresh claim in `next` wins over the carried one.
+        let refreshed = SessionActivityVitals {
+            state: SessionActivityState::Idle,
+            auth_failure: Some("Codex has no credentials on this daemon — sign in from the \
+                                Vault tab, or renew its vault lease"
+                .into()),
+            auth_failure_backend: Some("codex".into()),
+            ..Default::default()
+        };
+        let folded = fold_backend_auth_attention(Some(&signed_out), refreshed.clone());
+        assert_eq!(folded.auth_failure, refreshed.auth_failure);
+
+        // No previous attention → pass-through.
+        let idle = SessionActivityVitals::default();
+        let folded = fold_backend_auth_attention(None, idle.clone());
+        assert_eq!(folded, idle);
+    }
+
     #[test]
     fn wire_shape_serializes_kebab_states_and_camel_fields() {
         // The dashboard consumes these exact strings; pin them.
@@ -787,6 +900,8 @@ mod tests {
             background_tasks: vec!["cargo test".into()],
             died_background_tasks: Vec::new(),
             died_tasks_cause: None,
+            auth_failure: None,
+            auth_failure_backend: None,
         };
         let json = serde_json::to_string(&activity).expect("serializes");
         assert!(json.contains("\"state\":\"tool-running\""), "{json}");
@@ -802,6 +917,7 @@ mod tests {
         assert!(!quiet.contains("backgroundTasks"), "{quiet}");
         assert!(!quiet.contains("diedBackgroundTasks"), "{quiet}");
         assert!(!quiet.contains("diedTasksCause"), "{quiet}");
+        assert!(!quiet.contains("authFailure"), "{quiet}");
         // The died-with-restart attention snapshot's wire spelling is
         // what the dashboard keys the attention state on; pin it.
         let died = serde_json::to_string(&SessionActivityVitals {
@@ -817,6 +933,23 @@ mod tests {
         assert!(
             died.contains("\"diedTasksCause\":\"the credential-reload restart\""),
             "{died}"
+        );
+        // The auth-failure attention's wire spelling — the dashboard
+        // derives the `signed-out` display state from these; pin them.
+        let signed_out = serde_json::to_string(&SessionActivityVitals {
+            auth_failure: Some("Codex is signed out — sign in from the Vault tab".into()),
+            auth_failure_backend: Some("codex".into()),
+            ..SessionActivityVitals::default()
+        })
+        .expect("serializes");
+        assert!(
+            signed_out
+                .contains("\"authFailure\":\"Codex is signed out — sign in from the Vault tab\""),
+            "{signed_out}"
+        );
+        assert!(
+            signed_out.contains("\"authFailureBackend\":\"codex\""),
+            "{signed_out}"
         );
         for state in [
             SessionActivityState::Reasoning,

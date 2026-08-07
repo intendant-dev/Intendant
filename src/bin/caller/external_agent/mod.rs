@@ -436,6 +436,79 @@ pub(crate) fn stderr_line_level(line: &str) -> &'static str {
     }
 }
 
+/// The 401/auth family: does this backend-reported failure line mean the
+/// CLI's own credentials are absent, expired, or revoked? One classifier
+/// for every backend (the vocabulary is the union of what each CLI
+/// actually prints); the per-backend part of the surface is the copy in
+/// [`backend_auth_failure_copy`]. Deliberately needle-tight — a false
+/// positive here would rename a healthy round's error to "signed out",
+/// so generic transport noise ("failed to connect", "error") stays out.
+pub(crate) fn backend_auth_failure_line(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    // codex-cli's built-in MCP connectors log `AuthRequired` transport
+    // errors for every third-party connector (Linear, Asana, …) that
+    // isn't logged in, at every app-server spawn. That is churn about
+    // OTHER services' auth, never the backend's own — see
+    // `stderr_line_level`'s twin carve-out.
+    if lowered.contains("rmcp::transport::worker") {
+        return false;
+    }
+    // Observed vocabularies:
+    // - codex model-API websocket/HTTPS refusals: "401 Unauthorized" +
+    //   "Missing bearer or basic authentication in header" (specimen:
+    //   the 2026-08-07T00:00Z nightly, wss://…/v1/responses reconnect
+    //   storm ending "Round 1 complete (0 turns)").
+    // - codex CLI login status: "Not logged in".
+    // - Claude Code signed-out/expired: "Invalid API key · Please run
+    //   /login", "OAuth token has expired", and the Anthropic API's
+    //   "authentication_error" type.
+    lowered.contains("401 unauthorized")
+        || lowered.contains("missing bearer")
+        || lowered.contains("not logged in")
+        || lowered.contains("please run /login")
+        || lowered.contains("oauth token has expired")
+        || lowered.contains("invalid api key")
+        || lowered.contains("authentication_error")
+}
+
+/// The ONE named honest state for the auth family — per-backend
+/// vocabulary derived from the backend's display name, two flavors by
+/// what a credential-file probe found. `credential_file_missing` is
+/// `Some(true)` only when the CLI's on-disk login artifact is known
+/// absent (the sharpest message); `Some(false)`/`None` (file present, or
+/// out of stat's reach — Claude Code's macOS keychain) keep the
+/// signed-out flavor, which stays true for expired/revoked credentials
+/// behind an existing file.
+pub(crate) fn backend_auth_failure_copy(
+    display_name: &str,
+    credential_file_missing: Option<bool>,
+) -> String {
+    if credential_file_missing == Some(true) {
+        format!(
+            "{display_name} has no credentials on this daemon — sign in from the Vault tab, \
+             or renew its vault lease"
+        )
+    } else {
+        format!("{display_name} is signed out — sign in from the Vault tab")
+    }
+}
+
+/// Stat the backend CLI's own on-disk login artifact — the per-backend
+/// dispatch over the same probes `backend_availability` serves. `None`
+/// means the platform stores credentials out of stat's reach, so absence
+/// proves nothing. The probe reads the DAEMON's view of the home; a
+/// session running on a leased home is not distinguished here (the
+/// missing-file copy names the lease remedy alongside sign-in for
+/// exactly that reason).
+pub(crate) fn backend_local_login(backend: &AgentBackend, home: &Path) -> Option<bool> {
+    match backend {
+        AgentBackend::Codex => codex_local_login(home),
+        AgentBackend::ClaudeCode => claude_code_local_login(home),
+        AgentBackend::Kimi => kimi_local_login(home),
+        AgentBackend::Pi => pi_local_login(home),
+    }
+}
+
 /// Forward a spawned agent's stderr into the session activity stream as
 /// `AgentEvent::Log` entries. Every external backend previously inherited
 /// stderr into the daemon's own stderr, where nobody supervising from a
@@ -2617,6 +2690,98 @@ mod tests {
         assert_eq!(
             stderr_line_level("websocket handshake failed: 401 Unauthorized"),
             "error"
+        );
+    }
+
+    #[test]
+    fn auth_failure_line_classifies_the_401_family() {
+        // The live specimens from the 2026-08-07T00:00Z nightly (both the
+        // stderr and the wire-error shapes).
+        assert!(backend_auth_failure_line(
+            "[codex stderr] 2026-08-07T00:00:30.324066Z ERROR \
+             codex_api::endpoint::responses_websocket: failed to connect to websocket: \
+             HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses"
+        ));
+        assert!(backend_auth_failure_line(
+            "Reconnecting... 2/5\nunexpected status 401 Unauthorized: Missing bearer or basic \
+             authentication in header, url: wss://api.openai.com/v1/responses"
+        ));
+        // Codex login-status vocabulary.
+        assert!(backend_auth_failure_line("Not logged in"));
+        // Claude Code signed-out/expired vocabularies.
+        assert!(backend_auth_failure_line(
+            "Invalid API key \u{b7} Please run /login"
+        ));
+        assert!(backend_auth_failure_line(
+            "OAuth token has expired. Please obtain a new token or refresh your existing token."
+        ));
+        assert!(backend_auth_failure_line(
+            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"
+        ));
+    }
+
+    #[test]
+    fn auth_failure_line_ignores_connector_churn_and_generic_noise() {
+        // rmcp MCP-connector churn mentions OTHER services' auth at every
+        // app-server spawn — never the backend's own credentials.
+        assert!(!backend_auth_failure_line(
+            "2026-08-07T00:00:27.021261Z ERROR rmcp::transport::worker: worker quit with \
+             fatal: Transport channel closed, when AuthRequired(AuthRequiredError { \
+             www_authenticate_header: \"Bearer realm=\\\"OAuth\\\"\" })"
+        ));
+        // Generic transport failures are not the auth family.
+        assert!(!backend_auth_failure_line("failed to connect: connection refused"));
+        assert!(!backend_auth_failure_line("stream error: stream closed unexpectedly"));
+        assert!(!backend_auth_failure_line("Round 1 complete (0 turns)"));
+        // A 403 quota refusal is not a sign-in problem.
+        assert!(!backend_auth_failure_line("HTTP error: 403 Forbidden"));
+    }
+
+    #[test]
+    fn auth_failure_copy_names_backend_and_flavor() {
+        // The named honest state, per-backend vocabulary from one
+        // builder (derive-don't-mirror): signed-out flavor when the
+        // credential file exists or is out of stat's reach…
+        assert_eq!(
+            backend_auth_failure_copy("Codex", Some(false)),
+            "Codex is signed out — sign in from the Vault tab"
+        );
+        assert_eq!(
+            backend_auth_failure_copy("Claude Code", None),
+            "Claude Code is signed out — sign in from the Vault tab"
+        );
+        // …and the sharper credential-file-missing flavor when the probe
+        // proves absence (the 2026-08-07T00:00Z nightly's actual state).
+        assert_eq!(
+            backend_auth_failure_copy("Codex", Some(true)),
+            "Codex has no credentials on this daemon — sign in from the Vault tab, or renew \
+             its vault lease"
+        );
+    }
+
+    #[test]
+    fn backend_local_login_dispatches_per_backend_probe() {
+        // Only the Claude Code arm is exercised directly: its probe reads
+        // no process environment, so the dispatch stays hermetic here.
+        // The env-honoring codex/kimi/pi probes carry their own `_in`
+        // injection tests.
+        let home = tempfile::tempdir().unwrap();
+        let expected_absent = if cfg!(target_os = "macos") {
+            // The macOS keychain keeps absence unprovable.
+            None
+        } else {
+            Some(false)
+        };
+        assert_eq!(
+            backend_local_login(&AgentBackend::ClaudeCode, home.path()),
+            expected_absent
+        );
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join(".credentials.json"), "{}").unwrap();
+        assert_eq!(
+            backend_local_login(&AgentBackend::ClaudeCode, home.path()),
+            Some(true)
         );
     }
 
