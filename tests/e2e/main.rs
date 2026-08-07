@@ -10385,3 +10385,91 @@ async fn capacity_bound_refuses_forks_and_queues_creates_until_headroom() {
         .to_string();
     complete_and_stop_session(&mut ws, &queued_id, &daemon_log).await;
 }
+
+/// The auth-lapse classification end to end (card 01KZCSD1972XYH1PVKZ9A91WN9,
+/// the 2026-08-07T00:00Z nightly): a fake claude whose only output is an
+/// auth-shaped failure — a 401 stderr line plus the error result envelope —
+/// must surface the ONE named honest state ("… sign in from the Vault tab",
+/// with the credential-file-missing flavor where the probe can prove
+/// absence) while the raw lines keep flowing to the session log, and the
+/// zero-turn round must end FAILED with the named reason instead of a
+/// success-shaped completion. Unix-only for the /bin/sh fake; the
+/// classifier, copy, fold, and supersede rules carry platform-neutral
+/// unit pins.
+#[cfg(unix)]
+#[tokio::test]
+async fn backend_auth_failure_classifies_to_the_named_signed_out_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rig = TestRig::new();
+    rig.write_script(&serde_json::json!({ "profiles": [] }));
+
+    // The fake claude: answer the first turn with a 401 stderr line (the
+    // reconnect-storm shape) and the auth-error result envelope, then
+    // stay alive reading stdin — the round must die on the CLASSIFIED
+    // fatal through the grace path, not on a process-exit terminal
+    // racing it.
+    let fake = rig.home.path().join("fake-claude.sh");
+    std::fs::write(
+        &fake,
+        concat!(
+            "#!/bin/sh\n",
+            "SID=\"21111111-2222-4333-8444-555555555555\"\n",
+            "read -r _line || exit 1\n",
+            "printf '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"%s\",\"model\":\"fake-sonnet\",\"permissionMode\":\"default\",\"tools\":[],\"cwd\":\".\"}\\n' \"$SID\"\n",
+            "echo 'failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.example.com/v1/responses' >&2\n",
+            "printf '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header\",\"session_id\":\"%s\"}\\n' \"$SID\"\n",
+            "while read -r _line; do :; done\n",
+        ),
+    )
+    .expect("write fake claude");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+
+    std::fs::write(
+        rig.project.path().join("intendant.toml"),
+        format!("[agent.claude_code]\ncommand = \"{}\"\n", fake.display()),
+    )
+    .expect("write project config");
+
+    let mut cmd = rig.command();
+    cmd.stdin(Stdio::piped()).args([
+        "--no-web",
+        "--json",
+        "--agent",
+        "claude-code",
+        "auth lapse task",
+    ]);
+    let mut child = cmd.spawn().expect("spawn intendant");
+    let _stdin = child.stdin.take().expect("piped stdin");
+
+    let logs = poll_until(
+        "the named signed-out state and the failed terminal",
+        RUN_TIMEOUT,
+        || async {
+            let logs = rig.session_logs();
+            (logs.contains("sign in from the Vault tab")
+                && logs.contains("External agent round failed before any turn completed"))
+            .then_some(logs)
+        },
+        || tail(&rig.session_logs(), 4000),
+    )
+    .await;
+
+    // Log truth untouched: the raw 401 lines (stderr and the wire error)
+    // still flow to the session log alongside the classification.
+    assert!(
+        logs.contains("401 Unauthorized"),
+        "raw auth lines must stay in the session log:\n{}",
+        tail(&logs, 4000)
+    );
+    // The named copy is the round's honest cause (not the raw refusal):
+    // the failed-terminal row carries it.
+    assert!(
+        logs.contains("External agent round failed before any turn completed: Claude Code"),
+        "the failed terminal must carry the named signed-out reason:\n{}",
+        tail(&logs, 4000)
+    );
+
+    child.kill().await.ok();
+}

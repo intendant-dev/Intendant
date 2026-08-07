@@ -1377,15 +1377,24 @@ pub(crate) fn spawn_cache_vitals_listener(
                     activity,
                 }) => {
                     hub.apply(&session_id, |vitals| {
-                        // Sticky died-with-restart attention: a respawned
-                        // backend's fresh machine settling to idle knows
-                        // nothing of its predecessor's task deaths; only
-                        // demonstrable work clears the attention fields
-                        // (see `session_activity::fold_died_tasks_attention`).
-                        vitals.activity = Some(crate::session_activity::fold_died_tasks_attention(
+                        // Sticky attention folds: a respawned backend's
+                        // fresh machine settling to idle knows nothing of
+                        // its predecessor's task deaths, and a failing
+                        // round's own turn-state publishes know nothing
+                        // of the classified auth failure; only
+                        // demonstrable work clears each family's fields
+                        // (see `session_activity::fold_died_tasks_attention`
+                        // / `fold_backend_auth_attention` for the
+                        // per-family evidence rules).
+                        let folded = crate::session_activity::fold_died_tasks_attention(
                             vitals.activity.as_ref(),
                             activity,
-                        ));
+                        );
+                        vitals.activity =
+                            Some(crate::session_activity::fold_backend_auth_attention(
+                                vitals.activity.as_ref(),
+                                folded,
+                            ));
                     });
                 }
                 Ok(AppEvent::SessionConfigFacts {
@@ -4864,6 +4873,10 @@ mod tests {
             "stalledAfterSeconds",
             "effort",
             "backgroundTasks",
+            // The classified backend auth-failure attention (the named
+            // "signed out — sign in from the Vault tab" state).
+            "authFailure",
+            "authFailureBackend",
             "model",
             "permissionMode",
             "permissionKind",
@@ -4894,7 +4907,8 @@ mod tests {
             );
         }
         // The wire spellings of the activity states the catalog renders —
-        // and the derived-only `stalled` — must all be explained.
+        // and the derived-only `stalled` / `died-tasks` / `signed-out` —
+        // must all be explained.
         for state in [
             "reasoning",
             "responding",
@@ -4903,6 +4917,8 @@ mod tests {
             "parked-on-tasks",
             "rate-limited",
             "stalled",
+            "died-tasks",
+            "signed-out",
         ] {
             assert!(
                 catalog.contains(state),

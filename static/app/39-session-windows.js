@@ -1610,6 +1610,30 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
   if (!activity || typeof activity !== 'object') return null;
   const state = String(activity.state || 'idle').trim();
   const since = Number(activity.sinceEpoch) || 0;
+  // The classified backend auth failure (wire `authFailure` +
+  // `authFailureBackend`): the daemon publishes the ONE named honest
+  // state ("Codex is signed out — sign in from the Vault tab") when the
+  // backend's own failure lines are auth-shaped, and the hub's sticky
+  // fold clears it only once the backend demonstrably streams again —
+  // so whenever the field is present, `signed-out` outranks the quiet
+  // state it rides (idle, stalled, awaiting-api): those are the storm's
+  // phases, not the story.
+  const authFailure = String(activity.authFailure || '').trim();
+  if (authFailure) {
+    return {
+      state: 'signed-out',
+      rawState: state,
+      elapsed: since ? Math.max(0, nowSec - since) : 0,
+      quiet: 0,
+      hasHeartbeat: false,
+      resetsAtEpoch: 0,
+      backgroundTasks: [],
+      diedTasks: [],
+      diedCause: '',
+      authFailure,
+      authBackend: String(activity.authFailureBackend || '').trim(),
+    };
+  }
   // Background tasks that DIED with a backend restart (wire
   // `diedBackgroundTasks` + `diedTasksCause`): the daemon publishes them
   // on an honest `idle` (nothing is running), and the dashboard derives
@@ -1631,6 +1655,8 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
       backgroundTasks: [],
       diedTasks,
       diedCause: String(activity.diedTasksCause || '').trim() || 'a backend restart',
+      authFailure: '',
+      authBackend: '',
     };
   }
   const lastByte = Number(activity.lastStreamByteEpoch) || 0;
@@ -1653,6 +1679,8 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
       : [],
     diedTasks: [],
     diedCause: '',
+    authFailure: '',
+    authBackend: '',
   };
 }
 
@@ -1681,6 +1709,7 @@ const ACTIVITY_STATE_LABELS = {
   'rate-limited': 'Rate-limited',
   stalled: 'Stalled',
   'died-tasks': 'Task died',
+  'signed-out': 'Signed out',
 };
 
 // Status-pill label for a parked session: plain words, with the count the
@@ -1702,6 +1731,14 @@ function sessionDiedTasksPillLabel(act) {
   if (!act || act.state !== 'died-tasks') return '';
   const n = (act.diedTasks || []).length;
   return n === 1 ? 'Task died with restart' : `${n} tasks died with restart`;
+}
+
+// Status-pill label for the classified auth-failure attention state: the
+// backend is signed out and the remedy is one tap away on the activity
+// chip — the pill names the problem instead of a bare "Idle".
+function sessionSignedOutPillLabel(act) {
+  if (!act || act.state !== 'signed-out') return '';
+  return 'Signed out';
 }
 
 function formatActivityElapsed(seconds) {
@@ -1893,6 +1930,7 @@ const VITALS_SYMBOLS = {
       stalled: 'clock',
       'rate-limited': 'slash',
       'died-tasks': 'triangle',
+      'signed-out': 'triangle',
     }[v.state] || 'clock'),
     chip: (v) => {
       if (v.state === 'reasoning') return `🧠 Thinking${v.effort ? ` · ${v.effort}` : ''} · ${v.elapsedText}`;
@@ -1907,6 +1945,7 @@ const VITALS_SYMBOLS = {
           ? `⚠ Task died · ${v.diedCause}`
           : `⚠ ${v.diedCount} tasks died · ${v.diedCause}`;
       }
+      if (v.state === 'signed-out') return '⚠ Signed out';
       return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
     },
     explain: (v) => {
@@ -1968,6 +2007,12 @@ const VITALS_SYMBOLS = {
         );
         return lines;
       }
+      if (v.state === 'signed-out') {
+        return [
+          v.authFailure || 'This agent’s backend is signed out — sign in from the Vault tab.',
+          'The raw failure lines are in the session log; nothing will work until the account is signed in again (or its vault lease renewed).',
+        ];
+      }
       return [`The model reports “${v.state}”.`];
     },
     // Short attention phrase for the health verdict's culprit list —
@@ -1980,12 +2025,20 @@ const VITALS_SYMBOLS = {
           ? `A background task died with ${v.diedCause} — re-run is one tap away`
           : `${v.diedCount} background tasks died with ${v.diedCause} — re-run is one tap away`;
       }
+      if (v.state === 'signed-out') return v.authFailure || 'Backend signed out — sign in from the Vault tab';
       return '';
     },
     // The one-tap re-run: an OWNER action that asks the session (a
     // normal follow-up through the existing lane) — the daemon never
-    // re-executes a died command itself.
+    // re-executes a died command itself. The signed-out state's one tap
+    // routes to the Vault sign-in card instead (the classified remedy).
     action: (v, sessionId) => {
+      if (v.state === 'signed-out') {
+        return {
+          label: 'Sign in from the Vault tab',
+          run: () => focusVaultAgentSignin(v.authBackend || undefined),
+        };
+      }
       if (v.state !== 'died-tasks' || !(v.diedTasks || []).length) return null;
       return {
         label: v.diedCount === 1 ? 'Ask the session to re-run it' : 'Ask the session to re-run them',
@@ -2605,15 +2658,18 @@ function vitalsChipModels(vitals, meta, sessionId) {
       diedTasks: act.diedTasks || [],
       diedCount: (act.diedTasks || []).length,
       diedCause: act.diedCause || '',
+      authFailure: act.authFailure || '',
+      authBackend: act.authBackend || '',
     }, {
       // Calm while genuinely working (parked included — waiting on its
       // own background work is normal); attention (health dot) for
-      // stalled, rate-limited, and died-tasks — the states that mean
-      // "waiting on something other than the model's own work" (and for
-      // died-tasks, a wait that already ended without its work).
-      severity: act.state === 'stalled' || act.state === 'rate-limited' || act.state === 'died-tasks' ? 'warn' : '',
+      // stalled, rate-limited, died-tasks, and signed-out — the states
+      // that mean "waiting on something other than the model's own
+      // work" (and for died-tasks/signed-out, a wait that will not end
+      // by itself).
+      severity: act.state === 'stalled' || act.state === 'rate-limited' || act.state === 'died-tasks' || act.state === 'signed-out' ? 'warn' : '',
       ticking: true,
-      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}|${(act.diedTasks || []).join(';')}|${act.diedCause || ''}`,
+      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}|${(act.diedTasks || []).join(';')}|${act.diedCause || ''}|${act.authFailure || ''}`,
     });
   }
 
