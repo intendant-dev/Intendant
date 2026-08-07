@@ -322,7 +322,11 @@ fn is_direct_directory(path: &Path, metadata: &std::fs::Metadata) -> bool {
     metadata.is_dir() && !metadata.file_type().is_symlink() && std::fs::read_link(path).is_err()
 }
 
-fn installed_skill_is_current(dest: &Path, skill: SkillPayloadRef<'_>, marker_content: &str) -> bool {
+fn installed_skill_is_current(
+    dest: &Path,
+    skill: SkillPayloadRef<'_>,
+    marker_content: &str,
+) -> bool {
     std::fs::read_to_string(dest.join(INSTALL_MARKER))
         .is_ok_and(|current| current == marker_content)
         && installed_payload_is_current(dest, skill)
@@ -421,8 +425,8 @@ pub(crate) fn skill_install_status_in<'a>(
     .collect()
 }
 
-/// Re-run the global install against the current builtin + active-plugin
-/// + verified-user-library set minus the persisted disabled-set. The
+/// Re-run the global install against the current builtin, active-plugin,
+/// and verified-user-library set minus the persisted disabled-set. The
 /// plugin and skill mutation handlers call this right after a state write
 /// so materialization and sweep land in the same request; because the
 /// disabled-set is re-read here on every pass, the set outranks the sweep

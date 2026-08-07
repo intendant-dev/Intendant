@@ -461,7 +461,10 @@ mod tests {
         let refusal = add_user_skill_in(root, "my-notes", &oversized, stamp("p")).unwrap_err();
         assert_eq!(
             refusal.message(),
-            format!("SKILL.md is {} bytes — the user-skill cap is 64 KiB", oversized.len())
+            format!(
+                "SKILL.md is {} bytes — the user-skill cap is 64 KiB",
+                oversized.len()
+            )
         );
 
         assert!(crate::skill_state::user_skill_records_in(root).is_empty());
@@ -603,6 +606,12 @@ mod tests {
         ));
         let removed = remove_user_skill_in(root, builtin).unwrap();
         assert_eq!(removed.name, builtin);
-        assert!(crate::skill_state::user_skill_records_in(root).is_empty());
+        assert!(
+            crate::skill_state::user_skill_records_in(root)
+                .iter()
+                .all(|record| record.name != builtin),
+            "the shadowed record is gone; the unrelated my-notes record (library \
+             missing, record kept) still lists"
+        );
     }
 }

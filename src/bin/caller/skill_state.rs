@@ -643,7 +643,11 @@ mod tests {
         )
         .unwrap();
 
-        let body = skill_lifecycle_json("drift-probe", &disabled_skills_in(root), &user_skill_records_in(root));
+        let body = skill_lifecycle_json(
+            "drift-probe",
+            &disabled_skills_in(root),
+            &user_skill_records_in(root),
+        );
         assert_eq!(body["control"], "toggle");
         assert_eq!(body["enabled"], true);
         assert_eq!(body["removable"], true);
@@ -654,7 +658,11 @@ mod tests {
 
         // Deactivate records the flip; the body carries both stamps.
         set_skill_enabled_in(root, "drift-probe", false, record("p2", "dashboard", 901)).unwrap();
-        let body = skill_lifecycle_json("drift-probe", &disabled_skills_in(root), &user_skill_records_in(root));
+        let body = skill_lifecycle_json(
+            "drift-probe",
+            &disabled_skills_in(root),
+            &user_skill_records_in(root),
+        );
         assert_eq!(body["enabled"], false);
         assert_eq!(body["disabled_by"]["principal"], "p2");
         assert_eq!(body["added_by"]["principal"], "principal:owner");

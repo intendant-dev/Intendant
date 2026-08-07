@@ -84,11 +84,12 @@ fn user_skill_row_json(
     state_root: &Path,
     home: &Path,
 ) -> serde_json::Value {
-    let skill_md =
-        crate::user_skills::user_skill_library_bytes_in(state_root, &record.name).unwrap_or_default();
-    let description = intendant_core::skills::parse_skill_md(&skill_md, Path::new(record.name.as_str()))
-        .map(|(config, _)| config.description)
+    let skill_md = crate::user_skills::user_skill_library_bytes_in(state_root, &record.name)
         .unwrap_or_default();
+    let description =
+        intendant_core::skills::parse_skill_md(&skill_md, Path::new(record.name.as_str()))
+            .map(|(config, _)| config.description)
+            .unwrap_or_default();
     let payload = crate::skill_install::SkillPayloadRef {
         name: &record.name,
         skill_md: &skill_md,
@@ -144,7 +145,9 @@ pub(crate) fn skills_catalog_json_in(state_root: &Path, home: &Path) -> serde_js
             crate::skill_state::skill_lifecycle_with(&record.name, &user),
             crate::skill_state::SkillLifecycle::User(_)
         ) {
-            rows.push(user_skill_row_json(record, &disabled, &user, state_root, home));
+            rows.push(user_skill_row_json(
+                record, &disabled, &user, state_root, home,
+            ));
         }
     }
     serde_json::json!({ "skills": rows })
