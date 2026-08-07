@@ -27729,6 +27729,44 @@ html.ui-v2 .handover-holdout-list li {
   font-size: 12px;
   line-height: 1.45;
 }
+/* Each row is a real doorway into its session: a button styled as the
+   row text, leading with the grid convention's short-id chip. */
+html.ui-v2 .handover-holdout-row {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  padding: 0 4px 0 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-name,
+html.ui-v2 button.handover-holdout-row:focus-visible .handover-holdout-name,
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-id,
+html.ui-v2 button.handover-holdout-row:focus-visible .handover-holdout-id {
+  color: var(--accent, #62a0ea);
+}
+html.ui-v2 button.handover-holdout-row:hover .handover-holdout-name {
+  text-decoration: underline;
+}
+html.ui-v2 .handover-holdout-row-inert {
+  cursor: default;
+}
+html.ui-v2 .handover-holdout-id {
+  flex-shrink: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface2, rgba(58, 58, 70, 0.96));
+  color: var(--text, #e6e6e6);
+}
 html.ui-v2 .handover-holdout-name {
   font-weight: 600;
 }
@@ -27738,7 +27776,25 @@ html.ui-v2 .handover-holdout-state {
 html.ui-v2 .handover-holdout-state.parked {
   color: var(--warning, #e5a50a);
 }
-html.ui-v2 .handover-holdout-more {
+/* "…and N more" is a DOOR — a real button that widens the list to
+   every row in hand; the -note form covers only a remainder the
+   daemon never itemized (its door is the daemon link above). */
+html.ui-v2 button.handover-holdout-more {
+  display: block;
+  margin-top: 2px;
+  padding: 0 4px 0 0;
+  border: none;
+  background: transparent;
+  font-size: 11px;
+  color: var(--accent, #62a0ea);
+  cursor: pointer;
+}
+html.ui-v2 button.handover-holdout-more:hover,
+html.ui-v2 button.handover-holdout-more:focus-visible {
+  text-decoration: underline;
+}
+html.ui-v2 .handover-holdout-more-note {
+  margin-top: 2px;
   font-size: 11px;
   color: var(--muted, #7e8896);
 }
@@ -39165,7 +39221,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c24f8ae46bbe07e8';
+const INTENDANT_APP_BUILD = 'bff6d9658cdb5b01';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -108519,14 +108575,48 @@ async function memoryProposeFromForm(button) {
     }
   }
 
-  // Render at most this many holdout rows; the rest fold into an honest
-  // "…and N more" (parked rows arrive sorted first from the daemon, so
-  // the decisive parked-until facts survive the fold).
+  // Render at most this many holdout rows folded; "…and N more" is a
+  // real door — a button that widens THIS list to every row in hand
+  // (the list scrolls within the banner section). Parked rows arrive
+  // sorted first from the daemon, so the decisive parked-until facts
+  // survive the fold either way.
   const HOLDOUT_RENDER_CAP = 8;
+
+  // The owner's per-list expansion choice, keyed by the banner fact
+  // (kind + boot id) for the page's life — the 30s poll re-render must
+  // never silently re-fold a list the owner opened. Deliberately not
+  // persisted: a reload starts at the compact fold again.
+  const handoverHoldoutExpanded = new Set();
 
   function handoverShortId(id) {
     const raw = String(id || '');
     return raw.length > 8 ? raw.slice(0, 8) : raw;
+  }
+
+  // A holdout row is a doorway, not dead text: click opens that
+  // session. focusSessionWindow rides ensureSessionWindow — get or
+  // CREATE — so the click works in both grid realities: a row whose
+  // grid window exists is simply focused, and a row the grid does not
+  // hold (today a predecessor-held session reads pre-boot and stays
+  // off the grid until the era re-scope lands) gets its window created
+  // and hydrated from the catalog on the spot, the same lane restored
+  // off-grid sessions already ride. The transcript overlay (the
+  // sessions list's row-open) is the fallback when the grid surface is
+  // unavailable entirely.
+  function handoverOpenHoldoutSession(sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return;
+    if (typeof focusSessionWindow === 'function') {
+      // The grid lives on the Activity Timeline pane — surface it so
+      // the focused window is actually on screen (a refused route,
+      // e.g. a live annotation lock, still leaves the window ready).
+      if (typeof routeTo === 'function') { try { routeTo('activity', 'log'); } catch (_) {} }
+      try { focusSessionWindow(sid); return; } catch (_) { /* overlay lane below */ }
+    }
+    if (typeof openSessionDetail === 'function') {
+      if (typeof routeTo === 'function') { try { routeTo('sessions'); } catch (_) {} }
+      try { openSessionDetail(sid); } catch (_) { /* no session surface here */ }
+    }
   }
 
   // "9:10 PM (in ~42m)" from an epoch-seconds reset instant, in the
@@ -108582,34 +108672,79 @@ async function memoryProposeFromForm(button) {
 
   // The named wait set. textContent throughout — session names are
   // agent/user-controlled and must never reach innerHTML (the update
-  // chip states the same rule).
-  function handoverHoldoutList(rows, totalCount) {
+  // chip states the same rule). Every row leads with the session's
+  // short id (the grid id-chip convention) beside its title, and the
+  // row itself is a real button into that session.
+  function handoverHoldoutList(rows, totalCount, listKey) {
     const wrap = document.createElement('div');
     wrap.className = 'handover-holdouts';
     const list = document.createElement('ul');
     list.className = 'handover-holdout-list';
-    rows.slice(0, HOLDOUT_RENDER_CAP).forEach((holdout) => {
+    const expanded = handoverHoldoutExpanded.has(listKey);
+    rows.slice(0, expanded ? rows.length : HOLDOUT_RENDER_CAP).forEach((holdout) => {
       if (!holdout || typeof holdout !== 'object') return;
       const item = document.createElement('li');
-      const who = document.createElement('span');
-      who.className = 'handover-holdout-name';
-      who.textContent = holdout.name || handoverShortId(holdout.session_id) || 'unnamed session';
-      item.appendChild(who);
+      const sid = String(holdout.session_id || '').trim();
+      const name = holdout.name || (sid ? '' : 'unnamed session');
+      let row;
+      if (sid) {
+        row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'handover-holdout-row';
+        row.title = name ? `Open ${name} · ${sid}` : `Open ${sid}`;
+        row.addEventListener('click', () => handoverOpenHoldoutSession(sid));
+        const short = document.createElement('span');
+        short.className = 'handover-holdout-id';
+        short.textContent = handoverShortId(sid);
+        row.appendChild(short);
+      } else {
+        // No session id on the wire — nothing to open; a plain row,
+        // never a dead button.
+        row = document.createElement('span');
+        row.className = 'handover-holdout-row handover-holdout-row-inert';
+      }
+      if (name) {
+        const who = document.createElement('span');
+        who.className = 'handover-holdout-name';
+        who.textContent = name;
+        row.appendChild(who);
+      }
       const state = document.createElement('span');
       state.className = 'handover-holdout-state';
       if (holdout.limit_park) state.classList.add('parked');
       state.textContent = ` — ${handoverHoldoutState(holdout)}`;
-      item.appendChild(state);
+      row.appendChild(state);
+      item.appendChild(row);
       list.appendChild(item);
     });
     wrap.appendChild(list);
+    // The fold door. `totalCount` may exceed the rows in hand (a
+    // co-homed daemon's presence record caps its mirrored rows while
+    // session_count keeps the full truth): the expander opens every
+    // row we HOLD; a remainder the daemon did not itemize renders as
+    // an honest count instead — those rows are not hidden here, they
+    // were never reported, and the daemon doorway above is their door.
     const total = Number(totalCount);
-    const shown = Math.min(rows.length, HOLDOUT_RENDER_CAP);
-    const folded = Number.isFinite(total) && total > shown ? total - shown : 0;
-    if (folded > 0) {
-      const more = document.createElement('div');
+    const held = rows.length;
+    const known = Number.isFinite(total) && total > held ? total : held;
+    const shown = expanded ? held : Math.min(held, HOLDOUT_RENDER_CAP);
+    const folded = known - shown;
+    if (!expanded && held > shown) {
+      const more = document.createElement('button');
+      more.type = 'button';
       more.className = 'handover-holdout-more';
       more.textContent = `…and ${folded} more`;
+      more.title = 'Show the full list';
+      more.setAttribute('aria-label', 'Show the full list');
+      more.addEventListener('click', () => {
+        handoverHoldoutExpanded.add(listKey);
+        handoverRender(lastHandoverBody);
+      });
+      wrap.appendChild(more);
+    } else if (folded > 0) {
+      const more = document.createElement('div');
+      more.className = 'handover-holdout-more-note';
+      more.textContent = `…and ${folded} more not itemized here — its own dashboard has the full list.`;
       wrap.appendChild(more);
     }
     return wrap;
@@ -108725,7 +108860,11 @@ async function memoryProposeFromForm(button) {
         pending.textContent = 'No successor has acquired the lease yet.';
         fold.appendChild(pending);
       }
-      if (rows.length) fold.appendChild(handoverHoldoutList(rows, rows.length));
+      if (rows.length) {
+        fold.appendChild(
+          handoverHoldoutList(rows, rows.length, 'draining:' + String(body.boot_id || ''))
+        );
+      }
       el.appendChild(fold);
       handoverBannerReserve();
       return;
@@ -108783,7 +108922,11 @@ async function memoryProposeFromForm(button) {
         }
         section.appendChild(mech);
         const rows = Array.isArray(d.holdouts) ? d.holdouts : [];
-        if (rows.length) section.appendChild(handoverHoldoutList(rows, count));
+        if (rows.length) {
+          section.appendChild(
+            handoverHoldoutList(rows, count, 'predecessor:' + String((d && d.boot_id) || ''))
+          );
+        }
         const note = document.createElement('div');
         note.className = 'handover-banner-note';
         note.textContent = 'Mid-work sessions it releases are picked up here when it exits.';

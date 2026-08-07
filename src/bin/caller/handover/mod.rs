@@ -1247,6 +1247,102 @@ mod tests {
         );
     }
 
+    /// Owner finding (2026-08-07, live-DOM-verified): the banner's
+    /// holdout rows rendered dead text — no session id, no click
+    /// handler — and "…and N more" was a bare div truncating at 8 rows
+    /// with no door to the rest (against no-dead-affordances /
+    /// nothing-hidden-without-a-door). These needles hold the fix:
+    /// every row is a real button leading with the session's short id
+    /// (the grid id-chip convention) that opens that session — the one
+    /// focusSessionWindow/ensureSessionWindow get-or-create lane, so
+    /// the click works whether or not the grid already holds the
+    /// window, with the sessions list's transcript overlay as the
+    /// fallback — and the fold is a real expander button that widens
+    /// the list to every row in hand.
+    #[test]
+    fn drain_holdout_rows_are_doorways_and_the_fold_is_a_door() {
+        let fragment = include_str!("../../../../static/app/ui2-handover.js");
+        for needle in [
+            // Clickable rows: the open handler, both lanes it rides
+            // (grid focus first, transcript overlay fallback), the
+            // button row wiring, and the short-id chip.
+            "function handoverOpenHoldoutSession",
+            "focusSessionWindow(sid)",
+            "openSessionDetail(sid)",
+            "handoverOpenHoldoutSession(sid)",
+            "handover-holdout-row",
+            "handover-holdout-id",
+            "handoverShortId(sid)",
+            // Expansion: the per-fact choice, the count widening (cap
+            // folded, every held row expanded), the door arming it.
+            "rows.slice(0, expanded ? rows.length : HOLDOUT_RENDER_CAP)",
+            "handoverHoldoutExpanded.add(listKey)",
+            // The unreported-remainder honesty line (presence rows cap
+            // server-side while session_count keeps the full truth —
+            // that remainder is named, never silently hidden).
+            "not itemized here",
+        ] {
+            assert!(
+                fragment.contains(needle),
+                "the holdout doorway/expander wiring lost: {needle}"
+            );
+        }
+        // The no-dead-affordance negative: the "…and N more" fold must
+        // stay a BUTTON — the dead bare-div shape is pinned OUT.
+        let more_as_div = regex::Regex::new(
+            r"createElement\('div'\)[^;]{0,120};\s*\w+\.className = 'handover-holdout-more'",
+        )
+        .expect("the dead-fold shape compiles");
+        assert!(
+            !more_as_div.is_match(fragment),
+            "'…and N more' regressed to a dead div — the fold must stay a button (a door)"
+        );
+        let more_as_button = regex::Regex::new(
+            r"createElement\('button'\)[^;]{0,120};[\s\S]{0,200}\.className = 'handover-holdout-more'",
+        )
+        .expect("the fold-button shape compiles");
+        assert!(
+            more_as_button.is_match(fragment),
+            "the fold door lost its button shape"
+        );
+        // Rows are buttons too, in the same shape.
+        let row_as_button = regex::Regex::new(
+            r"createElement\('button'\)[^;]{0,120};[\s\S]{0,200}\.className = 'handover-holdout-row'",
+        )
+        .expect("the row-button shape compiles");
+        assert!(
+            row_as_button.is_match(fragment),
+            "the holdout row lost its button shape"
+        );
+        // The served bundle carries the whole wiring.
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            "function handoverOpenHoldoutSession",
+            "handover-holdout-row",
+            "handover-holdout-id",
+            "handoverHoldoutExpanded",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the served bundle lost the holdout doorway wiring: {needle}"
+            );
+        }
+        // Styling family: the row, the id chip, and the door live in
+        // the ui2-handover stylesheet with the rest of the banner.
+        let styles = include_str!("../../../../static/app/ui2-handover.css");
+        for needle in [
+            ".handover-holdout-row",
+            ".handover-holdout-id",
+            "button.handover-holdout-more",
+            ".handover-holdout-more-note",
+        ] {
+            assert!(
+                styles.contains(needle),
+                "the holdout row styling left the handover family: {needle}"
+            );
+        }
+    }
+
     /// Update-abstraction slice 4, the NEGATIVE grade-1 vocabulary pin
     /// (intake §4.3): every grade-1 string — across the banner, the
     /// predecessor story, the update chip, the follow/completion lines,
