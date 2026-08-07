@@ -2088,6 +2088,22 @@ impl IntendantServer {
                 let logs_home = mcp_state_session_logs_home(&*self.state.read().await);
                 match resolve_persisted_start_target(&logs_home, &session_id) {
                     PersistedStartTarget::External(target) => {
+                        // Gate-before-ack (the drainer resume lying-ack):
+                        // resuming a persisted wrapper is
+                        // `ControlMsg::creates_session`, which the funnel
+                        // refuses while draining — AFTER this branch has
+                        // already acked "ok (session resume dispatched…)".
+                        // Refuse synchronously instead, naming the drain
+                        // and what still serves.
+                        if let Some(refusal) = self.drain_refusal().await {
+                            return format!(
+                                "Cannot start task: {refusal}; session {session_id} is not \
+                                 live here, so this would resume it into a NEW resident \
+                                 session. Targeted follow-ups to live sessions still serve \
+                                 on this daemon — resume this session on the successor \
+                                 instead."
+                            );
+                        }
                         self.bus
                             .send(AppEvent::ControlCommand(ControlMsg::ResumeSession {
                                 source: target.source.clone(),
@@ -2183,6 +2199,15 @@ impl IntendantServer {
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
+            // Gate-before-ack: an untargeted CU task is
+            // `ControlMsg::creates_session` (StartTask without a session
+            // id) — refuse while draining instead of acking a dispatch
+            // the funnel refuses a beat later.
+            if let Some(refusal) = self.drain_refusal().await {
+                return format!(
+                    "Cannot start task: {refusal} (a computer-use task mints a new session)"
+                );
+            }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
                     session_id: None,
@@ -2206,6 +2231,13 @@ impl IntendantServer {
         // control-plane primitive as the dashboard instead of falling into
         // the standalone MCP launcher's "not configured" error.
         if self.http_control_plane_facade {
+            // Gate-before-ack: the same synchronous drain refusal as the
+            // standalone launcher lane (`start_task_with_state`) — this
+            // untargeted lane creates a session, and the funnel would
+            // refuse it a beat after the "ok (new session dispatched)".
+            if let Some(refusal) = self.drain_refusal().await {
+                return format!("Cannot start task: {refusal}");
+            }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
                     session_id: None,
@@ -2247,6 +2279,22 @@ impl IntendantServer {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("Cannot start task: {}", e),
         }
+    }
+
+    /// The drain gate consulted BEFORE acking any session-creating
+    /// dispatch (`ControlMsg::creates_session`): the supervisor funnel
+    /// refuses those intents while draining, so an optimistic
+    /// "ok (… dispatched)" from this layer would precede that refusal and
+    /// teach the caller the dispatch landed when it never did. `None`
+    /// when this server shape carries no handover runtime (bare stdio)
+    /// or the daemon is not draining.
+    async fn drain_refusal(&self) -> Option<String> {
+        self.state
+            .read()
+            .await
+            .handover
+            .as_ref()
+            .and_then(|runtime| runtime.drain_refusal_message())
     }
 
     async fn target_session_phase(&self, session_id: &str) -> Option<Phase> {
@@ -4377,6 +4425,223 @@ pub(crate) mod tests {
                 }
                 other => panic!("expected ResumeSession control event, got {other:?}"),
             }
+        });
+    }
+
+    /// A holder runtime flipped into drain — the fixture for the
+    /// gate-before-ack pins below. A fresh state root makes this boot the
+    /// lease holder, so drain entry always succeeds; no successor exists,
+    /// so refusals take the successor-pending arm.
+    fn draining_handover_runtime(
+        state_root: &std::path::Path,
+    ) -> std::sync::Arc<crate::handover::HandoverRuntime> {
+        let runtime = std::sync::Arc::new(crate::handover::HandoverRuntime::initialize(
+            state_root, 7001, 0,
+        ));
+        assert_eq!(
+            runtime.request_drain(None),
+            crate::handover::DrainRequest::Entered
+        );
+        runtime
+    }
+
+    /// The drainer resume lying-ack (agenda card 01KZ0HVNH4NEX7X17N8S1TF0ZH):
+    /// resume-at-idle on a DRAINING daemon consults the drain gate BEFORE
+    /// acking. This branch used to return "ok (session resume dispatched…)"
+    /// and the supervisor funnel refused the ResumeSession a beat later —
+    /// the caller walked away believing the resume landed, and a drainer
+    /// held by exactly such sessions extended its drain forever.
+    #[test]
+    fn start_task_resume_at_idle_refuses_honestly_while_draining() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let wrapper_session_id = "31bd0dc0-0bb0-4c02-9c8e-4a4bde3fdf41";
+            let backend_session_id = "019e9f80-aaaa-7000-bcef-f28ff5295aaa";
+            let project_root = home.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let wrapper_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(wrapper_session_id);
+            {
+                let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+                log.write_meta(Some(&project_root), Some("old task"));
+                log.session_identity(wrapper_session_id, "claude-code", backend_session_id);
+            }
+
+            let handover_root = tempdir().unwrap();
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_logs_home_override = Some(home.path().to_path_buf());
+                s.handover = Some(draining_handover_runtime(handover_root.path()));
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let (_home, server) = test_server(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({ "task": "wake the parked seat" }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("the refusal is a synchronous tool result");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("daemon_draining"),
+                "the refusal names the drain: {rendered}"
+            );
+            assert!(
+                rendered.contains("successor") && rendered.contains("follow-ups"),
+                "the refusal names the served alternatives: {rendered}"
+            );
+            assert!(
+                !rendered.contains("dispatched"),
+                "zero dispatched ack on a drain refusal: {rendered}"
+            );
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Err(_) => {}
+                Ok(event) => panic!("the refused intent must never ride the bus: {event:?}"),
+            }
+        });
+    }
+
+    /// The gate refuses ONLY the create class. A targeted follow-up is
+    /// in-flight work — the funnel serves it while draining, and it is
+    /// the alternative the resume refusal names — so pin that it still
+    /// dispatches with its honest ack under an active drain.
+    #[test]
+    fn start_task_targeted_follow_up_serves_while_draining() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let logs_home = tempdir().unwrap();
+            let handover_root = tempdir().unwrap();
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_logs_home_override = Some(logs_home.path().to_path_buf());
+                s.handover = Some(draining_handover_runtime(handover_root.path()));
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let (_home, server) = test_server(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({ "task": "continue the in-flight work" }),
+                    Some("managed-session-1"),
+                    None,
+                )
+                .await
+                .expect("targeted follow-up dispatches while draining");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("ok (task dispatched)"),
+                "targeted follow-ups keep their honest ack while draining: {rendered}"
+            );
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask { session_id, .. }))) => {
+                    assert_eq!(session_id.as_deref(), Some("managed-session-1"))
+                }
+                other => panic!("expected targeted StartTask control event, got {other:?}"),
+            }
+        });
+    }
+
+    /// Per-branch pins for the remaining untargeted lanes of the tool —
+    /// the CU runner, the HTTP/ctl facade, and the standalone launcher
+    /// each execute or emit a session CREATE: all refuse before their
+    /// "ok (… dispatched)" ack while draining, and nothing rides the bus.
+    #[test]
+    fn start_task_untargeted_lanes_refuse_before_ack_while_draining() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let handover_root = tempdir().unwrap();
+            let runtime = draining_handover_runtime(handover_root.path());
+
+            let facade_state = test_state();
+            facade_state.write().await.handover = Some(runtime.clone());
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let home = tempdir().unwrap();
+            let server =
+                IntendantServer::new_http_with_home(facade_state, bus, home.path().to_path_buf());
+
+            let cu = server
+                .start_task(Parameters(StartTaskParams {
+                    session_id: None,
+                    task: "look at the screen".to_string(),
+                    orchestrate: None,
+                    reference_frame_ids: vec!["frame-1".to_string()],
+                    display_target: None,
+                }))
+                .await;
+            assert!(cu.contains("daemon_draining"), "CU lane refuses: {cu}");
+            assert!(!cu.contains("dispatched"), "no CU ack while draining: {cu}");
+
+            let facade = server
+                .start_task(Parameters(StartTaskParams {
+                    session_id: None,
+                    task: "start something new".to_string(),
+                    orchestrate: Some(false),
+                    reference_frame_ids: vec![],
+                    display_target: None,
+                }))
+                .await;
+            assert!(
+                facade.contains("daemon_draining"),
+                "facade lane refuses: {facade}"
+            );
+            assert!(
+                !facade.contains("dispatched"),
+                "no facade ack while draining: {facade}"
+            );
+
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Err(_) => {}
+                Ok(event) => panic!("refused intents must never ride the bus: {event:?}"),
+            }
+
+            // The standalone launcher lane (`start_task_with_state`)
+            // derives the same canonical refusal builder.
+            let standalone_state = test_state();
+            standalone_state.write().await.handover = Some(runtime);
+            let standalone_bus = EventBus::new();
+            let (_home2, standalone) = test_server(standalone_state, standalone_bus);
+            let refusal = standalone
+                .start_task(Parameters(StartTaskParams {
+                    session_id: None,
+                    task: "start something new".to_string(),
+                    orchestrate: Some(false),
+                    reference_frame_ids: vec![],
+                    display_target: None,
+                }))
+                .await;
+            assert!(
+                refusal.contains("Cannot start task: daemon_draining"),
+                "standalone lane refuses with the canonical text: {refusal}"
+            );
+            assert!(
+                refusal.contains("successor has not acquired yet"),
+                "no-successor arm carries the canonical builder's text: {refusal}"
+            );
         });
     }
 

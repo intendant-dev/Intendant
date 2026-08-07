@@ -664,6 +664,29 @@ impl HandoverRuntime {
         self.draining.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Track HS3: the structured refusal session-creating intents
+    /// (`ControlMsg::creates_session`) receive while this daemon drains —
+    /// `None` otherwise. The ONE builder every surface derives from: the
+    /// supervisor funnel's loop error and the MCP layer's synchronous
+    /// gate-before-ack refusals must name the drain identically. Surfaces
+    /// and tests key on the stable `daemon_draining` prefix; the text
+    /// carries the successor pointer once the sidecar names one.
+    pub(crate) fn drain_refusal_message(&self) -> Option<String> {
+        if !self.is_draining() {
+            return None;
+        }
+        Some(match self.successor_port() {
+            Some(port) => format!(
+                "daemon_draining: this daemon is draining — in-flight sessions \
+                 finish here; start new work on the successor daemon (:{port})"
+            ),
+            None => "daemon_draining: this daemon is draining — in-flight sessions \
+                     finish here; the successor has not acquired yet (retry \
+                     shortly, or start another daemon with --takeover)"
+                .to_string(),
+        })
+    }
+
     /// Resolves when a drain (or takeover fast-poll) wake is requested —
     /// the scheduler selects on this beside its sleep so entry never
     /// waits out a tick.

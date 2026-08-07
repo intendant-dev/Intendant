@@ -132,6 +132,16 @@ impl TestRig {
             // runner account's screen. Honored only alongside
             // PROVIDER=mock — fail closed, like the provider itself.
             .env("INTENDANT_MOCK_DISPLAY", "synthetic")
+            // Hermeticity of the capacity plane: the monitor otherwise
+            // probes the HOST's real memory, so a loaded CI box flips
+            // stage defer at zero residents and suffixes every
+            // untargeted dispatch ack — three exact-ack pins broke live
+            // this way (2026-08-07 merge groups). Same fail-closed
+            // contract: honored only alongside PROVIDER=mock. The
+            // capacity e2e still exercises the RESIDENT-BOUND path via
+            // INTENDANT_CAPACITY_MAX_RESIDENT, which reads no host
+            // state.
+            .env("INTENDANT_MOCK_MEMORY", "nominal")
             .env("PROVIDER", "mock");
         cmd
     }
