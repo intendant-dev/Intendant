@@ -9,8 +9,14 @@
 //! foreign version ⇒ empty — the shipped default is every builtin
 //! active), writes are private (0600) and atomic, and both entries and
 //! top-level fields this binary does not recognize are preserved across
-//! rewrites, so an older daemon never disarms a newer one's records (the
-//! planned S4 user-skill library rides this same file).
+//! rewrites, so an older daemon never disarms a newer one's records.
+//!
+//! The same file carries the USER SKILL REGISTRY (S4): one
+//! [`UserSkillRecord`] per dashboard-added skill — name, the add's
+//! gate-resolved attribution, and the sha256 of the accepted bytes. The
+//! record is the provenance seal over the library copy
+//! ([`crate::user_skills`] owns the files); the library materializes only
+//! bytes the registry attests.
 //!
 //! **The set outranks the sweep.** Every sweep call site derives its
 //! desired set through [`disabled_skill_names`], so rebuilds, daemon
@@ -20,9 +26,11 @@
 //!
 //! **Per-kind law** (the intake's gesture table): builtin skills disable
 //! via this set — the bytes stay in the binary, deactivate is the honest
-//! verb; plugin-materialized skills are managed ONLY by their plugin's
-//! toggle (one authority, no second switch) and are never in this set;
-//! unknown names refuse. One classification ([`skill_lifecycle`]) drives
+//! verb; user skills disable via the same set and re-enable re-verifies
+//! the library bytes against the recorded sha256 (drift refuses, named);
+//! plugin-materialized skills are managed ONLY by their plugin's toggle
+//! (one authority, no second switch) and are never in this set; unknown
+//! names refuse. One classification ([`skill_lifecycle_with`]) drives
 //! both the catalog row's toggle availability and the mutation gate, so
 //! the two can never skew.
 //!
@@ -44,15 +52,23 @@ struct SkillsStateFile {
     version: u32,
     #[serde(default)]
     disabled: BTreeMap<String, DisabledRecord>,
-    /// Top-level fields a newer binary owns (the S4 user-skill library is
-    /// planned into this same file) — carried through rewrites verbatim.
+    /// The user-skill registry (S4): one record per dashboard-added
+    /// skill. Elements are objects within state v1; unknown fields inside
+    /// a record ride its own `foreign` map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    user: Vec<UserSkillRecord>,
+    /// Top-level fields a newer binary owns — carried through rewrites
+    /// verbatim.
     #[serde(flatten)]
     foreign: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One disabled entry: the gate-resolved attribution of the disabling
-/// flip. All fields optional by design — attribution must never block the
-/// flip — and unknown fields from newer binaries ride `foreign`.
+/// A gate-resolved attribution stamp: who performed one authority-bearing
+/// act on this plane, mapped at the authenticated edge. Records the
+/// disabling flip on `disabled` entries and the add on
+/// [`UserSkillRecord::added_by`]. All fields optional by design —
+/// attribution must never block the act — and unknown fields from newer
+/// binaries ride `foreign`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DisabledRecord {
     /// The IAM principal exactly as the gate named it.
@@ -84,6 +100,29 @@ impl DisabledRecord {
             foreign: serde_json::Map::new(),
         }
     }
+}
+
+/// One dashboard-added user skill's registry record (S4): the name, the
+/// add's gate-resolved attribution, and the sha256 (lowercase hex) of the
+/// accepted SKILL.md bytes. The record attests the library copy under
+/// `<state_root>/skills/<name>/SKILL.md` ([`crate::user_skills`]) — the
+/// installer materializes only bytes whose hash matches, and re-enable
+/// re-verifies (ruling R3). Every field is defaulted so any v1 object
+/// element parses; unknown fields ride `foreign` verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct UserSkillRecord {
+    #[serde(default)]
+    pub(crate) name: String,
+    /// The add's gate-resolved attribution stamp — the same shape the
+    /// disabling flip records, mapped at the authenticated edge.
+    #[serde(default)]
+    pub(crate) added_by: DisabledRecord,
+    /// sha256 (lowercase hex) of the accepted SKILL.md bytes.
+    #[serde(default)]
+    pub(crate) sha256: String,
+    /// Record fields a newer binary owns — preserved verbatim.
+    #[serde(flatten)]
+    pub(crate) foreign: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `<state_root>/skills/state.json`.
@@ -121,21 +160,90 @@ pub(crate) fn disabled_skill_names() -> BTreeSet<String> {
     disabled_skill_names_in(&intendant_core::state_paths::intendant_home())
 }
 
+/// The user-skill registry records, in file order. Records without a name
+/// (a defaulted parse of some malformed element) are invisible: nothing
+/// can address, materialize, or remove them, so they simply ride the file
+/// like any other foreign payload.
+pub(crate) fn user_skill_records_in(state_root: &Path) -> Vec<UserSkillRecord> {
+    load_state_in(state_root)
+        .user
+        .into_iter()
+        .filter(|record| !record.name.is_empty())
+        .collect()
+}
+
+/// Insert one user-skill record (replacing any same-name record in
+/// place). The dumb writer: collision policy lives with the add
+/// validation in [`crate::user_skills`].
+pub(crate) fn upsert_user_skill_record_in(
+    state_root: &Path,
+    record: UserSkillRecord,
+) -> Result<(), String> {
+    let mut state = load_state_in(state_root);
+    match state.user.iter_mut().find(|have| have.name == record.name) {
+        Some(have) => *have = record,
+        None => state.user.push(record),
+    }
+    persist_state_in(state_root, &mut state)
+}
+
+/// Remove one user-skill record. Returns whether a record was removed;
+/// a miss writes nothing.
+pub(crate) fn remove_user_skill_record_in(state_root: &Path, name: &str) -> Result<bool, String> {
+    let mut state = load_state_in(state_root);
+    let before = state.user.len();
+    state.user.retain(|record| record.name != name);
+    if state.user.len() == before {
+        return Ok(false);
+    }
+    persist_state_in(state_root, &mut state)?;
+    Ok(true)
+}
+
+/// Atomic private rewrite of the state file (tmp + rename, 0600). Foreign
+/// entries, record fields, and top-level fields all survive by
+/// construction — they were loaded into the same structures being
+/// serialized.
+fn persist_state_in(state_root: &Path, state: &mut SkillsStateFile) -> Result<(), String> {
+    state.version = STATE_VERSION;
+    let path = skills_state_path_in(state_root);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "skills state path has no parent".to_string())?;
+    intendant_core::state_paths::create_private_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|error| format!("encode skills state: {error}"))?;
+    let tmp = path.with_extension("json.tmp");
+    intendant_core::state_paths::write_private_file(&tmp, &bytes)
+        .map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("rename {}: {error}", path.display()))
+}
+
 // ── Per-kind classification (one authority for row + mutation) ──────────────
 
 /// Which lifecycle door manages one skill name. Derived from the shipped
-/// registries; the catalog row's toggle availability and the mutation
-/// gate both read THIS, so they cannot skew.
+/// registries plus the user-skill registry; the catalog row's toggle
+/// availability and the mutation gate both read THIS, so they cannot
+/// skew. Shipped names win: a user record shadowed by a later-shipping
+/// builtin or plugin payload classifies as the shipped kind (the shipped
+/// row is THE row; the orphaned record stays removable through
+/// [`crate::user_skills::remove_user_skill_in`], which targets records).
 pub(crate) enum SkillLifecycle {
     /// A builtin: deactivate/re-enable via the persisted disabled-set.
     Builtin(&'static crate::builtin_skills::BuiltinSkill),
     /// A bundled plugin's payload: its lifecycle IS the plugin's toggle.
     PluginManaged(&'static crate::plugin_registry::BundledPlugin),
+    /// A dashboard-added user skill: toggle via the same disabled-set
+    /// (re-enable re-verifies the library), removable.
+    User(UserSkillRecord),
     /// Not a name the registries know.
     Unknown,
 }
 
-pub(crate) fn skill_lifecycle(name: &str) -> SkillLifecycle {
+/// Classify against the shipped registries plus the given user records
+/// (pure — no I/O; callers load the records once per pass).
+pub(crate) fn skill_lifecycle_with(name: &str, user: &[UserSkillRecord]) -> SkillLifecycle {
     if let Some(skill) = crate::builtin_skills::BUILTIN_SKILLS
         .iter()
         .find(|skill| skill.name == name)
@@ -147,20 +255,33 @@ pub(crate) fn skill_lifecycle(name: &str) -> SkillLifecycle {
             return SkillLifecycle::PluginManaged(plugin);
         }
     }
+    if let Some(record) = user.iter().find(|record| record.name == name) {
+        return SkillLifecycle::User(record.clone());
+    }
     SkillLifecycle::Unknown
 }
 
-/// The catalog row's `lifecycle` body, derived from [`skill_lifecycle`]
-/// plus the persisted set. `control` names the door: `"toggle"` rows are
-/// flippable here (with `enabled` + the disabling attribution when off);
+/// [`skill_lifecycle_with`] loading the user registry from one state
+/// root.
+pub(crate) fn skill_lifecycle_in(state_root: &Path, name: &str) -> SkillLifecycle {
+    skill_lifecycle_with(name, &user_skill_records_in(state_root))
+}
+
+/// The catalog row's `lifecycle` body, derived from
+/// [`skill_lifecycle_with`] plus the persisted set. `control` names the
+/// door: `"toggle"` rows are flippable here (with `enabled` + the
+/// disabling attribution when off); user rows additionally carry
+/// `removable: true` (the daemon declaring the remove door), the add's
+/// gate-resolved attribution, and the recorded sha256 (ruling R3);
 /// `"plugin"` rows carry their managing plugin — the one authority, no
 /// second switch. The frontend renders this verbatim and holds no kind
 /// vocabulary of its own.
 pub(crate) fn skill_lifecycle_json(
     name: &str,
     disabled: &BTreeMap<String, DisabledRecord>,
+    user: &[UserSkillRecord],
 ) -> serde_json::Value {
-    match skill_lifecycle(name) {
+    match skill_lifecycle_with(name, user) {
         SkillLifecycle::Builtin(_) => match disabled.get(name) {
             None => serde_json::json!({ "control": "toggle", "enabled": true }),
             Some(record) => serde_json::json!({
@@ -169,6 +290,22 @@ pub(crate) fn skill_lifecycle_json(
                 "disabled_by": serde_json::to_value(record).unwrap_or_default(),
             }),
         },
+        SkillLifecycle::User(record) => {
+            let mut body = serde_json::json!({
+                "control": "toggle",
+                "removable": true,
+                "added_by": serde_json::to_value(&record.added_by).unwrap_or_default(),
+                "sha256": record.sha256,
+            });
+            match disabled.get(name) {
+                None => body["enabled"] = serde_json::json!(true),
+                Some(flip) => {
+                    body["enabled"] = serde_json::json!(false);
+                    body["disabled_by"] = serde_json::to_value(flip).unwrap_or_default();
+                }
+            }
+            body
+        }
         SkillLifecycle::PluginManaged(plugin) => serde_json::json!({
             "control": "plugin",
             "plugin_id": plugin.id,
@@ -189,6 +326,10 @@ pub(crate) enum SkillToggleRefusal {
     PluginManaged { message: String },
     /// Not a name the registries know.
     UnknownSkill { message: String },
+    /// Re-enable of a user skill whose library copy no longer matches the
+    /// recorded sha256 (§3b: the named stale refusal; the door is remove
+    /// and re-add — the daemon never re-teaches unattested bytes).
+    UserLibraryStale { message: String },
     /// State write failure.
     Io { message: String },
 }
@@ -205,7 +346,9 @@ impl SkillToggleRefusal {
 
     fn unknown(name: &str) -> Self {
         Self::UnknownSkill {
-            message: format!("unknown skill '{name}' — not a builtin or bundled plugin payload"),
+            message: format!(
+                "unknown skill '{name}' — not a builtin, bundled plugin payload, or user-added skill"
+            ),
         }
     }
 
@@ -217,7 +360,7 @@ impl SkillToggleRefusal {
 
     pub(crate) fn http_status(&self) -> u16 {
         match self {
-            Self::PluginManaged { .. } => 409,
+            Self::PluginManaged { .. } | Self::UserLibraryStale { .. } => 409,
             Self::UnknownSkill { .. } => 404,
             Self::Io { .. } => 500,
         }
@@ -227,6 +370,7 @@ impl SkillToggleRefusal {
         match self {
             Self::PluginManaged { message }
             | Self::UnknownSkill { message }
+            | Self::UserLibraryStale { message }
             | Self::Io { message } => message,
         }
     }
@@ -235,23 +379,39 @@ impl SkillToggleRefusal {
 /// Flip one skill's enable state in the persisted set. Idempotent: a
 /// no-change flip writes nothing (a repeat disable keeps the ORIGINAL
 /// attribution — the record is who disabled it, not who last asked).
-/// Foreign entries and top-level fields survive the rewrite; the write is
-/// private (0600) and atomic (tmp + rename). Callers reconcile the
-/// installed roots after a successful flip.
+/// Re-enabling a user skill first re-verifies the library bytes against
+/// the record's sha256 (ruling R3) and refuses named on drift. Foreign
+/// entries and top-level fields survive the rewrite; the write is private
+/// (0600) and atomic (tmp + rename). Callers reconcile the installed
+/// roots after a successful flip.
 pub(crate) fn set_skill_enabled_in(
     state_root: &Path,
     name: &str,
     enabled: bool,
     record: DisabledRecord,
 ) -> Result<(), SkillToggleRefusal> {
-    match skill_lifecycle(name) {
+    let mut state = load_state_in(state_root);
+    match skill_lifecycle_with(name, &state.user) {
         SkillLifecycle::Builtin(_) => {}
+        SkillLifecycle::User(user_record) => {
+            if enabled {
+                if let Err(issue) =
+                    crate::user_skills::verify_user_library_in(state_root, &user_record)
+                {
+                    return Err(SkillToggleRefusal::UserLibraryStale {
+                        message: format!(
+                            "user skill '{name}' cannot be re-enabled: its library copy is \
+                             {issue} — remove the skill and add it again"
+                        ),
+                    });
+                }
+            }
+        }
         SkillLifecycle::PluginManaged(plugin) => {
             return Err(SkillToggleRefusal::plugin_managed(plugin))
         }
         SkillLifecycle::Unknown => return Err(SkillToggleRefusal::unknown(name)),
     }
-    let mut state = load_state_in(state_root);
     let changed = if enabled {
         state.disabled.remove(name).is_some()
     } else if state.disabled.contains_key(name) {
@@ -263,20 +423,7 @@ pub(crate) fn set_skill_enabled_in(
     if !changed {
         return Ok(());
     }
-    state.version = STATE_VERSION;
-    let path = skills_state_path_in(state_root);
-    let parent = path
-        .parent()
-        .ok_or_else(|| SkillToggleRefusal::io("skills state path has no parent"))?;
-    intendant_core::state_paths::create_private_dir_all(parent)
-        .map_err(|error| SkillToggleRefusal::io(format!("create {}: {error}", parent.display())))?;
-    let bytes = serde_json::to_vec_pretty(&state)
-        .map_err(|error| SkillToggleRefusal::io(format!("encode skills state: {error}")))?;
-    let tmp = path.with_extension("json.tmp");
-    intendant_core::state_paths::write_private_file(&tmp, &bytes)
-        .map_err(|error| SkillToggleRefusal::io(format!("write {}: {error}", tmp.display())))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|error| SkillToggleRefusal::io(format!("rename {}: {error}", path.display())))
+    persist_state_in(state_root, &mut state).map_err(SkillToggleRefusal::io)
 }
 
 /// [`set_skill_enabled_in`] against the daemon's own state root.
@@ -384,7 +531,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             refusal.message(),
-            "unknown skill 'no-such-skill' — not a builtin or bundled plugin payload"
+            "unknown skill 'no-such-skill' — not a builtin, bundled plugin payload, or user-added skill"
         );
         assert_eq!(refusal.http_status(), 404);
 
@@ -393,27 +540,36 @@ mod tests {
     }
 
     /// The mutation gate and the served `lifecycle` body derive from the
-    /// SAME classification: a name is toggle-controlled iff the flip
-    /// accepts it, plugin-controlled iff the flip refuses toward the
-    /// plugin (derive, don't mirror — no client re-derivation possible).
+    /// SAME classification, across every kind including user records: a
+    /// name is toggle-controlled iff the flip accepts it,
+    /// plugin-controlled iff the flip refuses toward the plugin (derive,
+    /// don't mirror — no client re-derivation possible). The extended S4
+    /// matrix: user rows are toggle-controlled AND removable.
     #[test]
     fn toggle_availability_parity_between_row_and_mutation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        crate::user_skills::add_user_skill_in(
+            root,
+            "parity-user-skill",
+            "---\nname: parity-user-skill\ndescription: parity probe\n---\nbody\n",
+            DisabledRecord::default(),
+        )
+        .unwrap();
         let disabled = disabled_skills_in(root);
+        let user = user_skill_records_in(root);
 
-        let mut names: Vec<&'static str> = crate::builtin_skills::BUILTIN_SKILLS
+        let mut names: Vec<String> = crate::builtin_skills::BUILTIN_SKILLS
             .iter()
-            .map(|skill| skill.name)
+            .map(|skill| skill.name.to_string())
             .collect();
         for plugin in crate::plugin_registry::BUNDLED_PLUGINS {
-            names.extend(plugin.skills.iter().map(|skill| skill.name));
+            names.extend(plugin.skills.iter().map(|skill| skill.name.to_string()));
         }
-        for name in names {
-            let control = skill_lifecycle_json(name, &disabled)["control"]
-                .as_str()
-                .unwrap()
-                .to_string();
+        names.push("parity-user-skill".to_string());
+        for name in &names {
+            let body = skill_lifecycle_json(name, &disabled, &user);
+            let control = body["control"].as_str().unwrap().to_string();
             let flip = set_skill_enabled_in(root, name, false, DisabledRecord::default());
             match control.as_str() {
                 "toggle" => assert!(flip.is_ok(), "{name}: toggle rows must accept the flip"),
@@ -423,11 +579,19 @@ mod tests {
                 ),
                 other => panic!("{name}: unexpected control '{other}'"),
             }
+            // Removability parity: exactly the user row declares the
+            // remove door, and the remove lane accepts exactly it (the
+            // builtin/plugin refusals are pinned in user_skills tests).
+            assert_eq!(
+                body.get("removable").is_some(),
+                name == "parity-user-skill",
+                "{name}: removable is the user kind's door"
+            );
             // Leave the set as we found it.
             let _ = set_skill_enabled_in(root, name, true, DisabledRecord::default());
         }
         assert_eq!(
-            skill_lifecycle_json("no-such-skill", &disabled)["control"],
+            skill_lifecycle_json("no-such-skill", &disabled, &user)["control"],
             "unknown"
         );
     }
@@ -437,31 +601,96 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let name = builtin_name(0);
+        let user = user_skill_records_in(root);
 
-        let body = skill_lifecycle_json(name, &disabled_skills_in(root));
+        let body = skill_lifecycle_json(name, &disabled_skills_in(root), &user);
         assert_eq!(body["control"], "toggle");
         assert_eq!(body["enabled"], true);
         assert!(body.get("disabled_by").is_none());
+        assert!(
+            body.get("removable").is_none(),
+            "builtins are deactivate-only — the bytes ship in the binary"
+        );
 
         set_skill_enabled_in(root, name, false, record("principal:dash", "dashboard", 77)).unwrap();
-        let body = skill_lifecycle_json(name, &disabled_skills_in(root));
+        let body = skill_lifecycle_json(name, &disabled_skills_in(root), &user);
         assert_eq!(body["enabled"], false);
         assert_eq!(body["disabled_by"]["principal"], "principal:dash");
         assert_eq!(body["disabled_by"]["kind"], "dashboard");
         assert_eq!(body["disabled_by"]["at_ms"], 77);
 
         let plugin = &crate::plugin_registry::BUNDLED_PLUGINS[0];
-        let body = skill_lifecycle_json(plugin.skills[0].name, &disabled_skills_in(root));
+        let body = skill_lifecycle_json(plugin.skills[0].name, &disabled_skills_in(root), &user);
         assert_eq!(body["control"], "plugin");
         assert_eq!(body["plugin_id"], plugin.id);
         assert_eq!(body["plugin_display_name"], plugin.display_name);
     }
 
+    /// The user kind's lifecycle body: control toggle + removable, the
+    /// add's gate-resolved attribution and recorded sha256 (ruling R3),
+    /// the disabling flip's attribution when off, and the drift wall —
+    /// re-enable of a hand-edited library copy refuses named (§3b) while
+    /// deactivate stays allowed (sweeping is always safe).
+    #[test]
+    fn user_lifecycle_carries_attribution_sha_and_drift_wall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let added = crate::user_skills::add_user_skill_in(
+            root,
+            "drift-probe",
+            "---\nname: drift-probe\ndescription: drift probe\n---\nbody\n",
+            record("principal:owner", "dashboard", 900),
+        )
+        .unwrap();
+
+        let body = skill_lifecycle_json(
+            "drift-probe",
+            &disabled_skills_in(root),
+            &user_skill_records_in(root),
+        );
+        assert_eq!(body["control"], "toggle");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["removable"], true);
+        assert_eq!(body["added_by"]["principal"], "principal:owner");
+        assert_eq!(body["added_by"]["kind"], "dashboard");
+        assert_eq!(body["added_by"]["at_ms"], 900);
+        assert_eq!(body["sha256"], added.sha256);
+
+        // Deactivate records the flip; the body carries both stamps.
+        set_skill_enabled_in(root, "drift-probe", false, record("p2", "dashboard", 901)).unwrap();
+        let body = skill_lifecycle_json(
+            "drift-probe",
+            &disabled_skills_in(root),
+            &user_skill_records_in(root),
+        );
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["disabled_by"]["principal"], "p2");
+        assert_eq!(body["added_by"]["principal"], "principal:owner");
+
+        // Hand-edit the library copy: re-enable refuses named (409), the
+        // set is untouched, and disable remains accepted.
+        std::fs::write(
+            crate::user_skills::user_skill_md_path_in(root, "drift-probe"),
+            "---\nname: drift-probe\ndescription: tampered\n---\nbody\n",
+        )
+        .unwrap();
+        let refusal =
+            set_skill_enabled_in(root, "drift-probe", true, DisabledRecord::default()).unwrap_err();
+        assert_eq!(
+            refusal.message(),
+            "user skill 'drift-probe' cannot be re-enabled: its library copy is stale (bytes \
+             no longer match the recorded sha256) — remove the skill and add it again"
+        );
+        assert_eq!(refusal.http_status(), 409);
+        assert!(disabled_skill_names_in(root).contains("drift-probe"));
+        set_skill_enabled_in(root, "drift-probe", false, DisabledRecord::default()).unwrap();
+    }
+
     /// The plugin-state preservation discipline, transplanted: entries
     /// whose names this binary does not ship, unknown fields inside a
-    /// record, and unknown top-level fields (the S4 user-library seam)
-    /// all survive a rewrite; corrupt or foreign-version state reads as
-    /// nothing-disabled.
+    /// record, user-registry records with fields a newer binary owns, and
+    /// unknown top-level fields all survive a rewrite; corrupt or
+    /// foreign-version state reads as nothing-disabled.
     #[test]
     fn foreign_names_fields_and_versions_follow_the_plugin_discipline() {
         let tmp = tempfile::tempdir().unwrap();
@@ -469,26 +698,33 @@ mod tests {
         let name = builtin_name(1);
         set_skill_enabled_in(root, name, false, record("p", "dashboard", 5)).unwrap();
 
-        // A newer binary's entry, record field, and top-level field.
+        // A newer binary's entry, record field, user record, and
+        // top-level field.
         let path = skills_state_path_in(root);
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         raw["disabled"]["future-user-skill"] =
             serde_json::json!({ "principal": "p2", "at_ms": 9, "reason": "kept" });
         raw["disabled"][name]["future_field"] = serde_json::json!("kept");
-        raw["user"] = serde_json::json!([{ "name": "future-lib-entry" }]);
+        raw["user"] =
+            serde_json::json!([{ "name": "future-lib-entry", "future_record_field": "kept" }]);
+        raw["future_top_level"] = serde_json::json!({ "keep": true });
         std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
 
-        // The foreign entry is visible to the sweep subtraction…
+        // The foreign entry is visible to the sweep subtraction, and the
+        // newer binary's user record lists like any other.
         assert!(disabled_skill_names_in(root).contains("future-user-skill"));
+        assert_eq!(user_skill_records_in(root)[0].name, "future-lib-entry");
 
-        // …and a rewrite by this binary preserves all three foreigners.
+        // …and a rewrite by this binary preserves all four foreigners.
         set_skill_enabled_in(root, builtin_name(2), false, record("p", "dashboard", 6)).unwrap();
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(raw["disabled"]["future-user-skill"]["reason"], "kept");
         assert_eq!(raw["disabled"][name]["future_field"], "kept");
         assert_eq!(raw["user"][0]["name"], "future-lib-entry");
+        assert_eq!(raw["user"][0]["future_record_field"], "kept");
+        assert_eq!(raw["future_top_level"]["keep"], true);
 
         // Corrupt and foreign-version states read as nothing-disabled (R4).
         std::fs::write(&path, b"not json").unwrap();

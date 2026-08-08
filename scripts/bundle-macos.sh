@@ -670,8 +670,12 @@ if [ "$INSTALL_APP" = "1" ]; then
 else
     echo "✅ Built: $APP (version $APP_VERSION; skipping install; set INSTALL_APP=1 to install)"
     echo ""
-    echo "Launch:"
-    echo "  open target/Intendant.app"
+    # Not `open -b` here: this branch never installed or registered the
+    # staged bundle, so the bundle id would resolve to whatever older copy
+    # LaunchServices knows about (or nothing). The absolute path launches
+    # exactly this build and works from any cwd.
+    echo "Launch (staged bundle, not installed):"
+    echo "  open \"$PROJECT_ROOT/$APP\""
 fi
 
 # Repeat a one-line pointer at the very end so the full warning can't be

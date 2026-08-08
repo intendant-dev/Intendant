@@ -375,6 +375,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// The app historically had no menu bar because closing the window
     /// quit it. Now that the window is closable without stopping the
     /// daemon, Quit (Cmd+Q) and Close (Cmd+W) need menu items to exist.
+    ///
+    /// The Edit menu exists for its key equivalents: without one, macOS
+    /// routes no standard editing combos at all, so Cmd+C/V/X/A/Z were
+    /// dead inside the WKWebView dashboard. Every Edit action is a
+    /// nil-targeted standard selector, resolved down the responder chain
+    /// to the web view's focused content.
     func installMainMenu() {
         let mainMenu = NSMenu()
 
@@ -398,9 +404,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         updateItem.target = self
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(
+            withTitle: "Hide Intendant",
+            action: #selector(NSApplication.hide(_:)),
+            keyEquivalent: "h"
+        )
+        let hideOthersItem = appMenu.addItem(
+            withTitle: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h"
+        )
+        hideOthersItem.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(
+            withTitle: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)),
+            keyEquivalent: ""
+        )
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(
             withTitle: "Quit Intendant (stops the daemon)",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
+        )
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+        // Undo/Redo have no ObjC-visible Swift declaration to hang a
+        // #selector on (NSResponder picks them up informally), so the
+        // string form is the canonical spelling. The uppercase "Z" key
+        // equivalent means Shift+Cmd+Z.
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(
+            withTitle: "Select All",
+            action: #selector(NSText.selectAll(_:)),
+            keyEquivalent: "a"
         )
 
         let windowItem = NSMenuItem()

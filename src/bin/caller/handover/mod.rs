@@ -24,12 +24,20 @@
 
 mod lease;
 mod presence;
+mod sibling_wait_set;
 mod successor_exec;
 mod update_lane;
 mod update_watch;
 
 pub(crate) use lease::{read_lease_sidecar, BuildVersion, LeaseAttempt, SchedulerLease};
-pub(crate) use presence::{boot_id_is_live, read_presence_records, DaemonPresence, DrainHoldout};
+#[cfg(test)]
+pub(crate) use presence::PRESENCE_HOLDOUT_ROWS_CAP;
+pub(crate) use presence::{
+    boot_id_is_live, read_presence_records, sort_drain_holdout_rows, DaemonPresence, DrainHoldout,
+};
+#[cfg(test)]
+pub(crate) use sibling_wait_set::seed_for_tests as seed_sibling_wait_set_for_tests;
+pub(crate) use sibling_wait_set::{resolve_sibling_wait_set, sibling_record_truncated};
 pub(crate) use successor_exec::spawn_successor_exec_lane;
 pub(crate) use update_lane::{parse_channel_arg, spawn_update_lane, update_rendezvous_url};
 pub(crate) use update_watch::spawn_update_watch;
@@ -923,14 +931,35 @@ impl HandoverRuntime {
             },
             Err(_) => (false, None, None),
         };
+        let own_pid = std::process::id();
         let daemons: Vec<serde_json::Value> = read_presence_records(&self.state_root)
             .into_iter()
             .map(|record| {
                 let live = boot_id_is_live(&self.state_root, &record.boot_id);
+                // A live draining SIBLING's capped presence rows widen
+                // from its own uncapped wait set through the sibling
+                // doorway (card 01KZD84XEC): the successor-side banner
+                // names EVERY holdout, not the first 16 — display
+                // currency only, gated on the same provable liveness as
+                // the rows themselves; the on-disk record never grows.
+                let widened = (live && record.pid != own_pid && record.state == "draining")
+                    .then(|| sibling_wait_set::resolve_sibling_wait_set(&self.state_root, &record))
+                    .flatten()
+                    .map(|fetched| {
+                        sibling_wait_set::widen_holdout_rows(
+                            record.holdouts.as_deref().unwrap_or(&[]),
+                            &fetched,
+                        )
+                    });
                 let mut value =
                     serde_json::to_value(&record).unwrap_or_else(|_| serde_json::json!({}));
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("live".into(), live.into());
+                    if let Some(rows) = widened {
+                        if let Ok(rows) = serde_json::to_value(&rows) {
+                            obj.insert("holdouts".into(), rows);
+                        }
+                    }
                 }
                 value
             })
@@ -1854,6 +1883,114 @@ mod tests {
         assert_eq!(daemons.len(), 1);
         assert_eq!(daemons[0]["boot_id"], runtime.boot_id());
         assert_eq!(daemons[0]["live"], true);
+    }
+
+    /// Card 01KZD84XEC: the status surface's `daemons` list widens a
+    /// live draining sibling's capped holdout rows from the cached
+    /// sibling-doorway fetch — the successor-side banner can then name
+    /// EVERY holdout — while the on-disk presence record keeps the cap
+    /// (it crosses the handover wire and never grows) and
+    /// `session_count` stays the untouched full truth. Display currency
+    /// only, gated on provable liveness: a dead sibling's entry serves
+    /// exactly its capped floor.
+    #[test]
+    fn status_json_widens_a_live_draining_siblings_capped_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = HandoverRuntime::initialize(dir.path(), 8765, 0);
+        let cap = presence::PRESENCE_HOLDOUT_ROWS_CAP;
+        let full = cap + 2;
+
+        // A foreign draining sibling: the record itemizes only the cap.
+        let daemons_dir = dir.path().join(presence::DAEMONS_DIR);
+        let rows: Vec<serde_json::Value> = (0..cap)
+            .map(|n| {
+                serde_json::json!({
+                    "session_id": format!("sess-{n:02}"),
+                    "source": "intendant",
+                    "phase": "idle",
+                })
+            })
+            .collect();
+        std::fs::write(
+            daemons_dir.join("boot-sib.json"),
+            serde_json::json!({
+                "v": 1,
+                "boot_id": "boot-sib",
+                "pid": std::process::id() + 1,
+                "port": 8770,
+                "version": {"pkg": "0.0.0", "git_sha": "sib", "built_at": "sib-ts"},
+                "state": "draining",
+                "session_count": full as u64,
+                "holdouts": rows,
+                "updated_ms": 5_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let sibling_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(daemons_dir.join("boot-sib.lock"))
+            .unwrap();
+        sibling_lock.try_lock().unwrap();
+        let fetched: Vec<DrainHoldout> = (0..full)
+            .map(|n| {
+                serde_json::from_value(serde_json::json!({
+                    "session_id": format!("sess-{n:02}"),
+                    "source": "intendant",
+                    "phase": "idle",
+                }))
+                .unwrap()
+            })
+            .collect();
+        seed_sibling_wait_set_for_tests(dir.path(), "boot-sib", fetched);
+
+        let status = runtime.status_json();
+        let entry = status["daemons"]
+            .as_array()
+            .expect("daemons array")
+            .iter()
+            .find(|daemon| daemon["boot_id"] == "boot-sib")
+            .cloned()
+            .expect("the sibling's entry");
+        assert_eq!(entry["live"], true);
+        assert_eq!(
+            entry["holdouts"].as_array().map(Vec::len),
+            Some(full),
+            "the served entry names every holdout, past the cap"
+        );
+        assert_eq!(
+            entry["session_count"], full as u64,
+            "the full count stays the untouched truth beside the rows"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(daemons_dir.join("boot-sib.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            on_disk["holdouts"].as_array().map(Vec::len),
+            Some(cap),
+            "the presence record itself never grows — it crosses the handover wire"
+        );
+
+        // The sibling dies (lock freed): the cached fetch is inert — the
+        // entry serves exactly the capped floor again, marked not live.
+        drop(sibling_lock);
+        let status = runtime.status_json();
+        let entry = status["daemons"]
+            .as_array()
+            .expect("daemons array")
+            .iter()
+            .find(|daemon| daemon["boot_id"] == "boot-sib")
+            .cloned()
+            .expect("the sibling's entry");
+        assert_eq!(entry["live"], false);
+        assert_eq!(
+            entry["holdouts"].as_array().map(Vec::len),
+            Some(cap),
+            "a dead sibling's cached rows never widen its entry"
+        );
     }
 
     #[test]

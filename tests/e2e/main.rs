@@ -7601,6 +7601,353 @@ async fn held_by_rows_ride_the_successor_catalog_and_serve_the_composer_lane() {
     drop(daemon_b);
 }
 
+/// Card 01KZD84XEC (the 17-of-22 night's tail): a takeover from a
+/// drainer holding MORE sessions than the presence holdout cap (16).
+/// The presence record deliberately keeps the cap — it crosses the
+/// handover wire — so the successor derives the rest from the DRAINER'S
+/// OWN uncapped wait set through the sibling doorway (loopback + the
+/// drainer's admission token, `GET /api/daemon/handover`). Pins:
+/// - every draining sibling session appears in the successor catalog
+///   regardless of count — all 18 rows serve `boot.held_by` +
+///   era:"current"/ghost:false, the two beyond-cap rows included (the
+///   #812 never-ghost fix extended past the cap);
+/// - the successor's served handover status names all 18 holdouts on
+///   the drainer's daemons entry (the banner list's source) while
+///   `session_count` stays the untouched full truth;
+/// - the on-disk presence record still itemizes only the cap (it never
+///   grows);
+/// - the claim self-clears with the drainer's death: floor and fetched
+///   rows alike drop the instant the boot lock frees — the beyond-cap
+///   row loses held_by with no wrapper behind it, and a dead sibling's
+///   cached rows never resurrect the claim (the strict never-suppress-
+///   ghost direction is unit-pinned where fixture mtimes are
+///   controlled; here the drain-entry transcript notice honestly lands
+///   inside the successor's era).
+/// The 18 sessions are deliberately CHEAP (the e2e footprint law): one
+/// scripted mock turn each, then parked idle for follow-ups — an idle
+/// session holds the drain, needs no barrier or timer, and its store is
+/// a few hundred bytes of transcript.
+#[tokio::test]
+async fn drain_map_widens_past_presence_cap_on_the_successor() {
+    const PRESENCE_CAP: usize = 16; // handover::presence::PRESENCE_HOLDOUT_ROWS_CAP
+    const FULL: usize = PRESENCE_CAP + 2;
+    let script = serde_json::json!({
+        "profiles": [
+            { "match": "bulk hold",
+              "steps": [
+                { "content": "turn one done — parked for follow-ups." }
+              ] },
+            { "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]}
+        ]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let rig = TestRig::new();
+    std::fs::write(rig.project.path().join("intendant.toml"), "").expect("project marker");
+    rig.write_script(&script);
+    // The drainer boots first (a free lease makes it the holder), with
+    // the resident bound raised explicitly: the default is RAM-derived
+    // (one per GiB — 16 on a 16 GiB box), which would capacity-queue the
+    // sessions past the cap and starve the fixture on exactly the boxes
+    // it must run on. The env override reads no host state.
+    let mut daemon_a = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon-a.log",
+        &[("INTENDANT_CAPACITY_MAX_RESIDENT", "64")],
+        &[],
+    )
+    .await;
+    let port_a = daemon_a.port;
+    let a_log = || {
+        std::fs::read_to_string(rig.home.path().join("daemon-a.log"))
+            .map(|log| tail(&log, 3000))
+            .unwrap_or_default()
+    };
+    let holder_boot = lease_sidecar(&rig).expect("holder sidecar")["boot_id"]
+        .as_str()
+        .expect("boot id")
+        .to_string();
+
+    // 18 cheap held sessions: each does one mock turn and parks idle —
+    // alive, so each holds the coming drain. Every profile instance is
+    // per-session (provider selection constructs one per loop), so one
+    // "bulk hold" profile serves them all.
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{}/ws?token={}",
+        port_a,
+        rig_loopback_token(&rig, port_a)
+    ))
+    .await
+    .expect("connect drainer websocket");
+    for n in 0..FULL {
+        let task = format!("bulk hold {n:02}");
+        let started = ctl_on_rig(&rig, port_a, &["task", "start", "--task", &task]).await;
+        assert!(started.status.success(), "{}", text_of(&started));
+    }
+    let mut held_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while held_ids.len() < FULL || completed.len() < FULL {
+        let event = next_matching_ws_event(&mut ws_a, RUN_TIMEOUT, |json| {
+            matches!(
+                json.get("event").and_then(serde_json::Value::as_str),
+                Some("session_started") | Some("round_complete")
+            )
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "held sessions never settled ({} started, {} completed):\n{}",
+                held_ids.len(),
+                completed.len(),
+                a_log()
+            )
+        });
+        let Some(sid) = event.get("session_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("session_started")
+                if event
+                    .get("task")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|task| task.starts_with("bulk hold")) =>
+            {
+                held_ids.insert(sid.to_string());
+            }
+            Some("round_complete") if held_ids.contains(sid) => {
+                completed.insert(sid.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    // The successor boots with --takeover: the lease transfers, A drains.
+    let daemon_b = spawn_co_daemon(
+        &client,
+        &rig,
+        "daemon-b.log",
+        &[("INTENDANT_LEASE_POLL_MS", "500")],
+        &["--takeover"],
+    )
+    .await;
+    let port_b = daemon_b.port;
+    poll_until(
+        "the lease transferring to the successor",
+        RUN_TIMEOUT,
+        || async {
+            let sidecar = lease_sidecar(&rig)?;
+            (sidecar["boot_id"] != holder_boot.as_str() && sidecar["state"] == "active")
+                .then_some(())
+        },
+        || format!("sidecar: {:?}", lease_sidecar(&rig)),
+    )
+    .await;
+
+    // The drainer's presence record: draining, the FULL count, and
+    // exactly the capped rows — the record never grows past the cap.
+    let drainer_presence_path = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("daemons")
+        .join(format!("{holder_boot}.json"));
+    let read_presence = || -> Option<serde_json::Value> {
+        serde_json::from_slice(&std::fs::read(&drainer_presence_path).ok()?).ok()
+    };
+    poll_until(
+        "the drainer's presence reporting the full drain wait set",
+        RUN_TIMEOUT,
+        || async {
+            let presence = read_presence()?;
+            (presence["state"] == "draining"
+                && presence["session_count"] == FULL as u64
+                && presence["holdouts"].as_array().map(Vec::len) == Some(PRESENCE_CAP))
+            .then_some(())
+        },
+        || {
+            format!(
+                "--- drainer presence record ---\n{}\n--- A tail ---\n{}",
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                a_log()
+            )
+        },
+    )
+    .await;
+    let floor_ids: std::collections::HashSet<String> = read_presence()
+        .and_then(|presence| {
+            Some(
+                presence["holdouts"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|row| row["session_id"].as_str().map(str::to_string))
+                    .collect(),
+            )
+        })
+        .expect("itemized floor rows");
+    let beyond_cap: Vec<String> = held_ids.difference(&floor_ids).cloned().collect();
+    assert_eq!(
+        beyond_cap.len(),
+        FULL - PRESENCE_CAP,
+        "the cap hid exactly the beyond-cap sessions"
+    );
+
+    // Pin 1 — the successor catalog: EVERY held session serves the
+    // held_by claim with era current / ghost false, the beyond-cap rows
+    // included. Until the doorway fetch lands the successor legitimately
+    // serves only the 16 floor rows (the fast-path hint) — the poll
+    // crosses exactly when the fetched wait set widens the map.
+    let mut headers_b = reqwest::header::HeaderMap::new();
+    headers_b.insert(
+        "x-intendant-loopback-token",
+        rig_loopback_token(&rig, port_b)
+            .parse()
+            .expect("token header value"),
+    );
+    let client_b = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers_b)
+        .build()
+        .expect("successor-authed client");
+    let row_of = |sessions: &serde_json::Value, sid: &str| -> Option<serde_json::Value> {
+        sessions["sessions"]
+            .as_array()
+            .or_else(|| sessions.as_array())?
+            .iter()
+            .find(|row| row["session_id"] == sid)
+            .cloned()
+    };
+    let last_diag = std::sync::Mutex::new(String::from("(no row served yet)"));
+    poll_until(
+        "the successor serving held_by on every row past the cap",
+        RUN_TIMEOUT,
+        || async {
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
+            for sid in &held_ids {
+                let Some(row) = row_of(&sessions, sid) else {
+                    *last_diag.lock().unwrap() = format!("row {sid} missing from the catalog");
+                    return None;
+                };
+                let held = row.pointer("/boot/held_by").cloned().unwrap_or_default();
+                if held["boot_id"] != holder_boot.as_str()
+                    || row["boot"]["ghost"] != false
+                    || row["boot"]["era"] != "current"
+                {
+                    *last_diag.lock().unwrap() = format!("row {sid}: {row}");
+                    return None;
+                }
+            }
+            Some(())
+        },
+        || {
+            format!(
+                "--- last failing row ---\n{}\n--- drainer presence ---\n{}\n--- A tail ---\n{}",
+                last_diag.lock().unwrap(),
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                a_log()
+            )
+        },
+    )
+    .await;
+
+    // Pin 2 — the successor's served handover status (the banner list's
+    // source): the drainer's daemons entry names all 18 holdouts while
+    // session_count stays the full truth beside them.
+    poll_until(
+        "the successor's handover status widening the drainer's rows",
+        RUN_TIMEOUT,
+        || async {
+            let status = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/daemon/handover"),
+            )
+            .await?;
+            let entry = status["daemons"]
+                .as_array()?
+                .iter()
+                .find(|daemon| daemon["boot_id"] == holder_boot.as_str())
+                .cloned()?;
+            (entry["live"] == true
+                && entry["session_count"] == FULL as u64
+                && entry["holdouts"].as_array().map(Vec::len) == Some(FULL))
+            .then_some(())
+        },
+        || {
+            format!(
+                "--- drainer presence ---\n{}\n--- A tail ---\n{}",
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                a_log()
+            )
+        },
+    )
+    .await;
+
+    // Pin 3 — the record itself still itemizes only the cap: the
+    // widening is a served join, never presence growth.
+    assert_eq!(
+        read_presence().expect("drainer presence")["holdouts"]
+            .as_array()
+            .map(Vec::len),
+        Some(PRESENCE_CAP),
+        "the on-disk presence record never grows past the cap"
+    );
+
+    // Pin 4 — self-clear: kill the drainer. Its boot lock frees, the
+    // serve-time liveness gate fails, and the cached doorway rows are
+    // inert — the beyond-cap row loses the held_by claim entirely, and
+    // no wrapper stands behind it (idle released sessions are
+    // adjudicated left-dead, never readopted). The row then reads by
+    // the ordinary transcript arithmetic — here "current", HONESTLY:
+    // the drain-entry bus notice appended to every held transcript
+    // during the takeover, inside the successor's era (the strict
+    // dead-claim-never-suppresses-ghost direction is unit-pinned in
+    // grid_envelope, where fixture mtimes really predate the
+    // watershed).
+    daemon_a._child.kill().await.expect("kill the drainer");
+    let dead_probe = beyond_cap[0].clone();
+    let last_dead_row = std::sync::Mutex::new(String::from("(row never served)"));
+    poll_until(
+        "the dead drainer's claim clearing from the successor catalog",
+        RUN_TIMEOUT,
+        || async {
+            let sessions = http_get_json(
+                &client_b,
+                &format!("http://127.0.0.1:{port_b}/api/sessions"),
+            )
+            .await?;
+            let row = row_of(&sessions, &dead_probe)?;
+            *last_dead_row.lock().unwrap() = row.to_string();
+            (row.pointer("/boot/held_by").is_none() && row["boot"]["live_wrapper"] == false)
+                .then_some(())
+        },
+        || {
+            format!(
+                "--- drainer boot lock held (test-side probe) ---\n{}\n\
+                 --- last served row ({dead_probe}) ---\n{}\n\
+                 --- drainer presence ---\n{}\n--- B tail ---\n{}",
+                boot_lock_is_held(&rig, &holder_boot),
+                last_dead_row.lock().unwrap(),
+                std::fs::read_to_string(&drainer_presence_path).unwrap_or_default(),
+                std::fs::read_to_string(rig.home.path().join("daemon-b.log"))
+                    .map(|log| tail(&log, 3000))
+                    .unwrap_or_default(),
+            )
+        },
+    )
+    .await;
+    drop(daemon_b);
+}
+
 /// A mock script whose scheduled-session profile parks mid-turn on a
 /// long provider delay — the holdout that keeps each drainer in the
 /// three-daemon chain below alive (and draining) for the whole

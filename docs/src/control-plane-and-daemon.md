@@ -442,7 +442,13 @@ successor without kill-and-relaunch:
   the wait set is named, never silent: the status payload carries
   `holdouts` (each holding session's id, name, backend, phase, and its
   durable `limit_park` marker with the reset instant), the drainer's
-  presence record mirrors a capped row copy beside `session_count`, and
+  presence record mirrors a capped row copy beside `session_count`
+  (the record crosses the handover wire and never grows; when the cap
+  truncates it, a successor fetches the drainer's own uncapped
+  `holdouts` through the sibling doorway — loopback + the per-port
+  admission token — and widens its served drain map and status rows
+  with them, floor-first and under the same provable-liveness gate, so
+  no held session is invisible regardless of count), and
   the dashboard's drain banner speaks two grades: grade 1 tells the
   product event plainly ("Updating Intendant — your work continues",
   a portless "Open the updated dashboard →" doorway, "Waiting for the

@@ -76,7 +76,8 @@ pub(crate) struct GridEnvelopeJoins {
     lineage_epoch: Option<u64>,
     /// Update-abstraction §3 (residual R4): session id → the draining
     /// co-homed sibling still RUNNING it, resolved once per build from
-    /// presence (see [`resolve_drain_map`]). Empty when no live sibling
+    /// presence, widened past the presence cap through the sibling
+    /// doorway (see [`resolve_drain_map`]). Empty when no live sibling
     /// drains — the common case costs one directory read. Feeds both
     /// the `boot.held_by` wire block and — the 01KZ8X8DWK amendment —
     /// the era computation: a held row is never a ghost.
@@ -105,11 +106,18 @@ pub(crate) struct DrainHold {
 /// The co-homed drain map: presence records that are DRAINING and
 /// provably live (the boot-lock probe — the same liveness truth
 /// `status_json` serves), excluding this process's own record, with
-/// their named holdout rows indexed by session id. Sessions beyond the
-/// presence holdout cap (16) get no entry — `session_count` keeps the
-/// full truth and the drain banner stays the aggregate surface. The
-/// join self-clears: a drainer's exit frees its boot lock, `live`
-/// reads false, and the map stops carrying it.
+/// their named holdout rows indexed by session id. The capped presence
+/// rows are the FLOOR (instant, disk-read, first insert wins); when the
+/// cap truncated them (`session_count` keeps the full truth), the
+/// drainer's OWN uncapped wait set — fetched through the sibling
+/// doorway and cached ([`crate::handover::resolve_sibling_wait_set`],
+/// card 01KZD84XEC) — widens the map so no held session is invisible
+/// regardless of count. Until that fetch lands, or if it fails, the map
+/// serves exactly the floor — never less than the presence lane alone.
+/// Both lanes ride the SAME serve-time liveness gate, so a cached claim
+/// from a dead drainer is inert. The join self-clears: a drainer's exit
+/// frees its boot lock, `live` reads false, and the map stops carrying
+/// it — floor and fetched rows alike.
 fn resolve_drain_map(state_root: &Path) -> HashMap<String, DrainHold> {
     let own_pid = std::process::id();
     let current_build = crate::handover::BuildVersion::current();
@@ -118,14 +126,20 @@ fn resolve_drain_map(state_root: &Path) -> HashMap<String, DrainHold> {
         if record.pid == own_pid || record.state != "draining" {
             continue;
         }
-        let Some(holdouts) = record.holdouts.as_ref().filter(|rows| !rows.is_empty()) else {
+        let floor = record.holdouts.clone().unwrap_or_default();
+        let truncated = crate::handover::sibling_record_truncated(&record);
+        if floor.is_empty() && !truncated {
             continue;
-        };
+        }
         if !crate::handover::boot_id_is_live(state_root, &record.boot_id) {
             continue;
         }
         let same_build = record.version == current_build;
-        for holdout in holdouts {
+        let fetched = truncated
+            .then(|| crate::handover::resolve_sibling_wait_set(state_root, &record))
+            .flatten()
+            .unwrap_or_default();
+        for holdout in floor.iter().chain(fetched.iter()) {
             map.entry(holdout.session_id.clone())
                 .or_insert_with(|| DrainHold {
                     boot_id: record.boot_id.clone(),
@@ -1004,6 +1018,171 @@ mod tests {
                 .contains("(v.ghost ? 'Ghost — pre-boot, nothing behind it; safe to close' : '')"),
             "the safe-to-close brief must stay keyed on the served ghost bit"
         );
+    }
+
+    /// [`write_presence_record`] with an explicit `session_count` — the
+    /// truncation input for the sibling-doorway widening tests.
+    #[allow(clippy::too_many_arguments)]
+    fn write_presence_record_counted(
+        state_root: &Path,
+        boot_id: &str,
+        pid: u32,
+        port: u16,
+        state: &str,
+        version: serde_json::Value,
+        session_count: u64,
+        holdouts: serde_json::Value,
+    ) {
+        let dir = state_root.join("daemons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = serde_json::json!({
+            "v": 1,
+            "boot_id": boot_id,
+            "pid": pid,
+            "port": port,
+            "version": version,
+            "state": state,
+            "session_count": session_count,
+            "holdouts": holdouts,
+            "updated_ms": 5_000,
+        });
+        std::fs::write(dir.join(format!("{boot_id}.json")), record.to_string()).unwrap();
+    }
+
+    fn bulk_holdout_rows(count: usize, phase: &str) -> serde_json::Value {
+        (0..count)
+            .map(|n| {
+                serde_json::json!({
+                    "session_id": format!("sess-{n:02}"),
+                    "source": "intendant",
+                    "phase": phase,
+                })
+            })
+            .collect()
+    }
+
+    fn bulk_holdouts(count: usize, phase: &str) -> Vec<crate::handover::DrainHoldout> {
+        serde_json::from_value(bulk_holdout_rows(count, phase)).unwrap()
+    }
+
+    /// Card 01KZD84XEC (the 17-of-22 night's tail): the presence cap
+    /// truncates a big drain's named rows, and before the widening every
+    /// session past the cap read preboot/ghost on the successor — the
+    /// #812 never-ghost fix covered only the itemized 16. The drain map
+    /// now widens from the drainer's own uncapped wait set (the sibling
+    /// doorway's cached fetch): a beyond-cap session serves the full
+    /// held_by block and never ghosts, exactly like a floor row. The
+    /// floor stays the fast path AND the winner on per-session conflict;
+    /// without a landed fetch the map serves exactly the floor
+    /// (fail-open — never worse than the presence lane alone).
+    #[test]
+    fn drain_map_widens_past_presence_cap_through_the_sibling_doorway() {
+        let sessions = tempfile::tempdir().unwrap();
+        let beyond = "sess-17";
+        let dir = session_dir_with_transcript(sessions.path(), beyond);
+        let floor_dir = session_dir_with_transcript(sessions.path(), "sess-00");
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Transcripts predate the successor's boot: ghost by arithmetic
+        // unless a live hold claims the row.
+        let preboot_watershed = now_secs + 3_600;
+        let foreign_pid = std::process::id() + 1;
+        let elder_build =
+            serde_json::json!({"pkg": "0.0.0", "git_sha": "elder", "built_at": "elder-ts"});
+        let attach_with = |state_root: &Path, session_id: &str, dir: &Path| {
+            let mut row = serde_json::json!({});
+            joins(Some(preboot_watershed), Some(&[]), None)
+                .with_drain_map_from(state_root)
+                .attach(&mut row, session_id, dir);
+            row
+        };
+        let cap = crate::handover::PRESENCE_HOLDOUT_ROWS_CAP;
+
+        // A drainer holding cap+2 sessions: the record itemizes only the
+        // cap; the doorway fetch (seeded as landed) names all 18.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record_counted(
+            root.path(),
+            "boot-big-drainer",
+            foreign_pid,
+            8770,
+            "draining",
+            elder_build.clone(),
+            (cap + 2) as u64,
+            bulk_holdout_rows(cap, "idle"),
+        );
+        let _lock = hold_boot_lock(root.path(), "boot-big-drainer");
+        // Fail-open FIRST (same fixture, nothing fetched yet): the floor
+        // row is held, the beyond-cap row still ghosts — never LESS than
+        // the presence lane alone, and nothing better until the fetch
+        // truly lands.
+        let row = attach_with(root.path(), "sess-00", &floor_dir);
+        assert_eq!(row["boot"]["held_by"]["boot_id"], "boot-big-drainer");
+        assert_eq!(row["boot"]["ghost"], false);
+        let row = attach_with(root.path(), beyond, &dir);
+        assert!(
+            row["boot"].get("held_by").is_none(),
+            "no fetch landed: the beyond-cap row has no claim to ride"
+        );
+        assert_eq!(row["boot"]["ghost"], true);
+
+        // The fetch lands (seeded): every session gains the claim. The
+        // fetched copy disagrees about a floor session's phase — the
+        // disk-fresh floor wins.
+        crate::handover::seed_sibling_wait_set_for_tests(
+            root.path(),
+            "boot-big-drainer",
+            bulk_holdouts(cap + 2, "running"),
+        );
+        let row = attach_with(root.path(), beyond, &dir);
+        let held = &row["boot"]["held_by"];
+        assert_eq!(held["boot_id"], "boot-big-drainer");
+        assert_eq!(held["port"], 8770);
+        assert_eq!(held["phase"], "running");
+        assert_eq!(
+            row["boot"]["era"], "current",
+            "a beyond-cap held row belongs to the daemon driving it now"
+        );
+        assert_eq!(
+            row["boot"]["ghost"], false,
+            "the never-ghost-on-held invariant extends past the cap"
+        );
+        let row = attach_with(root.path(), "sess-00", &floor_dir);
+        assert_eq!(
+            row["boot"]["held_by"]["phase"], "idle",
+            "the presence floor wins on per-session conflict"
+        );
+
+        // The liveness gate is consume-side and covers the CACHE: the
+        // identical truncated record with a seeded fetch but a FREE boot
+        // lock (drainer dead) serves nothing — a cached claim can never
+        // resurrect a dead drainer or suppress ghost.
+        let root = tempfile::tempdir().unwrap();
+        write_presence_record_counted(
+            root.path(),
+            "boot-dead-big",
+            foreign_pid,
+            8771,
+            "draining",
+            elder_build,
+            (cap + 2) as u64,
+            bulk_holdout_rows(cap, "idle"),
+        );
+        crate::handover::seed_sibling_wait_set_for_tests(
+            root.path(),
+            "boot-dead-big",
+            bulk_holdouts(cap + 2, "running"),
+        );
+        let row = attach_with(root.path(), beyond, &dir);
+        assert!(row["boot"].get("held_by").is_none());
+        assert_eq!(
+            row["boot"]["ghost"], true,
+            "a dead sibling's cached rows never suppress ghost"
+        );
+        let row = attach_with(root.path(), "sess-00", &floor_dir);
+        assert!(row["boot"].get("held_by").is_none());
     }
 
     fn envelope(
