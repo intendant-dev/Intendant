@@ -7632,6 +7632,46 @@ mod tests {
         }
     }
 
+    /// S5.3: a stamp of a dashboard-added template seals the PERSONAL
+    /// file — the sealed sha256 is exactly the add's recorded sha and
+    /// the binding locator names the personal library copy, never the
+    /// `.house` twin — including when the added name SHADOWS a house
+    /// definition (the resolution order's personal-first rule carried
+    /// into the seal).
+    #[test]
+    fn stamp_of_added_personal_template_seals_the_personal_file() {
+        let (root, mut store) = stamp_rig();
+        let shadow_md = "---\nname: triage\ndescription: my triage\n---\n\nMine.\n\n\
+                         ## node: triage\n\n```toml\n```\n\nDo mine.\n";
+        let record = crate::user_templates::add_user_template_in(
+            root.path(),
+            "triage",
+            shadow_md,
+            crate::skill_state::DisabledRecord::default(),
+        )
+        .unwrap();
+        let outcome = store
+            .apply_stamp_command(stamp_cmd("triage"), owner(), 5000)
+            .unwrap();
+        assert_eq!(
+            outcome.sha256, record.sha256,
+            "the sealed bytes are the added bytes"
+        );
+        let personal_path = crate::user_templates::user_template_md_path_in(root.path(), "triage");
+        assert!(
+            outcome
+                .locator
+                .contains(&personal_path.display().to_string()),
+            "the locator names the personal copy: {}",
+            outcome.locator
+        );
+        assert!(
+            !outcome.locator.contains(".house"),
+            "never the sealed house twin: {}",
+            outcome.locator
+        );
+    }
+
     #[test]
     fn stamp_parks_and_proposes_but_never_approves() {
         let (_root, mut store) = stamp_rig();
