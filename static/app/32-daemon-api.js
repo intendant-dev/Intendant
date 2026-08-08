@@ -190,6 +190,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_agenda_item: { verb: 'GET', path: '/api/agenda/items/{item_id}' },
   api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
   api_agenda_definitions: { verb: 'GET', path: '/api/agenda/definitions' },
+  api_agenda_definition_add: { verb: 'POST', path: '/api/agenda/definitions' },
+  api_agenda_definition_remove: { verb: 'DELETE', path: '/api/agenda/definitions/{name}' },
   api_agenda_sealed: { verb: 'GET', path: '/api/agenda/sealed/{sha256}' },
   api_agenda_stamp: { verb: 'POST', path: '/api/agenda/stamp' },
   api_agenda_ref_drift: { verb: 'GET', path: '/api/agenda/items/{item_id}/refs/drift' },

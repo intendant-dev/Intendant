@@ -134,7 +134,24 @@ the recorded sha, toggle through the same disabled-set (re-enable re-verifies
 the library bytes against the recorded sha and refuses a drifted copy by
 name), and carry the Remove door (`DELETE /api/skills/{name}`) that deletes
 the library entry and sweeps the marked copies from both roots in-request —
-never an unmarked user-owned twin.
+never an unmarked user-owned twin. The **Automation templates** section
+renders the served definition catalog — the same shared frontend derivation
+the Automate sheet's picker reads, so the two surfaces can never skew — with
+per-row provenance, trust-posture lines, and shadow state verbatim: house
+templates ship in the binary, read-only rows with no remove door, and the
+**template add sheet** (`POST /api/agenda/definitions`, Settings-grade, same
+paste/upload-only lanes and 64 KiB cap as the skill add) writes a personal
+definition into `<state_root>/automations/<name>/` — validated by the real
+definition parser, so a file the stamp would refuse refuses at add with the
+parser's own error — recording gate-resolved attribution plus the sha256 of
+the accepted bytes in the `templates` registry family. A personal template
+taking a house name shadows it visibly (both rows list; "shadows house · your
+copy resolves first"), `DELETE /api/agenda/definitions/{name}` removes only
+dashboard-added entries (house names and hand-placed personal directories
+refuse by name) and un-shadows the house twin in the same response, and a
+hand-edited library copy renders `library: stale` — the attribution no longer
+covers the bytes; stamping still seals whatever the file holds, under its own
+approval ceremony.
 
 On content-heavy destinations the composer can collapse to a compact pill and
 expand in place; each tab remembers its own state. Its target switcher can move
@@ -2080,6 +2097,8 @@ response omits the header.
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke/withdraw) |
 | GET | `/api/agenda/definitions` | AgendaRead | own origin | none | Automation-definition catalog (house + personal, validation state, full text) |
+| POST | `/api/agenda/definitions` | Settings | own origin | ≤ 64 KiB | Add one personal automation template from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly) |
+| DELETE | `/api/agenda/definitions/{name}` | Settings | own origin | none | Remove one dashboard-added personal template (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name) |
 | GET | `/api/agenda/sealed/{sha256}` | AgendaRead | own origin | none | One sealed binding-ref snapshot by sha256 pin (read-only, content-addressed) |
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |

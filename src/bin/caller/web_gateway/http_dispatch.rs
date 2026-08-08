@@ -1447,6 +1447,38 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaDefinitionAdd => {
+                // The recorded attribution is the gate-resolved
+                // principal, never a request-body claim (the S4 add law).
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
+                return handle_agenda_definition_add(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AgendaDefinitionRemove => {
+                // The row's `{name}` capture.
+                let name = route_captures
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                return handle_agenda_definition_remove(
+                    stream,
+                    name,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::AgendaSealed => {
                 // The row's `{sha256}` capture.
                 let sha256 = route_captures

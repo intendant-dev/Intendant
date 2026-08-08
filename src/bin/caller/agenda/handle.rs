@@ -521,6 +521,39 @@ impl AgendaHandle {
         }
     }
 
+    /// Add one dashboard-added personal template (S5) against the SAME
+    /// state root the catalog reads and the stamp lane resolves —
+    /// validation, collision walls, and registration live in
+    /// [`crate::user_templates`].
+    pub(crate) fn add_personal_definition(
+        &self,
+        name: &str,
+        skill_md: &str,
+        added_by: crate::skill_state::DisabledRecord,
+    ) -> Result<crate::skill_state::UserTemplateRecord, crate::user_skills::UserSkillRefusal> {
+        let Some(state_root) = self.dir.parent() else {
+            return Err(crate::user_skills::UserSkillRefusal::Io {
+                message: "agenda dir has no parent state root".to_string(),
+            });
+        };
+        crate::user_templates::add_user_template_in(state_root, name, skill_md, added_by)
+    }
+
+    /// Remove one dashboard-added personal template (S5). Refusals are
+    /// per-kind and named; house bytes and hand-placed directories are
+    /// never touched.
+    pub(crate) fn remove_personal_definition(
+        &self,
+        name: &str,
+    ) -> Result<crate::skill_state::UserTemplateRecord, crate::user_skills::UserSkillRefusal> {
+        let Some(state_root) = self.dir.parent() else {
+            return Err(crate::user_skills::UserSkillRefusal::Io {
+                message: "agenda dir has no parent state root".to_string(),
+            });
+        };
+        crate::user_templates::remove_user_template_in(state_root, name)
+    }
+
     /// One sealed snapshot's bytes by its pin (Track AW slice 2): the
     /// read lane behind sealed-content rendering. Read-only and
     /// content-addressed — the served bytes are re-hashed against the

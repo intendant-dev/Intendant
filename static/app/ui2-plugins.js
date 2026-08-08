@@ -33,15 +33,32 @@
 //      (DELETE /api/skills/{name}, api_skill_remove: library entry
 //      deleted, both roots swept in-request); their attribution
 //      ("Added by …") and recorded sha256 render from the served body.
-//   3. Automation templates — the served definition catalog
-//      (api_agenda_definitions) read-first: provenance/shadowed/invalid
-//      state verbatim, with Automate… opening the EXISTING agenda stamp
-//      sheet preselected — no second stamp lane.
+//   3. Automation templates — the served definition catalog rendered
+//      from the ONE shared derivation: ui2-agenda.js's
+//      agendaDefinitionCatalog lane, the same cache the Automate sheet's
+//      picker reads (this section keeps no second copy, so the two can
+//      never skew). Provenance / shadowed / invalid state, trust-posture
+//      lines, and dashboard-added attribution all render the daemon body
+//      verbatim, with Automate… opening the EXISTING agenda stamp sheet
+//      preselected — no second stamp lane. S5 personal templates: an
+//      availability-gated "Add template" sheet posts pasted or uploaded
+//      definition SKILL.md bytes to POST /api/agenda/definitions
+//      (api_agenda_definition_add) — the daemon validates with the REAL
+//      definition parser (a file the stamp would refuse refuses at add,
+//      with the parser's error) and records gate-resolved attribution +
+//      sha256; rows the daemon declares `removable` get the Remove door
+//      (DELETE /api/agenda/definitions/{name},
+//      api_agenda_definition_remove). Both mutation responses carry the
+//      FULL refreshed catalog (an add/remove flips its house twin's
+//      shadowed state), which replaces the shared cache in place —
+//      picker parity by construction, no second fetch.
 //
 // Deep-link TDZ rule: evaluates BEFORE the router (48) because a
 // #plugins deep link makes the router's eval-time boot call
 // pluginsOnTabShown(), which reads this fragment's module-level lets.
-// Top level declares only lets/consts/functions.
+// (The agenda fragment's shared catalog lets evaluate earlier still —
+// ui2-agenda.js precedes this fragment in the manifest.) Top level
+// declares only lets/consts/functions.
 
 let pluginsRows = [];
 let pluginsError = '';
@@ -58,17 +75,20 @@ let skillsLastInstall = {};  // skill name -> install report from the last toggl
 let skillAddOpen = false;    // the add sheet is expanded
 let skillAddBusy = false;    // an add request is in flight
 let skillAddError = '';      // the daemon's refusal, rendered verbatim
-let templatesRows = null;    // null until the catalog loads
-let templatesError = '';
-let templatesFetchInFlight = null;
+let templatesAvailability = ''; // read-lane unavailability copy ('' when readable)
+let templatesError = '';        // mutation-lane failures, rendered verbatim
+let templatesNotice = '';       // one-line success note (add/remove)
+let templatesBusy = {};         // template name -> true while a remove runs
+let templateAddOpen = false;    // the add sheet is expanded
+let templateAddBusy = false;    // an add request is in flight
+let templateAddError = '';      // the daemon's refusal, rendered verbatim
 
 function pluginsOnTabShown() {
   if (pluginsLoaded) renderPlugins();
   else loadPlugins();
   if (skillsRows) renderSkillsSection();
   else loadSkillsSection();
-  if (templatesRows) renderTemplatesSection();
-  else loadTemplatesSection();
+  loadTemplatesSection();
 }
 
 async function loadPlugins() {
@@ -606,55 +626,60 @@ function renderSkillsSection() {
   });
 }
 
-// ── Automation templates section (api_agenda_definitions) ──────────────
+// ── Automation templates section ───────────────────────────────────────
+//
+// ONE derivation: this section reads the SAME module-level catalog the
+// Automate sheet's picker reads (agendaDefinitionCatalog +
+// agendaFetchDefinitionCatalog, ui2-agenda.js) — never a second fetch
+// lane or local copy. Add/remove responses carry the full refreshed
+// catalog and replace that shared cache in place, so the sheet's next
+// open (which also refetches) and this section can never disagree.
 
-async function loadTemplatesSection() {
-  if (templatesFetchInFlight) return templatesFetchInFlight;
-  templatesFetchInFlight = (async () => {
-    const avail = daemonApi.availability('api_agenda_definitions');
-    if (!avail.ok) {
-      templatesError = avail.reason === 'denied'
-        ? "This session's role can't read the automation-template catalog."
-        : avail.reason === 'unsupported'
-          ? 'This daemon predates the automation-template catalog.'
-          : 'Daemon connection not ready yet.';
-      templatesFetchInFlight = null;
-      renderTemplatesSection();
-      return;
-    }
-    try {
-      const resp = await daemonApi.request('api_agenda_definitions', {});
-      if (resp.ok && resp.body && Array.isArray(resp.body.definitions)) {
-        templatesRows = resp.body.definitions;
-        templatesError = '';
-      } else {
-        templatesError = (resp.body && resp.body.error) || `template catalog unavailable (${resp.status})`;
-      }
-    } catch (e) {
-      templatesError = String((e && e.message) || e);
-    } finally {
-      templatesFetchInFlight = null;
-    }
+function loadTemplatesSection() {
+  const avail = daemonApi.availability('api_agenda_definitions');
+  if (!avail.ok) {
+    templatesAvailability = avail.reason === 'denied'
+      ? "This session's role can't read the automation-template catalog."
+      : avail.reason === 'unsupported'
+        ? 'This daemon predates the automation-template catalog.'
+        : 'Daemon connection not ready yet.';
     renderTemplatesSection();
-  })();
-  return templatesFetchInFlight;
+    return;
+  }
+  templatesAvailability = '';
+  agendaFetchDefinitionCatalog(renderTemplatesSection);
+  // Paint the cached catalog (or the loading line) now; the fetch
+  // callback repaints with fresh rows.
+  renderTemplatesSection();
 }
 
 function templateRowHtml(d) {
   if (!d || !d.name) return '';
-  // Provenance / shadowed / invalid chips render the served values
-  // verbatim; the stampability rule mirrors the Automate sheet's picker
-  // (valid && !shadowed) so this section never promises a stamp the
-  // sheet would refuse.
-  const chips = [`<span class="ui-chip">${escapeHtml(String(d.provenance || ''))}</span>`];
+  // Provenance / shadowed / invalid / library chips render the served
+  // values verbatim; the stampability rule mirrors the Automate sheet's
+  // picker (valid && !shadowed) so this section never promises a stamp
+  // the sheet would refuse.
+  const chips = [`<span class="ui-chip"${d.trust_posture ? ` title="${escapeHtml(d.trust_posture)}"` : ''}>${escapeHtml(String(d.provenance || ''))}</span>`];
   if (d.shadowed) chips.push('<span class="ui-chip warn">shadowed</span>');
+  if (d.shadows_house) chips.push('<span class="ui-chip" title="A house template of the same name ships in the binary — your copy resolves first">shadows house</span>');
   if (!d.valid) chips.push('<span class="ui-chip warn">invalid</span>');
+  if (d.library && d.library !== 'ok') {
+    chips.push(`<span class="ui-chip warn" title="The library file no longer matches the sha256 recorded at add time — the attribution below no longer covers these bytes; remove and re-add to re-attest">library: ${escapeHtml(String(d.library))}</span>`);
+  }
   const usable = Boolean(d.valid && !d.shadowed);
   const automateTitle = usable
     ? 'Open the Automate sheet with this definition selected'
     : (d.shadowed
       ? 'shadowed by a personal definition of the same name'
       : (d.reason || 'invalid definition'));
+  const busy = Boolean(templatesBusy[d.name]);
+  // The remove door renders only where the daemon declared it (a
+  // `templates` registry record backs the row) — house rows and
+  // hand-placed personal rows never get one.
+  const removeAvail = daemonApi.availability('api_agenda_definition_remove');
+  const removeBtn = d.removable && removeAvail.ok
+    ? `<button type="button" class="ui-btn template-remove" data-template-remove="${escapeHtml(d.name)}"${busy ? ' disabled' : ''} title="Delete this template from the daemon's personal library${d.shadows_house ? ' (the house template of the same name resolves again)' : ''}">Remove</button>`
+    : '';
   const kindLine = typeof agendaDefinitionKindLine === 'function' ? agendaDefinitionKindLine(d) : '';
   const desc = d.description
     ? `<div class="template-row-desc">${escapeHtml(d.description)}</div>`
@@ -662,40 +687,218 @@ function templateRowHtml(d) {
   const reason = !d.valid && d.reason
     ? `<div class="template-row-reason">${escapeHtml(d.reason)}</div>`
     : '';
+  // Dashboard-added rows: the add's served gate-resolved attribution +
+  // recorded sha (byte-deep provenance — the S4 row convention).
+  const addedBy = d.added_by
+    ? `<div class="template-row-attribution">${escapeHtml(skillAddedByText(d.added_by))}${d.record_sha256 ? ` · <code class="skill-row-sha" title="sha256 of the definition bytes accepted at add time">sha256:${escapeHtml(String(d.record_sha256))}</code>` : ''}</div>`
+    : '';
+  const trust = d.trust_posture
+    ? `<div class="template-row-trust">${escapeHtml(d.trust_posture)}</div>`
+    : '';
   return `<div class="ui-card template-row">
     <div class="template-row-head">
       <span class="template-row-title">${escapeHtml(d.title || d.name)}</span>
       ${chips.join(' ')}
+      ${removeBtn}
       <button type="button" class="ui-btn template-automate" data-template="${escapeHtml(d.name)}" title="${escapeHtml(automateTitle)}"${usable ? '' : ' disabled'}>Automate…</button>
     </div>
     ${kindLine ? `<div class="template-row-kind">${escapeHtml(kindLine)}</div>` : ''}
+    ${addedBy}
     ${desc}
     ${reason}
+    ${trust}
   </div>`;
 }
 
+// ── S5: the personal-template add sheet (paste / upload only) ──────────
+//
+// Rendered into #template-add-slot only when the daemon supports AND
+// this role may call api_agenda_definition_add. Same two inputs as the
+// skill add sheet — pasted definition SKILL.md bytes or a single-file
+// upload into the same textarea — landing the one skill_md field. The
+// daemon validates with the REAL definition parser; refusals render
+// verbatim.
+
+function renderTemplateAddSlot() {
+  const slot = document.getElementById('template-add-slot');
+  if (!slot) return;
+  const avail = daemonApi.availability('api_agenda_definition_add');
+  if (!avail.ok) {
+    slot.innerHTML = '';
+    return;
+  }
+  if (!templateAddOpen) {
+    slot.innerHTML = '<button type="button" class="ui-btn" id="template-add-open">Add template…</button>';
+    const open = document.getElementById('template-add-open');
+    if (open) open.onclick = () => { templateAddOpen = true; templateAddError = ''; renderTemplateAddSlot(); };
+    return;
+  }
+  slot.innerHTML = `<div class="ui-card skill-add-card">
+    <div class="skill-add-head">Add an automation template</div>
+    <div class="skill-add-explainer">Paste a definition SKILL.md (YAML frontmatter with <code>name</code> and <code>description</code>, then one <code>## node: &lt;id&gt;</code> section per node) or upload the file. It joins this daemon's personal library; giving it a house template's name shadows that template until you remove yours. It does nothing until stamped — stamping seals the file and every firing still needs its approved manifest.</div>
+    <label class="skill-add-label">Template name (slug — must equal the frontmatter name)
+      <input type="text" id="template-add-name" class="skill-add-input" placeholder="my-automation" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="skill-add-label">Definition SKILL.md
+      <textarea id="template-add-md" class="skill-add-input skill-add-md" rows="10" placeholder="---&#10;name: my-automation&#10;description: What stamping this sets up.&#10;---&#10;&#10;Shared orientation.&#10;&#10;## node: my-automation&#10;&#10;&#96;&#96;&#96;toml&#10;&#96;&#96;&#96;&#10;&#10;The node's mandate." spellcheck="false"></textarea>
+    </label>
+    <div class="skill-add-actions">
+      <label class="ui-btn skill-add-upload">Upload SKILL.md<input type="file" id="template-add-file" accept=".md,text/markdown,text/plain" hidden></label>
+      <span class="skill-add-spacer"></span>
+      <button type="button" class="ui-btn" id="template-add-cancel">Cancel</button>
+      <button type="button" class="ui-btn primary" id="template-add-submit"${templateAddBusy ? ' disabled' : ''}>${templateAddBusy ? 'Adding…' : 'Add template'}</button>
+    </div>
+    <div class="skill-add-status${templateAddError ? ' plugins-status-error' : ''}">${escapeHtml(templateAddError)}</div>
+  </div>`;
+  const nameInput = document.getElementById('template-add-name');
+  const mdInput = document.getElementById('template-add-md');
+  const file = document.getElementById('template-add-file');
+  const cancel = document.getElementById('template-add-cancel');
+  const submit = document.getElementById('template-add-submit');
+  if (file) file.onchange = () => {
+    const picked = file.files && file.files[0];
+    if (!picked) return;
+    if (picked.size > 64 * 1024) {
+      templateAddError = `“${picked.name}” is ${picked.size} bytes — the cap is 64 KiB.`;
+      renderTemplateAddSlot();
+      return;
+    }
+    picked.text().then(text => {
+      const md = document.getElementById('template-add-md');
+      const name = document.getElementById('template-add-name');
+      if (md) md.value = text;
+      // Convenience prefill from the frontmatter; the daemon still
+      // enforces name == frontmatter name.
+      const m = /^name:\s*(.+)$/m.exec(text);
+      if (name && !name.value.trim() && m) name.value = m[1].trim().replace(/^["']|["']$/g, '');
+    }).catch(e => {
+      templateAddError = String((e && e.message) || e);
+      renderTemplateAddSlot();
+    });
+  };
+  if (cancel) cancel.onclick = () => { templateAddOpen = false; templateAddError = ''; renderTemplateAddSlot(); };
+  if (submit) submit.onclick = () => templateAddSubmit(
+    nameInput ? nameInput.value.trim() : '',
+    mdInput ? mdInput.value : ''
+  );
+}
+
+async function templateAddSubmit(name, skillMd) {
+  if (templateAddBusy) return;
+  const avail = daemonApi.availability('api_agenda_definition_add');
+  if (!avail.ok) {
+    templateAddError = avail.reason === 'denied'
+      ? "This session's role can't add templates."
+      : 'Adding templates is unavailable on this daemon.';
+    renderTemplateAddSlot();
+    return;
+  }
+  if (!name || !skillMd.trim()) {
+    templateAddError = 'Both the template name and the definition SKILL.md are required.';
+    renderTemplateAddSlot();
+    return;
+  }
+  templateAddBusy = true;
+  renderTemplateAddSlot();
+  try {
+    const resp = await daemonApi.request('api_agenda_definition_add', { name, skill_md: skillMd });
+    if (resp.ok && resp.body && Array.isArray(resp.body.definitions)) {
+      // The response's refreshed catalog replaces the SHARED cache —
+      // the Automate sheet's picker and this section stay one truth.
+      agendaDefinitionCatalog = resp.body.definitions;
+      agendaDefinitionCatalogError = '';
+      templateAddOpen = false;
+      templateAddError = '';
+      const shadowed = Boolean(resp.body.template && resp.body.template.shadows_house);
+      templatesNotice = `Added '${name}' to the personal library — ready to stamp from the Automate sheet.${shadowed ? ' It shadows the house template of the same name.' : ''}`;
+      templatesError = '';
+    } else {
+      templateAddError = (resp.body && resp.body.error) || `template add failed (${resp.status})`;
+    }
+  } catch (e) {
+    templateAddError = String((e && e.message) || e);
+  } finally {
+    templateAddBusy = false;
+  }
+  renderTemplatesSection();
+}
+
+// Remove one dashboard-added template (the daemon declared the row
+// removable). Refusals (house / hand-placed / unknown) render verbatim;
+// the response's refreshed catalog shows the un-shadowed house twin.
+async function templateRemove(name) {
+  if (templatesBusy[name]) return;
+  const avail = daemonApi.availability('api_agenda_definition_remove');
+  if (!avail.ok) {
+    templatesError = avail.reason === 'denied'
+      ? "This session's role can't remove templates."
+      : 'Removing templates is unavailable on this daemon.';
+    renderTemplatesSection();
+    return;
+  }
+  const row = (agendaDefinitionCatalog || []).find(d => d && d.name === name && d.provenance === 'personal');
+  const unshadow = row && row.shadows_house
+    ? ' The house template of the same name resolves again.'
+    : '';
+  const message = `Remove '${name}' from the daemon's personal template library? Already-stamped automations keep executing their sealed copies.${unshadow}`;
+  const confirmed = typeof showDashboardConfirm === 'function'
+    ? (await showDashboardConfirm({
+        title: 'Remove this template?',
+        message,
+        confirmLabel: 'Remove',
+        cancelLabel: 'Keep it',
+      })) === true
+    : window.confirm(message);
+  if (!confirmed) return;
+  templatesBusy[name] = true;
+  renderTemplatesSection();
+  try {
+    const resp = await daemonApi.request('api_agenda_definition_remove', { name });
+    if (resp.ok && resp.body && Array.isArray(resp.body.definitions)) {
+      agendaDefinitionCatalog = resp.body.definitions;
+      agendaDefinitionCatalogError = '';
+      templatesNotice = `Removed '${name}' from the personal library.${unshadow}`;
+      templatesError = '';
+    } else {
+      templatesError = (resp.body && resp.body.error) || `template remove failed (${resp.status})`;
+    }
+  } catch (e) {
+    templatesError = String((e && e.message) || e);
+  } finally {
+    delete templatesBusy[name];
+  }
+  renderTemplatesSection();
+}
+
 function renderTemplatesSection() {
+  const error = templatesAvailability || templatesError
+    || (typeof agendaDefinitionCatalogError === 'string' ? agendaDefinitionCatalogError : '');
   const status = document.getElementById('templates-status');
   if (status) {
-    status.textContent = templatesError ? `Error: ${templatesError}` : '';
-    status.classList.toggle('plugins-status-error', Boolean(templatesError));
+    status.textContent = error ? `Error: ${error}` : (templatesNotice || '');
+    status.classList.toggle('plugins-status-error', Boolean(error));
   }
+  renderTemplateAddSlot();
   const list = document.getElementById('templates-list');
   if (!list) return;
-  if (!templatesRows && !templatesError) {
+  const rows = agendaDefinitionCatalog;
+  if (!rows && !error) {
     list.innerHTML = '<div class="ui-explainer">Loading template catalog…</div>';
     return;
   }
-  if (!templatesRows || !templatesRows.length) {
-    list.innerHTML = templatesError ? '' : '<div class="ui-empty"><div class="ui-empty-title">No automation templates</div><div class="ui-empty-hint">This daemon serves no definitions.</div></div>';
+  if (!rows || !rows.length) {
+    list.innerHTML = error ? '' : '<div class="ui-empty"><div class="ui-empty-title">No automation templates</div><div class="ui-empty-hint">This daemon serves no definitions.</div></div>';
     return;
   }
-  list.innerHTML = templatesRows.map(templateRowHtml).join('');
+  list.innerHTML = rows.map(templateRowHtml).join('');
   list.querySelectorAll('button.template-automate').forEach(btn => {
     btn.onclick = () => {
       if (typeof agendaOpenAutomationSheet === 'function') {
         agendaOpenAutomationSheet(btn, btn.dataset.template);
       }
     };
+  });
+  list.querySelectorAll('button[data-template-remove]').forEach(btn => {
+    btn.onclick = () => templateRemove(btn.dataset.templateRemove);
   });
 }

@@ -80,15 +80,20 @@ html.ui-v2 .plugin-card-flash { animation: plugin-card-flash 1.6s ease-out; }
   100% { outline: 2px solid transparent; outline-offset: 2px; }
 }
 
-/* Template rows: title + provenance/shadowed/invalid chips + Automate…,
-   kind line, description, and the validator's reason when invalid. */
+/* Template rows: title + provenance/shadowed/shadows-house/invalid/
+   library chips + Remove (dashboard-added rows) + Automate…, kind line,
+   added-by attribution, description, the validator's reason when
+   invalid, and the served trust-posture line (S5). */
 html.ui-v2 .template-row { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; }
 html.ui-v2 .template-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 html.ui-v2 .template-row-title { font-size: 13.5px; font-weight: 600; margin-right: auto; }
-html.ui-v2 .template-automate { font-size: 12px; padding: 2px 10px; }
+html.ui-v2 .template-automate,
+html.ui-v2 .template-remove { font-size: 12px; padding: 2px 10px; }
 html.ui-v2 .template-row-kind { color: var(--text-3); font-size: 12px; }
 html.ui-v2 .template-row-desc { color: var(--text-2); font-size: 12.5px; line-height: 1.45; }
 html.ui-v2 .template-row-reason { color: var(--amber); font-size: 12.5px; }
+html.ui-v2 .template-row-attribution { color: var(--text-3); font-size: 12px; }
+html.ui-v2 .template-row-trust { color: var(--text-3); font-size: 12px; }
 
 /* ── S4: the user-skill add sheet + user-row provenance ─────────────── */
 

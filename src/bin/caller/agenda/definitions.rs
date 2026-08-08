@@ -100,6 +100,13 @@ pub(crate) const HOUSE_DEFINITIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Whether `name` is one of the shipped house definitions (the S5
+/// add/remove walls and the catalog's shadow derivation read this — one
+/// membership answer, never a re-derived list).
+pub(crate) fn is_house_definition_name(name: &str) -> bool {
+    HOUSE_DEFINITIONS.iter().any(|(have, _)| *have == name)
+}
+
 /// Where a resolved definition came from — catalog provenance chips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionProvenance {
@@ -438,11 +445,45 @@ pub(crate) struct CatalogNode {
 /// Invalid entries list with their refusal reason instead of vanishing
 /// (the skills skip-don't-die posture, made visible); a shadowed house
 /// entry stays listed with `shadowed:true` so a shadow is never silent.
+///
+/// S5 provenance surface: every entry carries a `trust_posture` line
+/// (derived from provenance + the template registry, never free text —
+/// the skills-catalog convention), personal entries that shadow a house
+/// twin say so (`shadows_house`), and dashboard-added entries carry the
+/// registry record's attribution, recorded sha256, `removable` door, and
+/// `library` drift status (`ok`/`stale`/`missing` — S4's vocabulary).
+/// Hand-placed personal definitions carry none of those: no record means
+/// the dashboard lanes refuse them, and the posture line says whose they
+/// are.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct DefinitionCatalogEntry {
     pub(crate) name: String,
     pub(crate) provenance: &'static str,
     pub(crate) shadowed: bool,
+    /// This personal entry shadows a house definition of the same name
+    /// (the resolution order prefers it) — the shadow relationship from
+    /// the winning side.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) shadows_house: bool,
+    /// Trust posture, rendered from provenance + registry state.
+    pub(crate) trust_posture: String,
+    /// The dashboard remove door: present exactly when a `templates`
+    /// registry record backs this entry.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) removable: bool,
+    /// The add's gate-resolved attribution (dashboard-added entries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) added_by: Option<crate::skill_state::DisabledRecord>,
+    /// sha256 the registry record attests (what the add accepted) —
+    /// distinct from `sha256`, the CURRENT file bytes a stamp would seal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) record_sha256: Option<String>,
+    /// Drift status of the recorded library file: `ok`, `stale` (edited
+    /// since add — the attribution no longer covers the bytes), or
+    /// `missing`. Display truth only; stamping still seals whatever the
+    /// file holds, under its own ceremony.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) library: Option<&'static str>,
     pub(crate) valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
@@ -471,14 +512,53 @@ pub(crate) struct DefinitionCatalogEntry {
     pub(crate) path: String,
 }
 
+/// The served `trust_posture` line — provenance + registry state, one
+/// composition site (never frontend free text).
+fn template_trust_posture(
+    provenance: DefinitionProvenance,
+    recorded: bool,
+    shadows_house: bool,
+) -> String {
+    let mut posture = match provenance {
+        DefinitionProvenance::House => {
+            "House template · ships in this daemon's binary, read-only here; adding a \
+             personal template of the same name shadows it."
+        }
+        DefinitionProvenance::Personal if recorded => {
+            "Personal template · added from the dashboard, attributed on this row."
+        }
+        DefinitionProvenance::Personal => {
+            "Personal template · hand-placed in this daemon's library, managed by hand."
+        }
+        DefinitionProvenance::Path => "Explicit file path outside the template libraries.",
+    }
+    .to_string();
+    if shadows_house {
+        posture
+            .push_str(" Shadows the house template of the same name — your copy resolves first.");
+    }
+    posture.push_str(" Stamping seals the file; firings execute the sealed bytes.");
+    posture
+}
+
 /// Assemble the served catalog: the personal library plus the
 /// materialized house set, each parsed by the one validator. Reads the
 /// SAME paths the stamp lane resolves, so the catalog never describes a
 /// file a stamp would not seal. Discovery grants nothing — bindingness
 /// requires the stamp seal under an approval digest.
+///
+/// Dashboard-added entries (S5) join their `templates` registry record:
+/// attribution, recorded sha256, the remove door, and the drift status
+/// all ride the entry. A record whose library file is GONE still lists —
+/// invalid, `library:"missing"`, removable — so the remove door survives
+/// a half-failed removal or a hand-deleted directory; such a name does
+/// NOT shadow its house twin (resolution already falls through to the
+/// house copy).
 pub(crate) fn definition_catalog(state_root: &Path) -> Vec<DefinitionCatalogEntry> {
     let mut entries: Vec<DefinitionCatalogEntry> = Vec::new();
     let mut personal_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let records = crate::skill_state::user_template_records_in(state_root);
+    let record_for = |name: &str| records.iter().find(|record| record.name == name);
     if let Ok(dir) = std::fs::read_dir(automations_dir_in(state_root)) {
         let mut dirs: Vec<PathBuf> = dir
             .flatten()
@@ -509,8 +589,46 @@ pub(crate) fn definition_catalog(state_root: &Path) -> Vec<DefinitionCatalogEntr
                 &name,
                 DefinitionProvenance::Personal,
                 false,
+                record_for(&name),
+                is_house_definition_name(&name),
             ));
         }
+    }
+    // Recorded names without a library file: listed from the record so
+    // the remove door stays reachable (the S4 missing posture).
+    for record in &records {
+        if personal_names.contains(&record.name) || !valid_slug(&record.name) {
+            continue;
+        }
+        let path = automations_dir_in(state_root)
+            .join(&record.name)
+            .join("SKILL.md");
+        entries.push(DefinitionCatalogEntry {
+            name: record.name.clone(),
+            provenance: DefinitionProvenance::Personal.as_str(),
+            shadowed: false,
+            shadows_house: false,
+            trust_posture: template_trust_posture(DefinitionProvenance::Personal, true, false),
+            removable: true,
+            added_by: Some(record.added_by.clone()),
+            record_sha256: Some(record.sha256.clone()),
+            library: Some("missing"),
+            valid: false,
+            reason: Some(
+                "the recorded personal template has no SKILL.md on disk — remove the \
+                 entry (or add the definition again)"
+                    .to_string(),
+            ),
+            title: None,
+            description: None,
+            advisories: Vec::new(),
+            workflow: false,
+            orientation: None,
+            nodes: Vec::new(),
+            text: String::new(),
+            sha256: None,
+            path: path.display().to_string(),
+        });
     }
     for (name, _) in HOUSE_DEFINITIONS {
         let path = house_dir_in(state_root).join(name).join("SKILL.md");
@@ -519,6 +637,8 @@ pub(crate) fn definition_catalog(state_root: &Path) -> Vec<DefinitionCatalogEntr
             name,
             DefinitionProvenance::House,
             personal_names.contains(*name),
+            None,
+            false,
         ));
     }
     // Name order; the active entry before its shadowed house twin.
@@ -531,11 +651,27 @@ fn catalog_entry(
     name: &str,
     provenance: DefinitionProvenance,
     shadowed: bool,
+    record: Option<&crate::skill_state::UserTemplateRecord>,
+    shadows_house: bool,
 ) -> DefinitionCatalogEntry {
+    let trust_posture = template_trust_posture(provenance, record.is_some(), shadows_house);
+    let added_by = record.map(|r| r.added_by.clone());
+    let record_sha256 = record.map(|r| r.sha256.clone());
     let invalid = |reason: String, text: String, sha256: Option<String>| DefinitionCatalogEntry {
         name: name.to_string(),
         provenance: provenance.as_str(),
         shadowed,
+        shadows_house,
+        trust_posture: trust_posture.clone(),
+        removable: record.is_some(),
+        added_by: added_by.clone(),
+        record_sha256: record_sha256.clone(),
+        // The drift status against the same read that produced `text`.
+        library: record.map(|r| match sha256.as_deref() {
+            Some(current) if current == r.sha256 => "ok",
+            Some(_) => "stale",
+            None => "missing",
+        }),
         valid: false,
         reason: Some(reason),
         title: None,
@@ -553,11 +689,24 @@ fn catalog_entry(
         Err(err) => return invalid(format!("unreadable: {err}"), String::new(), None),
     };
     let sha256 = Some(super::sealed_blobs::digest_bytes(text.as_bytes()));
+    let library = record.map(|r| {
+        if sha256.as_deref() == Some(r.sha256.as_str()) {
+            "ok"
+        } else {
+            "stale"
+        }
+    });
     match parse_definition(&text, name) {
         Ok(def) => DefinitionCatalogEntry {
             name: def.name.clone(),
             provenance: provenance.as_str(),
             shadowed,
+            shadows_house,
+            trust_posture,
+            removable: record.is_some(),
+            added_by,
+            record_sha256,
+            library,
             valid: true,
             reason: None,
             title: Some(def.title.clone()),
@@ -2022,6 +2171,139 @@ mod tests {
         );
         // Invalid-but-readable still hashes: bytes are bytes.
         assert!(broken_entry.sha256.is_some());
+    }
+
+    /// The S5 provenance surface on the served catalog: dashboard-added
+    /// entries join their `templates` registry record (attribution,
+    /// recorded sha256, the remove door, drift status), hand-placed
+    /// personal entries carry none of those, house entries stay
+    /// remove-less with the in-binary posture, the shadow relationship
+    /// renders from BOTH sides, and a record whose file is gone still
+    /// lists with the remove door while its house twin un-shadows.
+    #[test]
+    fn catalog_serves_template_registry_provenance_and_drift() {
+        let root = tempfile::tempdir().unwrap();
+        materialize_house_definitions(root.path()).unwrap();
+
+        // Hand-placed personal definition: no record, no dashboard door.
+        let hand = automations_dir_in(root.path()).join("hand-made");
+        std::fs::create_dir_all(&hand).unwrap();
+        std::fs::write(
+            hand.join("SKILL.md"),
+            "---\nname: hand-made\ndescription: d\n---\n\nO.\n\n## node: \
+             hand-made\n\n```toml\n```\n\nP.\n",
+        )
+        .unwrap();
+
+        // Dashboard-added shadow of a house name.
+        let shadow_md = "---\nname: triage\ndescription: my triage\n---\n\nMine.\n\n\
+                         ## node: triage\n\n```toml\n```\n\nDo mine.\n";
+        let added = crate::user_templates::add_user_template_in(
+            root.path(),
+            "triage",
+            shadow_md,
+            crate::skill_state::DisabledRecord {
+                principal: Some("principal:owner".to_string()),
+                kind: Some("dashboard".to_string()),
+                at_ms: 42,
+                foreign: serde_json::Map::new(),
+            },
+        )
+        .unwrap();
+
+        let catalog = definition_catalog(root.path());
+        let entry = |name: &str, provenance: &str| {
+            catalog
+                .iter()
+                .find(|e| e.name == name && e.provenance == provenance)
+                .unwrap_or_else(|| panic!("{provenance} entry {name}"))
+        };
+
+        let personal = entry("triage", "personal");
+        assert!(personal.valid);
+        assert!(personal.shadows_house, "the shadow says so from its side");
+        assert!(personal.removable, "recorded entries carry the remove door");
+        assert_eq!(
+            personal
+                .added_by
+                .as_ref()
+                .and_then(|a| a.principal.as_deref()),
+            Some("principal:owner")
+        );
+        assert_eq!(
+            personal.record_sha256.as_deref(),
+            Some(added.sha256.as_str())
+        );
+        assert_eq!(personal.library, Some("ok"));
+        assert_eq!(
+            personal.sha256, personal.record_sha256,
+            "current == attested at add"
+        );
+        assert!(
+            personal.trust_posture.contains("your copy resolves first"),
+            "{}",
+            personal.trust_posture
+        );
+
+        let house = entry("triage", "house");
+        assert!(house.shadowed);
+        assert!(!house.removable, "house entries expose no remove door");
+        assert!(house.added_by.is_none() && house.library.is_none());
+        assert!(
+            house
+                .trust_posture
+                .contains("ships in this daemon's binary"),
+            "{}",
+            house.trust_posture
+        );
+
+        let hand_made = entry("hand-made", "personal");
+        assert!(!hand_made.removable, "no record ⇒ no dashboard door");
+        assert!(hand_made.added_by.is_none() && hand_made.library.is_none());
+        assert!(!hand_made.shadows_house);
+        assert!(
+            hand_made.trust_posture.contains("hand-placed"),
+            "{}",
+            hand_made.trust_posture
+        );
+
+        // Drift: a hand edit flips the recorded entry to `stale` — the
+        // attribution no longer covers the current bytes — while the
+        // current-file sha keeps serving what a stamp WOULD seal.
+        std::fs::write(
+            crate::user_templates::user_template_md_path_in(root.path(), "triage"),
+            shadow_md.replace("Do mine.", "Do something else."),
+        )
+        .unwrap();
+        let catalog = definition_catalog(root.path());
+        let personal = catalog
+            .iter()
+            .find(|e| e.name == "triage" && e.provenance == "personal")
+            .unwrap();
+        assert_eq!(personal.library, Some("stale"));
+        assert_ne!(personal.sha256, personal.record_sha256);
+        assert!(personal.removable, "remove stays the door out of drift");
+
+        // Missing: the recorded file gone entirely — the record still
+        // lists (invalid, missing, removable) and the house twin
+        // un-shadows (resolution already falls through to it).
+        std::fs::remove_dir_all(automations_dir_in(root.path()).join("triage")).unwrap();
+        let catalog = definition_catalog(root.path());
+        let personal = catalog
+            .iter()
+            .find(|e| e.name == "triage" && e.provenance == "personal")
+            .expect("the record keeps the row listed");
+        assert!(!personal.valid);
+        assert_eq!(personal.library, Some("missing"));
+        assert!(personal.removable);
+        assert!(!personal.shadows_house, "a missing file shadows nothing");
+        let house = catalog
+            .iter()
+            .find(|e| e.name == "triage" && e.provenance == "house")
+            .unwrap();
+        assert!(!house.shadowed, "the house twin un-shadows");
+        // Every entry always serves a posture line.
+        assert!(catalog.iter().all(|e| !e.trust_posture.trim().is_empty()));
     }
 
     #[test]
