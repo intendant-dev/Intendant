@@ -195,6 +195,16 @@ class DashboardControlTransport {
         // The status frame carries the aggregate `fueled` flag the
         // New Session preflight banner derives from.
         if (typeof updateNewSessionFuelBanner === 'function') updateNewSessionFuelBanner();
+        // In tunnel-primary postures (the packaged macOS app, hosted
+        // Connect) this arrival is the first moment `fueled` is readable
+        // at all — and on a slow first boot it can land after the
+        // Activity empty state's boot probe expired its retries. Re-ask
+        // now so the unfueled CTAs can never miss a late answer.
+        // (Pinned by unfueled_empty_state_reprobe_rides_tunnel_status
+        // in dashboard_control/mod.rs.)
+        if (typeof refreshUnfueledEmptyState === 'function') {
+          refreshUnfueledEmptyState().catch(() => {});
+        }
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
