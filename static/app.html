@@ -18219,6 +18219,10 @@ html.ui-v2 #agent-signin-section .agent-signin-countdown {
 #agent-signin-section .agent-signin-step { display: flex; flex-direction: column; gap: 8px; }
 #agent-signin-section .agent-signin-url { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; user-select: all; }
 #agent-signin-section .agent-signin-code { font-family: var(--mono, monospace); }
+/* The install lane's verbatim-command note ("Official installer: …"):
+   the command must read as a command — mono and fully wrappable, but no
+   select-all (the line carries a prose prefix). */
+#agent-signin-section .agent-install-command { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; }
 #agent-signin-section .agent-signin-device-code { font-family: var(--mono, monospace); font-size: 26px; font-weight: 700; letter-spacing: 0.1em; user-select: all; }
 #agent-signin-section .agent-signin + .agent-signin { margin-top: 16px; }
 
@@ -39262,7 +39266,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '2ac034c667e354db';
+const INTENDANT_APP_BUILD = '32bda7774406ae81';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -45817,6 +45821,11 @@ async function agentInstallPropose(backendId) {
    transitions to the empty-state refresher so the fueling nudge and the
    new-session picker follow without a restart. */
 let agentInstallPollTimer = null;
+let agentInstallPollTicks = 0;
+// Longest legitimate in-flight window: a 600s approval wait plus a 900s
+// installer run, with margin. Past it the poll stops even if a dead
+// daemon left the last-seen state frozen mid-flight.
+const AGENT_INSTALL_POLL_MAX_TICKS = 1000;
 function agentInstallAnyInFlight() {
   if (!Array.isArray(externalAgentAvailability)) return false;
   return externalAgentAvailability.some(agent => {
@@ -45827,10 +45836,12 @@ function agentInstallAnyInFlight() {
 function agentInstallEnsurePoll() {
   if (agentInstallPollTimer) return;
   if (!agentInstallAnyInFlight()) return;
+  agentInstallPollTicks = 0;
   agentInstallPollTimer = window.setInterval(async () => {
+    agentInstallPollTicks += 1;
     await refreshExternalAgentAvailability();
     renderAgentSigninSection();
-    if (!agentInstallAnyInFlight()) {
+    if (!agentInstallAnyInFlight() || agentInstallPollTicks > AGENT_INSTALL_POLL_MAX_TICKS) {
       window.clearInterval(agentInstallPollTimer);
       agentInstallPollTimer = null;
       // Terminal: a success flips `installed` on the re-probe — let the

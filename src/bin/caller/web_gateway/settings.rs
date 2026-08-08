@@ -1194,8 +1194,13 @@ pub(crate) async fn external_agent_install_api_response(
         );
     };
     let registry = crate::backend_install::global_registry();
-    match crate::backend_install::propose_install(bus, registry.clone(), state_root, &payload.backend)
-        .await
+    match crate::backend_install::propose_install(
+        bus,
+        registry.clone(),
+        state_root,
+        &payload.backend,
+    )
+    .await
     {
         Ok(_) => {
             let backend = crate::external_agent::AgentBackend::from_str_loose(&payload.backend)
@@ -2582,10 +2587,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         let platform = crate::backend_install::InstallPlatform::current()
             .expect("test hosts are supported platforms");
-        assert_eq!(
-            parsed["install_platform"].as_str(),
-            Some(platform.as_str())
-        );
+        assert_eq!(parsed["install_platform"].as_str(), Some(platform.as_str()));
         let rows = parsed["external_agents"].as_array().unwrap();
         assert!(!rows.is_empty());
         for row in rows {
@@ -2604,8 +2606,9 @@ mod tests {
             );
         }
         // Pi is served with the honest no-lane answer, not omitted.
-        assert!(rows.iter().any(|row| row["id"] == "pi"
-            && row["install"]["available"] == serde_json::json!(false)));
+        assert!(rows.iter().any(
+            |row| row["id"] == "pi" && row["install"]["available"] == serde_json::json!(false)
+        ));
     }
 
     #[tokio::test]

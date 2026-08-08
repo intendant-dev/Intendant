@@ -844,6 +844,10 @@ html.ui-v2 #agent-signin-section .agent-signin-countdown {
 #agent-signin-section .agent-signin-step { display: flex; flex-direction: column; gap: 8px; }
 #agent-signin-section .agent-signin-url { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; user-select: all; }
 #agent-signin-section .agent-signin-code { font-family: var(--mono, monospace); }
+/* The install lane's verbatim-command note ("Official installer: …"):
+   the command must read as a command — mono and fully wrappable, but no
+   select-all (the line carries a prose prefix). */
+#agent-signin-section .agent-install-command { font-family: var(--mono, monospace); font-size: 11px; overflow-wrap: anywhere; }
 #agent-signin-section .agent-signin-device-code { font-family: var(--mono, monospace); font-size: 26px; font-weight: 700; letter-spacing: 0.1em; user-select: all; }
 #agent-signin-section .agent-signin + .agent-signin { margin-top: 16px; }
 

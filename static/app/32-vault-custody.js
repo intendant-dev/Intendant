@@ -2359,6 +2359,11 @@ async function agentInstallPropose(backendId) {
    transitions to the empty-state refresher so the fueling nudge and the
    new-session picker follow without a restart. */
 let agentInstallPollTimer = null;
+let agentInstallPollTicks = 0;
+// Longest legitimate in-flight window: a 600s approval wait plus a 900s
+// installer run, with margin. Past it the poll stops even if a dead
+// daemon left the last-seen state frozen mid-flight.
+const AGENT_INSTALL_POLL_MAX_TICKS = 1000;
 function agentInstallAnyInFlight() {
   if (!Array.isArray(externalAgentAvailability)) return false;
   return externalAgentAvailability.some(agent => {
@@ -2369,10 +2374,12 @@ function agentInstallAnyInFlight() {
 function agentInstallEnsurePoll() {
   if (agentInstallPollTimer) return;
   if (!agentInstallAnyInFlight()) return;
+  agentInstallPollTicks = 0;
   agentInstallPollTimer = window.setInterval(async () => {
+    agentInstallPollTicks += 1;
     await refreshExternalAgentAvailability();
     renderAgentSigninSection();
-    if (!agentInstallAnyInFlight()) {
+    if (!agentInstallAnyInFlight() || agentInstallPollTicks > AGENT_INSTALL_POLL_MAX_TICKS) {
       window.clearInterval(agentInstallPollTimer);
       agentInstallPollTimer = null;
       // Terminal: a success flips `installed` on the re-probe — let the

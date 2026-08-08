@@ -34,7 +34,7 @@
 //!    about an approval id it does not own.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -190,7 +190,9 @@ pub(crate) fn install_approval_preview(backend: &AgentBackend, command: &str) ->
 pub(crate) enum InstallState {
     Idle,
     /// Proposed and waiting on the approval rail. Nothing has executed.
-    WaitingApproval { approval_id: u64 },
+    WaitingApproval {
+        approval_id: u64,
+    },
     Running,
     Succeeded {
         exit_code: i32,
@@ -207,10 +209,16 @@ pub(crate) enum InstallState {
     },
     /// The user declined/skipped the approval, or it timed out unanswered.
     /// Nothing executed.
-    Declined { detail: String, finished_ms: u64 },
+    Declined {
+        detail: String,
+        finished_ms: u64,
+    },
     /// Refused before the wall (approval-policy deny, no matrix lane,
     /// unknown backend). Nothing executed and no approval was raised.
-    Refused { detail: String, finished_ms: u64 },
+    Refused {
+        detail: String,
+        finished_ms: u64,
+    },
 }
 
 impl InstallState {
@@ -291,7 +299,11 @@ pub(crate) enum InstallGateDecision {
 
 /// Pure decision over an autonomy snapshot — pinned exhaustively in tests.
 pub(crate) fn install_gate_decision(state: &AutonomyState) -> InstallGateDecision {
-    if state.effective_rules(None).rule_for(ActionCategory::CommandExec) == ApprovalRule::Deny {
+    if state
+        .effective_rules(None)
+        .rule_for(ActionCategory::CommandExec)
+        == ApprovalRule::Deny
+    {
         return InstallGateDecision::Refused(
             "Denied by approval policy: an [approval] deny rule covers shell execution on this \
              daemon, so the installer was not proposed."
@@ -345,7 +357,10 @@ fn unix_ms() -> u64 {
 pub(crate) enum ProposeRefusal {
     UnknownBackend(String),
     /// The matrix has no lane for this backend on this platform.
-    NoLane { backend: String, platform: &'static str },
+    NoLane {
+        backend: String,
+        platform: &'static str,
+    },
 }
 
 /// Propose installing `backend` on this machine. Never executes in this
@@ -458,9 +473,11 @@ async fn install_gate_waiter(
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                break Err("The approval channel closed before a decision arrived — the \
+                break Err(
+                    "The approval channel closed before a decision arrived — the \
                            installer was not run."
-                    .to_string());
+                        .to_string(),
+                );
             }
             Ok(Ok(AppEvent::ControlCommand(msg))) => match msg {
                 // Approval ids are process-wide — match on id alone (the
@@ -523,7 +540,10 @@ fn decode_install_result(stdout: &str) -> Option<(Option<i32>, String)> {
         }
         let data = parsed.get("data").and_then(|v| v.as_str()).unwrap_or("");
         if let Ok(exec) = serde_json::from_str::<serde_json::Value>(data) {
-            let exit_code = exec.get("exit_code").and_then(|v| v.as_i64()).map(|c| c as i32);
+            let exit_code = exec
+                .get("exit_code")
+                .and_then(|v| v.as_i64())
+                .map(|c| c as i32);
             let mut tail = String::new();
             for key in ["stdout_tail", "stderr_tail"] {
                 if let Some(text) = exec.get(key).and_then(|v| v.as_str()) {
@@ -554,7 +574,9 @@ fn bounded_tail(text: &str) -> String {
     if chars.len() <= INSTALL_OUTPUT_TAIL_CHARS {
         return text.to_string();
     }
-    chars[chars.len() - INSTALL_OUTPUT_TAIL_CHARS..].iter().collect()
+    chars[chars.len() - INSTALL_OUTPUT_TAIL_CHARS..]
+        .iter()
+        .collect()
 }
 
 /// Execute the announced command through the sandboxed runtime lane and
@@ -565,10 +587,11 @@ async fn run_install(
     backend: AgentBackend,
     command: &'static str,
 ) {
-    let log_dir = state_root
-        .join("logs")
-        .join("installs")
-        .join(format!("{}-{}", backend.as_short_str(), unix_ms()));
+    let log_dir = state_root.join("logs").join("installs").join(format!(
+        "{}-{}",
+        backend.as_short_str(),
+        unix_ms()
+    ));
     if let Err(err) = std::fs::create_dir_all(&log_dir) {
         registry.set(
             &backend,
@@ -593,12 +616,8 @@ async fn run_install(
     })
     .to_string();
 
-    let outcome = crate::agent_runner::run_install_batch(
-        &input,
-        &log_dir,
-        INSTALL_BATCH_HARD_TIMEOUT,
-    )
-    .await;
+    let outcome =
+        crate::agent_runner::run_install_batch(&input, &log_dir, INSTALL_BATCH_HARD_TIMEOUT).await;
 
     let finished_ms = unix_ms();
     let state = match outcome {
@@ -657,7 +676,10 @@ async fn run_install(
 /// derived from the matrix (availability + command) and the registry
 /// (state). The dashboard renders the button from `available`, shows
 /// `command` verbatim, and narrates `state` honestly.
-pub(crate) fn install_status_json(registry: &InstallRegistry, backend: &AgentBackend) -> serde_json::Value {
+pub(crate) fn install_status_json(
+    registry: &InstallRegistry,
+    backend: &AgentBackend,
+) -> serde_json::Value {
     let lane = InstallPlatform::current().and_then(|platform| install_command(backend, platform));
     let mut value = serde_json::json!({
         "available": lane.is_some(),
@@ -704,12 +726,18 @@ pub(crate) fn install_status_json(registry: &InstallRegistry, backend: &AgentBac
             }
             obj.insert("finished_ms".into(), finished_ms.into());
         }
-        InstallState::Declined { detail, finished_ms } => {
+        InstallState::Declined {
+            detail,
+            finished_ms,
+        } => {
             obj.insert("state".into(), "declined".into());
             obj.insert("detail".into(), detail.into());
             obj.insert("finished_ms".into(), finished_ms.into());
         }
-        InstallState::Refused { detail, finished_ms } => {
+        InstallState::Refused {
+            detail,
+            finished_ms,
+        } => {
             obj.insert("state".into(), "refused".into());
             obj.insert("detail".into(), detail.into());
             obj.insert("finished_ms".into(), finished_ms.into());
@@ -724,7 +752,11 @@ mod tests {
     use crate::autonomy::AutonomyLevel;
 
     fn backends() -> [AgentBackend; 3] {
-        [AgentBackend::ClaudeCode, AgentBackend::Codex, AgentBackend::Kimi]
+        [
+            AgentBackend::ClaudeCode,
+            AgentBackend::Codex,
+            AgentBackend::Kimi,
+        ]
     }
 
     const PLATFORMS: [InstallPlatform; 3] = [
@@ -762,7 +794,9 @@ mod tests {
         }
         // Pi deliberately has no lane on any platform.
         assert!(
-            INSTALL_MATRIX.iter().all(|lane| lane.backend != AgentBackend::Pi),
+            INSTALL_MATRIX
+                .iter()
+                .all(|lane| lane.backend != AgentBackend::Pi),
             "pi has no vendor install lane by decision — adding one belongs in the matrix comment"
         );
     }
@@ -796,7 +830,10 @@ mod tests {
         let command = install_command(&AgentBackend::ClaudeCode, InstallPlatform::MacOs).unwrap();
         let preview = install_approval_preview(&AgentBackend::ClaudeCode, command);
         assert!(preview.contains("Install Claude Code"));
-        assert!(preview.contains(command), "the exact command rides verbatim");
+        assert!(
+            preview.contains(command),
+            "the exact command rides verbatim"
+        );
         assert!(preview.contains("Intendant will run this in a terminal session on this machine."));
     }
 
@@ -806,7 +843,11 @@ mod tests {
     #[test]
     fn gate_decision_follows_the_command_exec_wall_conventions() {
         let mut state = AutonomyState::default();
-        assert_eq!(state.level, AutonomyLevel::Medium, "default level is Medium");
+        assert_eq!(
+            state.level,
+            AutonomyLevel::Medium,
+            "default level is Medium"
+        );
         assert_eq!(install_gate_decision(&state), InstallGateDecision::Wall);
 
         state.level = AutonomyLevel::Low;
@@ -831,7 +872,10 @@ mod tests {
             };
             let denied = AutonomyState::new(level, denied_rules);
             assert!(
-                matches!(install_gate_decision(&denied), InstallGateDecision::Refused(_)),
+                matches!(
+                    install_gate_decision(&denied),
+                    InstallGateDecision::Refused(_)
+                ),
                 "deny rule refuses at {level:?}"
             );
         }
@@ -885,7 +929,10 @@ mod tests {
         };
         let platform = InstallPlatform::current().unwrap();
         let command = install_command(&AgentBackend::Codex, platform).unwrap();
-        assert!(announced.contains(command), "the preview carries the command verbatim");
+        assert!(
+            announced.contains(command),
+            "the preview carries the command verbatim"
+        );
 
         // Nothing executed: the executor's first observable act (its log
         // dir) must not exist while the wall stands.
@@ -955,8 +1002,13 @@ mod tests {
         let registry = InstallRegistry::default();
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
-            propose_install(bus.clone(), registry.clone(), root.path().into(), "not-a-backend")
-                .await,
+            propose_install(
+                bus.clone(),
+                registry.clone(),
+                root.path().into(),
+                "not-a-backend"
+            )
+            .await,
             Err(ProposeRefusal::UnknownBackend("not-a-backend".to_string()))
         );
         let pi = propose_install(bus, registry.clone(), root.path().into(), "pi").await;
@@ -1008,7 +1060,10 @@ mod tests {
         let op = route
             .tunnel_operation()
             .expect("the install route derives an IAM operation");
-        assert_eq!(crate::access::iam::operation_permission_id(op), "settings.manage");
+        assert_eq!(
+            crate::access::iam::operation_permission_id(op),
+            "settings.manage"
+        );
 
         let roles = crate::access::iam::builtin_role_templates();
         let none = roles
@@ -1026,7 +1081,10 @@ mod tests {
     #[test]
     fn decode_install_result_reads_the_runtime_protocol() {
         let ok = r#"{"type":"result","nonce":1,"data":"{\"nonce\":1,\"pid\":7,\"exit_code\":0,\"stdout_tail\":\"installed\",\"stderr_tail\":\"\"}"}"#;
-        assert_eq!(decode_install_result(ok), Some((Some(0), "installed".to_string())));
+        assert_eq!(
+            decode_install_result(ok),
+            Some((Some(0), "installed".to_string()))
+        );
 
         let failed = r#"{"type":"result","nonce":1,"data":"{\"nonce\":1,\"pid\":7,\"exit_code\":127,\"stdout_tail\":\"\",\"stderr_tail\":\"curl: not found\"}"}"#;
         assert_eq!(
@@ -1035,7 +1093,10 @@ mod tests {
         );
 
         let error = r#"{"type":"result","nonce":1,"data":"Error: Process error"}"#;
-        assert_eq!(decode_install_result(error), Some((None, "Error: Process error".to_string())));
+        assert_eq!(
+            decode_install_result(error),
+            Some((None, "Error: Process error".to_string()))
+        );
 
         assert_eq!(decode_install_result("not json\n"), None);
     }
