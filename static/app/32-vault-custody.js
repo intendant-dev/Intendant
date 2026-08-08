@@ -2254,6 +2254,149 @@ function agentSigninMissingAvailability(spec) {
   return entry && entry.installed === false ? entry : null;
 }
 
+/* The approval-gated Install lane on a not-installed card. Everything
+   renders from the availability row's `install` object, which the daemon
+   derives from its install-command matrix (`available` + the exact
+   `command`) and its install registry (`state`): clicking Install only
+   PROPOSES — the daemon raises a command_exec approval showing the exact
+   command, and nothing runs until it is approved there. While a proposal
+   is pending or running, a bounded poll keeps the card honest; a finished
+   install triggers the availability re-probe so this card and the
+   new-session picker refresh without a restart. */
+const agentInstallProposeBusy = {};
+function agentInstallSection(card, spec, missing, note, actionsRow) {
+  const install = missing.install;
+  if (!install || install.available !== true || !install.command) {
+    // The matrix has no lane for this backend on this platform — the
+    // honest absence IS the answer; no button renders.
+    return;
+  }
+  const avail = daemonApi.availability('api_external_agent_install');
+  if (avail.reason === 'denied') {
+    note("This session's role can't propose installs — installing needs settings.manage.");
+    return;
+  }
+  const commandNote = () => {
+    const el = note(`Official installer: ${install.command}`);
+    el.classList.add('agent-install-command');
+    return el;
+  };
+  const installButton = (label) =>
+    vaultButton(label, () => agentInstallPropose(spec.sessionKind), { primary: true });
+  const state = String(install.state || 'idle');
+  if (state === 'waiting_approval') {
+    note(
+      'Waiting for your approval — the exact command is on the approval rail. ' +
+        'Approve it there to run the installer, or deny it to keep this machine unchanged.',
+      'vault-warning'
+    );
+    agentInstallEnsurePoll();
+    return;
+  }
+  if (state === 'running') {
+    note('Running the official installer in a terminal session on the daemon host…');
+    commandNote();
+    agentInstallEnsurePoll();
+    return;
+  }
+  if (state === 'succeeded') {
+    // Still on the not-installed card after a finished install: the
+    // PATH-inheritance footgun — the daemon inherited PATH at launch, so
+    // a fresh install dir may not resolve until PATH carries it.
+    const el = note(
+      'The installer finished, but the CLI still does not resolve on the ' +
+        "daemon's PATH. The daemon inherited its PATH at launch — add the " +
+        'install directory to PATH and restart the daemon, or restart your ' +
+        'terminal session, then this card will pick it up.',
+      'vault-warning'
+    );
+    if (install.log_dir) el.title = `Full installer output: ${install.log_dir}`;
+    actionsRow(installButton('Run installer again'));
+    return;
+  }
+  if (state === 'failed') {
+    const el = note(
+      `The install did not complete: ${install.detail || 'unknown failure'}`,
+      'vault-error'
+    );
+    const evidence = [install.output_tail, install.log_dir ? `Full output: ${install.log_dir}` : '']
+      .filter(Boolean)
+      .join('\n');
+    if (evidence) el.title = evidence;
+    actionsRow(installButton('Try again'));
+    return;
+  }
+  if (state === 'declined') {
+    note(install.detail || 'You declined the install — nothing was run.');
+  } else if (state === 'refused') {
+    note(install.detail || 'The install was refused by approval policy.', 'vault-error');
+  }
+  commandNote();
+  note('Installing runs the official installer above. Intendant will ask for your approval first.');
+  actionsRow(installButton(`Install ${spec.label}`));
+}
+
+async function agentInstallPropose(backendId) {
+  if (agentInstallProposeBusy[backendId]) return;
+  agentInstallProposeBusy[backendId] = true;
+  try {
+    await daemonApi.request('api_external_agent_install', { backend: backendId });
+  } catch (err) {
+    console.warn('install proposal failed', backendId, err);
+  } finally {
+    agentInstallProposeBusy[backendId] = false;
+  }
+  // Adopt the daemon's authoritative state (waiting/running/refused) and
+  // repaint; the poll keeps following it from here. The explicit refresh
+  // lane, not the bounded-TTL cache: the install registry state rides
+  // the availability rows, and a just-proposed install is exactly the
+  // moment the served state must not be up to 30s stale.
+  await refreshExternalAgentAvailability({ refresh: true });
+  renderAgentSigninSection();
+  agentInstallEnsurePoll();
+}
+
+/* Bounded honesty poll: while any backend's install is waiting on the
+   rail or running, re-fetch availability and repaint. Stops itself the
+   tick after every install reaches a terminal state, and hands terminal
+   transitions to the empty-state refresher so the fueling nudge and the
+   new-session picker follow without a restart. */
+let agentInstallPollTimer = null;
+let agentInstallPollTicks = 0;
+// Longest legitimate in-flight window: a 600s approval wait plus a 900s
+// installer run, with margin. Past it the poll stops even if a dead
+// daemon left the last-seen state frozen mid-flight.
+const AGENT_INSTALL_POLL_MAX_TICKS = 1000;
+function agentInstallAnyInFlight() {
+  if (!Array.isArray(externalAgentAvailability)) return false;
+  return externalAgentAvailability.some(agent => {
+    const state = agent && agent.install && agent.install.state;
+    return state === 'waiting_approval' || state === 'running';
+  });
+}
+function agentInstallEnsurePoll() {
+  if (agentInstallPollTimer) return;
+  if (!agentInstallAnyInFlight()) return;
+  agentInstallPollTicks = 0;
+  agentInstallPollTimer = window.setInterval(async () => {
+    agentInstallPollTicks += 1;
+    // Refresh lane on every tick: a live install is user intent, and the
+    // terminal `installed` flip this poll exists to observe is exactly
+    // what the daemon's re-probe (and its change broadcast) keys on.
+    await refreshExternalAgentAvailability({ refresh: true });
+    renderAgentSigninSection();
+    if (!agentInstallAnyInFlight() || agentInstallPollTicks > AGENT_INSTALL_POLL_MAX_TICKS) {
+      window.clearInterval(agentInstallPollTimer);
+      agentInstallPollTimer = null;
+      // Terminal: a success flips `installed` on the re-probe — let the
+      // Activity empty state and the picker hear about it too.
+      if (typeof refreshUnfueledEmptyState === 'function') {
+        refreshUnfueledEmptyState();
+      }
+    }
+  }, 2500);
+}
+
 function renderAgentSigninSection() {
   const mount = document.getElementById('agent-signin-section');
   if (!mount) return;
@@ -2327,7 +2470,10 @@ function agentSigninProviderCard(provider) {
   }
 
   // Machine pre-flight: a backend the daemon reports uninstalled can
-  // only click-then-fail — mute the card and name what was looked for.
+  // only click-then-fail — mute the card, name what was looked for, and
+  // offer the approval-gated Install lane (the daemon's install-command
+  // matrix decides whether a button renders and which exact command the
+  // approval rail will announce).
   const missing = agentSigninMissingAvailability(spec);
   if (missing) {
     card.classList.add('agent-signin-missing');
@@ -2346,6 +2492,7 @@ function agentSigninProviderCard(provider) {
     // where-and-why instead of leaving "install it" to gaslight a user
     // who just did.
     if (missing.path_hint) note(String(missing.path_hint));
+    agentInstallSection(card, spec, missing, note, actionsRow);
     return card;
   }
 

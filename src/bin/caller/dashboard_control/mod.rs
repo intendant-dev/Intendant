@@ -6115,6 +6115,7 @@ mod tests {
             ("api_managed_context_anchors", Row, Some(Op::SessionInspect)),
             ("api_managed_context_fission", Row, Some(Op::SessionInspect)),
             ("api_external_agents", Row, Some(Op::SessionInspect)),
+            ("api_external_agent_install", Row, Some(Op::Settings)),
         ];
 
         // Live partition: rows first (the resolution order), then the
@@ -6420,6 +6421,7 @@ mod tests {
             "api_kimi_auth_cancel",
             "api_project_root",
             "api_external_agents",
+            "api_external_agent_install",
             "api_displays",
             "api_diagnostics_visual_freshness",
             "api_access_overview",

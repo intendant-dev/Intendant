@@ -1655,6 +1655,12 @@ impl SessionSupervisor {
         if crate::live_audio::spawn_consent_pending(approval_id) {
             return;
         }
+        // A Vault backend-install proposal (crate::backend_install) is the
+        // same shape: daemon-scoped, its own bus-observing waiter resolves
+        // and emits ApprovalResolved.
+        if crate::backend_install::install_pending(approval_id) {
+            return;
+        }
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
             self.warn("Approval response dropped: no active managed session");
             return;

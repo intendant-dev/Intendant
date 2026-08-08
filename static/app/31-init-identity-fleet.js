@@ -844,6 +844,7 @@ function applyUnfueledEmptyState(unfueled) {
       hint.textContent = LOG_EMPTY_DEFAULT_HINT;
       document.getElementById('log-empty-actions')?.remove();
       document.getElementById('log-empty-external-agents')?.remove();
+      document.getElementById('log-empty-install')?.remove();
     }
     return;
   }
@@ -961,15 +962,65 @@ function applyUnfueledExternalAgentNote(empty, { omitReady = false } = {}) {
   let note = document.getElementById('log-empty-external-agents');
   if (!parts.length) {
     if (note) note.remove();
+  } else {
+    if (!note) {
+      note = document.createElement('div');
+      note.id = 'log-empty-external-agents';
+      note.className = 'ui-empty-hint';
+      empty.appendChild(note);
+    }
+    note.textContent = parts.join('. ') + '.';
+  }
+  applyUnfueledInstallActions(empty);
+}
+
+/* Per-backend Install buttons for the unfueled empty state: backends the
+   daemon reports NOT installed, where its install-command matrix has a
+   lane for this platform (`install.available`). Clicking only PROPOSES —
+   the daemon raises the approval showing the exact command — then focuses
+   the backend's Vault card, where the install's honest state lives. */
+function applyUnfueledInstallActions(empty) {
+  const missing = Array.isArray(externalAgentAvailability)
+    ? externalAgentAvailability.filter(
+        agent => agent && agent.installed === false
+          && agent.install && agent.install.available === true && agent.install.command
+      )
+    : [];
+  let row = document.getElementById('log-empty-install');
+  if (!missing.length) {
+    if (row) row.remove();
     return;
   }
-  if (!note) {
-    note = document.createElement('div');
-    note.id = 'log-empty-external-agents';
-    note.className = 'ui-empty-hint';
-    empty.appendChild(note);
+  if (row) row.remove();
+  row = document.createElement('div');
+  row.id = 'log-empty-install';
+  row.className = 'ui-empty-actions';
+  const lead = document.createElement('div');
+  lead.className = 'ui-empty-hint';
+  lead.textContent = (missing.length === 1
+    ? `${missing[0].label || missing[0].id} is not installed on this machine — Intendant can run its official installer here, with your approval first.`
+    : `${joinAgentNames(missing.map(agent => agent.label || agent.id))} are not installed on this machine — Intendant can run their official installers here, with your approval first.`);
+  row.appendChild(lead);
+  for (const agent of missing) {
+    const btn = document.createElement('button');
+    btn.className = 'ui-empty-btn';
+    btn.textContent = `Install ${agent.label || agent.id}`;
+    btn.title = agent.install.command;
+    btn.addEventListener('click', async () => {
+      try {
+        await daemonApi.request('api_external_agent_install', { backend: agent.id });
+      } catch (err) {
+        console.warn('install proposal failed', agent.id, err);
+      }
+      // Refresh lane: adopt the just-proposed install state exactly, not
+      // the bounded-TTL cache's up-to-30s-stale rows.
+      await refreshExternalAgentAvailability({ refresh: true });
+      if (typeof focusVaultAgentSignin === 'function') focusVaultAgentSignin(agent.id);
+      if (typeof agentInstallEnsurePoll === 'function') agentInstallEnsurePoll();
+    });
+    row.appendChild(btn);
   }
-  note.textContent = parts.join('. ') + '.';
+  empty.appendChild(row);
 }
 // Probe once the transport can answer; in connect mode the data channel
 // (possibly via TURN) can take a while, so keep retrying for ~40s rather

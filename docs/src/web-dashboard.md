@@ -2017,7 +2017,8 @@ family (sub-routes elided where the family is uniform):
 | `GET /api/fs/{stat,list,read}`, `POST /api/fs/{mkdir,write}` | Scoped filesystem browsing and editor writes (fs scope enforced per grant) |
 | `GET/POST /api/settings`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key status |
 | `POST /api/api-keys` | Store provider API keys (credential custody: `CredentialsManage`, which no peer profile carries) |
-| `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
+| `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) and each backend's install lane (matrix command + install state) — drives the fueling nudge, the new-session picker, and the Vault Install buttons |
+| `POST /api/external-agents/install` | Propose the approval-gated install of one backend's CLI: consults the daemon's install-command matrix and the CommandExec autonomy wall; the exact command is announced verbatim on the approval rail and runs through the sandboxed runtime only on approval (Settings-grade, so hosted `role:none` never reaches it) |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
 | `GET /api/hosted-control/{bootstrap,certificate-ledger}`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions,witness-reports}` | Public hosted doorbell and signed certificate-observation records: dark when disabled; the ledger is also readable over authenticated direct peer routes, request creation/poll proves the tab key, and signed-app inputs verify the enrolled anchor |
 | `POST /api/hosted-control/passkey/{register/start,register/finish,start,finish}` | Exact-own-origin WebAuthn enrollment and assertion ceremonies on a configured custom name; enrollment consumes a direct-owner invitation and assertion success issues only the signed tab's bounded daemon lease |
@@ -2181,6 +2182,7 @@ response omits the header.
 | GET | `/api/kimi-auth/status` | CredentialsManage | own origin | none | Kimi Code sign-in ceremony state (verification URL + one-time code) |
 | POST | `/api/kimi-auth/cancel` | CredentialsManage | own origin | none | Cancel the Kimi Code sign-in ceremony (non-destructive; prior login keeps working) |
 | GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude, kimi, pi) |
+| POST | `/api/external-agents/install` | Settings | own origin | ≤ 1 KiB | Propose installing one external agent CLI (approval-gated; the exact command from the daemon's install matrix) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
 | any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
