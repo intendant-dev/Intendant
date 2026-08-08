@@ -1463,6 +1463,39 @@ pub(crate) async fn handle_external_agents(
 mod tests {
     use super::*;
 
+    /// Lane parity for the daemon's fueling truth: the aggregate
+    /// `fueled` boolean the dashboard-control status frame serves
+    /// ([`any_provider_credential_usable`]) must equal the OR of the
+    /// per-provider booleans `/api/api-key-status` serves
+    /// ([`get_api_key_status_json`]), and the per-provider key set must
+    /// stay derived from `PROVIDER_KEY_ENV_VARS` — one authoritative
+    /// list feeding both lanes, so the two surfaces cannot drift apart.
+    /// Assertions are relational (not absolute), so the test passes on
+    /// any machine state; the env lock serializes against tests that
+    /// mutate provider key variables mid-flight.
+    #[test]
+    fn aggregate_fueled_flag_matches_per_provider_key_status() {
+        let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let status: serde_json::Value = serde_json::from_str(&get_api_key_status_json())
+            .expect("api key status is a JSON object");
+        let map = status.as_object().expect("api key status is an object");
+        let expected_keys: std::collections::BTreeSet<String> = crate::provider::PROVIDER_KEY_ENV_VARS
+            .iter()
+            .map(|name| name.trim_end_matches("_API_KEY").to_ascii_lowercase())
+            .collect();
+        let actual_keys: std::collections::BTreeSet<String> = map.keys().cloned().collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "per-provider status keys must derive from PROVIDER_KEY_ENV_VARS"
+        );
+        let any_per_provider = map.values().any(|value| value.as_bool() == Some(true));
+        assert_eq!(
+            any_provider_credential_usable(),
+            any_per_provider,
+            "the status frame's aggregate `fueled` and /api/api-key-status disagree"
+        );
+    }
+
     #[tokio::test]
     async fn settings_catalog_uses_the_signed_in_codex_account_cache() {
         let codex_home = tempfile::tempdir().unwrap();

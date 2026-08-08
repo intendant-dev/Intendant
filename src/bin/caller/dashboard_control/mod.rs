@@ -6175,6 +6175,48 @@ mod tests {
         }
     }
 
+    /// In tunnel-primary postures (the packaged macOS app's mTLS bundle,
+    /// hosted Connect) the status frame's aggregate `fueled` flag is the
+    /// only lane the Activity empty state's unfueled CTAs can learn the
+    /// answer from — and the SPA's boot probe retires after ~40s, so the
+    /// status handler (50-control-transport.js handleOpen) must re-ask
+    /// the empty-state probe when the answer finally arrives. That
+    /// arrival hook is a plain call in a fragment, invisible to the type
+    /// system; pin it textually against the assembled app.html (the
+    /// sanctioned mirror-with-parity-test pattern) so deleting either
+    /// consumer fails the suite instead of shipping the 2026-08 packaged
+    /// -app regression again (unfueled daemon, bare "No activity yet",
+    /// no CTAs).
+    #[test]
+    fn unfueled_empty_state_reprobe_rides_tunnel_status() {
+        let app = include_str!("../../../../static/app.html");
+        let marker = "'[dashboard-control] status RPC ok'";
+        let from = app
+            .find(marker)
+            .expect("the local tunnel's status-RPC success log is gone from app.html")
+            + marker.len();
+        let rest = &app[from..];
+        let to = rest
+            .find("status RPC failed")
+            .expect("the local tunnel's status-RPC failure log is gone from app.html");
+        let then_block = &rest[..to];
+        for consumer in ["updateNewSessionFuelBanner", "refreshUnfueledEmptyState"] {
+            assert!(
+                then_block.contains(consumer),
+                "the tunnel status handler no longer notifies {consumer}; \
+                 tunnel-primary postures would lose their fueled-state \
+                 arrival hook (see the handleOpen comment in \
+                 static/app/50-control-transport.js)"
+            );
+        }
+        // And the empty-state probe itself still reads the aggregate flag
+        // the status frame carries (dispatch.rs pins the frame's side).
+        assert!(
+            app.contains("dashboardControlTransport?.lastStatus?.fueled"),
+            "the SPA no longer reads the status frame's aggregate `fueled` flag"
+        );
+    }
+
     /// The SPA's `daemonApi` facade mirrors the HTTP twins of its tunnel
     /// methods as `DAEMON_API_HTTP_MAP` (static/app/32-daemon-api.js). That
     /// copy can't derive from `gateway_routes::ROUTES`, so pin every entry

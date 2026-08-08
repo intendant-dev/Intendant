@@ -762,40 +762,48 @@ function applyExternalAgentAvailabilityToNewSessionPicker() {
   }
 }
 
-let unfueledCheckInFlight = false;
-async function refreshUnfueledEmptyState() {
-  if (unfueledCheckInFlight) return true;
-  unfueledCheckInFlight = true;
-  try {
-    // Freshest first: an active lease means fueled, and the lease list
-    // updates live as the vault grants/revokes (credentials.manage).
-    if (vaultLeaseState.supported === true && vaultLeaseState.leases.length > 0) {
-      applyUnfueledEmptyState(false);
+let unfueledCheckPromise = null;
+function refreshUnfueledEmptyState() {
+  // Concurrent callers share the in-flight check's REAL verdict. (This
+  // used to answer a fabricated `true` — "known" — while another check
+  // was in flight; when a vault-lease refresh overlapped one of the boot
+  // probe's attempts, scheduleUnfueledProbe read that lie as "answered"
+  // and retired its retry chain, leaving an unfueled daemon's Activity
+  // empty state permanently bare on slow first boots.)
+  if (unfueledCheckPromise) return unfueledCheckPromise;
+  unfueledCheckPromise = (async () => {
+    try {
+      // Freshest first: an active lease means fueled, and the lease list
+      // updates live as the vault grants/revokes (credentials.manage).
+      if (vaultLeaseState.supported === true && vaultLeaseState.leases.length > 0) {
+        applyUnfueledEmptyState(false);
+        return true;
+      }
+      // The status frame carries an aggregate `fueled` flag readable by
+      // every authorized binding; per-provider api_key_status needs
+      // settings.manage. Hosted Connect has no daemon-control binding in the
+      // default build.
+      const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
+      if (typeof statusFueled === 'boolean') {
+        if (!statusFueled) await refreshExternalAgentAvailability();
+        applyUnfueledEmptyState(!statusFueled);
+        return true;
+      }
+      const keys = await fetchApiKeyStatus();
+      if (!keys || typeof keys !== 'object') return false;
+      const unfueled = !(keys.openai || keys.anthropic || keys.gemini);
+      if (unfueled) await refreshExternalAgentAvailability();
+      applyUnfueledEmptyState(unfueled);
       return true;
+    } catch {
+      // Unknown (transport not up yet, or a daemon predating the flag):
+      // keep the default copy rather than guessing.
+      return false;
+    } finally {
+      unfueledCheckPromise = null;
     }
-    // The status frame carries an aggregate `fueled` flag readable by
-    // every authorized binding; per-provider api_key_status needs
-    // settings.manage. Hosted Connect has no daemon-control binding in the
-    // default build.
-    const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
-    if (typeof statusFueled === 'boolean') {
-      if (!statusFueled) await refreshExternalAgentAvailability();
-      applyUnfueledEmptyState(!statusFueled);
-      return true;
-    }
-    const keys = await fetchApiKeyStatus();
-    if (!keys || typeof keys !== 'object') return false;
-    const unfueled = !(keys.openai || keys.anthropic || keys.gemini);
-    if (unfueled) await refreshExternalAgentAvailability();
-    applyUnfueledEmptyState(unfueled);
-    return true;
-  } catch {
-    // Unknown (transport not up yet, or a daemon predating the flag):
-    // keep the default copy rather than guessing.
-    return false;
-  } finally {
-    unfueledCheckInFlight = false;
-  }
+  })();
+  return unfueledCheckPromise;
 }
 function applyUnfueledEmptyState(unfueled) {
   const empty = document.getElementById('log-empty-state');
