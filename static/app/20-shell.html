@@ -86,10 +86,10 @@
          and the manifest TDZ rule key on it; only the visible label moved
          to "Plugins & Skills"). Three daemon-derived sections: bundled
          plugins (/api/plugins), the unified skill catalog (/api/skills),
-         and the automation-template catalog (/api/agenda/definitions). -->
+         and the automation-definition catalog (/api/agenda/definitions). -->
     <div id="tab-plugins" class="tab-pane">
       <div class="plugins-wrap">
-        <div class="plugins-intro">Optional bundled capabilities and agent skills. Bundled plugins ship no third-party code; skills are instructions — a skill you add here installs machine-wide for every backend and every project on this machine, and can be deactivated or removed below.</div>
+        <div class="plugins-intro">Optional bundled capabilities and agent skills. Bundled plugins ship no third-party code; skills are instructions — a skill you add here installs machine-wide for every backend and every project on this machine, and can be deactivated or removed below. There are no per-skill settings: a skill is prose, and its whole configuration is whether it is active. A plugin's real knobs are the environment and config its readiness checks name, outside this page; an automation definition takes its configuration at stamp time, through the fields and knobs the Automate sheet renders from what the definition declares.</div>
         <section class="plugins-section">
           <h3 class="ui-section-title">Plugins</h3>
           <div id="plugins-status" class="plugins-status"></div>
@@ -103,8 +103,8 @@
           <div id="skills-list"></div>
         </section>
         <section class="plugins-section">
-          <h3 class="ui-section-title">Automation templates</h3>
-          <div class="plugins-section-sub">Sealed automation definitions. House templates ship in the binary, read-only; a template you add here joins the personal library — and if it takes a house name, your copy shadows the house one until you remove it. Stamping seals the file — firings execute the sealed bytes, and nothing runs until each proposed manifest is approved on its card.</div>
+          <h3 class="ui-section-title">Automation definitions</h3>
+          <div class="plugins-section-sub">SKILL.md files the Automate sheet stamps into automations. House definitions ship in the binary, read-only; a definition you add here joins the personal library — and if it takes a house name, your copy shadows the house one until you remove it. Stamping seals the file — firings execute the sealed bytes, and nothing runs until each proposed manifest is approved on its card.</div>
           <div id="templates-status" class="plugins-status"></div>
           <div id="template-add-slot"></div>
           <div id="templates-list"></div>

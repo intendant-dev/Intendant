@@ -442,11 +442,11 @@ pub(crate) enum RouteHandlerId {
     /// The automation-definition catalog (Track AW: house + personal
     /// libraries, validation state, full text).
     AgendaDefinitions,
-    /// Add one personal automation template into the automations library
-    /// (S5: validated by the real definition parser; attributed +
+    /// Add one personal automation definition into the automations
+    /// library (S5: validated by the real definition parser; attributed +
     /// sha256-sealed in the templates registry).
     AgendaDefinitionAdd,
-    /// Remove one dashboard-added personal template (un-shadows a house
+    /// Remove one dashboard-added personal definition (un-shadows a house
     /// twin; house bytes and hand-placed directories refuse by name).
     AgendaDefinitionRemove,
     /// One sealed binding-ref snapshot's bytes by sha256 pin (read-only,
@@ -1224,7 +1224,7 @@ pub(crate) static ROUTES: &[Route] = &[
         "Automation-definition catalog (house + personal, validation state, full text)",
     )
     .with_tunnel(tunnel_method("api_agenda_definitions")),
-    // Add one personal automation template (skills/plugins unification
+    // Add one personal automation definition (skills/plugins unification
     // S5). The S4 user-skill add lane retargeted at the automations
     // library: Settings-grade (hosted provenance `role:none` never
     // reaches it), pasted/uploaded SKILL.md bytes are the ONLY input
@@ -1242,10 +1242,10 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::Capped(crate::user_templates::ADD_BODY_CAP_BYTES),
         RouteHandlerId::AgendaDefinitionAdd,
-        "Add one personal automation template from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly)",
+        "Add one personal automation definition from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly)",
     )
     .with_tunnel(tunnel_method("api_agenda_definition_add")),
-    // Remove one dashboard-added personal template (S5): deletes the
+    // Remove one dashboard-added personal definition (S5): deletes the
     // library directory + registry record — never house bytes (they live
     // under `.house/` and removal un-shadows back to them), never a
     // hand-placed personal directory (no record ⇒ named refusal toward
@@ -1256,7 +1256,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::Settings,
         BodyPolicy::None,
         RouteHandlerId::AgendaDefinitionRemove,
-        "Remove one dashboard-added personal template (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name)",
+        "Remove one dashboard-added personal definition (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name)",
     )
     .with_tunnel(tunnel_method("api_agenda_definition_remove")),
     // Sealed binding-ref snapshots (Track AW): the read lane behind

@@ -98,15 +98,24 @@ the idle daemon loop.
 The v2 chrome groups fourteen destinations in the left navigation rail —
 **Activity**, **Sessions**, **Agenda**, and **Memory** (Work), **Live display**
 and **Station** (Watch), **Terminal** and **Files** (Machine), **Usage**
-(Insight), **Access** and **Vault** (Trust), **Settings**, **Plugins**, and
-**Debug** (System). The oversight bar on top carries the phase pill, stop control,
+(Insight), **Access** and **Vault** (Trust), **Settings**, **Plugins & Skills**,
+and **Debug** (System). The oversight bar on top carries the phase pill, stop control,
 context meter, transport state, and the ⌘K command palette. Activity's own
 header carries its five-view switch and Timeline-only session/layout controls;
 the composer — the global task input — docks at the bottom
 and reaches the daemon from any destination. New events arriving while you are
 elsewhere raise a badge on the rail item.
 
-**Plugins** (System) is the bundled-plugin catalog: first-party, default-off
+**Plugins & Skills** (System; the tab id stays `#plugins`, so deep links and
+routes are unchanged) is the unified management surface for everything this
+daemon teaches its agents — three daemon-derived sections: bundled plugins,
+the skill catalog, and the automation-definition catalog. There are no
+per-skill settings to find here: a skill is prose, so its whole
+configuration is whether it is active; a plugin's real knobs are the
+environment and config its readiness fixes name (outside the dashboard);
+an automation definition takes its configuration at stamp time, through
+the fields and knobs the Automate sheet renders from what it declares.
+The **Plugins** section is the bundled-plugin catalog: first-party, default-off
 capabilities — V1 ships **Codex Cloud Remote Compute** — rendered as
 host-owned cards whose lifecycle state (Available / Needs setup / Enabled /
 Setup failed), readiness layers with named fixes, and per-skill install facts
@@ -115,8 +124,11 @@ skill for every supervised backend and the response reports exactly what the
 installer did; disabling removes only Intendant-managed copies. Plugins here
 ship no dashboard code, hooks, or frames (a plugin ecosystem is the stated
 direction, but today's catalog is bundled first-party only) — see the
-Remote Compute plugin section of the Codex Cloud workers chapter. The tab also
-renders the unified skill catalog (`GET /api/skills`): builtin rows carry a
+Remote Compute plugin section of the Codex Cloud workers chapter. The
+**Skills** section renders the unified skill catalog (`GET /api/skills`) —
+every skill the daemon manages, builtin, plugin-carried, or user-added,
+with provenance, trust posture, and per-root install facts, never a
+directory enumeration: builtin rows carry a
 deactivate/re-enable toggle (`POST /api/skills/{name}`) backed by a persisted
 disabled-set the installer re-applies on every materialization pass over both
 global roots — a deactivated skill cannot resurrect on restart or rebuild, its
@@ -134,24 +146,28 @@ the recorded sha, toggle through the same disabled-set (re-enable re-verifies
 the library bytes against the recorded sha and refuses a drifted copy by
 name), and carry the Remove door (`DELETE /api/skills/{name}`) that deletes
 the library entry and sweeps the marked copies from both roots in-request —
-never an unmarked user-owned twin. The **Automation templates** section
+never an unmarked user-owned twin. The **Automation definitions** section
 renders the served definition catalog — the same shared frontend derivation
 the Automate sheet's picker reads, so the two surfaces can never skew — with
 per-row provenance, trust-posture lines, and shadow state verbatim: house
-templates ship in the binary, read-only rows with no remove door, and the
-**template add sheet** (`POST /api/agenda/definitions`, Settings-grade, same
+definitions ship in the binary, read-only rows with no remove door, and the
+**definition add sheet** (`POST /api/agenda/definitions`, Settings-grade, same
 paste/upload-only lanes and 64 KiB cap as the skill add) writes a personal
 definition into `<state_root>/automations/<name>/` — validated by the real
 definition parser, so a file the stamp would refuse refuses at add with the
 parser's own error — recording gate-resolved attribution plus the sha256 of
-the accepted bytes in the `templates` registry family. A personal template
+the accepted bytes in the `templates` registry family. A personal definition
 taking a house name shadows it visibly (both rows list; "shadows house · your
 copy resolves first"), `DELETE /api/agenda/definitions/{name}` removes only
 dashboard-added entries (house names and hand-placed personal directories
 refuse by name) and un-shadows the house twin in the same response, and a
 hand-edited library copy renders `library: stale` — the attribution no longer
 covers the bytes; stamping still seals whatever the file holds, under its own
-approval ceremony.
+approval ceremony. Each valid row's **Automate…** opens the agenda's
+existing Automate sheet preselected — one stamp lane, no duplicate knobs —
+where the sheet renders one labeled input per stamp-time parameter the
+definition declares (the agenda chapter's declared-parameters coverage);
+nothing here re-implements stamping or approval.
 
 On content-heavy destinations the composer can collapse to a compact pill and
 expand in place; each tab remembers its own state. Its target switcher can move
@@ -2097,8 +2113,8 @@ response omits the header.
 | GET | `/api/agenda/occurrences` | AgendaRead | own origin | none | Raw occurrence-journal page (since/item/limit cursor; unknown records served verbatim) |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | ≤ 16 MiB | Apply one agenda command (add, ask, answer, patch, transitions, or scheduled-session propose/approve/revoke/withdraw) |
 | GET | `/api/agenda/definitions` | AgendaRead | own origin | none | Automation-definition catalog (house + personal, validation state, full text) |
-| POST | `/api/agenda/definitions` | Settings | own origin | ≤ 64 KiB | Add one personal automation template from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly) |
-| DELETE | `/api/agenda/definitions/{name}` | Settings | own origin | none | Remove one dashboard-added personal template (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name) |
+| POST | `/api/agenda/definitions` | Settings | own origin | ≤ 64 KiB | Add one personal automation definition from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly) |
+| DELETE | `/api/agenda/definitions/{name}` | Settings | own origin | none | Remove one dashboard-added personal definition (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name) |
 | GET | `/api/agenda/sealed/{sha256}` | AgendaRead | own origin | none | One sealed binding-ref snapshot by sha256 pin (read-only, content-addressed) |
 | POST | `/api/agenda/stamp` | AgendaWrite | own origin | bounded | Stamp an automation definition (park + propose the instance graph; never approves) |
 | POST | `/api/daemon/takeover` | Settings | own origin | ≤ 4 KiB | Request drain of this daemon (handover): the scheduler lease frees for a successor; in-flight sessions finish here |

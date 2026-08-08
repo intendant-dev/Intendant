@@ -1,4 +1,4 @@
-//! The dashboard-added PERSONAL automation templates (skills/plugins
+//! The dashboard-added PERSONAL automation definitions (skills/plugins
 //! unification S5): the S4 user-skill lane retargeted at the automation
 //! library — `<state_root>/automations/<name>/SKILL.md`, the exact home
 //! the documented shadow-resolution order already reads
@@ -12,11 +12,11 @@
 //! stamp resolves through (deny-unknown config blocks, spec frontmatter,
 //! node arity, the whole set) — so a definition that would refuse at
 //! stamp time refuses at ADD time with the parser's own error. The add
-//! executes nothing and arms nothing: a template does nothing until
+//! executes nothing and arms nothing: a definition does nothing until
 //! stamped, and stamping still seals the file under an approval digest
 //! through the untouched stamp lane (intake §5.1).
 //!
-//! **House templates stay sealed.** The embedded house set lives under
+//! **House definitions stay sealed.** The embedded house set lives under
 //! `automations/.house/` and is never written here; adding a personal
 //! definition under a house NAME is the documented override mechanism —
 //! it shadows the house twin visibly (the catalog lists both) and
@@ -59,7 +59,7 @@ pub(crate) fn user_template_md_path_in(state_root: &Path, name: &str) -> PathBuf
         .join("SKILL.md")
 }
 
-/// Add one personal template: cap + slug walls, then the REAL definition
+/// Add one personal definition: cap + slug walls, then the REAL definition
 /// intake ([`crate::agenda::parse_definition`] — its error verbatim),
 /// then the collision walls (an existing record refuses remove-first; a
 /// hand-placed directory refuses fail-closed; a HOUSE name is the one
@@ -77,7 +77,7 @@ pub(crate) fn add_user_template_in(
     if skill_md.len() > ADD_BODY_CAP_BYTES {
         return Err(UserSkillRefusal::Invalid {
             message: format!(
-                "definition SKILL.md is {} bytes — the template cap is {} KiB",
+                "definition SKILL.md is {} bytes — the definition cap is {} KiB",
                 skill_md.len(),
                 ADD_BODY_CAP_BYTES / 1024
             ),
@@ -86,7 +86,7 @@ pub(crate) fn add_user_template_in(
     if !crate::agenda::valid_slug(name) {
         return Err(UserSkillRefusal::Invalid {
             message: format!(
-                "template name {name:?} violates the slug grammar (1..=64 lowercase \
+                "definition name {name:?} violates the slug grammar (1..=64 lowercase \
                  alphanumerics with single interior hyphens)"
             ),
         });
@@ -101,7 +101,7 @@ pub(crate) fn add_user_template_in(
     {
         return Err(UserSkillRefusal::NameCollision {
             message: format!(
-                "a personal template named '{name}' already exists — remove it first to \
+                "a personal definition named '{name}' already exists — remove it first to \
                  replace its bytes"
             ),
         });
@@ -173,15 +173,15 @@ pub(crate) fn remove_user_template_in(
         if crate::agenda::is_house_definition_name(name) {
             return Err(UserSkillRefusal::WrongLane {
                 message: format!(
-                    "house template '{name}' ships in the binary — there is nothing to \
-                     remove; add a personal template of the same name to shadow it instead"
+                    "house definition '{name}' ships in the binary — there is nothing to \
+                     remove; add a personal definition of the same name to shadow it instead"
                 ),
             });
         }
         return Err(UserSkillRefusal::UnknownSkill {
             message: format!(
-                "unknown template '{name}' — not a house definition or a dashboard-added \
-                 personal template"
+                "unknown definition '{name}' — not a house definition or a dashboard-added \
+                 personal one"
             ),
         });
     };
@@ -318,7 +318,7 @@ mod tests {
             add_user_template_in(root, "Bad_Slug", &action_md("bad-slug"), stamp("p")).unwrap_err();
         assert_eq!(
             refusal.message(),
-            "template name \"Bad_Slug\" violates the slug grammar (1..=64 lowercase \
+            "definition name \"Bad_Slug\" violates the slug grammar (1..=64 lowercase \
              alphanumerics with single interior hyphens)"
         );
         let oversized = format!("{}{}", action_md("big"), "x".repeat(ADD_BODY_CAP_BYTES));
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(
             refusal.message(),
             format!(
-                "definition SKILL.md is {} bytes — the template cap is 64 KiB",
+                "definition SKILL.md is {} bytes — the definition cap is 64 KiB",
                 oversized.len()
             )
         );
@@ -349,7 +349,7 @@ mod tests {
             add_user_template_in(root, "mine", &action_md("mine"), stamp("p")).unwrap_err();
         assert_eq!(
             refusal.message(),
-            "a personal template named 'mine' already exists — remove it first to \
+            "a personal definition named 'mine' already exists — remove it first to \
              replace its bytes"
         );
         assert_eq!(refusal.http_status(), 409);
@@ -415,8 +415,8 @@ mod tests {
         let refusal = remove_user_template_in(root, "triage").unwrap_err();
         assert_eq!(
             refusal.message(),
-            "house template 'triage' ships in the binary — there is nothing to \
-             remove; add a personal template of the same name to shadow it instead"
+            "house definition 'triage' ships in the binary — there is nothing to \
+             remove; add a personal definition of the same name to shadow it instead"
         );
         assert_eq!(refusal.http_status(), 409);
 
@@ -447,8 +447,8 @@ mod tests {
         let refusal = remove_user_template_in(root, "no-such").unwrap_err();
         assert_eq!(
             refusal.message(),
-            "unknown template 'no-such' — not a house definition or a dashboard-added \
-             personal template"
+            "unknown definition 'no-such' — not a house definition or a dashboard-added \
+             personal one"
         );
         assert_eq!(refusal.http_status(), 404);
     }

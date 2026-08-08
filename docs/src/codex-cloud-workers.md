@@ -629,7 +629,7 @@ is remembered locally.
 
 ## Remote Compute plugin
 
-The dashboard's **Plugins** destination carries **Codex Cloud Remote
+The dashboard's **Plugins & Skills** destination carries **Codex Cloud Remote
 Compute** — a bundled, default-off plugin wrapping this chapter's lane in a
 product surface. It is a declarative bundle, not an extension system:
 enabling it does two bounded things.

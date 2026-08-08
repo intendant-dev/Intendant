@@ -35,7 +35,7 @@ effort = "xhigh"
 [parameters.cap]
 label = "Spend cap"
 required = true
-hint = "Cumulative cost ceiling for this arc; estimates, never billed dollars. Re-annotate the THREAD to steer it mid-arc."
+hint = "Amount only — the $ is already in the line (60, not $60). Cumulative cost ceiling for this arc; estimates, never billed dollars. Re-annotate the THREAD to steer it mid-arc."
 kind = "annotation"
 line = "NS CAP: $<value>"
 ```

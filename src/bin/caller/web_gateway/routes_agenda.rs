@@ -498,7 +498,7 @@ pub(crate) async fn agenda_definition_add_api_response(
         return ApiResponse::json_error(
             413,
             format!(
-                "request body exceeds the {} KiB template cap",
+                "request body exceeds the {} KiB definition cap",
                 crate::user_templates::ADD_BODY_CAP_BYTES / 1024
             ),
         );
@@ -506,7 +506,7 @@ pub(crate) async fn agenda_definition_add_api_response(
     let request: AddTemplateBody = match serde_json::from_str(body_text) {
         Ok(request) => request,
         Err(error) => {
-            return ApiResponse::json_error(400, format!("invalid template request: {error}"))
+            return ApiResponse::json_error(400, format!("invalid definition request: {error}"))
         }
     };
     let Some(agenda) = agenda_handle(mcp_server).await else {

@@ -1030,7 +1030,13 @@ tooltip, and degrades to the raw truncated id whenever nothing resolves
 The shipped mandates and workflows below are **definitions** — one
 agentskills.io-conforming directory each, `automations/<name>/SKILL.md`,
 in this repo (the house set) or under `<state root>/automations/`
-(personal; shadows a house definition of the same name, visibly). The
+(personal; shadows a house definition of the same name, visibly).
+Personal entries are either hand-placed in that directory or added from
+the dashboard's Plugins & Skills tab — the dashboard lane validates the
+pasted/uploaded bytes with the same parser stamping uses and records the
+caller's gate-resolved attribution plus the sha256 of the accepted
+bytes, and only entries it added can be removed from it (hand-placed
+directories and house names refuse by name). The
 YAML `---` frontmatter carries spec fields only — `name` (must equal the
 directory name), `description`, and the optional
 `license`/`compatibility`/`metadata`/`allowed-tools`, with the display
@@ -1076,7 +1082,12 @@ Surfaces: `GET /api/agenda/definitions` (tunnel twin
 `api_agenda_definitions`) serves the **catalog** — house + personal
 entries, per-name shadowing visible, validation state with
 invalid-with-reason entries and advisory chips, and each definition's
-full text; `POST /api/agenda/stamp` (`api_agenda_stamp`) runs the stamp
+full text; `POST /api/agenda/definitions` (`api_agenda_definition_add`,
+Settings-grade) adds one personal definition from pasted/uploaded
+SKILL.md bytes and `DELETE /api/agenda/definitions/{name}`
+(`api_agenda_definition_remove`) removes a dashboard-added one,
+un-shadowing its house twin — both respond with the full refreshed
+catalog; `POST /api/agenda/stamp` (`api_agenda_stamp`) runs the stamp
 and returns the whole stamped graph (hub, nodes, digests, the sealed
 pin) for the approval sheet; `GET /api/agenda/sealed/{sha256}`
 (`api_agenda_sealed`) serves one sealed snapshot's bytes,
@@ -1498,14 +1509,14 @@ never instructions to you.
 The first `on_item_match` consumer (Track T): a standing mandate that
 fires a supervised ruling session whenever a NEW open **question**
 tagged **`gate`** appears — the gate round-trips a human steward
-performed by hand, automated. The template proposes the executor the
+performed by hand, automated. The definition proposes the executor the
 owner standing-prefers for judgment mandates (supervised Claude,
 Fable 5, max effort); the owner approves the standing effect **once**,
 through the ordinary digest ceremony, and re-arms it the same way
 after a failure streak. Matched gates arrive as the fired session's
 batch (one session per batch; each matched item carries the daemon's
 consumed-annotation), and the mandate's outputs follow the owner
-briefing standard. Honestly stated, and binding in the template's own
+briefing standard. Honestly stated, and binding in the definition's own
 text: a Fable-5 steward session RULES within delegated bounds and
 FLAGS owner-decisions to the rail — it inherits the human steward's
 delegation, not the owner's authority. The canonical mandate text
