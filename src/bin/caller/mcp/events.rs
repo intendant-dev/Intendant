@@ -271,6 +271,7 @@ pub fn spawn_event_listener(
                     | AppEvent::AgendaChanged { .. }
                     | AppEvent::AgendaAskOutcome { .. }
                     | AppEvent::MemoryChanged { .. }
+                    | AppEvent::ExternalAgentsChanged { .. }
                     | AppEvent::CoordinationRadar { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..

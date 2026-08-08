@@ -712,14 +712,28 @@ const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a 
    visible before Start. */
 let externalAgentAvailability = null; // null = not yet known
 let externalAgentAvailabilityFetch = null;
-function refreshExternalAgentAvailability() {
-  if (!externalAgentAvailabilityFetch) {
-    externalAgentAvailabilityFetch = fetchExternalAgentAvailability()
+/* One applier for every source of fresh rows — the fetch below AND the
+   daemon's `external_agents_changed` broadcast (an install/uninstall
+   observed by a re-probe) — so the picker and the Vault sign-in cards
+   repaint together wherever the update came from. */
+function applyExternalAgentAvailability(list) {
+  if (!Array.isArray(list)) return;
+  externalAgentAvailability = list;
+  applyExternalAgentAvailabilityToNewSessionPicker();
+  // The Vault sign-in pre-flight (32-vault-custody.js) reads the same
+  // store; repaint its cards so a freshly detected CLI unmutes without
+  // a tab re-entry. Renders are focus-guarded and cheap.
+  if (typeof renderAgentSigninSection === 'function') renderAgentSigninSection();
+}
+function refreshExternalAgentAvailability(options = {}) {
+  const refresh = options.refresh === true;
+  // An explicit re-probe (picker open, Vault tab open) must not be
+  // swallowed by a plain fetch already in flight — the daemon coalesces
+  // via its bounded-TTL cache, so a second request is cheap and exact.
+  if (!externalAgentAvailabilityFetch || refresh) {
+    externalAgentAvailabilityFetch = fetchExternalAgentAvailability({ refresh })
       .then(body => {
-        if (Array.isArray(body?.external_agents)) {
-          externalAgentAvailability = body.external_agents;
-          applyExternalAgentAvailabilityToNewSessionPicker();
-        }
+        applyExternalAgentAvailability(body?.external_agents);
         return externalAgentAvailability;
       })
       .catch(() => null)
@@ -747,8 +761,12 @@ function applyExternalAgentAvailabilityToNewSessionPicker() {
     if (!option) continue;
     const missing = agent.installed === false;
     option.disabled = missing;
+    // The PATH-inheritance hint outranks the generic not-found copy: it
+    // names where the CLI actually is and why the daemon can't see it
+    // (installed mid-run into a directory the daemon's boot-time PATH
+    // lacks — restart to pick it up).
     option.title = missing
-      ? `${agent.command || agent.id} was not found on the daemon host`
+      ? (agent.path_hint || `${agent.command || agent.id} was not found on the daemon host`)
       : '';
   }
   // A backend restored from last-used prefs (or picked before this probe

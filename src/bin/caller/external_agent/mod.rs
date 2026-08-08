@@ -1214,6 +1214,15 @@ pub struct BackendAvailability {
     /// Passive, zero-additional-quota compatibility evidence for the exact
     /// configured executable artifact and current adapter contract.
     pub compatibility: protocol_watch::PassiveCompatibilityStatus,
+    /// The honest explanation when `installed` is false but the CLI *is*
+    /// present in a well-known install directory the daemon's inherited
+    /// `PATH` does not carry (`platform::off_path_install_probe`): the
+    /// startup-only `ensure_tool_paths` augmentation cannot see a
+    /// directory the install itself created (the Windows npm-shim
+    /// footgun; a first Homebrew install on macOS), so a re-probe keeps
+    /// failing until the daemon restarts — and the payload says so
+    /// instead of serving a bare not-found.
+    pub path_hint: Option<String>,
 }
 
 fn codex_local_login(home: &Path) -> Option<bool> {
@@ -1338,6 +1347,11 @@ pub fn backend_availability(
             compatibility_profile,
             &compatibility_command,
         );
+        let path_hint = if installed {
+            None
+        } else {
+            path_inheritance_hint(&command)
+        };
         BackendAvailability {
             backend,
             command,
@@ -1346,9 +1360,36 @@ pub fn backend_availability(
             leased,
             local_login,
             compatibility,
+            path_hint,
         }
     })
     .collect()
+}
+
+/// The PATH-inheritance explanation for a backend whose configured bare
+/// command failed to resolve: when the CLI actually exists in a
+/// well-known install directory the daemon's `PATH` (inherited at daemon
+/// start, augmented once by `ensure_tool_paths`) does not carry, name
+/// where it was found and the remedy — the same honest-refusal
+/// convention as the update lane's toolchain resolution. `None` when the
+/// CLI genuinely isn't anywhere we know to look (or the command is an
+/// explicit path, where PATH is not the story).
+fn path_inheritance_hint(command: &str) -> Option<String> {
+    let hit = crate::platform::off_path_install_probe(command)?;
+    Some(path_inheritance_hint_copy(command, &hit))
+}
+
+/// Pure wording half, split from the ambient-PATH probe for hermetic
+/// tests.
+fn path_inheritance_hint_copy(command: &str, hit: &crate::platform::OffPathInstall) -> String {
+    format!(
+        "{} is installed at {}, but {} is not on the daemon's PATH (inherited when the daemon \
+         started) — restart the Intendant daemon to pick it up, or launch it from a shell where \
+         that directory is on PATH.",
+        command,
+        hit.found.display(),
+        hit.dir.display()
+    )
 }
 
 /// The wire shape the dashboard consumes: `id` matches the new-session
@@ -1370,6 +1411,7 @@ pub fn backend_availability_json(
                     "leased": info.leased,
                     "local_login": info.local_login,
                     "compatibility": info.compatibility,
+                    "path_hint": info.path_hint,
                 })
             })
             .collect(),
@@ -2966,6 +3008,10 @@ mod tests {
                 entry.get("local_login").is_some(),
                 "local_login must be present (bool or null)"
             );
+            assert!(
+                entry.get("path_hint").is_some(),
+                "path_hint must be present (string or null) — the PATH-inheritance honesty key"
+            );
             let compatibility = entry
                 .get("compatibility")
                 .and_then(serde_json::Value::as_object)
@@ -2982,6 +3028,39 @@ mod tests {
                 Some("unobserved")
             );
         }
+    }
+
+    /// The PATH-inheritance hint names the found executable, the
+    /// off-PATH directory, and the restart remedy — the honest copy the
+    /// picker tooltip and the Vault card render verbatim when a fresh
+    /// install stays invisible to the daemon's boot-time PATH.
+    #[test]
+    fn path_inheritance_hint_names_found_dir_and_remedy() {
+        let hit = crate::platform::OffPathInstall {
+            found: std::path::Path::new("install-dir").join("codex"),
+            dir: std::path::PathBuf::from("install-dir"),
+        };
+        let copy = path_inheritance_hint_copy("codex", &hit);
+        for needle in [
+            "codex is installed at ",
+            "is not on the daemon's PATH",
+            "inherited when the daemon started",
+            "restart the Intendant daemon",
+        ] {
+            assert!(copy.contains(needle), "hint copy lost {needle:?}: {copy}");
+        }
+        // Absent commands stay hintless: the plain not-found copy is the
+        // honest message when the CLI is nowhere we know to look.
+        let missing = backend_availability(
+            &{
+                let mut config = crate::project::ExternalAgentConfig::default();
+                config.codex.command = "intendant-test-absent-codex".to_string();
+                config.codex.managed_command = None;
+                config
+            },
+            tempfile::tempdir().unwrap().path(),
+        );
+        assert_eq!(missing[0].path_hint, None);
     }
 
     #[test]
@@ -3090,6 +3169,46 @@ mod tests {
                 "the dashboard bundle lost the sign-in not-installed pre-flight: {needle}"
             );
         }
+    }
+
+    /// The mid-run install-detection lanes (card 01KZDRNRNX): a backend
+    /// CLI installed after daemon boot must ungrey the AGENT picker and
+    /// unmute its Vault sign-in card without a restart. Pin the SPA
+    /// wiring by needle: the shared applier both fresh-rows sources
+    /// funnel through (the fetch and the daemon's change broadcast),
+    /// the two explicit re-probe triggers (picker open, Vault tab
+    /// open), the wire flag the daemon's bounded-TTL cache honors, and
+    /// the PATH-inheritance hint reaching both render surfaces.
+    #[test]
+    fn spa_availability_refresh_lanes_are_wired() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // One applier for every source of fresh rows; it repaints
+            // the picker and the Vault cards together.
+            "function applyExternalAgentAvailability(list)",
+            "applyExternalAgentAvailabilityToNewSessionPicker();",
+            // The daemon's installed-flip broadcast routes to it —
+            // repaint with no user action on any open dashboard.
+            "d.event === 'external_agents_changed'",
+            // The explicit re-probe flag rides the declared query lane.
+            "query: ['refresh']",
+            // The PATH-inheritance hint renders on both surfaces.
+            "agent.path_hint",
+            "missing.path_hint",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the availability refresh wiring: {needle}"
+            );
+        }
+        // Both user-intent surfaces trigger the exact re-probe lane:
+        // picker open (sessions → new) and Vault tab open.
+        assert!(
+            app.matches("refreshExternalAgentAvailability({ refresh: true })")
+                .count()
+                >= 2,
+            "picker-open and Vault-tab-open must both ride the explicit refresh lane"
+        );
     }
 
     /// The classified auth-failure surface, daemon → dashboard: the wire

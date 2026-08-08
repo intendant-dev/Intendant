@@ -1599,6 +1599,103 @@ fn executable_candidate(path: &std::path::Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// A bare command that failed `PATH` resolution but *is* installed in a
+/// well-known per-user install directory the daemon's `PATH` does not
+/// carry — the honest explanation availability surfaces attach when
+/// detection keeps failing after an install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffPathInstall {
+    /// The executable that was found (`<dir>/<command>`, with the
+    /// Windows `PATHEXT`-style suffix applied when needed).
+    pub found: std::path::PathBuf,
+    /// The well-known install directory it lives in.
+    pub dir: std::path::PathBuf,
+}
+
+/// Probe the well-known install directories for a bare command the
+/// daemon's `PATH` failed to resolve.
+///
+/// `ensure_tool_paths` extends the daemon's `PATH` **once, at startup**,
+/// and skips candidate directories that don't exist yet — so a CLI whose
+/// install *created* its directory mid-run (the first `npm -g` install on
+/// Windows creating `%APPDATA%\npm`, a first Homebrew install creating
+/// `/opt/homebrew/bin`) stays invisible to `resolve_command_path` until
+/// the daemon restarts. This probe answers "is it actually installed
+/// somewhere the daemon just can't see?" so availability payloads can say
+/// so instead of reporting a bare not-found. Directories already on the
+/// current `PATH` are skipped — resolution has searched those. Stat-only,
+/// like `resolve_command_path`.
+pub fn off_path_install_probe(command: &str) -> Option<OffPathInstall> {
+    off_path_install_probe_in(command, std::env::var_os("PATH"), &home_dir())
+}
+
+/// `PATH` and the home directory are injected so tests never read or
+/// mutate process-global state (the tests-are-hermetic convention).
+fn off_path_install_probe_in(
+    command: &str,
+    path_var: Option<std::ffi::OsString>,
+    home: &std::path::Path,
+) -> Option<OffPathInstall> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    // Only bare names resolve via PATH; an explicit path in the config
+    // points at one exact file, and PATH inheritance is not the story
+    // when that file is missing.
+    if command == "~"
+        || command.starts_with("~/")
+        || std::path::Path::new(command).is_absolute()
+        || std::path::Path::new(command).components().count() > 1
+    {
+        return None;
+    }
+    let path_var = path_var.unwrap_or_default();
+    for dir in install_dir_candidates(home) {
+        if path_contains_dir(&path_var, &dir) {
+            continue;
+        }
+        if let Some(found) = executable_candidate(&dir.join(command)) {
+            return Some(OffPathInstall { found, dir });
+        }
+    }
+    None
+}
+
+/// Well-known per-user CLI install directories, in search priority order:
+/// the startup `PATH` augmentation set (`tool_path_candidates`) plus the
+/// installers that set only the *user's* environment — invisible to an
+/// already-running daemon even after a restart of the shell that ran
+/// them. Pure (a function of `home`) so tests stay hermetic.
+fn install_dir_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = tool_path_candidates(home);
+    // Cargo-installed CLIs; the update lane's toolchain resolution
+    // already treats this as the canonical service-daemon blind spot.
+    dirs.push(home.join(".cargo").join("bin"));
+    #[cfg(target_os = "linux")]
+    {
+        dirs.push(std::path::PathBuf::from("/usr/local/bin"));
+        dirs.push(std::path::PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
+    }
+    #[cfg(windows)]
+    {
+        // npm's global shim directory — where `npm install -g` lands
+        // codex/claude shims. The installer appends it to the *user*
+        // PATH in the registry; a service/schtasks-born daemon keeps its
+        // boot-time snapshot until restart.
+        dirs.push(home.join("AppData").join("Roaming").join("npm"));
+        dirs.push(home.join("scoop").join("shims"));
+        dirs.push(
+            home.join("AppData")
+                .join("Local")
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links"),
+        );
+    }
+    dirs
+}
+
 /// Effective-root check for paths that install system-wide artifacts
 /// (`intendant service install` picks the system vs user unit by this).
 /// Root is a Unix concept; on Windows elevation is probed differently.
@@ -2369,6 +2466,63 @@ mod tests {
         let candidates = tool_path_candidates(home);
         assert_eq!(candidates[0], home.join(".kimi-code").join("bin"));
         assert_eq!(candidates[1], home.join(".local").join("bin"));
+    }
+
+    /// The off-PATH probe finds a bare command installed under a
+    /// well-known home-relative directory the daemon's PATH lacks — the
+    /// mid-run-install case a boot-time `ensure_tool_paths` cannot see.
+    #[test]
+    fn off_path_install_probe_finds_home_relative_installs() {
+        let home = tempfile::tempdir().unwrap();
+        let local_bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let placed = place_executable(&local_bin, "intendant-test-offpath");
+
+        // The daemon PATH knows nothing of ~/.local/bin: the probe hits.
+        let elsewhere = Some(std::ffi::OsString::from("/usr/bin"));
+        let hit = off_path_install_probe_in("intendant-test-offpath", elsewhere, home.path())
+            .expect("well-known dir off PATH must report the install");
+        assert_eq!(hit.found, placed);
+        assert_eq!(hit.dir, local_bin);
+
+        // The same dir ON the daemon PATH: resolution already searched
+        // it, so the probe stays quiet instead of restating a miss.
+        let on_path = Some(local_bin.clone().into_os_string());
+        assert_eq!(
+            off_path_install_probe_in("intendant-test-offpath", on_path, home.path()),
+            None
+        );
+
+        // Absent everywhere: no hit to report.
+        assert_eq!(
+            off_path_install_probe_in("intendant-test-not-installed", None, home.path()),
+            None
+        );
+    }
+
+    /// Explicit paths never get a PATH-inheritance story: the config
+    /// points at one exact file, and its absence is its own message.
+    #[test]
+    fn off_path_install_probe_ignores_explicit_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let local_bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        place_executable(&local_bin, "intendant-test-explicit");
+        for query in [
+            local_bin
+                .join("intendant-test-explicit")
+                .to_string_lossy()
+                .into_owned(),
+            "~/.local/bin/intendant-test-explicit".to_string(),
+            "rel/intendant-test-explicit".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                off_path_install_probe_in(&query, None, home.path()),
+                None,
+                "explicit path {query:?} must not probe install dirs"
+            );
+        }
     }
 
     #[test]
