@@ -665,6 +665,7 @@ pub async fn run_agent(
                 user_display_granted,
                 has_ask_human,
                 mcp_env,
+                None,
             )
             .await;
         }
@@ -677,6 +678,7 @@ pub async fn run_agent(
         user_display_granted,
         has_ask_human,
         mcp_env,
+        None,
     )
     .await
 }
@@ -698,6 +700,38 @@ pub async fn run_agent_sandboxed(
         user_display_granted,
         has_ask_human,
         None,
+        None,
+    )
+    .await
+}
+
+/// Run one daemon-initiated install batch through the runtime executor
+/// (the approval-gated Vault install lane, `backend_install.rs`).
+///
+/// Same lane as every runtime spawn — the keyless `intendant-runtime`
+/// with the provider-key/host-credential env scrub, and on macOS the
+/// sensitive-directory Seatbelt profile — but with the interactive 120s
+/// batch hard-timeout replaced by the caller's install-sized deadline,
+/// and WITHOUT the per-session write-restriction set: installers write
+/// package prefixes (`~/.local/bin`, npm/brew trees) by definition, so a
+/// session-scoped write set would fail every install by construction.
+/// The batch's own per-command `timeout_ms` should sit under
+/// `hard_timeout` so the runtime's in-band kill (with salvaged output
+/// tails) fires before the controller-side one.
+pub async fn run_install_batch(
+    json_input: &str,
+    log_dir: &std::path::Path,
+    hard_timeout: std::time::Duration,
+) -> Result<AgentOutput, CallerError> {
+    run_agent_inner(
+        json_input,
+        log_dir,
+        Some(log_dir),
+        None,
+        false,
+        false,
+        None,
+        Some(hard_timeout),
     )
     .await
 }
@@ -711,6 +745,7 @@ async fn run_agent_inner(
     user_display_granted: bool,
     has_ask_human: bool,
     mcp_env: Option<&RuntimeMcpEnv>,
+    hard_timeout_override: Option<std::time::Duration>,
 ) -> Result<AgentOutput, CallerError> {
     // Authenticate every result line with a fresh, controller-minted
     // secret. Arm askHuman after it so both internal fields ride the same
@@ -825,9 +860,12 @@ async fn run_agent_inner(
         // stdin dropped here, closing the pipe
     }
 
-    // Hard timeout: 120s default, no timeout for askHuman (polls indefinitely)
-    let hard_timeout_secs: u64 = if has_ask_human { u64::MAX / 2 } else { 120 };
-    let hard_timeout = Duration::from_secs(hard_timeout_secs);
+    // Hard timeout: 120s default, no timeout for askHuman (polls
+    // indefinitely); daemon-initiated install batches pass their own
+    // install-sized deadline instead.
+    let hard_timeout = hard_timeout_override
+        .unwrap_or_else(|| Duration::from_secs(if has_ask_human { u64::MAX / 2 } else { 120 }));
+    let hard_timeout_secs: u64 = hard_timeout.as_secs();
 
     // Read stdout and stderr (bounded), then wait for exit, all under a
     // single hard timeout. The buffers live outside the timed future so a

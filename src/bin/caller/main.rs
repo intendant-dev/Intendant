@@ -10,6 +10,7 @@ mod auth_ceremony;
 pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
+mod backend_install;
 mod background_tasks;
 mod boot_readopt;
 mod browser_workspace;
@@ -4043,6 +4044,9 @@ async fn main() -> Result<(), CallerError> {
     // Build autonomy state from project config + CLI flags
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
     let autonomy = autonomy::shared_autonomy(autonomy_state);
+    // The Vault install lane consults the same live dial for its
+    // CommandExec wall (backend_install.rs); unregistered shapes ask.
+    backend_install::register_autonomy(autonomy.clone());
 
     if web_daemon_requested {
         return startup::daemon::run_daemon(

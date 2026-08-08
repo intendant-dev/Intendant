@@ -364,6 +364,17 @@ pub(crate) async fn control_request_frame(
             ),
             "external agents",
         ),
+        "api_external_agent_install" => frame_api_response(
+            id,
+            crate::web_gateway::external_agent_install_api_response(
+                &params_body_text(params.as_ref()),
+                runtime.bus.clone(),
+                // Same seam: the edge resolves the state root.
+                crate::platform::intendant_home(),
+            )
+            .await,
+            "external agent install",
+        ),
         "api_api_keys_save" => {
             api_api_keys_save_response(
                 id,

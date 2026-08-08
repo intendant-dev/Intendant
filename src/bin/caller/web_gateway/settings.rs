@@ -1141,11 +1141,103 @@ pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &
         .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
         .map(|project| project.config.agent)
         .unwrap_or_default();
+    let mut agents = crate::external_agent::backend_availability_json(&agent_config, home);
+    // The approval-gated install lane rides each row: availability + the
+    // exact command derive from the install-command matrix, the state
+    // from the daemon's install registry (backend_install.rs). The
+    // dashboard's Install buttons and the approval-wall copy both consume
+    // THIS payload — the matrix is declared once.
+    if let Some(rows) = agents.as_array_mut() {
+        let registry = crate::backend_install::global_registry();
+        for row in rows {
+            let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(backend) = crate::external_agent::AgentBackend::from_str_loose(id) else {
+                continue;
+            };
+            let install = crate::backend_install::install_status_json(&registry, &backend);
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("install".to_string(), install);
+            }
+        }
+    }
     serde_json::json!({
-        "external_agents":
-            crate::external_agent::backend_availability_json(&agent_config, home),
+        "external_agents": agents,
+        "install_platform": crate::backend_install::InstallPlatform::current()
+            .map(|platform| platform.as_str()),
     })
     .to_string()
+}
+
+/// Payload for POST /api/external-agents/install.
+#[derive(serde::Deserialize)]
+pub(crate) struct InstallProposalPayload {
+    backend: String,
+}
+
+/// POST /api/external-agents/install + the tunnel's
+/// `api_external_agent_install`: propose the approval-gated install of one
+/// backend's CLI. Never executes in-request — see `backend_install.rs`.
+/// `state_root` arrives from the transport edge (hermeticity convention).
+pub(crate) async fn external_agent_install_api_response(
+    body_text: &str,
+    bus: EventBus,
+    state_root: PathBuf,
+) -> ApiResponse {
+    let Ok(payload) = serde_json::from_str::<InstallProposalPayload>(body_text) else {
+        return ApiResponse::json(
+            400,
+            JsonBody::Value(
+                serde_json::json!({ "error": "expected a JSON body with a `backend` field" }),
+            ),
+        );
+    };
+    let registry = crate::backend_install::global_registry();
+    match crate::backend_install::propose_install(bus, registry.clone(), state_root, &payload.backend)
+        .await
+    {
+        Ok(_) => {
+            let backend = crate::external_agent::AgentBackend::from_str_loose(&payload.backend)
+                .expect("propose_install accepted the backend");
+            ApiResponse::json(
+                200,
+                JsonBody::Value(serde_json::json!({
+                    "backend": backend.as_short_str(),
+                    "install": crate::backend_install::install_status_json(&registry, &backend),
+                })),
+            )
+        }
+        Err(crate::backend_install::ProposeRefusal::UnknownBackend(name)) => ApiResponse::json(
+            404,
+            JsonBody::Value(serde_json::json!({
+                "error": format!("unknown backend `{name}`"),
+            })),
+        ),
+        Err(crate::backend_install::ProposeRefusal::NoLane { backend, platform }) => {
+            ApiResponse::json(
+                409,
+                JsonBody::Value(serde_json::json!({
+                    "error": format!(
+                        "no supported install lane for `{backend}` on {platform} — install it \
+                         manually on the daemon machine"
+                    ),
+                })),
+            )
+        }
+    }
+}
+
+pub(crate) async fn handle_external_agent_install(
+    stream: DemuxStream,
+    body_text: String,
+    bus: EventBus,
+    state_root: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = external_agent_install_api_response(&body_text, bus, state_root).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Payload for POST /api/api-keys.
@@ -2477,6 +2569,43 @@ mod tests {
             golden_settings_transcript(&response),
             golden_settings_json_transcript("200 OK", &body)
         );
+    }
+
+    /// Matrix parity at the served edge: every availability row carries
+    /// the install lane derived from the daemon's install-command matrix
+    /// (backend_install.rs) — command and availability both directions,
+    /// pi's honest no-lane included — plus the platform the lane serves.
+    #[test]
+    fn served_external_agents_rows_carry_the_install_matrix() {
+        let home = tempfile::tempdir().unwrap();
+        let body = external_agents_response_body(None, home.path());
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let platform = crate::backend_install::InstallPlatform::current()
+            .expect("test hosts are supported platforms");
+        assert_eq!(
+            parsed["install_platform"].as_str(),
+            Some(platform.as_str())
+        );
+        let rows = parsed["external_agents"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        for row in rows {
+            let id = row["id"].as_str().unwrap();
+            let backend = crate::external_agent::AgentBackend::from_str_loose(id).unwrap();
+            let lane = crate::backend_install::install_command(&backend, platform);
+            assert_eq!(
+                row["install"]["available"],
+                serde_json::json!(lane.is_some()),
+                "{id}: served availability mirrors the matrix"
+            );
+            assert_eq!(
+                row["install"]["command"].as_str(),
+                lane,
+                "{id}: served command IS the matrix cell"
+            );
+        }
+        // Pi is served with the honest no-lane answer, not omitted.
+        assert!(rows.iter().any(|row| row["id"] == "pi"
+            && row["install"]["available"] == serde_json::json!(false)));
     }
 
     #[tokio::test]

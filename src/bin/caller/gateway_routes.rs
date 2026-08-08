@@ -232,6 +232,8 @@ pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
 pub(crate) const CODEX_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
 /// Kimi's start body carries only the selected sign-in mode.
 pub(crate) const KIMI_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
+/// Backend-install proposal body carries only `{"backend": …}`.
+pub(crate) const EXTERNAL_AGENT_INSTALL_BODY_CAP_BYTES: usize = 1024;
 
 /// Links a table row to its dispatch arm in
 /// `web_gateway/http_dispatch.rs`. The match there is exhaustive, so a
@@ -374,6 +376,9 @@ pub(crate) enum RouteHandlerId {
     /// Cancel the Kimi ceremony (Ctrl-C + reap; non-destructive).
     KimiAuthCancel,
     ExternalAgents,
+    /// Propose installing one backend's CLI (approval-gated; the
+    /// install-command matrix in `backend_install.rs` is the authority).
+    ExternalAgentInstall,
     DiagnosticsVisualFreshness,
     Displays,
     /// The public peer access-request doorbell (create + status poll).
@@ -2232,6 +2237,21 @@ pub(crate) static ROUTES: &[Route] = &[
         "Detected external coding agents (codex, claude, kimi, pi)",
     )
     .with_tunnel(tunnel_method("api_external_agents")),
+    // Propose installing one backend's CLI on this machine. PROPOSES only:
+    // execution is approval-gated behind the CommandExec wall
+    // (backend_install.rs — the install-command matrix is the single
+    // authority for what would run). Settings-grade like the skills S3/S4
+    // walls: an authority-bearing act over the daemon host, so hosted
+    // provenance (`role:none`) never reaches it.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/external-agents/install"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(EXTERNAL_AGENT_INSTALL_BODY_CAP_BYTES),
+        RouteHandlerId::ExternalAgentInstall,
+        "Propose installing one external agent CLI (approval-gated; the exact command from the daemon's install matrix)",
+    )
+    .with_tunnel(tunnel_method("api_external_agent_install")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/diagnostics/visual-freshness"),
@@ -3582,6 +3602,11 @@ mod tests {
             BodyPolicy::Capped(KIMI_AUTH_START_BODY_CAP_BYTES)
         );
         assert_eq!(policy("POST", "/api/kimi-auth/cancel"), BodyPolicy::None);
+        // Install proposal carries only the backend id.
+        assert_eq!(
+            policy("POST", "/api/external-agents/install"),
+            BodyPolicy::Capped(EXTERNAL_AGENT_INSTALL_BODY_CAP_BYTES)
+        );
         assert_eq!(
             policy("POST", "/api/access/org-grants"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)

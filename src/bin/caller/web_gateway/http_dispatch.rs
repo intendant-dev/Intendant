@@ -2086,6 +2086,19 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::ExternalAgentInstall => {
+                // Same seam: dispatch resolves the state root the install
+                // logs land under.
+                return handle_external_agent_install(
+                    stream,
+                    route_body,
+                    bus,
+                    crate::platform::intendant_home(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::DiagnosticsVisualFreshness => {
                 // Same seam: dispatch resolves the state dir the sink
                 // appends under.

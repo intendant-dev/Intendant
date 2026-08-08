@@ -3175,7 +3175,7 @@ pub(crate) fn grant_overview_values_with_fleet_zone(
         .collect()
 }
 
-fn builtin_role_templates() -> Vec<IamRole> {
+pub(crate) fn builtin_role_templates() -> Vec<IamRole> {
     vec![
         IamRole {
             id: "role:root".to_string(),
