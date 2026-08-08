@@ -366,9 +366,7 @@ pub(crate) async fn control_request_frame(
                     .as_ref()
                     .and_then(|p| p.get("refresh"))
                     .is_some_and(|flag| {
-                        flag == &serde_json::Value::Bool(true)
-                            || flag == "1"
-                            || flag == "true"
+                        flag == &serde_json::Value::Bool(true) || flag == "1" || flag == "true"
                     }),
                 Some(&runtime.bus),
             ),

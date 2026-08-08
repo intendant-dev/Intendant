@@ -1165,7 +1165,8 @@ struct ExternalAgentsProbeEntry {
     installed: Vec<(String, bool)>,
 }
 
-type ExternalAgentsProbeCache = Mutex<HashMap<(Option<PathBuf>, PathBuf), ExternalAgentsProbeEntry>>;
+type ExternalAgentsProbeCache =
+    Mutex<HashMap<(Option<PathBuf>, PathBuf), ExternalAgentsProbeEntry>>;
 
 fn external_agents_probe_cache() -> &'static ExternalAgentsProbeCache {
     static CACHE: OnceLock<ExternalAgentsProbeCache> = OnceLock::new();
@@ -1225,7 +1226,9 @@ fn external_agents_serve_in(
                             .and_then(|id| id.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        row.get("installed").and_then(|i| i.as_bool()).unwrap_or(false),
+                        row.get("installed")
+                            .and_then(|i| i.as_bool())
+                            .unwrap_or(false),
                     )
                 })
                 .collect()
@@ -1569,7 +1572,8 @@ pub(crate) async fn handle_external_agents(
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = external_agents_api_response(project_root.as_deref(), &home, refresh, Some(&bus));
+    let response =
+        external_agents_api_response(project_root.as_deref(), &home, refresh, Some(&bus));
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -2621,10 +2625,7 @@ mod tests {
         // TOML literal strings take Windows backslashes unescaped.
         std::fs::write(
             root.path().join("intendant.toml"),
-            format!(
-                "[agent.codex]\ncommand = '{}'\n",
-                bin.display()
-            ),
+            format!("[agent.codex]\ncommand = '{}'\n", bin.display()),
         )
         .unwrap();
         (home, root, bin)
@@ -2693,7 +2694,9 @@ mod tests {
             t0 + EXTERNAL_AGENTS_PROBE_TTL + std::time::Duration::from_secs(1),
         );
         assert!(codex_installed(&reprobed.body));
-        let changed = reprobed.changed.expect("installed flip must report a change");
+        let changed = reprobed
+            .changed
+            .expect("installed flip must report a change");
         assert!(
             changed
                 .as_array()
@@ -2735,7 +2738,10 @@ mod tests {
             t0 + std::time::Duration::from_secs(1),
         );
         assert!(codex_installed(&refreshed.body));
-        assert!(refreshed.changed.is_some(), "the forced re-probe saw the flip");
+        assert!(
+            refreshed.changed.is_some(),
+            "the forced re-probe saw the flip"
+        );
 
         // The refreshed result re-arms the cache: a plain request right
         // after serves it without re-probing (body identity is enough —
@@ -2760,8 +2766,7 @@ mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
 
-        let first =
-            external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        let first = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
         assert!(matches!(first, ApiResponse::Json { status: 200, .. }));
         assert!(
             rx.try_recv().is_err(),

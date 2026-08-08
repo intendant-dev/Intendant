@@ -1328,7 +1328,9 @@ pub enum AppEvent {
     /// its new-session picker and Vault sign-in cards without refetching
     /// or user action. Emitted only on change by the availability
     /// serving cache (`web_gateway::settings`), never per request.
-    ExternalAgentsChanged { agents: serde_json::Value },
+    ExternalAgentsChanged {
+        agents: serde_json::Value,
+    },
 
     /// A recorded outcome on an agenda-backed rich ask: an answer resolved
     /// the item, or a dismissal/administrative close marked it. Emitted
