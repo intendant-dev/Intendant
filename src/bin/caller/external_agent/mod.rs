@@ -1214,6 +1214,15 @@ pub struct BackendAvailability {
     /// Passive, zero-additional-quota compatibility evidence for the exact
     /// configured executable artifact and current adapter contract.
     pub compatibility: protocol_watch::PassiveCompatibilityStatus,
+    /// The honest explanation when `installed` is false but the CLI *is*
+    /// present in a well-known install directory the daemon's inherited
+    /// `PATH` does not carry (`platform::off_path_install_probe`): the
+    /// startup-only `ensure_tool_paths` augmentation cannot see a
+    /// directory the install itself created (the Windows npm-shim
+    /// footgun; a first Homebrew install on macOS), so a re-probe keeps
+    /// failing until the daemon restarts — and the payload says so
+    /// instead of serving a bare not-found.
+    pub path_hint: Option<String>,
 }
 
 fn codex_local_login(home: &Path) -> Option<bool> {
@@ -1338,6 +1347,11 @@ pub fn backend_availability(
             compatibility_profile,
             &compatibility_command,
         );
+        let path_hint = if installed {
+            None
+        } else {
+            path_inheritance_hint(&command)
+        };
         BackendAvailability {
             backend,
             command,
@@ -1346,9 +1360,36 @@ pub fn backend_availability(
             leased,
             local_login,
             compatibility,
+            path_hint,
         }
     })
     .collect()
+}
+
+/// The PATH-inheritance explanation for a backend whose configured bare
+/// command failed to resolve: when the CLI actually exists in a
+/// well-known install directory the daemon's `PATH` (inherited at daemon
+/// start, augmented once by `ensure_tool_paths`) does not carry, name
+/// where it was found and the remedy — the same honest-refusal
+/// convention as the update lane's toolchain resolution. `None` when the
+/// CLI genuinely isn't anywhere we know to look (or the command is an
+/// explicit path, where PATH is not the story).
+fn path_inheritance_hint(command: &str) -> Option<String> {
+    let hit = crate::platform::off_path_install_probe(command)?;
+    Some(path_inheritance_hint_copy(command, &hit))
+}
+
+/// Pure wording half, split from the ambient-PATH probe for hermetic
+/// tests.
+fn path_inheritance_hint_copy(command: &str, hit: &crate::platform::OffPathInstall) -> String {
+    format!(
+        "{} is installed at {}, but {} is not on the daemon's PATH (inherited when the daemon \
+         started) — restart the Intendant daemon to pick it up, or launch it from a shell where \
+         that directory is on PATH.",
+        command,
+        hit.found.display(),
+        hit.dir.display()
+    )
 }
 
 /// The wire shape the dashboard consumes: `id` matches the new-session
@@ -1370,6 +1411,7 @@ pub fn backend_availability_json(
                     "leased": info.leased,
                     "local_login": info.local_login,
                     "compatibility": info.compatibility,
+                    "path_hint": info.path_hint,
                 })
             })
             .collect(),
@@ -2966,6 +3008,10 @@ mod tests {
                 entry.get("local_login").is_some(),
                 "local_login must be present (bool or null)"
             );
+            assert!(
+                entry.get("path_hint").is_some(),
+                "path_hint must be present (string or null) — the PATH-inheritance honesty key"
+            );
             let compatibility = entry
                 .get("compatibility")
                 .and_then(serde_json::Value::as_object)
@@ -2982,6 +3028,39 @@ mod tests {
                 Some("unobserved")
             );
         }
+    }
+
+    /// The PATH-inheritance hint names the found executable, the
+    /// off-PATH directory, and the restart remedy — the honest copy the
+    /// picker tooltip and the Vault card render verbatim when a fresh
+    /// install stays invisible to the daemon's boot-time PATH.
+    #[test]
+    fn path_inheritance_hint_names_found_dir_and_remedy() {
+        let hit = crate::platform::OffPathInstall {
+            found: std::path::Path::new("install-dir").join("codex"),
+            dir: std::path::PathBuf::from("install-dir"),
+        };
+        let copy = path_inheritance_hint_copy("codex", &hit);
+        for needle in [
+            "codex is installed at ",
+            "is not on the daemon's PATH",
+            "inherited when the daemon started",
+            "restart the Intendant daemon",
+        ] {
+            assert!(copy.contains(needle), "hint copy lost {needle:?}: {copy}");
+        }
+        // Absent commands stay hintless: the plain not-found copy is the
+        // honest message when the CLI is nowhere we know to look.
+        let missing = backend_availability(
+            &{
+                let mut config = crate::project::ExternalAgentConfig::default();
+                config.codex.command = "intendant-test-absent-codex".to_string();
+                config.codex.managed_command = None;
+                config
+            },
+            tempfile::tempdir().unwrap().path(),
+        );
+        assert_eq!(missing[0].path_hint, None);
     }
 
     #[test]
@@ -3092,6 +3171,46 @@ mod tests {
         }
     }
 
+    /// The mid-run install-detection lanes (card 01KZDRNRNX): a backend
+    /// CLI installed after daemon boot must ungrey the AGENT picker and
+    /// unmute its Vault sign-in card without a restart. Pin the SPA
+    /// wiring by needle: the shared applier both fresh-rows sources
+    /// funnel through (the fetch and the daemon's change broadcast),
+    /// the two explicit re-probe triggers (picker open, Vault tab
+    /// open), the wire flag the daemon's bounded-TTL cache honors, and
+    /// the PATH-inheritance hint reaching both render surfaces.
+    #[test]
+    fn spa_availability_refresh_lanes_are_wired() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // One applier for every source of fresh rows; it repaints
+            // the picker and the Vault cards together.
+            "function applyExternalAgentAvailability(list)",
+            "applyExternalAgentAvailabilityToNewSessionPicker();",
+            // The daemon's installed-flip broadcast routes to it —
+            // repaint with no user action on any open dashboard.
+            "d.event === 'external_agents_changed'",
+            // The explicit re-probe flag rides the declared query lane.
+            "query: ['refresh']",
+            // The PATH-inheritance hint renders on both surfaces.
+            "agent.path_hint",
+            "missing.path_hint",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the availability refresh wiring: {needle}"
+            );
+        }
+        // Both user-intent surfaces trigger the exact re-probe lane:
+        // picker open (sessions → new) and Vault tab open.
+        assert!(
+            app.matches("refreshExternalAgentAvailability({ refresh: true })")
+                .count()
+                >= 2,
+            "picker-open and Vault-tab-open must both ride the explicit refresh lane"
+        );
+    }
+
     /// The classified auth-failure surface, daemon → dashboard: the wire
     /// fields this module's classifier feeds (`authFailure` /
     /// `authFailureBackend` via the activity attention), the derived
@@ -3124,6 +3243,112 @@ mod tests {
                 "the dashboard bundle lost the signed-out state wiring: {needle}"
             );
         }
+    }
+
+    /// The `<option value="…">` values of one `<select id="…">` in the
+    /// bundled dashboard markup, for the picker-parity pins below.
+    fn spa_select_option_values(app: &str, select_id: &str) -> Vec<String> {
+        let marker = format!("id=\"{select_id}\"");
+        let start = app
+            .find(&marker)
+            .unwrap_or_else(|| panic!("select #{select_id} not found in static/app.html"));
+        let body = &app[start..];
+        let end = body
+            .find("</select>")
+            .unwrap_or_else(|| panic!("select #{select_id} is never closed"));
+        let body = &body[..end];
+        let mut values = Vec::new();
+        let mut rest = body;
+        while let Some(option_at) = rest.find("<option") {
+            rest = &rest[option_at..];
+            let tag_end = rest.find('>').expect("unterminated <option tag");
+            let tag = &rest[..tag_end];
+            if let Some(value_at) = tag.find("value=\"") {
+                let value = &tag[value_at + "value=\"".len()..];
+                let close = value.find('"').expect("unterminated option value");
+                values.push(value[..close].to_string());
+            }
+            rest = &rest[tag_end..];
+        }
+        values
+    }
+
+    /// Every dashboard surface that offers a *backend* choice — the New
+    /// Session Agent picker, the Delegate dialog, and Settings' External
+    /// Agent dropdown — is static fallback markup mirroring the daemon
+    /// catalog (`AgentBackend` / `backend_availability_json`), so this
+    /// parity test pins each option set to the source (the CLAUDE.md
+    /// "derive, don't mirror" carve-out). A retired backend surviving in
+    /// any picker (the Gemini CLI, retired 2026-07-03, was reported as an
+    /// installed agent on the 2026-08-07 wrapper e2e) or a new backend
+    /// missing from one ships as silent drift without this.
+    #[test]
+    fn spa_backend_pickers_match_the_backend_catalog() {
+        let app = include_str!("../../../../static/app.html");
+        let canonical: Vec<&str> = [
+            AgentBackend::Codex,
+            AgentBackend::ClaudeCode,
+            AgentBackend::Kimi,
+            AgentBackend::Pi,
+        ]
+        .iter()
+        .map(AgentBackend::as_short_str)
+        .collect();
+        for select_id in [
+            "new-session-agent",
+            "session-delegate-agent",
+            "set-external-agent",
+        ] {
+            let backend_ids: Vec<String> = spa_select_option_values(app, select_id)
+                .into_iter()
+                // Non-backend rows: "" (inherit / internal placeholder)
+                // and the New Session picker's explicit internal row.
+                .filter(|value| !value.is_empty() && value != "internal")
+                .collect();
+            assert_eq!(
+                backend_ids, canonical,
+                "#{select_id} backend options drifted from the AgentBackend catalog"
+            );
+            for id in &backend_ids {
+                assert!(
+                    AgentBackend::from_str_loose(id).is_some(),
+                    "#{select_id} offers '{id}', which no live backend resolves"
+                );
+            }
+        }
+    }
+
+    /// The New Session fueled banner names PROVIDER-KEY fuel (Anthropic /
+    /// OpenAI / Gemini booleans from api_key_status) directly under the
+    /// Agent picker, so its copy must speak provider language — "provider
+    /// API key(s)" — never bare company names that read as installed
+    /// agents ("Fueled — Gemini credentials" was reported as "Gemini
+    /// installed" on the 2026-08-07 wrapper e2e; Gemini exists only as a
+    /// native provider, provider/gemini.rs, not as an agent backend).
+    #[test]
+    fn spa_new_session_fuel_note_speaks_provider_language() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // The name list derives from the per-provider key-status
+            // booleans — provider names only, never backend labels.
+            "d.anthropic ? 'Anthropic' : ''",
+            "d.openai ? 'OpenAI' : ''",
+            "d.gemini ? 'Gemini' : ''",
+            // The named and generic templates, provider-qualified.
+            "`Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`",
+            "'Fueled — provider credentials active for the internal agent, ready to launch.'",
+            // The pre-JS static default carries the same generic copy.
+            "Fueled &mdash; provider credentials active for the internal agent, ready to launch.",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the provider-language fueled banner: {needle}"
+            );
+        }
+        assert!(
+            !app.contains("${names} credentials active"),
+            "the fueled banner regressed to bare provider names, which read as installed agents"
+        );
     }
 
     #[test]

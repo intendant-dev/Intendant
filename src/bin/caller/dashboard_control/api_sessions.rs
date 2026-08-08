@@ -367,6 +367,16 @@ pub(crate) async fn control_request_frame(
                 runtime.project_root.as_deref(),
                 // Same seam: the edge resolves home.
                 &crate::platform::home_dir(),
+                // The HTTP twin's `?refresh=1` rides the tunnel as a
+                // `refresh` param; both spellings the query lane
+                // accepts land here as strings or a bare bool.
+                params
+                    .as_ref()
+                    .and_then(|p| p.get("refresh"))
+                    .is_some_and(|flag| {
+                        flag == &serde_json::Value::Bool(true) || flag == "1" || flag == "true"
+                    }),
+                Some(&runtime.bus),
             ),
             "external agents",
         ),

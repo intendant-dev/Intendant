@@ -34639,7 +34639,7 @@ html.ui-v2 .daemon-relay-note {
                      the ui-v2 flag and only when fuel is positively known. -->
                 <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
                   <span class="sessions-fueled-dot" aria-hidden="true"></span>
-                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; provider credentials active for the internal agent, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts and still work.</span>
@@ -39268,7 +39268,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '1e0426df05e3511c';
+const INTENDANT_APP_BUILD = 'df6af22e588d7ee4';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -39967,18 +39967,41 @@ const LOG_EMPTY_DEFAULT_HINT = 'Send a task below to start the agent, or pick a 
    visible before Start. */
 let externalAgentAvailability = null; // null = not yet known
 let externalAgentAvailabilityFetch = null;
-function refreshExternalAgentAvailability() {
-  if (!externalAgentAvailabilityFetch) {
-    externalAgentAvailabilityFetch = fetchExternalAgentAvailability()
+/* One applier for every source of fresh rows — the fetch below AND the
+   daemon's `external_agents_changed` broadcast (an install/uninstall
+   observed by a re-probe) — so the picker and the Vault sign-in cards
+   repaint together wherever the update came from. */
+function applyExternalAgentAvailability(list) {
+  if (!Array.isArray(list)) return;
+  externalAgentAvailability = list;
+  applyExternalAgentAvailabilityToNewSessionPicker();
+  // The Vault sign-in pre-flight (32-vault-custody.js) reads the same
+  // store; repaint its cards so a freshly detected CLI unmutes without
+  // a tab re-entry. Renders are focus-guarded and cheap.
+  if (typeof renderAgentSigninSection === 'function') renderAgentSigninSection();
+}
+let externalAgentAvailabilitySeq = 0;
+function refreshExternalAgentAvailability(options = {}) {
+  const refresh = options.refresh === true;
+  // An explicit re-probe (picker open, Vault tab open) must not be
+  // swallowed by a plain fetch already in flight — the daemon coalesces
+  // via its bounded-TTL cache, so a second request is cheap and exact.
+  if (!externalAgentAvailabilityFetch || refresh) {
+    // Last writer wins: when a forced re-probe overtakes an in-flight
+    // plain fetch, the slower (possibly cache-served) response must not
+    // overwrite the fresher rows — only the newest request applies.
+    const seq = ++externalAgentAvailabilitySeq;
+    externalAgentAvailabilityFetch = fetchExternalAgentAvailability({ refresh })
       .then(body => {
-        if (Array.isArray(body?.external_agents)) {
-          externalAgentAvailability = body.external_agents;
-          applyExternalAgentAvailabilityToNewSessionPicker();
+        if (seq === externalAgentAvailabilitySeq) {
+          applyExternalAgentAvailability(body?.external_agents);
         }
         return externalAgentAvailability;
       })
       .catch(() => null)
-      .finally(() => { externalAgentAvailabilityFetch = null; });
+      .finally(() => {
+        if (seq === externalAgentAvailabilitySeq) externalAgentAvailabilityFetch = null;
+      });
   }
   return externalAgentAvailabilityFetch;
 }
@@ -40002,8 +40025,12 @@ function applyExternalAgentAvailabilityToNewSessionPicker() {
     if (!option) continue;
     const missing = agent.installed === false;
     option.disabled = missing;
+    // The PATH-inheritance hint outranks the generic not-found copy: it
+    // names where the CLI actually is and why the daemon can't see it
+    // (installed mid-run into a directory the daemon's boot-time PATH
+    // lacks — restart to pick it up).
     option.title = missing
-      ? `${agent.command || agent.id} was not found on the daemon host`
+      ? (agent.path_hint || `${agent.command || agent.id} was not found on the daemon host`)
       : '';
   }
   // A backend restored from last-used prefs (or picked before this probe
@@ -42388,7 +42415,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_kimi_auth_status: { verb: 'GET', path: '/api/kimi-auth/status' },
   api_kimi_auth_cancel: { verb: 'POST', path: '/api/kimi-auth/cancel' },
   api_project_root: { verb: 'GET', path: '/api/project-root' },
-  api_external_agents: { verb: 'GET', path: '/api/external-agents' },
+  api_external_agents: { verb: 'GET', path: '/api/external-agents', query: ['refresh'] },
   api_displays: { verb: 'GET', path: '/api/displays' },
   api_diagnostics_visual_freshness: { verb: 'POST', path: '/api/diagnostics/visual-freshness', query: ['session_id'], rawBody: 'body', rawBodyType: 'application/x-ndjson' },
   api_access_overview: { verb: 'GET', path: '/api/access/overview' },
@@ -45681,13 +45708,13 @@ function renderAgentSigninSection() {
     return;
   }
   // The not-installed pre-flight reads the shared availability probe:
-  // ask once while this page hasn't heard yet, repaint when it lands.
-  // A failed probe resolves null and does NOT re-render, so there is
-  // no fetch/render loop — the next user-driven render retries.
+  // ask once while this page hasn't heard yet; the shared applier
+  // repaints this section when rows land (from this fetch, a refresh
+  // lane, or the daemon's change broadcast). A failed probe resolves
+  // null and does NOT re-render, so there is no fetch/render loop —
+  // the next user-driven render retries.
   if (externalAgentAvailability === null) {
-    refreshExternalAgentAvailability().then(list => {
-      if (Array.isArray(list)) renderAgentSigninSection();
-    });
+    refreshExternalAgentAvailability();
   }
   mount.innerHTML = '';
   for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
@@ -45756,6 +45783,12 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
+    // PATH-inheritance honesty: the daemon found the CLI in a known
+    // install directory its inherited PATH doesn't carry (installed
+    // mid-run — the Windows npm-shim footgun). Surface the exact
+    // where-and-why instead of leaving "install it" to gaslight a user
+    // who just did.
+    if (missing.path_hint) note(String(missing.path_hint));
     return card;
   }
 
@@ -56438,6 +56471,14 @@ async function main() {
     }
     if (d.event === 'memory_changed') {
       serverMsgStep(d, 'memory_changed', () => memoryObserveServerMessage(d));
+      return;
+    }
+    if (d.event === 'external_agents_changed') {
+      // An availability re-probe on the daemon observed an installed
+      // flip (a backend CLI appeared or vanished mid-run): apply the
+      // fresh rows so the AGENT picker and the Vault sign-in cards
+      // repaint on every open dashboard without any user action.
+      serverMsgStep(d, 'external_agents_changed', () => applyExternalAgentAvailability(d.agents));
       return;
     }
     if (d.event === 'session_note') {
@@ -111273,6 +111314,11 @@ function switchTab(tabId) {
     // the pane repaints once so lease countdowns are fresh — the renderer
     // itself kicks the lease + custody refreshes.
     paneDeferredRenders.delete('vault');
+    // Explicit availability re-probe at the moment of user intent: a
+    // backend CLI installed since the boot-time probe unmutes its
+    // sign-in card when the refreshed rows land (the applier repaints
+    // this section).
+    refreshExternalAgentAvailability({ refresh: true });
     renderAccessVaultSection();
   }
   if (tabId === 'access') {
@@ -111503,6 +111549,11 @@ function switchSessionsSubtab(name) {
   });
   if (next === 'new') {
     updateNewSessionProjectPrefills();
+    // Picker-open re-probe: the AGENT picker's grey-out must reflect a
+    // CLI installed since the boot-time probe, not require a daemon
+    // restart — the daemon re-stats now and the applier repaints the
+    // options when the rows land.
+    refreshExternalAgentAvailability({ refresh: true });
     requestAnimationFrame(focusNewSessionInput);
   } else if (next === 'cloud') {
     cloudWorkersOnShown();
@@ -117976,8 +118027,13 @@ async function fetchApiKeyStatus() {
   return resp.body;
 }
 
-async function fetchExternalAgentAvailability() {
-  const resp = await daemonApi.request('api_external_agents');
+async function fetchExternalAgentAvailability(options = {}) {
+  // `refresh: true` = the explicit re-probe lane (?refresh=1 / the tunnel
+  // param): the daemon re-runs its stat probe now instead of serving the
+  // bounded-TTL cache — exact at the moment of user intent (picker open,
+  // Vault tab open) so a CLI installed mid-run ungreys without a restart.
+  const params = options.refresh ? { refresh: '1' } : {};
+  const resp = await daemonApi.request('api_external_agents', params);
   if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
   return resp.body;
 }
@@ -134901,9 +134957,15 @@ function updateNewSessionFuelBanner() {
         ? daemonFuelProviders.join(' + ')
         : '';
       if (textEl) {
+        // Provider names here are PROVIDER-KEY fuel (Anthropic / OpenAI /
+        // Gemini from api_key_status) — say "API key", never bare names:
+        // this banner sits under the Agent picker, and "Fueled — Gemini
+        // credentials" read as an installed Gemini AGENT on the 2026-08-07
+        // wrapper e2e (the Gemini CLI backend was retired 2026-07-03).
+        // Agents render only from the /api/external-agents catalog.
         textEl.textContent = names
-          ? `Fueled — ${names} credentials active, ready to launch.`
-          : 'Fueled — model credentials active, ready to launch.';
+          ? `Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`
+          : 'Fueled — provider credentials active for the internal agent, ready to launch.';
       }
     }
   }

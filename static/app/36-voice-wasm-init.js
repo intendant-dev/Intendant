@@ -570,6 +570,14 @@ async function main() {
       serverMsgStep(d, 'memory_changed', () => memoryObserveServerMessage(d));
       return;
     }
+    if (d.event === 'external_agents_changed') {
+      // An availability re-probe on the daemon observed an installed
+      // flip (a backend CLI appeared or vanished mid-run): apply the
+      // fresh rows so the AGENT picker and the Vault sign-in cards
+      // repaint on every open dashboard without any user action.
+      serverMsgStep(d, 'external_agents_changed', () => applyExternalAgentAvailability(d.agents));
+      return;
+    }
     if (d.event === 'session_note') {
         // Display-only transcript note: rendered end to end in JS (the
         // WASM presence layer does not know this event).

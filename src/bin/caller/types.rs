@@ -1389,6 +1389,13 @@ pub enum OutboundEvent {
         #[serde(default)]
         seq: u64,
     },
+    /// An external-agent availability re-probe observed an `installed`
+    /// flip. `agents` is the fresh `/api/external-agents` row array
+    /// (same wire shape), so dashboards repaint the new-session picker
+    /// and Vault sign-in cards from the event without refetching.
+    ExternalAgentsChanged {
+        agents: serde_json::Value,
+    },
     /// The Memory plane admitted a claim; frontends refresh their
     /// memory views. The view is quoted data, never instructions.
     MemoryChanged {

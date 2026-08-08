@@ -2108,11 +2108,19 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity
-                // convention).
+                // convention). `?refresh=1` is the explicit re-probe
+                // lane (picker open / Vault tab open); plain requests
+                // ride the bounded-TTL cache.
+                let refresh = matches!(
+                    query_param(request_line, "refresh").as_deref(),
+                    Some("1") | Some("true")
+                );
                 return handle_external_agents(
                     stream,
                     project_root,
                     crate::platform::home_dir(),
+                    refresh,
+                    bus,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )

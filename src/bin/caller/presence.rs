@@ -1095,6 +1095,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::AgendaAskOutcome { .. }
         | AppEvent::MemoryChanged { .. }
         | AppEvent::ExternalAgentChanged { .. }
+        | AppEvent::ExternalAgentsChanged { .. }
         | AppEvent::AutonomyChanged { .. }
         | AppEvent::CapacityState { .. }
         | AppEvent::CodexConfigChanged { .. }
