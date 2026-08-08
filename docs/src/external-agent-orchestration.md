@@ -42,8 +42,8 @@ one in Intendant gives you:
   heavy local build when acquisition fails. The workflow *teaching* lives in
   the shared `intendant-remote-compute` agent skill, materialized for every
   backend only while the **Codex Cloud Remote Compute** plugin (dashboard →
-  Plugins; default off) is enabled and ready — the ctl lane itself stays
-  available and self-describing either way.
+  Plugins & Skills; default off) is enabled and ready — the ctl lane itself
+  stays available and self-describing either way.
 - **Presence & multi-session.** The supervised session is just another session on
   the [EventBus](./architecture.md); the [presence layer](./presence.md) narrates
   it and the daemon can run several alongside native agents

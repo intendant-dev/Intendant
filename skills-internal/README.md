@@ -2,12 +2,13 @@
 
 Dev-fleet-only agent skills: in the public repo, outside the product.
 
-The four skill tiers:
+The five skill tiers:
 
 | Tier | Embedded in binary | Installed |
 |---|---|---|
-| `skills/` | yes (`builtin_skills.rs`, byte-pinned) | unconditionally, both global roots |
+| `skills/` | yes (`builtin_skills.rs`, byte-pinned) | both global roots, minus the owner's persisted disabled-set (dashboard deactivate/re-enable) |
 | `plugins/<name>/skills/` | yes (`plugin_registry.rs`) | materialized only while the plugin is enabled and ready |
+| `<state root>/skills/` (user library) | no — dashboard-added bytes, recorded with attribution + sha256 (`user_skills.rs`) | both global roots while enabled, marked `source: user (dashboard-added)`; removable from the dashboard |
 | `skills-internal/` (this tier) | **never** | dev-machine opt-in only |
 | `tests/skills/` | no | never (operator E2E briefs) |
 

@@ -521,7 +521,7 @@ impl AgendaHandle {
         }
     }
 
-    /// Add one dashboard-added personal template (S5) against the SAME
+    /// Add one dashboard-added personal definition (S5) against the SAME
     /// state root the catalog reads and the stamp lane resolves —
     /// validation, collision walls, and registration live in
     /// [`crate::user_templates`].
@@ -539,7 +539,7 @@ impl AgendaHandle {
         crate::user_templates::add_user_template_in(state_root, name, skill_md, added_by)
     }
 
-    /// Remove one dashboard-added personal template (S5). Refusals are
+    /// Remove one dashboard-added personal definition (S5). Refusals are
     /// per-kind and named; house bytes and hand-placed directories are
     /// never touched.
     pub(crate) fn remove_personal_definition(

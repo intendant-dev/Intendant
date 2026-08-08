@@ -1,6 +1,6 @@
 /* Plugins & Skills tab (System; pane id #tab-plugins is permanent): the
    bundled-plugin catalog plus the unified skill catalog and the
-   automation-template catalog. Cards and rows are host-owned; every
+   automation-definition catalog. Cards and rows are host-owned; every
    state/readiness/install fact derives from the daemon bodies. Styles
    reuse the shared ui-* components (.ui-card, .ui-btn, .ui-chip,
    .ui-empty, .ui-explainer) and the v2 token palette. */
@@ -51,7 +51,7 @@ html.ui-v2 .plugin-skill-row {
 
 html.ui-v2 .plugin-install-note { font-size: 12.5px; color: var(--text-3); }
 
-/* ── Sections (Plugins / Skills / Automation templates) ─────────────── */
+/* ── Sections (Plugins / Skills / Automation definitions) ───────────── */
 
 html.ui-v2 .plugins-section { display: flex; flex-direction: column; gap: 10px; }
 html.ui-v2 .plugins-section .ui-section-title { margin: 6px 0 0; }

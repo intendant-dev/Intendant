@@ -521,21 +521,21 @@ fn template_trust_posture(
 ) -> String {
     let mut posture = match provenance {
         DefinitionProvenance::House => {
-            "House template · ships in this daemon's binary, read-only here; adding a \
-             personal template of the same name shadows it."
+            "House definition · ships in this daemon's binary, read-only here; adding a \
+             personal definition of the same name shadows it."
         }
         DefinitionProvenance::Personal if recorded => {
-            "Personal template · added from the dashboard, attributed on this row."
+            "Personal definition · added from the dashboard, attributed on this row."
         }
         DefinitionProvenance::Personal => {
-            "Personal template · hand-placed in this daemon's library, managed by hand."
+            "Personal definition · hand-placed in this daemon's library, managed by hand."
         }
-        DefinitionProvenance::Path => "Explicit file path outside the template libraries.",
+        DefinitionProvenance::Path => "Explicit file path outside the definition libraries.",
     }
     .to_string();
     if shadows_house {
         posture
-            .push_str(" Shadows the house template of the same name — your copy resolves first.");
+            .push_str(" Shadows the house definition of the same name — your copy resolves first.");
     }
     posture.push_str(" Stamping seals the file; firings execute the sealed bytes.");
     posture
@@ -615,7 +615,7 @@ pub(crate) fn definition_catalog(state_root: &Path) -> Vec<DefinitionCatalogEntr
             library: Some("missing"),
             valid: false,
             reason: Some(
-                "the recorded personal template has no SKILL.md on disk — remove the \
+                "the recorded personal definition has no SKILL.md on disk — remove the \
                  entry (or add the definition again)"
                     .to_string(),
             ),
@@ -1761,7 +1761,8 @@ mod tests {
                 "name": "cap",
                 "label": "Spend cap",
                 "required": true,
-                "hint": "Cumulative cost ceiling for this arc; estimates, never billed \
+                "hint": "Amount only — the $ is already in the line (60, not $60). \
+                         Cumulative cost ceiling for this arc; estimates, never billed \
                          dollars. Re-annotate the THREAD to steer it mid-arc.",
                 "kind": "annotation",
                 "line": "NS CAP: $<value>",

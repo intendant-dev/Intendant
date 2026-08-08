@@ -3284,7 +3284,7 @@ fn agenda_triage_watermark(all_items: &[Value]) -> u64 {
 /// chip; the daemon kind is gate-derived and stronger.
 /// The dashboard twin is `agendaFrontierPredicate()` in
 /// `static/app/ui2-agenda-cards.js`; the definition also lives in
-/// `docs/src/agenda-and-memory.md` and the triage mandate template —
+/// `docs/src/agenda-and-memory.md` and the triage definition's mandate —
 /// the four expressions move together.
 fn agenda_item_in_frontier(item: &Value, triage_watermark: u64) -> bool {
     if item.get("status").and_then(Value::as_str) != Some("open") || agenda_summary_tagged(item) {
