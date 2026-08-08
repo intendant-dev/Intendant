@@ -2208,8 +2208,13 @@ function agendaPositionCard() {
 let agendaDefinitionCatalog = null; // null = never fetched; else the entries array
 let agendaDefinitionCatalogError = '';
 let agendaDefinitionCatalogLoading = false;
+let agendaDefinitionCatalogWaiters = []; // onSettled callbacks for the in-flight fetch
 
 function agendaFetchDefinitionCatalog(onSettled) {
+  // Two surfaces share this lane (the Automate sheet's picker and the
+  // Plugins & Skills Templates section): every caller's callback runs
+  // when the in-flight fetch settles, not just the first's.
+  if (typeof onSettled === 'function') agendaDefinitionCatalogWaiters.push(onSettled);
   if (agendaDefinitionCatalogLoading) return;
   agendaDefinitionCatalogLoading = true;
   daemonApi.request('api_agenda_definitions', {})
@@ -2225,7 +2230,7 @@ function agendaFetchDefinitionCatalog(onSettled) {
     .catch((e) => { agendaDefinitionCatalogError = String((e && e.message) || e); })
     .finally(() => {
       agendaDefinitionCatalogLoading = false;
-      if (typeof onSettled === 'function') onSettled();
+      for (const settled of agendaDefinitionCatalogWaiters.splice(0)) settled();
     });
 }
 
@@ -2264,7 +2269,7 @@ function agendaProvenanceChipEl(provenance) {
   const chip = agendaStartSheetEl('span', `agsx-prov agsx-prov-${p}`, p);
   chip.title = p === 'house'
     ? 'Ships with this daemon, materialized into the library root — stamping seals the file itself'
-    : 'From this daemon’s personal library — shadows a house definition of the same name';
+    : 'From this daemon’s personal library — resolves first when a house definition shares its name';
   return chip;
 }
 

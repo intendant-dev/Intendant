@@ -259,6 +259,12 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
         "api_agenda_definitions" => api_agenda_definitions_response(id, &runtime).await,
+        "api_agenda_definition_add" => {
+            api_agenda_definition_add_response(id, params.as_ref(), &runtime).await
+        }
+        "api_agenda_definition_remove" => {
+            api_agenda_definition_remove_response(id, params.as_ref(), &runtime).await
+        }
         "api_agenda_sealed" => api_agenda_sealed_response(id, params.as_ref(), &runtime).await,
         "api_agenda_stamp" => api_agenda_stamp_response(id, params.as_ref(), &runtime).await,
         "api_agenda_ref_drift" => {
@@ -1709,6 +1715,57 @@ pub(crate) async fn api_skills_list_response(id: String) -> serde_json::Value {
         id,
         crate::web_gateway::skills_list_api_response().await,
         "skills list",
+    )
+}
+
+/// Tunnel twin of `POST /api/agenda/definitions` (the S5 template add) —
+/// `name` and `skill_md` ride `params`; the whole params object doubles
+/// as the body (the core ignores unknown keys and re-checks the byte
+/// cap). The recorded attribution is the tunnel grant's gate-resolved
+/// principal, never a params claim.
+pub(crate) async fn api_agenda_definition_add_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body = params
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+        .to_string();
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_definition_add_api_response(
+            &body,
+            runtime.mcp_server.as_ref(),
+            &actor,
+        )
+        .await,
+        "template add",
+    )
+}
+
+/// Tunnel twin of `DELETE /api/agenda/definitions/{name}` (the S5
+/// template remove) — `name` rides `params`.
+pub(crate) async fn api_agenda_definition_remove_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let name = params
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_definition_remove_api_response(
+            &name,
+            runtime.mcp_server.as_ref(),
+        )
+        .await,
+        "template remove",
     )
 }
 

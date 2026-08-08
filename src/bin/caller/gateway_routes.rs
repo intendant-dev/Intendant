@@ -437,6 +437,13 @@ pub(crate) enum RouteHandlerId {
     /// The automation-definition catalog (Track AW: house + personal
     /// libraries, validation state, full text).
     AgendaDefinitions,
+    /// Add one personal automation template into the automations library
+    /// (S5: validated by the real definition parser; attributed +
+    /// sha256-sealed in the templates registry).
+    AgendaDefinitionAdd,
+    /// Remove one dashboard-added personal template (un-shadows a house
+    /// twin; house bytes and hand-placed directories refuse by name).
+    AgendaDefinitionRemove,
     /// One sealed binding-ref snapshot's bytes by sha256 pin (read-only,
     /// content-addressed).
     AgendaSealed,
@@ -1212,6 +1219,41 @@ pub(crate) static ROUTES: &[Route] = &[
         "Automation-definition catalog (house + personal, validation state, full text)",
     )
     .with_tunnel(tunnel_method("api_agenda_definitions")),
+    // Add one personal automation template (skills/plugins unification
+    // S5). The S4 user-skill add lane retargeted at the automations
+    // library: Settings-grade (hosted provenance `role:none` never
+    // reaches it), pasted/uploaded SKILL.md bytes are the ONLY input
+    // lanes, and validation is the REAL definition intake — a file the
+    // stamp parser would refuse refuses here with the parser's own
+    // error. Accepted bytes land in `<state_root>/automations/<name>/`
+    // (the documented personal-shadow home) with the caller's
+    // gate-resolved attribution + sha256 recorded in the `templates`
+    // registry family. House bytes are never written: a house-named add
+    // is the shadow mechanism, visible in the same response's refreshed
+    // catalog.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/agenda/definitions"),
+        PeerOperation::Settings,
+        BodyPolicy::Capped(crate::user_templates::ADD_BODY_CAP_BYTES),
+        RouteHandlerId::AgendaDefinitionAdd,
+        "Add one personal automation template from pasted/uploaded SKILL.md bytes (validated by the real definition parser; records attribution + sha256; a house name shadows visibly)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_definition_add")),
+    // Remove one dashboard-added personal template (S5): deletes the
+    // library directory + registry record — never house bytes (they live
+    // under `.house/` and removal un-shadows back to them), never a
+    // hand-placed personal directory (no record ⇒ named refusal toward
+    // "manage it by hand"). Unknown names 404.
+    op_route(
+        RouteMethod::Delete,
+        PathPattern::Segments("/api/agenda/definitions", &[SegmentSpec::Capture("name")]),
+        PeerOperation::Settings,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaDefinitionRemove,
+        "Remove one dashboard-added personal template (deletes the library entry + record; un-shadows the house twin; house/hand-placed names refuse by name)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_definition_remove")),
     // Sealed binding-ref snapshots (Track AW): the read lane behind
     // sealed-content rendering — content-addressed and immutable; the
     // served bytes re-hash to the requested pin or the request errors.
@@ -3510,8 +3552,25 @@ mod tests {
             policy("DELETE", "/api/skills/some-user-skill"),
             BodyPolicy::None
         );
-        // The S4 role wall: every user-skill mutation lane classifies as
-        // a Settings-grade operation — the class the compiled hosted
+        // The template add carries a whole pasted/uploaded definition
+        // SKILL.md — the same 64 KiB prose budget as the skill add (the
+        // constant is derived from it, and the transport core re-checks
+        // it so the tunnel lane is equally bounded).
+        assert_eq!(
+            policy("POST", "/api/agenda/definitions"),
+            BodyPolicy::Capped(crate::user_templates::ADD_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            crate::user_templates::ADD_BODY_CAP_BYTES,
+            crate::user_skills::ADD_BODY_CAP_BYTES
+        );
+        assert_eq!(
+            policy("DELETE", "/api/agenda/definitions/some-template"),
+            BodyPolicy::None
+        );
+        // The S4 role wall (extended to the S5 template lanes): every
+        // user-skill and user-template mutation lane classifies as a
+        // Settings-grade operation — the class the compiled hosted
         // ceiling can never satisfy (`role:none` denies Settings; pinned
         // in access::iam's hosted-immutability tests) — so
         // hosted-provenance principals cannot reach add, remove, or the
@@ -3520,6 +3579,8 @@ mod tests {
             ("POST", "/api/skills"),
             ("DELETE", "/api/skills/some-user-skill"),
             ("POST", "/api/skills/intendant-cli"),
+            ("POST", "/api/agenda/definitions"),
+            ("DELETE", "/api/agenda/definitions/some-template"),
         ] {
             let (route, _) = match_route(method, path).unwrap();
             assert_eq!(
@@ -3528,6 +3589,14 @@ mod tests {
                 "{method} {path} must stay Settings-grade"
             );
         }
+        // …while the catalog READ stays AgendaRead — the S1 read surface
+        // is not raised by the S5 mutations sharing its path.
+        let (route, _) = match_route("GET", "/api/agenda/definitions").unwrap();
+        assert_eq!(
+            route.authz,
+            RouteAuthz::Operation(PeerOperation::AgendaRead),
+            "GET /api/agenda/definitions stays a read"
+        );
         // The update-lane actions carry at most a small JSON body.
         assert_eq!(
             policy("POST", "/api/daemon/update-lane/check"),

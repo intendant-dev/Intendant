@@ -18,6 +18,18 @@
 //! ([`crate::user_skills`] owns the files); the library materializes only
 //! bytes the registry attests.
 //!
+//! …and the USER TEMPLATE REGISTRY (S5): the same record shape
+//! ([`UserTemplateRecord`] = [`UserSkillRecord`]), one per
+//! dashboard-added automation definition under
+//! `<state_root>/automations/<name>/SKILL.md` ([`crate::user_templates`]
+//! owns the files). Templates have no enable state and no
+//! materialization — a definition does nothing until stamped — so the
+//! record carries provenance only: the add's attribution and the sha256
+//! seal the definition catalog renders and the remove lane targets. A
+//! personal definition WITHOUT a record (hand-placed in the library) is
+//! owner-managed exactly like an unmarked skill directory: the dashboard
+//! lanes never touch it.
+//!
 //! **The set outranks the sweep.** Every sweep call site derives its
 //! desired set through [`disabled_skill_names`], so rebuilds, daemon
 //! restarts, plugin refreshes, and re-materializations all re-apply the
@@ -57,6 +69,10 @@ struct SkillsStateFile {
     /// a record ride its own `foreign` map.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     user: Vec<UserSkillRecord>,
+    /// The user-template registry (S5): one record per dashboard-added
+    /// automation definition, same element shape as `user`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    templates: Vec<UserTemplateRecord>,
     /// Top-level fields a newer binary owns — carried through rewrites
     /// verbatim.
     #[serde(flatten)]
@@ -124,6 +140,14 @@ pub(crate) struct UserSkillRecord {
     #[serde(flatten)]
     pub(crate) foreign: serde_json::Map<String, serde_json::Value>,
 }
+
+/// One dashboard-added automation definition's registry record (S5):
+/// deliberately the SAME shape as the skill family — name, gate-resolved
+/// attribution, sha256 seal over the accepted bytes — persisted under the
+/// `templates` key of the same state file. The alias names the family at
+/// call sites; the shape is shared by design (intake S5: reuse S4's
+/// record shape, extend-don't-fork).
+pub(crate) type UserTemplateRecord = UserSkillRecord;
 
 /// `<state_root>/skills/state.json`.
 pub(crate) fn skills_state_path_in(state_root: &Path) -> PathBuf {
@@ -194,6 +218,52 @@ pub(crate) fn remove_user_skill_record_in(state_root: &Path, name: &str) -> Resu
     let before = state.user.len();
     state.user.retain(|record| record.name != name);
     if state.user.len() == before {
+        return Ok(false);
+    }
+    persist_state_in(state_root, &mut state)?;
+    Ok(true)
+}
+
+/// The user-template registry records, in file order — the S5 family's
+/// twin of [`user_skill_records_in`], with the same nameless-element
+/// tolerance.
+pub(crate) fn user_template_records_in(state_root: &Path) -> Vec<UserTemplateRecord> {
+    load_state_in(state_root)
+        .templates
+        .into_iter()
+        .filter(|record| !record.name.is_empty())
+        .collect()
+}
+
+/// Insert one user-template record (replacing any same-name record in
+/// place). The dumb writer: collision policy lives with the add
+/// validation in [`crate::user_templates`].
+pub(crate) fn upsert_user_template_record_in(
+    state_root: &Path,
+    record: UserTemplateRecord,
+) -> Result<(), String> {
+    let mut state = load_state_in(state_root);
+    match state
+        .templates
+        .iter_mut()
+        .find(|have| have.name == record.name)
+    {
+        Some(have) => *have = record,
+        None => state.templates.push(record),
+    }
+    persist_state_in(state_root, &mut state)
+}
+
+/// Remove one user-template record. Returns whether a record was
+/// removed; a miss writes nothing.
+pub(crate) fn remove_user_template_record_in(
+    state_root: &Path,
+    name: &str,
+) -> Result<bool, String> {
+    let mut state = load_state_in(state_root);
+    let before = state.templates.len();
+    state.templates.retain(|record| record.name != name);
+    if state.templates.len() == before {
         return Ok(false);
     }
     persist_state_in(state_root, &mut state)?;
@@ -708,15 +778,18 @@ mod tests {
         raw["disabled"][name]["future_field"] = serde_json::json!("kept");
         raw["user"] =
             serde_json::json!([{ "name": "future-lib-entry", "future_record_field": "kept" }]);
+        raw["templates"] =
+            serde_json::json!([{ "name": "future-template", "future_record_field": "kept" }]);
         raw["future_top_level"] = serde_json::json!({ "keep": true });
         std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
 
         // The foreign entry is visible to the sweep subtraction, and the
-        // newer binary's user record lists like any other.
+        // newer binary's user and template records list like any other.
         assert!(disabled_skill_names_in(root).contains("future-user-skill"));
         assert_eq!(user_skill_records_in(root)[0].name, "future-lib-entry");
+        assert_eq!(user_template_records_in(root)[0].name, "future-template");
 
-        // …and a rewrite by this binary preserves all four foreigners.
+        // …and a rewrite by this binary preserves all five foreigners.
         set_skill_enabled_in(root, builtin_name(2), false, record("p", "dashboard", 6)).unwrap();
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -724,6 +797,8 @@ mod tests {
         assert_eq!(raw["disabled"][name]["future_field"], "kept");
         assert_eq!(raw["user"][0]["name"], "future-lib-entry");
         assert_eq!(raw["user"][0]["future_record_field"], "kept");
+        assert_eq!(raw["templates"][0]["name"], "future-template");
+        assert_eq!(raw["templates"][0]["future_record_field"], "kept");
         assert_eq!(raw["future_top_level"]["keep"], true);
 
         // Corrupt and foreign-version states read as nothing-disabled (R4).

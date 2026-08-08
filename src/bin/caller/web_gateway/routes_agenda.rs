@@ -467,6 +467,135 @@ pub(crate) async fn handle_agenda_definitions(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+/// Body of `POST /api/agenda/definitions` (the S5 template add).
+/// `skill_md` is the ONLY content lane — pasted and uploaded definition
+/// bytes both land here; there is no URL and no path field (the S4 add
+/// law transplanted), and unknown keys are ignored so the tunnel twin
+/// can pass its whole `params` object through.
+#[derive(serde::Deserialize)]
+struct AddTemplateBody {
+    name: String,
+    skill_md: String,
+}
+
+/// Transport-neutral core of `POST /api/agenda/definitions` (tunnel twin
+/// `api_agenda_definition_add`): validate the submitted definition
+/// through the REAL intake parser (a definition that would refuse at
+/// stamp time refuses here with the parser's own error), seal it into
+/// the personal automations library with the caller's gate-resolved
+/// attribution + sha256 recorded in the `templates` registry, then serve
+/// the added entry, its recorded sha, and the FULL refreshed catalog —
+/// an add can flip a house twin to `shadowed`, so the whole catalog is
+/// the honest no-second-fetch response. The body cap is re-checked here
+/// so the tunnel lane (params-as-body, no HTTP BodyPolicy) is equally
+/// bounded.
+pub(crate) async fn agenda_definition_add_api_response(
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+    actor: &crate::access::actor::ActorBinding,
+) -> ApiResponse {
+    if body_text.len() > crate::user_templates::ADD_BODY_CAP_BYTES {
+        return ApiResponse::json_error(
+            413,
+            format!(
+                "request body exceeds the {} KiB template cap",
+                crate::user_templates::ADD_BODY_CAP_BYTES / 1024
+            ),
+        );
+    }
+    let request: AddTemplateBody = match serde_json::from_str(body_text) {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiResponse::json_error(400, format!("invalid template request: {error}"))
+        }
+    };
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let added_by = crate::skill_state::DisabledRecord::from_actor(actor, at_ms);
+    let record = match agenda.add_personal_definition(&request.name, &request.skill_md, added_by) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return ApiResponse::json_error(refusal.http_status(), refusal.message())
+        }
+    };
+    let catalog = agenda.definition_catalog();
+    let template = catalog
+        .iter()
+        .find(|entry| entry.name == record.name && entry.provenance == "personal")
+        .cloned();
+    match serde_json::to_value(&catalog) {
+        Ok(definitions) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({
+                "template": template,
+                "sha256": record.sha256,
+                "definitions": definitions,
+            })),
+        ),
+        Err(err) => ApiResponse::json_error(500, format!("encoding definition catalog: {err}")),
+    }
+}
+
+/// Transport-neutral core of `DELETE /api/agenda/definitions/{name}`
+/// (tunnel twin `api_agenda_definition_remove`): delete the
+/// dashboard-added library entry + registry record — never house bytes,
+/// never a hand-placed directory (per-kind named refusals) — then serve
+/// the FULL refreshed catalog (removal un-shadows a house twin, so
+/// single-row responses would lie).
+pub(crate) async fn agenda_definition_remove_api_response(
+    name: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let record = match agenda.remove_personal_definition(name) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return ApiResponse::json_error(refusal.http_status(), refusal.message())
+        }
+    };
+    match serde_json::to_value(agenda.definition_catalog()) {
+        Ok(definitions) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({
+                "removed": record.name,
+                "definitions": definitions,
+            })),
+        ),
+        Err(err) => ApiResponse::json_error(500, format!("encoding definition catalog: {err}")),
+    }
+}
+
+pub(crate) async fn handle_agenda_definition_add(
+    stream: DemuxStream,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    actor: crate::access::actor::ActorBinding,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response =
+        agenda_definition_add_api_response(&body_text, mcp_server.as_ref(), &actor).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_agenda_definition_remove(
+    stream: DemuxStream,
+    name: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_definition_remove_api_response(&name, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 /// Transport-neutral core of `GET /api/agenda/sealed/{sha256}` (tunnel
 /// twin `api_agenda_sealed`): one sealed binding-ref snapshot's bytes by
 /// pin — read-only and content-addressed (the served bytes re-hash to
@@ -807,6 +936,113 @@ mod tests {
             }
             _ => panic!("expected the JSON lane"),
         }
+    }
+
+    /// The S5 template lanes end to end at the transport core: the ONLY
+    /// content lane is `skill_md` bytes (no URL, no path field — parked
+    /// vocabulary), oversized bodies refuse 413 on any transport,
+    /// invalid definitions refuse with the REAL parser's own error, a
+    /// house-named add shadows visibly (house twin flips `shadowed`,
+    /// stays remove-less), and the remove un-shadows in the same
+    /// response's refreshed catalog.
+    #[tokio::test]
+    async fn template_add_and_remove_round_trip_with_shadow_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _agenda) = mcp_with_agenda(dir.path());
+        crate::agenda::materialize_house_definitions(dir.path()).unwrap();
+        let binding = crate::access::actor::ActorBinding::from_principal(
+            &crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http"),
+            None,
+        );
+
+        // No URL/path lane exists: a body offering one fails for the
+        // missing `skill_md` field.
+        for body in [
+            r#"{"name":"x","url":"https://example.com/SKILL.md"}"#,
+            r#"{"name":"x","path":"/tmp/SKILL.md"}"#,
+        ] {
+            let response =
+                agenda_definition_add_api_response(body, Some(&server), &binding).await;
+            assert_eq!(status_of(&response), 400, "{body}");
+        }
+
+        // The byte cap refuses 413 before any parse (the tunnel lane has
+        // no HTTP BodyPolicy in front — the core is the wall).
+        let oversized = "x".repeat(crate::user_templates::ADD_BODY_CAP_BYTES + 1);
+        let response =
+            agenda_definition_add_api_response(&oversized, Some(&server), &binding).await;
+        assert_eq!(status_of(&response), 413);
+
+        // An invalid definition refuses with the parser's own reason.
+        let bad_md = "---\nname: bad\ndescription: d\nshape: action\n---\n\n## node: \
+                      bad\n\n```toml\n```\n\nP.\n";
+        let body = serde_json::json!({ "name": "bad", "skill_md": bad_md }).to_string();
+        let response = agenda_definition_add_api_response(&body, Some(&server), &binding).await;
+        assert_eq!(status_of(&response), 400);
+        let error = json_of(&response)["error"].as_str().unwrap().to_string();
+        assert_eq!(
+            error,
+            crate::agenda::parse_definition(bad_md, "bad").unwrap_err(),
+            "the refusal is the REAL intake parser's own error"
+        );
+
+        // A valid personal shadow of a house name: the response carries
+        // the added entry (attributed, removable, library ok), the
+        // recorded sha, and the FULL catalog with the house twin flipped
+        // shadowed — no second fetch.
+        let shadow_md = "---\nname: triage\ndescription: my triage\n---\n\nMine.\n\n\
+                         ## node: triage\n\n```toml\ntitle = \"Mine\"\n```\n\nDo mine.\n";
+        let body = serde_json::json!({ "name": "triage", "skill_md": shadow_md }).to_string();
+        let response = agenda_definition_add_api_response(&body, Some(&server), &binding).await;
+        assert_eq!(status_of(&response), 200);
+        let json = json_of(&response);
+        let template = &json["template"];
+        assert_eq!(template["provenance"], "personal");
+        assert_eq!(template["shadows_house"], true);
+        assert_eq!(template["removable"], true);
+        assert_eq!(template["library"], "ok");
+        assert_eq!(
+            template["added_by"]["principal"].as_str(),
+            binding.principal_id.as_deref(),
+            "attribution is the gate-resolved principal"
+        );
+        assert_eq!(json["sha256"], template["record_sha256"]);
+        assert_eq!(json["sha256"], template["sha256"], "record == current at add time");
+        let defs = json["definitions"].as_array().unwrap();
+        let house_twin = defs
+            .iter()
+            .find(|d| d["name"] == "triage" && d["provenance"] == "house")
+            .expect("shadowed house twin stays listed");
+        assert_eq!(house_twin["shadowed"], true);
+        assert!(
+            house_twin.get("removable").is_none(),
+            "house entries expose no remove door"
+        );
+        assert!(house_twin["trust_posture"]
+            .as_str()
+            .unwrap()
+            .contains("ships in this daemon's binary"));
+        assert!(template["trust_posture"]
+            .as_str()
+            .unwrap()
+            .contains("your copy resolves first"));
+
+        // Remove un-shadows visibly in the same response.
+        let response = agenda_definition_remove_api_response("triage", Some(&server)).await;
+        assert_eq!(status_of(&response), 200);
+        let json = json_of(&response);
+        assert_eq!(json["removed"], "triage");
+        let defs = json["definitions"].as_array().unwrap();
+        let triage: Vec<_> = defs.iter().filter(|d| d["name"] == "triage").collect();
+        assert_eq!(triage.len(), 1, "the personal shadow is gone");
+        assert_eq!(triage[0]["provenance"], "house");
+        assert_eq!(triage[0]["shadowed"], false);
+
+        // Per-kind remove walls at the transport: house 409, unknown 404.
+        let response = agenda_definition_remove_api_response("triage", Some(&server)).await;
+        assert_eq!(status_of(&response), 409);
+        let response = agenda_definition_remove_api_response("no-such", Some(&server)).await;
+        assert_eq!(status_of(&response), 404);
     }
 
     /// Track AS freeze pin (ruling R-AS1, §6.3): the BARE list lane —
