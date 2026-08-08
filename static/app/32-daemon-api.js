@@ -200,6 +200,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_plugin_set_enabled: { verb: 'POST', path: '/api/plugins/{plugin_id}' },
   api_skills_list: { verb: 'GET', path: '/api/skills' },
   api_skill_set_enabled: { verb: 'POST', path: '/api/skills/{name}' },
+  api_skill_add: { verb: 'POST', path: '/api/skills' },
+  api_skill_remove: { verb: 'DELETE', path: '/api/skills/{name}' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
   api_agenda_occurrences: { verb: 'GET', path: '/api/agenda/occurrences', query: ['since', 'item', 'limit'] },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },

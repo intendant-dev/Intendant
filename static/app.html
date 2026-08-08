@@ -27623,6 +27623,40 @@ html.ui-v2 .template-automate { font-size: 12px; padding: 2px 10px; }
 html.ui-v2 .template-row-kind { color: var(--text-3); font-size: 12px; }
 html.ui-v2 .template-row-desc { color: var(--text-2); font-size: 12.5px; line-height: 1.45; }
 html.ui-v2 .template-row-reason { color: var(--amber); font-size: 12.5px; }
+
+/* ── S4: the user-skill add sheet + user-row provenance ─────────────── */
+
+html.ui-v2 .skill-add-card { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; }
+html.ui-v2 .skill-add-head { font-size: 13.5px; font-weight: 600; }
+html.ui-v2 .skill-add-explainer { color: var(--text-3); font-size: 12.5px; line-height: 1.5; }
+html.ui-v2 .skill-add-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+html.ui-v2 .skill-add-input {
+  background: var(--bg-1);
+  color: var(--text);
+  border: 1px solid rgba(var(--iris-rgb), 0.25);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12.5px;
+}
+html.ui-v2 .skill-add-input:focus { outline: none; border-color: var(--iris); }
+html.ui-v2 .skill-add-md { font-family: monospace; resize: vertical; min-height: 120px; }
+html.ui-v2 .skill-add-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+html.ui-v2 .skill-add-upload { cursor: pointer; }
+html.ui-v2 .skill-add-spacer { flex: 1; }
+html.ui-v2 .skill-add-status { font-size: 12.5px; color: var(--text-3); min-height: 1em; }
+html.ui-v2 .skill-add-status.plugins-status-error { color: var(--amber); }
+html.ui-v2 .skill-remove { font-size: 12px; padding: 2px 10px; }
+html.ui-v2 .skill-row-sha {
+  font-size: 11px;
+  color: var(--text-3);
+  word-break: break-all;
+}
 /* ── static/app/ui2-handover.css ── */
 /* ── ui2-handover — drain banner + predecessor chip (Track HS5) ──────
    Placement/z audit (the owner-hit wall class): both banner kinds dock
@@ -32845,7 +32879,7 @@ html.ui-v2 .daemon-relay-note {
          and the automation-template catalog (/api/agenda/definitions). -->
     <div id="tab-plugins" class="tab-pane">
       <div class="plugins-wrap">
-        <div class="plugins-intro">Optional bundled capabilities. Enabling a plugin activates its agent skill for every backend on this machine; nothing here installs or runs third-party code.</div>
+        <div class="plugins-intro">Optional bundled capabilities and agent skills. Bundled plugins ship no third-party code; skills are instructions — a skill you add here installs machine-wide for every backend and every project on this machine, and can be deactivated or removed below.</div>
         <section class="plugins-section">
           <h3 class="ui-section-title">Plugins</h3>
           <div id="plugins-status" class="plugins-status"></div>
@@ -32853,8 +32887,9 @@ html.ui-v2 .daemon-relay-note {
         </section>
         <section class="plugins-section">
           <h3 class="ui-section-title">Skills</h3>
-          <div class="plugins-section-sub">Every agent skill this daemon manages — shipped in the binary or carried by a bundled plugin — with its install state in both machine-wide roots.</div>
+          <div class="plugins-section-sub">Every agent skill this daemon manages — shipped in the binary, carried by a bundled plugin, or added by you — with its install state in both machine-wide roots.</div>
           <div id="skills-status" class="plugins-status"></div>
+          <div id="skill-add-slot"></div>
           <div id="skills-list"></div>
         </section>
         <section class="plugins-section">
@@ -34598,7 +34633,7 @@ html.ui-v2 .daemon-relay-note {
                      the ui-v2 flag and only when fuel is positively known. -->
                 <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
                   <span class="sessions-fueled-dot" aria-hidden="true"></span>
-                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; provider credentials active for the internal agent, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts and still work.</span>
@@ -39227,7 +39262,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '71b422240b12b12b';
+const INTENDANT_APP_BUILD = '89d5a6b6d7d13260';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -42337,6 +42372,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_plugin_set_enabled: { verb: 'POST', path: '/api/plugins/{plugin_id}' },
   api_skills_list: { verb: 'GET', path: '/api/skills' },
   api_skill_set_enabled: { verb: 'POST', path: '/api/skills/{name}' },
+  api_skill_add: { verb: 'POST', path: '/api/skills' },
+  api_skill_remove: { verb: 'DELETE', path: '/api/skills/{name}' },
   api_agenda_ops: { verb: 'GET', path: '/api/agenda/ops', query: ['since', 'item', 'limit'] },
   api_agenda_occurrences: { verb: 'GET', path: '/api/agenda/occurrences', query: ['since', 'item', 'limit'] },
   api_memory_search: { verb: 'GET', path: '/api/memory/search', query: ['q', 'limit', 'candidates'] },
@@ -110056,6 +110093,15 @@ window.submitCloudTask = submitCloudTask;
 //      deactivated row renders the served gate-resolved attribution);
 //      control 'plugin' rows deep-link their plugin card — the plugin
 //      toggle is the one lifecycle authority, no second switch here.
+//      S4 user skills: an availability-gated "Add skill" sheet posts
+//      pasted or uploaded SKILL.md bytes to POST /api/skills
+//      (api_skill_add) — those are the ONLY input lanes; the daemon
+//      validates fail-closed, records the gate-resolved attribution +
+//      sha256, and installs to both roots marked source: user. Rows the
+//      daemon declares `removable` get the Remove door
+//      (DELETE /api/skills/{name}, api_skill_remove: library entry
+//      deleted, both roots swept in-request); their attribution
+//      ("Added by …") and recorded sha256 render from the served body.
 //   3. Automation templates — the served definition catalog
 //      (api_agenda_definitions) read-first: provenance/shadowed/invalid
 //      state verbatim, with Automate… opening the EXISTING agenda stamp
@@ -110074,9 +110120,13 @@ let pluginsBusy = {};        // plugin id -> true while a toggle runs
 let pluginsLastInstall = {}; // plugin id -> install report from the last toggle
 let skillsRows = null;       // null until the catalog loads
 let skillsError = '';
+let skillsNotice = '';       // one-line success note (e.g. after a remove)
 let skillsFetchInFlight = null;
 let skillsBusy = {};         // skill name -> true while a toggle runs
 let skillsLastInstall = {};  // skill name -> install report from the last toggle
+let skillAddOpen = false;    // the add sheet is expanded
+let skillAddBusy = false;    // an add request is in flight
+let skillAddError = '';      // the daemon's refusal, rendered verbatim
 let templatesRows = null;    // null until the catalog loads
 let templatesError = '';
 let templatesFetchInFlight = null;
@@ -110347,6 +110397,163 @@ async function skillSetEnabled(name, enabled) {
   renderSkillsSection();
 }
 
+// ── S4: the user-skill add sheet (paste / upload only) ─────────────────
+//
+// Rendered into #skill-add-slot only when the daemon supports AND this
+// role may call api_skill_add — an older daemon or a read-only role sees
+// no dead affordance. The sheet's two inputs are a pasted SKILL.md body
+// and a single-file upload that reads into the same textarea; both land
+// the one skill_md request field. The daemon is the wall — every
+// validation refusal renders verbatim.
+
+function renderSkillAddSlot() {
+  const slot = document.getElementById('skill-add-slot');
+  if (!slot) return;
+  const avail = daemonApi.availability('api_skill_add');
+  if (!avail.ok) {
+    slot.innerHTML = '';
+    return;
+  }
+  if (!skillAddOpen) {
+    slot.innerHTML = '<button type="button" class="ui-btn" id="skill-add-open">Add skill…</button>';
+    const open = document.getElementById('skill-add-open');
+    if (open) open.onclick = () => { skillAddOpen = true; skillAddError = ''; renderSkillAddSlot(); };
+    return;
+  }
+  slot.innerHTML = `<div class="ui-card skill-add-card">
+    <div class="skill-add-head">Add a skill</div>
+    <div class="skill-add-explainer">Paste a SKILL.md (YAML frontmatter with <code>name</code> and <code>description</code>, then the body) or upload the file. Adding is machine-wide: every backend and every project on this machine will see it until you deactivate or remove it here.</div>
+    <label class="skill-add-label">Skill name (slug — must equal the frontmatter name)
+      <input type="text" id="skill-add-name" class="skill-add-input" placeholder="my-skill" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="skill-add-label">SKILL.md
+      <textarea id="skill-add-md" class="skill-add-input skill-add-md" rows="10" placeholder="---&#10;name: my-skill&#10;description: When to use this skill.&#10;---&#10;Teach the agent here." spellcheck="false"></textarea>
+    </label>
+    <div class="skill-add-actions">
+      <label class="ui-btn skill-add-upload">Upload SKILL.md<input type="file" id="skill-add-file" accept=".md,text/markdown,text/plain" hidden></label>
+      <span class="skill-add-spacer"></span>
+      <button type="button" class="ui-btn" id="skill-add-cancel">Cancel</button>
+      <button type="button" class="ui-btn primary" id="skill-add-submit"${skillAddBusy ? ' disabled' : ''}>${skillAddBusy ? 'Adding…' : 'Add skill'}</button>
+    </div>
+    <div class="skill-add-status${skillAddError ? ' plugins-status-error' : ''}">${escapeHtml(skillAddError)}</div>
+  </div>`;
+  const nameInput = document.getElementById('skill-add-name');
+  const mdInput = document.getElementById('skill-add-md');
+  const file = document.getElementById('skill-add-file');
+  const cancel = document.getElementById('skill-add-cancel');
+  const submit = document.getElementById('skill-add-submit');
+  if (file) file.onchange = () => {
+    const picked = file.files && file.files[0];
+    if (!picked) return;
+    if (picked.size > 64 * 1024) {
+      skillAddError = `“${picked.name}” is ${picked.size} bytes — the cap is 64 KiB.`;
+      renderSkillAddSlot();
+      return;
+    }
+    picked.text().then(text => {
+      const md = document.getElementById('skill-add-md');
+      const name = document.getElementById('skill-add-name');
+      if (md) md.value = text;
+      // Convenience prefill from the frontmatter; the daemon still
+      // enforces name == frontmatter name.
+      const m = /^name:\s*(.+)$/m.exec(text);
+      if (name && !name.value.trim() && m) name.value = m[1].trim().replace(/^["']|["']$/g, '');
+    }).catch(e => {
+      skillAddError = String((e && e.message) || e);
+      renderSkillAddSlot();
+    });
+  };
+  if (cancel) cancel.onclick = () => { skillAddOpen = false; skillAddError = ''; renderSkillAddSlot(); };
+  if (submit) submit.onclick = () => skillAddSubmit(
+    nameInput ? nameInput.value.trim() : '',
+    mdInput ? mdInput.value : ''
+  );
+}
+
+async function skillAddSubmit(name, skillMd) {
+  if (skillAddBusy) return;
+  const avail = daemonApi.availability('api_skill_add');
+  if (!avail.ok) {
+    skillAddError = avail.reason === 'denied'
+      ? "This session's role can't add skills."
+      : 'Adding skills is unavailable on this daemon.';
+    renderSkillAddSlot();
+    return;
+  }
+  if (!name || !skillMd.trim()) {
+    skillAddError = 'Both the skill name and the SKILL.md content are required.';
+    renderSkillAddSlot();
+    return;
+  }
+  skillAddBusy = true;
+  renderSkillAddSlot();
+  try {
+    const resp = await daemonApi.request('api_skill_add', { name, skill_md: skillMd });
+    if (resp.ok && resp.body && resp.body.skill) {
+      const row = resp.body.skill;
+      skillsRows = skillsRows || [];
+      const at = skillsRows.findIndex(s => s && s.name === row.name);
+      if (at >= 0) skillsRows[at] = row; else skillsRows.push(row);
+      skillsLastInstall[row.name] = resp.body.install || null;
+      skillAddOpen = false;
+      skillAddError = '';
+      skillsNotice = `Added '${row.name}' — installed machine-wide for every backend.`;
+      skillsError = '';
+    } else {
+      skillAddError = (resp.body && resp.body.error) || `skill add failed (${resp.status})`;
+    }
+  } catch (e) {
+    skillAddError = String((e && e.message) || e);
+  } finally {
+    skillAddBusy = false;
+  }
+  renderSkillsSection();
+}
+
+// Remove one user skill (the daemon declared the row removable). The
+// daemon deletes the library entry + registry record and sweeps the
+// marked copies from both roots in the same request; refusals (builtin /
+// plugin-managed / unknown) render verbatim.
+async function skillRemove(name) {
+  if (skillsBusy[name]) return;
+  const avail = daemonApi.availability('api_skill_remove');
+  if (!avail.ok) {
+    skillsError = avail.reason === 'denied'
+      ? "This session's role can't remove skills."
+      : 'Removing skills is unavailable on this daemon.';
+    renderSkillsSection();
+    return;
+  }
+  const message = `Remove '${name}'? This deletes the skill from the daemon's library and removes its installed copies from both machine-wide roots.`;
+  const confirmed = typeof showDashboardConfirm === 'function'
+    ? (await showDashboardConfirm({
+        title: 'Remove this skill?',
+        message,
+        confirmLabel: 'Remove',
+        cancelLabel: 'Keep it',
+      })) === true
+    : window.confirm(message);
+  if (!confirmed) return;
+  skillsBusy[name] = true;
+  renderSkillsSection();
+  try {
+    const resp = await daemonApi.request('api_skill_remove', { name });
+    if (resp.ok && resp.body && resp.body.removed) {
+      skillsRows = (skillsRows || []).filter(s => !(s && s.name === name));
+      delete skillsLastInstall[name];
+      skillsNotice = `Removed '${name}' — library entry deleted, installed copies swept from both roots.`;
+      skillsError = '';
+    } else {
+      skillsError = (resp.body && resp.body.error) || `skill remove failed (${resp.status})`;
+    }
+  } catch (e) {
+    skillsError = String((e && e.message) || e);
+  } finally {
+    delete skillsBusy[name];
+  }
+  renderSkillsSection();
+}
+
 // "Disabled by you · <when>" from the served gate-resolved record —
 // never a client-side claim. Plain TEXT only — callers escape.
 function skillAttributionText(rec) {
@@ -110356,6 +110563,17 @@ function skillAttributionText(rec) {
       : (rec.principal || 'unknown');
   const when = rec.at_ms ? new Date(rec.at_ms).toLocaleString() : '';
   return `Disabled by ${who}${when ? ` · ${when}` : ''}`;
+}
+
+// "Added by you · <when>" — the add's served gate-resolved attribution
+// (never a client-side claim). Plain TEXT only — callers escape.
+function skillAddedByText(rec) {
+  if (!rec || typeof rec !== 'object') return 'Added';
+  const who = rec.kind === 'dashboard' ? 'you'
+    : rec.kind === 'local_process' ? 'local ctl'
+      : (rec.principal || 'unknown');
+  const when = rec.at_ms ? new Date(rec.at_ms).toLocaleString() : '';
+  return `Added by ${who}${when ? ` · ${when}` : ''}`;
 }
 
 // Per-root install chips, the same status vocabulary the plugin cards
@@ -110372,9 +110590,10 @@ function skillRowHtml(s) {
   if (!s || !s.name) return '';
   // The served lifecycle body is the one gesture authority: 'toggle'
   // rows get the deactivate/re-enable button (state + attribution from
-  // the same body), 'plugin' rows keep the plugin deep-link as their
-  // only door, and anything this frontend does not know renders no
-  // gesture at all (an older daemon serves none — same outcome).
+  // the same body), rows the daemon declares removable get the Remove
+  // door too, 'plugin' rows keep the plugin deep-link as their only
+  // door, and anything this frontend does not know renders no gesture at
+  // all (an older daemon serves none — same outcome).
   const lc = (s.lifecycle && typeof s.lifecycle === 'object') ? s.lifecycle : null;
   const disabled = Boolean(lc && lc.control === 'toggle' && lc.enabled === false);
   const busy = Boolean(skillsBusy[s.name]);
@@ -110383,12 +110602,23 @@ function skillRowHtml(s) {
     const label = busy ? 'Working…' : (disabled ? 'Re-enable' : 'Deactivate');
     gesture = `<button type="button" class="${disabled ? 'ui-btn primary' : 'ui-btn'} skill-toggle" data-skill-toggle="${escapeHtml(s.name)}" data-enable="${disabled ? '1' : '0'}"${busy ? ' disabled' : ''}>${label}</button>`;
   }
+  const removeBtn = lc && lc.removable
+    ? `<button type="button" class="ui-btn skill-remove" data-skill-remove="${escapeHtml(s.name)}"${busy ? ' disabled' : ''} title="Delete this skill from the daemon's library and sweep its installed copies from both roots">Remove</button>`
+    : '';
   const pluginLink = s.plugin_id
     ? `<button type="button" class="ui-btn skill-plugin-link" data-skill-plugin="${escapeHtml(s.plugin_id)}" title="This skill's lifecycle is its plugin's toggle — there is no per-skill switch">View plugin</button>`
     : '';
   const stateChip = disabled ? '<span class="ui-chip warn">deactivated</span>' : '';
+  const libraryChip = s.library && s.library !== 'ok'
+    ? `<span class="ui-chip warn" title="The daemon's library copy no longer matches the recorded sha256 — it will not be re-taught; remove and re-add the skill">library: ${escapeHtml(String(s.library))}</span>`
+    : '';
   const attribution = disabled
-    ? `<div class="skill-row-attribution">${escapeHtml(skillAttributionText(lc.disabled_by))} — the bytes stay in the binary; re-enable restores the install.</div>`
+    ? `<div class="skill-row-attribution">${escapeHtml(skillAttributionText(lc.disabled_by))}${lc.removable ? '' : ' — the bytes stay in the binary; re-enable restores the install.'}</div>`
+    : '';
+  // The add's attribution + recorded sha render on user rows from the
+  // served body (added_by / sha256 — byte-deep provenance, ruling R3).
+  const addedBy = lc && lc.added_by
+    ? `<div class="skill-row-attribution">${escapeHtml(skillAddedByText(lc.added_by))}${lc.sha256 ? ` · <code class="skill-row-sha" title="sha256 of the accepted SKILL.md bytes">sha256:${escapeHtml(String(lc.sha256))}</code>` : ''}</div>`
     : '';
   const desc = s.description
     ? `<div class="skill-row-desc">${escapeHtml(s.description)}</div>`
@@ -110402,10 +110632,13 @@ function skillRowHtml(s) {
       <code class="skill-row-name">${escapeHtml(s.name)}</code>
       <span class="ui-chip">${escapeHtml(String(s.provenance || ''))}</span>
       ${stateChip}
+      ${libraryChip}
       ${pluginLink}
+      ${removeBtn}
       ${gesture}
     </div>
     ${attribution}
+    ${addedBy}
     ${desc}
     ${trust}
     <div class="skill-row-roots">${skillRootChipsHtml(s.roots)}</div>
@@ -110416,9 +110649,10 @@ function skillRowHtml(s) {
 function renderSkillsSection() {
   const status = document.getElementById('skills-status');
   if (status) {
-    status.textContent = skillsError ? `Error: ${skillsError}` : '';
+    status.textContent = skillsError ? `Error: ${skillsError}` : (skillsNotice || '');
     status.classList.toggle('plugins-status-error', Boolean(skillsError));
   }
+  renderSkillAddSlot();
   const list = document.getElementById('skills-list');
   if (!list) return;
   if (!skillsRows && !skillsError) {
@@ -110435,6 +110669,9 @@ function renderSkillsSection() {
   });
   list.querySelectorAll('button[data-skill-toggle]').forEach(btn => {
     btn.onclick = () => skillSetEnabled(btn.dataset.skillToggle, btn.dataset.enable === '1');
+  });
+  list.querySelectorAll('button[data-skill-remove]').forEach(btn => {
+    btn.onclick = () => skillRemove(btn.dataset.skillRemove);
   });
 }
 
@@ -134504,9 +134741,15 @@ function updateNewSessionFuelBanner() {
         ? daemonFuelProviders.join(' + ')
         : '';
       if (textEl) {
+        // Provider names here are PROVIDER-KEY fuel (Anthropic / OpenAI /
+        // Gemini from api_key_status) — say "API key", never bare names:
+        // this banner sits under the Agent picker, and "Fueled — Gemini
+        // credentials" read as an installed Gemini AGENT on the 2026-08-07
+        // wrapper e2e (the Gemini CLI backend was retired 2026-07-03).
+        // Agents render only from the /api/external-agents catalog.
         textEl.textContent = names
-          ? `Fueled — ${names} credentials active, ready to launch.`
-          : 'Fueled — model credentials active, ready to launch.';
+          ? `Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`
+          : 'Fueled — provider credentials active for the internal agent, ready to launch.';
       }
     }
   }

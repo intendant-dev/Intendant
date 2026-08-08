@@ -122,7 +122,19 @@ disabled-set the installer re-applies on every materialization pass over both
 global roots — a deactivated skill cannot resurrect on restart or rebuild, its
 row shows the gate-resolved attribution of the flip, and plugin-materialized
 rows refuse the toggle by name toward their plugin's card, the one lifecycle
-authority.
+authority. The Skills section also holds the **user-skill add sheet**
+(`POST /api/skills`, Settings-grade): pasted or uploaded SKILL.md bytes — the
+only input lanes; no URL fetch, no path import — are validated fail-closed
+(frontmatter parse, name==slug, non-empty description, collision with any
+builtin/plugin/user name refused by name), sealed into a daemon-owned library
+under the state root with the caller's gate-resolved attribution and the
+sha256 of the accepted bytes, and materialized into both global roots marked
+`source: user (dashboard-added)`. User rows render "Added by … · when" plus
+the recorded sha, toggle through the same disabled-set (re-enable re-verifies
+the library bytes against the recorded sha and refuses a drifted copy by
+name), and carry the Remove door (`DELETE /api/skills/{name}`) that deletes
+the library entry and sweeps the marked copies from both roots in-request —
+never an unmarked user-owned twin.
 
 On content-heavy destinations the composer can collapse to a compact pill and
 expand in place; each tab remembers its own state. Its target switcher can move
@@ -2057,8 +2069,10 @@ response omits the header.
 | POST | `/api/codex-cloud/enroll` | public | public | ≤ 8 KiB | Redeem a single-use Codex Cloud attach token (public key in, zero-authority cloud-worker certificate out) |
 | GET | `/api/plugins` | StatsRead | own origin | none | Bundled-plugin catalog: enabled flags, derived lifecycle state, readiness layers, per-skill install facts |
 | POST | `/api/plugins/{plugin_id}` | Settings | own origin | ≤ 4 KiB | Enable or disable one bundled plugin (reconciles skill materialization; reports the install outcome) |
-| GET | `/api/skills` | StatsRead | own origin | none | Unified skill catalog: builtins + bundled plugin payloads with provenance, trust posture, per-root install facts |
+| GET | `/api/skills` | StatsRead | own origin | none | Unified skill catalog: builtins + bundled plugin payloads + user-added skills with provenance, trust posture, per-root install facts |
 | POST | `/api/skills/{name}` | Settings | own origin | ≤ 4 KiB | Deactivate or re-enable one skill via the persisted disabled-set (sweeps both roots in-request; plugin payloads refuse toward their plugin's toggle) |
+| POST | `/api/skills` | Settings | own origin | ≤ 64 KiB | Add one user skill from pasted/uploaded SKILL.md bytes (validates fail-closed; records attribution + sha256; installs to both roots marked source: user) |
+| DELETE | `/api/skills/{name}` | Settings | own origin | none | Remove one user skill (deletes the library entry + record; sweeps both roots in-request; builtin/plugin names refuse toward their own lifecycle door) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts; additive since_seq (delta), shape=summary, q= (search), window=live|archive (+before/before_id/limit paging) — the bare call serves the full ledger forever |
 | GET | `/api/agenda/items/{item_id}` | AgendaRead | own origin | none | One agenda item, full + decorated, by id or unique prefix (+ its sessions join) |
 | GET | `/api/agenda/ops` | AgendaRead | own origin | none | Raw agenda op-log page (since/item/limit cursor; unknown ops served verbatim) |

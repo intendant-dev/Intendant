@@ -89,7 +89,7 @@
          and the automation-template catalog (/api/agenda/definitions). -->
     <div id="tab-plugins" class="tab-pane">
       <div class="plugins-wrap">
-        <div class="plugins-intro">Optional bundled capabilities. Enabling a plugin activates its agent skill for every backend on this machine; nothing here installs or runs third-party code.</div>
+        <div class="plugins-intro">Optional bundled capabilities and agent skills. Bundled plugins ship no third-party code; skills are instructions — a skill you add here installs machine-wide for every backend and every project on this machine, and can be deactivated or removed below.</div>
         <section class="plugins-section">
           <h3 class="ui-section-title">Plugins</h3>
           <div id="plugins-status" class="plugins-status"></div>
@@ -97,8 +97,9 @@
         </section>
         <section class="plugins-section">
           <h3 class="ui-section-title">Skills</h3>
-          <div class="plugins-section-sub">Every agent skill this daemon manages — shipped in the binary or carried by a bundled plugin — with its install state in both machine-wide roots.</div>
+          <div class="plugins-section-sub">Every agent skill this daemon manages — shipped in the binary, carried by a bundled plugin, or added by you — with its install state in both machine-wide roots.</div>
           <div id="skills-status" class="plugins-status"></div>
+          <div id="skill-add-slot"></div>
           <div id="skills-list"></div>
         </section>
         <section class="plugins-section">
@@ -1842,7 +1843,7 @@
                      the ui-v2 flag and only when fuel is positively known. -->
                 <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
                   <span class="sessions-fueled-dot" aria-hidden="true"></span>
-                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; provider credentials active for the internal agent, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts and still work.</span>

@@ -110,6 +110,7 @@ mod skill_catalog;
 mod skill_install;
 mod skill_state;
 mod usage_rail;
+mod user_skills;
 pub(crate) use intendant_core::skills;
 mod sub_agent;
 mod task_dispatch;

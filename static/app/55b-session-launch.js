@@ -865,9 +865,15 @@ function updateNewSessionFuelBanner() {
         ? daemonFuelProviders.join(' + ')
         : '';
       if (textEl) {
+        // Provider names here are PROVIDER-KEY fuel (Anthropic / OpenAI /
+        // Gemini from api_key_status) — say "API key", never bare names:
+        // this banner sits under the Agent picker, and "Fueled — Gemini
+        // credentials" read as an installed Gemini AGENT on the 2026-08-07
+        // wrapper e2e (the Gemini CLI backend was retired 2026-07-03).
+        // Agents render only from the /api/external-agents catalog.
         textEl.textContent = names
-          ? `Fueled — ${names} credentials active, ready to launch.`
-          : 'Fueled — model credentials active, ready to launch.';
+          ? `Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`
+          : 'Fueled — provider credentials active for the internal agent, ready to launch.';
       }
     }
   }

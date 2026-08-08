@@ -1089,9 +1089,10 @@ pub(crate) fn session_holds_drain(phase: &str, died_park: bool) -> bool {
 /// durable limit-park marker resolved from its `session_meta.json` —
 /// "parked until T" is decisive information (an in-memory park can hold
 /// the drain for hours), so the reset instant must reach every surface
-/// that renders the drain. Parked rows sort first (earliest reset
-/// leading) so capped renders keep the decisive ones; the rest keep id
-/// order for stable rendering.
+/// that renders the drain. Ordered by the ONE shared holdout rule
+/// ([`crate::handover::sort_drain_holdout_rows`]): parked rows first
+/// (earliest reset leading) so capped renders keep the decisive ones,
+/// then id order for stable rendering.
 fn drain_holdout_rows(
     holding: &[(String, String, Option<String>, String, PathBuf)],
 ) -> Vec<crate::handover::DrainHoldout> {
@@ -1112,15 +1113,7 @@ fn drain_holdout_rows(
             }
         })
         .collect();
-    let park_key = |row: &crate::handover::DrainHoldout| match &row.limit_park {
-        Some(park) => (0u8, park.resets_at_epoch.unwrap_or(u64::MAX)),
-        None => (1u8, 0),
-    };
-    rows.sort_by(|a, b| {
-        park_key(a)
-            .cmp(&park_key(b))
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    });
+    crate::handover::sort_drain_holdout_rows(&mut rows);
     rows
 }
 

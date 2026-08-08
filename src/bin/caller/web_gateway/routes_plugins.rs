@@ -115,6 +115,100 @@ pub(crate) async fn skill_set_enabled_api_response(
     }
 }
 
+/// Body of `POST /api/skills` (the S4 add). `skill_md` is the ONLY
+/// content lane — pasted and uploaded bytes both land here; there is no
+/// URL and no path field, and unknown keys are ignored so the tunnel
+/// twin can pass its whole `params` object through.
+#[derive(serde::Deserialize)]
+struct AddSkillBody {
+    name: String,
+    skill_md: String,
+}
+
+/// Transport-neutral core of `POST /api/skills` (tunnel twin
+/// `api_skill_add`): validate + seal the submitted SKILL.md into the
+/// daemon-owned user library with the caller's gate-resolved attribution
+/// and sha256, reconcile skill materialization in the same request, then
+/// serve the new catalog row + the per-root installer report + the
+/// recorded sha (ruling R3). The body cap is re-checked here so the
+/// tunnel lane (params-as-body, no HTTP BodyPolicy) is equally bounded.
+pub(crate) async fn skill_add_api_response(
+    body: &str,
+    actor: &crate::access::actor::ActorBinding,
+) -> ApiResponse {
+    if body.len() > crate::user_skills::ADD_BODY_CAP_BYTES {
+        return ApiResponse::json_error(
+            413,
+            format!(
+                "request body exceeds the {} KiB user-skill cap",
+                crate::user_skills::ADD_BODY_CAP_BYTES / 1024
+            ),
+        );
+    }
+    let request: AddSkillBody = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiResponse::json_error(400, format!("invalid skill request: {error}"))
+        }
+    };
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    let added_by = crate::skill_state::DisabledRecord::from_actor(actor, at_ms);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let state_root = intendant_core::state_paths::intendant_home();
+        let record = crate::user_skills::add_user_skill_in(
+            &state_root,
+            &request.name,
+            &request.skill_md,
+            added_by,
+        )?;
+        let install = crate::skill_install::reconcile_global_skills().to_json();
+        let skill = crate::skill_catalog::skill_entry_json(&request.name).ok_or_else(|| {
+            crate::user_skills::UserSkillRefusal::Io {
+                message: format!("skill '{}' vanished mid-request", request.name),
+            }
+        })?;
+        Ok::<_, crate::user_skills::UserSkillRefusal>(serde_json::json!({
+            "skill": skill,
+            "install": install,
+            "sha256": record.sha256,
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(body)) => ApiResponse::json(200, JsonBody::Value(body)),
+        Ok(Err(refusal)) => ApiResponse::json_error(refusal.http_status(), refusal.message()),
+        Err(error) => ApiResponse::json_error(500, format!("skill add: {error}")),
+    }
+}
+
+/// Transport-neutral core of `DELETE /api/skills/{name}` (tunnel twin
+/// `api_skill_remove`): delete the library entry + registry record, then
+/// reconcile in the same request so the sweep clears the marked copies
+/// from both roots — never an unmarked user-owned twin. Per-kind
+/// refusals: builtins toward deactivate, plugin payloads toward their
+/// plugin's toggle, unknown names 404.
+pub(crate) async fn skill_remove_api_response(name: &str) -> ApiResponse {
+    let name = name.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let state_root = intendant_core::state_paths::intendant_home();
+        let record = crate::user_skills::remove_user_skill_in(&state_root, &name)?;
+        let install = crate::skill_install::reconcile_global_skills().to_json();
+        Ok::<_, crate::user_skills::UserSkillRefusal>(serde_json::json!({
+            "removed": record.name,
+            "install": install,
+        }))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(body)) => ApiResponse::json(200, JsonBody::Value(body)),
+        Ok(Err(refusal)) => ApiResponse::json_error(refusal.http_status(), refusal.message()),
+        Err(error) => ApiResponse::json_error(500, format!("skill remove: {error}")),
+    }
+}
+
 pub(crate) async fn handle_plugins_list(
     stream: DemuxStream,
     cors: crate::gateway_routes::CorsPosture,
@@ -156,9 +250,30 @@ pub(crate) async fn handle_skill_set_enabled(
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
+pub(crate) async fn handle_skill_add(
+    stream: DemuxStream,
+    body: String,
+    actor: crate::access::actor::ActorBinding,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = skill_add_api_response(&body, &actor).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_skill_remove(
+    stream: DemuxStream,
+    name: String,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = skill_remove_api_response(&name).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SetEnabledBody;
+    use super::{AddSkillBody, SetEnabledBody};
 
     #[test]
     fn set_enabled_body_ignores_extra_keys_and_rejects_garbage() {
@@ -169,5 +284,41 @@ mod tests {
         assert!(serde_json::from_str::<SetEnabledBody>("not json").is_err());
         assert!(serde_json::from_str::<SetEnabledBody>(r#"{"enabled":"yes"}"#).is_err());
         assert!(serde_json::from_str::<SetEnabledBody>(r#"{}"#).is_err());
+    }
+
+    /// The add's ONLY content lane is the SKILL.md bytes field (intake
+    /// §3a / ruling H4: no URL fetch, no path import — those are parked
+    /// vocabulary). A body offering a `url` or `path` instead of bytes
+    /// fails for the missing field; extra keys (the tunnel's params
+    /// envelope) are ignored around the two real fields.
+    #[test]
+    fn add_skill_body_has_exactly_the_paste_upload_lane() {
+        let parsed: AddSkillBody = serde_json::from_str(
+            r#"{"name":"x","skill_md":"---","id":"m1","method":"api_skill_add"}"#,
+        )
+        .expect("tunnel params parse");
+        assert_eq!(parsed.name, "x");
+        assert_eq!(parsed.skill_md, "---");
+        assert!(serde_json::from_str::<AddSkillBody>(r#"{"name":"x","url":"https://e"}"#).is_err());
+        assert!(serde_json::from_str::<AddSkillBody>(r#"{"name":"x","path":"/tmp/s"}"#).is_err());
+        assert!(serde_json::from_str::<AddSkillBody>(r#"{"skill_md":"---"}"#).is_err());
+    }
+
+    /// The add core re-checks the byte cap before touching anything, so
+    /// the tunnel lane (params-as-body, no HTTP BodyPolicy in front) is
+    /// bounded by the same constant the route row pins. The refusal fires
+    /// before any parse or state access — hermetic by construction.
+    #[tokio::test]
+    async fn add_core_refuses_oversized_bodies_on_any_transport() {
+        let body = "x".repeat(crate::user_skills::ADD_BODY_CAP_BYTES + 1);
+        let actor = crate::access::actor::ActorBinding::from_principal(
+            &crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http"),
+            None,
+        );
+        let response = super::skill_add_api_response(&body, &actor).await;
+        match response {
+            super::ApiResponse::Json { status, .. } => assert_eq!(status, 413),
+            _ => panic!("expected a JSON refusal"),
+        }
     }
 }
