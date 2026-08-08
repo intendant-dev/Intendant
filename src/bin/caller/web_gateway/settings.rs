@@ -1479,10 +1479,11 @@ mod tests {
         let status: serde_json::Value = serde_json::from_str(&get_api_key_status_json())
             .expect("api key status is a JSON object");
         let map = status.as_object().expect("api key status is an object");
-        let expected_keys: std::collections::BTreeSet<String> = crate::provider::PROVIDER_KEY_ENV_VARS
-            .iter()
-            .map(|name| name.trim_end_matches("_API_KEY").to_ascii_lowercase())
-            .collect();
+        let expected_keys: std::collections::BTreeSet<String> =
+            crate::provider::PROVIDER_KEY_ENV_VARS
+                .iter()
+                .map(|name| name.trim_end_matches("_API_KEY").to_ascii_lowercase())
+                .collect();
         let actual_keys: std::collections::BTreeSet<String> = map.keys().cloned().collect();
         assert_eq!(
             actual_keys, expected_keys,
