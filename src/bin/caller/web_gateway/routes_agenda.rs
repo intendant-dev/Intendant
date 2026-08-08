@@ -519,9 +519,7 @@ pub(crate) async fn agenda_definition_add_api_response(
     let added_by = crate::skill_state::DisabledRecord::from_actor(actor, at_ms);
     let record = match agenda.add_personal_definition(&request.name, &request.skill_md, added_by) {
         Ok(record) => record,
-        Err(refusal) => {
-            return ApiResponse::json_error(refusal.http_status(), refusal.message())
-        }
+        Err(refusal) => return ApiResponse::json_error(refusal.http_status(), refusal.message()),
     };
     let catalog = agenda.definition_catalog();
     let template = catalog
@@ -556,9 +554,7 @@ pub(crate) async fn agenda_definition_remove_api_response(
     };
     let record = match agenda.remove_personal_definition(name) {
         Ok(record) => record,
-        Err(refusal) => {
-            return ApiResponse::json_error(refusal.http_status(), refusal.message())
-        }
+        Err(refusal) => return ApiResponse::json_error(refusal.http_status(), refusal.message()),
     };
     match serde_json::to_value(agenda.definition_catalog()) {
         Ok(definitions) => ApiResponse::json(
@@ -961,8 +957,7 @@ mod tests {
             r#"{"name":"x","url":"https://example.com/SKILL.md"}"#,
             r#"{"name":"x","path":"/tmp/SKILL.md"}"#,
         ] {
-            let response =
-                agenda_definition_add_api_response(body, Some(&server), &binding).await;
+            let response = agenda_definition_add_api_response(body, Some(&server), &binding).await;
             assert_eq!(status_of(&response), 400, "{body}");
         }
 
@@ -1007,7 +1002,10 @@ mod tests {
             "attribution is the gate-resolved principal"
         );
         assert_eq!(json["sha256"], template["record_sha256"]);
-        assert_eq!(json["sha256"], template["sha256"], "record == current at add time");
+        assert_eq!(
+            json["sha256"], template["sha256"],
+            "record == current at add time"
+        );
         let defs = json["definitions"].as_array().unwrap();
         let house_twin = defs
             .iter()

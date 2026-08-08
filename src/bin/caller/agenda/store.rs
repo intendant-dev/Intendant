@@ -7659,7 +7659,9 @@ mod tests {
         );
         let personal_path = crate::user_templates::user_template_md_path_in(root.path(), "triage");
         assert!(
-            outcome.locator.contains(&personal_path.display().to_string()),
+            outcome
+                .locator
+                .contains(&personal_path.display().to_string()),
             "the locator names the personal copy: {}",
             outcome.locator
         );

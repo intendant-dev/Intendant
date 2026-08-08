@@ -534,7 +534,8 @@ fn template_trust_posture(
     }
     .to_string();
     if shadows_house {
-        posture.push_str(" Shadows the house template of the same name — your copy resolves first.");
+        posture
+            .push_str(" Shadows the house template of the same name — your copy resolves first.");
     }
     posture.push_str(" Stamping seals the file; firings execute the sealed bytes.");
     posture
@@ -2229,9 +2230,15 @@ mod tests {
                 .and_then(|a| a.principal.as_deref()),
             Some("principal:owner")
         );
-        assert_eq!(personal.record_sha256.as_deref(), Some(added.sha256.as_str()));
+        assert_eq!(
+            personal.record_sha256.as_deref(),
+            Some(added.sha256.as_str())
+        );
         assert_eq!(personal.library, Some("ok"));
-        assert_eq!(personal.sha256, personal.record_sha256, "current == attested at add");
+        assert_eq!(
+            personal.sha256, personal.record_sha256,
+            "current == attested at add"
+        );
         assert!(
             personal.trust_posture.contains("your copy resolves first"),
             "{}",
@@ -2243,7 +2250,9 @@ mod tests {
         assert!(!house.removable, "house entries expose no remove door");
         assert!(house.added_by.is_none() && house.library.is_none());
         assert!(
-            house.trust_posture.contains("ships in this daemon's binary"),
+            house
+                .trust_posture
+                .contains("ships in this daemon's binary"),
             "{}",
             house.trust_posture
         );

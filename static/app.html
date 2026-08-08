@@ -39268,7 +39268,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'cef75ea556568b79';
+const INTENDANT_APP_BUILD = '1e0426df05e3511c';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -97854,8 +97854,8 @@ let agendaDefinitionCatalogWaiters = []; // onSettled callbacks for the in-fligh
 
 function agendaFetchDefinitionCatalog(onSettled) {
   // Two surfaces share this lane (the Automate sheet's picker and the
-  // Plugins & Skills Templates section): every caller's callback runs
-  // when the in-flight fetch settles, not just the first's.
+  // Plugins & Skills tab's definition-catalog section): every caller's
+  // callback runs when the in-flight fetch settles, not just the first's.
   if (typeof onSettled === 'function') agendaDefinitionCatalogWaiters.push(onSettled);
   if (agendaDefinitionCatalogLoading) return;
   agendaDefinitionCatalogLoading = true;

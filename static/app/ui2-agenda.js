@@ -2212,8 +2212,8 @@ let agendaDefinitionCatalogWaiters = []; // onSettled callbacks for the in-fligh
 
 function agendaFetchDefinitionCatalog(onSettled) {
   // Two surfaces share this lane (the Automate sheet's picker and the
-  // Plugins & Skills Templates section): every caller's callback runs
-  // when the in-flight fetch settles, not just the first's.
+  // Plugins & Skills tab's definition-catalog section): every caller's
+  // callback runs when the in-flight fetch settles, not just the first's.
   if (typeof onSettled === 'function') agendaDefinitionCatalogWaiters.push(onSettled);
   if (agendaDefinitionCatalogLoading) return;
   agendaDefinitionCatalogLoading = true;

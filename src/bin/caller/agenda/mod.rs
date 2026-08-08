@@ -49,11 +49,12 @@ pub(crate) use definitions::materialize_house_definitions;
 pub(crate) use definitions::valid_slug;
 // The S5 personal-template lane's seams ([`crate::user_templates`]): the
 // library roots, the ONE validator (add-time refusals are the stamp-time
-// parser's own), house membership, and resolution for the un-shadow pins.
-pub(crate) use definitions::{
-    automations_dir_in, is_house_definition_name, parse_definition, resolve_definition,
-    DefinitionProvenance,
-};
+// parser's own), and house membership.
+pub(crate) use definitions::{automations_dir_in, is_house_definition_name, parse_definition};
+// Resolution + provenance are test-only seams (the user_templates
+// shadow/un-shadow pins); production resolution stays inside this module.
+#[cfg(test)]
+pub(crate) use definitions::{resolve_definition, DefinitionProvenance};
 pub(crate) use handle::now_ms;
 pub(crate) use handle::{AgendaHandle, AgendaPrefixResolution, SessionAgendaEnvelope};
 pub(crate) use reminders::{

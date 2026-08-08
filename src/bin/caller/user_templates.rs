@@ -2,7 +2,7 @@
 //! unification S5): the S4 user-skill lane retargeted at the automation
 //! library — `<state_root>/automations/<name>/SKILL.md`, the exact home
 //! the documented shadow-resolution order already reads
-//! ([`crate::agenda::resolve_definition`]: personal shadows house) — with
+//! (`agenda::definitions::resolve_definition`: personal shadows house) — with
 //! a [`crate::skill_state::UserTemplateRecord`] (S4's record shape:
 //! gate-resolved attribution + sha256 of the accepted bytes) persisted
 //! under the `templates` family of `skills/state.json`.
@@ -46,54 +46,17 @@ use crate::user_skills::UserSkillRefusal;
 /// equally bounded.
 pub(crate) const ADD_BODY_CAP_BYTES: usize = crate::user_skills::ADD_BODY_CAP_BYTES;
 
-/// Why a recorded template's library file fails verification against its
-/// registry record — the S4 drift vocabulary, verbatim.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TemplateLibraryIssue {
-    /// The file exists but its bytes no longer hash to the recorded
-    /// sha256 (a hand edit — the attribution no longer covers them).
-    Stale,
-    /// No SKILL.md on disk for the recorded name.
-    Missing,
-}
-
 /// `<state_root>/automations/<name>/SKILL.md` — the personal library
 /// path the shadow-resolution order reads first.
+///
+/// Drift between a record's sha256 and this file's current bytes is
+/// judged in ONE place — the served catalog
+/// (`agenda::definitions::definition_catalog`), against the same read
+/// that serves the text — never re-derived here.
 pub(crate) fn user_template_md_path_in(state_root: &Path, name: &str) -> PathBuf {
     crate::agenda::automations_dir_in(state_root)
         .join(name)
         .join("SKILL.md")
-}
-
-/// Verify one registry record's library file against its recorded
-/// sha256. Display truth only (the catalog's `library` status): drift
-/// never gates listing or stamping — the stamp lane re-reads and seals
-/// whatever the file holds, under its own ceremony.
-pub(crate) fn verify_user_template_in(
-    state_root: &Path,
-    record: &UserTemplateRecord,
-) -> Result<(), TemplateLibraryIssue> {
-    let Ok(bytes) = std::fs::read_to_string(user_template_md_path_in(state_root, &record.name))
-    else {
-        return Err(TemplateLibraryIssue::Missing);
-    };
-    if crate::agenda::digest_bytes(bytes.as_bytes()) == record.sha256 {
-        Ok(())
-    } else {
-        Err(TemplateLibraryIssue::Stale)
-    }
-}
-
-/// The row-facing library status vocabulary (S4's, verbatim).
-pub(crate) fn user_template_status_in(
-    state_root: &Path,
-    record: &UserTemplateRecord,
-) -> &'static str {
-    match verify_user_template_in(state_root, record) {
-        Ok(()) => "ok",
-        Err(TemplateLibraryIssue::Stale) => "stale",
-        Err(TemplateLibraryIssue::Missing) => "missing",
-    }
 }
 
 /// Add one personal template: cap + slug walls, then the REAL definition
@@ -164,11 +127,11 @@ pub(crate) fn add_user_template_in(
     })?;
     let path = user_template_md_path_in(state_root, name);
     let tmp = dir.join("SKILL.md.tmp");
-    intendant_core::state_paths::write_private_file(&tmp, skill_md.as_bytes()).map_err(|error| {
-        UserSkillRefusal::Io {
+    intendant_core::state_paths::write_private_file(&tmp, skill_md.as_bytes()).map_err(
+        |error| UserSkillRefusal::Io {
             message: format!("write {}: {error}", tmp.display()),
-        }
-    })?;
+        },
+    )?;
     std::fs::rename(&tmp, &path).map_err(|error| UserSkillRefusal::Io {
         message: format!("rename {}: {error}", path.display()),
     })?;
@@ -284,7 +247,6 @@ mod tests {
             crate::skill_state::user_template_records_in(root),
             vec![record.clone()]
         );
-        assert_eq!(user_template_status_in(root, &record), "ok");
 
         // The stamp lane resolves the added definition at the personal
         // home — the file a stamp would seal IS the added file.
@@ -333,7 +295,10 @@ mod tests {
                 "bad-config",
             ),
             // No node section at all.
-            ("---\nname: no-nodes\ndescription: d\n---\n\nProse only.\n", "no-nodes"),
+            (
+                "---\nname: no-nodes\ndescription: d\n---\n\nProse only.\n",
+                "no-nodes",
+            ),
         ];
         for (md, name) in cases {
             let parser_error = crate::agenda::parse_definition(md, name).unwrap_err();
@@ -394,9 +359,8 @@ mod tests {
         let hand = crate::agenda::automations_dir_in(root).join("hand-made");
         std::fs::create_dir_all(&hand).unwrap();
         std::fs::write(hand.join("SKILL.md"), action_md("hand-made")).unwrap();
-        let refusal =
-            add_user_template_in(root, "hand-made", &action_md("hand-made"), stamp("p"))
-                .unwrap_err();
+        let refusal = add_user_template_in(root, "hand-made", &action_md("hand-made"), stamp("p"))
+            .unwrap_err();
         assert_eq!(
             refusal.message(),
             "a personal definition directory named 'hand-made' already exists in the \
@@ -490,25 +454,29 @@ mod tests {
     }
 
     /// Drift semantics (S4's conventions on the template family): a
-    /// hand-edited recorded file reads `stale`, a deleted one `missing`;
-    /// neither gates removal — remove stays the door out of drift.
+    /// hand-edited recorded file and a record whose file is gone never
+    /// gate removal — remove stays the door out of drift. (The
+    /// `ok`/`stale`/`missing` rendering is the served catalog's,
+    /// computed against the same read that serves the text — pinned in
+    /// `agenda::definitions`.)
     #[test]
-    fn drift_reads_stale_or_missing_and_remove_stays_open() {
+    fn drift_never_gates_removal() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let record =
             add_user_template_in(root, "mine", &action_md("mine"), stamp("principal:me")).unwrap();
-        assert_eq!(user_template_status_in(root, &record), "ok");
 
+        // A hand edit: the recorded sha no longer covers the file bytes.
         std::fs::write(
             user_template_md_path_in(root, "mine"),
             action_md("mine").replace("Do the thing.", "Do a different thing."),
         )
         .unwrap();
-        assert_eq!(user_template_status_in(root, &record), "stale");
-        assert_eq!(
-            verify_user_template_in(root, &record),
-            Err(TemplateLibraryIssue::Stale)
+        let drifted = std::fs::read_to_string(user_template_md_path_in(root, "mine")).unwrap();
+        assert_ne!(
+            crate::agenda::digest_bytes(drifted.as_bytes()),
+            record.sha256,
+            "the edit really drifted the bytes past the record"
         );
 
         // Remove deletes the drifted copy + record (the named remedy).
@@ -516,15 +484,14 @@ mod tests {
         assert!(crate::skill_state::user_template_records_in(root).is_empty());
 
         // Missing: record without a file (a failed removal's residue, or
-        // a hand-deleted directory) — status missing, remove clears it.
+        // a hand-deleted directory) — remove still clears it.
         let orphan = UserTemplateRecord {
             name: "orphan".to_string(),
             added_by: stamp("p"),
             sha256: "0".repeat(64),
             foreign: serde_json::Map::new(),
         };
-        crate::skill_state::upsert_user_template_record_in(root, orphan.clone()).unwrap();
-        assert_eq!(user_template_status_in(root, &orphan), "missing");
+        crate::skill_state::upsert_user_template_record_in(root, orphan).unwrap();
         let removed = remove_user_template_in(root, "orphan").unwrap();
         assert_eq!(removed.name, "orphan");
         assert!(crate::skill_state::user_template_records_in(root).is_empty());
