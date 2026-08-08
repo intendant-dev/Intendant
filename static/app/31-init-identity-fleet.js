@@ -725,19 +725,28 @@ function applyExternalAgentAvailability(list) {
   // a tab re-entry. Renders are focus-guarded and cheap.
   if (typeof renderAgentSigninSection === 'function') renderAgentSigninSection();
 }
+let externalAgentAvailabilitySeq = 0;
 function refreshExternalAgentAvailability(options = {}) {
   const refresh = options.refresh === true;
   // An explicit re-probe (picker open, Vault tab open) must not be
   // swallowed by a plain fetch already in flight — the daemon coalesces
   // via its bounded-TTL cache, so a second request is cheap and exact.
   if (!externalAgentAvailabilityFetch || refresh) {
+    // Last writer wins: when a forced re-probe overtakes an in-flight
+    // plain fetch, the slower (possibly cache-served) response must not
+    // overwrite the fresher rows — only the newest request applies.
+    const seq = ++externalAgentAvailabilitySeq;
     externalAgentAvailabilityFetch = fetchExternalAgentAvailability({ refresh })
       .then(body => {
-        applyExternalAgentAvailability(body?.external_agents);
+        if (seq === externalAgentAvailabilitySeq) {
+          applyExternalAgentAvailability(body?.external_agents);
+        }
         return externalAgentAvailability;
       })
       .catch(() => null)
-      .finally(() => { externalAgentAvailabilityFetch = null; });
+      .finally(() => {
+        if (seq === externalAgentAvailabilitySeq) externalAgentAvailabilityFetch = null;
+      });
   }
   return externalAgentAvailabilityFetch;
 }
