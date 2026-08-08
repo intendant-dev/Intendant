@@ -3175,7 +3175,11 @@ mod tests {
         .iter()
         .map(AgentBackend::as_short_str)
         .collect();
-        for select_id in ["new-session-agent", "session-delegate-agent", "set-external-agent"] {
+        for select_id in [
+            "new-session-agent",
+            "session-delegate-agent",
+            "set-external-agent",
+        ] {
             let backend_ids: Vec<String> = spa_select_option_values(app, select_id)
                 .into_iter()
                 // Non-backend rows: "" (inherit / internal placeholder)
