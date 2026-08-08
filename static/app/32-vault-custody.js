@@ -2265,13 +2265,13 @@ function renderAgentSigninSection() {
     return;
   }
   // The not-installed pre-flight reads the shared availability probe:
-  // ask once while this page hasn't heard yet, repaint when it lands.
-  // A failed probe resolves null and does NOT re-render, so there is
-  // no fetch/render loop — the next user-driven render retries.
+  // ask once while this page hasn't heard yet; the shared applier
+  // repaints this section when rows land (from this fetch, a refresh
+  // lane, or the daemon's change broadcast). A failed probe resolves
+  // null and does NOT re-render, so there is no fetch/render loop —
+  // the next user-driven render retries.
   if (externalAgentAvailability === null) {
-    refreshExternalAgentAvailability().then(list => {
-      if (Array.isArray(list)) renderAgentSigninSection();
-    });
+    refreshExternalAgentAvailability();
   }
   mount.innerHTML = '';
   for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
@@ -2340,6 +2340,12 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
+    // PATH-inheritance honesty: the daemon found the CLI in a known
+    // install directory its inherited PATH doesn't carry (installed
+    // mid-run — the Windows npm-shim footgun). Surface the exact
+    // where-and-why instead of leaving "install it" to gaslight a user
+    // who just did.
+    if (missing.path_hint) note(String(missing.path_hint));
     return card;
   }
 

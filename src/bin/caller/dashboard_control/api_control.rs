@@ -3179,13 +3179,13 @@ mod tests {
         // one neutral fn body-only.
         let home = tempfile::tempdir().expect("temp home");
         let (status, http_body) = parity_http_status_and_body(
-            crate::web_gateway::external_agents_api_response(None, home.path()),
+            crate::web_gateway::external_agents_api_response(None, home.path(), false, None),
         );
         assert_eq!(status, 200);
         assert!(http_body["external_agents"].is_array(), "{http_body}");
         let frame = frame_api_json_body_response(
             "parity-external-agents".to_string(),
-            crate::web_gateway::external_agents_api_response(None, home.path()),
+            crate::web_gateway::external_agents_api_response(None, home.path(), false, None),
             "external agents",
         );
         assert_eq!(frame["ok"], true);

@@ -627,6 +627,10 @@ impl AppEventUpcaster {
             | AppEvent::AgendaChanged { .. }
             | AppEvent::AgendaAskOutcome { .. }
             | AppEvent::MemoryChanged { .. }
+            // Backend availability is box-local install state; a peer
+            // dashboard reads it through the peer's own availability
+            // route, not the federation rail.
+            | AppEvent::ExternalAgentsChanged { .. }
             // A daemon's capacity pressure is box-local state: peers see
             // its effects (refusals, queue receipts), never the gauge.
             | AppEvent::CapacityState { .. }
@@ -2113,6 +2117,7 @@ impl WireEventUpcaster {
             | OutboundEvent::ContextSnapshot { .. }
             | OutboundEvent::AgendaChanged { .. }
             | OutboundEvent::MemoryChanged { .. }
+            | OutboundEvent::ExternalAgentsChanged { .. }
             | OutboundEvent::FileChanged { .. }
             | OutboundEvent::SessionVcsChanged { .. }
             | OutboundEvent::UploadReady { .. }
