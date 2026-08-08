@@ -3265,6 +3265,38 @@ mod tests {
         }
     }
 
+    /// The aggregate `fueled` flag rides EVERY status frame, for every
+    /// grant shape — deliberately presence-level (no settings.manage), and
+    /// in tunnel-primary postures (the packaged macOS app, hosted Connect)
+    /// it is the ONLY lane the SPA's unfueled empty-state CTAs can learn
+    /// the answer from. Shape-only assertion: the value depends on live
+    /// credentials, the presence of the boolean must not.
+    #[test]
+    fn status_carries_the_aggregate_fueled_flag_for_every_grant_shape() {
+        let mut rt = runtime();
+        for grant in [
+            DashboardControlGrant::TrustedLocal,
+            scoped_user_client_grant(),
+            DashboardControlGrant::Peer {
+                fingerprint: "aabbccdd".into(),
+                label: "peer".into(),
+                profile: "read-only-display".into(),
+                filesystem: Default::default(),
+                attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
+            },
+        ] {
+            rt.grant = grant;
+            let status = status_response_frame("s1".to_string(), &rt);
+            assert!(
+                status["result"]["fueled"].is_boolean(),
+                "status result missing the aggregate `fueled` boolean for {}",
+                status["result"]["grant_kind"]
+            );
+        }
+    }
+
     #[test]
     fn upload_start_authorizes_by_delivered_method_not_blanket_fs_write() {
         let file_operator = ControlRuntime {
