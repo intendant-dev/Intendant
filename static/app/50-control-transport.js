@@ -2036,8 +2036,13 @@ async function fetchApiKeyStatus() {
   return resp.body;
 }
 
-async function fetchExternalAgentAvailability() {
-  const resp = await daemonApi.request('api_external_agents');
+async function fetchExternalAgentAvailability(options = {}) {
+  // `refresh: true` = the explicit re-probe lane (?refresh=1 / the tunnel
+  // param): the daemon re-runs its stat probe now instead of serving the
+  // bounded-TTL cache — exact at the moment of user intent (picker open,
+  // Vault tab open) so a CLI installed mid-run ungreys without a restart.
+  const params = options.refresh ? { refresh: '1' } : {};
+  const resp = await daemonApi.request('api_external_agents', params);
   if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
   return resp.body;
 }

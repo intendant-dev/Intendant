@@ -327,6 +327,11 @@ function switchTab(tabId) {
     // the pane repaints once so lease countdowns are fresh — the renderer
     // itself kicks the lease + custody refreshes.
     paneDeferredRenders.delete('vault');
+    // Explicit availability re-probe at the moment of user intent: a
+    // backend CLI installed since the boot-time probe unmutes its
+    // sign-in card when the refreshed rows land (the applier repaints
+    // this section).
+    refreshExternalAgentAvailability({ refresh: true });
     renderAccessVaultSection();
   }
   if (tabId === 'access') {
@@ -557,6 +562,11 @@ function switchSessionsSubtab(name) {
   });
   if (next === 'new') {
     updateNewSessionProjectPrefills();
+    // Picker-open re-probe: the AGENT picker's grey-out must reflect a
+    // CLI installed since the boot-time probe, not require a daemon
+    // restart — the daemon re-stats now and the applier repaints the
+    // options when the rows land.
+    refreshExternalAgentAvailability({ refresh: true });
     requestAnimationFrame(focusNewSessionInput);
   } else if (next === 'cloud') {
     cloudWorkersOnShown();
