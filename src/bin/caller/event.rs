@@ -1321,6 +1321,17 @@ pub enum AppEvent {
         seq: u64,
     },
 
+    /// An external-agent availability re-probe observed an `installed`
+    /// flip (a backend CLI appeared or vanished mid-run — the owner
+    /// brew-installing codex without restarting the daemon). Carries the
+    /// fresh `/api/external-agents` rows so every open dashboard repaints
+    /// its new-session picker and Vault sign-in cards without refetching
+    /// or user action. Emitted only on change by the availability
+    /// serving cache (`web_gateway::settings`), never per request.
+    ExternalAgentsChanged {
+        agents: serde_json::Value,
+    },
+
     /// A recorded outcome on an agenda-backed rich ask: an answer resolved
     /// the item, or a dismissal/administrative close marked it. Emitted
     /// exactly once per accepted op by the agenda handle (the item's single
@@ -3871,6 +3882,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             item: Box::new(item.clone()),
             counts: *counts,
             seq: *seq,
+        }),
+        AppEvent::ExternalAgentsChanged { agents } => Some(OutboundEvent::ExternalAgentsChanged {
+            agents: agents.clone(),
         }),
         // Supervisor-internal delivery signal: browsers already see the
         // resolution via AgendaChanged + ApprovalResolved.

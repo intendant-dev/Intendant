@@ -2347,8 +2347,11 @@ async function agentInstallPropose(backendId) {
     agentInstallProposeBusy[backendId] = false;
   }
   // Adopt the daemon's authoritative state (waiting/running/refused) and
-  // repaint; the poll keeps following it from here.
-  await refreshExternalAgentAvailability();
+  // repaint; the poll keeps following it from here. The explicit refresh
+  // lane, not the bounded-TTL cache: the install registry state rides
+  // the availability rows, and a just-proposed install is exactly the
+  // moment the served state must not be up to 30s stale.
+  await refreshExternalAgentAvailability({ refresh: true });
   renderAgentSigninSection();
   agentInstallEnsurePoll();
 }
@@ -2377,7 +2380,10 @@ function agentInstallEnsurePoll() {
   agentInstallPollTicks = 0;
   agentInstallPollTimer = window.setInterval(async () => {
     agentInstallPollTicks += 1;
-    await refreshExternalAgentAvailability();
+    // Refresh lane on every tick: a live install is user intent, and the
+    // terminal `installed` flip this poll exists to observe is exactly
+    // what the daemon's re-probe (and its change broadcast) keys on.
+    await refreshExternalAgentAvailability({ refresh: true });
     renderAgentSigninSection();
     if (!agentInstallAnyInFlight() || agentInstallPollTicks > AGENT_INSTALL_POLL_MAX_TICKS) {
       window.clearInterval(agentInstallPollTimer);
@@ -2402,13 +2408,13 @@ function renderAgentSigninSection() {
     return;
   }
   // The not-installed pre-flight reads the shared availability probe:
-  // ask once while this page hasn't heard yet, repaint when it lands.
-  // A failed probe resolves null and does NOT re-render, so there is
-  // no fetch/render loop — the next user-driven render retries.
+  // ask once while this page hasn't heard yet; the shared applier
+  // repaints this section when rows land (from this fetch, a refresh
+  // lane, or the daemon's change broadcast). A failed probe resolves
+  // null and does NOT re-render, so there is no fetch/render loop —
+  // the next user-driven render retries.
   if (externalAgentAvailability === null) {
-    refreshExternalAgentAvailability().then(list => {
-      if (Array.isArray(list)) renderAgentSigninSection();
-    });
+    refreshExternalAgentAvailability();
   }
   mount.innerHTML = '';
   for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
@@ -2480,6 +2486,12 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
+    // PATH-inheritance honesty: the daemon found the CLI in a known
+    // install directory its inherited PATH doesn't carry (installed
+    // mid-run — the Windows npm-shim footgun). Surface the exact
+    // where-and-why instead of leaving "install it" to gaslight a user
+    // who just did.
+    if (missing.path_hint) note(String(missing.path_hint));
     agentInstallSection(card, spec, missing, note, actionsRow);
     return card;
   }

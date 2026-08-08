@@ -235,7 +235,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_kimi_auth_status: { verb: 'GET', path: '/api/kimi-auth/status' },
   api_kimi_auth_cancel: { verb: 'POST', path: '/api/kimi-auth/cancel' },
   api_project_root: { verb: 'GET', path: '/api/project-root' },
-  api_external_agents: { verb: 'GET', path: '/api/external-agents' },
+  api_external_agents: { verb: 'GET', path: '/api/external-agents', query: ['refresh'] },
   api_external_agent_install: { verb: 'POST', path: '/api/external-agents/install' },
   api_displays: { verb: 'GET', path: '/api/displays' },
   api_diagnostics_visual_freshness: { verb: 'POST', path: '/api/diagnostics/visual-freshness', query: ['session_id'], rawBody: 'body', rawBodyType: 'application/x-ndjson' },

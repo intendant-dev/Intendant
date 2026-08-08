@@ -660,12 +660,14 @@ async fn run_install(
     };
     registry.set(&backend, state);
     // No broadcast here: the dashboard's in-flight poll re-fetches
-    // /api/external-agents (whose stat-based probe is what flips
-    // `installed`) until the install reaches a terminal state.
-    // `ExternalAgentChanged` is deliberately NOT reused — it means "the
-    // selected backend changed" and frontends feed it into the backend
-    // picker; the availability change-broadcast lane (PR #823) is the
-    // composition point when it lands.
+    // /api/external-agents through the explicit refresh lane until the
+    // install reaches a terminal state, and the availability serving
+    // cache (web_gateway::settings, the #823 lane) itself broadcasts
+    // `ExternalAgentsChanged` when a re-probe observes the `installed`
+    // flip — every open dashboard repaints without this executor knowing
+    // about frontends. `ExternalAgentChanged` (singular) is deliberately
+    // NOT reused — it means "the selected backend changed" and frontends
+    // feed it into the backend picker.
 }
 
 // ---------------------------------------------------------------------------

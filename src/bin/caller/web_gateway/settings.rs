@@ -1136,7 +1136,7 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
 /// arrives from the transport edge (last-run recency and local-login
 /// probes read under it), so tests inject a tempdir instead of reading
 /// the live account (the CLAUDE.md tests-are-hermetic convention).
-pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &Path) -> String {
+fn external_agents_probe(project_root: Option<&Path>, home: &Path) -> serde_json::Value {
     let agent_config = project_root
         .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
         .map(|project| project.config.agent)
@@ -1146,7 +1146,11 @@ pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &
     // exact command derive from the install-command matrix, the state
     // from the daemon's install registry (backend_install.rs). The
     // dashboard's Install buttons and the approval-wall copy both consume
-    // THIS payload — the matrix is declared once.
+    // THIS payload — the matrix is declared once. Stamped at row birth so
+    // the TTL-cached body and the change-broadcast rows carry the same
+    // install objects; the dashboard's install lanes fetch through the
+    // explicit `refresh` lane, so a live install's state transitions
+    // never wait out the passive cache.
     if let Some(rows) = agents.as_array_mut() {
         let registry = crate::backend_install::global_registry();
         for row in rows {
@@ -1162,12 +1166,118 @@ pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &
             }
         }
     }
-    serde_json::json!({
+    agents
+}
+
+/// How long a served availability probe stays authoritative before a
+/// request re-runs it. The probe is stat-only (never executes a CLI), so
+/// this is a chatter bound, not a cost shield — a deliberate constant,
+/// not a knob: 30s keeps every passive surface at most half a minute
+/// stale while the explicit `refresh` lane (picker open, Vault tab open)
+/// stays exact at the moment of user intent.
+const EXTERNAL_AGENTS_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One cached availability probe for a `(project_root, home)` serving
+/// identity (a real daemon has exactly one; tests inject tempdirs and get
+/// their own entries — the hermeticity convention).
+struct ExternalAgentsProbeEntry {
+    probed_at: std::time::Instant,
+    body: String,
+    /// `(backend id, installed)` fingerprint of the served rows — the
+    /// change signal the repaint event keys on. Deliberately only the
+    /// `installed` flips: last-used stamps and compatibility digests
+    /// churn without meaning "the picker's grey-out is now wrong".
+    installed: Vec<(String, bool)>,
+}
+
+type ExternalAgentsProbeCache =
+    Mutex<HashMap<(Option<PathBuf>, PathBuf), ExternalAgentsProbeEntry>>;
+
+fn external_agents_probe_cache() -> &'static ExternalAgentsProbeCache {
+    static CACHE: OnceLock<ExternalAgentsProbeCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// A served availability response plus the change it observed, if any.
+struct ExternalAgentsServed {
+    body: String,
+    /// `Some(fresh row array)` when this call ran the probe and a
+    /// backend's `installed` differs from the previously served rows —
+    /// the caller broadcasts it so every open dashboard repaints. `None`
+    /// on cache hits, on the first probe (nothing served yet to differ
+    /// from), and on no-change re-probes.
+    changed: Option<serde_json::Value>,
+}
+
+/// Bounded-TTL serving core for `/api/external-agents` + its tunnel twin.
+///
+/// The boot-time probe going stale was a real owner incident: a backend
+/// CLI installed mid-run stayed greyed out in every open dashboard until
+/// a full daemon restart. Serving is request-driven and cache-bounded:
+/// a result younger than [`EXTERNAL_AGENTS_PROBE_TTL`] serves from cache,
+/// an older one re-probes, and `refresh` (the explicit user-intent lane)
+/// always re-probes. The cache and clock are injected so tests drive the
+/// TTL without wall-time sleeps.
+fn external_agents_serve_in(
+    cache: &ExternalAgentsProbeCache,
+    project_root: Option<&Path>,
+    home: &Path,
+    refresh: bool,
+    now: std::time::Instant,
+) -> ExternalAgentsServed {
+    let key = (project_root.map(Path::to_path_buf), home.to_path_buf());
+    // Held across the probe on purpose: concurrent stale requests would
+    // all stat the same artifacts, so serializing them costs nothing and
+    // keeps exactly one change event per observed flip.
+    let mut cache = cache.lock().expect("external-agents probe cache poisoned");
+    if !refresh {
+        if let Some(entry) = cache.get(&key) {
+            if now.saturating_duration_since(entry.probed_at) < EXTERNAL_AGENTS_PROBE_TTL {
+                return ExternalAgentsServed {
+                    body: entry.body.clone(),
+                    changed: None,
+                };
+            }
+        }
+    }
+    let agents = external_agents_probe(project_root, home);
+    let installed: Vec<(String, bool)> = agents
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.get("id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        row.get("installed")
+                            .and_then(|i| i.as_bool())
+                            .unwrap_or(false),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = serde_json::json!({
         "external_agents": agents,
         "install_platform": crate::backend_install::InstallPlatform::current()
             .map(|platform| platform.as_str()),
     })
-    .to_string()
+    .to_string();
+    let changed = match cache.get(&key) {
+        Some(previous) if previous.installed != installed => Some(agents),
+        _ => None,
+    };
+    cache.insert(
+        key,
+        ExternalAgentsProbeEntry {
+            probed_at: now,
+            body: body.clone(),
+            installed,
+        },
+    );
+    ExternalAgentsServed { body, changed }
 }
 
 /// Payload for POST /api/external-agents/install.
@@ -1456,16 +1566,29 @@ pub(crate) fn project_root_api_response(project_root: Option<&Path>) -> ApiRespo
     )
 }
 
-/// GET /api/external-agents + the tunnel's `api_external_agents`.
-/// `home` arrives from the transport edge (hermeticity convention).
+/// GET /api/external-agents + the tunnel's `api_external_agents`, on the
+/// bounded-TTL serving cache. `refresh` is the request's explicit
+/// re-probe flag (`?refresh=1` / the tunnel param — the picker-open and
+/// Vault-tab-open lanes); `bus` broadcasts the repaint event when a probe
+/// observes an `installed` flip (`None` only in bus-less tests). `home`
+/// arrives from the transport edge (hermeticity convention).
 pub(crate) fn external_agents_api_response(
     project_root: Option<&Path>,
     home: &Path,
+    refresh: bool,
+    bus: Option<&EventBus>,
 ) -> ApiResponse {
-    ApiResponse::json(
-        200,
-        JsonBody::PreSerialized(external_agents_response_body(project_root, home)),
-    )
+    let served = external_agents_serve_in(
+        external_agents_probe_cache(),
+        project_root,
+        home,
+        refresh,
+        std::time::Instant::now(),
+    );
+    if let (Some(bus), Some(agents)) = (bus, served.changed) {
+        bus.send(AppEvent::ExternalAgentsChanged { agents });
+    }
+    ApiResponse::json(200, JsonBody::PreSerialized(served.body))
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,10 +1672,13 @@ pub(crate) async fn handle_external_agents(
     stream: DemuxStream,
     project_root: Option<PathBuf>,
     home: PathBuf,
+    refresh: bool,
+    bus: EventBus,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = external_agents_api_response(project_root.as_deref(), &home);
+    let response =
+        external_agents_api_response(project_root.as_deref(), &home, refresh, Some(&bus));
     write_api_response(stream, response, cors, fleet_origin).await;
 }
 
@@ -2539,11 +2665,18 @@ mod tests {
     async fn golden_external_agents_transcripts() {
         // S5 second slice (info/displays/diagnostics). The availability
         // body probes the configured commands on PATH, so it is
-        // computed through the untouched builder over an injected temp
-        // home (no live-account reads) and spliced — the canonical 200
-        // framing is the byte-exact pin.
+        // computed through the serving core over a throwaway cache and
+        // an injected temp home (no live-account reads) and spliced —
+        // the canonical 200 framing is the byte-exact pin.
         let home = tempfile::tempdir().unwrap();
-        let body = external_agents_response_body(None, home.path());
+        let body = external_agents_serve_in(
+            &ExternalAgentsProbeCache::default(),
+            None,
+            home.path(),
+            false,
+            std::time::Instant::now(),
+        )
+        .body;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
             parsed["external_agents"].is_array(),
@@ -2551,8 +2684,10 @@ mod tests {
         );
         let cors = settings_route_cors("GET", "/api/external-agents");
         let home_path = home.path().to_path_buf();
+        let bus = EventBus::new();
+        let handler_bus = bus.clone();
         let response = collect_settings_handler_response(|stream| {
-            handle_external_agents(stream, None, home_path, cors, None)
+            handle_external_agents(stream, None, home_path, false, handler_bus, cors, None)
         })
         .await;
         assert_eq!(
@@ -2561,13 +2696,20 @@ mod tests {
         );
 
         // A tempdir project root loads the default agent config — same
-        // framing, same builder.
+        // framing, same core.
         let root = tempfile::tempdir().unwrap();
-        let body = external_agents_response_body(Some(root.path()), home.path());
+        let body = external_agents_serve_in(
+            &ExternalAgentsProbeCache::default(),
+            Some(root.path()),
+            home.path(),
+            false,
+            std::time::Instant::now(),
+        )
+        .body;
         let root_path = root.path().to_path_buf();
         let home_path = home.path().to_path_buf();
         let response = collect_settings_handler_response(|stream| {
-            handle_external_agents(stream, Some(root_path), home_path, cors, None)
+            handle_external_agents(stream, Some(root_path), home_path, false, bus, cors, None)
         })
         .await;
         assert_eq!(
@@ -2580,10 +2722,20 @@ mod tests {
     /// the install lane derived from the daemon's install-command matrix
     /// (backend_install.rs) — command and availability both directions,
     /// pi's honest no-lane included — plus the platform the lane serves.
+    /// Runs through the serving core over a throwaway cache (the same
+    /// seam as the golden transcripts), so the pin covers what the TTL
+    /// cache actually stores and broadcasts.
     #[test]
     fn served_external_agents_rows_carry_the_install_matrix() {
         let home = tempfile::tempdir().unwrap();
-        let body = external_agents_response_body(None, home.path());
+        let body = external_agents_serve_in(
+            &ExternalAgentsProbeCache::default(),
+            None,
+            home.path(),
+            false,
+            std::time::Instant::now(),
+        )
+        .body;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         let platform = crate::backend_install::InstallPlatform::current()
             .expect("test hosts are supported platforms");
@@ -2609,6 +2761,187 @@ mod tests {
         assert!(rows.iter().any(
             |row| row["id"] == "pi" && row["install"]["available"] == serde_json::json!(false)
         ));
+    }
+
+    /// Fixture for the availability-cache pins: a project whose codex
+    /// command is an absolute path inside the project tempdir, so
+    /// `installed` flips hermetically by creating the file — no PATH or
+    /// live-account reads. The `.exe` suffix keeps the explicit-path
+    /// resolution honest on Windows; the exec bit does on Unix.
+    fn availability_flip_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("codex-probe.exe");
+        // TOML literal strings take Windows backslashes unescaped.
+        std::fs::write(
+            root.path().join("intendant.toml"),
+            format!("[agent.codex]\ncommand = '{}'\n", bin.display()),
+        )
+        .unwrap();
+        (home, root, bin)
+    }
+
+    fn install_fixture_binary(bin: &Path) {
+        std::fs::write(bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn codex_installed(body: &str) -> bool {
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        parsed["external_agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "codex")
+            .expect("codex row")["installed"]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// The TTL contract (owner incident: a CLI installed mid-run stayed
+    /// greyed out until daemon restart): a fresh cache entry serves as-is
+    /// — even when the disk already changed — and a stale one re-probes
+    /// and observes the flip. The TTL is a constant, not a knob.
+    #[test]
+    fn external_agents_ttl_serves_fresh_cache_and_reprobes_stale() {
+        let (home, root, bin) = availability_flip_fixture();
+        let cache = ExternalAgentsProbeCache::default();
+        let t0 = std::time::Instant::now();
+
+        let first = external_agents_serve_in(&cache, Some(root.path()), home.path(), false, t0);
+        assert!(!codex_installed(&first.body));
+        assert!(
+            first.changed.is_none(),
+            "the first probe has nothing served to differ from"
+        );
+
+        // The owner installs codex mid-run…
+        install_fixture_binary(&bin);
+
+        // …but a request inside the TTL serves the cached result: the
+        // bound is the contract, not best-effort freshness.
+        let cached = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            false,
+            t0 + std::time::Duration::from_secs(10),
+        );
+        assert_eq!(cached.body, first.body);
+        assert!(cached.changed.is_none());
+
+        // Past the TTL the same plain request re-probes, sees the flip,
+        // and reports the change exactly once.
+        let reprobed = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            false,
+            t0 + EXTERNAL_AGENTS_PROBE_TTL + std::time::Duration::from_secs(1),
+        );
+        assert!(codex_installed(&reprobed.body));
+        let changed = reprobed
+            .changed
+            .expect("installed flip must report a change");
+        assert!(
+            changed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "codex" && row["installed"] == true),
+            "the change payload carries the fresh rows: {changed}"
+        );
+
+        // Steady state: a later re-probe with no flip stays silent.
+        let steady = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            false,
+            t0 + (EXTERNAL_AGENTS_PROBE_TTL * 2) + std::time::Duration::from_secs(2),
+        );
+        assert!(codex_installed(&steady.body));
+        assert!(steady.changed.is_none(), "no flip, no event");
+    }
+
+    /// The explicit refresh lane (picker open, Vault tab open) re-probes
+    /// inside the TTL — exact at the moment of user intent.
+    #[test]
+    fn external_agents_refresh_flag_reprobes_within_ttl() {
+        let (home, root, bin) = availability_flip_fixture();
+        let cache = ExternalAgentsProbeCache::default();
+        let t0 = std::time::Instant::now();
+
+        let first = external_agents_serve_in(&cache, Some(root.path()), home.path(), false, t0);
+        assert!(!codex_installed(&first.body));
+
+        install_fixture_binary(&bin);
+        let refreshed = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            true,
+            t0 + std::time::Duration::from_secs(1),
+        );
+        assert!(codex_installed(&refreshed.body));
+        assert!(
+            refreshed.changed.is_some(),
+            "the forced re-probe saw the flip"
+        );
+
+        // The refreshed result re-arms the cache: a plain request right
+        // after serves it without re-probing (body identity is enough —
+        // the fixture can't observe stats, but the change silence can).
+        let cached = external_agents_serve_in(
+            &cache,
+            Some(root.path()),
+            home.path(),
+            false,
+            t0 + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(cached.body, refreshed.body);
+        assert!(cached.changed.is_none());
+    }
+
+    /// The transport-facing wrapper broadcasts the repaint event on a
+    /// flip, and the wire shape is the one the dashboard dispatcher
+    /// routes on: `{"event":"external_agents_changed","agents":[…]}`.
+    #[tokio::test]
+    async fn external_agents_change_event_reaches_the_outbound_wire() {
+        let (home, root, bin) = availability_flip_fixture();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        let first = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        assert!(matches!(first, ApiResponse::Json { status: 200, .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "the first probe must not broadcast — nothing was served before it"
+        );
+
+        install_fixture_binary(&bin);
+        let _ = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        let event = rx.try_recv().expect("the installed flip broadcasts");
+        let outbound = crate::event::app_event_to_outbound(&event)
+            .expect("availability changes reach external consumers");
+        let wire = serde_json::to_value(&outbound).unwrap();
+        assert_eq!(wire["event"], "external_agents_changed");
+        assert!(
+            wire["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "codex" && row["installed"] == true),
+            "the event carries the fresh rows: {wire}"
+        );
+
+        // No flip → no second broadcast, even on explicit refresh.
+        let _ = external_agents_api_response(Some(root.path()), home.path(), true, Some(&bus));
+        assert!(rx.try_recv().is_err(), "steady state stays silent");
     }
 
     #[tokio::test]
