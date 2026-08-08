@@ -34633,7 +34633,7 @@ html.ui-v2 .daemon-relay-note {
                      the ui-v2 flag and only when fuel is positively known. -->
                 <div id="new-session-fueled-banner" class="sessions-fueled-banner hidden">
                   <span class="sessions-fueled-dot" aria-hidden="true"></span>
-                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; model credentials active, ready to launch.</span>
+                  <span class="sessions-fueled-text" id="new-session-fueled-text">Fueled &mdash; provider credentials active for the internal agent, ready to launch.</span>
                 </div>
                 <div id="new-session-unfueled-banner" class="sessions-unfueled-banner hidden">
                   <span class="sessions-unfueled-text">No model credentials on this daemon &mdash; the internal agent can&rsquo;t start. External agents (Codex, Claude Code, Kimi Code, Pi) sign in with their own accounts and still work.</span>
@@ -39262,7 +39262,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '0956aa384617f6b5';
+const INTENDANT_APP_BUILD = 'c7a0663fb7eeebcd';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -134685,9 +134685,15 @@ function updateNewSessionFuelBanner() {
         ? daemonFuelProviders.join(' + ')
         : '';
       if (textEl) {
+        // Provider names here are PROVIDER-KEY fuel (Anthropic / OpenAI /
+        // Gemini from api_key_status) — say "API key", never bare names:
+        // this banner sits under the Agent picker, and "Fueled — Gemini
+        // credentials" read as an installed Gemini AGENT on the 2026-08-07
+        // wrapper e2e (the Gemini CLI backend was retired 2026-07-03).
+        // Agents render only from the /api/external-agents catalog.
         textEl.textContent = names
-          ? `Fueled — ${names} credentials active, ready to launch.`
-          : 'Fueled — model credentials active, ready to launch.';
+          ? `Fueled — ${names} provider ${daemonFuelProviders.length === 1 ? 'API key' : 'API keys'} active for the internal agent, ready to launch.`
+          : 'Fueled — provider credentials active for the internal agent, ready to launch.';
       }
     }
   }
