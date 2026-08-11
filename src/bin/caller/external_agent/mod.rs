@@ -3189,7 +3189,7 @@ mod tests {
             .unwrap();
         assert_eq!(codex_row["login_incomplete"], serde_json::Value::Null);
 
-        let vault_fragment = include_str!("../../../static/app/32-vault-custody.js");
+        let vault_fragment = include_str!("../../../../static/app/32-vault-custody.js");
         assert!(
             vault_fragment.contains("login_incomplete"),
             "the Vault card must consume the availability row's login_incomplete field"

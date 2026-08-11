@@ -217,10 +217,8 @@ pub(crate) fn complete_managed_onboarding(
     })?;
 
     // 1. The managed provider record.
-    root_table(&mut primary, "providers").insert(
-        MANAGED_KIMI_PROVIDER,
-        Item::Table(managed_provider.clone()),
-    );
+    root_table(&mut primary, "providers")
+        .insert(MANAGED_KIMI_PROVIDER, Item::Table(managed_provider.clone()));
 
     // 2. Drop primary managed aliases the ceremony lineup no longer carries.
     let ceremony_keys: std::collections::HashSet<&str> = ceremony_aliases
@@ -335,13 +333,17 @@ fn merge_refreshed_model_alias(existing: &Table, upstream: &Table) -> Table {
     merged
 }
 
-/// The named root table, created as an explicit table when absent. A scalar
-/// squatting on the name is replaced — the merge's sections are tables in
-/// every config kimi itself writes.
+/// The named root table, created as an implicit container when absent (the
+/// children render their own `[section.child]` headers with no bare empty
+/// `[section]` header, and re-merges stay byte-stable). A scalar squatting
+/// on the name is replaced — the merge's sections are tables in every
+/// config kimi itself writes.
 fn root_table<'a>(document: &'a mut DocumentMut, key: &str) -> &'a mut Table {
     let root = document.as_table_mut();
     if !root.get(key).is_some_and(Item::is_table) {
-        root.insert(key, Item::Table(Table::new()));
+        let mut table = Table::new();
+        table.set_implicit(true);
+        root.insert(key, Item::Table(table));
     }
     root.get_mut(key)
         .and_then(Item::as_table_mut)
@@ -468,7 +470,10 @@ display_name = "K3-256k"
     #[test]
     fn providers_configured_truth_table() {
         // Absent config: not configured (kimi's gate reads an empty table).
-        assert_eq!(providers_configured(home_with_config(None).path()), Some(false));
+        assert_eq!(
+            providers_configured(home_with_config(None).path()),
+            Some(false)
+        );
         // The incident's comment-only stub.
         assert_eq!(
             providers_configured(home_with_config(Some(STUB_CONFIG)).path()),
@@ -510,10 +515,7 @@ display_name = "K3-256k"
         ));
         // Provider record without any alias is a half-written provision.
         assert!(!ceremony_home_provisioned(
-            home_with_config(Some(
-                "[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n"
-            ))
-            .path()
+            home_with_config(Some("[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n")).path()
         ));
         assert!(ceremony_home_provisioned(
             home_with_config(Some(CEREMONY_CONFIG)).path()

@@ -38,9 +38,6 @@ pub(crate) use self::bridge::{
     seed_kimi_ceremony_credential, sync_managed_bridges_to_primary, KimiCredentialBaseline,
     KimiCredentialInstall,
 };
-pub(crate) use self::onboarding::{
-    ceremony_home_provisioned, complete_managed_onboarding, providers_configured,
-};
 use self::bridge::{
     choose_mcp_server_name, prepare_bridge_home, sync_bridge_home_to_primary, BridgeMcpConfig,
     CredentialRefreshMonitor,
@@ -48,6 +45,9 @@ use self::bridge::{
 use self::events::{
     child_thread_id, normalize_goal_status, question_answer_body, split_child_thread_id,
     KimiSharedState,
+};
+pub(crate) use self::onboarding::{
+    ceremony_home_provisioned, complete_managed_onboarding, providers_configured,
 };
 use self::rpc::{KimiGoalBudgetLimits, KimiRpcApi, KimiRpcModel, KimiRpcTool};
 use self::runtime::*;
@@ -3338,12 +3338,16 @@ mod tests {
         let remediated = agent.onboarding_remediated(incident()).to_string();
         assert!(remediated.contains("code 40110"), "{remediated}");
         assert!(remediated.contains("Finish setup"), "{remediated}");
-        assert!(remediated.contains("onboarding never finished"), "{remediated}");
+        assert!(
+            remediated.contains("onboarding never finished"),
+            "{remediated}"
+        );
         // No nested "External agent error:" prefixes from the rewrite.
         assert_eq!(remediated.matches("External agent error:").count(), 1);
 
         // Unrelated errors pass through untouched.
-        let unrelated = external("Kimi /sessions/session_x/prompts failed (HTTP 200, code 40001): bad");
+        let unrelated =
+            external("Kimi /sessions/session_x/prompts failed (HTTP 200, code 40001): bad");
         let passthrough = agent.onboarding_remediated(unrelated).to_string();
         assert!(!passthrough.contains("Finish setup"), "{passthrough}");
     }

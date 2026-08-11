@@ -708,7 +708,10 @@ display_name = "K3"
             Some(true)
         );
         let config = std::fs::read_to_string(primary.join("config.toml")).unwrap();
-        assert!(config.contains("[providers.\"managed:kimi-code\"]"), "{config}");
+        assert!(
+            config.contains("[providers.\"managed:kimi-code\"]"),
+            "{config}"
+        );
         assert!(config.contains("[models.\"kimi-code/k3\"]"), "{config}");
     }
 
@@ -742,7 +745,10 @@ display_name = "K3"
             .probe_and_promote()
             .unwrap()
             .is_some_and(|probe| probe.logged_in));
-        assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), credential);
+        assert_eq!(
+            std::fs::read(credentials_path(&primary)).unwrap(),
+            credential
+        );
         assert_eq!(
             crate::external_agent::kimi_code::providers_configured(&primary),
             Some(true)
