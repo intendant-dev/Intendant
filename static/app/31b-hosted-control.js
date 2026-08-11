@@ -902,7 +902,15 @@ function hostedControlRenderManagementCard() {
     if (addPasskey) {
       addPasskey.onclick = async () => {
         addPasskey.disabled = true;
-        const enrollmentWindow = window.open('about:blank', '_blank');
+        // Pre-open about:blank inside the click gesture so the popup
+        // survives blockers, then point it at the fetched URL. Skipped
+        // in the macOS app wrapper: its webview routes popups to the
+        // system browser and an about:blank pre-open can never carry
+        // the later URL — openExternalUrl below opens the real link
+        // instead (NSWorkspace needs no gesture timing).
+        const enrollmentWindow = window.__intendantAppExternalOpen === true
+          ? null
+          : window.open('about:blank', '_blank');
         if (enrollmentWindow) enrollmentWindow.opener = null;
         try {
           const label = mount.querySelector('#custom-passkey-label').value.trim();
@@ -922,7 +930,7 @@ function hostedControlRenderManagementCard() {
           }
           if (enrollmentWindow) {
             enrollmentWindow.location.replace(invitation.enrollment_url);
-          } else {
+          } else if (!openExternalUrl(invitation.enrollment_url)) {
             await navigator.clipboard.writeText(invitation.enrollment_url);
             showControlToast?.('info', 'Enrollment link copied. Open it before it expires.');
           }

@@ -1759,6 +1759,11 @@ function agentSigninProviderState() {
     busy: false,
     lastError: '',
     pollTimer: null,
+    // The "Open …" button could not open a tab (popup blocker, or an app
+    // wrapper predating the system-browser popup route): state, not DOM,
+    // because the 2s ceremony poll re-renders the card and would wipe an
+    // ad-hoc note. Cleared on the next ceremony start.
+    openFallback: false,
   };
 }
 const agentSigninState = {
@@ -1890,6 +1895,7 @@ async function agentSigninStart(provider) {
   // or the guard above mutes the button for the rest of the page load.
   try {
     state.lastError = '';
+    state.openFallback = false;
     renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
@@ -2579,7 +2585,9 @@ function agentSigninProviderCard(provider) {
       openRow.className = 'vault-actions';
       openRow.appendChild(
         vaultButton(spec.openLabel, () => {
-          window.open(url, '_blank', 'noopener');
+          if (openExternalUrl(url)) return;
+          state.openFallback = true;
+          renderAgentSigninSection();
         }, { primary: true })
       );
       openRow.appendChild(
@@ -2591,6 +2599,17 @@ function agentSigninProviderCard(provider) {
         })
       );
       stepOne.appendChild(openRow);
+      if (state.openFallback) {
+        // Honest fallback when no tab opened (popup blocker, or an app
+        // wrapper predating the system-browser popup route): the link
+        // itself renders right below — point at it instead of no-oping.
+        const fallback = document.createElement('div');
+        fallback.className = 'vault-warning agent-signin-open-fallback';
+        fallback.textContent =
+          'A browser tab could not be opened from here — use Copy link ' +
+          'and open the link below in your browser.';
+        stepOne.appendChild(fallback);
+      }
       const checkNote = document.createElement('div');
       checkNote.className = 'vault-note';
       checkNote.textContent = spec.checkNote;

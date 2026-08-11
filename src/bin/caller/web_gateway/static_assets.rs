@@ -1825,6 +1825,40 @@ mod tests {
         assert!(THREE_MODULE_JS.contains("Three.js Authors"));
     }
 
+    /// External-URL opener contract with the bundled macOS app: the
+    /// wrapper routes popups/external navigations to the system default
+    /// browser (sign-in needs the user's real profile), returns null from
+    /// window.open by design, and marks the capability with an injected
+    /// `__intendantAppExternalOpen`. The SPA's shared opener reads that
+    /// marker, and external window.open sites go through it so a genuinely
+    /// blocked popup renders an honest fallback instead of a silent no-op.
+    #[test]
+    fn external_url_opener_contract_is_pinned() {
+        // The shared helpers exist (foundation fragment) and read the marker.
+        assert!(APP_HTML.contains("function openExternalUrl(url)"));
+        assert!(APP_HTML.contains("function openExternalUrlOrExplain(url)"));
+        assert!(APP_HTML.contains("window.__intendantAppExternalOpen === true"));
+
+        // Agent sign-in: helper-routed open + state-driven honest fallback
+        // (state, not DOM — the 2s ceremony poll re-renders the card).
+        assert!(APP_HTML.contains("if (openExternalUrl(url)) return;"));
+        assert!(APP_HTML.contains("state.openFallback = true;"));
+        assert!(APP_HTML.contains("agent-signin-open-fallback"));
+
+        // Passkey enrollment: the gesture-preserving about:blank pre-open
+        // is skipped under the wrapper marker (it can never carry the
+        // later URL there) and the fetched URL goes through the helper.
+        assert!(APP_HTML.contains("!openExternalUrl(invitation.enrollment_url)"));
+
+        // The wrapper really injects the marker the SPA reads and carries
+        // both webview exits (popup + main-frame policy) — a rename or a
+        // dropped hook on either side fails here, not in a user's hands.
+        let wrapper = include_str!("../../../../macos-app/main.swift");
+        assert!(wrapper.contains("window.__intendantAppExternalOpen = true;"));
+        assert!(wrapper.contains("createWebViewWith configuration: WKWebViewConfiguration"));
+        assert!(wrapper.contains("decidePolicyFor navigationAction: WKNavigationAction"));
+    }
+
     #[test]
     fn live_workspace_input_is_released_before_its_surface_is_hidden() {
         fn section(start: &str, end: &str) -> &'static str {

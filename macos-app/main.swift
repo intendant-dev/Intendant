@@ -767,7 +767,75 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // stay silent; the menu item remains available.
     }
 
-    // MARK: - WKUIDelegate (JS alert/confirm/prompt)
+    // MARK: - External links (system browser)
+
+    /// Whether `url` stays inside the app's own dashboard world: the
+    /// `intendant://` proxy scheme, the wrapper's generated pages
+    /// (about:blank via loadHTMLString) and in-page content schemes, and
+    /// anything on loopback — the supervised daemon in every TLS/WS/port
+    /// shape, co-homed sibling daemons included.
+    func isDashboardOrigin(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return true }
+        if ["intendant", "about", "data", "blob", "file", "javascript"].contains(scheme) {
+            return true
+        }
+        let host = url.host?.lowercased() ?? ""
+        return host == "localhost" || host.hasSuffix(".localhost")
+            || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+    }
+
+    /// Map a webview-internal URL to what the system browser should get.
+    /// `intendant://backend/...` is the proxy origin — its real address is
+    /// the supervised daemon on loopback (an explicit port in the URL
+    /// survives, so co-homed sibling links keep working; the default is
+    /// the supervised port). Pure in-page schemes yield nil (nothing a
+    /// browser could open).
+    func systemBrowserURL(for url: URL?) -> URL? {
+        guard let url = url, let scheme = url.scheme?.lowercased(), !scheme.isEmpty else {
+            return nil
+        }
+        if ["about", "data", "blob", "javascript"].contains(scheme) { return nil }
+        if scheme == "intendant" {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.scheme = launchPlan.scheme
+            components?.host = "127.0.0.1"
+            components?.port = url.port ?? port
+            return components?.url
+        }
+        return url
+    }
+
+    /// Hand a URL out of the webview to the user's default browser.
+    /// Sign-in and enrollment flows depend on the real profile (password
+    /// manager, passkeys, existing sessions) — an isolated webview window
+    /// is never the right place for them.
+    func openInSystemBrowser(_ rawURL: URL?, reason: String) {
+        guard let target = systemBrowserURL(for: rawURL) else {
+            NSLog("External open skipped (\(reason)): no browser-usable URL in \(rawURL?.absoluteString ?? "nil")")
+            return
+        }
+        NSLog("Opening in system browser (\(reason)): \(target.absoluteString)")
+        NSWorkspace.shared.open(target)
+    }
+
+    // MARK: - WKUIDelegate (popups + JS alert/confirm/prompt)
+
+    /// window.open / target=_blank from the dashboard. The app never
+    /// grows a second webview: popups are sign-in and enrollment flows
+    /// that must land in the system default browser, so the URL goes
+    /// there and nil comes back (window.open yields null). The SPA knows
+    /// this contract through the injected `__intendantAppExternalOpen`
+    /// marker and treats the null as handled instead of rendering its
+    /// popup-blocked fallback. about:blank pre-opens get nothing useful
+    /// here — under the marker the SPA skips them and opens the final
+    /// URL directly.
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        openInSystemBrowser(navigationAction.request.url, reason: "popup")
+        return nil
+    }
 
     func webView(_ webView: WKWebView,
                  runJavaScriptAlertPanelWithMessage message: String,
@@ -807,6 +875,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     // MARK: - WKNavigationDelegate
+
+    /// One policy for sign-in, enrollment, and every future external
+    /// link: the dashboard main frame never navigates off its own origin
+    /// — anything else opens in the system default browser instead.
+    /// Sub-frame loads pass through untouched, as do new-window targets
+    /// (nil frame — those reach createWebViewWith above).
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let frame = navigationAction.targetFrame, frame.isMainFrame,
+              let url = navigationAction.request.url,
+              !isDashboardOrigin(url)
+        else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        openInSystemBrowser(url, reason: "main-frame navigation")
+    }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         // macOS killed the web process (memory pressure). Restore what was
@@ -986,14 +1073,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     /// bypass the scheme handler and need the real address), and
     /// `__intendantAppSupervisor` marks the supervisor's presence so the
     /// dashboard's update chip renders the one-click action instead of
-    /// the CLI-daemon hand-off. Re-run at update swap with the new port
+    /// the CLI-daemon hand-off. `__intendantAppExternalOpen` tells the
+    /// SPA that popups and external links are routed to the system
+    /// default browser (window.open returns null yet succeeded — see
+    /// createWebViewWith). Re-run at update swap with the new port
     /// (scripts are fixed strings, so a swap must replace them).
     func installUserScripts(_ controller: WKUserContentController, port: Int) {
         controller.removeAllUserScripts()
         let tlsLiteral = launchPlan.usesTLS ? "true" : "false"
         let portScript = WKUserScript(
             source: "window.__intendantPort = \(port); window.__intendantBackendTls = \(tlsLiteral); "
-                + "window.__intendantAppSupervisor = true;",
+                + "window.__intendantAppSupervisor = true; window.__intendantAppExternalOpen = true;",
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )

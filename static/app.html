@@ -36715,6 +36715,47 @@ window.__ui2 = {
   enabled: ui2Enabled, icon: ui2Icon,
   theme: ui2Theme, setTheme: ui2SetTheme,
 };
+
+// ── external-URL opener ────────────────────────────────────────────────
+// window.open is not a given: the bundled macOS app's WKWebView routes
+// popups to the system default browser (sign-in flows need the user's
+// real profile — password manager, passkeys — never an isolated webview)
+// and returns null from window.open BY DESIGN; its injected
+// `__intendantAppExternalOpen` marker says "null still opened". Popup
+// blockers and older app bundles return null with no marker. Callers
+// branch on the boolean and render an honest fallback (the URL with a
+// copy affordance) instead of a silent no-op.
+function openExternalUrl(url) {
+  let popup = null;
+  try {
+    popup = window.open(url, '_blank');
+  } catch (err) {
+    popup = null;
+  }
+  if (popup) {
+    // Sever the opener by hand: the 'noopener' feature would make
+    // window.open return null even on success, hiding the outcome.
+    try { popup.opener = null; } catch (err) { /* cross-origin */ }
+    return true;
+  }
+  return window.__intendantAppExternalOpen === true;
+}
+
+// Shared fallback for call sites without their own inline URL surface:
+// copy the link and say so, or at least show it — never a silent no-op.
+function openExternalUrlOrExplain(url) {
+  if (openExternalUrl(url)) return true;
+  const link = String(url);
+  const explain = 'This view can’t open browser tabs — ';
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(link)
+      .then(() => showControlToast?.('info', explain + 'link copied, paste it in your browser.'))
+      .catch(() => showControlToast?.('error', explain + `open ${link} in your browser.`));
+  } else {
+    showControlToast?.('error', explain + `open ${link} in your browser.`);
+  }
+  return false;
+}
 /* ── static/app/ui2-chrome.js ── */
 // ── ui-v2 chrome wiring (design-overhaul P1a) ──────────────────────────
 // Builds the nav rail's destination buttons and mirrors live state out of
@@ -39277,7 +39318,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '5ac59007638403f2';
+const INTENDANT_APP_BUILD = '74767ea1322b937a';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -42186,7 +42227,15 @@ function hostedControlRenderManagementCard() {
     if (addPasskey) {
       addPasskey.onclick = async () => {
         addPasskey.disabled = true;
-        const enrollmentWindow = window.open('about:blank', '_blank');
+        // Pre-open about:blank inside the click gesture so the popup
+        // survives blockers, then point it at the fetched URL. Skipped
+        // in the macOS app wrapper: its webview routes popups to the
+        // system browser and an about:blank pre-open can never carry
+        // the later URL — openExternalUrl below opens the real link
+        // instead (NSWorkspace needs no gesture timing).
+        const enrollmentWindow = window.__intendantAppExternalOpen === true
+          ? null
+          : window.open('about:blank', '_blank');
         if (enrollmentWindow) enrollmentWindow.opener = null;
         try {
           const label = mount.querySelector('#custom-passkey-label').value.trim();
@@ -42206,7 +42255,7 @@ function hostedControlRenderManagementCard() {
           }
           if (enrollmentWindow) {
             enrollmentWindow.location.replace(invitation.enrollment_url);
-          } else {
+          } else if (!openExternalUrl(invitation.enrollment_url)) {
             await navigator.clipboard.writeText(invitation.enrollment_url);
             showControlToast?.('info', 'Enrollment link copied. Open it before it expires.');
           }
@@ -45271,6 +45320,11 @@ function agentSigninProviderState() {
     busy: false,
     lastError: '',
     pollTimer: null,
+    // The "Open …" button could not open a tab (popup blocker, or an app
+    // wrapper predating the system-browser popup route): state, not DOM,
+    // because the 2s ceremony poll re-renders the card and would wipe an
+    // ad-hoc note. Cleared on the next ceremony start.
+    openFallback: false,
   };
 }
 const agentSigninState = {
@@ -45402,6 +45456,7 @@ async function agentSigninStart(provider) {
   // or the guard above mutes the button for the rest of the page load.
   try {
     state.lastError = '';
+    state.openFallback = false;
     renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
@@ -46091,7 +46146,9 @@ function agentSigninProviderCard(provider) {
       openRow.className = 'vault-actions';
       openRow.appendChild(
         vaultButton(spec.openLabel, () => {
-          window.open(url, '_blank', 'noopener');
+          if (openExternalUrl(url)) return;
+          state.openFallback = true;
+          renderAgentSigninSection();
         }, { primary: true })
       );
       openRow.appendChild(
@@ -46103,6 +46160,17 @@ function agentSigninProviderCard(provider) {
         })
       );
       stepOne.appendChild(openRow);
+      if (state.openFallback) {
+        // Honest fallback when no tab opened (popup blocker, or an app
+        // wrapper predating the system-browser popup route): the link
+        // itself renders right below — point at it instead of no-oping.
+        const fallback = document.createElement('div');
+        fallback.className = 'vault-warning agent-signin-open-fallback';
+        fallback.textContent =
+          'A browser tab could not be opened from here — use Copy link ' +
+          'and open the link below in your browser.';
+        stepOne.appendChild(fallback);
+      }
       const checkNote = document.createElement('div');
       checkNote.className = 'vault-note';
       checkNote.textContent = spec.checkNote;
@@ -83756,7 +83824,7 @@ function renderAccessFleetStrip() {
       direct.title = `Open ${directUrl} — this daemon's own dashboard, no rendezvous in the loop. Works when this browser can reach it (same LAN/VPN); a self-signed daemon shows a one-time certificate warning.`;
       direct.addEventListener('click', async event => {
         event.stopPropagation();
-        window.open(await withSiblingLoopbackToken(directUrl), '_blank', 'noopener');
+        openExternalUrlOrExplain(await withSiblingLoopbackToken(directUrl));
       });
       meta.appendChild(direct);
     }
@@ -109158,7 +109226,7 @@ async function memoryProposeFromForm(button) {
       if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
       ev.preventDefault();
       Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
-        window.open(url, '_blank', 'noopener');
+        openExternalUrlOrExplain(url);
       });
     });
     return link;
@@ -136148,7 +136216,7 @@ function openPeerSessionExternally(s, hostId) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');
     return;
   }
-  window.open(`${base}/#sessions`, '_blank', 'noopener');
+  if (!openExternalUrlOrExplain(`${base}/#sessions`)) return;
   const sid = String(s?.session_id || s?.resume_id || '').trim();
   if (sid) {
     showControlToast('info', `Opened ${host.label || 'peer'} dashboard — look for session ${sid.slice(0, 8)}…`);

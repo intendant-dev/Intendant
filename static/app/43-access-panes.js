@@ -830,7 +830,7 @@ function renderAccessFleetStrip() {
       direct.title = `Open ${directUrl} — this daemon's own dashboard, no rendezvous in the loop. Works when this browser can reach it (same LAN/VPN); a self-signed daemon shows a one-time certificate warning.`;
       direct.addEventListener('click', async event => {
         event.stopPropagation();
-        window.open(await withSiblingLoopbackToken(directUrl), '_blank', 'noopener');
+        openExternalUrlOrExplain(await withSiblingLoopbackToken(directUrl));
       });
       meta.appendChild(direct);
     }
