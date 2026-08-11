@@ -365,8 +365,9 @@ pub(crate) async fn control_request_frame(
             id,
             crate::web_gateway::external_agents_api_response(
                 runtime.project_root.as_deref(),
-                // Same seam: the edge resolves home.
+                // Same seam: the edge resolves home and the state root.
                 &crate::platform::home_dir(),
+                &crate::platform::intendant_home(),
                 // The HTTP twin's `?refresh=1` rides the tunnel as a
                 // `refresh` param; both spellings the query lane
                 // accepts land here as strings or a bare bool.

@@ -1586,17 +1586,14 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op.startsWith('kimi-model:')) {
+    // The token carries the full model id straight from the daemon-served
+    // catalog the Station pane rendered (card 01KZR0QP9A) — no hardcoded
+    // vocabulary map on the decode side either.
     const choice = op.slice('kimi-model:'.length).trim();
-    const models = {
-      default: null,
-      'k2.7': 'kimi-code/kimi-for-coding',
-      'k2.7-fast': 'kimi-code/kimi-for-coding-highspeed',
-      k3: 'kimi-code/k3',
-    };
-    if (!Object.prototype.hasOwnProperty.call(models, choice)) return;
-    const model = models[choice];
+    if (!choice) return;
+    const model = choice === 'default' ? null : choice;
     dispatchControlMsg({ action: 'set_kimi_model', model });
-    showControlToast?.('success', `Kimi model: ${choice}`);
+    showControlToast?.('success', `Kimi model: ${model || 'default'}`);
     return;
   }
   if (op.startsWith('kimi-thinking:')) {

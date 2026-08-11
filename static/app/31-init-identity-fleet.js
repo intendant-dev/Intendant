@@ -724,6 +724,102 @@ function applyExternalAgentAvailability(list) {
   // store; repaint its cards so a freshly detected CLI unmutes without
   // a tab re-entry. Renders are focus-guarded and cheap.
   if (typeof renderAgentSigninSection === 'function') renderAgentSigninSection();
+  // The daemon-served model catalogs ride the same rows (card
+  // 01KZR0QP9A): repaint every kimi model picker so a catalog learned
+  // mid-run (first Kimi spawn, config change) lands without a reload.
+  // Each populate preserves a still-valid current selection.
+  if (typeof populateNewSessionKimiModelSelect === 'function') {
+    populateNewSessionKimiModelSelect();
+  }
+  if (typeof refreshSettingsKimiModelOptions === 'function') {
+    refreshSettingsKimiModelOptions();
+  }
+  if (typeof stationScheduleUpdate === 'function') stationScheduleUpdate();
+}
+
+/* ── Per-backend model catalogs (card 01KZR0QP9A) ──
+   THE one SPA source for backend model vocabularies, derived from the
+   daemon-served availability rows above (`row.models`, learned from live
+   backend runs). Nothing here is ever fabricated: an unknown catalog
+   renders an honest empty state and every picker keeps its free-text
+   custom entry. The four historic hardcoded kimi model mirrors (session
+   launch, settings, agenda start sheet, Station controls) all derive
+   from here now — a daemon-side needle test pins the mirrors dead. */
+function backendModelCatalog(backendId) {
+  const rows = Array.isArray(externalAgentAvailability) ? externalAgentAvailability : null;
+  const row = rows ? rows.find(agent => agent && agent.id === backendId) : null;
+  const list = row && row.models && Array.isArray(row.models.list) ? row.models.list : null;
+  if (!list) {
+    return {
+      known: false,
+      models: [],
+      reason: row
+        ? (String(row.models_reason || '') ||
+           (row.installed === false ? 'not-installed' : 'no-run-observed'))
+        : 'unknown',
+    };
+  }
+  return {
+    known: true,
+    models: list.filter(m => m && typeof m.id === 'string' && m.id.trim()),
+    reason: null,
+  };
+}
+
+/* Honest one-liner for a kimi picker's current catalog state ('' when a
+   non-empty catalog is known). */
+function kimiModelCatalogNote(catalog) {
+  if (catalog.known) {
+    return catalog.models.length
+      ? ''
+      : 'Kimi reports no configured models — use the default or a custom id.';
+  }
+  return catalog.reason === 'not-installed'
+    ? 'Model list appears after Kimi Code is installed and a session runs.'
+    : 'Model list unavailable until the first Kimi Code run — use a custom id for a pin.';
+}
+
+/* Rebuild one kimi model <select> from the daemon-served catalog:
+   inherit option, catalog entries, an inline disabled note when the
+   catalog is unknown/empty, and the Custom escape hatch. Preserves the
+   current selection when it is still offered; returns the catalog so
+   callers can map a pinned model onto their own custom-input rows. */
+function populateKimiModelSelect(select, { inheritValue = '', inheritLabel = 'Default' } = {}) {
+  const catalog = backendModelCatalog('kimi');
+  if (!select) return catalog;
+  const previous = select.value || inheritValue;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = inheritValue;
+  inherit.textContent = inheritLabel;
+  select.appendChild(inherit);
+  for (const model of catalog.models) {
+    const option = document.createElement('option');
+    option.value = model.id;
+    const label = typeof model.display_name === 'string' ? model.display_name.trim() : '';
+    option.textContent = label && label !== model.id ? `${label} — ${model.id}` : model.id;
+    select.appendChild(option);
+  }
+  const note = kimiModelCatalogNote(catalog);
+  if (note) {
+    const hint = document.createElement('option');
+    hint.disabled = true;
+    hint.value = '__catalog_note__';
+    hint.textContent = `— ${note} —`;
+    select.appendChild(hint);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  select.title = note;
+  select.value =
+    previous === '__custom__' ||
+    previous === inheritValue ||
+    catalog.models.some(m => m.id === previous)
+      ? previous
+      : inheritValue;
+  return catalog;
 }
 let externalAgentAvailabilitySeq = 0;
 function refreshExternalAgentAvailability(options = {}) {

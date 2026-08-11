@@ -440,17 +440,17 @@
               </div>
               <div class="settings-row">
                 <label for="set-kimi-model-select">Kimi model</label>
+                <!-- Options are the daemon-learned Kimi catalog
+                     (populateSettingsKimiModel); no hardcoded model
+                     vocabulary lives here. -->
                 <select id="set-kimi-model-select">
                   <option value="">Kimi account default</option>
-                  <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-                  <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-                  <option value="kimi-code/k3">K3</option>
                   <option value="__custom__">Custom model id…</option>
                 </select>
               </div>
               <div class="settings-row hidden" id="set-kimi-model-custom-row">
                 <label for="set-kimi-model-custom">Custom Kimi id</label>
-                <input id="set-kimi-model-custom" type="text" placeholder="e.g. kimi-code/kimi-for-coding" autocomplete="off" spellcheck="false">
+                <input id="set-kimi-model-custom" type="text" placeholder="model id from Kimi's catalog" autocomplete="off" spellcheck="false">
               </div>
               <div class="settings-row">
                 <label for="set-kimi-thinking">Kimi thinking</label>
@@ -971,17 +971,16 @@
     </div>
     <div class="session-config-row" id="session-config-kimi-model-row">
       <label for="session-config-kimi-model">Kimi model</label>
+      <!-- Options are the daemon-learned Kimi catalog (rebuilt on modal
+           open); no hardcoded model vocabulary lives here. -->
       <select id="session-config-kimi-model" onchange="onSessionConfigKimiModelChange()">
         <option value="inherit">inherit Control default</option>
-        <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-        <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-        <option value="kimi-code/k3">K3</option>
         <option value="__custom__">Custom model id…</option>
       </select>
     </div>
     <div class="session-config-row" id="session-config-kimi-model-custom-row" style="display:none">
       <label for="session-config-kimi-model-custom">Custom id</label>
-      <input id="session-config-kimi-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding">
+      <input id="session-config-kimi-model-custom" type="text" autocomplete="off" spellcheck="false" placeholder="model id from Kimi's catalog">
     </div>
     <div class="session-config-row" id="session-config-kimi-thinking-row">
       <label for="session-config-kimi-thinking">Thinking</label>

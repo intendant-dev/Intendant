@@ -334,18 +334,34 @@ function updateSettingsKimiCustomModelRow() {
   document.getElementById('set-kimi-model-custom-row')?.classList.toggle('hidden', !custom);
 }
 
+// The option list is the daemon-served catalog (card 01KZR0QP9A) —
+// rebuilt on every settings load and on availability broadcasts; a
+// configured model outside it shows honestly in the Custom row.
 function populateSettingsKimiModel(configuredModel) {
   const select = document.getElementById('set-kimi-model-select');
   const customInput = document.getElementById('set-kimi-model-custom');
   if (!select) return;
   const model = String(configuredModel || '').trim();
-  const known = [
-    'kimi-code/kimi-for-coding',
-    'kimi-code/kimi-for-coding-highspeed',
-    'kimi-code/k3',
-  ];
-  select.value = !model ? '' : (known.includes(model) ? model : '__custom__');
-  if (customInput) customInput.value = model && !known.includes(model) ? model : '';
+  const catalog = populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: 'Kimi account default',
+  });
+  const known = catalog.models.some(m => m.id === model);
+  select.value = !model ? '' : (known ? model : '__custom__');
+  if (customInput) customInput.value = model && !known ? model : '';
+  updateSettingsKimiCustomModelRow();
+}
+
+// Availability-broadcast repaint: rebuild the options in place, keeping
+// the user's current (still-valid) selection — never clobbering an
+// unsaved edit back to the persisted config.
+function refreshSettingsKimiModelOptions() {
+  const select = document.getElementById('set-kimi-model-select');
+  if (!select) return;
+  populateKimiModelSelect(select, {
+    inheritValue: '',
+    inheritLabel: 'Kimi account default',
+  });
   updateSettingsKimiCustomModelRow();
 }
 

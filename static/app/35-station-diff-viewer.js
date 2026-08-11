@@ -1060,6 +1060,11 @@ function stationBuildControlsSummary() {
     sessionCanInterrupt,
   });
   const launchReadiness = stationBuildLaunchReadiness();
+  // The daemon-learned Kimi catalog feeds the Controls pane's model
+  // choices (card 01KZR0QP9A); `known` distinguishes a fresh install's
+  // honestly empty catalog from "no Kimi run observed yet".
+  const kimiCatalog = (typeof backendModelCatalog === 'function')
+    ? backendModelCatalog('kimi') : { known: false, models: [] };
   return {
     backend: backend || 'none',
     command,
@@ -1079,6 +1084,11 @@ function stationBuildControlsSummary() {
     claudeModel: controlClaudeConfig.model || '',
     claudePermissionMode: controlClaudeConfig.permission_mode || 'default',
     kimiModel: controlKimiConfig.model || '',
+    kimiModelChoices: kimiCatalog.models.map(m => ({
+      id: m.id,
+      label: (typeof m.display_name === 'string' && m.display_name.trim()) || m.id,
+    })),
+    kimiModelCatalogKnown: kimiCatalog.known,
     kimiThinking: controlKimiConfig.thinking || '',
     kimiPermissionMode: controlKimiConfig.permission_mode || 'manual',
     kimiPlanMode: !!controlKimiConfig.plan_mode,

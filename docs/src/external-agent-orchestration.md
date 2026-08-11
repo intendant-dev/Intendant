@@ -111,6 +111,19 @@ receives its launch profile (`thinking`, permission mode, plan mode, and swarm
 mode); Pi receives model, thinking level, and an exact active-tool override.
 Backends that don't model a field ignore it.
 
+**Kimi model catalog** (`backend_model_catalog.rs`): every successful Kimi
+spawn records the harness's own `listModels` catalog (memory + `<state
+root>/external-agents/model-catalogs.json`). It is the only truth source for
+Kimi's model vocabulary — a fresh install legitimately reports an empty
+configured-model list — and three consumers derive from it: the
+`/api/external-agents` availability rows serve it (with capture provenance,
+or an honest `models: null` + `models_reason` before any run), the session
+launch path refuses a model pin outside a *known* catalog before spawning,
+and if a stale pin still reaches Kimi (catalog unknowable pre-spawn), the
+adapter degrades once — drops the pin, retries the create/profile step on
+Kimi's default model, and surfaces a warn note — instead of letting the
+spawned session die on Kimi's "model not configured" refusal.
+
 The supported backend identities are the `AgentBackend` enum (`Codex`,
 `ClaudeCode`, `Kimi`, `Pi`). `from_str_loose()` accepts the canonical short
 forms plus older/display forms (`codex`, `claude-code`/`claude_code`/`cc`,

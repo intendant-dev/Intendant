@@ -1657,12 +1657,14 @@ function agendaStartExecutionSummary(mode) {
 }
 
 // The sheet's per-backend config vocabulary, from the daemon's served
-// settings (derive-don't-mirror: models and efforts come from the settings
-// payload where the daemon serves them; the static kimi/claude-alias lists
-// mirror the pinned settings-pane markup). `model`/`effort` are the daemon
-// DEFAULTS the selects inherit when left untouched. `backend` may override
-// the daemon default (the sheet's Backend select) — the same
-// AgentLaunchConfig vocabulary CreateSession uses.
+// settings (derive-don't-mirror: codex models/efforts come from the
+// settings payload, kimi models from the daemon-learned catalog on the
+// availability rows; the static claude-alias list is pinned to
+// project::CLAUDE_MODEL_ALIASES by a daemon-side parity test). `model`/
+// `effort` are the daemon DEFAULTS the selects inherit when left
+// untouched. `backend` may override the daemon default (the sheet's
+// Backend select) — the same AgentLaunchConfig vocabulary CreateSession
+// uses.
 function agendaStartBackendConfig(settings, backendOverride) {
   const d = settings || {};
   const dflt = (typeof normalizeAgentId === 'function')
@@ -1696,6 +1698,12 @@ function agendaStartBackendConfig(settings, backendOverride) {
     };
   }
   if (backend === 'kimi') {
+    // Model vocabulary from the daemon-learned catalog (card 01KZR0QP9A)
+    // — the availability rows, not a hardcoded list; unknown catalogs
+    // honestly offer only the daemon default (plus any configured pin,
+    // appended by the renderer below).
+    const kimiCatalog = (typeof backendModelCatalog === 'function')
+      ? backendModelCatalog('kimi') : { models: [] };
     return {
       backend,
       label: 'Kimi Code',
@@ -1703,7 +1711,7 @@ function agendaStartBackendConfig(settings, backendOverride) {
       effortKey: 'kimi_thinking',
       effortLabel: 'Thinking',
       model: backend === dflt ? String(d.kimi_model || '') : '',
-      models: ['kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed', 'kimi-code/k3'],
+      models: kimiCatalog.models.map((m) => m.id),
       effort: backend === dflt ? String(d.kimi_thinking || '') : '',
       efforts: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
     };

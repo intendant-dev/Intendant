@@ -2119,6 +2119,87 @@ mod tests {
         assert_eq!(actual_efforts, expected_efforts);
     }
 
+    /// Card 01KZR0QP9A: the SPA's hardcoded Kimi model vocabulary killed
+    /// sessions when the installed backend's real catalog moved (fresh
+    /// Kimi 0.34.0 refused `kimi-code/k3` after spawn). The mirrors are
+    /// dead: no quoted `kimi-code/…` model-id literal may exist in the
+    /// assembled dashboard or the Station pane producer — every picker
+    /// derives from the daemon-served catalog through the one shared
+    /// helper. (`~/.kimi-code/…` path copy is not a model id and stays.)
+    #[test]
+    fn kimi_model_vocabulary_mirrors_are_dead() {
+        for needle in ["'kimi-code/", "\"kimi-code/"] {
+            assert!(
+                !APP_HTML.contains(needle),
+                "app.html re-grew a hardcoded kimi model-id literal ({needle}…): \
+                 derive from backendModelCatalog('kimi') instead"
+            );
+        }
+        let station_panels = include_str!("../../../../crates/station-web/src/hud/panels.rs");
+        assert!(
+            !station_panels.contains("\"kimi-code/"),
+            "station-web panels re-grew a hardcoded kimi model-id literal: \
+             render from StationControlsSummary::kimi_model_choices instead"
+        );
+        // The shared derivation really is wired: the one helper exists and
+        // every picker lane consumes it.
+        assert!(APP_HTML.contains("function backendModelCatalog("));
+        assert!(APP_HTML.contains("function populateKimiModelSelect("));
+        assert!(APP_HTML.contains("function populateNewSessionKimiModelSelect("));
+        assert!(APP_HTML.contains("function refreshSettingsKimiModelOptions("));
+        assert!(APP_HTML.contains("kimiModelChoices:"));
+    }
+
+    /// The Claude model-alias vocabulary is a deliberate static mirror
+    /// (the CLI resolves the aliases; there is no daemon-learned catalog
+    /// for Claude Code yet), so per the repo convention each mirror site
+    /// is pinned to the daemon's `project::CLAUDE_MODEL_ALIASES` — an
+    /// alias change that forgets a picker fails here instead of shipping
+    /// as drift.
+    #[test]
+    fn claude_model_alias_mirrors_match_daemon_vocabulary() {
+        let single_quoted = crate::project::CLAUDE_MODEL_ALIASES
+            .iter()
+            .map(|alias| format!("'{alias}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (name, fragment) in [
+            (
+                "40-session-launch.js",
+                include_str!("../../../../static/app/40-session-launch.js"),
+            ),
+            (
+                "53-stats-settings.js",
+                include_str!("../../../../static/app/53-stats-settings.js"),
+            ),
+            (
+                "ui2-agenda.js",
+                include_str!("../../../../static/app/ui2-agenda.js"),
+            ),
+            (
+                "34-station-panes.js",
+                include_str!("../../../../static/app/34-station-panes.js"),
+            ),
+        ] {
+            assert!(
+                fragment.contains(&single_quoted),
+                "{name}: claude alias list must mirror project::CLAUDE_MODEL_ALIASES \
+                 ({single_quoted})"
+            );
+        }
+        let double_quoted = crate::project::CLAUDE_MODEL_ALIASES
+            .iter()
+            .map(|alias| format!("\"{alias}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let station_panels = include_str!("../../../../crates/station-web/src/hud/panels.rs");
+        assert!(
+            station_panels.contains(&double_quoted),
+            "station-web panels: MODEL_ALIASES must mirror project::CLAUDE_MODEL_ALIASES \
+             ({double_quoted})"
+        );
+    }
+
     #[test]
     fn api_request_mentioning_asset_path_in_query_is_not_shadowed() {
         // Regression: the old `request_line.contains(...)` routing served

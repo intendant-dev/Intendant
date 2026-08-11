@@ -638,6 +638,32 @@ impl SessionSupervisor {
                 }
             }
         }
+        // Stale-model-catalog session death (card 01KZR0QP9A): when the
+        // daemon KNOWS Kimi's configured-model catalog (learned from a live
+        // Kimi run), refuse an effective model pin outside it here — before
+        // any harness spawns — naming what IS available. The effective pin
+        // is the post-override project config (launch pin → daemon default).
+        // An unknown catalog never refuses: the adapter degrades mid-launch
+        // instead of letting the spawned session die.
+        if matches!(backend.as_ref(), Some(external_agent::AgentBackend::Kimi)) {
+            if let Some(model) = project
+                .config
+                .agent
+                .kimi
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            {
+                if let Some(refusal) = crate::backend_model_catalog::kimi_launch_model_refusal(
+                    &crate::platform::intendant_home(),
+                    model,
+                ) {
+                    self.loop_error(format!("Session create failed: {refusal}"));
+                    return None;
+                }
+            }
+        }
         let mut codex_home = None;
         if let Some(backend) = backend.as_ref() {
             let mut config = crate::session_config::from_project(backend, &project);

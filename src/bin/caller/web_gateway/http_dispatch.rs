@@ -2119,6 +2119,7 @@ pub(crate) async fn serve_http_request(
                     stream,
                     project_root,
                     crate::platform::home_dir(),
+                    crate::platform::intendant_home(),
                     refresh,
                     bus,
                     route.cors,

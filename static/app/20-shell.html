@@ -967,7 +967,7 @@
                 <legend>Model</legend>
                 <div class="control-row">
                   <label for="control-kimi-model">Override</label>
-                  <input type="text" id="control-kimi-model" placeholder="e.g. kimi-code/kimi-for-coding (empty = Kimi default)">
+                  <input type="text" id="control-kimi-model" placeholder="model id from Kimi's catalog (empty = Kimi default)">
                 </div>
                 <div class="control-hint">
                   Applies when the next Kimi session process starts. Empty leaves the selected Kimi provider and account defaults in charge.
@@ -1921,17 +1921,17 @@
                       </label>
                       <label class="sessions-new-session-field" for="new-session-kimi-model-select">
                         Kimi model
+                        <!-- Options are the daemon-learned Kimi catalog
+                             (populateNewSessionKimiModelSelect); no
+                             hardcoded model vocabulary lives here. -->
                         <select id="new-session-kimi-model-select" onchange="onNewSessionKimiModelSelectChange()" disabled>
                           <option value="">Global setting</option>
-                          <option value="kimi-code/kimi-for-coding">K2.7 Coding</option>
-                          <option value="kimi-code/kimi-for-coding-highspeed">K2.7 Coding Highspeed</option>
-                          <option value="kimi-code/k3">K3</option>
                           <option value="__custom__">Custom model id…</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field hidden" for="new-session-kimi-model" id="new-session-kimi-model-custom-row">
                         Custom model id
-                        <input id="new-session-kimi-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. kimi-code/kimi-for-coding" disabled>
+                        <input id="new-session-kimi-model" type="text" autocomplete="off" spellcheck="false" placeholder="model id from Kimi's catalog" disabled>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-kimi-thinking">
                         Kimi thinking
