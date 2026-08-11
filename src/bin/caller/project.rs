@@ -134,6 +134,15 @@ pub struct CapacityConfig {
     /// var overrides the derivation but not this key.
     #[serde(default)]
     pub max_resident_sessions: Option<usize>,
+    /// Staging aggressiveness — one coarse knob, deliberately not
+    /// per-threshold tuning: `"normal"` (default; defer and park per the
+    /// watermarks), `"defer-only"` (pressure signals cap at defer —
+    /// admissions queue, nothing parks), `"off"` (pressure staging
+    /// disabled; the resident-session bound still gates). Unrecognized
+    /// values read as `normal`. The `INTENDANT_CAPACITY_STAGING` env var
+    /// fills in when this key is unset.
+    #[serde(default)]
+    pub staging: Option<String>,
 }
 
 impl Default for CapacityConfig {
@@ -141,6 +150,7 @@ impl Default for CapacityConfig {
         Self {
             enabled: default_capacity_enabled(),
             max_resident_sessions: None,
+            staging: None,
         }
     }
 }
