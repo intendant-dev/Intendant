@@ -507,7 +507,9 @@ impl ExternalAgent for PiAgent {
             &self.launch,
         )?;
 
-        let mut command = crate::platform::spawn_command(&self.command);
+        // Detection's resolution ladder, not the daemon's inherited PATH:
+        // a CLI that reports installed must spawn.
+        let mut command = super::spawn_backend_command(&super::AgentBackend::Pi, &self.command);
         command
             .args(&args)
             .current_dir(&config.working_dir)

@@ -217,7 +217,9 @@ pub(crate) enum ClaudeRewindWireCapability {
 pub(crate) fn claude_rewind_wire_capability(command: &str) -> ClaudeRewindWireCapability {
     static CACHE: std::sync::OnceLock<StdMutex<HashMap<String, (String, bool)>>> =
         std::sync::OnceLock::new();
-    let Some(fingerprint) = super::protocol_watch::executable_fingerprint(command) else {
+    let Some(fingerprint) =
+        super::protocol_watch::executable_fingerprint(&super::AgentBackend::ClaudeCode, command)
+    else {
         return ClaudeRewindWireCapability::Unknown;
     };
     let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
@@ -4363,7 +4365,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         }
 
         // Spawn the process
-        let mut command = crate::platform::spawn_command(&self.command);
+        // Detection's resolution ladder, not the daemon's inherited PATH:
+        // a CLI that reports installed must spawn.
+        let mut command =
+            super::spawn_backend_command(&super::AgentBackend::ClaudeCode, &self.command);
         command
             .args(&args)
             .current_dir(&config.working_dir)

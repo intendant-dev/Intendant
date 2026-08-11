@@ -273,7 +273,8 @@ pub(crate) fn parse_login_status(exit_ok: bool, output: &str) -> AuthProbe {
 /// the ceremony's worker threads only. Both output streams feed the
 /// parser (CLI status lines have moved between them before).
 fn probe_login_status(command: &str) -> Option<AuthProbe> {
-    let (program, mut args) = pty_program_invocation(command);
+    let (program, mut args) =
+        pty_program_invocation(&crate::external_agent::AgentBackend::Codex, command);
     args.extend(["login".to_string(), "status".to_string()]);
     let output = std::process::Command::new(program)
         .args(args)
@@ -345,7 +346,8 @@ fn spawn_ceremony_process(id: u64, command: &str) -> Result<(), String> {
         })
         .map_err(|e| format!("openpty: {e}"))?;
 
-    let (program, mut args) = pty_program_invocation(command);
+    let (program, mut args) =
+        pty_program_invocation(&crate::external_agent::AgentBackend::Codex, command);
     args.extend(["login".to_string(), "--device-auth".to_string()]);
     let mut cmd = portable_pty::CommandBuilder::new(&program);
     cmd.args(&args);

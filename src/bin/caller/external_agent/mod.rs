@@ -1214,14 +1214,16 @@ pub struct BackendAvailability {
     /// Passive, zero-additional-quota compatibility evidence for the exact
     /// configured executable artifact and current adapter contract.
     pub compatibility: protocol_watch::PassiveCompatibilityStatus,
-    /// The honest explanation when `installed` is false but the CLI *is*
-    /// present in a well-known install directory the daemon's inherited
-    /// `PATH` does not carry (`platform::off_path_install_probe`): the
-    /// startup-only `ensure_tool_paths` augmentation cannot see a
-    /// directory the install itself created (the Windows npm-shim
-    /// footgun; a first Homebrew install on macOS), so a re-probe keeps
-    /// failing until the daemon restarts — and the payload says so
-    /// instead of serving a bare not-found.
+    /// The honest explanation for a bare-name command that is genuinely
+    /// not found: not on the daemon's PATH, not at the backend's declared
+    /// installer destination (the install matrix), and not in any
+    /// well-known install directory (`platform::off_path_install_probe`)
+    /// — detection and launch resolve through all of those, so a CLI
+    /// present in any of them reports `installed` and needs no hint or
+    /// restart. What survives here is the custom-location remedy: add
+    /// that directory to the daemon's PATH and restart. `None` when
+    /// installed, or when the configured command is an explicit path
+    /// (PATH is not the story for one exact missing file).
     pub path_hint: Option<String>,
 }
 
@@ -1280,6 +1282,89 @@ fn pi_local_login_in(env_pi_home: Option<std::ffi::OsString>, home: &Path) -> Op
     Some(pi_home.join("auth.json").is_file())
 }
 
+/// Where a backend's configured command actually lives — the one
+/// resolution ladder detection, the compatibility fingerprint, and
+/// launch all share, so "detection says installed but launch can't find
+/// it" is impossible by construction:
+///
+/// 1. the daemon's `PATH` (explicit paths are checked directly here);
+/// 2. the backend's declared installer destinations
+///    ([`crate::backend_install`]'s matrix — e.g. `~/.kimi-code/bin`,
+///    which a one-click install creates *after* the daemon inherited its
+///    PATH, so no restart can be required);
+/// 3. the generic well-known install directories the PATH-hint probe
+///    consults (`platform::off_path_install_probe` — npm shims, cargo
+///    bin, Homebrew, scoop/winget).
+///
+/// Stat-only; never executes anything. The transport edge resolves the
+/// real environment; [`resolve_backend_command_path_in`] injects it.
+pub(crate) fn resolve_backend_command_path(
+    backend: &AgentBackend,
+    command: &str,
+) -> Option<PathBuf> {
+    resolve_backend_command_path_in(
+        backend,
+        command,
+        std::env::var_os("PATH"),
+        &crate::platform::home_dir(),
+    )
+}
+
+/// `PATH` and the home directory injected (tests-are-hermetic).
+fn resolve_backend_command_path_in(
+    backend: &AgentBackend,
+    command: &str,
+    path_var: Option<std::ffi::OsString>,
+    home: &Path,
+) -> Option<PathBuf> {
+    if let Some(found) = crate::platform::resolve_command_path_in(command, path_var.clone()) {
+        return Some(found);
+    }
+    // Only bare names get the install-dir rungs: an explicit path in the
+    // config points at one exact file (the same rule as the off-PATH
+    // probe), and `~` expansion above already consulted the real home.
+    let command = command.trim();
+    if command.is_empty()
+        || command == "~"
+        || command.starts_with("~/")
+        || Path::new(command).is_absolute()
+        || Path::new(command).components().count() > 1
+    {
+        return None;
+    }
+    if let Some(platform) = crate::backend_install::InstallPlatform::current() {
+        for dir in crate::backend_install::declared_install_dirs(backend, platform, home) {
+            if let Some(found) = crate::platform::executable_in_dir(&dir, command) {
+                return Some(found);
+            }
+        }
+    }
+    crate::platform::off_path_install_probe_in(command, path_var, home).map(|hit| hit.found)
+}
+
+/// The program string a spawn should exec for `backend`'s configured
+/// `command`: the ladder-resolved absolute path when it resolves, the
+/// command verbatim when it doesn't — so the eventual spawn error stays
+/// the honest NotFound instead of this helper inventing one.
+pub(crate) fn launch_program(backend: &AgentBackend, command: &str) -> String {
+    resolve_backend_command_path(backend, command)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| command.to_string())
+}
+
+/// Build the spawn command for a backend CLI through the shared
+/// resolution ladder — the launch half of the detection contract. All
+/// backend-process spawns (wrapper adapters, the voice app-server, the
+/// Codex Cloud CLI lane) go through here rather than handing the bare
+/// configured name to the OS, which only searches the daemon's
+/// launch-time `PATH`.
+pub(crate) fn spawn_backend_command(
+    backend: &AgentBackend,
+    command: &str,
+) -> tokio::process::Command {
+    crate::platform::spawn_command(&launch_program(backend, command))
+}
+
 /// Probe every supported backend. Stat-based (never executes the CLIs),
 /// so it is cheap enough to answer a dashboard request directly. Reads
 /// the persisted project config only — a runtime `set_codex_command`
@@ -1303,7 +1388,12 @@ pub fn backend_availability(
             AgentBackend::Kimi => agent_config.kimi.command.clone(),
             AgentBackend::Pi => agent_config.pi.command.clone(),
         };
-        let mut installed = crate::platform::resolve_command_path(&command).is_some();
+        // The same ladder launch resolves through (PATH, then the
+        // declared installer destinations, then the generic well-known
+        // install dirs): `installed` is a promise that spawning works.
+        let path_var = std::env::var_os("PATH");
+        let mut installed =
+            resolve_backend_command_path_in(&backend, &command, path_var.clone(), home).is_some();
         if !installed && backend == AgentBackend::Codex {
             // Managed sessions spawn the Intendant-aware fork instead
             // of `command`; either binary makes the backend usable.
@@ -1311,7 +1401,9 @@ pub fn backend_availability(
                 .codex
                 .managed_command
                 .as_deref()
-                .is_some_and(|cmd| crate::platform::resolve_command_path(cmd).is_some());
+                .is_some_and(|cmd| {
+                    resolve_backend_command_path_in(&backend, cmd, path_var.clone(), home).is_some()
+                });
         }
         let last_used_secs =
             crate::external_wrapper_index::wrappers_for_source(home, backend.as_short_str())
@@ -1350,7 +1442,7 @@ pub fn backend_availability(
         let path_hint = if installed {
             None
         } else {
-            path_inheritance_hint(&command)
+            path_inheritance_hint(&backend, &command, home)
         };
         BackendAvailability {
             backend,
@@ -1366,29 +1458,47 @@ pub fn backend_availability(
     .collect()
 }
 
-/// The PATH-inheritance explanation for a backend whose configured bare
-/// command failed to resolve: when the CLI actually exists in a
-/// well-known install directory the daemon's `PATH` (inherited at daemon
-/// start, augmented once by `ensure_tool_paths`) does not carry, name
-/// where it was found and the remedy — the same honest-refusal
-/// convention as the update lane's toolchain resolution. `None` when the
-/// CLI genuinely isn't anywhere we know to look (or the command is an
-/// explicit path, where PATH is not the story).
-fn path_inheritance_hint(command: &str) -> Option<String> {
-    let hit = crate::platform::off_path_install_probe(command)?;
-    Some(path_inheritance_hint_copy(command, &hit))
+/// The honest explanation for a bare-name command that is genuinely not
+/// found anywhere the daemon knows to look — the resolution ladder
+/// already searched the PATH, the backend's declared installer
+/// destination, and the generic well-known install directories, so the
+/// only surviving remedy is the custom-location one. Names the declared
+/// destination (derived from the install matrix — the same declaration
+/// resolution consults) so an owner who installed by hand knows where a
+/// no-restart pickup would have landed. `None` for explicit-path
+/// commands, where PATH is not the story: the config points at one exact
+/// missing file, and that absence is its own message.
+fn path_inheritance_hint(backend: &AgentBackend, command: &str, home: &Path) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty()
+        || command == "~"
+        || command.starts_with("~/")
+        || Path::new(command).is_absolute()
+        || Path::new(command).components().count() > 1
+    {
+        return None;
+    }
+    let declared = crate::backend_install::InstallPlatform::current()
+        .map(|platform| crate::backend_install::declared_install_dirs(backend, platform, home))
+        .unwrap_or_default();
+    Some(path_inheritance_hint_copy(command, declared.first()))
 }
 
-/// Pure wording half, split from the ambient-PATH probe for hermetic
-/// tests.
-fn path_inheritance_hint_copy(command: &str, hit: &crate::platform::OffPathInstall) -> String {
+/// Pure wording half, split from the platform/home resolution for
+/// hermetic tests.
+fn path_inheritance_hint_copy(command: &str, declared_dir: Option<&PathBuf>) -> String {
+    let searched = match declared_dir {
+        Some(dir) => format!(
+            "the daemon's PATH, its installer's destination ({}), or the other well-known \
+             install directories",
+            dir.display()
+        ),
+        None => "the daemon's PATH or the well-known install directories".to_string(),
+    };
     format!(
-        "{} is installed at {}, but {} is not on the daemon's PATH (inherited when the daemon \
-         started) — restart the Intendant daemon to pick it up, or launch it from a shell where \
-         that directory is on PATH.",
-        command,
-        hit.found.display(),
-        hit.dir.display()
+        "{command} was not found on {searched}. Installs into those locations are picked up \
+         automatically — if it is installed somewhere custom, add that directory to the \
+         daemon's PATH and restart the Intendant daemon."
     )
 }
 
@@ -3030,37 +3140,265 @@ mod tests {
         }
     }
 
-    /// The PATH-inheritance hint names the found executable, the
-    /// off-PATH directory, and the restart remedy — the honest copy the
-    /// picker tooltip and the Vault card render verbatim when a fresh
-    /// install stays invisible to the daemon's boot-time PATH.
-    #[test]
-    fn path_inheritance_hint_names_found_dir_and_remedy() {
-        let hit = crate::platform::OffPathInstall {
-            found: std::path::Path::new("install-dir").join("codex"),
-            dir: std::path::PathBuf::from("install-dir"),
+    /// A test executable dropped into `dir` under the platform's
+    /// resolvable name (Windows resolution probes `.exe`).
+    fn place_executable(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.exe"))
+        } else {
+            dir.join(name)
         };
-        let copy = path_inheritance_hint_copy("codex", &hit);
-        for needle in [
-            "codex is installed at ",
-            "is not on the daemon's PATH",
-            "inherited when the daemon started",
-            "restart the Intendant daemon",
-        ] {
-            assert!(copy.contains(needle), "hint copy lost {needle:?}: {copy}");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // Absent commands stay hintless: the plain not-found copy is the
-        // honest message when the CLI is nowhere we know to look.
-        let missing = backend_availability(
-            &{
-                let mut config = crate::project::ExternalAgentConfig::default();
-                config.codex.command = "intendant-test-absent-codex".to_string();
-                config.codex.managed_command = None;
-                config
-            },
-            tempfile::tempdir().unwrap().path(),
+        path
+    }
+
+    /// The backend's declared installer destination on THIS platform —
+    /// tests build their fixtures through the same declaration the
+    /// ladder consults, so they hold on all three CI hosts.
+    fn declared_dir(backend: &AgentBackend, home: &Path) -> PathBuf {
+        crate::backend_install::declared_install_dirs(
+            backend,
+            crate::backend_install::InstallPlatform::current().unwrap(),
+            home,
+        )
+        .remove(0)
+    }
+
+    /// The resolution ladder, rung by rung (hermetic: PATH and home are
+    /// injected): a PATH hit wins outright; the declared installer
+    /// destination answers when PATH misses; the generic well-known
+    /// install dirs are the final rung; nothing anywhere is None.
+    #[test]
+    fn backend_resolution_ladder_path_then_declared_then_known_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let path_var = Some(path_dir.path().as_os_str().to_os_string());
+        let kimi_dir = declared_dir(&AgentBackend::Kimi, home.path());
+
+        // Rung 2: PATH misses, the declared installer destination hits —
+        // the 2026-08-11 incident shape (one-click install into
+        // ~/.kimi-code/bin, daemon PATH inherited before it existed).
+        let installed = place_executable(&kimi_dir, "intendant-test-ladder-kimi");
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Kimi,
+                "intendant-test-ladder-kimi",
+                path_var.clone(),
+                home.path(),
+            ),
+            Some(installed.clone())
         );
-        assert_eq!(missing[0].path_hint, None);
+
+        // Rung 1 wins over rung 2 when both have the binary.
+        let on_path = place_executable(path_dir.path(), "intendant-test-ladder-kimi");
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Kimi,
+                "intendant-test-ladder-kimi",
+                path_var.clone(),
+                home.path(),
+            ),
+            Some(on_path)
+        );
+
+        // Rung 3: a dir the generic off-PATH probe knows (cargo bin) but
+        // no matrix cell declares.
+        let cargo_bin = home.path().join(".cargo").join("bin");
+        let generic = place_executable(&cargo_bin, "intendant-test-ladder-generic");
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Codex,
+                "intendant-test-ladder-generic",
+                path_var.clone(),
+                home.path(),
+            ),
+            Some(generic)
+        );
+
+        // Nowhere: genuinely not installed.
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Kimi,
+                "intendant-test-ladder-absent",
+                path_var.clone(),
+                home.path(),
+            ),
+            None
+        );
+
+        // Explicit paths never get the install-dir rungs: the config
+        // points at one exact file.
+        let explicit_missing = home
+            .path()
+            .join("elsewhere")
+            .join("intendant-test-ladder-kimi");
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Kimi,
+                &explicit_missing.to_string_lossy(),
+                path_var,
+                home.path(),
+            ),
+            None
+        );
+    }
+
+    /// Declared-dir hits require the execute bit — a plain file at the
+    /// destination is not an install.
+    #[cfg(unix)]
+    #[test]
+    fn backend_resolution_ladder_requires_the_execute_bit() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi_dir = declared_dir(&AgentBackend::Kimi, home.path());
+        std::fs::create_dir_all(&kimi_dir).unwrap();
+        std::fs::write(kimi_dir.join("intendant-test-ladder-noexec"), b"data").unwrap();
+        assert_eq!(
+            resolve_backend_command_path_in(
+                &AgentBackend::Kimi,
+                "intendant-test-ladder-noexec",
+                None,
+                home.path(),
+            ),
+            None
+        );
+    }
+
+    /// Launch runs the binary detection found: `launch_program` is the
+    /// same ladder collapsed to a spawnable string, and the incident
+    /// shape (installed only in the declared dir) yields that exact
+    /// absolute path. Unresolvable commands pass through verbatim so the
+    /// spawn error stays the honest NotFound. Hermetic via the injected
+    /// core the public edge wraps.
+    #[test]
+    fn launch_uses_the_detection_resolved_path() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi_dir = declared_dir(&AgentBackend::Kimi, home.path());
+        let installed = place_executable(&kimi_dir, "intendant-test-launch-kimi");
+
+        let detected = resolve_backend_command_path_in(
+            &AgentBackend::Kimi,
+            "intendant-test-launch-kimi",
+            None,
+            home.path(),
+        )
+        .expect("the declared dir resolves");
+        assert_eq!(
+            detected, installed,
+            "detection finds the declared-dir install"
+        );
+
+        // The launch half: same ladder, same inputs, same absolute path —
+        // detection-says-installed while launch-misses is impossible.
+        let program = resolve_backend_command_path_in(
+            &AgentBackend::Kimi,
+            "intendant-test-launch-kimi",
+            None,
+            home.path(),
+        )
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "intendant-test-launch-kimi".to_string());
+        assert_eq!(program, installed.to_string_lossy());
+
+        // The public edge agrees with the core on a command the real
+        // environment cannot resolve (unique name, nothing planted):
+        // verbatim passthrough.
+        assert_eq!(
+            launch_program(&AgentBackend::Kimi, "intendant-test-launch-absent"),
+            "intendant-test-launch-absent"
+        );
+    }
+
+    /// End to end through `backend_availability` (the incident pin): a
+    /// one-click install into the declared destination reports installed
+    /// on the next probe — no PATH surgery, no daemon restart — and
+    /// carries no hint. The genuinely-absent backends keep the narrowed
+    /// custom-location hint.
+    #[test]
+    fn availability_reports_declared_dir_installs_without_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi_dir = declared_dir(&AgentBackend::Kimi, home.path());
+        place_executable(&kimi_dir, "intendant-test-availability-kimi");
+
+        let mut config = crate::project::ExternalAgentConfig::default();
+        config.codex.command = "intendant-test-absent-codex".to_string();
+        config.codex.managed_command = None;
+        config.claude_code.command = "intendant-test-absent-claude".to_string();
+        config.kimi.command = "intendant-test-availability-kimi".to_string();
+        config.pi.command = "intendant-test-absent-pi".to_string();
+
+        let availability = backend_availability(&config, home.path());
+        let kimi = &availability[2];
+        assert_eq!(kimi.backend, AgentBackend::Kimi);
+        assert!(
+            kimi.installed,
+            "an install into the declared destination is installed NOW, not after a restart"
+        );
+        assert_eq!(kimi.path_hint, None, "installed backends carry no hint");
+
+        let codex = &availability[0];
+        assert!(!codex.installed);
+        let hint = codex
+            .path_hint
+            .as_deref()
+            .expect("bare missing commands get the hint");
+        for needle in [
+            "intendant-test-absent-codex was not found on the daemon's PATH",
+            "its installer's destination",
+            "picked up automatically",
+            "add that directory to the daemon's PATH and restart the Intendant daemon",
+        ] {
+            assert!(hint.contains(needle), "hint copy lost {needle:?}: {hint}");
+        }
+    }
+
+    /// The narrowed hint fires only where PATH is the story: bare names
+    /// get the genuinely-not-found copy (naming the declared destination
+    /// when the matrix has one), explicit paths stay hintless.
+    #[test]
+    fn path_inheritance_hint_narrows_to_genuinely_not_found() {
+        let home = tempfile::tempdir().unwrap();
+        let hint =
+            path_inheritance_hint(&AgentBackend::Kimi, "intendant-test-hint-kimi", home.path())
+                .expect("bare names get the hint");
+        assert!(
+            hint.contains(
+                &declared_dir(&AgentBackend::Kimi, home.path())
+                    .display()
+                    .to_string()
+            ),
+            "the hint names the matrix-declared destination: {hint}"
+        );
+
+        // No matrix lane (Pi): the generic wording, no destination named.
+        let pi_hint =
+            path_inheritance_hint(&AgentBackend::Pi, "intendant-test-hint-pi", home.path())
+                .expect("laneless backends still get the generic hint");
+        assert!(pi_hint.contains("the daemon's PATH or the well-known install directories"));
+        assert!(!pi_hint.contains("its installer's destination"));
+
+        // Explicit paths: PATH is not the story.
+        for explicit in [
+            home.path()
+                .join("bin")
+                .join("kimi")
+                .to_string_lossy()
+                .into_owned(),
+            "~/.kimi-code/bin/kimi".to_string(),
+            "rel/kimi".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                path_inheritance_hint(&AgentBackend::Kimi, &explicit, home.path()),
+                None,
+                "explicit path {explicit:?} must stay hintless"
+            );
+        }
     }
 
     #[test]

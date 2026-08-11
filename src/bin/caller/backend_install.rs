@@ -81,33 +81,59 @@ impl InstallPlatform {
 
 /// One cell of the matrix: the official, vendor-documented install
 /// command for `backend` on `platform`, verbatim as the approval wall
-/// announces and the runtime executes it.
+/// announces and the runtime executes it — plus the destination
+/// directories that installer places the CLI's launcher in.
 pub(crate) struct InstallLane {
     pub(crate) backend: AgentBackend,
     pub(crate) platform: InstallPlatform,
     pub(crate) command: &'static str,
+    /// Where the declared installer lands the launcher: home-relative
+    /// directories (components `/`-separated; joined per component so
+    /// Windows paths come out native), in search priority order. This is
+    /// the declaration backend *detection and launch* resolve through
+    /// when the daemon's inherited `PATH` misses — the daemon commonly
+    /// boots from launchd/a service with a minimal PATH, and an installer
+    /// that patched the owner's shell rc can never reach an
+    /// already-running daemon. The narrowed genuinely-not-found PATH hint
+    /// derives its named location from the same cell.
+    pub(crate) dest_dirs: &'static [&'static str],
 }
 
-/// The matrix. Sources ([external] claims, fetched 2026-08-08):
+/// The matrix. Sources ([external] claims, fetched 2026-08-08;
+/// destination dirs re-verified against the live install scripts
+/// 2026-08-11):
 ///
 /// - **Claude Code** — code.claude.com/docs/en/setup, "Native Install
 ///   (Recommended)": `curl -fsSL https://claude.ai/install.sh | bash`
 ///   (macOS/Linux/WSL); the Windows CMD lane is the vendor's own CMD tab
 ///   (the runtime's Windows shell is `cmd.exe /C`). npm/brew/winget lanes
-///   exist but the native installer is the documented primary.
+///   exist but the native installer is the documented primary. Both
+///   lanes download the versioned binary and run its own `claude
+///   install`, which lands the launcher in `~/.local/bin`
+///   (`%USERPROFILE%\.local\bin` on Windows; versions live under
+///   `~/.claude`).
 /// - **Codex** — github.com/openai/codex README: shell installer
 ///   `curl -fsSL https://chatgpt.com/codex/install.sh | sh` (macOS/Linux)
 ///   and the vendor's own PowerShell one-liner for Windows (documented in
 ///   the exact `powershell -ExecutionPolicy ByPass -c "…"` form, which is
 ///   cmd.exe-invokable). npm (`npm install -g @openai/codex`) and
-///   `brew install --cask codex` are documented alternatives.
+///   `brew install --cask codex` are documented alternatives. install.sh
+///   symlinks the launcher into `BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"`
+///   (releases under `~/.codex`); install.ps1's default visible bin dir
+///   is `$env:LOCALAPPDATA\Programs\OpenAI\Codex\bin` (declared here via
+///   LOCALAPPDATA's home-relative default — a registry-redirected
+///   LOCALAPPDATA falls back to the PATH rung).
 /// - **Kimi Code** — moonshotai.github.io/kimi-code getting-started:
 ///   install script (recommended, no Node required)
 ///   `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`;
 ///   Windows is the vendor's `irm https://code.kimi.com/kimi-code/install.ps1 | iex`
 ///   PowerShell lane, wrapped for the runtime's cmd.exe shell the same
 ///   way the Codex vendor documents theirs. npm alternative:
-///   `npm install -g @moonshot-ai/kimi-code`.
+///   `npm install -g @moonshot-ai/kimi-code`. Both scripts default
+///   `KIMI_INSTALL_DIR` to `~/.kimi-code` and land the launcher in its
+///   `bin/` (the 2026-08-11 owner e2e incident: the installer succeeded
+///   into `~/.kimi-code/bin` and patched `~/.zshrc`, which an
+///   already-running daemon can never inherit).
 /// - **Pi** deliberately has no lane: no vendor-documented single-command
 ///   installer of the same class, so the matrix says so and no button
 ///   renders for it.
@@ -116,58 +142,98 @@ const INSTALL_MATRIX: &[InstallLane] = &[
         backend: AgentBackend::ClaudeCode,
         platform: InstallPlatform::MacOs,
         command: "curl -fsSL https://claude.ai/install.sh | bash",
+        dest_dirs: &[".local/bin"],
     },
     InstallLane {
         backend: AgentBackend::ClaudeCode,
         platform: InstallPlatform::Linux,
         command: "curl -fsSL https://claude.ai/install.sh | bash",
+        dest_dirs: &[".local/bin"],
     },
     InstallLane {
         backend: AgentBackend::ClaudeCode,
         platform: InstallPlatform::Windows,
         command: "curl -fsSL https://claude.ai/install.cmd -o install.cmd && install.cmd && del install.cmd",
+        dest_dirs: &[".local/bin"],
     },
     InstallLane {
         backend: AgentBackend::Codex,
         platform: InstallPlatform::MacOs,
         command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        dest_dirs: &[".local/bin"],
     },
     InstallLane {
         backend: AgentBackend::Codex,
         platform: InstallPlatform::Linux,
         command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        dest_dirs: &[".local/bin"],
     },
     InstallLane {
         backend: AgentBackend::Codex,
         platform: InstallPlatform::Windows,
         command: "powershell -ExecutionPolicy ByPass -c \"irm https://chatgpt.com/codex/install.ps1 | iex\"",
+        dest_dirs: &["AppData/Local/Programs/OpenAI/Codex/bin"],
     },
     InstallLane {
         backend: AgentBackend::Kimi,
         platform: InstallPlatform::MacOs,
         command: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        dest_dirs: &[".kimi-code/bin"],
     },
     InstallLane {
         backend: AgentBackend::Kimi,
         platform: InstallPlatform::Linux,
         command: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        dest_dirs: &[".kimi-code/bin"],
     },
     InstallLane {
         backend: AgentBackend::Kimi,
         platform: InstallPlatform::Windows,
         command: "powershell -ExecutionPolicy Bypass -c \"irm https://code.kimi.com/kimi-code/install.ps1 | iex\"",
+        dest_dirs: &[".kimi-code/bin"],
     },
 ];
 
 /// The matrix cell for (`backend`, `platform`), if declared.
+fn install_lane(backend: &AgentBackend, platform: InstallPlatform) -> Option<&'static InstallLane> {
+    INSTALL_MATRIX
+        .iter()
+        .find(|lane| lane.backend == *backend && lane.platform == platform)
+}
+
+/// The install command for (`backend`, `platform`), if declared.
 pub(crate) fn install_command(
     backend: &AgentBackend,
     platform: InstallPlatform,
 ) -> Option<&'static str> {
-    INSTALL_MATRIX
-        .iter()
-        .find(|lane| lane.backend == *backend && lane.platform == platform)
-        .map(|lane| lane.command)
+    install_lane(backend, platform).map(|lane| lane.command)
+}
+
+/// The declared installer destination directories for (`backend`,
+/// `platform`), resolved under `home`, in search priority order. Empty
+/// when the matrix has no lane (Pi, untargeted platforms). Detection and
+/// launch resolve through these when the daemon's inherited `PATH`
+/// misses; the genuinely-not-found hint names the first one. `home` is
+/// injected (tests-are-hermetic).
+pub(crate) fn declared_install_dirs(
+    backend: &AgentBackend,
+    platform: InstallPlatform,
+    home: &std::path::Path,
+) -> Vec<PathBuf> {
+    install_lane(backend, platform)
+        .map(|lane| {
+            lane.dest_dirs
+                .iter()
+                .map(|spec| {
+                    let mut dir = home.to_path_buf();
+                    for component in spec.split('/') {
+                        dir.push(component);
+                    }
+                    dir
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The approval-rail preview: the backend, the EXACT command verbatim on
@@ -799,6 +865,24 @@ mod tests {
                     !command.contains('\n') && !command.contains('\r'),
                     "install commands are single-line by contract"
                 );
+                // Every lane declares where its installer lands the
+                // launcher — home-relative, so detection/launch can
+                // resolve it under any injected home.
+                assert!(
+                    !cells[0].dest_dirs.is_empty(),
+                    "{}/{} must declare its installer destination",
+                    backend.as_short_str(),
+                    platform.as_str()
+                );
+                for spec in cells[0].dest_dirs {
+                    assert!(
+                        !spec.is_empty()
+                            && !spec.starts_with('/')
+                            && !spec.starts_with('~')
+                            && !spec.contains('\\'),
+                        "dest dirs are home-relative `/`-separated specs: {spec:?}"
+                    );
+                }
             }
         }
         // Pi deliberately has no lane on any platform.
@@ -807,6 +891,53 @@ mod tests {
                 .iter()
                 .all(|lane| lane.backend != AgentBackend::Pi),
             "pi has no vendor install lane by decision — adding one belongs in the matrix comment"
+        );
+    }
+
+    /// The declared destinations match the actual install scripts'
+    /// behavior (verified 2026-08-11): kimi lands in `~/.kimi-code/bin`
+    /// everywhere (the owner-e2e incident dir), claude and codex in
+    /// `~/.local/bin` on macOS/Linux, and codex's Windows installer in
+    /// LOCALAPPDATA's `Programs\OpenAI\Codex\bin`. `declared_install_dirs`
+    /// resolves them under the injected home.
+    #[test]
+    fn declared_destinations_match_the_official_installers() {
+        let home = std::path::Path::new("test-home");
+        for platform in PLATFORMS {
+            assert_eq!(
+                declared_install_dirs(&AgentBackend::Kimi, platform, home),
+                vec![home.join(".kimi-code").join("bin")],
+                "kimi installs into ~/.kimi-code/bin on {}",
+                platform.as_str()
+            );
+            assert_eq!(
+                declared_install_dirs(&AgentBackend::ClaudeCode, platform, home),
+                vec![home.join(".local").join("bin")],
+                "claude's native installer lands in ~/.local/bin on {}",
+                platform.as_str()
+            );
+            assert!(
+                declared_install_dirs(&AgentBackend::Pi, platform, home).is_empty(),
+                "pi has no lane, so no declared destinations"
+            );
+        }
+        assert_eq!(
+            declared_install_dirs(&AgentBackend::Codex, InstallPlatform::MacOs, home),
+            vec![home.join(".local").join("bin")]
+        );
+        assert_eq!(
+            declared_install_dirs(&AgentBackend::Codex, InstallPlatform::Linux, home),
+            vec![home.join(".local").join("bin")]
+        );
+        assert_eq!(
+            declared_install_dirs(&AgentBackend::Codex, InstallPlatform::Windows, home),
+            vec![home
+                .join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")]
         );
     }
 
@@ -1044,7 +1175,7 @@ mod tests {
             "function agentInstallSection",
             "api_external_agent_install",
             "the exact command is on the approval rail",
-            "The daemon inherited its PATH at launch",
+            "any install location the daemon checks",
             "Intendant can run its official installer here, with your approval first.",
             "log-empty-install",
         ] {

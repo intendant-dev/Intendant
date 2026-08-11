@@ -1544,9 +1544,10 @@ pub fn resolve_command_path(command: &str) -> Option<std::path::PathBuf> {
     resolve_command_path_in(command, std::env::var_os("PATH"))
 }
 
-/// `PATH` is injected so tests don't have to mutate process-global env
-/// (which races the parallel test runner).
-fn resolve_command_path_in(
+/// `PATH` is injected so tests (and callers composing their own
+/// resolution ladders) don't have to mutate process-global env — which
+/// races the parallel test runner.
+pub fn resolve_command_path_in(
     command: &str,
     path_var: Option<std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
@@ -1571,6 +1572,14 @@ fn resolve_command_path_in(
         }
     }
     None
+}
+
+/// Whether an executable named `command` exists in `dir` — the per-dir
+/// probe callers use to search declared installer destinations that are
+/// not on `PATH` (Windows gets the same `PATHEXT`-style suffix handling
+/// as `PATH` resolution). Stat-only; never executes anything.
+pub fn executable_in_dir(dir: &std::path::Path, command: &str) -> Option<std::path::PathBuf> {
+    executable_candidate(&dir.join(command))
 }
 
 /// The candidate itself on Unix (a regular file with an execute bit); on
@@ -1629,9 +1638,10 @@ pub fn off_path_install_probe(command: &str) -> Option<OffPathInstall> {
     off_path_install_probe_in(command, std::env::var_os("PATH"), &home_dir())
 }
 
-/// `PATH` and the home directory are injected so tests never read or
-/// mutate process-global state (the tests-are-hermetic convention).
-fn off_path_install_probe_in(
+/// `PATH` and the home directory are injected so tests (and callers
+/// composing their own resolution ladders) never read or mutate
+/// process-global state (the tests-are-hermetic convention).
+pub fn off_path_install_probe_in(
     command: &str,
     path_var: Option<std::ffi::OsString>,
     home: &std::path::Path,

@@ -353,7 +353,12 @@ impl VoiceAppServer {
     ) -> Result<Self, String> {
         std::fs::create_dir_all(neutral_cwd)
             .map_err(|e| format!("create neutral cwd {}: {e}", neutral_cwd.display()))?;
-        let mut cmd = crate::platform::spawn_command(command);
+        // The codex CLI through detection's resolution ladder, not the
+        // daemon's inherited PATH — same contract as the wrapper spawns.
+        let mut cmd = crate::external_agent::spawn_backend_command(
+            &crate::external_agent::AgentBackend::Codex,
+            command,
+        );
         cmd.args(voice_app_server_args())
             .current_dir(neutral_cwd)
             .stdin(std::process::Stdio::piped())

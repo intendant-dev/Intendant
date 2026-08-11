@@ -599,12 +599,19 @@ pub(crate) async fn run_identity_probe(
     provider: Provider,
     command: &str,
 ) -> Result<AuthProbe, String> {
-    let (program, mut args) = crate::auth_ceremony::pty_program_invocation(command);
-    match provider {
-        Provider::Claude => args.extend(["auth".to_string(), "status".to_string()]),
-        Provider::Codex => args.extend(["login".to_string(), "status".to_string()]),
+    let (backend, probe_args) = match provider {
+        Provider::Claude => (
+            crate::external_agent::AgentBackend::ClaudeCode,
+            ["auth", "status"],
+        ),
+        Provider::Codex => (
+            crate::external_agent::AgentBackend::Codex,
+            ["login", "status"],
+        ),
         Provider::Kimi => return Err("kimi is out of scope for the credential watch".to_string()),
-    }
+    };
+    let (program, mut args) = crate::auth_ceremony::pty_program_invocation(&backend, command);
+    args.extend(probe_args.into_iter().map(String::from));
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .stdin(std::process::Stdio::null())
