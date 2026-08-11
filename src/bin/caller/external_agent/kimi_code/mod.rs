@@ -11,6 +11,7 @@
 
 mod bridge;
 mod events;
+mod onboarding;
 mod review;
 mod rpc;
 mod runtime;
@@ -34,7 +35,8 @@ use crate::error::CallerError;
 
 pub(crate) use self::bridge::{
     capture_kimi_credential_baseline, install_kimi_credential_if_unchanged,
-    sync_managed_bridges_to_primary, KimiCredentialBaseline, KimiCredentialInstall,
+    seed_kimi_ceremony_credential, sync_managed_bridges_to_primary, KimiCredentialBaseline,
+    KimiCredentialInstall,
 };
 use self::bridge::{
     choose_mcp_server_name, prepare_bridge_home, sync_bridge_home_to_primary, BridgeMcpConfig,
@@ -43,6 +45,9 @@ use self::bridge::{
 use self::events::{
     child_thread_id, normalize_goal_status, question_answer_body, split_child_thread_id,
     KimiSharedState,
+};
+pub(crate) use self::onboarding::{
+    ceremony_home_provisioned, complete_managed_onboarding, providers_configured,
 };
 use self::rpc::{KimiGoalBudgetLimits, KimiRpcApi, KimiRpcModel, KimiRpcTool};
 use self::runtime::*;
@@ -142,6 +147,10 @@ pub struct KimiCodeAgent {
         Option<crate::web_gateway::session_catalog::kimi_history::KimiTurnHorizon>,
     mcp_auth_token: Option<String>,
     mcp_session_id: Option<String>,
+    /// The user-facing Kimi data home the bridge mirrors — kept for honest
+    /// error remediation (the 40110 onboarding refusal names finish-setup
+    /// only when this home really holds a credential).
+    primary_home: Option<PathBuf>,
     bridge_home: Option<PathBuf>,
     credential_refresh: Option<CredentialRefreshMonitor>,
     review_lease: Arc<tokio::sync::Mutex<Option<KimiReviewToolLease>>>,
@@ -183,6 +192,7 @@ impl KimiCodeAgent {
             fork_expected_horizon: None,
             mcp_auth_token: None,
             mcp_session_id: None,
+            primary_home: None,
             bridge_home: None,
             credential_refresh: None,
             review_lease: Arc::new(tokio::sync::Mutex::new(None)),
@@ -398,6 +408,40 @@ impl KimiCodeAgent {
         self.launch.model.take()
     }
 
+    /// Rewrite Kimi's bare "no provider configured" onboarding refusal
+    /// (wire code 40110 — card 01KZR9YHTX) into an actionable session
+    /// error. The refusal means the home is unonboarded: kimi's `/login`
+    /// writes both the credential and the managed provider entries in
+    /// `config.toml`, and `ensureReady` kills every prompts call until a
+    /// provider exists. When a credential already exists (signed in but
+    /// unonboarded — the incident state) the remedy is the Vault card's
+    /// Finish setup, which re-runs the sign-in ceremony non-interactively
+    /// on the existing credential; otherwise it is a plain sign-in. Any
+    /// other error passes through untouched.
+    fn onboarding_remediated(&self, error: CallerError) -> CallerError {
+        if !wire::provider_onboarding_refusal(&error) {
+            return error;
+        }
+        let signed_in = self
+            .primary_home
+            .as_deref()
+            .is_some_and(|home| home.join("credentials").join("kimi-code.json").is_file());
+        let remedy = if signed_in {
+            "Kimi is signed in on this machine, but onboarding never finished: its config.toml \
+             has no provider entries, which kimi's own login normally writes. Open the Vault \
+             tab's Kimi card and use \"Finish setup\" — it completes onboarding on the existing \
+             sign-in, usually without any browser step."
+        } else {
+            "Kimi has no provider configured on this machine because it is not signed in. Sign \
+             in from the Vault tab's Kimi card; the sign-in completes onboarding."
+        };
+        let base = match &error {
+            CallerError::ExternalAgent(message) => message.clone(),
+            other => other.to_string(),
+        };
+        external(format!("{base}. {remedy}"))
+    }
+
     async fn submit_content(
         &mut self,
         thread: &AgentThread,
@@ -424,7 +468,11 @@ impl KimiCodeAgent {
         let result = self
             .api()?
             .submit_prompt(&session_id, content, Value::Object(overrides))
-            .await?;
+            .await
+            // The incident seam (card 01KZR9YHTX): an unonboarded home's
+            // very first prompts call dies with the 40110 provider refusal
+            // — surface the finish-setup remedy, never the bare wire error.
+            .map_err(|error| self.onboarding_remediated(error))?;
         let status = result
             .get("status")
             .and_then(Value::as_str)
@@ -1493,6 +1541,7 @@ impl ExternalAgent for KimiCodeAgent {
             .or_else(|| std::env::var_os("KIMI_CODE_HOME").map(PathBuf::from))
             .or_else(|| dirs::home_dir().map(|home| home.join(".kimi-code")))
             .ok_or_else(|| external("could not resolve Kimi data home"))?;
+        self.primary_home = Some(primary_home.clone());
         let identity = self
             .mcp_session_id
             .clone()
@@ -1780,7 +1829,7 @@ impl ExternalAgent for KimiCodeAgent {
                             .create_session(&working_dir, self.session_agent_config())
                             .await?
                     }
-                    None => return Err(error),
+                    None => return Err(self.onboarding_remediated(error)),
                 },
             }
         };
@@ -1823,7 +1872,7 @@ impl ExternalAgent for KimiCodeAgent {
                             .update_profile(&session_id, self.session_agent_config())
                             .await?
                     }
-                    None => return Err(error),
+                    None => return Err(self.onboarding_remediated(error)),
                 },
             };
             if let Some(names) = self.launch.allowed_tools.clone() {
@@ -3255,6 +3304,89 @@ mod tests {
         assert_eq!(agent.degradable_launch_model(&refusal), None);
         // And the launch config stops sending the dead pin.
         assert!(agent.session_agent_config().get("model").is_none());
+    }
+
+    /// The onboarding remediation (card 01KZR9YHTX): only the 40110
+    /// provider refusal is rewritten, and the remedy names Finish setup
+    /// exactly when the primary home really holds a credential.
+    #[test]
+    fn onboarding_remediation_names_finish_setup_for_a_signed_in_home() {
+        let primary = tempfile::tempdir().unwrap();
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.primary_home = Some(primary.path().to_path_buf());
+        let incident = || {
+            external(
+                "Kimi /sessions/session_x/prompts failed (HTTP 200, code 40110): \
+                 no provider configured; complete onboarding via /login or the providers endpoint",
+            )
+        };
+
+        // Signed out: the remedy is a plain sign-in.
+        let remediated = agent.onboarding_remediated(incident()).to_string();
+        assert!(remediated.contains("code 40110"), "{remediated}");
+        assert!(remediated.contains("not signed in"), "{remediated}");
+        assert!(remediated.contains("Vault tab"), "{remediated}");
+
+        // The incident state — credential present, no providers: the
+        // remedy is the Vault card's Finish setup completion lane.
+        fs::create_dir_all(primary.path().join("credentials")).unwrap();
+        fs::write(
+            primary.path().join("credentials").join("kimi-code.json"),
+            b"{}",
+        )
+        .unwrap();
+        let remediated = agent.onboarding_remediated(incident()).to_string();
+        assert!(remediated.contains("code 40110"), "{remediated}");
+        assert!(remediated.contains("Finish setup"), "{remediated}");
+        assert!(
+            remediated.contains("onboarding never finished"),
+            "{remediated}"
+        );
+        // No nested "External agent error:" prefixes from the rewrite.
+        assert_eq!(remediated.matches("External agent error:").count(), 1);
+
+        // Unrelated errors pass through untouched.
+        let unrelated =
+            external("Kimi /sessions/session_x/prompts failed (HTTP 200, code 40001): bad");
+        let passthrough = agent.onboarding_remediated(unrelated).to_string();
+        assert!(!passthrough.contains("Finish setup"), "{passthrough}");
+    }
+
+    /// The incident seam end to end: the very first prompts call against a
+    /// signed-in-but-unonboarded home returns the exact captured 40110
+    /// envelope, and the session error the supervisor surfaces names the
+    /// finish-setup remedy instead of the bare wire failure.
+    #[tokio::test]
+    async fn submit_wraps_the_40110_provider_refusal_with_finish_setup() {
+        let (origin, _requests, server) = sequential_mock_server(vec![serde_json::json!({
+            "code": 40110,
+            "msg": "no provider configured; complete onboarding via /login or the providers endpoint",
+            "data": null
+        })])
+        .await;
+        let primary = tempfile::tempdir().unwrap();
+        fs::create_dir_all(primary.path().join("credentials")).unwrap();
+        fs::write(
+            primary.path().join("credentials").join("kimi-code.json"),
+            b"{}",
+        )
+        .unwrap();
+        let mut agent = KimiCodeAgent::new("kimi".into(), launch(), None);
+        agent.primary_home = Some(primary.path().to_path_buf());
+        agent.api = Some(KimiApi::new(origin, "test-token".into()).unwrap());
+        agent.shared.set_session_id(Some("session_x".to_string()));
+
+        let thread = AgentThread {
+            thread_id: "session_x".to_string(),
+        };
+        let error = agent
+            .send_message(&thread, "hello")
+            .await
+            .expect_err("an unonboarded home must fail the prompt");
+        let message = error.to_string();
+        assert!(message.contains("code 40110"), "{message}");
+        assert!(message.contains("Finish setup"), "{message}");
+        server.await.unwrap();
     }
 
     /// The 2026-08-11 owner incident end to end: a fresh Kimi install

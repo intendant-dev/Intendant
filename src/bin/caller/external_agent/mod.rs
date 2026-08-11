@@ -1211,6 +1211,12 @@ pub struct BackendAvailability {
     /// the platform stores credentials out of stat's reach (Claude Code
     /// keeps them in the keychain on macOS), so absence proves nothing.
     pub local_login: Option<bool>,
+    /// Kimi only: `Some(true)` when the home is signed in but unonboarded —
+    /// the credential exists while `config.toml` declares no provider, so
+    /// every session dies at its first prompts call (wire code 40110) until
+    /// setup is finished. `Some(false)` = signed in and onboarded; `None` =
+    /// signed out, probe unknown, or a backend without the concept.
+    pub login_incomplete: Option<bool>,
     /// Passive, zero-additional-quota compatibility evidence for the exact
     /// configured executable artifact and current adapter contract.
     pub compatibility: protocol_watch::PassiveCompatibilityStatus,
@@ -1256,17 +1262,47 @@ fn kimi_local_login(home: &Path) -> Option<bool> {
     kimi_local_login_in(std::env::var_os("KIMI_CODE_HOME"), home)
 }
 
+fn kimi_home_in(env_kimi_home: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    env_kimi_home
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".kimi-code"))
+}
+
 /// `KIMI_CODE_HOME` injected for hermetic tests.
 fn kimi_local_login_in(env_kimi_home: Option<std::ffi::OsString>, home: &Path) -> Option<bool> {
-    let kimi_home = env_kimi_home
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".kimi-code"));
     Some(
-        kimi_home
+        kimi_home_in(env_kimi_home, home)
             .join("credentials")
             .join("kimi-code.json")
             .is_file(),
     )
+}
+
+fn kimi_login_incomplete(home: &Path) -> Option<bool> {
+    kimi_login_incomplete_in(std::env::var_os("KIMI_CODE_HOME"), home)
+}
+
+/// Whether the Kimi home is *signed in but unonboarded* — a credential
+/// exists while `config.toml` declares no provider (card 01KZR9YHTX: kimi's
+/// own `/login` writes both, so this state means onboarding never finished
+/// on this machine, and every session dies at its first prompts call with
+/// wire code 40110). `Some(true)` = finish setup; `Some(false)` = signed in
+/// and onboarded; `None` = signed out (nothing to finish — the plain
+/// sign-in copy owns that state) or the config is unreadable (unknown, not
+/// a verdict). `KIMI_CODE_HOME` injected for hermetic tests.
+fn kimi_login_incomplete_in(
+    env_kimi_home: Option<std::ffi::OsString>,
+    home: &Path,
+) -> Option<bool> {
+    let kimi_home = kimi_home_in(env_kimi_home, home);
+    if !kimi_home
+        .join("credentials")
+        .join("kimi-code.json")
+        .is_file()
+    {
+        return None;
+    }
+    kimi_code::providers_configured(&kimi_home).map(|configured| !configured)
 }
 
 fn pi_local_login(home: &Path) -> Option<bool> {
@@ -1419,6 +1455,10 @@ pub fn backend_availability(
             AgentBackend::Kimi => kimi_local_login(home),
             AgentBackend::Pi => pi_local_login(home),
         };
+        let login_incomplete = match backend {
+            AgentBackend::Kimi => kimi_login_incomplete(home),
+            _ => None,
+        };
         let (compatibility_command, compatibility_profile) = match backend {
             AgentBackend::Codex => {
                 let managed = crate::project::codex_managed_context_enabled(
@@ -1451,6 +1491,7 @@ pub fn backend_availability(
             last_used_secs,
             leased,
             local_login,
+            login_incomplete,
             compatibility,
             path_hint,
         }
@@ -1520,6 +1561,7 @@ pub fn backend_availability_json(
                     "last_used_secs": info.last_used_secs,
                     "leased": info.leased,
                     "local_login": info.local_login,
+                    "login_incomplete": info.login_incomplete,
                     "compatibility": info.compatibility,
                     "path_hint": info.path_hint,
                 })
@@ -3051,6 +3093,114 @@ mod tests {
         assert_eq!(
             pi_local_login_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
             Some(false)
+        );
+    }
+
+    /// The signed-in-but-unonboarded truth table (card 01KZR9YHTX): the
+    /// incomplete verdict exists only where a credential exists, mirrors
+    /// kimi's own ensureReady provider gate, and never guesses through an
+    /// unreadable config.
+    #[test]
+    fn kimi_login_incomplete_probe_truth_table() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi_home = home.path().join(".kimi-code");
+
+        // Signed out: nothing to finish, whatever the config says.
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), None);
+        std::fs::create_dir_all(&kimi_home).unwrap();
+        std::fs::write(
+            kimi_home.join("config.toml"),
+            "# Login will populate managed Kimi provider and model entries.\n",
+        )
+        .unwrap();
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), None);
+
+        // The incident state: credential present + the comment-only stub.
+        std::fs::create_dir_all(kimi_home.join("credentials")).unwrap();
+        std::fs::write(kimi_home.join("credentials/kimi-code.json"), b"{}").unwrap();
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), Some(true));
+
+        // Credential present, config absent entirely: still unonboarded.
+        std::fs::remove_file(kimi_home.join("config.toml")).unwrap();
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), Some(true));
+
+        // Any configured provider passes kimi's gate — onboarded.
+        std::fs::write(
+            kimi_home.join("config.toml"),
+            "[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n",
+        )
+        .unwrap();
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), Some(false));
+
+        // Unreadable config: unknown, never a verdict.
+        std::fs::write(kimi_home.join("config.toml"), "providers = [broken").unwrap();
+        assert_eq!(kimi_login_incomplete_in(None, home.path()), None);
+
+        // KIMI_CODE_HOME redirects the probe wholesale.
+        let alt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(alt.path().join("credentials")).unwrap();
+        std::fs::write(alt.path().join("credentials/kimi-code.json"), b"{}").unwrap();
+        assert_eq!(
+            kimi_login_incomplete_in(Some(alt.path().as_os_str().to_os_string()), home.path()),
+            Some(true)
+        );
+    }
+
+    /// The dashboard contract for the finish-setup lane: the availability
+    /// wire row carries `login_incomplete`, and the Vault card fragment
+    /// consumes it with the finish-setup affordance (needle-pinned so a
+    /// fragment rewrite that drops the state fails here instead of
+    /// shipping as drift).
+    #[test]
+    fn login_incomplete_reaches_the_availability_wire_and_vault_card() {
+        let home = tempfile::tempdir().unwrap();
+        let kimi_home = home.path().join(".kimi-code");
+        std::fs::create_dir_all(kimi_home.join("credentials")).unwrap();
+        std::fs::write(kimi_home.join("credentials/kimi-code.json"), b"{}").unwrap();
+
+        let mut config = crate::project::ExternalAgentConfig::default();
+        config.codex.command = "intendant-test-absent-codex".to_string();
+        config.claude_code.command = "intendant-test-absent-claude".to_string();
+        config.kimi.command = "intendant-test-absent-kimi".to_string();
+        config.pi.command = "intendant-test-absent-pi".to_string();
+        // The kimi probes honor KIMI_CODE_HOME; pin them to the injected
+        // home for the duration (mutate/restore under the env lock).
+        let _env = crate::test_support::TEST_ENV_LOCK.blocking_lock();
+        let saved = std::env::var_os("KIMI_CODE_HOME");
+        std::env::remove_var("KIMI_CODE_HOME");
+        let rows = backend_availability_json(&config, home.path());
+        match &saved {
+            Some(value) => std::env::set_var("KIMI_CODE_HOME", value),
+            None => std::env::remove_var("KIMI_CODE_HOME"),
+        }
+        drop(_env);
+        let kimi_row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "kimi")
+            .unwrap();
+        assert_eq!(kimi_row["login_incomplete"], serde_json::json!(true));
+        let codex_row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "codex")
+            .unwrap();
+        assert_eq!(codex_row["login_incomplete"], serde_json::Value::Null);
+
+        let vault_fragment = include_str!("../../../../static/app/32-vault-custody.js");
+        assert!(
+            vault_fragment.contains("login_incomplete"),
+            "the Vault card must consume the availability row's login_incomplete field"
+        );
+        assert!(
+            vault_fragment.contains("Sign-in incomplete"),
+            "the Vault card must render the partial state"
+        );
+        assert!(
+            vault_fragment.contains("Finish setup"),
+            "the partial state's affordance must be the finish-setup lane"
         );
     }
 

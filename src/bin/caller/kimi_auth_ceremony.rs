@@ -18,7 +18,8 @@ use crate::auth_ceremony::{
     AuthProbe, CeremonyAccount, CeremonyPhase, Provider, StartRefusal,
 };
 use crate::external_agent::kimi_code::{
-    capture_kimi_credential_baseline, install_kimi_credential_if_unchanged, KimiCredentialBaseline,
+    capture_kimi_credential_baseline, ceremony_home_provisioned, complete_managed_onboarding,
+    install_kimi_credential_if_unchanged, seed_kimi_ceremony_credential, KimiCredentialBaseline,
     KimiCredentialInstall,
 };
 
@@ -53,7 +54,17 @@ impl CredentialPromotion {
     }
 
     /// Promote the isolated login exactly once. `Ok(None)` means the CLI has
-    /// not finished writing a valid credential yet, so the poller should retry.
+    /// not finished sign-in AND onboarding yet, so the poller should retry.
+    ///
+    /// Kimi's own `/login` writes two halves — the credential, then the
+    /// managed provider+model entries its provisioner fetches into
+    /// `config.toml` (card 01KZR9YHTX: promoting only the credential leaves
+    /// the primary home signed in but unonboarded, and every session dies at
+    /// its first prompts call with wire code 40110). Promotion therefore
+    /// waits for the ceremony home to be BOTH logged in and provisioned —
+    /// there is a real window where the credential exists and the model
+    /// fetch is still in flight — and completes by installing the credential
+    /// and then merging the managed config entries into the primary home.
     fn probe_and_promote(&self) -> Result<Option<AuthProbe>, String> {
         let mut state = self
             .inner
@@ -66,12 +77,28 @@ impl CredentialPromotion {
         else {
             return Ok(None);
         };
+        if !ceremony_home_provisioned(&state.ceremony_home) {
+            return Ok(None);
+        }
         let completed = match install_kimi_credential_if_unchanged(
             &state.primary_home,
             &state.ceremony_home,
             state.baseline,
         ) {
-            Ok(KimiCredentialInstall::Installed) => Ok(probe),
+            Ok(KimiCredentialInstall::Installed) => {
+                // The credential is in. Finish the onboarding half with the
+                // provider entries this exact login just wrote; a failure
+                // here leaves the honest partial state the Vault card
+                // renders as "Sign-in incomplete — finish setup".
+                match complete_managed_onboarding(&state.primary_home, &state.ceremony_home) {
+                    Ok(()) => Ok(probe),
+                    Err(error) => Err(format!(
+                        "Kimi signed in, but installing its provider entries into config.toml \
+                         failed ({error}); sessions will refuse to start until setup is finished \
+                         — use Finish setup on the Vault tab's Kimi card"
+                    )),
+                }
+            }
             Ok(KimiCredentialInstall::SourceChanged) => Err(
                 "Kimi credentials changed in another login, logout, or refresh while this \
                  ceremony was running; the concurrent credential was preserved"
@@ -299,7 +326,15 @@ fn spawn_ceremony_process(id: u64, command: &str, primary_home: PathBuf) -> Resu
     };
     let ceremony_home = shim_parent.join("kimi-home");
     ensure_private_ceremony_directory(&ceremony_home)?;
-    let promotion = CredentialPromotion::new(primary_home, ceremony_home.clone())?;
+    let promotion = CredentialPromotion::new(primary_home.clone(), ceremony_home.clone())?;
+    // Seed the isolated home with the current credential (when one exists):
+    // kimi's login then refreshes and re-provisions without a device-code
+    // round trip, which makes this same ceremony the "finish setup" lane for
+    // a signed-in-but-unonboarded home. Best-effort — an unreadable primary
+    // credential simply leaves the normal interactive device flow, which
+    // completes onboarding all the same. The promotion baseline was captured
+    // above, before this copy, so the concurrent-change CAS is unaffected.
+    let _ = seed_kimi_ceremony_credential(&primary_home, &ceremony_home);
 
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
@@ -427,8 +462,9 @@ fn reader_thread(
             Ok(None) => {
                 manager().spawn_failed(
                     id,
-                    "Kimi login exited without producing an authenticated credential; the \
-                     previous login was preserved"
+                    "Kimi login exited without completing sign-in and onboarding (its \
+                     credential or managed provider entries never appeared); the previous \
+                     login was preserved"
                         .to_string(),
                 );
                 return;
@@ -598,13 +634,46 @@ mod tests {
         assert!(custody_refusal_for(false).is_none());
     }
 
+    /// A login-provisioned ceremony config.toml in the exact shape kimi
+    /// 0.34.0's own provisioner writes (captured live on this seat).
+    const PROVISIONED_CEREMONY_CONFIG: &str = r#"default_model = "kimi-code/k3"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+api_key = ""
+base_url = "https://api.kimi.com/coding/v1"
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+max_context_size = 1048576
+display_name = "K3"
+"#;
+
+    /// The two-halves promotion gate and full completion (card 01KZR9YHTX):
+    /// nothing is promoted while the ceremony home lacks a valid credential,
+    /// nothing is promoted while the login has written its credential but
+    /// not yet its provider entries (the mid-login race that used to
+    /// recreate the incident state), and completion installs BOTH the
+    /// credential and the managed config.toml entries — the ceremony-complete
+    /// verdict is credentials present AND providers configured.
     #[test]
-    fn isolated_promotion_preserves_primary_until_a_valid_login_exists() {
+    fn isolated_promotion_completes_credential_and_onboarding_halves() {
         let temp = tempfile::tempdir().unwrap();
         let primary = temp.path().join("primary");
         let ceremony = temp.path().join("ceremony");
         std::fs::create_dir_all(primary.join("credentials")).unwrap();
         std::fs::create_dir_all(ceremony.join("credentials")).unwrap();
+        // The incident's primary state: fresh-install comment-only stub.
+        std::fs::write(
+            primary.join("config.toml"),
+            "# Login will populate managed Kimi provider and model entries.\n",
+        )
+        .unwrap();
         let old = serde_json::to_vec(&serde_json::json!({
             "refresh_token": "synthetic-old"
         }))
@@ -616,14 +685,73 @@ mod tests {
         std::fs::write(credentials_path(&primary), &old).unwrap();
         let promotion = CredentialPromotion::new(primary.clone(), ceremony.clone()).unwrap();
 
+        // No ceremony credential yet.
         assert_eq!(promotion.probe_and_promote().unwrap(), None);
         assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), old);
 
+        // Credential written, provisioning still in flight: not promotable.
         std::fs::write(credentials_path(&ceremony), &new).unwrap();
+        assert_eq!(promotion.probe_and_promote().unwrap(), None);
+        assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), old);
+
+        // Provisioning lands: the promotion installs the credential AND the
+        // managed provider entries, and the primary passes the same provider
+        // gate kimi's ensureReady enforces at the prompts call.
+        std::fs::write(ceremony.join("config.toml"), PROVISIONED_CEREMONY_CONFIG).unwrap();
         assert!(promotion
             .probe_and_promote()
             .unwrap()
             .is_some_and(|probe| probe.logged_in));
         assert_eq!(std::fs::read(credentials_path(&primary)).unwrap(), new);
+        assert_eq!(
+            crate::external_agent::kimi_code::providers_configured(&primary),
+            Some(true)
+        );
+        let config = std::fs::read_to_string(primary.join("config.toml")).unwrap();
+        assert!(
+            config.contains("[providers.\"managed:kimi-code\"]"),
+            "{config}"
+        );
+        assert!(config.contains("[models.\"kimi-code/k3\"]"), "{config}");
+    }
+
+    /// The finish-setup lane: a primary that is already signed in (the
+    /// seeded, non-interactive relogin) but unonboarded gets its provider
+    /// entries; the concurrent-change CAS still owns the credential half.
+    #[test]
+    fn seeded_completion_onboards_a_signed_in_but_unonboarded_primary() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let ceremony = temp.path().join("ceremony");
+        std::fs::create_dir_all(primary.join("credentials")).unwrap();
+        let credential = serde_json::to_vec(&serde_json::json!({
+            "refresh_token": "synthetic-existing"
+        }))
+        .unwrap();
+        std::fs::write(credentials_path(&primary), &credential).unwrap();
+        let promotion = CredentialPromotion::new(primary.clone(), ceremony.clone()).unwrap();
+
+        // What spawn_ceremony_process does: seed the ceremony home from the
+        // primary so kimi's login runs its non-interactive refresh path.
+        std::fs::create_dir_all(&ceremony).unwrap();
+        assert!(
+            crate::external_agent::kimi_code::seed_kimi_ceremony_credential(&primary, &ceremony)
+                .unwrap()
+        );
+        // Login re-provisions the config; the (possibly unrotated) seeded
+        // credential plus the provisioned config complete the ceremony.
+        std::fs::write(ceremony.join("config.toml"), PROVISIONED_CEREMONY_CONFIG).unwrap();
+        assert!(promotion
+            .probe_and_promote()
+            .unwrap()
+            .is_some_and(|probe| probe.logged_in));
+        assert_eq!(
+            std::fs::read(credentials_path(&primary)).unwrap(),
+            credential
+        );
+        assert_eq!(
+            crate::external_agent::kimi_code::providers_configured(&primary),
+            Some(true)
+        );
     }
 }

@@ -2260,6 +2260,22 @@ function agentSigninMissingAvailability(spec) {
   return entry && entry.installed === false ? entry : null;
 }
 
+/* The signed-in-but-unonboarded partial state (today only Kimi reports it):
+   the availability row's `login_incomplete === true` means the backend's
+   credential exists while its config declares no provider — sign-in
+   finished, onboarding didn't (kimi's own login writes both), and every
+   session dies at its first prompt (wire code 40110) until setup is
+   finished. The affordance is the SAME sign-in ceremony: the daemon seeds
+   the isolated login with the existing credential, so the backend
+   re-provisions on the current account, usually with no browser step. */
+function agentSigninIncompleteAvailability(spec) {
+  if (!Array.isArray(externalAgentAvailability)) return null;
+  const entry = externalAgentAvailability.find(
+    agent => agent && agent.id === spec.sessionKind
+  );
+  return entry && entry.login_incomplete === true ? entry : null;
+}
+
 /* The approval-gated Install lane on a not-installed card. Everything
    renders from the availability row's `install` object, which the daemon
    derives from its install-command matrix (`available` + the exact
@@ -2553,6 +2569,23 @@ function agentSigninProviderCard(provider) {
       const other = AGENT_SIGNIN_PROVIDERS[busyWith]?.label || busyWith;
       note(
         `A ${other} sign-in ceremony is running — one credential ceremony at a time on this daemon.`
+      );
+      return card;
+    }
+    if (phase === 'idle' && agentSigninIncompleteAvailability(spec)) {
+      const setupChip = document.createElement('span');
+      setupChip.className = 'vault-chip warn';
+      setupChip.textContent = 'setup incomplete';
+      head.appendChild(setupChip);
+      note(
+        `Sign-in incomplete — finish setup. ${spec.label} is signed in on this machine, but ` +
+          'onboarding never finished: its config has no provider entries (the sign-in normally ' +
+          'writes them), so sessions fail at their first prompt until setup completes. Finish ' +
+          'setup completes onboarding on the existing account — usually with no browser step.',
+        'vault-warning'
+      );
+      actionsRow(
+        vaultButton('Finish setup', () => agentSigninStart(provider), { primary: true })
       );
       return card;
     }
