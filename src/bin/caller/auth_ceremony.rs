@@ -818,20 +818,34 @@ pub(crate) fn url_from_shim_log(
     None
 }
 
-/// PTY program resolution mirroring `platform::spawn_command`'s rules: on
-/// Windows a bare npm-shim name (`claude` → `claude.cmd`) needs PATHEXT
-/// resolution and a `cmd.exe /C` wrapper; everywhere else the name passes
-/// through.
-pub(crate) fn pty_program_invocation(command: &str) -> (String, Vec<String>) {
+/// PTY program resolution for a backend CLI: the shared detection/launch
+/// ladder picks the actual binary first (the daemon's PATH, then the
+/// backend's declared installer destinations, then the well-known
+/// install dirs — `external_agent::launch_program`), so a CLI that
+/// availability reports installed also signs in without PATH surgery.
+/// The platform shaping then mirrors `platform::spawn_command`'s rules:
+/// on Windows a `.cmd`/`.bat` npm shim needs a `cmd.exe /C` wrapper
+/// (CreateProcess cannot exec batch files, and portable_pty has no
+/// implicit shim); everywhere else the resolved program passes through.
+pub(crate) fn pty_program_invocation(
+    backend: &crate::external_agent::AgentBackend,
+    command: &str,
+) -> (String, Vec<String>) {
+    let program = crate::external_agent::launch_program(backend, command);
     #[cfg(windows)]
     {
-        let lower = command.to_ascii_lowercase();
-        if !(command.contains('/')
-            || command.contains('\\')
+        let lower = program.to_ascii_lowercase();
+        // A ladder-resolved (or explicitly configured) batch shim path
+        // still needs the interpreter.
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            return ("cmd.exe".to_string(), vec!["/C".to_string(), program]);
+        }
+        if !(program.contains('/')
+            || program.contains('\\')
             || lower.ends_with(".exe")
             || lower.ends_with(".com"))
         {
-            if let Ok(resolved) = which::which(command) {
+            if let Ok(resolved) = which::which(&program) {
                 let ext = resolved
                     .extension()
                     .and_then(|e| e.to_str())
@@ -846,7 +860,7 @@ pub(crate) fn pty_program_invocation(command: &str) -> (String, Vec<String>) {
             }
         }
     }
-    (command.to_string(), Vec::new())
+    (program, Vec::new())
 }
 
 #[cfg(test)]

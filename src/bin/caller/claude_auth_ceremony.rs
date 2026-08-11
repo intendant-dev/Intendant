@@ -204,7 +204,8 @@ pub(crate) fn parse_auth_status(output: &str) -> Option<AuthProbe> {
 /// Run `<command> auth status` and parse it. Blocking — called from the
 /// ceremony's reader thread only.
 fn probe_auth_status(command: &str) -> Option<AuthProbe> {
-    let (program, mut args) = pty_program_invocation(command);
+    let (program, mut args) =
+        pty_program_invocation(&crate::external_agent::AgentBackend::ClaudeCode, command);
     args.extend(["auth".to_string(), "status".to_string()]);
     let output = std::process::Command::new(program)
         .args(args)
@@ -272,7 +273,8 @@ fn spawn_ceremony_process(id: u64, command: &str) -> Result<(), String> {
         })
         .map_err(|e| format!("openpty: {e}"))?;
 
-    let (program, mut args) = pty_program_invocation(command);
+    let (program, mut args) =
+        pty_program_invocation(&crate::external_agent::AgentBackend::ClaudeCode, command);
     args.extend(["auth".to_string(), "login".to_string()]);
     // V1 is the claude.ai lane, the CLI default; passed explicitly so the
     // ceremony can never inherit a different default from a newer CLI.

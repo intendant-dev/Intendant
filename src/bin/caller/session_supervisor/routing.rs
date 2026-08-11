@@ -1661,8 +1661,24 @@ impl SessionSupervisor {
         if crate::backend_install::install_pending(approval_id) {
             return;
         }
+        // The id is nobody's pending approval. If this process already
+        // resolved it, the response is a benign duplicate (a dashboard
+        // double-send, a re-click) — or this very check lost the broadcast
+        // race to the gate's own waiter, which consumes the pending entry
+        // concurrently. Either way the human's decision took effect exactly
+        // once; say so quietly instead of falling through to a stale-id
+        // warning. Checked before any session resolution because the id may
+        // never have belonged to a session (frontends historically attach a
+        // fallback session id to daemon-scoped approvals).
+        if crate::event::approval_recently_resolved(approval_id) {
+            self.info(&format!(
+                "Approval {approval_id} was already resolved — duplicate '{action}' response \
+                 ignored"
+            ));
+            return;
+        }
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
-            self.warn("Approval response dropped: no active managed session");
+            self.warn_stale_approval_response(approval_id);
             return;
         };
         let registry = {
@@ -1676,10 +1692,7 @@ impl SessionSupervisor {
                 .map(|session| session.approval_registry.clone())
         };
         let Some(registry) = registry else {
-            self.warn(&format!(
-                "Approval response dropped: session {} is not managed by this daemon",
-                short_session(&target_id)
-            ));
+            self.warn_stale_approval_response(approval_id);
             return;
         };
         let responder = registry.lock().unwrap().remove(&approval_id);
@@ -1693,13 +1706,25 @@ impl SessionSupervisor {
                 });
             }
             None => {
-                self.warn(&format!(
-                    "Approval response dropped: id {} is not pending for session {}",
-                    approval_id,
-                    short_session(&target_id)
-                ));
+                self.warn_stale_approval_response(approval_id);
             }
         }
+    }
+
+    /// The honest terminal for an approval response whose id is pending
+    /// nowhere and was not recently resolved: the proposal expired (the
+    /// install gate's 600s wall, a question deadline), the daemon
+    /// restarted (pending sets and approval registries are process
+    /// memory), or another surface consumed it longer ago than the
+    /// recently-resolved register remembers. Deliberately free of session
+    /// vocabulary — the id may belong to a daemon-scoped act (a Vault
+    /// install, a live-audio consent), where "no active managed session"
+    /// misreports the owner's own approval as a session-routing failure.
+    fn warn_stale_approval_response(&self, approval_id: u64) {
+        self.warn(&format!(
+            "Approval {approval_id} is no longer pending — it may have expired or already been \
+             resolved; trigger the action again if it is still needed"
+        ));
     }
 }
 
@@ -4451,5 +4476,173 @@ mod tests {
             }
         }
         assert!(saw_refusal, "the refusal must be reported honestly");
+    }
+
+    /// Drain the broadcast ring into the `LogEntry` lines it carries.
+    fn drain_log_entries(
+        bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    ) -> Vec<(String, String)> {
+        let mut lines = Vec::new();
+        while let Ok(event) = bus_rx.try_recv() {
+            if let AppEvent::LogEntry { level, content, .. } = event {
+                lines.push((level, content));
+            }
+        }
+        lines
+    }
+
+    /// The Vault-install incident pin (card 01KZQWXEEK): a duplicate
+    /// approval response — the id was consumed by a daemon-scoped gate's
+    /// waiter moments earlier (dashboard double-send, or the supervisor
+    /// losing the broadcast race) — is a benign no-op. The dashboard hears
+    /// "already resolved" at info level; the session-vocabulary warning
+    /// ("no active managed session") never fires for it.
+    #[tokio::test]
+    async fn duplicate_approval_response_is_an_honest_no_op() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let approval_id = crate::event::next_approval_id();
+        // The first decision resolved a daemon-scoped gate, whose waiter
+        // announced it on this bus — the choke point that feeds the
+        // recently-resolved register.
+        bus.send(AppEvent::ApprovalResolved {
+            session_id: None,
+            id: approval_id,
+            action: "approve".to_string(),
+        });
+        let mut bus_rx = bus.subscribe();
+        supervisor
+            .resolve_approval(
+                None,
+                approval_id,
+                event::ApprovalResponse::Approve,
+                "approve",
+            )
+            .await;
+        let lines = drain_log_entries(&mut bus_rx);
+        let benign: Vec<_> = lines
+            .iter()
+            .filter(|(_, content)| content.contains("already resolved"))
+            .collect();
+        assert_eq!(
+            benign.len(),
+            1,
+            "exactly one honest 'already resolved' line: {lines:?}"
+        );
+        assert_eq!(
+            benign[0].0, "info",
+            "the duplicate case is benign, not a warning"
+        );
+        assert!(
+            lines.iter().all(
+                |(_, content)| !content.contains("no active managed session")
+                    && !content.contains("managed session")
+            ),
+            "session vocabulary must never describe a daemon-scoped duplicate: {lines:?}"
+        );
+    }
+
+    /// An approval response whose id is pending nowhere and was never
+    /// resolved by this process (expiry past the register's memory, a
+    /// daemon restart) gets the honest neutral copy — expired/resolved,
+    /// trigger again — with no session vocabulary, on every fallthrough:
+    /// no target session, and a live managed session that does not hold
+    /// the id.
+    #[tokio::test]
+    async fn unknown_approval_response_speaks_daemon_honest_copy() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "sess-live".to_string(),
+                managed_session("sess-live", "intendant"),
+            );
+        }
+        let mut bus_rx = bus.subscribe();
+
+        // No session id, nothing pending anywhere.
+        let stale_daemon_scoped = crate::event::next_approval_id();
+        supervisor
+            .resolve_approval(
+                None,
+                stale_daemon_scoped,
+                event::ApprovalResponse::Approve,
+                "approve",
+            )
+            .await;
+        // A live managed session that never armed this id.
+        let stale_session_scoped = crate::event::next_approval_id();
+        supervisor
+            .resolve_approval(
+                Some("sess-live".to_string()),
+                stale_session_scoped,
+                event::ApprovalResponse::Deny,
+                "deny",
+            )
+            .await;
+
+        let lines = drain_log_entries(&mut bus_rx);
+        for id in [stale_daemon_scoped, stale_session_scoped] {
+            let matched: Vec<_> = lines
+                .iter()
+                .filter(|(_, content)| content.contains(&format!("Approval {id} ")))
+                .collect();
+            assert_eq!(matched.len(), 1, "one honest line for {id}: {lines:?}");
+            let (level, content) = matched[0];
+            assert_eq!(level, "warn");
+            assert!(
+                content.contains("no longer pending")
+                    && content.contains("may have expired or already been resolved")
+                    && content.contains("trigger the action again"),
+                "the stale copy names expiry and the remedy: {content}"
+            );
+            assert!(
+                !content.contains("session"),
+                "no session vocabulary on the stale-approval terminal: {content}"
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .all(|(_, content)| !content.contains("no active managed session")),
+            "the misleading legacy copy is gone: {lines:?}"
+        );
+    }
+
+    /// The dashboard bundle's half of the response-drop fix, pinned
+    /// daemon-side (the `spa_install_lane_renders_from_the_matrix`
+    /// pattern): the approval rail must not smuggle an unrelated session
+    /// id onto daemon-scoped approvals, must treat the tunnel RPC's
+    /// delivered ack as delivery (no "retry" invitation that mints
+    /// duplicate decisions), and must truth-link its cards — clearing on
+    /// `approval_resolved` and on transport loss, re-deriving from the
+    /// daemon's bootstrap replay.
+    #[test]
+    fn spa_approval_rail_truth_links_to_daemon_state() {
+        let app = include_str!("../../../../static/app.html");
+        for needle in [
+            // showApproval: no currentSessionFullId fallback on the session
+            // binding (the exact replacement line).
+            "pendingApprovalSessionId = sessionId || approvalSessionIds.get(String(id)) || '';",
+            // sendApproval marks tunnel-delivered decisions; the watchdog
+            // then never invites the duplicate-minting retry.
+            "markApprovalSendDelivered",
+            "delivered: false",
+            // The wire approval_resolved clears the shown approval card.
+            "approval_resolved' && d.id !== undefined && typeof pendingApprovalId",
+            // Transport loss clears local approval cards; the bootstrap
+            // replay re-derives what still stands.
+            "clearLocalApprovalCardsOnTransportLoss",
+        ] {
+            assert!(
+                app.contains(needle),
+                "the dashboard bundle lost the approval-rail truth link: {needle}"
+            );
+        }
+        assert!(
+            !app.contains("|| currentSessionFullId\n      || '';"),
+            "daemon-scoped approvals must not borrow the focused session's identity"
+        );
     }
 }

@@ -36714,6 +36714,47 @@ window.__ui2 = {
   enabled: ui2Enabled, icon: ui2Icon,
   theme: ui2Theme, setTheme: ui2SetTheme,
 };
+
+// ── external-URL opener ────────────────────────────────────────────────
+// window.open is not a given: the bundled macOS app's WKWebView routes
+// popups to the system default browser (sign-in flows need the user's
+// real profile — password manager, passkeys — never an isolated webview)
+// and returns null from window.open BY DESIGN; its injected
+// `__intendantAppExternalOpen` marker says "null still opened". Popup
+// blockers and older app bundles return null with no marker. Callers
+// branch on the boolean and render an honest fallback (the URL with a
+// copy affordance) instead of a silent no-op.
+function openExternalUrl(url) {
+  let popup = null;
+  try {
+    popup = window.open(url, '_blank');
+  } catch (err) {
+    popup = null;
+  }
+  if (popup) {
+    // Sever the opener by hand: the 'noopener' feature would make
+    // window.open return null even on success, hiding the outcome.
+    try { popup.opener = null; } catch (err) { /* cross-origin */ }
+    return true;
+  }
+  return window.__intendantAppExternalOpen === true;
+}
+
+// Shared fallback for call sites without their own inline URL surface:
+// copy the link and say so, or at least show it — never a silent no-op.
+function openExternalUrlOrExplain(url) {
+  if (openExternalUrl(url)) return true;
+  const link = String(url);
+  const explain = 'This view can’t open browser tabs — ';
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(link)
+      .then(() => showControlToast?.('info', explain + 'link copied, paste it in your browser.'))
+      .catch(() => showControlToast?.('error', explain + `open ${link} in your browser.`));
+  } else {
+    showControlToast?.('error', explain + `open ${link} in your browser.`);
+  }
+  return false;
+}
 /* ── static/app/ui2-chrome.js ── */
 // ── ui-v2 chrome wiring (design-overhaul P1a) ──────────────────────────
 // Builds the nav rail's destination buttons and mirrors live state out of
@@ -39276,7 +39317,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'ff2d023f1da16f8a';
+const INTENDANT_APP_BUILD = '98691dc32280a28e';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -42281,7 +42322,15 @@ function hostedControlRenderManagementCard() {
     if (addPasskey) {
       addPasskey.onclick = async () => {
         addPasskey.disabled = true;
-        const enrollmentWindow = window.open('about:blank', '_blank');
+        // Pre-open about:blank inside the click gesture so the popup
+        // survives blockers, then point it at the fetched URL. Skipped
+        // in the macOS app wrapper: its webview routes popups to the
+        // system browser and an about:blank pre-open can never carry
+        // the later URL — openExternalUrl below opens the real link
+        // instead (NSWorkspace needs no gesture timing).
+        const enrollmentWindow = window.__intendantAppExternalOpen === true
+          ? null
+          : window.open('about:blank', '_blank');
         if (enrollmentWindow) enrollmentWindow.opener = null;
         try {
           const label = mount.querySelector('#custom-passkey-label').value.trim();
@@ -42301,7 +42350,7 @@ function hostedControlRenderManagementCard() {
           }
           if (enrollmentWindow) {
             enrollmentWindow.location.replace(invitation.enrollment_url);
-          } else {
+          } else if (!openExternalUrl(invitation.enrollment_url)) {
             await navigator.clipboard.writeText(invitation.enrollment_url);
             showControlToast?.('info', 'Enrollment link copied. Open it before it expires.');
           }
@@ -45366,6 +45415,11 @@ function agentSigninProviderState() {
     busy: false,
     lastError: '',
     pollTimer: null,
+    // The "Open …" button could not open a tab (popup blocker, or an app
+    // wrapper predating the system-browser popup route): state, not DOM,
+    // because the 2s ceremony poll re-renders the card and would wipe an
+    // ad-hoc note. Cleared on the next ceremony start.
+    openFallback: false,
   };
 }
 const agentSigninState = {
@@ -45497,6 +45551,7 @@ async function agentSigninStart(provider) {
   // or the guard above mutes the button for the rest of the page load.
   try {
     state.lastError = '';
+    state.openFallback = false;
     renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
@@ -45908,13 +45963,16 @@ function agentInstallSection(card, spec, missing, note, actionsRow) {
   }
   if (state === 'succeeded') {
     // Still on the not-installed card after a finished install: the
-    // PATH-inheritance footgun — the daemon inherited PATH at launch, so
-    // a fresh install dir may not resolve until PATH carries it.
+    // daemon resolves through its PATH, the installer's declared
+    // destination, and the well-known install dirs — so reaching this
+    // state means the CLI landed somewhere genuinely custom. Known
+    // locations flip the card automatically on the next probe.
     const el = note(
-      'The installer finished, but the CLI still does not resolve on the ' +
-        "daemon's PATH. The daemon inherited its PATH at launch — add the " +
-        'install directory to PATH and restart the daemon, or restart your ' +
-        'terminal session, then this card will pick it up.',
+      'The installer finished, but the CLI still does not resolve — it is ' +
+        "not on the daemon's PATH, at the installer's usual destination, or " +
+        'in any install location the daemon checks (those are picked up ' +
+        'automatically, no restart needed). If it landed somewhere custom, ' +
+        "add that directory to the daemon's PATH and restart the daemon.",
       'vault-warning'
     );
     if (install.log_dir) el.title = `Full installer output: ${install.log_dir}`;
@@ -46093,11 +46151,11 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
-    // PATH-inheritance honesty: the daemon found the CLI in a known
-    // install directory its inherited PATH doesn't carry (installed
-    // mid-run — the Windows npm-shim footgun). Surface the exact
-    // where-and-why instead of leaving "install it" to gaslight a user
-    // who just did.
+    // Genuinely-not-found honesty: the daemon already resolved through
+    // its PATH, the installer's declared destination, and the well-known
+    // install dirs (a CLI in any of those reports installed — no restart
+    // needed), so the surviving hint names where it looked and the
+    // custom-location remedy.
     if (missing.path_hint) note(String(missing.path_hint));
     agentInstallSection(card, spec, missing, note, actionsRow);
     return card;
@@ -46183,7 +46241,9 @@ function agentSigninProviderCard(provider) {
       openRow.className = 'vault-actions';
       openRow.appendChild(
         vaultButton(spec.openLabel, () => {
-          window.open(url, '_blank', 'noopener');
+          if (openExternalUrl(url)) return;
+          state.openFallback = true;
+          renderAgentSigninSection();
         }, { primary: true })
       );
       openRow.appendChild(
@@ -46195,6 +46255,17 @@ function agentSigninProviderCard(provider) {
         })
       );
       stepOne.appendChild(openRow);
+      if (state.openFallback) {
+        // Honest fallback when no tab opened (popup blocker, or an app
+        // wrapper predating the system-browser popup route): the link
+        // itself renders right below — point at it instead of no-oping.
+        const fallback = document.createElement('div');
+        fallback.className = 'vault-warning agent-signin-open-fallback';
+        fallback.textContent =
+          'A browser tab could not be opened from here — use Copy link ' +
+          'and open the link below in your browser.';
+        stepOne.appendChild(fallback);
+      }
       const checkNote = document.createElement('div');
       checkNote.className = 'vault-note';
       checkNote.textContent = spec.checkNote;
@@ -47878,7 +47949,13 @@ function dispatchSessionControlMsg(payload, options = {}) {
     daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
     }).then(resp => {
-      if (resp.ok) return;
+      if (resp.ok) {
+        // Delivered ack: the daemon received and dispatched this message.
+        // Callers with at-most-once semantics (the approval rail) use it
+        // to disarm their retry paths.
+        if (typeof options.onDelivered === 'function') options.onDelivered(resp);
+        return;
+      }
       // Delivered refusals (allowlist drift the parity pins make
       // near-impossible) surface instead of silently resolving; still no
       // /ws replay — the response was delivered.
@@ -56980,6 +57057,25 @@ async function main() {
         serverMsgStep(d, 'approval_resolved', () => {
           clearPendingQuestion();
           hidePanel('question-panel');
+        });
+      }
+      // The approval card truth-link: the daemon says this id is settled
+      // (decided here or elsewhere, or its waiter expired — the install
+      // gate's 600s wall). Clear the shown card so it cannot outlive its
+      // daemon-side backing and invite a decision for a dead id; peer
+      // cards retire on peer_approval_resolved instead.
+      if (d.event === 'approval_resolved' && d.id !== undefined && typeof pendingApprovalId !== 'undefined'
+          && pendingApprovalId !== null && !pendingApprovalHostId
+          && String(pendingApprovalId) === String(d.id)) {
+        serverMsgStep(d, 'approval_resolved_panel', () => {
+          const localSend = typeof approvalSendPending !== 'undefined' && approvalSendPending
+            && approvalSendPending.id === String(d.id);
+          hidePanel('approval-panel'); // clearPendingApproval + queue pump ride inside
+          if (!localSend && typeof showControlToast === 'function') {
+            showControlToast('info', d.action === 'timeout'
+              ? 'An approval expired without a decision — trigger the action again if it is still needed'
+              : 'An approval was resolved from another surface');
+          }
         });
       }
       if (d.event === 'autonomy_changed') {
@@ -77772,10 +77868,24 @@ function beginApprovalSend(id, sessionId) {
     attnKey: attentionApprovalKeyFor(id, sessionId),
     timer: null,
     poll: null,
+    // Flipped by markApprovalSendDelivered when the decision's transport
+    // ACKS receipt (the tunnel RPC's response). The fire-and-forget /ws
+    // lane never flips it.
+    delivered: false,
   };
   pending.timer = setTimeout(() => {
     // Identity check: a later send must never be killed by this timer.
     if (approvalSendPending !== pending) return;
+    if (pending.delivered) {
+      // The daemon acked receipt of the decision; only the resolution
+      // evidence (approval_resolved et al.) is late or lost. Retire the
+      // card WITHOUT the retry invitation — a re-click here is what mints
+      // duplicate decisions ("already resolved" daemon-side). If the
+      // decision found nothing pending, the daemon says so honestly on
+      // its own lane.
+      confirmApprovalSendDelivered();
+      return;
+    }
     if (pending.poll) clearInterval(pending.poll);
     approvalSendPending = null;
     setApprovalPanelSending(false);
@@ -77803,6 +77913,35 @@ function resolveApprovalSend() {
   if (approvalSendPending.poll) clearInterval(approvalSendPending.poll);
   approvalSendPending = null;
   setApprovalPanelSending(false);
+}
+
+// The decision's transport delivered it to the daemon (tunnel RPC ack).
+// Not resolution evidence by itself — the panel keeps waiting for that —
+// but it disarms the watchdog's "may not have reached the daemon — retry"
+// path, whose invited re-click double-sends one human decision.
+function markApprovalSendDelivered(id) {
+  if (approvalSendPending && approvalSendPending.id === String(id)) {
+    approvalSendPending.delivered = true;
+  }
+}
+
+// Transport loss, not resolution (the attention set's attentionClearAll
+// contract): local approval cards drop silently — the daemon-side pending
+// registries are the truth, and the reconnect bootstrap replays whatever
+// still stands (session-scoped and daemon-scoped alike), re-opening the
+// panel through the ordinary approval_required path. Without this, cards
+// whose daemon-side backing died with the process (pending sets are
+// process memory) rendered forever and invited decisions for dead ids.
+// Peer-hosted cards stay: their truth (peerPendingApprovals) survives a
+// local transport flap and retires on peer events instead.
+function clearLocalApprovalCardsOnTransportLoss() {
+  for (let i = approvalDisplayQueue.length - 1; i >= 0; i -= 1) {
+    if (!(approvalDisplayQueue[i].hostId || '')) approvalDisplayQueue.splice(i, 1);
+  }
+  if (pendingApprovalId !== null && !pendingApprovalHostId) {
+    hidePanel('approval-panel');
+  }
+  updateApprovalPendingCount();
 }
 
 function confirmApprovalSendDelivered() {
@@ -77949,11 +78088,14 @@ function showApproval(id, command, category, sessionId, hostId) {
     // local windows; the provenance line names the peer context instead.
     pendingApprovalSessionId = sessionId || '';
   } else {
-    pendingApprovalSessionId =
-      sessionId
-      || approvalSessionIds.get(String(id))
-      || currentSessionFullId
-      || '';
+    // Only a session the approval actually CARRIED. Daemon-scoped
+    // approvals (Vault installs, live-audio consent) ride sessionless by
+    // design — borrowing the focused session's identity here aimed the
+    // decision at an unrelated session and bought session-vocabulary
+    // errors for owners performing daemon-scoped acts. Sessionless
+    // main-loop approvals need no fallback either: the daemon resolves a
+    // sessionless decision against its active session itself.
+    pendingApprovalSessionId = sessionId || approvalSessionIds.get(String(id)) || '';
     if (pendingApprovalSessionId) {
       ensureSessionWindow(pendingApprovalSessionId, { phase: 'waiting' });
       focusSessionWindow(pendingApprovalSessionId);
@@ -83786,7 +83928,7 @@ function renderAccessFleetStrip() {
       direct.title = `Open ${directUrl} — this daemon's own dashboard, no rendezvous in the loop. Works when this browser can reach it (same LAN/VPN); a self-signed daemon shows a one-time certificate warning.`;
       direct.addEventListener('click', async event => {
         event.stopPropagation();
-        window.open(await withSiblingLoopbackToken(directUrl), '_blank', 'noopener');
+        openExternalUrlOrExplain(await withSiblingLoopbackToken(directUrl));
       });
       meta.appendChild(direct);
     }
@@ -109196,7 +109338,7 @@ async function memoryProposeFromForm(button) {
       if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
       ev.preventDefault();
       Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
-        window.open(url, '_blank', 'noopener');
+        openExternalUrlOrExplain(url);
       });
     });
     return link;
@@ -136220,7 +136362,7 @@ function openPeerSessionExternally(s, hostId) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');
     return;
   }
-  window.open(`${base}/#sessions`, '_blank', 'noopener');
+  if (!openExternalUrlOrExplain(`${base}/#sessions`)) return;
   const sid = String(s?.session_id || s?.resume_id || '').trim();
   if (sid) {
     showControlToast('info', `Opened ${host.label || 'peer'} dashboard — look for session ${sid.slice(0, 8)}…`);
@@ -144260,6 +144402,15 @@ function attentionApplyEvent(d, live) {
 function attentionOnServerState(connected) {
   if (!connected) {
     attentionClearAll();
+    // The bottom-panel approval card follows the same transport-loss
+    // contract as the attention set: drop local cards silently and let
+    // the reconnect bootstrap replay what still stands — the daemon
+    // replays pending approvals (session-scoped and daemon-scoped), and
+    // a card whose daemon died with its pending set stays gone instead
+    // of rendering forever (41-session-window-actions.js).
+    if (typeof clearLocalApprovalCardsOnTransportLoss === 'function') {
+      clearLocalApprovalCardsOnTransportLoss();
+    }
     return;
   }
   // Local-WS reconnect (RC-C2): the clear dropped peer approval items,
@@ -144829,7 +144980,12 @@ window.sendApproval = function(action) {
     resolveApprovalSend();
     showControlToast('error', err?.message || 'Approval could not be sent — retry');
   };
-  const sent = dispatchSessionControlMsg(msg, { onError: failSend });
+  const sent = dispatchSessionControlMsg(msg, {
+    onError: failSend,
+    // Tunnel RPC ack: the daemon received THIS decision. Disarms the
+    // watchdog's retry invitation so one click stays one response.
+    onDelivered: () => markApprovalSendDelivered(msg.id),
+  });
   if (sent === false) failSend(new Error('Approval could not be sent — no daemon connection; retry'));
 };
 window.sendHumanResponse = function() {

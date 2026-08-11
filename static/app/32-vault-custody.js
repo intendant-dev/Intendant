@@ -1759,6 +1759,11 @@ function agentSigninProviderState() {
     busy: false,
     lastError: '',
     pollTimer: null,
+    // The "Open …" button could not open a tab (popup blocker, or an app
+    // wrapper predating the system-browser popup route): state, not DOM,
+    // because the 2s ceremony poll re-renders the card and would wipe an
+    // ad-hoc note. Cleared on the next ceremony start.
+    openFallback: false,
   };
 }
 const agentSigninState = {
@@ -1890,6 +1895,7 @@ async function agentSigninStart(provider) {
   // or the guard above mutes the button for the rest of the page load.
   try {
     state.lastError = '';
+    state.openFallback = false;
     renderAgentSigninSection();
     const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
@@ -2301,13 +2307,16 @@ function agentInstallSection(card, spec, missing, note, actionsRow) {
   }
   if (state === 'succeeded') {
     // Still on the not-installed card after a finished install: the
-    // PATH-inheritance footgun — the daemon inherited PATH at launch, so
-    // a fresh install dir may not resolve until PATH carries it.
+    // daemon resolves through its PATH, the installer's declared
+    // destination, and the well-known install dirs — so reaching this
+    // state means the CLI landed somewhere genuinely custom. Known
+    // locations flip the card automatically on the next probe.
     const el = note(
-      'The installer finished, but the CLI still does not resolve on the ' +
-        "daemon's PATH. The daemon inherited its PATH at launch — add the " +
-        'install directory to PATH and restart the daemon, or restart your ' +
-        'terminal session, then this card will pick it up.',
+      'The installer finished, but the CLI still does not resolve — it is ' +
+        "not on the daemon's PATH, at the installer's usual destination, or " +
+        'in any install location the daemon checks (those are picked up ' +
+        'automatically, no restart needed). If it landed somewhere custom, ' +
+        "add that directory to the daemon's PATH and restart the daemon.",
       'vault-warning'
     );
     if (install.log_dir) el.title = `Full installer output: ${install.log_dir}`;
@@ -2486,11 +2495,11 @@ function agentSigninProviderCard(provider) {
         'was not found on the daemon host, so there is no account to sign ' +
         'in yet. Install it on the daemon machine, then sign in from here.'
     );
-    // PATH-inheritance honesty: the daemon found the CLI in a known
-    // install directory its inherited PATH doesn't carry (installed
-    // mid-run — the Windows npm-shim footgun). Surface the exact
-    // where-and-why instead of leaving "install it" to gaslight a user
-    // who just did.
+    // Genuinely-not-found honesty: the daemon already resolved through
+    // its PATH, the installer's declared destination, and the well-known
+    // install dirs (a CLI in any of those reports installed — no restart
+    // needed), so the surviving hint names where it looked and the
+    // custom-location remedy.
     if (missing.path_hint) note(String(missing.path_hint));
     agentInstallSection(card, spec, missing, note, actionsRow);
     return card;
@@ -2576,7 +2585,9 @@ function agentSigninProviderCard(provider) {
       openRow.className = 'vault-actions';
       openRow.appendChild(
         vaultButton(spec.openLabel, () => {
-          window.open(url, '_blank', 'noopener');
+          if (openExternalUrl(url)) return;
+          state.openFallback = true;
+          renderAgentSigninSection();
         }, { primary: true })
       );
       openRow.appendChild(
@@ -2588,6 +2599,17 @@ function agentSigninProviderCard(provider) {
         })
       );
       stepOne.appendChild(openRow);
+      if (state.openFallback) {
+        // Honest fallback when no tab opened (popup blocker, or an app
+        // wrapper predating the system-browser popup route): the link
+        // itself renders right below — point at it instead of no-oping.
+        const fallback = document.createElement('div');
+        fallback.className = 'vault-warning agent-signin-open-fallback';
+        fallback.textContent =
+          'A browser tab could not be opened from here — use Copy link ' +
+          'and open the link below in your browser.';
+        stepOne.appendChild(fallback);
+      }
       const checkNote = document.createElement('div');
       checkNote.className = 'vault-note';
       checkNote.textContent = spec.checkNote;
@@ -4271,7 +4293,13 @@ function dispatchSessionControlMsg(payload, options = {}) {
     daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
     }).then(resp => {
-      if (resp.ok) return;
+      if (resp.ok) {
+        // Delivered ack: the daemon received and dispatched this message.
+        // Callers with at-most-once semantics (the approval rail) use it
+        // to disarm their retry paths.
+        if (typeof options.onDelivered === 'function') options.onDelivered(resp);
+        return;
+      }
       // Delivered refusals (allowlist drift the parity pins make
       // near-impossible) surface instead of silently resolving; still no
       // /ws replay — the response was delivered.

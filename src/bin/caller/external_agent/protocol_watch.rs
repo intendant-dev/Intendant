@@ -1538,8 +1538,16 @@ pub(crate) struct ExecutableFingerprint {
     pub(crate) digest: String,
 }
 
-pub(crate) fn executable_fingerprint(command: &str) -> Option<ExecutableFingerprint> {
-    let resolved = crate::platform::resolve_command_path(command)?;
+/// Fingerprint the executable `command` resolves to for `backend` — the
+/// same ladder detection and launch use (PATH, declared installer
+/// destinations, generic install dirs), so the `resolved_path` this
+/// carries into the compatibility payload names the binary that will
+/// actually spawn.
+pub(crate) fn executable_fingerprint(
+    backend: &AgentBackend,
+    command: &str,
+) -> Option<ExecutableFingerprint> {
+    let resolved = crate::external_agent::resolve_backend_command_path(backend, command)?;
     let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
     let file = std::fs::File::open(&canonical).ok()?;
     let metadata = file.metadata().ok()?;
@@ -1712,7 +1720,7 @@ impl ProtocolWatchHandle {
         profile: &str,
         command: &str,
     ) -> Option<Self> {
-        let artifact = executable_fingerprint(command)?;
+        let artifact = executable_fingerprint(&backend, command)?;
         let manifest_digest = manifest_digest(&backend);
         let profile = profile_key(profile).to_string();
         let contract_path = contract_dir(
@@ -2263,7 +2271,7 @@ pub(crate) fn passive_status_in(
     command: &str,
 ) -> PassiveCompatibilityStatus {
     let contract_digest = manifest_digest(backend);
-    let Some(artifact) = executable_fingerprint(command) else {
+    let Some(artifact) = executable_fingerprint(backend, command) else {
         return PassiveCompatibilityStatus {
             state: PassiveCompatibilityState::Unobserved,
             coverage: "passive",

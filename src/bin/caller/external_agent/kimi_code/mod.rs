@@ -1536,7 +1536,12 @@ impl ExternalAgent for KimiCodeAgent {
                 KimiServerEntrypoint::ServerRun => HashSet::new(),
                 KimiServerEntrypoint::Web => capture_server_instance_baseline(&bridge_home).await?,
             };
-            let mut command = crate::platform::spawn_command(&self.command);
+            // Detection's resolution ladder, not the daemon's inherited
+            // PATH: a CLI that reports installed must spawn (the one-click
+            // installer lands in ~/.kimi-code/bin, which the running
+            // daemon's PATH never carries).
+            let mut command =
+                super::spawn_backend_command(&super::AgentBackend::Kimi, &self.command);
             command
                 .args(entrypoint.args())
                 .current_dir(&config.working_dir)

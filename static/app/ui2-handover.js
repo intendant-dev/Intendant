@@ -1560,7 +1560,7 @@
       if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
       ev.preventDefault();
       Promise.resolve(withSiblingLoopbackToken(bare)).then((url) => {
-        window.open(url, '_blank', 'noopener');
+        openExternalUrlOrExplain(url);
       });
     });
     return link;

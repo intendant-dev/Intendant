@@ -1427,6 +1427,14 @@ pub struct DashboardBootstrapCaches {
     /// → serialized wire line; pruned on `session_ended`.
     pub(crate) session_state_lines:
         Arc<std::sync::Mutex<BTreeMap<String, BTreeMap<&'static str, String>>>>,
+    /// Pending DAEMON-SCOPED approvals (`approval_required` with no
+    /// session — Vault installs, live-audio consent), keyed by approval
+    /// id and replayed like the per-session lines above: their pending
+    /// sets are process memory the reconnecting dashboard must re-derive,
+    /// not mirror — a card kept client-side outlives a restarted daemon
+    /// and invites decisions for dead ids. Cleared on `approval_resolved`
+    /// (which the arming gates emit on every outcome, expiry included).
+    pub(crate) daemon_approval_lines: Arc<std::sync::Mutex<BTreeMap<u64, String>>>,
 }
 
 type DashboardPresenceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;

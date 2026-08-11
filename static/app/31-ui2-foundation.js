@@ -120,3 +120,44 @@ window.__ui2 = {
   enabled: ui2Enabled, icon: ui2Icon,
   theme: ui2Theme, setTheme: ui2SetTheme,
 };
+
+// ── external-URL opener ────────────────────────────────────────────────
+// window.open is not a given: the bundled macOS app's WKWebView routes
+// popups to the system default browser (sign-in flows need the user's
+// real profile — password manager, passkeys — never an isolated webview)
+// and returns null from window.open BY DESIGN; its injected
+// `__intendantAppExternalOpen` marker says "null still opened". Popup
+// blockers and older app bundles return null with no marker. Callers
+// branch on the boolean and render an honest fallback (the URL with a
+// copy affordance) instead of a silent no-op.
+function openExternalUrl(url) {
+  let popup = null;
+  try {
+    popup = window.open(url, '_blank');
+  } catch (err) {
+    popup = null;
+  }
+  if (popup) {
+    // Sever the opener by hand: the 'noopener' feature would make
+    // window.open return null even on success, hiding the outcome.
+    try { popup.opener = null; } catch (err) { /* cross-origin */ }
+    return true;
+  }
+  return window.__intendantAppExternalOpen === true;
+}
+
+// Shared fallback for call sites without their own inline URL surface:
+// copy the link and say so, or at least show it — never a silent no-op.
+function openExternalUrlOrExplain(url) {
+  if (openExternalUrl(url)) return true;
+  const link = String(url);
+  const explain = 'This view can’t open browser tabs — ';
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(link)
+      .then(() => showControlToast?.('info', explain + 'link copied, paste it in your browser.'))
+      .catch(() => showControlToast?.('error', explain + `open ${link} in your browser.`));
+  } else {
+    showControlToast?.('error', explain + `open ${link} in your browser.`);
+  }
+  return false;
+}

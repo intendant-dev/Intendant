@@ -761,6 +761,25 @@ async function main() {
           hidePanel('question-panel');
         });
       }
+      // The approval card truth-link: the daemon says this id is settled
+      // (decided here or elsewhere, or its waiter expired — the install
+      // gate's 600s wall). Clear the shown card so it cannot outlive its
+      // daemon-side backing and invite a decision for a dead id; peer
+      // cards retire on peer_approval_resolved instead.
+      if (d.event === 'approval_resolved' && d.id !== undefined && typeof pendingApprovalId !== 'undefined'
+          && pendingApprovalId !== null && !pendingApprovalHostId
+          && String(pendingApprovalId) === String(d.id)) {
+        serverMsgStep(d, 'approval_resolved_panel', () => {
+          const localSend = typeof approvalSendPending !== 'undefined' && approvalSendPending
+            && approvalSendPending.id === String(d.id);
+          hidePanel('approval-panel'); // clearPendingApproval + queue pump ride inside
+          if (!localSend && typeof showControlToast === 'function') {
+            showControlToast('info', d.action === 'timeout'
+              ? 'An approval expired without a decision — trigger the action again if it is still needed'
+              : 'An approval was resolved from another surface');
+          }
+        });
+      }
       if (d.event === 'autonomy_changed') {
         serverMsgStep(d, 'autonomy_changed', () => updateStatusBar({ autonomy: d.autonomy }));
         return;

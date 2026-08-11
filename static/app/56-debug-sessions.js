@@ -479,7 +479,7 @@ function openPeerSessionExternally(s, hostId) {
     showControlToast('error', 'No reachable dashboard URL is known for this peer.');
     return;
   }
-  window.open(`${base}/#sessions`, '_blank', 'noopener');
+  if (!openExternalUrlOrExplain(`${base}/#sessions`)) return;
   const sid = String(s?.session_id || s?.resume_id || '').trim();
   if (sid) {
     showControlToast('info', `Opened ${host.label || 'peer'} dashboard — look for session ${sid.slice(0, 8)}…`);
