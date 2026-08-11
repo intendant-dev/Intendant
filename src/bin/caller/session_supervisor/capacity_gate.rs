@@ -98,6 +98,7 @@ impl SessionSupervisor {
                 AdmissionCheck::Admit => Decision::Pass(Box::new(msg), reserved),
                 AdmissionCheck::Gate {
                     stage,
+                    reasons,
                     bound,
                     resident,
                     ..
@@ -113,12 +114,13 @@ impl SessionSupervisor {
                     };
                     match refusing_lane {
                         Some(what) => Decision::Refuse(capacity::refusal_text(
-                            what, stage, resident, bound, queued,
+                            what, stage, &reasons, resident, bound, queued,
                         )),
                         None if queued >= capacity::ADMISSION_QUEUE_CAP => {
                             Decision::Refuse(capacity::refusal_text(
                                 "session create (admission queue full)",
                                 stage,
+                                &reasons,
                                 resident,
                                 bound,
                                 queued,
@@ -135,6 +137,7 @@ impl SessionSupervisor {
                                 "session create",
                                 position,
                                 stage,
+                                &reasons,
                                 resident,
                                 bound,
                             ))
